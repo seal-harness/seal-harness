@@ -103,6 +103,61 @@ self-destructs, you replay the audited log forward to reconstruct state at
 any point in the agent's lifetime. **The agent's evolution is permanent and
 recoverable.**
 
+### Secret Protection
+
+Secrets get first-class treatment. API keys, bearer tokens, pairing codes, and
+encryption keys are not stored in plaintext config files or environment
+variables that any shell command can read. They live in an **encrypted vault**
+with proper cryptographic guarantees.
+
+**The vault:**
+
+- Encrypted at rest using [age](https://age-encryption.org) — public-key
+  encryption with support for hardware tokens (YubiKey, NitroKey) via
+  `age-plugin-yubikey`. No software-only keys required.
+- Three unlock modes: explicit unlock at startup, automatic unlock on first
+  access, or decrypt-from-disk on every operation (keys never held in memory
+  longer than needed).
+- Atomic writes (write to temp, chmod 0600, rename) — no partial states.
+- Rekey support: re-encrypt the entire vault with a new key, verified
+  byte-for-byte before the old vault is replaced.
+
+**The secret types:**
+
+All secret values use opaque newtypes with redacted `Show` instances and no
+`ToJSON`/`FromJSON` instances. There is no code path that accidentally
+serializes a secret to the transcript, logs, or API response. Access is via
+CPS-style continuations (`withApiKey`, `withBearerToken`) that limit the
+secret's scope to a single function — it can't leak into a binding that
+persists beyond the call.
+
+**The opcodes:**
+
+The Secrets group provides five opcodes for vault management. All are
+Audited — every vault mutation (save, delete) is recorded in the unified
+cross-session log. But **secret values are never written to the audited log
+or the session transcript.** Only key names and operation metadata are
+recorded. The audited log proves *that* a secret was saved or retrieved,
+not *what* it was.
+
+Vault lock, unlock, and rekey are admin operations handled by the CLI, not
+agent opcodes. Unlocking can require a physical hardware token (YubiKey,
+NitroKey) — that's a human-in-the-loop step, not something the agent does
+autonomously. If the vault is locked when the agent calls `SECRET_GET`, it
+gets a "vault locked" error and can ask the human to unlock it via `ASK_HUMAN`.
+
+| Opcode | What it does |
+|---|---|
+| `SECRET_SAVE` | Encrypt and store a secret under a key name |
+| `SECRET_GET` | Decrypt and return a secret (value stays in memory, not logged) |
+| `SECRET_LIST` | List key names only — never values |
+| `SECRET_DELETE` | Remove a secret from the vault |
+| `VAULT_STATUS` | Report locked/unlocked state, key type, secret count |
+
+This isn't a config file with `API_KEY=***`. It's a cryptographically sealed
+vault with hardware token support, atomic operations, and a full audit trail
+of every access — without ever exposing the secrets themselves.
+
 ### Security by Construction
 
 Haskell's type system eliminates entire classes of vulnerabilities at compile
@@ -112,7 +167,7 @@ time:
 |---|---|---|
 | Command authorization | `AuthorizedCommand` proof type | Executing a shell command without policy approval |
 | Filesystem confinement | `SafePath` validated path | Accessing files outside the workspace |
-| Secret protection | Redacted `Show` on all secret types | Logging or serializing API keys, tokens, pairing codes |
+| Secret protection | Opaque newtypes, redacted `Show`, no serialization instances, encrypted vault | Logging or serializing API keys, tokens, pairing codes |
 | Policy evaluation | Pure functions, no IO | Security checks that depend on external state |
 | Error isolation | `PublicError` channel type | Leaking internal error details to users |
 | Capability scoping | Handle pattern | Accessing capabilities not explicitly provided |
@@ -163,7 +218,7 @@ seal --allow git --allow ls --memory sqlite
 
 ## The Instruction Set
 
-The ISA defines 74 opcodes organized into 15 groups. Every opcode is classified
+The ISA defines 77 opcodes organized into 16 groups. Every opcode is classified
 as **Untrusted** (prefer isolated execution, interacts with outside world), **Trusted**
 (harness-internal, logged in session transcript), or **Audited** (harness-internal,
 logged in session transcript AND in a unified cross-session append-only log).
@@ -174,6 +229,7 @@ logged in session transcript AND in a unified cross-session append-only log).
 | **Skills** | `SKILL_LIST`, `SKILL_READ`, `SKILL_CREATE`, `SKILL_UPDATE` | Audited |
 | **Agents** | `AGENT_DEF_READ`, `AGENT_DEF_UPDATE`, `AGENT_LIST`, `AGENT_START`, `AGENT_STATUS`, `AGENT_STOP` | Audited |
 | **Config** | `CONFIG_VIEW`, `CONFIG_UPDATE`, `TARGET_SET`, `PROVIDER_LIST` | Audited |
+| **Secrets** | `SECRET_SAVE`, `SECRET_GET`, `SECRET_LIST`, `SECRET_DELETE`, `VAULT_STATUS` | Audited |
 | **Sessions** | `SESSION_NEW`, `SESSION_COMPACT`, `SESSION_SEARCH` | Trusted |
 | **Scheduling** | `CRON`, `HEARTBEAT_WAKEUP` | Trusted |
 | **Human Interaction** | `ASK_HUMAN`, `SHOW_HUMAN` | Trusted |
@@ -206,7 +262,7 @@ Page size follows the **square root law**: `page_size = min(total, max(floor, ro
 seal-harness/
 ├── src/Seal/
 │   ├── Core/            Types, Config, Errors
-│   ├── Security/        Path, Command, Policy, Secrets, Crypto, Pairing
+│   ├── Security/        Path, Command, Policy, Secrets, Crypto, Pairing, Vault
 │   ├── Handles/         File, Shell, Network, Memory, Channel, Log
 │   ├── ISA/             Opcode definitions, dispatcher, registry
 │   ├── Tools/            Opcode implementations
