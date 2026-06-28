@@ -228,6 +228,21 @@ spec = describe "Seal.Security.Vault" $ do
       st <- vhStatus h
       vsKeyType st `shouldBe` "mock"
 
+    it "UnlockPerAccess: rekey leaves cache empty (no residency) but secret still readable" $
+      withSystemTempDirectory "seal-vault" $ \dir -> do
+        let cfg = VaultConfig (dir </> "vault.age") "mock" UnlockPerAccess
+        h <- openVault cfg mkMockEncryptor
+        _ <- vhInit h
+        _ <- vhPut h "secret" "pa-value"
+        let newEnc = mockXor 0xCD
+        result <- vhRekey h newEnc "alt-mock" (const (pure True))
+        result `shouldBe` Right ()
+        -- (a) per-access mode must not leave decrypted data resident in the cache
+        st <- vhStatus h
+        vsLocked st `shouldBe` True
+        -- (b) secret is retrievable — rekey persisted and new encryptor is active
+        vhGet h "secret" `shouldReturn` Right "pa-value"
+
   describe "real-age integration" $ do
     it "round-trips put/get/list with the real age binary" $ do
       ageExe <- findExecutable "age"

@@ -229,7 +229,9 @@ vaultRekey st newEnc newKeyType confirm = withMVar (stWriteLock st) $ \_ -> do
                   renameFile newPath path
                   writeIORef (stEncryptor st) newEnc
                   writeIORef (stKeyType st) newKeyType
-                  atomically (writeTVar (stCache st) (Just plainMap))
+                  case vcUnlock (stConfig st) of
+                    UnlockPerAccess -> atomically (writeTVar (stCache st) Nothing)
+                    _ -> atomically (writeTVar (stCache st) (Just plainMap))
                   pure (Right ())
 
 verifyRekey :: VaultEncryptor -> FilePath -> Map Text ByteString -> IO Bool
