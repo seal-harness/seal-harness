@@ -43,6 +43,7 @@ library
         Seal.Commands.Tick
         Seal.Security.Crypto
         Seal.Security.Secrets
+        Seal.Security.Vault.Age
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -94,3 +95,4 @@ test-suite tests
         Seal.ConfigSpec
         Seal.Security.CryptoSpec
         Seal.Security.SecretsSpec
+        Seal.Security.Vault.AgeSpec
