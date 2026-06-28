@@ -42,6 +42,7 @@ library
         Seal.Commands.Greet
         Seal.Commands.Tick
         Seal.Security.Crypto
+        Seal.Security.Path
         Seal.Security.Secrets
         Seal.Security.Vault.Age
         Seal.Security.Vault
@@ -98,6 +99,7 @@ test-suite tests
     other-modules:
         Seal.ConfigSpec
         Seal.Security.CryptoSpec
+        Seal.Security.PathSpec
         Seal.Security.SecretsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
