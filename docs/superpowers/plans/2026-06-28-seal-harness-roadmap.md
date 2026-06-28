@@ -14,12 +14,14 @@ rebuilt on a stronger security spine.
 **Architecture:** `ReaderT AppEnv IO` plus the capability-handle pattern
 throughout (no effect systems). Every agent action is a typed ISA *opcode*
 classified by trust level (Untrusted / Trusted / Audited). All execution is
-recorded in an append-only, cryptographically hash-chained transcript that
-serves as the audit log; the four evolutionary stores (memory, skills, agent
-definitions, config) additionally write to a unified cross-session Audited log.
+recorded in an append-only transcript that serves as the audit log; integrity
+is guaranteed by never executing untrusted actions on the machine that holds
+the log, so the harness's own codebase is the trust boundary. The four
+evolutionary stores (memory, skills, agent definitions, config) additionally
+write to a unified cross-session Audited log.
 
 **Tech Stack:** GHC 9.12 (GHC2021), Cabal, Nix/haskell.nix, `aeson`, `text`,
-`bytestring`, `containers`, `stm`, `async`, `typed-process`, `katip`,
+`bytestring`, `containers`, `stm`, `async`, `process`, `katip`,
 `configuration-tools`, `optparse-applicative`, `crypton`, `sqlite-simple`,
 `http-client`/`wai`/`warp`, `hspec` + `QuickCheck`. Vault encryption shells out
 to the `age` binary (with `age-plugin-yubikey` for hardware tokens).
@@ -40,7 +42,8 @@ spec is exact.
 - **Module namespace:** all library code under `Seal.*`, matching the README
   architecture (`Seal.Core`, `Seal.Security`, `Seal.Handles`, `Seal.ISA`,
   `Seal.Tools`, `Seal.Agent`, `Seal.Providers`, `Seal.Channels`, `Seal.Memory`,
-  `Seal.Gateway`, `Seal.Scheduler`, `Seal.CLI`, `Seal.Transcript`).
+  `Seal.Gateway`, `Seal.Scheduler`, `Seal.CLI`, `Seal.Transcript`,
+  `Seal.Session`, `Seal.Harness`, `Seal.Tabs`).
 - **Coding style:** follow the repo's `haskell-coder` skill. Settled project
   conventions (established in Phase 1, Task 0): `default-language: GHC2021`;
   a conservative always-on `default-extensions` set (`DeriveGeneric,
@@ -59,18 +62,37 @@ spec is exact.
   errors; the build must stay green.
 - **TDD:** red → green. Write the failing test first, watch it fail, implement
   the minimum, watch it pass, commit. Security-critical pure functions
-  (policy, path validation, hash chaining) get QuickCheck properties.
+  (policy, path validation) get QuickCheck properties.
 - **hlint clean** required before each commit: `hlint src/ test/`.
 - **No secret ever serialized.** Secret newtypes have redacted `Show`, no
   `ToJSON`/`FromJSON`, and are accessed only through CPS continuations. No code
   path may write a secret value to a transcript, log, audited log, or API
   response. This is enforced structurally, not by review.
+- **No shell-wrapping in Trusted/Audited opcodes.** Trusted and Audited opcodes
+  are **never** implemented by wrapping a shell and **never** run an arbitrary or
+  agent-supplied command — no shell interpreter (`sh -c`), no constructed command
+  strings. They use direct mechanisms only (native libraries, direct
+  file/network handles, in-process data structures, SQLite via a binding, an STM
+  scheduler, …). The capability to run a command lives **exclusively** in the
+  Untrusted opcode path. Enforced by capability scoping: the `Shell` handle is
+  wired only into Untrusted implementations, so a Trusted opcode that shells out
+  fails to type-check. *Permitted as infrastructure (not opcode shell-wrapping):*
+  fixed-argv invocation of a specific trusted binary with no shell interpreter
+  and no agent-supplied command — `age` (vault crypto), `ssh` (untrusted
+  transport), `tmux` (harness control).
+- **Type-guaranteed subprocess arguments.** Every value derived from user/LLM
+  input that reaches a subprocess argv must be carried by a validated,
+  smart-constructed newtype — never raw `Text`/`String`. The exec/subprocess
+  wrappers accept only these types in their signatures, so unsanitized input
+  fails to compile. Extends the `SafePath`/`AuthorizedCommand`/`ContainerTarget`
+  pattern (e.g. a `VaultKey` for the `age` seam) and the smart constructor must
+  also defend against **option injection** (reject leading-dash values and/or
+  always pass a leading `--` separator before user-derived arguments).
 - **Build/verify command:** everything runs under the Nix dev shell, e.g.
   `nix develop --command cabal build all`,
   `nix develop --command cabal test`,
   `nix develop --command hlint src/ test/`.
-- **Commit cadence:** one commit per completed task (all steps green). End every
-  commit message with the project's `Co-Authored-By` trailer.
+- **Commit cadence:** one commit per completed task (all steps green).
 
 ---
 
@@ -90,18 +112,15 @@ gateway server, the scheduler, and the security primitives `SafePath`,
 1. **Trust-level taxonomy.** A first-class `TrustLevel = Untrusted | Trusted |
    Audited` attached to every opcode. The reference has only an autonomy
    level; it has no per-opcode trust classification.
-2. **Cryptographic hash-chaining.** The reference links request/response by a
-   shared UUID only. The README requires a real tamper-evident chain: each
-   transcript entry stores the hash of the previous entry. New.
-3. **ACK-before-execute.** Untrusted opcodes must block until the transcript
+2. **ACK-before-execute.** Untrusted opcodes must block until the transcript
    daemon confirms the audit entry is durably written. New.
-4. **Unified cross-session Audited log.** A single global, append-only,
-   hash-chained log capturing every mutation to the four evolutionary stores
-   (memory, skills, agent defs, config) across all concurrent sessions. New.
-5. **Formal ISA.** Every opcode carries a typed input/output schema, a trust
+3. **Unified cross-session Audited log.** A single global, append-only log
+   capturing every mutation to the four evolutionary stores (memory, skills,
+   agent defs, config) across all concurrent sessions. New.
+4. **Formal ISA.** Every opcode carries a typed input/output schema, a trust
    classification, an atomicity guarantee, a transcript-entry format, and an
    authorization gate — as data, not ad-hoc handler functions. New structure.
-6. **Skills and Agent-definition stores** as first-class Audited opcode groups.
+5. **Skills and Agent-definition stores** as first-class Audited opcode groups.
 
 ---
 
@@ -123,7 +142,7 @@ Phase 6  Channels, Gateway, Scheduler, MCP ..... reach + automation
 
 Dependency rationale: Phase 1 establishes the secret types, crypto seam, and
 project conventions everything else imports. Phase 2 stands up the transcript
-spine (hash-chain + ACK), the ISA dispatcher skeleton, one provider, the CLI
+spine (append-only + ACK), the ISA dispatcher skeleton, one provider, the CLI
 channel, the agent loop, the Secrets opcodes (proving the vault end-to-end),
 and exactly one Untrusted opcode (proving the ACK-before-execute path). Phase 3
 then widens the ISA along the Trusted groups, which is where the architecture's
@@ -167,7 +186,7 @@ every later subsystem imports secrets and encryption that are already correct.
   `generateToken`, and symmetric `encrypt`/`decrypt` (`crypton`,
   AES-256-CTR, random IV prepended). Round-trip + tamper QuickCheck props.
 - `Seal.Security.Vault.Age` — `VaultError`, the `AgeEncryptor` /
-  `VaultEncryptor` handles that shell out to `age` (`typed-process`), a
+  `VaultEncryptor` handles that shell out to `age` (`process`), a
   preflight `age --version` check, and mock encryptors for tests (no binary
   needed). `age-plugin-yubikey` works transparently via recipient/identity
   strings.
@@ -197,47 +216,155 @@ agent yet — just a rock-solid security floor. hlint clean, `-Werror` green.
 (`2026-07-xx-phase-2-mvp.md`).
 
 **MVP bar (decided):** CLI chat against Anthropic, the working vault (Secrets
-opcodes), `ASK_HUMAN`/`SHOW_HUMAN` so the loop is interactive, a hash-chained
+opcodes), `ASK_HUMAN`/`SHOW_HUMAN` so the loop is interactive, an append-only
 transcript underneath, **plus one Untrusted opcode** (`FILE_READ`) exercising
 the full ACK-before-execute path. Smallest thing that proves the whole
 architecture end-to-end.
 
-**Deliverables (task groups):**
-1. **`Seal.Core.Types`** — `ProviderId`, `ModelId`, `ToolCallId`, `SessionId`
-   (+ `isValidSessionId`), `MessageSource`/`ChannelKind`, `WorkspaceRoot`,
-   `TrustLevel(Untrusted|Trusted|Audited)`, `AllowList`.
-2. **Transcript spine** — `Seal.Transcript.Types` (entry with `prevHash`/
-   `entryHash`), `Seal.Handles.Transcript` (append-only JSONL via raw POSIX
-   FDs + fsync), and the **hash-chain**: `entryHash = sha256(prevHash ‖
-   canonical(entry))`, with a `verifyChain` function. QuickCheck: any mutation
-   to any entry breaks verification.
-3. **Transcript daemon + ACK** — a writer thread; `recordAndAck` returns only
-   after fsync. The dispatcher must call this before executing an Untrusted
-   opcode.
-4. **ISA skeleton** — `Seal.ISA.Opcode` (the `Opcode` record: name, trust
+**Core type foundations land here, in full.** Even though the *runtime* MVP only
+exercises a provider-backed CLI session, Phase 2 settles the complete core type
+structure — sessions, transcripts, providers, harnesses, and tabs — up front,
+because every later subsystem imports these types and they are expensive to
+churn once code depends on them. For harnesses and tabs, Phase 2 ships the
+**types plus their pure operations** (registry CRUD, tab-list invariants, cursor
+resolution); the live lifecycle (process spawn, reconcile loop, output routing)
+is wired in Phase 3 and later on top of these stable types. All foundation
+modules are leaf-ish (depend only on `Seal.Core` / `Seal.Security`) and carry
+QuickCheck coverage for their invariants and JSON round-trips.
+
+**Deliverables (task groups).** Groups 1–6 are the core type foundations;
+groups 7–13 are the runtime MVP built on top of them.
+
+1. **`Seal.Core.Types`** — the shared leaf vocabulary, imported everywhere:
+   - Identity newtypes: `ProviderId`, `ModelId`, `ToolCallId`, `MemoryId`,
+     `UserId`, `CommandName`, `Port`.
+   - `SessionId` — opaque label (no parse invariant, so older/newer on-disk
+     session dirs stay readable) plus the single strict predicate
+     `isValidSessionId` (non-empty, no leading dot, charset `[A-Za-z0-9_-]`)
+     used at every path-join and network boundary.
+   - `ConversationId` — a server-derived, transport-scoped conversation key,
+     **always minted from authenticated transport metadata, never read from a
+     message body**, so a sender cannot forge it to hijack another
+     conversation's tab cursor.
+   - `MessageSource` (`ChannelKind` ∈ {Cli, Web, Signal, Telegram, Background,
+     Other}, the required `ConversationId`, optional `UserId`, an open field
+     map) constructed only via `mkMessageSource`, which strips control
+     characters and bounds the length of every attacker-controlled string leaf.
+   - `MessageTarget` (`TargetProvider` | `TargetHarness Name`), `WorkspaceRoot`,
+     `AutonomyLevel` (`Full`|`Supervised`|`Deny`, the per-session/agent posture
+     — distinct from the per-opcode `TrustLevel`),
+     `TrustLevel`(`Untrusted`|`Trusted`|`Audited`), and the `AllowList` family
+     (`AllowAll`|`AllowList (Set a)`, `isAllowed`, `allowListWarning`).
+2. **`Seal.Session.*`** — the session model:
+   - `Seal.Session.Kind` — `SessionKind` (`SkProvider ProviderSpec` |
+     `SkHarness HarnessSpec`); `ProviderSpec` (provider, model, optional agent);
+     `HarnessSpec` — because a harness is an external CLI tool that can only be
+     driven reliably **inside a tmux session**, the spec carries its `TmuxConfig`
+     coordinates directly (flavour, tmux, cwd, args, optional durable ids)
+     rather than a general backend; `HarnessFlavour` (known tools + a
+     smart-constructed `HCustom` that rejects path separators);
+     `inferProviderId` (model-prefix → provider).
+   - **Harness backend vs. tool-call backend — keep these separate.** They are
+     two different concerns and must not share a type. A *harness* backend has
+     exactly one viable form — tmux — so `HarnessSpec` hard-codes `TmuxConfig`
+     (no choice to model). A *tool-call execution* backend — where Untrusted
+     opcodes and raw-shell tabs actually run — is genuinely plural and is
+     modelled by the `TerminalBackend` family
+     (`Local`/`Tmux`/`Ssh`/`Container`, with `TmuxConfig`/`SshConfig`/
+     `ContainerSpec`+validated `ContainerTarget`). That type belongs with the
+     isolated execution environments in **Phase 4**, not here; Phase 2 only
+     fixes the harness/session shape.
+   - `Seal.Session.Types` — `SessionPrefix` (smart-constructed, reserved-word
+     denylist), `newSessionId` (timestamp-leading so lexicographic = chronological
+     order), and `SessionMeta`, the persistent `session.json` record
+     (id, kind, model, channel, created/last-active, archived/description/
+     auto-summary display state, and a set-once `MessageSource` provenance field
+     flagged **never to feed authz**).
+   - Tag-discriminated, back-compat-tolerant JSON throughout (unknown/legacy
+     shapes decode rather than crash). QuickCheck: every smart constructor
+     rejects malformed input; `SessionMeta`/`SessionKind` round-trip.
+3. **`Seal.Transcript.Types`** — the append-only audit-entry model:
+   `Direction` (`Request`|`Response`); `TranscriptEntry` (uuid, timestamp,
+   optional harness/model, direction, raw payload, optional duration, a
+   correlation id linking request↔response, extensible metadata map);
+   `TranscriptFilter` (record-of-`Maybe`, all fields AND together) with pure
+   `matchesFilter`/`applyFilter`; `encodeEntryRaw` guaranteeing the in-memory
+   entry re-encodes byte-identically to its on-disk JSONL line so "view raw"
+   hides nothing. QuickCheck: round-trip and ordering preserved.
+4. **`Seal.Providers.Class`** — the provider/message model: `Role`
+   (`User`|`Assistant`); `ContentBlock` (`Text`|`Image`|`ToolUse`|
+   `ToolResult`) and `ToolResultPart` (text/image) so tool-use/tool-result and
+   vision interleave in one message list; `Message` + convenience builders;
+   `ToolDefinition`/`ToolChoice`; `CompletionRequest`/`CompletionResponse`/
+   `Usage`; `StreamEvent` for incremental output; the `Provider` class
+   (`complete`, default-delegating `completeStream`, `listModels`) and the
+   `SomeProvider` existential for config-driven selection. Full JSON instances
+   with QuickCheck round-trips.
+5. **`Seal.Harness.*` + `Seal.Handles.Harness`** — the external-tool model
+   (types + pure registry ops now; lifecycle in Phase 3):
+   - `Seal.Harness.Id` — `HarnessId`, a UUID-backed durable identity (the
+     registry key), keyed on identity rather than a mutable terminal label.
+   - `Seal.Handles.Harness` — `HarnessHandle`, the capability record of `IO`
+     actions (send/receive/snapshot/status/stop); `HarnessStatus`,
+     `HarnessError`, a no-op handle for tests, and the output
+     prefix/sanitize helpers (strip ANSI/control/decorative bytes).
+   - `Seal.Harness.Registry` — `HarnessEntry` (identity + reconciled
+     coordinate/health cache), `HarnessOrigin` (`Spawned`/`Discovered`/
+     `Adopted`), `Liveness` (`Idle`/`Thinking`/`AwaitingInput`/`Exited`/
+     `Orphaned`), the `STM`-backed `HarnessRegistry` with race-safe CRUD
+     (`insert`/`lookupById`/`lookupByLabel`/`modify`/`delete`/`snapshot`), and
+     `mergeReconcile` (`ObservedHarness` → entries, merged **by key inside one
+     transaction** so concurrent inserts are never clobbered).
+6. **`Seal.Tabs.Types` + `Seal.Handles.Tab`** — the tab model, a pure view
+   layer over ground truth (types + pure ops now; routing wired later):
+   - `Seal.Handles.Tab` — the validated `TabIndex` (`0..35`, `mkTabIndex`),
+     the single index type reused everywhere.
+   - `Seal.Tabs.Types` — `TabRef` (`BoundSession SessionId` |
+     `BoundHarness HarnessId`), `TabStatus` (`Live`|`Dead`), `Tab`, and the
+     `TabList` enforcing **I1** (contiguous slots `0..n-1`; removal compacts,
+     tmux-window style) and **I2** (no two tabs share a `TabRef`) by
+     construction, with a hard 36-slot cap; plus per-conversation routing —
+     `ConversationKey` (`ChannelKind`×`ConversationId`), `RelayMode`
+     (`FocusedOnly`|`ActivityDigest`|`Firehose`), and `CursorState` whose
+     cursors key by `TabRef` not slot (**I3**: a cursor survives slot
+     compaction because it names ground truth, resolved to a current slot at
+     read time). Includes the parsed `/tab` command ADTs. Heavy QuickCheck on
+     the I1/I2/I3 invariants.
+7. **Transcript handle + daemon + ACK** — `Seal.Handles.Transcript`
+   (append-only JSONL via raw POSIX FDs + fsync) and a writer-thread daemon
+   whose `recordAndAck` returns only after fsync. Integrity comes from the
+   append-only handle plus keeping untrusted actions off the box that holds the
+   log, not from a tamper-evident chain. The dispatcher must call `recordAndAck`
+   before executing an Untrusted opcode.
+8. **ISA skeleton** — `Seal.ISA.Opcode` (the `Opcode` record: name, trust
    level, input/output schema, authorization gate), `Seal.ISA.Registry`,
    `Seal.ISA.Dispatch` (`dispatch :: Registry -> OpName -> Value -> App
-   Result`, enforcing ACK-before-execute for Untrusted).
-5. **Provider abstraction + Anthropic** — `Seal.Providers.Class` (`Provider`
-   class, `SomeProvider`, `CompletionRequest`/`Response`, `ContentBlock` with
-   tool-use/tool-result), `Seal.Providers.Anthropic` (Messages API, reads key
-   via `withApiKey` from the vault).
-6. **CLI channel** — `Seal.Handles.Channel` + `Seal.Channels.CLI`
-   (haskeline; `prompt`/`promptSecret`/streaming chunks).
-7. **Agent loop** — `Seal.Agent.Env`, `Seal.Agent.Loop` (turn-based: message →
-   completion → opcode dispatch → transcript → channel, until no tool calls).
-8. **First opcodes** — `SHOW_HUMAN`, `ASK_HUMAN` (Trusted); the five Secrets
-   opcodes (`SECRET_SAVE/GET/LIST/DELETE`, `VAULT_STATUS`, all Audited but
-   values never logged); `FILE_READ` (Untrusted, via `SafePath` +
-   ACK-before-execute).
-9. **Real CLI** — replace `greet`/`tick` with `seal` chat + `vault`
-   admin subcommands (`init`/`lock`/`unlock`/`rekey`), wired through
-   `configuration-tools`.
+   Result`, enforcing ACK-before-execute for Untrusted). Untrusted opcodes must
+   dispatch through a **backend execution seam** (not run inline), so Phase 4 can
+   slot the local-vs-remote executors behind it without reworking dispatch — see
+   the remote-only untrusted execution design
+   (`docs/superpowers/specs/2026-06-28-remote-only-untrusted-execution-design.md`).
+9. **Anthropic provider** — `Seal.Providers.Anthropic` (Messages API,
+   implements the Phase-2 `Provider` class, reads the key via `withApiKey` from
+   the vault).
+10. **CLI channel** — `Seal.Handles.Channel` + `Seal.Channels.CLI`
+    (haskeline; `prompt`/`promptSecret`/streaming chunks).
+11. **Agent loop** — `Seal.Agent.Env`, `Seal.Agent.Loop` (turn-based: message →
+    completion → opcode dispatch → transcript → channel, until no tool calls).
+12. **First opcodes** — `SHOW_HUMAN`, `ASK_HUMAN` (Trusted); the five Secrets
+    opcodes (`SECRET_SAVE/GET/LIST/DELETE`, `VAULT_STATUS`, all Audited but
+    values never logged); `FILE_READ` (Untrusted, via `SafePath` +
+    ACK-before-execute).
+13. **Real CLI** — replace `greet`/`tick` with `seal` chat + `vault`
+    admin subcommands (`init`/`lock`/`unlock`/`rekey`), wired through
+    `configuration-tools`.
 
-**Milestone:** `export ANTHROPIC_API_KEY=…; seal` → chat with a model that can
-save/read secrets, ask the human a question, and read a workspace file, with
-every step landing in a verifiable hash-chained transcript and Untrusted reads
-blocked until their audit entry is durably written.
+**Milestone:** the core type foundations (groups 1–6) compile `-Werror` clean
+with their invariant/round-trip properties green; and
+`export ANTHROPIC_API_KEY=…; seal` → chat with a model that can save/read
+secrets, ask the human a question, and read a workspace file, with every step
+landing in the append-only transcript and Untrusted reads blocked until their
+audit entry is durably written.
 
 ---
 
@@ -259,11 +386,16 @@ class, atomicity guarantee, transcript format, and authorization gate.
    page-sizing (`page_size = clamp(floor, round(A·total^0.5), ceiling)`),
    configurable at config/session/call layers. Retrofit `FILE_READ`; reuse
    everywhere a retrieval opcode returns bounded content.
-3. **Sessions group** — `SESSION_NEW`, `SESSION_COMPACT`, `SESSION_SEARCH`.
+3. **Sessions group** — `SESSION_NEW`, `SESSION_COMPACT`, `SESSION_SEARCH`
+   (session *types* seeded in Phase 2; this group adds the opcodes and the
+   on-disk session store).
 4. **Human Interaction** — already seeded in Phase 2; finalize schemas.
 5. **Scheduling group** — `CRON`, `HEARTBEAT_WAKEUP` (pure cron predicate +
    STM scheduler).
-6. **Harnesses group** — `HARNESS_LIST/START/STOP`, `PLAN_MODE`.
+6. **Harnesses group** — `HARNESS_LIST/START/STOP`, `PLAN_MODE`, and the tab
+   view layer (harness/tab *types* and pure ops seeded in Phase 2; this group
+   adds the live lifecycle — process spawn, the reconcile loop, and output
+   routing through tabs/cursors).
 7. **MCP group** — `MCP_LIST/CONNECT/DISCONNECT`.
 
 **Milestone:** the agent can introspect and call the full Trusted instruction
@@ -274,22 +406,54 @@ session transcript with its declared schema.
 
 ## Phase 4 — Untrusted opcode breadth + isolation
 
-**Deliverables:** `SHELL_EXEC`, `PROCESS_MANAGE`, `CODE_EXEC` (Execution);
-`FILE_WRITE`, `SEARCH_FILES`, `FILE_PATCH` (Files); `WEB_SEARCH`,
-`WEB_EXTRACT`, `BROWSER_*` (Web & Browser); `IMAGE_*`, `TEXT_TO_SPEECH`
-(Media). All Untrusted: isolated/disposable execution environment, `SafePath`
-confinement, `AuthorizedCommand` gating, ACK-before-execute. Network opcodes
-redact auth headers via CPS and check allow-lists.
+**Deliverables:** the `TerminalBackend` family — the typed selector for *where*
+a tool call runs (`Local`/`Tmux`/`Ssh`/`Container`, with `TmuxConfig`/
+`SshConfig`/`ContainerSpec`+validated `ContainerTarget`) — which is the
+tool-call-execution counterpart to the tmux-only harness backend fixed in
+Phase 2; then the opcodes themselves: `SHELL_EXEC`, `PROCESS_MANAGE`,
+`CODE_EXEC` (Execution); `FILE_WRITE`, `SEARCH_FILES`, `FILE_PATCH` (Files);
+`WEB_SEARCH`, `WEB_EXTRACT`, `BROWSER_*` (Web & Browser); `IMAGE_*`,
+`TEXT_TO_SPEECH` (Media). All Untrusted: isolated/disposable execution
+environment, `SafePath` confinement, `AuthorizedCommand` gating,
+ACK-before-execute. Network opcodes redact auth headers via CPS and check
+allow-lists.
+
+**Remote-only untrusted execution (control plane / untrusted plane split).**
+**Full design:**
+`docs/superpowers/specs/2026-06-28-remote-only-untrusted-execution-design.md`.
+A configurable, optionally compile-time-enforced guarantee that **no untrusted
+opcode ever executes on the harness machine** — all untrusted execution runs on
+a separate machine over SSH, leaving the control plane holding only the agent
+loop, transcript, vault, and Trusted/Audited opcodes. Deliverables:
+- **Executor split** — `Seal.Tools.Exec.Local` (untrusted local executor) vs
+  `Seal.Tools.Exec.Remote` (SSH executor), behind the Phase-2 backend dispatch
+  seam.
+- **`UntrustedExecBackend`** — smart-constructed so it can be built *only* from
+  an `Ssh` backend (a local container/VM shares the harness kernel and does
+  **not** count as remote). Pure `selectUntrustedBackend`; QuickCheck: untrusted
+  ⇒ `Ssh`-or-failure, never `Local`.
+- **Runtime layer** — `untrusted_execution = local | remote` config, fail-closed
+  when `remote` (no local fallback ever); boot succeeds even with no/unreachable
+  remote, untrusted ops fail closed at call time.
+- **Compile-time layer** — Cabal flag `remote-only-untrusted` that omits
+  `Seal.Tools.Exec.Local` from the build entirely (the local untrusted-exec
+  capability is absent from the binary; `mode=local` rejected at startup). CI
+  builds and asserts the local executor is absent under the flag.
+- **SSH transport** — shells out to `ssh` via fixed argv with **mandatory
+  host-key pinning** (`StrictHostKeyChecking`, pinned `known_hosts`); a host-key
+  mismatch is a hard failure. Remote workspace root anchors `SafePath`.
 
 **Milestone:** the README's core pitch — agents with real shell, file, and web
-access, every action sealed in the audit log.
+access, every action sealed in the audit log; plus a deployment mode (runtime or
+hardened-build) in which untrusted execution is provably confined to a remote
+machine and the control plane runs no agent-driven commands.
 
 ---
 
 ## Phase 5 — Audited evolutionary stores
 
 **Deliverables:** the unified cross-session Audited log (`Seal.Audited`),
-hash-chained and mirrored off-box like the transcript; then the four Audited
+append-only and mirrored off-box like the transcript; then the four Audited
 opcode groups built on it — **Memory** (`MEMORY_STORE/RECALL/UPDATE/DELETE`,
 SQLite/Markdown/None backends), **Skills** (`SKILL_LIST/READ/CREATE/UPDATE`),
 **Agents** (`AGENT_DEF_*`, `AGENT_LIST/START/STATUS/STOP`), **Config**
