@@ -28,11 +28,18 @@ Inherited from `2026-06-28-seal-harness-roadmap.md` → **Global Constraints**.
 The load-bearing ones for this phase:
 
 - **Clean-room:** no reference to any upstream repo/product, anywhere.
-- **Namespace:** all modules under `Seal.Security.*` (and `Seal.Core.Errors`).
-- **Style:** GHC2021; extensions `OverloadedStrings, LambdaCase,
-  DerivingStrategies, DeriveGeneric, GeneralizedNewtypeDeriving,
-  ImportQualifiedPost, ScopedTypeVariables, TupleSections`; post-positive
-  qualified imports.
+- **Namespace:** all modules under `Seal.Security.*`.
+- **Errors (haskell-coder skill):** default to `Either Text`. Only introduce a
+  bespoke error ADT when the program actually pattern-matches on the error to
+  drive control flow. In this phase that is exactly one type — `VaultError`,
+  whose constructors the vault opcodes and CLI branch on (locked → ask the
+  human; already-exists → init; key-not-found → distinct result). Crypto and
+  path/policy failures are reported, not matched, so they use `Either Text`.
+- **Style (haskell-coder skill):** GHC2021; whole-module imports (not explicit
+  symbol lists) except a qualified alias for `Data.Text`/`Data.Map` etc. and
+  the bare `Text` name; per-file `{-# LANGUAGE #-}` pragmas for situational
+  extensions (`OverloadedStrings`, `GeneralizedNewtypeDeriving`) rather than
+  piling them into `default-extensions`.
 - **Flags:** `-Wall -Werror` + strict warning set. Build stays green.
 - **No secret serialized / shown.** Redacted `Show`, no JSON, CPS access only.
 - **TDD + QuickCheck** for pure security functions. **hlint clean** per commit.
@@ -45,7 +52,6 @@ The load-bearing ones for this phase:
 | File | Responsibility |
 |---|---|
 | `seal-harness.cabal` | Settle language/extensions/warnings; add deps; register new modules + test modules. |
-| `src/Seal/Core/Errors.hs` | `CryptoError` and the shared `PublicError` channel type (minimal here; grows later). |
 | `src/Seal/Security/Secrets.hs` | Opaque secret newtypes, smart constructors, CPS accessors. |
 | `src/Seal/Security/Crypto.hs` | Random bytes, SHA-256 hex, constant-time eq, token gen, AES-256-CTR encrypt/decrypt. |
 | `src/Seal/Security/Vault/Age.hs` | `VaultError`, `VaultEncryptor` handle, real `age` shell-out, mocks. |
@@ -60,142 +66,69 @@ Tasks are ordered by dependency: each builds only on earlier ones.
 
 ---
 
-### Task 0: Settle project conventions and `Seal.Core.Errors`
+### Task 0: Settle project conventions
 
-Folds the cabal/style setup into the first real module so it is exercised
-immediately.
+Establish the project-wide language settings, warnings, and dependencies. There
+is no error module: per the haskell-coder skill we default to `Either Text` and
+introduce a bespoke error type only where control flow demands it (only
+`VaultError`, in Task 3). This task's deliverable is verified by the existing
+scaffold test still passing under the new settings — a reviewer can accept or
+reject the conventions on their own.
 
 **Files:**
 - Modify: `seal-harness.cabal`
-- Create: `src/Seal/Core/Errors.hs`
-- Test: `test/Seal/Core/ErrorsSpec.hs`
-- Modify: `test/Main.hs`
 
 **Interfaces:**
-- Produces: `data CryptoError = BadKeyLength | BadInitVector | ShortCiphertext`
-  (`deriving stock (Eq, Show)`); `data PublicError = TemporaryError Text |
-  RateLimitError | NotAllowedError` (`deriving stock (Eq, Show)`); class
-  `ToPublicError e where toPublicError :: e -> PublicError`.
+- Produces: the shared `common settings` stanza and the dependency set every
+  later task imports. No new Haskell symbols.
 
 - [ ] **Step 1: Update the cabal `common` stanza and dependencies.**
 
 In `seal-harness.cabal`, replace the `common warnings` block and the library's
 `default-language`/`default-extensions`/`build-depends` so all components share
-GHC2021 + strict warnings, and add this phase's dependencies:
+GHC2021 + strict warnings, and add this phase's dependencies. Keep
+`default-extensions` to the conservative always-on set the haskell-coder skill
+prescribes; situational extensions (`OverloadedStrings`,
+`GeneralizedNewtypeDeriving`) go in per-file `{-# LANGUAGE #-}` pragmas instead.
 
 ```cabal
 common settings
     default-language: GHC2021
     default-extensions:
-        OverloadedStrings
-        LambdaCase
-        DerivingStrategies
         DeriveGeneric
-        GeneralizedNewtypeDeriving
-        ImportQualifiedPost
+        DerivingStrategies
+        LambdaCase
         ScopedTypeVariables
-        TupleSections
     ghc-options:
-        -Wall -Werror
+        -Wall -Werror -Wcompat -Widentities
         -Wincomplete-uni-patterns
         -Wincomplete-record-updates
         -Wname-shadowing
+        -Wpartial-fields
         -Wredundant-constraints
 ```
 
 Point `library`, `executable seal`, and `test-suite tests` at
 `import: settings` (replacing `import: warnings`). Add to the **library**
-`build-depends`: `base16-bytestring` is **not** needed (we use `memory`'s
-`convertToBase`); add `bytestring`, `base64-bytestring`, `crypton`, `memory`,
-`typed-process`, `unix`, `directory`, `filepath`, `stm`. Add to the **test**
-`build-depends`: `QuickCheck`, `temporary`, `bytestring`, `text`, `containers`.
-Register `Seal.Core.Errors` under library `exposed-modules` and
-`Seal.Core.ErrorsSpec` under the test suite's `other-modules`.
+`build-depends` (no `base16-bytestring` — we use `memory`'s `convertToBase`):
+`bytestring`, `base64-bytestring`, `crypton`, `memory`, `typed-process`,
+`unix`, `directory`, `filepath`, `stm`. Add to the **test** `build-depends`:
+`QuickCheck`, `temporary`, `bytestring`, `text`, `containers`.
 
-- [ ] **Step 2: Write the failing test.**
+- [ ] **Step 2: Verify the existing scaffold still builds and tests green.**
 
-`test/Seal/Core/ErrorsSpec.hs`:
-
-```haskell
-module Seal.Core.ErrorsSpec (spec) where
-
-import Test.Hspec
-import Seal.Core.Errors
-
-data Boom = Boom
-
-instance ToPublicError Boom where
-  toPublicError _ = NotAllowedError
-
-spec :: Spec
-spec = describe "Seal.Core.Errors" $
-  it "maps a domain error to a PublicError without leaking detail" $
-    toPublicError Boom `shouldBe` NotAllowedError
-```
-
-Wire it into `test/Main.hs`:
-
-```haskell
-module Main (main) where
-
-import Test.Hspec
-import qualified Seal.Core.ErrorsSpec
-import qualified Seal.ConfigSpec
-
-main :: IO ()
-main = hspec $ do
-  Seal.Core.ErrorsSpec.spec
-  Seal.ConfigSpec.spec
-```
-
-- [ ] **Step 3: Run it; expect failure.**
-
+Run: `nix develop --command cabal build all 2>&1 | tail -20`
+Expected: `-Werror`-clean build of the library + `seal` exe.
 Run: `nix develop --command cabal test 2>&1 | tail -20`
-Expected: FAIL — `Could not find module 'Seal.Core.Errors'`.
-
-- [ ] **Step 4: Implement `Seal.Core.Errors`.**
-
-```haskell
-module Seal.Core.Errors
-  ( CryptoError (..)
-  , PublicError (..)
-  , ToPublicError (..)
-  ) where
-
-import Data.Text (Text)
-
--- | Failures from symmetric crypto in "Seal.Security.Crypto".
-data CryptoError
-  = BadKeyLength    -- ^ key was not the 32 bytes AES-256 requires
-  | BadInitVector   -- ^ could not construct a valid 16-byte IV
-  | ShortCiphertext -- ^ ciphertext shorter than the IV it must carry
-  deriving stock (Eq, Show)
-
--- | The only error shape that may cross the boundary to a human/channel.
--- Carries no internal detail (no model names, URLs, paths, or stack traces).
-data PublicError
-  = TemporaryError Text
-  | RateLimitError
-  | NotAllowedError
-  deriving stock (Eq, Show)
-
--- | Project domain errors implement this to redact themselves before display.
-class ToPublicError e where
-  toPublicError :: e -> PublicError
-```
-
-- [ ] **Step 5: Run tests + hlint; expect pass/clean.**
-
-Run: `nix develop --command cabal test 2>&1 | tail -20`
-Expected: PASS (2 example groups).
+Expected: the existing `Seal.ConfigSpec` round-trip test still PASSES.
 Run: `nix develop --command hlint src/ test/`
 Expected: `No hints`.
 
-- [ ] **Step 6: Commit.**
+- [ ] **Step 3: Commit.**
 
 ```bash
-git add seal-harness.cabal src/Seal/Core/Errors.hs test/Seal/Core/ErrorsSpec.hs test/Main.hs
-git commit -m "Settle project conventions and add Seal.Core.Errors"
+git add seal-harness.cabal
+git commit -m "Settle project conventions (GHC2021, strict warnings, deps)"
 ```
 
 ---
@@ -328,15 +261,18 @@ git commit -m "Add opaque, unleakable secret types"
 - Modify: cabal + `test/Main.hs`
 
 **Interfaces:**
-- Consumes: `SecretKey`, `withSecretKey` (Task 1); `CryptoError` (Task 0).
+- Consumes: `SecretKey`, `withSecretKey` (Task 1).
 - Produces:
   - `getRandomBytes :: Int -> IO ByteString`
   - `sha256Hash :: ByteString -> ByteString` (lowercase hex, 64 bytes ASCII)
   - `constantTimeEq :: ByteString -> ByteString -> Bool`
   - `generateToken :: Int -> IO Text` (hex of N random bytes)
-  - `encrypt :: SecretKey -> ByteString -> IO (Either CryptoError ByteString)`
+  - `encrypt :: SecretKey -> ByteString -> IO (Either Text ByteString)`
     (AES-256-CTR; 16-byte random IV prepended)
-  - `decrypt :: SecretKey -> ByteString -> Either CryptoError ByteString`
+  - `decrypt :: SecretKey -> ByteString -> Either Text ByteString`
+
+  The failure values are plain `Text` messages: nothing branches on *why*
+  crypto failed, so a sum type would be over-engineering (haskell-coder skill).
 
 - [ ] **Step 1: Write the failing test.**
 
@@ -348,9 +284,9 @@ module Seal.Security.CryptoSpec (spec) where
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
+import Data.Either (isLeft)
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
-import Seal.Core.Errors (CryptoError (..))
 import Seal.Security.Secrets (mkSecretKey)
 import Seal.Security.Crypto
 
@@ -374,10 +310,10 @@ spec = describe "Seal.Security.Crypto" $ do
 
   it "rejects a wrong-length key" $ do
     enc <- encrypt (mkSecretKey "short") "data"
-    enc `shouldBe` Left BadKeyLength
+    enc `shouldSatisfy` isLeft
 
   it "rejects ciphertext shorter than the IV" $
-    decrypt (mkSecretKey key32) "tiny" `shouldBe` Left ShortCiphertext
+    decrypt (mkSecretKey key32) "tiny" `shouldSatisfy` isLeft
 ```
 
 - [ ] **Step 2: Run it; expect failure.**
@@ -388,6 +324,7 @@ Expected: FAIL — module not found.
 - [ ] **Step 3: Implement `Seal.Security.Crypto`.**
 
 ```haskell
+{-# LANGUAGE OverloadedStrings #-}
 module Seal.Security.Crypto
   ( getRandomBytes
   , sha256Hash
@@ -409,7 +346,6 @@ import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
 
-import Seal.Core.Errors (CryptoError (..))
 import Seal.Security.Secrets (SecretKey, withSecretKey)
 
 ivLength :: Int
@@ -435,28 +371,28 @@ generateToken n = do
 
 -- | AES-256-CTR encrypt. A fresh random 16-byte IV is generated and prepended
 -- to the ciphertext. The key must be exactly 32 bytes.
-encrypt :: SecretKey -> ByteString -> IO (Either CryptoError ByteString)
+encrypt :: SecretKey -> ByteString -> IO (Either Text ByteString)
 encrypt sk plaintext = withSecretKey sk $ \keyBytes ->
   case cipherInit keyBytes :: CryptoFailable AES256 of
-    CryptoFailed _     -> pure (Left BadKeyLength)
+    CryptoFailed _     -> pure (Left "key must be 32 bytes for AES-256")
     CryptoPassed cipher -> do
       ivBytes <- getRandomBytes ivLength
       case makeIV ivBytes of
-        Nothing -> pure (Left BadInitVector)
+        Nothing -> pure (Left "could not construct a 16-byte IV")
         Just iv -> pure (Right (ivBytes <> ctrCombine cipher iv plaintext))
 
 -- | Inverse of 'encrypt'. Pure: CTR needs no entropy to decrypt.
-decrypt :: SecretKey -> ByteString -> Either CryptoError ByteString
+decrypt :: SecretKey -> ByteString -> Either Text ByteString
 decrypt sk blob = withSecretKey sk $ \keyBytes ->
   if BS.length blob < ivLength
-    then Left ShortCiphertext
+    then Left "ciphertext shorter than the IV it must carry"
     else
       let (ivBytes, ciphertext) = BS.splitAt ivLength blob
       in case cipherInit keyBytes :: CryptoFailable AES256 of
-           CryptoFailed _      -> Left BadKeyLength
+           CryptoFailed _      -> Left "key must be 32 bytes for AES-256"
            CryptoPassed cipher ->
              case makeIV ivBytes of
-               Nothing -> Left BadInitVector
+               Nothing -> Left "could not construct a 16-byte IV"
                Just iv -> Right (ctrCombine cipher iv ciphertext)
 ```
 
@@ -484,8 +420,16 @@ git commit -m "Add symmetric crypto utilities (AES-256-CTR, SHA-256)"
 **Interfaces:**
 - Produces:
   - `data VaultError = VaultLocked | VaultNotFound | VaultAlreadyExists |
-    VaultKeyNotFound Text | VaultCorrupted Text | AgeError Text |
-    AgeNotInstalled Text` (`deriving stock (Eq, Show)`).
+    VaultKeyNotFound Text | VaultBackendError Text` (`deriving stock (Eq,
+    Show)`). This is the **one** bespoke error ADT in the phase, and it earns
+    it: the vault opcodes and CLI pattern-match these arms to drive control
+    flow (`VaultLocked` → ask the human to unlock; `VaultAlreadyExists` → the
+    `init` path; `VaultNotFound` → suggest `vault init`; `VaultKeyNotFound` → a
+    distinct get/delete result). The first four are the control-flow arms; the
+    fifth, `VaultBackendError`, is the single catch-all message for things
+    callers do *not* branch on — `age` stderr, "age not installed", and corrupt
+    on-disk data — so those collapse into one `Text`-carrying constructor
+    instead of three.
   - `data VaultEncryptor = VaultEncryptor { veEncrypt :: ByteString -> IO
     (Either VaultError ByteString), veDecrypt :: ByteString -> IO (Either
     VaultError ByteString) }` — recipient/identity captured in the closure.
@@ -557,14 +501,16 @@ import Data.Text.Encoding qualified as TE
 import System.Process.Typed
   ( ExitCode (..), byteStringInput, proc, readProcess, runProcess, setStdin )
 
+-- | The vault's error type. The first four constructors are matched on to
+-- drive control flow (so they earn being a sum type per the haskell-coder
+-- skill); 'VaultBackendError' is the single catch-all for failures that are
+-- only reported — @age@ stderr, "age not installed", corrupt vault data.
 data VaultError
   = VaultLocked
   | VaultNotFound
   | VaultAlreadyExists
   | VaultKeyNotFound Text
-  | VaultCorrupted Text
-  | AgeError Text          -- ^ stderr from the @age@ subprocess
-  | AgeNotInstalled Text   -- ^ message with an install hint
+  | VaultBackendError Text
   deriving stock (Eq, Show)
 
 newtype AgeRecipient = AgeRecipient Text deriving stock (Eq, Show)
@@ -577,13 +523,13 @@ data VaultEncryptor = VaultEncryptor
   }
 
 -- | Build a real encryptor backed by @age@. Preflights @age --version@ and
--- returns 'AgeNotInstalled' if the binary is absent.
+-- reports a 'VaultBackendError' install hint if the binary is absent.
 mkAgeEncryptor :: AgeRecipient -> AgeIdentity -> IO (Either VaultError VaultEncryptor)
 mkAgeEncryptor (AgeRecipient recipient) (AgeIdentity identity) = do
   versionResult <- runProcess (proc "age" ["--version"])
   case versionResult of
     ExitFailure _ ->
-      pure (Left (AgeNotInstalled "Install age from https://age-encryption.org"))
+      pure (Left (VaultBackendError "age not installed; see https://age-encryption.org"))
     ExitSuccess ->
       pure (Right VaultEncryptor
         { veEncrypt = run ["--encrypt", "--recipient", T.unpack recipient]
@@ -596,7 +542,7 @@ mkAgeEncryptor (AgeRecipient recipient) (AgeIdentity identity) = do
       (code, out, err) <- readProcess cfg
       pure $ case code of
         ExitSuccess   -> Right (BL.toStrict out)
-        ExitFailure _ -> Left (AgeError (TE.decodeUtf8 (BL.toStrict err)))
+        ExitFailure _ -> Left (VaultBackendError (TE.decodeUtf8 (BL.toStrict err)))
 
 -- | XOR-with-0xAB mock; reversible, no binary required.
 mkMockEncryptor :: VaultEncryptor
@@ -945,12 +891,12 @@ vaultRekey st newEnc newKeyType confirm = withMVar (stWriteLock st) $ \_ -> do
           atomicWrite newPath ciphertext
           verified <- verifyRekey newEnc newPath plainMap
           if not verified
-            then cleanup newPath >> pure (Left (VaultCorrupted "rekey verification failed"))
+            then cleanup newPath >> pure (Left (VaultBackendError "rekey verification failed"))
             else do
               oldKeyType <- readIORef (stKeyType st)
               ok <- confirm (rekeyPrompt oldKeyType newKeyType (Map.size plainMap))
               if not ok
-                then cleanup newPath >> pure (Left (VaultCorrupted "rekey cancelled"))
+                then cleanup newPath >> pure (Left (VaultBackendError "rekey cancelled"))
                 else do
                   renameFile newPath path
                   writeIORef (stEncryptor st) newEnc
@@ -1001,8 +947,8 @@ encodeValues = Map.map (TE.decodeUtf8 . B64.encode)
 decodePayload :: ByteString -> Either VaultError (Map Text ByteString)
 decodePayload plain =
   case Aeson.decodeStrict plain of
-    Nothing      -> Left (VaultCorrupted "invalid JSON")
-    Just encoded -> maybe (Left (VaultCorrupted "invalid base64")) Right
+    Nothing      -> Left (VaultBackendError "invalid JSON")
+    Just encoded -> maybe (Left (VaultBackendError "invalid base64")) Right
                           (traverse decodeValue encoded)
   where
     decodeValue t = either (const Nothing) Just (B64.decode (TE.encodeUtf8 t))

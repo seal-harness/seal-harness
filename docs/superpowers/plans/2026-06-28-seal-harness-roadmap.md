@@ -43,14 +43,20 @@ spec is exact.
   `Seal.Gateway`, `Seal.Scheduler`, `Seal.CLI`, `Seal.Transcript`).
 - **Coding style:** follow the repo's `haskell-coder` skill. Settled project
   conventions (established in Phase 1, Task 0): `default-language: GHC2021`;
-  default extensions `OverloadedStrings, LambdaCase, DerivingStrategies,
-  DeriveGeneric, GeneralizedNewtypeDeriving, ImportQualifiedPost,
-  ScopedTypeVariables, TupleSections`; post-positive qualified imports
-  (`import Data.ByteString qualified as BS`).
-- **GHC flags:** `-Wall -Werror` with the strict set:
-  `-Wincomplete-patterns -Wincomplete-uni-patterns -Wname-shadowing
-  -Wunused-imports -Wredundant-constraints`. Warnings are errors; the build
-  must stay green.
+  a conservative always-on `default-extensions` set (`DeriveGeneric,
+  DerivingStrategies, LambdaCase, ScopedTypeVariables`) with situational
+  extensions (`OverloadedStrings`, `GeneralizedNewtypeDeriving`,
+  `ImportQualifiedPost`, …) enabled per-file via `{-# LANGUAGE #-}` pragmas;
+  whole-module imports rather than explicit symbol lists.
+- **Errors:** default to `Either Text`/`ExceptT Text`. Introduce a bespoke
+  error ADT only when the program pattern-matches the error to drive control
+  flow (per the `haskell-coder` skill) — a typed error that is only shown to a
+  user is over-engineering. Keep the matched-on constructors distinct and fold
+  report-only failures into a single `Text`-carrying constructor.
+- **GHC flags:** `-Wall -Werror` with the `haskell-coder` strict set:
+  `-Wcompat -Widentities -Wincomplete-uni-patterns -Wincomplete-record-updates
+  -Wname-shadowing -Wpartial-fields -Wredundant-constraints`. Warnings are
+  errors; the build must stay green.
 - **TDD:** red → green. Write the failing test first, watch it fail, implement
   the minimum, watch it pass, commit. Security-critical pure functions
   (policy, path validation, hash chaining) get QuickCheck properties.
@@ -150,8 +156,10 @@ it. Phase 1 delivers the secret types, the crypto seam, and the vault so that
 every later subsystem imports secrets and encryption that are already correct.
 
 **Deliverables:**
-- Task 0 — Project conventions: GHC2021, strict warnings, extension set,
-  `Seal.Core.Errors` skeleton. (Folds setup into the first real module.)
+- Task 0 — Project conventions: GHC2021, strict warnings, the conservative
+  always-on extension set, and this phase's dependencies. No error module:
+  errors default to `Either Text`; a bespoke error ADT appears only where
+  control flow demands it (just `VaultError`).
 - `Seal.Security.Secrets` — opaque `ApiKey`, `BearerToken`, `PairingCode`,
   `SecretKey`; redacted `Show`; no JSON; smart constructors; CPS accessors
   (`withApiKey`, …). Property test: `show` never reveals bytes.
