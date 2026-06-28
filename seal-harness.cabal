@@ -1,0 +1,76 @@
+cabal-version: 3.0
+name: seal-harness
+version: 0.1.0.0
+synopsis: A harness for secure AI agent execution around the SealOp ISA
+description:
+  Seal Harness is an agent runtime designed from the ground up for security
+  and reliability around the SealOp Instruction Set Architecture (ISA). Every
+  agent action is a typed opcode, recorded in an append-only hash-chained
+  transcript that serves as the audit log.
+license: LicenseRef-FSL-1.1-MIT
+license-file: LICENSE
+author: Doug Beardsley
+maintainer: Doug Beardsley
+build-type: Simple
+extra-doc-files:
+    CHANGELOG.md
+    README.md
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import: warnings
+    exposed-modules:
+        Seal.AppMain
+        Seal.Types.App
+        Seal.Types.Config
+        Seal.Types.Command
+        Seal.Types.Env
+        Seal.Commands.Greet
+        Seal.Commands.Tick
+    build-depends:
+        base >= 4.18 && < 5
+      , text
+      , bytestring
+      , containers
+      , mtl
+      , exceptions
+      , lens
+      , aeson
+      , katip
+      , configuration-tools
+      , optparse-applicative
+      , time
+    hs-source-dirs: src
+    default-language: Haskell2010
+    default-extensions:
+        DeriveGeneric
+        DerivingStrategies
+        FlexibleInstances
+        LambdaCase
+        ScopedTypeVariables
+
+executable seal
+    import: warnings
+    main-is: Main.hs
+    build-depends:
+        base
+      , seal-harness
+    hs-source-dirs: exe
+    default-language: Haskell2010
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+
+test-suite tests
+    import: warnings
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    build-depends:
+        base
+      , seal-harness
+      , aeson
+      , hspec
+    hs-source-dirs: test
+    default-language: Haskell2010
+    other-modules:
+        Seal.ConfigSpec

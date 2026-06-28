@@ -1,0 +1,5 @@
+result
+*.o
+*.hi
+*.swp
+dist-newstyle/

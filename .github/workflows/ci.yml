@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel outdated runs when a new push arrives on the same ref
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-latest
+    # Map the optional S3-cache secrets to env so step-level `if` can test them.
+    # (The `secrets` context is not permitted in `if` conditionals; `env` is.)
+    env:
+      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+      NIX_CACHE_AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
+      NIX_CACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action/restore@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: Populate Nix store with dependencies
+        run: nix develop --command true
+
+      - name: Save Nix store cache
+        uses: nix-community/cache-nix-action/save@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          gc-max-store-size-linux: 5G
+          gc-max-store-size-macos: 5G
+          purge: true
+          purge-created: 604800
+
+      - name: Build
+        run: nix build --print-build-logs
+
+      - name: Run tests with coverage
+        run: nix develop --command cabal test --enable-coverage
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          nix develop --command bash -c '
+          # The .tix file is named after the cabal test-suite (`tests`).
+          TIX=$(find dist-newstyle -name "tests.tix" 2>/dev/null | head -1)
+          if [ -z "$TIX" ]; then
+            echo "No .tix file found — coverage report skipped."
+            exit 0
+          fi
+
+          # Collect all mix directories
+          MIXDIRS=$(find dist-newstyle -path "*/hpc/vanilla/mix" -type d 2>/dev/null)
+          HPCDIR_ARGS=""
+          for d in $MIXDIRS; do
+            HPCDIR_ARGS="$HPCDIR_ARGS --hpcdir=$d"
+          done
+
+          # Generate text report (library modules only, exclude test harness)
+          echo "=== HPC Coverage Report ==="
+          REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+            --exclude=Main \
+            --exclude=Paths_seal_harness \
+            2>&1)
+          echo "$REPORT"
+          echo "$REPORT" > coverage-report.txt
+
+          # Per-module breakdown
+          echo ""
+          echo "=== Per-Module Coverage ==="
+          MODULE_REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+            --exclude=Main \
+            --exclude=Paths_seal_harness \
+            --per-module \
+            2>&1)
+          echo "$MODULE_REPORT"
+          echo "$MODULE_REPORT" > coverage-per-module.txt
+          '
+
+      - name: Post coverage to job summary
+        if: always()
+        run: |
+          if [ ! -f coverage-report.txt ]; then
+            echo "No coverage report found." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## Code Coverage (HPC)"
+            echo ""
+            echo '```'
+            cat coverage-report.txt
+            echo '```'
+            echo ""
+            echo "<details>"
+            echo "<summary>Per-module breakdown</summary>"
+            echo ""
+            echo '```'
+            cat coverage-per-module.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Optional: push built store paths to a private S3 Nix binary cache.
+      # Runs only on pushes to main, and only when the three S3 cache secrets
+      # are configured (see README → CI → S3 Nix cache). Skipped otherwise.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Push to S3 Nix cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
+        run: |
+          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET || "your-nix-cache-bucket" }}'
+          KEY=/tmp/nix-cache-priv-key.pem
+          echo "$NIX_CACHE_SIGNING_KEY" > "$KEY"
+
+          echo "Collecting store paths..."
+          RESULT_PATHS=""
+          if [ -e ./result ]; then
+            RESULT_PATHS=$(nix-store -qR ./result)
+          else
+            echo "No ./result found, pushing dev shell only."
+          fi
+
+          DEVSHELL_OUT=$(nix build .#devShells.${{ matrix.system }}.default --print-out-paths --no-link 2>/dev/null || true)
+          DEVSHELL_PATHS=""
+          if [ -n "$DEVSHELL_OUT" ]; then
+            DEVSHELL_PATHS=$(nix-store -qR $DEVSHELL_OUT)
+          fi
+
+          ALL_PATHS=$(echo -e "${RESULT_PATHS}\n${DEVSHELL_PATHS}" | sort -u | grep -v '^$')
+          if [ -z "$ALL_PATHS" ]; then
+            echo "No store paths to push."
+            exit 0
+          fi
+
+          TOTAL=$(echo "$ALL_PATHS" | wc -l)
+          echo "Signing and pushing $TOTAL store paths..."
+          echo "$ALL_PATHS" | xargs nix store sign --key-file "$KEY"
+          echo "$ALL_PATHS" | xargs nix copy --to "$S3_CACHE"
+          echo "Cache push complete: $TOTAL paths."
