@@ -8,6 +8,8 @@ import qualified Seal.Security.PathSpec
 import qualified Seal.Security.SecretsSpec
 import qualified Seal.Security.Vault.AgeSpec
 import qualified Seal.Security.VaultSpec
+import qualified Seal.Security.PolicySpec
+import qualified Seal.Security.CommandSpec
 
 main :: IO ()
 main = hspec $ do
@@ -17,3 +19,5 @@ main = hspec $ do
   Seal.Security.SecretsSpec.spec
   Seal.Security.Vault.AgeSpec.spec
   Seal.Security.VaultSpec.spec
+  Seal.Security.PolicySpec.spec
+  Seal.Security.CommandSpec.spec

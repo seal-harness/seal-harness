@@ -46,6 +46,8 @@ library
         Seal.Security.Secrets
         Seal.Security.Vault.Age
         Seal.Security.Vault
+        Seal.Security.Policy
+        Seal.Security.Command
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -103,3 +105,5 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
+        Seal.Security.PolicySpec
+        Seal.Security.CommandSpec
