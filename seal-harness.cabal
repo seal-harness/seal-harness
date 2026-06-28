@@ -44,6 +44,7 @@ library
         Seal.Security.Crypto
         Seal.Security.Secrets
         Seal.Security.Vault.Age
+        Seal.Security.Vault
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -90,9 +91,13 @@ test-suite tests
       , bytestring
       , text
       , containers
+      , directory
+      , filepath
+      , typed-process
     hs-source-dirs: test
     other-modules:
         Seal.ConfigSpec
         Seal.Security.CryptoSpec
         Seal.Security.SecretsSpec
         Seal.Security.Vault.AgeSpec
+        Seal.Security.VaultSpec

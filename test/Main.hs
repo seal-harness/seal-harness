@@ -6,6 +6,7 @@ import qualified Seal.ConfigSpec
 import qualified Seal.Security.CryptoSpec
 import qualified Seal.Security.SecretsSpec
 import qualified Seal.Security.Vault.AgeSpec
+import qualified Seal.Security.VaultSpec
 
 main :: IO ()
 main = hspec $ do
@@ -13,3 +14,4 @@ main = hspec $ do
   Seal.Security.CryptoSpec.spec
   Seal.Security.SecretsSpec.spec
   Seal.Security.Vault.AgeSpec.spec
+  Seal.Security.VaultSpec.spec
