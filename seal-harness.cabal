@@ -41,6 +41,7 @@ library
         Seal.Types.Env
         Seal.Commands.Greet
         Seal.Commands.Tick
+        Seal.Security.Secrets
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -90,3 +91,4 @@ test-suite tests
     hs-source-dirs: test
     other-modules:
         Seal.ConfigSpec
+        Seal.Security.SecretsSpec
