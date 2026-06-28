@@ -3,3 +3,4 @@ result
 *.hi
 *.swp
 dist-newstyle/
+.superpowers/
