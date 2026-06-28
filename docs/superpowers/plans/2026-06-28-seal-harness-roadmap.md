@@ -43,7 +43,8 @@ spec is exact.
   architecture (`Seal.Core`, `Seal.Security`, `Seal.Handles`, `Seal.ISA`,
   `Seal.Tools`, `Seal.Agent`, `Seal.Providers`, `Seal.Channels`, `Seal.Memory`,
   `Seal.Gateway`, `Seal.Scheduler`, `Seal.CLI`, `Seal.Transcript`,
-  `Seal.Session`, `Seal.Harness`, `Seal.Tabs`).
+  `Seal.Session`, `Seal.Harness`, `Seal.Tabs`, `Seal.Command`, `Seal.Routing`,
+  `Seal.Ingest`).
 - **Coding style:** follow the repo's `haskell-coder` skill. Settled project
   conventions (established in Phase 1, Task 0): `default-language: GHC2021`;
   a conservative always-on `default-extensions` set (`DeriveGeneric,
@@ -121,6 +122,17 @@ gateway server, the scheduler, and the security primitives `SafePath`,
    classification, an atomicity guarantee, a transcript-entry format, and an
    authorization gate — as data, not ad-hoc handler functions. New structure.
 5. **Skills and Agent-definition stores** as first-class Audited opcode groups.
+6. **Channel-ingress preprocessing gate.** A single `ingest` chokepoint with an
+   ordered preprocessing chain guaranteed (by construction of the one ingress
+   pipeline) to run before any LLM call on every channel — the future home for
+   prompt-injection / policy scanning that sees 100% of inbound traffic. The
+   reference does slash-before-LLM by control-flow convention; this makes it a
+   structural seam. See the slash-command infrastructure design.
+7. **Discoverable `/`-command infrastructure.** Each command is channel-agnostic
+   data with an optparse-applicative parser, so help/usage is auto-derived and a
+   property test enforces that *every* command and option is discoverable via
+   `/help`. The reference's `/`-command help is partly hand-written and ad-hoc.
+   (The terse tab grammar is preserved exactly as a bespoke Layer-1 front-end.)
 
 ---
 
@@ -130,23 +142,35 @@ The ordering follows the user's directive: **vault first** (security
 foundation), then **the shortest path to a usable system**, then **build out
 the ISA starting with the core Trusted opcodes**.
 
+**Channel priority (user-directed):** the first usable channel is the **web
+frontend** (a close duplication of the reference's React 18 + TypeScript + Vite
++ Tailwind SPA over a Warp/WAI gateway with a WebSocket transcript broker), then
+**Signal**, with the **CLI channel deferred to much later**. The MVP is
+therefore delivered over the web channel, not a CLI REPL.
+
 ```
 Phase 0  Scaffolding ........................... DONE (committed)
 Phase 1  Security foundation + Secret Vault .... security from day one
-Phase 2  Minimal usable agent (MVP) ............ usable end-to-end, fast
+Phase 2  Minimal usable agent (MVP) over WEB ... usable end-to-end, web-first
+  2a   Command infra + ingress gate + min web loop
+  2b   Full web-frontend close-duplication
 Phase 3  ISA build-out: core Trusted opcodes ... the highest-value feature
 Phase 4  Untrusted opcode breadth + isolation .. shell/files/web at scale
 Phase 5  Audited stores: Memory/Skills/Agents/Config
-Phase 6  Channels, Gateway, Scheduler, MCP ..... reach + automation
+Phase 6  More channels (Signal → …), Scheduler, MCP, remaining providers
 ```
 
 Dependency rationale: Phase 1 establishes the secret types, crypto seam, and
 project conventions everything else imports. Phase 2 stands up the transcript
-spine (append-only + ACK), the ISA dispatcher skeleton, one provider, the CLI
-channel, the agent loop, the Secrets opcodes (proving the vault end-to-end),
-and exactly one Untrusted opcode (proving the ACK-before-execute path). Phase 3
-then widens the ISA along the Trusted groups, which is where the architecture's
-value compounds.
+spine (append-only + ACK), the ISA dispatcher skeleton, one provider, the
+agent loop, the Secrets opcodes (proving the vault end-to-end), exactly one
+Untrusted opcode (proving the ACK-before-execute path), the **`/`-command
+infrastructure + channel-ingress preprocessing gate**
+(`docs/superpowers/specs/2026-06-28-slash-command-infrastructure-design.md`),
+and the **web channel** (gateway + WebSocket broker + React/TS frontend) as the
+MVP's first and only channel. Phase 3 then widens the ISA along the Trusted
+groups, which is where the architecture's value compounds. Signal and the
+deferred CLI channel land in Phase 6.
 
 ---
 
@@ -210,19 +234,30 @@ agent yet — just a rock-solid security floor. hlint clean, `-Werror` green.
 
 ---
 
-## Phase 2 — Minimal usable agent (MVP)
+## Phase 2 — Minimal usable agent (MVP) over the web channel
 
 **Detailed plan:** to be written at the start of Phase 2
-(`2026-07-xx-phase-2-mvp.md`).
+(`2026-07-xx-phase-2-mvp.md`), likely split into **2a** (command infrastructure
++ ingress gate + minimal end-to-end web loop) and **2b** (full web-frontend
+close-duplication) to keep milestones bite-sized. Two designs feed it:
+- `docs/superpowers/specs/2026-06-28-slash-command-infrastructure-design.md` —
+  the `/`-command registry, optparse-derived discoverable help, the Layer-1
+  terse tab-routing front-end, and the single channel-ingress preprocessing
+  gate (preprocessing guaranteed before any LLM call, on every channel).
+- a web-frontend behavioral spec written at the start of the 2b work.
 
-**MVP bar (decided):** CLI chat against Anthropic, the working vault (Secrets
-opcodes), `ASK_HUMAN`/`SHOW_HUMAN` so the loop is interactive, an append-only
-transcript underneath, **plus one Untrusted opcode** (`FILE_READ`) exercising
-the full ACK-before-execute path. Smallest thing that proves the whole
-architecture end-to-end.
+**MVP bar (decided):** **web chat** against Anthropic (gateway + WebSocket
+transcript broker + React/TS/Vite/Tailwind SPA, close-duplicating the
+reference), the working vault (Secrets opcodes), `ASK_HUMAN`/`SHOW_HUMAN` so the
+loop is interactive, an append-only transcript underneath, the `/`-command
+infrastructure with a working `/help` and the preserved tab UX, **plus one
+Untrusted opcode** (`FILE_READ`) exercising the full ACK-before-execute path.
+Smallest thing that proves the whole architecture end-to-end — over the
+prioritized web channel rather than a CLI REPL (the CLI channel is deferred to
+Phase 6).
 
 **Core type foundations land here, in full.** Even though the *runtime* MVP only
-exercises a provider-backed CLI session, Phase 2 settles the complete core type
+exercises a provider-backed web session, Phase 2 settles the complete core type
 structure — sessions, transcripts, providers, harnesses, and tabs — up front,
 because every later subsystem imports these types and they are expensive to
 churn once code depends on them. For harnesses and tabs, Phase 2 ships the
@@ -233,7 +268,11 @@ modules are leaf-ish (depend only on `Seal.Core` / `Seal.Security`) and carry
 QuickCheck coverage for their invariants and JSON round-trips.
 
 **Deliverables (task groups).** Groups 1–6 are the core type foundations;
-groups 7–13 are the runtime MVP built on top of them.
+groups 7–15 are the runtime MVP built on top of them. Roughly, groups 1–11 and
+13–15 are the **2a** milestone (command infra + ingress gate + minimal web loop);
+group 12 (the frontend) straddles both — a deliberately minimal web client in
+2a (enough to chat, stream the transcript, run `/help`, and drive tabs) and the
+full close-duplication of the reference's UI in the **2b** milestone.
 
 1. **`Seal.Core.Types`** — the shared leaf vocabulary, imported everywhere:
    - Identity newtypes: `ProviderId`, `ModelId`, `ToolCallId`, `MemoryId`,
@@ -329,7 +368,9 @@ groups 7–13 are the runtime MVP built on top of them.
      cursors key by `TabRef` not slot (**I3**: a cursor survives slot
      compaction because it names ground truth, resolved to a current slot at
      read time). Includes the parsed `/tab` command ADTs. Heavy QuickCheck on
-     the I1/I2/I3 invariants.
+     the I1/I2/I3 invariants. The **Layer-1 terse-grammar routing front-end**
+     (`route`: `/N` switch, `/N payload` inject, plain-text default) that drives
+     these ADTs lands in group 10 with the rest of the command infrastructure.
 7. **Transcript handle + daemon + ACK** — `Seal.Handles.Transcript`
    (append-only JSONL via raw POSIX FDs + fsync) and a writer-thread daemon
    whose `recordAndAck` returns only after fsync. Integrity comes from the
@@ -347,24 +388,56 @@ groups 7–13 are the runtime MVP built on top of them.
 9. **Anthropic provider** — `Seal.Providers.Anthropic` (Messages API,
    implements the Phase-2 `Provider` class, reads the key via `withApiKey` from
    the vault).
-10. **CLI channel** — `Seal.Handles.Channel` + `Seal.Channels.CLI`
-    (haskeline; `prompt`/`promptSecret`/streaming chunks).
-11. **Agent loop** — `Seal.Agent.Env`, `Seal.Agent.Loop` (turn-based: message →
-    completion → opcode dispatch → transcript → channel, until no tool calls).
-12. **First opcodes** — `SHOW_HUMAN`, `ASK_HUMAN` (Trusted); the five Secrets
-    opcodes (`SECRET_SAVE/GET/LIST/DELETE`, `VAULT_STATUS`, all Audited but
-    values never logged); `FILE_READ` (Untrusted, via `SafePath` +
-    ACK-before-execute).
-13. **Real CLI** — replace `greet`/`tick` with `seal` chat + `vault`
-    admin subcommands (`init`/`lock`/`unlock`/`rekey`), wired through
-    `configuration-tools`.
+10. **`/`-command infrastructure + channel-ingress gate** — full design in
+    `docs/superpowers/specs/2026-06-28-slash-command-infrastructure-design.md`.
+    `Seal.Command.Spec`/`Parse`/`Help` (the `CommandSpec` registry, quote-aware
+    tokenizer, `execParserPure` bridge, and optparse-derived `/help` for every
+    command and option), `Seal.Routing.Route` (the Layer-1 terse tab grammar),
+    and `Seal.Ingest` (the single `ingest` chokepoint + ordered `PreprocessChain`
+    that is guaranteed to run before any LLM call). Discoverability is enforced
+    by a property test over the registry; the tab terse grammar is a first-class
+    synopsis entry so it is discoverable through the same `/help`.
+11. **Channel handle + web gateway** — `Seal.Handles.Channel` (the `ChannelCaps`
+    capability: `send`/`prompt`/`promptSecret`/streaming chunks, with
+    interactive ops returning a structured deferral on request/response
+    channels), and `Seal.Gateway` (Warp/WAI HTTP server + WebSocket
+    transcript-streaming broker), the close duplication of the reference gateway.
+    This is the MVP channel.
+12. **Web frontend (close duplication)** — a clean-room reimplementation of the
+    reference's React 18 + TypeScript + Vite + Tailwind SPA. **2a** ships a
+    deliberately minimal client (chat/transcript view + live WebSocket streaming
+    + `/help` + tab driving) to close the end-to-end loop; **2b** is the bulk —
+    sidebar with tabs + recent/archived sessions, tab + harness controls, and the
+    command palette/autocomplete generated from the `/`-command registry.
+    Behavior and appearance close-match the reference; no source is copied. The
+    detailed behavioral spec is written at the start of this work.
+13. **Agent loop** — `Seal.Agent.Env`, `Seal.Agent.Loop` (turn-based: message →
+    completion → opcode dispatch → transcript → channel, until no tool calls),
+    fed only via `Seal.Ingest`.
+14. **First opcodes + first registered commands** — opcodes: `SHOW_HUMAN`,
+    `ASK_HUMAN` (Trusted); the five Secrets opcodes (`SECRET_SAVE/GET/LIST/
+    DELETE`, `VAULT_STATUS`, all Audited but values never logged); `FILE_READ`
+    (Untrusted, via `SafePath` + ACK-before-execute). Commands registered into
+    the Phase-2 registry: `/help`, the tab family (`/tabs`, `/tab …`, plus the
+    terse `/N` routing), and the Secrets/`/vault` commands — proving the registry
+    end-to-end with real entries.
+15. **`seal` startup CLI** — replace `greet`/`tick` with `seal serve` (launch the
+    web gateway) plus `vault` admin subcommands (`init`/`lock`/`unlock`/`rekey`),
+    wired through `configuration-tools`. This is the process-`argv` parser only;
+    it is a **completely separate** optparse tree from the `/`-command registry
+    (group 10), even though both use optparse machinery. The interactive **CLI
+    *channel*** (a haskeline REPL) is **not** built here — it is deferred to
+    Phase 6.
 
 **Milestone:** the core type foundations (groups 1–6) compile `-Werror` clean
-with their invariant/round-trip properties green; and
-`export ANTHROPIC_API_KEY=…; seal` → chat with a model that can save/read
-secrets, ask the human a question, and read a workspace file, with every step
-landing in the append-only transcript and Untrusted reads blocked until their
-audit entry is durably written.
+with their invariant/round-trip properties green; the `/`-command discoverability
+property test passes (every command and option reachable via `/help`); and
+`export ANTHROPIC_API_KEY=…; seal serve` → open the **web UI** and chat with a
+model that can save/read secrets, ask the human a question, and read a workspace
+file, drive tabs via the preserved terse grammar, and discover every command via
+`/help` — with every inbound message passing the ingress preprocessing chain
+before any LLM call, every step landing in the append-only transcript, and
+Untrusted reads blocked until their audit entry is durably written.
 
 ---
 
@@ -466,15 +539,29 @@ agent is fully reconstructible by replay.
 
 ---
 
-## Phase 6 — Channels, Gateway, Scheduler, breadth
+## Phase 6 — More channels, Scheduler, breadth
 
-**Deliverables:** Telegram and Signal channels (allow-lists, pairing via
-`Seal.Security.Pairing`); the gateway HTTP server (`Seal.Gateway`) serving a
-web channel + transcript streaming + pairing; remaining providers (OpenAI,
-OpenRouter, Ollama); off-box transcript mirroring hardening.
+The web channel + gateway already shipped in Phase 2. This phase adds the
+remaining channels in priority order and the breadth features. All new channels
+register their commands into the existing Phase-2 `/`-command registry and enter
+the core only via `Seal.Ingest`, so the preserved tab UX, discoverable `/help`,
+and the preprocessing gate come for free.
 
-**Milestone:** reach the agent from anywhere, multiple providers, durable
-off-box audit — the full README feature set.
+**Deliverables (in priority order):**
+- **Signal channel** (channel priority #2) — `Seal.Channels.Signal`, allow-lists,
+  pairing via `Seal.Security.Pairing`; the single-threaded chat surface where the
+  terse tab UX matters most. Generates its command/autocomplete list from the
+  registry.
+- **Telegram channel** — `Seal.Channels.Telegram` (BotFather command
+  registration generated from the registry), allow-lists, pairing.
+- **CLI channel (deferred from Phase 2)** — `Seal.Channels.CLI` (haskeline REPL
+  `prompt`/`promptSecret`/streaming), now built as a real interactive channel
+  rather than the MVP harness.
+- Remaining providers (OpenAI, OpenRouter, Ollama); the scheduler; off-box
+  transcript mirroring hardening; gateway pairing/multi-device hardening.
+
+**Milestone:** reach the agent from anywhere (web, Signal, Telegram, CLI),
+multiple providers, durable off-box audit — the full README feature set.
 
 ---
 
