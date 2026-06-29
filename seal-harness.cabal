@@ -52,6 +52,7 @@ library
         Seal.Security.Vault
         Seal.Security.Policy
         Seal.Security.Command
+        Seal.Config.File
         Seal.Config.Paths
     build-depends:
         base >= 4.18 && < 5
@@ -121,3 +122,4 @@ test-suite tests
         Seal.Command.HelpSpec
         Seal.Command.ParseSpec
         Seal.Command.SpecSpec
+        Seal.Config.FileSpec
