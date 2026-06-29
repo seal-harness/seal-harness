@@ -39,8 +39,6 @@ library
         Seal.Types.Config
         Seal.Types.Command
         Seal.Types.Env
-        Seal.Commands.Greet
-        Seal.Commands.Tick
         Seal.Channel.Caps
         Seal.Command.Help
         Seal.Command.Parse
