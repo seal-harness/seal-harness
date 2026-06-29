@@ -134,7 +134,7 @@ jobs:
       - name: Push to S3 Nix cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
         run: |
-          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET || "your-nix-cache-bucket" }}'
+          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET }}'
           KEY=/tmp/nix-cache-priv-key.pem
           echo "$NIX_CACHE_SIGNING_KEY" > "$KEY"
 
