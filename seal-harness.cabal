@@ -69,6 +69,8 @@ library
       , directory
       , filepath
       , stm
+      , haskeline
+      , tomland
     hs-source-dirs: src
 
 executable seal
@@ -77,6 +79,7 @@ executable seal
     build-depends:
         base
       , seal-harness
+      , haskeline
     hs-source-dirs: exe
     ghc-options: -threaded -rtsopts -with-rtsopts=-N
 
