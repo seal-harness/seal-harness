@@ -6,7 +6,7 @@ import Data.Text (Text)
 
 -- | A channel's interaction capabilities as a record of IO functions
 -- (house style: no type class; callers receive the handle and call fields
--- directly). Web deferral of prompts is a later phase; the CLI REPL
+-- directly). Web deferral of prompts is a later phase; the CLI TUI
 -- is always interactive.
 data ChannelCaps = ChannelCaps
   { ccSend         :: Text -> IO ()   -- ^ Emit one line to the user

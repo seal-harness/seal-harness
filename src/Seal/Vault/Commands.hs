@@ -172,7 +172,7 @@ setupCmd rt = CommandAction $ \caps -> do
         Left e -> ccSend caps (vaultErrMsg e)
         Right enc -> do
           -- Honor vault_path from config if set; fall back to the default path.
-          -- tryOpenVault in Seal.Repl uses the same expression to stay in sync.
+          -- tryOpenVault in Seal.Tui uses the same expression to stay in sync.
           let vaultPath = case oldCfg of
                 Left _    -> vaultFilePath (vrPaths rt)
                 Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath cfg)
@@ -216,7 +216,7 @@ rekeyExisting rt caps newEnc rk eCfg = do
       ccSend caps ("Cannot read existing config for rekey: " <> err)
     Right oldCfg ->
       -- Honor vault_path from config if set; fall back to the default path.
-      -- tryOpenVault in Seal.Repl uses the same expression to stay in sync.
+      -- tryOpenVault in Seal.Tui uses the same expression to stay in sync.
       let vaultPath = maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath oldCfg)
       in case (fcVaultRecipient oldCfg, fcVaultIdentity oldCfg) of
         (Nothing, Nothing) ->

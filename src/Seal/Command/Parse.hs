@@ -89,7 +89,7 @@ data ParseOutcome
 --   4. head word not in registry              -> 'ParseFailure'
 --
 -- 'CompletionInvoked' from 'execParserPure' is reserved for future
--- shell-completion integration (seal --bash-completion-*); the REPL
+-- shell-completion integration (seal --bash-completion-*); the TUI
 -- never triggers it, so it maps to @ParseFailure ""@ (empty, not shown).
 parseSlash :: Registry -> Text -> ParseOutcome
 parseSlash registry fullLine =

@@ -49,8 +49,8 @@ spec = do
       sent <- readIORef ref
       sent `shouldBe` ["from action"]
 
-  describe "seal repl smoke (interactive — manual)" $
-    it "seal repl launches and shows the > prompt" $
+  describe "seal tui smoke (interactive — manual)" $
+    it "seal tui launches and shows the > prompt" $
       pendingWith
-        "interactive: run `nix develop --command cabal run seal -- repl` \
+        "interactive: run `nix develop --command cabal run seal -- tui` \
         \and verify the '> ' prompt appears; Ctrl-D exits cleanly"

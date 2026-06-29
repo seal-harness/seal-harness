@@ -10,7 +10,7 @@ spec = describe "Seal.AppMain.withDefaultArgs" $ do
     withDefaultArgs [] `shouldBe` ["--help"]
 
   it "passes a non-empty argument list through unchanged" $
-    withDefaultArgs ["repl"] `shouldBe` ["repl"]
+    withDefaultArgs ["tui"] `shouldBe` ["tui"]
 
   it "leaves an explicit --help unchanged" $
     withDefaultArgs ["--help"] `shouldBe` ["--help"]

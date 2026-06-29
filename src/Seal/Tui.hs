@@ -1,12 +1,12 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Top-level REPL entry: path resolution -> config -> vault -> registry -> loop.
-module Seal.Repl (runRepl) where
+-- | Top-level TUI entry: path resolution -> config -> vault -> registry -> loop.
+module Seal.Tui (runTui) where
 
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
-import Seal.Channel.Cli (runCliRepl)
+import Seal.Channel.Cli (runCliTui)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -22,7 +22,7 @@ import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
 -- | Open the vault if both recipient and identity are configured.
--- Failures print a warning and return 'Nothing' so the REPL still starts;
+-- Failures print a warning and return 'Nothing' so the TUI still starts;
 -- vault commands will direct the user to run @\/vault setup@.
 tryOpenVault :: SealPaths -> FileConfig -> IO (Maybe VaultHandle)
 tryOpenVault paths cfg =
@@ -45,9 +45,9 @@ tryOpenVault paths cfg =
           Just <$> openVault vcfg enc
     _ -> pure Nothing
 
--- | Full REPL wiring.
-runRepl :: IO ()
-runRepl = do
+-- | Full TUI wiring.
+runTui :: IO ()
+runTui = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
@@ -64,4 +64,4 @@ runRepl = do
             , vrHandleRef  = ref
             }
       registry = mkRegistry [vaultCommandSpec rt]
-  runCliRepl paths registry emptyChain
+  runCliTui paths registry emptyChain

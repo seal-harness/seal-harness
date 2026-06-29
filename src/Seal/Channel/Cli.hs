@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Haskeline-backed CLI REPL channel.
+-- | Haskeline-backed CLI TUI channel.
 module Seal.Channel.Cli
-  ( runCliRepl
+  ( runCliTui
   , interpretDisposition
   ) where
 
@@ -34,11 +34,11 @@ interpretDisposition caps = \case
   PlainMessage _   -> ccSend caps "(no agent configured yet)"
   Rejected msg     -> ccSend caps msg
 
--- | Run the Haskeline REPL loop.
+-- | Run the Haskeline TUI loop.
 --
 -- History is persisted at @\<state\>\/history@.  EOF (Ctrl-D) exits.
-runCliRepl :: SealPaths -> Registry -> PreprocessChain -> IO ()
-runCliRepl paths registry chain =
+runCliTui :: SealPaths -> Registry -> PreprocessChain -> IO ()
+runCliTui paths registry chain =
   let histFile      = spState paths </> "history"
       innerSettings = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings    = innerSettings { historyFile = Just histFile }

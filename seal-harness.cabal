@@ -43,7 +43,6 @@ library
         Seal.Config.File
         Seal.Config.Paths
         Seal.Ingest
-        Seal.Repl
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -51,6 +50,7 @@ library
         Seal.Security.Secrets
         Seal.Security.Vault
         Seal.Security.Vault.Age
+        Seal.Tui
         Seal.Types.App
         Seal.Types.Command
         Seal.Types.Config
