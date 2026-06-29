@@ -45,7 +45,7 @@ testRegistry = mkRegistry [pingSpec]
 -- A "word" safe for the tokenizer QuickCheck: non-empty, no spaces, no quotes.
 -- ---------------------------------------------------------------------------
 
-newtype SafeWord = SafeWord Text deriving (Show)
+newtype SafeWord = SafeWord Text deriving stock (Show)
 
 instance Arbitrary SafeWord where
   arbitrary = do

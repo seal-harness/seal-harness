@@ -171,8 +171,13 @@ setupCmd rt = CommandAction $ \caps -> do
       case encResult of
         Left e -> ccSend caps (vaultErrMsg e)
         Right enc -> do
-          let vaultCfg = VaultConfig
-                { vcPath   = vaultFilePath (vrPaths rt)
+          -- Honor vault_path from config if set; fall back to the default path.
+          -- tryOpenVault in Seal.Repl uses the same expression to stay in sync.
+          let vaultPath = case oldCfg of
+                Left _    -> vaultFilePath (vrPaths rt)
+                Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath cfg)
+              vaultCfg = VaultConfig
+                { vcPath   = vaultPath
                 , vcKeyType = rkKeyType rk
                 , vcUnlock  = UnlockOnDemand
                 }
@@ -210,14 +215,17 @@ rekeyExisting rt caps newEnc rk eCfg = do
     Left err ->
       ccSend caps ("Cannot read existing config for rekey: " <> err)
     Right oldCfg ->
-      case (fcVaultRecipient oldCfg, fcVaultIdentity oldCfg) of
+      -- Honor vault_path from config if set; fall back to the default path.
+      -- tryOpenVault in Seal.Repl uses the same expression to stay in sync.
+      let vaultPath = maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath oldCfg)
+      in case (fcVaultRecipient oldCfg, fcVaultIdentity oldCfg) of
         (Nothing, Nothing) ->
           -- Vault file exists but config has no key: a previous setup was
           -- interrupted before the config was written.  Tell the user to
           -- remove the orphaned file rather than trying to re-encrypt it.
           ccSend caps
             (  "vault file exists at "
-            <> T.pack (vaultFilePath (vrPaths rt))
+            <> T.pack vaultPath
             <> " but the config has no key recorded — it was likely left from"
             <> " an interrupted setup. Delete that file and re-run '/vault setup'.")
         _ -> do
@@ -227,7 +235,7 @@ rekeyExisting rt caps newEnc rk eCfg = do
               ccSend caps ("Cannot load existing key for rekey: " <> vaultErrMsg e)
             Right oldEnc -> do
               let oldVaultCfg = VaultConfig
-                    { vcPath    = vaultFilePath (vrPaths rt)
+                    { vcPath    = vaultPath
                     , vcKeyType = fromMaybe "unknown" (fcVaultKeyType oldCfg)
                     , vcUnlock  = UnlockOnDemand
                     }
@@ -248,10 +256,12 @@ rekeyExisting rt caps newEnc rk eCfg = do
                   case ur of
                     Left err -> ccSend caps
                       (  "ERROR: vault was re-encrypted with the new key, but saving the"
-                      <> " config failed (" <> err <> "). The vault on disk now requires"
-                      <> " the NEW key, but the config still points at the OLD key, so the"
-                      <> " next session cannot open it. Fix: re-run '/vault setup' to write"
-                      <> " the new key into config, or restore config from backup.")
+                      <> " config failed (" <> err <> "). The vault on disk now uses the"
+                      <> " NEW key, but config.toml still names the OLD key. Do NOT re-run"
+                      <> " '/vault setup' — that would attempt to decrypt with the old key"
+                      <> " and fail. Instead, manually edit config.toml to set"
+                      <> " vault_recipient, vault_identity, and vault_key_type to the"
+                      <> " values just configured, or restore config.toml from a backup.")
                     Right () -> do
                       writeIORef (vrHandleRef rt) (Just oldH)
                       ccSend caps "Vault rekeyed successfully."

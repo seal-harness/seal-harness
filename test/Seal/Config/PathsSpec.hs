@@ -76,12 +76,6 @@ spec = describe "Seal.Config.Paths" $ do
           paths <- getSealPaths
           vaultFilePath paths `shouldBe` tmp </> "config" </> "vault" </> "vault.age"
 
-    it "keyFilePath appends name under keys/" $
-      withSystemTempDirectory "seal-home" $ \tmp ->
-        withSealHomeEnv tmp $ do
-          paths <- getSealPaths
-          keyFilePath paths "mykey.identity" `shouldBe` tmp </> "keys" </> "mykey.identity"
-
 -- | Run an action with SEAL_HOME set to the given path, restoring the
 -- previous value (or unsetting) on exit, even if the action throws.
 withSealHomeEnv :: FilePath -> IO a -> IO a

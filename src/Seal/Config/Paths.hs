@@ -5,7 +5,6 @@ module Seal.Config.Paths
   , ensureSealDirs
   , configFilePath
   , vaultFilePath
-  , keyFilePath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -74,6 +73,3 @@ configFilePath paths = spConfig paths </> "config.toml"
 vaultFilePath :: SealPaths -> FilePath
 vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
 
--- | Absolute path to a named key file under @\<keys\>\/@.
-keyFilePath :: SealPaths -> FilePath -> FilePath
-keyFilePath paths name = spKeys paths </> name

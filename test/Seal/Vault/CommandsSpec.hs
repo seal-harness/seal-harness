@@ -9,7 +9,7 @@ import Data.Text qualified as T
 import Data.ByteString.Lazy qualified as BL
 import Data.Text.Encoding qualified as TE
 import Options.Applicative (defaultPrefs, execParserPure, renderFailure, ParserResult (..))
-import System.Directory (createDirectoryIfMissing, findExecutable)
+import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process.Typed (ExitCode (..), proc, readProcess)
@@ -17,7 +17,8 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec (CommandSpec (..), CommandAction (..))
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.File (FileConfig (..), defaultFileConfig, saveFileConfig)
+import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), VaultStatus (..), UnlockMode (..), openVault)
 import Seal.Security.Vault.Age (VaultError (..), mkMockEncryptor)
 import Seal.TestHelpers.FakeCaps (FakeCaps, makeFakeCaps, getSent)
@@ -362,6 +363,35 @@ spec = describe "Seal.Vault.Commands" $ do
             runVaultCmd_ rt caps ["setup"]
             sent <- getSent fc
             sent `shouldSatisfy` any (T.isInfixOf "Delete that file")
+
+    it "setup creates vault at fcVaultPath when set in config.toml" $ do
+      ageExe       <- findExecutable "age"
+      agekeygenExe <- findExecutable "age-keygen"
+      case (ageExe, agekeygenExe) of
+        (Nothing, _) -> pendingWith "age not installed"
+        (_, Nothing) -> pendingWith "age-keygen not installed"
+        _ ->
+          withSystemTempDirectory "seal-cmd-setup-custom" $ \tmpDir -> do
+            let customVaultDir  = tmpDir </> "custom-vault-dir"
+                customVaultPath = customVaultDir </> "custom.age"
+                paths    = SealPaths tmpDir (tmpDir </> "config")
+                                      (tmpDir </> "state") (tmpDir </> "keys")
+                cfgPath  = tmpDir </> "config" </> "config.toml"
+            createDirectoryIfMissing True (tmpDir </> "config")
+            createDirectoryIfMissing True (tmpDir </> "keys")
+            createDirectoryIfMissing True customVaultDir
+            -- Pre-populate config with a custom vault_path.
+            saveFileConfig cfgPath
+              (defaultFileConfig { fcVaultPath = Just (T.pack customVaultPath) })
+            ref <- newIORef Nothing
+            let rt = VaultRuntime paths cfgPath ref
+            (fc, caps) <- makeFakeCaps ["1"]
+            runVaultCmd_ rt caps ["setup"]
+            -- Vault must be at the custom path, not the default path.
+            doesFileExist customVaultPath `shouldReturn` True
+            doesFileExist (vaultFilePath paths) `shouldReturn` False
+            sent <- getSent fc
+            sent `shouldSatisfy` any (T.isInfixOf "created")
 
   describe "full sequence (mock encryptor)" $ do
     it "add -> get -> list -> delete -> status flow" $

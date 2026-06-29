@@ -33,6 +33,9 @@ tryOpenVault paths cfg =
           putStrLn ("Warning: vault not available: " <> show err)
           pure Nothing
         Right enc -> do
+          -- Honor vault_path from config if set; fall back to the default.
+          -- setupCmd and rekeyExisting in Seal.Vault.Commands replicate this
+          -- same expression so all three stay in sync.
           let vcfg = VaultConfig
                 { vcPath    = maybe (vaultFilePath paths) T.unpack
                                     (fcVaultPath cfg)

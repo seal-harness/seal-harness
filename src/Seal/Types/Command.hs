@@ -11,8 +11,8 @@ import Options.Applicative
 
 -- | The subcommand selected on the command line. 'CommandNoOp' is the
 -- harmless placeholder carried by 'defaultConfig'; it is not exposed as a
--- subcommand (the only subcommands are @greet@ and @tick@) and is excluded
--- from the config-file 'FromJSON'/'ToJSON' instances.
+-- subcommand (the only subcommands are @greet@, @tick@, and @repl@) and is
+-- excluded from the config-file 'FromJSON'/'ToJSON' instances.
 data Command
   = CommandNoOp
   | CommandGreet !Text
