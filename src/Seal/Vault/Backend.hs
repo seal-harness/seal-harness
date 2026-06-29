@@ -8,6 +8,7 @@ module Seal.Vault.Backend
   , ResolvedKey (..)
   , detectAgePlugins
   , filterPluginNames    -- exported for testing
+  , parsePluginRecipient -- exported for testing
   , setupLocalAgeKey
   , setupYubiKey
   , setupUserSupplied
@@ -23,7 +24,7 @@ import Data.List (isPrefixOf, nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (findExecutable, listDirectory, makeAbsolute)
+import System.Directory (findExecutable, listDirectory)
 import System.Environment (lookupEnv)
 import System.FilePath (splitSearchPath)
 import System.Posix.Files (setFileMode)
@@ -31,8 +32,8 @@ import System.Process.Typed (ExitCode (..), proc, readProcess)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.File (FileConfig (..))
-import Seal.Config.Paths (SealPaths (..), keyFilePath)
-import Seal.Security.Path (ensureKeysRoot)
+import Seal.Config.Paths (SealPaths (..))
+import Seal.Security.Path (ensureKeysRoot, getSafeKeyPath, mkSafeKeyPath)
 import Seal.Security.Vault (UnlockMode (..))
 import Seal.Security.Vault.Age
   ( AgeIdentity (..)
@@ -90,25 +91,28 @@ detectAgePlugins = do
 
 setupLocalAgeKey :: SealPaths -> Text -> IO (Either Text ResolvedKey)
 setupLocalAgeKey paths name = do
-  _ <- ensureKeysRoot (spKeys paths)
-  let identPath = keyFilePath paths (T.unpack name <> ".identity")
-  (exitCode, _stdout, stderrBs) <-
-    readProcess (proc "age-keygen" ["-o", identPath])
-  case exitCode of
-    ExitFailure n ->
-      pure (Left ("age-keygen exited with code " <> T.pack (show n)))
-    ExitSuccess -> do
-      let stderrText = TE.decodeUtf8Lenient (BL.toStrict stderrBs)
-      case parseAgePublicKey stderrText of
-        Nothing  -> pure (Left "age-keygen: could not parse public key from stderr")
-        Just pub -> do
-          setFileMode identPath 0o600
-          absPath <- makeAbsolute identPath
-          pure (Right ResolvedKey
-            { rkRecipient = pub
-            , rkIdentity  = T.pack absPath
-            , rkKeyType   = "x25519"
-            })
+  keysRoot <- ensureKeysRoot (spKeys paths)
+  pathRes  <- mkSafeKeyPath keysRoot (T.unpack name <> ".identity")
+  case pathRes of
+    Left err       -> pure (Left (T.pack (show err)))
+    Right safePath -> do
+      let identPath = getSafeKeyPath safePath
+      (exitCode, _stdout, stderrBs) <-
+        readProcess (proc "age-keygen" ["-o", identPath])
+      case exitCode of
+        ExitFailure n ->
+          pure (Left ("age-keygen exited with code " <> T.pack (show n)))
+        ExitSuccess -> do
+          let stderrText = TE.decodeUtf8Lenient (BL.toStrict stderrBs)
+          case parseAgePublicKey stderrText of
+            Nothing  -> pure (Left "age-keygen: could not parse public key from stderr")
+            Just pub -> do
+              setFileMode identPath 0o600
+              pure (Right ResolvedKey
+                { rkRecipient = pub
+                , rkIdentity  = T.pack identPath
+                , rkKeyType   = "x25519"
+                })
 
 setupYubiKey
   :: SealPaths -> Text -> Bool -> ChannelCaps -> IO (Either Text ResolvedKey)
@@ -118,41 +122,47 @@ setupYubiKey paths name touchRequired caps = do
     Nothing ->
       pure (Left "age-plugin-yubikey not found on PATH")
     Just _ -> do
-      _ <- ensureKeysRoot (spKeys paths)
-      let identPath   = keyFilePath paths (T.unpack name <> ".yubikey.txt")
-          touchPolicy = if touchRequired then "always" else "never"
-      (exitCode, stdoutBs, _) <-
-        readProcess (proc "age-plugin-yubikey"
-          ["--generate", "--touch-policy", touchPolicy])
-      let stdoutText = TE.decodeUtf8Lenient (BL.toStrict stdoutBs)
-      mRecipient <-
-        if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
-          then do
-            BS.writeFile identPath (TE.encodeUtf8 stdoutText)
-            setFileMode identPath 0o600
-            pure (parsePluginRecipient stdoutText)
-          else do
-            -- TTY fallback: instruct user and wait for manual completion.
-            ccSend caps
-              ("age-plugin-yubikey requires interactive input. Run:\n"
-               <> "    age-plugin-yubikey --generate --touch-policy "
-               <> T.pack touchPolicy <> " > " <> T.pack identPath)
-            _ <- ccPrompt caps "Press Enter once the command has completed"
-            rawE <- try @IOException (BS.readFile identPath)
-            case rawE of
-              Left _ -> pure Nothing
-              Right raw -> do
+      keysRoot <- ensureKeysRoot (spKeys paths)
+      pathRes  <- mkSafeKeyPath keysRoot (T.unpack name <> ".yubikey.txt")
+      case pathRes of
+        Left err -> pure (Left (T.pack (show err)))
+        Right safePath -> do
+          let identPath   = getSafeKeyPath safePath
+              touchPolicy = if touchRequired then "always" else "never"
+          (exitCode, stdoutBs, _) <-
+            readProcess (proc "age-plugin-yubikey"
+              ["--generate", "--touch-policy", touchPolicy])
+          let stdoutText = TE.decodeUtf8Lenient (BL.toStrict stdoutBs)
+          mRecipient <-
+            if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
+              then do
+                BS.writeFile identPath (TE.encodeUtf8 stdoutText)
                 setFileMode identPath 0o600
-                pure (parsePluginRecipient (TE.decodeUtf8Lenient raw))
-      case mRecipient of
-        Nothing  -> pure (Left "age-plugin-yubikey: could not parse recipient line")
-        Just pub -> do
-          absPath <- makeAbsolute identPath
-          pure (Right ResolvedKey
-            { rkRecipient = pub
-            , rkIdentity  = T.pack absPath
-            , rkKeyType   = "yubikey"
-            })
+                pure (Right (parsePluginRecipient stdoutText))
+              else do
+                -- TTY fallback: instruct user and wait for manual completion.
+                ccSend caps
+                  ("age-plugin-yubikey requires interactive input. Run:\n"
+                   <> "    age-plugin-yubikey --generate --touch-policy "
+                   <> T.pack touchPolicy <> " > " <> T.pack identPath)
+                _ <- ccPrompt caps "Press Enter once the command has completed"
+                rawE <- try @IOException (BS.readFile identPath)
+                case rawE of
+                  Left e ->
+                    pure (Left ("age-plugin-yubikey: identity file not readable: "
+                                 <> T.pack (show e)))
+                  Right raw -> do
+                    setFileMode identPath 0o600
+                    pure (Right (parsePluginRecipient (TE.decodeUtf8Lenient raw)))
+          case mRecipient of
+            Left ioErr       -> pure (Left ioErr)
+            Right Nothing    -> pure (Left "age-plugin-yubikey: could not parse recipient line")
+            Right (Just pub) ->
+              pure (Right ResolvedKey
+                { rkRecipient = pub
+                , rkIdentity  = T.pack identPath
+                , rkKeyType   = "yubikey"
+                })
 
 setupUserSupplied :: ChannelCaps -> IO (Either Text ResolvedKey)
 setupUserSupplied caps = do

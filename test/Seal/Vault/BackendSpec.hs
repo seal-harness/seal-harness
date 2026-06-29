@@ -2,6 +2,7 @@
 module Seal.Vault.BackendSpec (spec) where
 
 import Data.Bits ((.&.))
+import Data.Either (isLeft)
 import Data.List (sort)
 import Data.Text qualified as T
 import System.Directory (doesFileExist, findExecutable)
@@ -19,6 +20,7 @@ import Seal.Vault.Backend
   ( ResolvedKey (..)
   , detectAgePlugins
   , filterPluginNames
+  , parsePluginRecipient
   , parseUnlockMode
   , resolveEncryptor
   , setupLocalAgeKey
@@ -54,6 +56,17 @@ spec = describe "Seal.Vault.Backend" $ do
       plugins <- detectAgePlugins
       plugins `shouldSatisfy` (not . any (null . show))
 
+  describe "parsePluginRecipient" $ do
+    it "parses a canonical Recipient line" $
+      parsePluginRecipient "# Recipient: age1yubikey1abc123\n"
+        `shouldBe` Just "age1yubikey1abc123"
+    it "parses a lowercase recipient: line (case-insensitive)" $
+      parsePluginRecipient "# recipient: age1yubikey1xyz\n"
+        `shouldBe` Just "age1yubikey1xyz"
+    it "returns Nothing when no recipient line is present" $
+      parsePluginRecipient "# Identity: AGE-PLUGIN-YUBIKEY-1ABC\n"
+        `shouldBe` Nothing
+
   describe "resolveEncryptor" $ do
     it "returns Left VaultBackendError when recipient is missing" $ do
       result <- resolveEncryptor defaultFileConfig
@@ -76,6 +89,18 @@ spec = describe "Seal.Vault.Backend" $ do
       case result of
         Left (VaultBackendError _) -> pure ()
         _ -> expectationFailure "expected Left VaultBackendError"
+
+    it "returns Right VaultEncryptor (or Left VaultBackendError if age absent) when both fields are set" $ do
+      let fc = defaultFileConfig
+            { fcVaultRecipient = Just "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqysq0"
+            , fcVaultIdentity  = Just "/nonexistent/test.identity"
+            }
+      result <- resolveEncryptor fc
+      case result of
+        Right _                    -> pure ()  -- age binary present; encryptor built
+        Left (VaultBackendError _) -> pure ()  -- age binary absent; acceptable
+        Left other ->
+          expectationFailure $ "unexpected error variant: " ++ show other
 
   describe "setupUserSupplied" $ do
     it "prompts for recipient then identity path; returns ResolvedKey with rkKeyType=user" $ do
@@ -122,6 +147,24 @@ spec = describe "Seal.Vault.Backend" $ do
                 st <- getFileStatus identPath
                 let mode = fileMode st .&. 0o777
                 mode `shouldBe` 0o600
+
+    it "rejects a traversing name (\"../escape\") and creates no file outside keys dir" $ do
+      ageKeygenExe <- findExecutable "age-keygen"
+      case ageKeygenExe of
+        Nothing -> pendingWith "age-keygen not installed"
+        Just _  ->
+          withSystemTempDirectory "seal-confine-test" $ \tmpDir -> do
+            let paths = SealPaths
+                  { spHome   = tmpDir
+                  , spConfig = tmpDir </> "config"
+                  , spState  = tmpDir </> "state"
+                  , spKeys   = tmpDir </> "keys"
+                  }
+            result <- setupLocalAgeKey paths "../escape"
+            result `shouldSatisfy` isLeft
+            -- Verify no file was written outside the keys directory
+            exists <- doesFileExist (tmpDir </> "escape.identity")
+            exists `shouldBe` False
 
   describe "setupYubiKey" $ do
     it "generates a yubikey identity and returns ResolvedKey with rkKeyType=yubikey" $ do
