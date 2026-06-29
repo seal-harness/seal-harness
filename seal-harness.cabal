@@ -52,6 +52,7 @@ library
         Seal.Security.Vault
         Seal.Security.Policy
         Seal.Security.Command
+        Seal.Config.Paths
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -105,9 +106,11 @@ test-suite tests
       , filepath
       , typed-process
       , optparse-applicative
+      , unix
     hs-source-dirs: test
     other-modules:
         Seal.ConfigSpec
+        Seal.Config.PathsSpec
         Seal.Security.CryptoSpec
         Seal.Security.PathSpec
         Seal.Security.SecretsSpec

@@ -3,6 +3,7 @@ module Main (main) where
 import Test.Hspec
 
 import qualified Seal.ConfigSpec
+import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
 import qualified Seal.Security.PathSpec
 import qualified Seal.Security.SecretsSpec
@@ -17,6 +18,7 @@ import qualified Seal.Command.SpecSpec
 main :: IO ()
 main = hspec $ do
   Seal.ConfigSpec.spec
+  Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
   Seal.Security.PathSpec.spec
   Seal.Security.SecretsSpec.spec
