@@ -66,6 +66,20 @@ spec = describe "Seal.Vault.Backend" $ do
     it "returns Nothing when no recipient line is present" $
       parsePluginRecipient "# Identity: AGE-PLUGIN-YUBIKEY-1ABC\n"
         `shouldBe` Nothing
+    -- Regression: age-plugin-yubikey right-aligns its comment labels, so the
+    -- real Recipient line has several spaces after '#'. The label-stripping
+    -- parser must handle that, not just a single space.
+    it "parses the right-aligned Recipient label from real --generate output" $
+      parsePluginRecipient (T.unlines
+        [ "#       Serial: 27249638, Slot: 3"
+        , "#         Name: age identity d170efd7"
+        , "#      Created: Mon, 29 Jun 2026 16:13:09 +0000"
+        , "#   PIN policy: Once   (A PIN is required once per session, if set)"
+        , "# Touch policy: Never  (A physical touch is NOT required to decrypt)"
+        , "#    Recipient: age1yubikey1qexampleexampleexampleexampleexampleex0"
+        , "AGE-PLUGIN-YUBIKEY-1EXAMPLEEXAMPLEEXAMPLE"
+        ])
+        `shouldBe` Just "age1yubikey1qexampleexampleexampleexampleexampleex0"
 
   describe "resolveEncryptor" $ do
     it "returns Left VaultBackendError when recipient is missing" $ do

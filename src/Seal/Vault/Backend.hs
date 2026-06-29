@@ -205,15 +205,22 @@ parseAgePublicKey txt =
     []       -> Nothing
     (line:_) -> Just (T.drop (T.length "Public key: ") line)
 
--- | Parse "# Recipient: age1yubikey1..." from age-plugin-yubikey output.
--- Match is case-insensitive on "recipient" per the age plugin spec.
--- Structure: "# " (2) + word + ": " + recipient. We drop "# ", then split on ": ".
+-- | Parse the recipient (public key) from age-plugin-yubikey @--generate@
+-- output. The recipient appears on a comment line such as
+-- @#    Recipient: age1yubikey1...@. age-plugin-yubikey RIGHT-ALIGNS its
+-- comment labels, so the number of spaces between @#@ and the label varies
+-- between lines; we therefore strip the leading @#@ and surrounding whitespace
+-- before matching the label (case-insensitively per the age plugin spec) and
+-- take everything after the first @:@.
 parsePluginRecipient :: Text -> Maybe Text
 parsePluginRecipient txt =
-  let isRecipientLine l = "# recipient: " `T.isPrefixOf` T.toCaseFold l
-  in case filter isRecipientLine (T.lines txt) of
-       []      -> Nothing
-       (line:_) ->
-         case T.breakOn ": " (T.drop 2 line) of   -- drop "# "
-           (_, rest) | not (T.null rest) -> Just (T.strip (T.drop 2 rest))
-           _                             -> Nothing
+  case filter isRecipientLine (T.lines txt) of
+    []       -> Nothing
+    (line:_) ->
+      let value = T.strip (T.drop 1 (T.dropWhile (/= ':') (labelOf line)))
+      in if T.null value then Nothing else Just value
+  where
+    -- Drop a leading @#@ comment marker and the surrounding alignment spaces,
+    -- leaving the label, e.g. @"Recipient: age1yubikey1..."@.
+    labelOf l = T.stripStart (T.dropWhile (== '#') (T.stripStart l))
+    isRecipientLine l = "recipient:" `T.isPrefixOf` T.toCaseFold (labelOf l)
