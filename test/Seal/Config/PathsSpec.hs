@@ -4,7 +4,7 @@ import Control.Exception (bracket)
 import Data.Foldable (for_)
 import System.Directory (doesDirectoryExist, getHomeDirectory)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus, intersectFileModes)
 import Test.Hspec
@@ -45,6 +45,14 @@ spec = describe "Seal.Config.Paths" $ do
           ensureSealDirs paths
           doesDirectoryExist (spConfig paths) `shouldReturn` True
           doesDirectoryExist (spState  paths) `shouldReturn` True
+
+    it "creates the vault's parent directory (so the atomic write succeeds)" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          ensureSealDirs paths
+          doesDirectoryExist (takeDirectory (vaultFilePath paths))
+            `shouldReturn` True
 
     it "creates keys/ with mode 0700" $
       withSystemTempDirectory "seal-home" $ \tmp ->

@@ -9,7 +9,7 @@ module Seal.Config.Paths
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.Posix.Files (setFileMode)
 
 -- | All paths derived from the seal home directory.
@@ -62,6 +62,9 @@ ensureSealDirs paths = do
   createDirectoryIfMissing True (spConfig paths)
   createDirectoryIfMissing True (spState  paths)
   createDirectoryIfMissing True (spKeys   paths)
+  -- The vault lives in a subdirectory of config/ ('vaultFilePath'); create it
+  -- so the atomic vault write has an existing parent for its .tmp file.
+  createDirectoryIfMissing True (takeDirectory (vaultFilePath paths))
   setFileMode (spKeys paths) 0o700
 
 -- | Absolute path to the TOML config file: @\<config\>\/config.toml@.
