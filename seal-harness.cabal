@@ -42,6 +42,7 @@ library
         Seal.Commands.Greet
         Seal.Commands.Tick
         Seal.Channel.Caps
+        Seal.Command.Parse
         Seal.Command.Spec
         Seal.Security.Crypto
         Seal.Security.Path
@@ -113,4 +114,5 @@ test-suite tests
         Seal.Security.VaultSpec
         Seal.Security.PolicySpec
         Seal.Security.CommandSpec
+        Seal.Command.ParseSpec
         Seal.Command.SpecSpec
