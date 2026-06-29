@@ -17,7 +17,7 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec (CommandSpec (..), CommandAction (..))
-import Seal.Config.File (FileConfig (..), defaultFileConfig, saveFileConfig)
+import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
 import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), VaultStatus (..), UnlockMode (..), openVault)
 import Seal.Security.Vault.Age (VaultError (..), mkMockEncryptor)
@@ -86,6 +86,14 @@ runVaultCmd_ rt caps args = do
   case result of
     Right () -> pure ()
     Left msg -> expectationFailure $ "vault command parse failed: " ++ msg
+
+-- | The vault identity path currently recorded in config (empty if absent).
+identityFromConfig :: FilePath -> IO FilePath
+identityFromConfig cfgPath = do
+  c <- loadFileConfig cfgPath
+  pure $ case c of
+    Right fc -> maybe "" T.unpack (fcVaultIdentity fc)
+    Left _   -> ""
 
 -- ---------------------------------------------------------------------------
 -- Spec
@@ -322,8 +330,10 @@ spec = describe "Seal.Vault.Commands" $ do
                     hasYubi <- elem "yubikey" <$> detectAgePlugins
                     let userBackend = if hasYubi then "3" else "2"
                     -- Step 4: second setup with UserSupplied → hits rekeyExisting.
+                    -- "y" confirms the up-front rotation prompt; the inner rekey
+                    -- confirmation is now implicit, so no trailing "y".
                     (fc2, caps2) <- makeFakeCaps
-                      [userBackend, recipient2, T.pack ident2Path, "y"]
+                      ["y", userBackend, recipient2, T.pack ident2Path]
                     runVaultCmd_ rt caps2 ["setup"]
                     sent2 <- getSent fc2
                     sent2 `shouldSatisfy` any (T.isInfixOf "rekey")
@@ -392,6 +402,89 @@ spec = describe "Seal.Vault.Commands" $ do
             doesFileExist (vaultFilePath paths) `shouldReturn` False
             sent <- getSent fc
             sent `shouldSatisfy` any (T.isInfixOf "created")
+
+    -- Regression: re-running setup must never overwrite the in-use identity
+    -- file, or the existing vault becomes undecryptable and its secrets are
+    -- lost. A local-age rotation writes a brand-new key file; the old one must
+    -- survive so rekey can decrypt the current vault first.
+    it "rotation keeps the old key file and preserves secrets (no clobber)" $ do
+      ageExe       <- findExecutable "age"
+      agekeygenExe <- findExecutable "age-keygen"
+      case (ageExe, agekeygenExe) of
+        (Nothing, _) -> pendingWith "age not installed"
+        (_, Nothing) -> pendingWith "age-keygen not installed"
+        _ ->
+          withSystemTempDirectory "seal-cmd-rotate" $ \tmpDir -> do
+            let vaultDir = tmpDir </> "config" </> "vault"
+                keysDir  = tmpDir </> "keys"
+                cfgPath  = tmpDir </> "config" </> "config.toml"
+                paths    = SealPaths tmpDir (tmpDir </> "config")
+                                      (tmpDir </> "state") keysDir
+            createDirectoryIfMissing True vaultDir
+            createDirectoryIfMissing True (tmpDir </> "config")
+            createDirectoryIfMissing True keysDir
+            ref <- newIORef Nothing
+            let rt = VaultRuntime paths cfgPath ref
+            -- First setup (local age) and store a secret.
+            (_, caps1) <- makeFakeCaps ["1"]
+            runVaultCmd_ rt caps1 ["setup"]
+            mh1 <- readIORef ref
+            case mh1 of
+              Nothing -> expectationFailure "first setup did not populate vrHandleRef"
+              Just h1 -> do
+                _ <- vhPut h1 "k" (TE.encodeUtf8 "v")
+                ident1 <- identityFromConfig cfgPath
+                ident1 `shouldSatisfy` (not . null)
+                -- Second setup (local age) → rotation: "y" up front, backend "1".
+                (_, caps2) <- makeFakeCaps ["y", "1"]
+                runVaultCmd_ rt caps2 ["setup"]
+                -- The OLD identity file is never overwritten.
+                doesFileExist ident1 `shouldReturn` True
+                -- Config now points at a fresh, different identity file.
+                ident2 <- identityFromConfig cfgPath
+                ident2 `shouldNotBe` ident1
+                doesFileExist ident2 `shouldReturn` True
+                -- The pre-rotation secret survives the rotation.
+                mh2 <- readIORef ref
+                case mh2 of
+                  Nothing -> expectationFailure "rotation did not update vrHandleRef"
+                  Just h2 -> vhGet h2 "k" `shouldReturn` Right (TE.encodeUtf8 "v")
+
+    it "declining rotation on an existing vault leaves it unchanged" $ do
+      ageExe       <- findExecutable "age"
+      agekeygenExe <- findExecutable "age-keygen"
+      case (ageExe, agekeygenExe) of
+        (Nothing, _) -> pendingWith "age not installed"
+        (_, Nothing) -> pendingWith "age-keygen not installed"
+        _ ->
+          withSystemTempDirectory "seal-cmd-decline" $ \tmpDir -> do
+            let vaultDir = tmpDir </> "config" </> "vault"
+                keysDir  = tmpDir </> "keys"
+                cfgPath  = tmpDir </> "config" </> "config.toml"
+                paths    = SealPaths tmpDir (tmpDir </> "config")
+                                      (tmpDir </> "state") keysDir
+            createDirectoryIfMissing True vaultDir
+            createDirectoryIfMissing True (tmpDir </> "config")
+            createDirectoryIfMissing True keysDir
+            ref <- newIORef Nothing
+            let rt = VaultRuntime paths cfgPath ref
+            (_, caps1) <- makeFakeCaps ["1"]
+            runVaultCmd_ rt caps1 ["setup"]
+            ident1 <- identityFromConfig cfgPath
+            mh1 <- readIORef ref
+            case mh1 of
+              Nothing -> expectationFailure "first setup did not populate vrHandleRef"
+              Just h1 -> do
+                _ <- vhPut h1 "k" (TE.encodeUtf8 "v")
+                -- Second setup, decline the rotation prompt with "n".
+                (fc2, caps2) <- makeFakeCaps ["n"]
+                runVaultCmd_ rt caps2 ["setup"]
+                sent2 <- getSent fc2
+                sent2 `shouldSatisfy` any (T.isInfixOf "cancelled")
+                -- Config key unchanged; the secret is still readable.
+                ident2 <- identityFromConfig cfgPath
+                ident2 `shouldBe` ident1
+                vhGet h1 "k" `shouldReturn` Right (TE.encodeUtf8 "v")
 
   describe "full sequence (mock encryptor)" $ do
     it "add -> get -> list -> delete -> status flow" $

@@ -24,9 +24,9 @@ import Data.List (isPrefixOf, nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (findExecutable, listDirectory)
+import System.Directory (doesPathExist, findExecutable, listDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath (splitSearchPath)
+import System.FilePath (splitSearchPath, (</>))
 import System.Posix.Files (setFileMode)
 import System.Process.Typed (ExitCode (..), proc, readProcess)
 
@@ -89,10 +89,24 @@ detectAgePlugins = do
 -- Backend setup
 -- ---------------------------------------------------------------------------
 
+-- | First available relative key-file name under the keys directory, of the
+-- form @<base><ext>@, @<base>-1<ext>@, @<base>-2<ext>@, … A newly generated key
+-- is always written to a name that does not yet exist, so setup NEVER
+-- overwrites an identity file that an existing vault still depends on: key
+-- rotation must keep the old key intact in order to decrypt the current vault.
+freshKeyName :: FilePath -> String -> String -> IO FilePath
+freshKeyName keysDir base ext = go (0 :: Int)
+  where
+    go n = do
+      let rel = base <> (if n == 0 then "" else "-" <> show n) <> ext
+      taken <- doesPathExist (keysDir </> rel)
+      if taken then go (n + 1) else pure rel
+
 setupLocalAgeKey :: SealPaths -> Text -> IO (Either Text ResolvedKey)
 setupLocalAgeKey paths name = do
   keysRoot <- ensureKeysRoot (spKeys paths)
-  pathRes  <- mkSafeKeyPath keysRoot (T.unpack name <> ".identity")
+  rel      <- freshKeyName (spKeys paths) (T.unpack name) ".identity"
+  pathRes  <- mkSafeKeyPath keysRoot rel
   case pathRes of
     Left err       -> pure (Left (T.pack (show err)))
     Right safePath -> do
@@ -131,7 +145,8 @@ setupYubiKey paths name touchRequired pinRequired caps = do
       pure (Left "age-plugin-yubikey not found on PATH")
     Just _ -> do
       keysRoot <- ensureKeysRoot (spKeys paths)
-      pathRes  <- mkSafeKeyPath keysRoot (T.unpack name <> ".yubikey.txt")
+      rel      <- freshKeyName (spKeys paths) (T.unpack name) ".yubikey.txt"
+      pathRes  <- mkSafeKeyPath keysRoot rel
       case pathRes of
         Left err -> pure (Left (T.pack (show err)))
         Right safePath -> do

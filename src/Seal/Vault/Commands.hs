@@ -10,11 +10,12 @@ module Seal.Vault.Commands
 
 import Control.Monad (when)
 import Data.IORef (IORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Options.Applicative
+import System.Directory (doesFileExist)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
@@ -143,6 +144,39 @@ setupCmd :: VaultRuntime -> CommandAction
 setupCmd rt = CommandAction $ \caps -> do
   -- Snapshot old config BEFORE any modifications so rekeyExisting can use it.
   oldCfg <- loadFileConfig (vrConfigPath rt)
+  let vaultPath = case oldCfg of
+        Left _    -> vaultFilePath (vrPaths rt)
+        Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath cfg)
+      hasKey = case oldCfg of
+        Right cfg -> isJust (fcVaultRecipient cfg) && isJust (fcVaultIdentity cfg)
+        Left _    -> False
+  vaultExists <- doesFileExist vaultPath
+  -- An existing vault WITH a recorded key means re-running setup rotates that
+  -- key; confirm first and reassure that secrets are preserved (the old key is
+  -- kept and nothing is decrypted-then-lost). A vault file with no key recorded
+  -- in config is an orphan from an interrupted setup — fall through so the
+  -- orphan branch in rekeyExisting can tell the user to delete it.
+  proceed <-
+    if vaultExists && hasKey
+      then do
+        ccSend caps
+          (  "A vault already exists. Continuing will ROTATE its key: every "
+          <> "secret is re-encrypted to a new key. Your existing secrets are "
+          <> "preserved, and the current key file is kept (never overwritten).")
+        ans <- ccPrompt caps "Rotate the vault key? [y/N]: "
+        pure (T.toLower (T.strip ans) `elem` ["y", "yes"])
+      else pure True
+  if not proceed
+    then ccSend caps "Setup cancelled; the vault is unchanged."
+    else runSetup rt caps oldCfg
+
+-- | Backend selection + key generation + vault init/rekey. Split out of
+-- 'setupCmd' so the existing-vault rotation guard stays readable. New keys are
+-- always written to a fresh identity file (see 'freshKeyName' in
+-- "Seal.Vault.Backend"), so a rotation never overwrites the key the current
+-- vault still depends on.
+runSetup :: VaultRuntime -> ChannelCaps -> Either Text FileConfig -> IO ()
+runSetup rt caps oldCfg = do
   plugins <- detectAgePlugins
   let hasYubi = "yubikey" `elem` plugins
   ccSend caps "Available vault backends:"
@@ -244,10 +278,9 @@ rekeyExisting rt caps newEnc rk eCfg = do
                     }
               oldH <- openVault oldVaultCfg oldEnc
               -- vhRekey reads from disk directly; no explicit unlock needed.
-              let confirmRekey msg = do
-                    ccSend caps msg
-                    r <- ccPrompt caps "Confirm rekey? [y/N]: "
-                    pure (T.toLower (T.strip r) `elem` ["y", "yes"])
+              -- Rotation was already confirmed up front in setupCmd, so show the
+              -- old/new key summary and proceed without a second prompt.
+              let confirmRekey msg = ccSend caps msg >> pure True
               rekeyResult <- vhRekey oldH newEnc (rkKeyType rk) confirmRekey
               case rekeyResult of
                 Right () -> do
