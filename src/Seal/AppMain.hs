@@ -1,6 +1,10 @@
-module Seal.AppMain (appMain) where
+module Seal.AppMain
+  ( appMain
+  , withDefaultArgs
+  ) where
 
 import Control.Monad.IO.Class (liftIO)
+import System.Environment (getArgs, withArgs)
 import qualified Configuration.Utils as CUtils
 
 import Seal.Types.Config
@@ -23,6 +27,17 @@ dispatch cfg = do
     CommandNoOp -> pure ()
     CommandRepl -> liftIO Seal.Repl.runRepl
 
+-- | Map the process arguments so that an empty argument list behaves as if
+-- @--help@ was passed. Running @seal@ with no arguments should print usage
+-- rather than silently doing nothing. Any non-empty argument list is passed
+-- through unchanged.
+withDefaultArgs :: [String] -> [String]
+withDefaultArgs [] = ["--help"]
+withDefaultArgs as = as
+
 -- | Entry point: parse defaults + config file + CLI flags, then dispatch.
+-- With no arguments, fall back to @--help@.
 appMain :: IO ()
-appMain = CUtils.runWithConfiguration programInfo dispatch
+appMain = do
+  args <- getArgs
+  withArgs (withDefaultArgs args) (CUtils.runWithConfiguration programInfo dispatch)

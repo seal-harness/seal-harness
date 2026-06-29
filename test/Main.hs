@@ -2,6 +2,7 @@ module Main (main) where
 
 import Test.Hspec
 
+import qualified Seal.AppMainSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -22,6 +23,7 @@ import qualified Seal.Channel.CliSpec
 
 main :: IO ()
 main = hspec $ do
+  Seal.AppMainSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec

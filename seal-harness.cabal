@@ -113,6 +113,7 @@ test-suite tests
       , unix
     hs-source-dirs: test
     other-modules:
+        Seal.AppMainSpec
         Seal.ConfigSpec
         Seal.Config.PathsSpec
         Seal.Security.CryptoSpec
