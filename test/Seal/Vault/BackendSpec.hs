@@ -197,7 +197,8 @@ spec = describe "Seal.Vault.Backend" $ do
             -- (captured stdout) does not consume these, but if the plugin
             -- requires a TTY the fallback prompts exactly once.
             (_, caps) <- makeFakeCaps [""]
-            result <- setupYubiKey paths "yubi" False caps
+            -- touchRequired=False, pinRequired=True (the age-plugin default).
+            result <- setupYubiKey paths "yubi" False True caps
             case result of
               -- Hardware absent: plugin ran but produced no parseable output.
               Left _ -> pendingWith "age-plugin-yubikey: hardware not available"

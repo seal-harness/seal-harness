@@ -158,7 +158,10 @@ setupCmd rt = CommandAction $ \caps -> do
     ("2", True)  -> do
       tp <- ccPrompt caps "Require touch? [y/N]: "
       let touch = T.toLower (T.strip tp) `elem` ["y", "yes"]
-      setupYubiKey (vrPaths rt) "default" touch caps
+      pp <- ccPrompt caps
+        "Require PIN on each decrypt session? [Y/n] (choose n for no PIN): "
+      let pin = T.toLower (T.strip pp) `notElem` ["n", "no"]
+      setupYubiKey (vrPaths rt) "default" touch pin caps
     ("2", False) -> setupUserSupplied caps
     ("3", True)  -> setupUserSupplied caps
     (other, _)   -> pure (Left ("Invalid choice: " <> other))

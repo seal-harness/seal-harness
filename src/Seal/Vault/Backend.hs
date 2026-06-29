@@ -114,9 +114,17 @@ setupLocalAgeKey paths name = do
                 , rkKeyType   = "x25519"
                 })
 
+-- | Generate (or reuse) a YubiKey-backed age identity.
+--
+-- @touchRequired@ -> @--touch-policy always|never@.
+-- @pinRequired@   -> @--pin-policy   once|never@. Choosing @never@ means
+-- decryption needs no PIN (only the token present, plus a touch if required);
+-- choosing @once@ (the age-plugin-yubikey default) prompts for the PIN once per
+-- decrypt session.
 setupYubiKey
-  :: SealPaths -> Text -> Bool -> ChannelCaps -> IO (Either Text ResolvedKey)
-setupYubiKey paths name touchRequired caps = do
+  :: SealPaths -> Text -> Bool -> Bool -> ChannelCaps
+  -> IO (Either Text ResolvedKey)
+setupYubiKey paths name touchRequired pinRequired caps = do
   mPlugin <- findExecutable "age-plugin-yubikey"
   case mPlugin of
     Nothing ->
@@ -129,9 +137,13 @@ setupYubiKey paths name touchRequired caps = do
         Right safePath -> do
           let identPath   = getSafeKeyPath safePath
               touchPolicy = if touchRequired then "always" else "never"
+              pinPolicy   = if pinRequired then "once" else "never"
           (exitCode, stdoutBs, _) <-
             readProcess (proc "age-plugin-yubikey"
-              ["--generate", "--touch-policy", touchPolicy])
+              [ "--generate"
+              , "--touch-policy", touchPolicy
+              , "--pin-policy", pinPolicy
+              ])
           let stdoutText = TE.decodeUtf8Lenient (BL.toStrict stdoutBs)
           mRecipient <-
             if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
@@ -144,7 +156,8 @@ setupYubiKey paths name touchRequired caps = do
                 ccSend caps
                   ("age-plugin-yubikey requires interactive input. Run:\n"
                    <> "    age-plugin-yubikey --generate --touch-policy "
-                   <> T.pack touchPolicy <> " > " <> T.pack identPath)
+                   <> T.pack touchPolicy <> " --pin-policy " <> T.pack pinPolicy
+                   <> " > " <> T.pack identPath)
                 _ <- ccPrompt caps "Press Enter once the command has completed"
                 rawE <- try @IOException (BS.readFile identPath)
                 case rawE of
