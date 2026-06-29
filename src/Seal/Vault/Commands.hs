@@ -209,38 +209,54 @@ rekeyExisting rt caps newEnc rk eCfg = do
   case eCfg of
     Left err ->
       ccSend caps ("Cannot read existing config for rekey: " <> err)
-    Right oldCfg -> do
-      oldEncResult <- resolveEncryptor oldCfg
-      case oldEncResult of
-        Left e ->
-          ccSend caps ("Cannot load existing key for rekey: " <> vaultErrMsg e)
-        Right oldEnc -> do
-          let oldVaultCfg = VaultConfig
-                { vcPath   = vaultFilePath (vrPaths rt)
-                , vcKeyType = fromMaybe "unknown" (fcVaultKeyType oldCfg)
-                , vcUnlock  = UnlockOnDemand
-                }
-          oldH <- openVault oldVaultCfg oldEnc
-          _ <- vhUnlock oldH
-          let confirmRekey msg = do
-                ccSend caps msg
-                r <- ccPrompt caps "Confirm rekey? [y/N]: "
-                pure (T.toLower (T.strip r) `elem` ["y", "yes"])
-          rekeyResult <- vhRekey oldH newEnc (rkKeyType rk) confirmRekey
-          case rekeyResult of
-            Right () -> do
-              ur <- updateFileConfig (vrConfigPath rt) $ \fc -> fc
-                { fcVaultRecipient = Just (rkRecipient rk)
-                , fcVaultIdentity  = Just (rkIdentity  rk)
-                , fcVaultKeyType   = Just (rkKeyType   rk)
-                }
-              case ur of
-                Left err -> ccSend caps ("Config write failed after rekey: " <> err)
-                Right () -> do
-                  writeIORef (vrHandleRef rt) (Just oldH)
-                  ccSend caps "Vault rekeyed successfully."
+    Right oldCfg ->
+      case (fcVaultRecipient oldCfg, fcVaultIdentity oldCfg) of
+        (Nothing, Nothing) ->
+          -- Vault file exists but config has no key: a previous setup was
+          -- interrupted before the config was written.  Tell the user to
+          -- remove the orphaned file rather than trying to re-encrypt it.
+          ccSend caps
+            (  "vault file exists at "
+            <> T.pack (vaultFilePath (vrPaths rt))
+            <> " but the config has no key recorded — it was likely left from"
+            <> " an interrupted setup. Delete that file and re-run '/vault setup'.")
+        _ -> do
+          oldEncResult <- resolveEncryptor oldCfg
+          case oldEncResult of
             Left e ->
-              ccSend caps (vaultErrMsg e)
+              ccSend caps ("Cannot load existing key for rekey: " <> vaultErrMsg e)
+            Right oldEnc -> do
+              let oldVaultCfg = VaultConfig
+                    { vcPath    = vaultFilePath (vrPaths rt)
+                    , vcKeyType = fromMaybe "unknown" (fcVaultKeyType oldCfg)
+                    , vcUnlock  = UnlockOnDemand
+                    }
+              oldH <- openVault oldVaultCfg oldEnc
+              -- vhRekey reads from disk directly; no explicit unlock needed.
+              let confirmRekey msg = do
+                    ccSend caps msg
+                    r <- ccPrompt caps "Confirm rekey? [y/N]: "
+                    pure (T.toLower (T.strip r) `elem` ["y", "yes"])
+              rekeyResult <- vhRekey oldH newEnc (rkKeyType rk) confirmRekey
+              case rekeyResult of
+                Right () -> do
+                  ur <- updateFileConfig (vrConfigPath rt) $ \fc -> fc
+                    { fcVaultRecipient = Just (rkRecipient rk)
+                    , fcVaultIdentity  = Just (rkIdentity  rk)
+                    , fcVaultKeyType   = Just (rkKeyType   rk)
+                    }
+                  case ur of
+                    Left err -> ccSend caps
+                      (  "ERROR: vault was re-encrypted with the new key, but saving the"
+                      <> " config failed (" <> err <> "). The vault on disk now requires"
+                      <> " the NEW key, but the config still points at the OLD key, so the"
+                      <> " next session cannot open it. Fix: re-run '/vault setup' to write"
+                      <> " the new key into config, or restore config from backup.")
+                    Right () -> do
+                      writeIORef (vrHandleRef rt) (Just oldH)
+                      ccSend caps "Vault rekeyed successfully."
+                Left e ->
+                  ccSend caps (vaultErrMsg e)
 
 addCmd :: VaultRuntime -> Text -> CommandAction
 addCmd rt name = CommandAction $ \caps ->
