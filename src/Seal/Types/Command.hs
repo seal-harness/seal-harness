@@ -17,12 +17,15 @@ data Command
   = CommandNoOp
   | CommandGreet !Text
   | CommandTick !Int
+  | CommandRepl
   deriving (Eq, Show)
 
 pCommand :: Parser Command
 pCommand = hsubparser
-  $ command "greet" (info pGreet (progDesc "Greet someone"))
-  <> command "tick" (info pTick (progDesc "Increment the tick counter N times"))
+  $  command "greet" (info pGreet (progDesc "Greet someone"))
+  <> command "tick"  (info pTick  (progDesc "Increment the tick counter N times"))
+  <> command "repl"  (info (pure CommandRepl)
+                           (progDesc "Start the interactive REPL"))
 
 pGreet :: Parser Command
 pGreet = CommandGreet

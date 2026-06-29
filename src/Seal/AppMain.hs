@@ -1,5 +1,6 @@
 module Seal.AppMain (appMain) where
 
+import Control.Monad.IO.Class (liftIO)
 import qualified Configuration.Utils as CUtils
 
 import Seal.Types.Config
@@ -8,6 +9,7 @@ import Seal.Types.Env
 import Seal.Types.App
 import Seal.Commands.Greet
 import Seal.Commands.Tick
+import qualified Seal.Repl
 
 -- | Program information for 'runWithConfiguration'. Provides @--config-file@,
 -- @--print-config@, and @--help@ automatically.
@@ -20,9 +22,10 @@ dispatch :: Config -> IO ()
 dispatch cfg = do
   env <- mkEnv cfg
   runApp env $ case _config_command cfg of
-    CommandNoOp     -> pure ()
-    CommandGreet n  -> greet n
-    CommandTick n   -> tick n
+    CommandNoOp    -> pure ()
+    CommandGreet n -> greet n
+    CommandTick n  -> tick n
+    CommandRepl    -> liftIO Seal.Repl.runRepl
 
 -- | Entry point: parse defaults + config file + CLI flags, then dispatch.
 appMain :: IO ()
