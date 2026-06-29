@@ -106,6 +106,12 @@ spec = describe "Seal.Command.Help" $ do
       T.isInfixOf "General" idx `shouldBe` True
       T.isInfixOf "Vault"   idx `shouldBe` True
 
+    it "General group header appears before Vault group header (derived Ord)" $ do
+      let idx        = renderHelpIndex testRegistry
+          generalPos = T.length (fst (T.breakOn "General" idx))
+          vaultPos   = T.length (fst (T.breakOn "Vault"   idx))
+      generalPos `shouldSatisfy` (< vaultPos)
+
   -- -------------------------------------------------------------------------
   describe "renderHelpFor" $ do
 
@@ -124,10 +130,12 @@ spec = describe "Seal.Command.Help" $ do
       let h = renderHelpFor testRegistry (CommandName "nonexistent")
       T.null h `shouldBe` False
 
-    it "/help vault == /vault --help (same text)" $ do
-      let viaHelp  = renderHelpFor testRegistry (CommandName "vault")
-          viaFlag  = renderHelpFor testRegistry (CommandName "vault")
-      viaHelp `shouldBe` viaFlag
+    it "vault help contains its progDesc text and differs from ping help" $ do
+      let vaultHelp = renderHelpFor testRegistry (CommandName "vault")
+          pingHelp  = renderHelpFor testRegistry (CommandName "ping")
+      T.isInfixOf "Encrypt and manage secrets" vaultHelp `shouldBe` True
+      T.isInfixOf "vault" vaultHelp `shouldBe` True
+      vaultHelp `shouldNotBe` pingHelp
 
   -- -------------------------------------------------------------------------
   -- CENTERPIECE: Discoverability invariant.
