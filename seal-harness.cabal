@@ -55,6 +55,7 @@ library
         Seal.Config.File
         Seal.Config.Paths
         Seal.Vault.Backend
+        Seal.Vault.Commands
     build-depends:
         base >= 4.18 && < 5
       , text
@@ -126,3 +127,4 @@ test-suite tests
         Seal.Config.FileSpec
         Seal.TestHelpers.FakeCaps
         Seal.Vault.BackendSpec
+        Seal.Vault.CommandsSpec
