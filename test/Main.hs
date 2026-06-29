@@ -15,6 +15,7 @@ import qualified Seal.Command.HelpSpec
 import qualified Seal.Command.ParseSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Config.FileSpec
+import qualified Seal.Vault.BackendSpec
 
 main :: IO ()
 main = hspec $ do
@@ -31,3 +32,4 @@ main = hspec $ do
   Seal.Command.ParseSpec.spec
   Seal.Command.SpecSpec.spec
   Seal.Config.FileSpec.spec
+  Seal.Vault.BackendSpec.spec
