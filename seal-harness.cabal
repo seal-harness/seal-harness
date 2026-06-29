@@ -41,6 +41,7 @@ library
         Seal.Types.Env
         Seal.Commands.Greet
         Seal.Commands.Tick
+        Seal.Channel.Caps
         Seal.Security.Crypto
         Seal.Security.Path
         Seal.Security.Secrets
