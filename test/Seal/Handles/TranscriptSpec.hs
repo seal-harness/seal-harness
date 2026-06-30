@@ -38,6 +38,15 @@ spec = describe "Seal.Handles.Transcript" $ do
       contents <- BS8.readFile path
       length (BS8.lines contents) `shouldBe` 2
 
+  it "drains a recordAsync entry queued just before scope exit" $
+    withSystemTempDirectory "seal-tx" $ \dir -> do
+      let path = dir </> "transcript.jsonl"
+      e <- mkEntry
+      withTranscript path $ \h ->
+        recordAsync h e
+      contents <- BS8.readFile path
+      length (BS8.lines contents) `shouldBe` 1
+
   it "fakeTranscript records invocation order for assertions" $ do
     (h, readLog) <- fakeTranscript
     e <- mkEntry

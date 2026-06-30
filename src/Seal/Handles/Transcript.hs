@@ -12,10 +12,11 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (bracket)
-import Control.Monad (forever, void)
+import Control.Monad (void)
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BSU
-import Foreign.Ptr (castPtr)
+import Data.Word (Word8)
+import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import System.Posix.IO
   ( OpenFileFlags (..)
   , OpenMode (..)
@@ -41,14 +42,28 @@ data TranscriptHandle = TranscriptHandle
   -- for callers that want an explicit close point.
   }
 
-data Item = Item TranscriptEntry (Maybe (TMVar ()))
+-- | A unit of work for the single-writer daemon. 'Write' carries an entry and
+-- an optional ack slot (filled after fsync). 'Shutdown' tells the daemon to
+-- drain any remaining queued writes, fill its ack slot, and exit.
+data Item
+  = Write TranscriptEntry (Maybe (TMVar ()))
+  | Shutdown (TMVar ())
 
 -- | Write the strict 'ByteString' to 'fd' using the Posix primitive, which
--- bypasses any user-space buffer. Retries on short writes (rare but possible).
+-- bypasses any user-space buffer. Loops until the whole buffer is written,
+-- advancing past each (possibly short) write; 'fdWriteBuf' itself retries the
+-- underlying syscall on @EINTR@, so an interrupted write resumes rather than
+-- truncating the line.
 writeFd :: Fd -> BS.ByteString -> IO ()
 writeFd fd bs =
   BSU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
-    void $ fdWriteBuf fd (castPtr ptr) (fromIntegral len)
+    go (castPtr ptr) len
+  where
+    go :: Ptr Word8 -> Int -> IO ()
+    go _ 0 = pure ()
+    go ptr remaining = do
+      written <- fromIntegral <$> fdWriteBuf fd ptr (fromIntegral remaining)
+      go (ptr `plusPtr` written) (remaining - written)
 
 -- | Open the transcript file in O_APPEND mode, spawn the single-writer daemon,
 -- run @action@, then close. Every 'recordAndAck' blocks until 'fileSynchronise'
@@ -58,19 +73,40 @@ withTranscript path action = do
   q <- newTQueueIO
   let flags = defaultFileFlags
         { append = True
-        , creat = Just (0o644 :: FileMode)
+        , creat = Just (0o600 :: FileMode)
         }
-  bracket (openFd path WriteOnly flags) closeFd $ \fd -> do
-    void $ forkIO $ forever $ do
-      Item e mack <- atomically (readTQueue q)
-      writeFd fd (encodeEntryRaw e)
-      writeFd fd "\n"
-      fileSynchronise fd
-      maybe (pure ()) (\tv -> atomically (putTMVar tv ())) mack
-    let enqueue e = atomically (writeTQueue q (Item e Nothing))
+      ack = maybe (pure ()) (\tv -> atomically (putTMVar tv ()))
+      writeEntry fd e = do
+        writeFd fd (encodeEntryRaw e <> "\n")
+        fileSynchronise fd
+      -- Drain every currently-queued write (used at shutdown), fsyncing and
+      -- acking each, so nothing is lost before the fd is closed.
+      drain fd = do
+        next <- atomically (tryReadTQueue q)
+        case next of
+          Nothing -> pure ()
+          Just (Write e mack) -> writeEntry fd e >> ack mack >> drain fd
+          Just (Shutdown done) -> atomically (putTMVar done ()) >> drain fd
+      -- Single-writer daemon: process writes; on Shutdown, drain the queue,
+      -- signal completion, and exit (no 'forever', so it stops deterministically).
+      daemon fd = do
+        item <- atomically (readTQueue q)
+        case item of
+          Write e mack -> writeEntry fd e >> ack mack >> daemon fd
+          Shutdown done -> drain fd >> atomically (putTMVar done ())
+      -- Cleanup: tell the daemon to drain+exit and WAIT for it before closing
+      -- the fd, so no queued write races (or writes to) a closed fd.
+      shutdown fd = do
+        done <- newEmptyTMVarIO
+        atomically (writeTQueue q (Shutdown done))
+        atomically (takeTMVar done)
+        closeFd fd
+  bracket (openFd path WriteOnly flags) shutdown $ \fd -> do
+    void $ forkIO (daemon fd)
+    let enqueue e = atomically (writeTQueue q (Write e Nothing))
         ackWrite e = do
           tv <- newEmptyTMVarIO
-          atomically (writeTQueue q (Item e (Just tv)))
+          atomically (writeTQueue q (Write e (Just tv)))
           atomically (takeTMVar tv)
     action TranscriptHandle
       { recordAndAck = ackWrite
