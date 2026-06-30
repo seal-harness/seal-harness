@@ -10,6 +10,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.File
+  ( FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig, updateFileConfig )
 
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
@@ -22,6 +23,8 @@ spec = describe "Seal.Config.File" $ do
         , fcVaultIdentity  = Nothing
         , fcVaultUnlock    = Nothing
         , fcVaultKeyType   = Nothing
+        , fcDefaultProvider = Nothing
+        , fcDefaultModel    = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -48,6 +51,8 @@ spec = describe "Seal.Config.File" $ do
             fcVaultIdentity  cfg `shouldBe` Nothing
             fcVaultUnlock    cfg `shouldBe` Nothing
             fcVaultKeyType   cfg `shouldBe` Just "x25519"
+            fcDefaultProvider cfg `shouldBe` Nothing
+            fcDefaultModel    cfg `shouldBe` Nothing
 
     it "returns Left on malformed TOML" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
@@ -68,6 +73,8 @@ spec = describe "Seal.Config.File" $ do
               , fcVaultIdentity  = Just "/home/user/.seal/keys/default.identity"
               , fcVaultUnlock    = Just "on_demand"
               , fcVaultKeyType   = Just "x25519"
+              , fcDefaultProvider = Nothing
+              , fcDefaultModel    = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
@@ -94,6 +101,8 @@ spec = describe "Seal.Config.File" $ do
         let initial = defaultFileConfig
               { fcVaultPath    = Just "/old/vault.age"
               , fcVaultKeyType = Just "x25519"
+              , fcDefaultProvider = Nothing
+              , fcDefaultModel    = Nothing
               }
         saveFileConfig path initial
         result <- updateFileConfig path (\c -> c { fcVaultRecipient = Just "age1new" })
@@ -107,6 +116,8 @@ spec = describe "Seal.Config.File" $ do
             fcVaultRecipient cfg `shouldBe` Just "age1new"
             fcVaultIdentity  cfg `shouldBe` Nothing
             fcVaultUnlock    cfg `shouldBe` Nothing
+            fcDefaultProvider cfg `shouldBe` Nothing
+            fcDefaultModel    cfg `shouldBe` Nothing
 
     it "returns Left when the config file is malformed" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
@@ -116,3 +127,20 @@ spec = describe "Seal.Config.File" $ do
         case result of
           Left _  -> pure ()
           Right _ -> expectationFailure "expected Left for malformed config"
+
+  describe "provider defaults" $ do
+    it "round-trips default_provider and default_model through TOML" $
+      withSystemTempDirectory "seal-cfg" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig
+              { fcDefaultProvider = Just "anthropic"
+              , fcDefaultModel    = Just "claude-opus-4-8"
+              }
+        saveFileConfig path cfg
+        Right loaded <- loadFileConfig path
+        fcDefaultProvider loaded `shouldBe` Just "anthropic"
+        fcDefaultModel    loaded `shouldBe` Just "claude-opus-4-8"
+
+    it "defaults to Nothing when the keys are absent" $ do
+      fcDefaultProvider defaultFileConfig `shouldBe` Nothing
+      fcDefaultModel    defaultFileConfig `shouldBe` Nothing

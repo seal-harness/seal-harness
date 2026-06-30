@@ -31,6 +31,10 @@ data FileConfig = FileConfig
     -- ^ @\"startup\"@ | @\"on_demand\"@ | @\"per_access\"@.
   , fcVaultKeyType :: Maybe Text
     -- ^ Display label: @\"x25519\"@ | @\"yubikey\"@ | @\"user\"@.
+  , fcDefaultProvider :: Maybe Text
+    -- ^ Provider id used for new sessions (e.g. @\"anthropic\"@).
+  , fcDefaultModel :: Maybe Text
+    -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
   } deriving stock (Eq, Show)
 
 -- | Starting state: all fields absent, before @\/vault setup@ is run.
@@ -41,6 +45,8 @@ defaultFileConfig = FileConfig
   , fcVaultIdentity  = Nothing
   , fcVaultUnlock    = Nothing
   , fcVaultKeyType   = Nothing
+  , fcDefaultProvider = Nothing
+  , fcDefaultModel    = Nothing
   }
 
 -- ---------------------------------------------------------------------------
@@ -57,6 +63,8 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "vault_identity")  .= fcVaultIdentity
   <*> Toml.dioptional (Toml.text "vault_unlock")    .= fcVaultUnlock
   <*> Toml.dioptional (Toml.text "vault_key_type")  .= fcVaultKeyType
+  <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
+  <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
 
 -- ---------------------------------------------------------------------------
 -- Public API
