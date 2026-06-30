@@ -10,11 +10,13 @@ module Seal.Providers.Anthropic
   , decodeResponse
   ) where
 
+import Control.Exception
 import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client
+import Network.HTTP.Types (statusCode)
 
 import Seal.Core.Types
 import Seal.Providers.Class
@@ -109,7 +111,15 @@ instance Provider Anthropic where
               , ("x-api-key",          keyBytes)
               ]
           }
-    resp <- httpLbs req (anManager a)
-    pure $ case eitherDecode (responseBody resp) of
-      Left e  -> Left (T.pack e)
-      Right v -> decodeResponse v
+    result <- try (httpLbs req (anManager a))
+    case result of
+      Left (_ :: HttpException) ->
+        pure (Left "HTTP request to Anthropic failed (connection or transport error)")
+      Right resp -> do
+        let code = statusCode (responseStatus resp)
+        if code >= 200 && code <= 299
+          then pure $ case eitherDecode (responseBody resp) of
+            Left e  -> Left (T.pack e)
+            Right v -> decodeResponse v
+          else pure $ Left $
+            "Anthropic API returned HTTP " <> T.pack (show code)
