@@ -35,6 +35,7 @@ library
     import: settings
     exposed-modules:
         Seal.Core.Types
+        Seal.Transcript.Types
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -110,11 +111,13 @@ test-suite tests
       , optparse-applicative
       , temporary
       , text
+      , time
       , typed-process
       , unix
     hs-source-dirs: test
     other-modules:
         Seal.Core.TypesSpec
+        Seal.Transcript.TypesSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Command.HelpSpec
