@@ -2,6 +2,7 @@
 module Seal.ISA.Ops.FileSpec (spec) where
 
 import Data.Aeson (object, (.=))
+import System.Directory (createDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -37,4 +38,11 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = fileReadOp (WorkspaceRoot root)
       r <- runTestApp (opRun op localBackend (object ["path" .= ("nonexistent.txt" :: String)]))
+      orIsError r `shouldBe` True
+
+  it "returns an error result when the path is a directory (IOError caught)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      createDirectory (root </> "adir")
+      let op = fileReadOp (WorkspaceRoot root)
+      r <- runTestApp (opRun op localBackend (object ["path" .= ("adir" :: String)]))
       orIsError r `shouldBe` True

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications  #-}
 -- | FILE_READ (Untrusted): read a workspace file, confined by SafePath.
 -- This is the opcode that exercises the ACK-before-execute path in the
 -- dispatcher.
@@ -6,6 +7,7 @@ module Seal.ISA.Ops.File
   ( fileReadOp
   ) where
 
+import Control.Exception (try)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
@@ -55,12 +57,22 @@ fileReadOp root = Opcode
         Right safe -> do
           -- Read at most 64 KiB; avoids unbounded memory use on large files.
           -- Phase-3 Dynamic-Retrieval will implement proper paging.
-          txt <- runLocal backend $
-            withFile (getSafePath safe) ReadMode $ \h -> do
-              bytes <- BS.hGet h maxReadBytes
-              pure (TE.decodeUtf8Lenient bytes)
-          pure $ OpResult
-            [TrpText txt]
-            False
-            (object ["path" .= rel])
+          -- Wrap in try to catch IOErrors (e.g. file deleted or permissions
+          -- revoked between mkSafePath and withFile, or path is a directory).
+          eResult <- runLocal backend $
+            try @IOError $
+              withFile (getSafePath safe) ReadMode $ \h -> do
+                bytes <- BS.hGet h maxReadBytes
+                pure (TE.decodeUtf8Lenient bytes)
+          case eResult of
+            Left ioErr ->
+              pure $ OpResult
+                [TrpText (T.pack (show ioErr))]
+                True
+                (object ["path" .= rel])
+            Right txt ->
+              pure $ OpResult
+                [TrpText txt]
+                False
+                (object ["path" .= rel])
   }
