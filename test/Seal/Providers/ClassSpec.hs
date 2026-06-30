@@ -10,8 +10,8 @@ import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck
 
-import Seal.Core.Types
 import Seal.Providers.Class
+import Seal.TestHelpers.Arbitrary ()
 
 spec :: Spec
 spec = describe "Seal.Providers.Class" $ do
@@ -23,12 +23,6 @@ spec = describe "Seal.Providers.Class" $ do
 -- ---------------------------------------------------------------------------
 -- Arbitrary instances (orphans, suppressed above)
 -- ---------------------------------------------------------------------------
-
-instance Arbitrary ToolCallId where
-  arbitrary = ToolCallId . pack <$> arbitrary
-
-instance Arbitrary OpName where
-  arbitrary = OpName . pack <$> arbitrary
 
 instance Arbitrary Role where
   arbitrary = elements [User, Assistant]

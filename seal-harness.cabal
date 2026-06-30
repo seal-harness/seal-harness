@@ -137,6 +137,7 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
+        Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
         Seal.Providers.ClassSpec
         Seal.Vault.BackendSpec

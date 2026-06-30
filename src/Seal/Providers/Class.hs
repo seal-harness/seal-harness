@@ -33,6 +33,14 @@ newtype ToolResultPart = TrpText Text deriving stock (Eq, Show, Generic)
 instance ToJSON ToolResultPart
 instance FromJSON ToolResultPart
 
+-- | A single block of content in a message.
+--
+-- __Partial field selectors warning:__ The record fields 'cbId', 'cbName',
+-- 'cbInput', 'cbForId', 'cbParts', and 'cbIsError' are only defined on their
+-- respective constructors ('CbToolUse' and 'CbToolResult'). They are partial
+-- across the full type and will throw a runtime error if applied to the wrong
+-- constructor. Always access them inside a constructor-specific pattern match;
+-- never use them as bare accessor functions.
 data ContentBlock
   = CbText Text
   | CbToolUse    { cbId :: ToolCallId, cbName :: OpName, cbInput :: Value }
