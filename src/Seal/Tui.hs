@@ -64,4 +64,4 @@ runTui = do
             , vrHandleRef  = ref
             }
       registry = mkRegistry [vaultCommandSpec rt]
-  runCliTui paths registry emptyChain
+  runCliTui paths rt registry emptyChain
