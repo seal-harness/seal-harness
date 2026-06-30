@@ -28,6 +28,7 @@ import qualified Seal.Providers.ClassSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
+import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
 
 main :: IO ()
@@ -58,4 +59,5 @@ main = hspec $ do
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.Ops.FileSpec.spec
+  Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
