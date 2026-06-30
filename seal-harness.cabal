@@ -35,6 +35,7 @@ library
     import: settings
     exposed-modules:
         Seal.Core.Types
+        Seal.Providers.Class
         Seal.Transcript.Types
         Seal.Handles.Transcript
         Seal.AppMain
@@ -137,5 +138,6 @@ test-suite tests
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.FakeCaps
+        Seal.Providers.ClassSpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
