@@ -37,6 +37,7 @@ library
         Seal.Core.Types
         Seal.Providers.Anthropic
         Seal.Providers.Class
+        Seal.Providers.Registry
         Seal.Transcript.Types
         Seal.Handles.Transcript
         Seal.AppMain
@@ -154,6 +155,7 @@ test-suite tests
         Seal.TestHelpers.FakeCaps
         Seal.Providers.AnthropicSpec
         Seal.Providers.ClassSpec
+        Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
