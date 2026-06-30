@@ -36,6 +36,7 @@ library
     exposed-modules:
         Seal.Core.Types
         Seal.Transcript.Types
+        Seal.Handles.Transcript
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -118,6 +119,7 @@ test-suite tests
     other-modules:
         Seal.Core.TypesSpec
         Seal.Transcript.TypesSpec
+        Seal.Handles.TranscriptSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Command.HelpSpec

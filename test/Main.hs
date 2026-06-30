@@ -22,6 +22,7 @@ import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Transcript.TypesSpec
+import qualified Seal.Handles.TranscriptSpec
 
 main :: IO ()
 main = hspec $ do
@@ -45,3 +46,4 @@ main = hspec $ do
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec
   Seal.Transcript.TypesSpec.spec
+  Seal.Handles.TranscriptSpec.spec
