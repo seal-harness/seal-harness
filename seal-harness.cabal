@@ -62,6 +62,7 @@ library
         Seal.Types.Env
         Seal.Vault.Backend
         Seal.Vault.Commands
+        Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Registry
     build-depends:
@@ -149,4 +150,5 @@ test-suite tests
         Seal.Providers.ClassSpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
+        Seal.ISA.DispatchSpec
         Seal.ISA.RegistrySpec

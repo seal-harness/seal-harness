@@ -21,7 +21,7 @@ data OpResult = OpResult
   { orParts :: [ToolResultPart]  -- ^ what the model sees (may include secret values)
   , orIsError :: Bool
   , orRecorded :: Value          -- ^ what the transcript records (secret-free)
-  }
+  } deriving stock (Eq, Show)
 
 -- | The execution seam. Untrusted opcodes funnel their IO through 'runLocal';
 -- Phase 4 introduces a remote-SSH 'BackendExec' with the same shape.
