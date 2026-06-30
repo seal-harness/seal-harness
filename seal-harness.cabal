@@ -35,6 +35,7 @@ library
     import: settings
     exposed-modules:
         Seal.Core.Types
+        Seal.Providers.Anthropic
         Seal.Providers.Class
         Seal.Transcript.Types
         Seal.Handles.Transcript
@@ -81,6 +82,8 @@ library
       , stm
       , text
       , time
+      , http-client
+      , http-client-tls
       , tomland
       , typed-process
       , unix
@@ -139,6 +142,7 @@ test-suite tests
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
+        Seal.Providers.AnthropicSpec
         Seal.Providers.ClassSpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
