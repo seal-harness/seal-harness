@@ -34,6 +34,7 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.Types
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -113,6 +114,7 @@ test-suite tests
       , unix
     hs-source-dirs: test
     other-modules:
+        Seal.Core.TypesSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Command.HelpSpec
