@@ -7,7 +7,7 @@ module Seal.Types.Config
   , defaultServerConfig
   , pConfig
   -- * Lenses
-  , config_command, config_greeting, config_logLevel, config_server
+  , config_command, config_logLevel, config_server
   , serverConfig_host, serverConfig_port
   ) where
 
@@ -59,7 +59,6 @@ pServerConfig = id
 -- the selected subcommand plus its per-command arguments.
 data Config = Config
   { _config_command :: !Command
-  , _config_greeting :: !Text
   , _config_logLevel :: !Text
   , _config_server :: !ServerConfig
   } deriving (Eq, Show)
@@ -69,7 +68,6 @@ makeLenses ''Config
 defaultConfig :: Config
 defaultConfig = Config
   { _config_command = CommandNoOp
-  , _config_greeting = "Hello"
   , _config_logLevel = "Info"
   , _config_server = defaultServerConfig
   }
@@ -78,15 +76,13 @@ defaultConfig = Config
 -- field is intentionally excluded: commands are not config-file data.
 instance FromJSON (Config -> Config) where
   parseJSON = withObject "Config" $ \o -> id
-    <$< config_greeting ..: "greeting" % o
-    <*< config_logLevel ..: "log-level" % o
+    <$< config_logLevel ..: "log-level" % o
     <*< config_server %.: "server" % o
 
 -- | Hand-written 'ToJSON' for '--print-config'. Excludes '_config_command'.
 instance ToJSON Config where
   toJSON c = object
-    [ "greeting" .= _config_greeting c
-    , "log-level" .= _config_logLevel c
+    [ "log-level" .= _config_logLevel c
     , "server" .= _config_server c
     ]
 
@@ -95,9 +91,6 @@ instance ToJSON Config where
 pConfig :: MParser Config
 pConfig = id
   <$< config_command .:: pCommand
-  <*< config_greeting .:: strOption
-      ( long "greeting"
-      <> help "Greeting word to use" )
   <*< config_logLevel .:: strOption
       ( long "log-level"
       <> help "Minimum log severity (Debug|Info|Notice|Warning|Error)" )

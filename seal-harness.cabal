@@ -35,40 +35,51 @@ library
     import: settings
     exposed-modules:
         Seal.AppMain
-        Seal.Types.App
-        Seal.Types.Config
-        Seal.Types.Command
-        Seal.Types.Env
-        Seal.Commands.Greet
-        Seal.Commands.Tick
+        Seal.Channel.Caps
+        Seal.Channel.Cli
+        Seal.Command.Help
+        Seal.Command.Parse
+        Seal.Command.Spec
+        Seal.Config.File
+        Seal.Config.Paths
+        Seal.Ingest
+        Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
-        Seal.Security.Secrets
-        Seal.Security.Vault.Age
-        Seal.Security.Vault
         Seal.Security.Policy
-        Seal.Security.Command
+        Seal.Security.Secrets
+        Seal.Security.Vault
+        Seal.Security.Vault.Age
+        Seal.Tui
+        Seal.Types.App
+        Seal.Types.Command
+        Seal.Types.Config
+        Seal.Types.Env
+        Seal.Vault.Backend
+        Seal.Vault.Commands
     build-depends:
         base >= 4.18 && < 5
-      , text
-      , bytestring
-      , containers
-      , mtl
-      , exceptions
-      , lens
       , aeson
-      , katip
-      , configuration-tools
-      , optparse-applicative
-      , time
       , base64-bytestring
+      , bytestring
+      , configuration-tools
+      , containers
       , crypton
+      , directory
+      , exceptions
+      , filepath
+      , haskeline
+      , katip
+      , lens
       , memory
+      , mtl
+      , optparse-applicative
+      , stm
+      , text
+      , time
+      , tomland
       , typed-process
       , unix
-      , directory
-      , filepath
-      , stm
     hs-source-dirs: src
 
 executable seal
@@ -77,6 +88,7 @@ executable seal
     build-depends:
         base
       , seal-harness
+      , haskeline
     hs-source-dirs: exe
     ghc-options: -threaded -rtsopts -with-rtsopts=-N
 
@@ -87,23 +99,36 @@ test-suite tests
     build-depends:
         base
       , seal-harness
-      , aeson
-      , hspec
       , QuickCheck
-      , temporary
+      , aeson
       , bytestring
-      , text
       , containers
       , directory
       , filepath
+      , hspec
+      , optparse-applicative
+      , temporary
+      , text
       , typed-process
+      , unix
     hs-source-dirs: test
     other-modules:
+        Seal.AppMainSpec
+        Seal.Channel.CliSpec
+        Seal.Command.HelpSpec
+        Seal.Command.ParseSpec
+        Seal.Command.SpecSpec
+        Seal.Config.FileSpec
+        Seal.Config.PathsSpec
         Seal.ConfigSpec
+        Seal.IngestSpec
+        Seal.Security.CommandSpec
         Seal.Security.CryptoSpec
         Seal.Security.PathSpec
+        Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
-        Seal.Security.PolicySpec
-        Seal.Security.CommandSpec
+        Seal.TestHelpers.FakeCaps
+        Seal.Vault.BackendSpec
+        Seal.Vault.CommandsSpec

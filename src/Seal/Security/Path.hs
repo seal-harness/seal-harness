@@ -4,14 +4,27 @@ module Seal.Security.Path
   , WorkspaceRoot (..)
   , PathError (..)
   , mkSafePath
+  , KeysRoot (..)
+  , ensureKeysRoot
+  , SafeKeyPath
+  , getSafeKeyPath
+  , mkSafeKeyPath
   ) where
 
 import Control.Exception (IOException, try)
 import Data.List (isPrefixOf)
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.Directory (canonicalizePath, doesPathExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesPathExist)
 import System.FilePath (isAbsolute, joinPath, splitDirectories, (</>))
+import System.Posix.Files
+  ( fileMode
+  , fileOwner
+  , getFileStatus
+  , intersectFileModes
+  , setFileMode
+  )
+import System.Posix.User (getEffectiveUserID)
 
 newtype SafePath = SafePath FilePath
   deriving stock (Show)
@@ -25,6 +38,7 @@ data PathError
   = PathEscapesWorkspace FilePath
   | PathIsBlocked Text
   | PathDoesNotExist FilePath
+  | PathInsecureMode FilePath
   deriving stock (Eq, Show)
 
 blockedNames :: [FilePath]
@@ -89,3 +103,79 @@ mkSafePath (WorkspaceRoot root) requested = do
               if not exists
                 then pure $ Left $ PathDoesNotExist canon
                 else pure $ Right $ SafePath canon
+
+-- ---------------------------------------------------------------------------
+-- Key-material confinement
+-- ---------------------------------------------------------------------------
+
+newtype KeysRoot = KeysRoot FilePath
+  deriving stock (Eq, Show)
+
+-- | Create (mkdir -p) and harden (chmod 0700) a keys directory, returning a
+-- typed 'KeysRoot'. Idempotent — safe to call on an already-existing directory.
+ensureKeysRoot :: FilePath -> IO KeysRoot
+ensureKeysRoot dir = do
+  createDirectoryIfMissing True dir
+  setFileMode dir 0o700
+  pure (KeysRoot dir)
+
+-- | An absolute path that has been verified to be safely confined within a
+-- 'KeysRoot' directory (no @..@ escape, no symlink escape, and — if the file
+-- already exists — owned by the effective user with mode 0600 or 0400). The
+-- constructor is intentionally not exported; obtain a value via 'mkSafeKeyPath'.
+newtype SafeKeyPath = SafeKeyPath FilePath
+
+-- | The 'Show' instance deliberately omits the path to prevent accidental
+-- disclosure in logs or error messages.
+instance Show SafeKeyPath where
+  show _ = "SafeKeyPath <redacted>"
+
+getSafeKeyPath :: SafeKeyPath -> FilePath
+getSafeKeyPath (SafeKeyPath p) = p
+
+-- | Validate that a requested path is safely confined within the 'KeysRoot'.
+--
+-- Steps (in order):
+--   1. Lexically collapse @..@\/@.@ and check containment under the root —
+--      identical to 'mkSafePath' (reuses 'lexicalCollapse' + component-wise
+--      @splitDirectories@ prefix check).
+--   2. Canonicalize (follows symlinks); re-run the containment check to catch
+--      symlink escapes.
+--   3. If the target does not yet exist (key to be written later): return
+--      @Right@ with the lexically-resolved path.
+--   4. If the target exists: require @fileOwner == getEffectiveUserID@ and
+--      @fileMode & 0o777 ∈ {0o600, 0o400}@; otherwise return
+--      @Left (PathInsecureMode path)@.
+mkSafeKeyPath :: KeysRoot -> FilePath -> IO (Either PathError SafeKeyPath)
+mkSafeKeyPath (KeysRoot root) requested = do
+  canonRoot <- canonicalizePath root
+  let joined = if isAbsolute requested then requested else canonRoot </> requested
+      rootDirs = splitDirectories canonRoot
+      lexicalDirs = lexicalCollapse (splitDirectories joined)
+  if not (rootDirs `isPrefixOf` lexicalDirs)
+    then pure $ Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+    else do
+      canonResult <- try (canonicalizePath joined) :: IO (Either IOException FilePath)
+      case canonResult of
+        Left _ ->
+          -- Path does not exist yet — allowed; the caller will create it.
+          pure $ Right $ SafeKeyPath (joinPath lexicalDirs)
+        Right canon ->
+          if not (rootDirs `isPrefixOf` splitDirectories canon)
+            then pure $ Left $ PathEscapesWorkspace canon
+            else do
+              exists <- doesPathExist canon
+              if not exists
+                -- canonicalizePath resolved the parent but the file is absent —
+                -- still allowed; the caller will create it.
+                then pure $ Right $ SafeKeyPath canon
+                else checkSecurity canon
+  where
+    checkSecurity canon = do
+      status <- getFileStatus canon
+      euid <- getEffectiveUserID
+      let owner = fileOwner status
+          mode = fileMode status `intersectFileModes` 0o777
+      if (owner /= euid) || (mode `notElem` [0o600, 0o400])
+        then pure $ Left $ PathInsecureMode canon
+        else pure $ Right $ SafeKeyPath canon

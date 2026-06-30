@@ -116,6 +116,22 @@ If you stop working an issue, **unassign yourself** (`gh issue edit <NN>
 Everything runs through the **Nix flake dev shell** — you do not install GHC,
 cabal, or `hlint` yourself.
 
+The `Makefile` wraps the common tasks so you don't have to type the
+`nix develop --command …` prefix; run `make` to list targets:
+
+```bash
+make            # list available targets
+make build      # build the library + executable (-Werror clean)
+make test       # run the test suite
+make lint       # hlint src/ test/ (must report: No hints)
+make check      # build + test + lint (the full local gate)
+make tui        # launch the interactive TUI (seal tui)
+make run ARGS="--help"   # run the seal executable with arbitrary flags
+make shell      # drop into an interactive dev shell
+```
+
+Each target is just a thin wrapper; the equivalent raw commands are:
+
 ```bash
 nix develop                                   # enter the dev shell
 nix develop --command cabal build all         # build (-Werror clean)
