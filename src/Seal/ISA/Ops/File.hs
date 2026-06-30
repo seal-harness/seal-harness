@@ -9,6 +9,7 @@ module Seal.ISA.Ops.File
 
 import Control.Exception (try)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
+import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
@@ -26,6 +27,19 @@ import Seal.Security.Path
 maxReadBytes :: Int
 maxReadBytes = 65536
 
+-- | Build a JSON-Schema object with a single required string property.
+singleStringSchema :: Text -> Text -> Value
+singleStringSchema fieldName fieldDesc =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [fromText fieldName .= object
+           [ "type" .= ("string" :: Text)
+           , "description" .= fieldDesc
+           ]]
+    , "required" .= ([fieldName] :: [Text])
+    ]
+
 -- | Extract the @path@ string field from a JSON object.
 pathField :: Value -> Maybe Text
 pathField = parseMaybe (withObject "in" (.: "path"))
@@ -41,7 +55,7 @@ fileReadOp root = Opcode
   { opName = OpName "FILE_READ"
   , opTrust = Untrusted
   , opDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
-  , opInSchema = object []
+  , opInSchema = singleStringSchema "path" "Workspace-relative path of the file to read."
   , opOutSchema = object []
   , opAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField

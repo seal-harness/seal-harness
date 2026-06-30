@@ -10,6 +10,7 @@ module Seal.ISA.Ops.Secret
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
+import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
@@ -23,6 +24,19 @@ import Seal.Providers.Class
 import Seal.Security.Vault
 import Seal.Vault.Commands
 
+-- | Build a JSON-Schema object with a single required string property.
+singleStringSchema :: Text -> Text -> Value
+singleStringSchema fieldName fieldDesc =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [fromText fieldName .= object
+           [ "type" .= ("string" :: Text)
+           , "description" .= fieldDesc
+           ]]
+    , "required" .= ([fieldName] :: [Text])
+    ]
+
 -- | Extract the @name@ string field from a JSON object.
 nameField :: Value -> Maybe Text
 nameField = parseMaybe (withObject "in" (.: "name"))
@@ -35,7 +49,7 @@ secretGetOp rt = Opcode
   { opName = OpName "SECRET_GET"
   , opTrust = Audited
   , opDesc = "Fetch a secret value from the vault by key name."
-  , opInSchema = object []
+  , opInSchema = singleStringSchema "name" "The vault key name of the secret to fetch."
   , opOutSchema = object []
   , opAuthorize =
       maybe (Left "SECRET_GET requires {name:string}") (const (Right ())) . nameField

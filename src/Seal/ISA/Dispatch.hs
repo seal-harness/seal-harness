@@ -44,7 +44,10 @@ dispatch reg h backend name input =
             Untrusted -> do
               liftIO (recordAndAck h entry)   -- ACK-before-execute: durable before run
               Right <$> opRun op backend input
-            _ -> do
+            Trusted -> do
+              liftIO (recordAsync h entry)
+              Right <$> opRun op backend input
+            Audited -> do
               liftIO (recordAsync h entry)
               Right <$> opRun op backend input
 

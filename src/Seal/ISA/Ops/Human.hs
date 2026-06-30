@@ -8,8 +8,8 @@ module Seal.ISA.Ops.Human
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value (..), object, withObject, (.:))
-import Data.Aeson.Key (Key)
+import Data.Aeson (Value (..), object, withObject, (.:), (.=))
+import Data.Aeson.Key (Key, fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -24,6 +24,19 @@ import Seal.Providers.Class
 strField :: Key -> Value -> Maybe Text
 strField k = parseMaybe (withObject "in" (.: k))
 
+-- | Build a JSON-Schema object with a single required string property.
+singleStringSchema :: Text -> Text -> Value
+singleStringSchema fieldName fieldDesc =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [fromText fieldName .= object
+           [ "type" .= ("string" :: Text)
+           , "description" .= fieldDesc
+           ]]
+    , "required" .= ([fieldName] :: [Text])
+    ]
+
 -- | SHOW_HUMAN: emit @message@ to the human via the channel.
 -- Returns an empty, non-error result; the channel itself is the side-effect.
 showHumanOp :: ChannelCaps -> Opcode
@@ -31,7 +44,7 @@ showHumanOp caps = Opcode
   { opName = OpName "SHOW_HUMAN"
   , opTrust = Trusted
   , opDesc = "Display a message to the human operator."
-  , opInSchema = object []
+  , opInSchema = singleStringSchema "message" "The message to display to the human operator."
   , opOutSchema = object []
   , opAuthorize =
       maybe (Left "SHOW_HUMAN requires {message:string}") (const (Right ())) . strField "message"
@@ -47,7 +60,7 @@ askHumanOp caps = Opcode
   { opName = OpName "ASK_HUMAN"
   , opTrust = Trusted
   , opDesc = "Ask the human operator a question and return their reply."
-  , opInSchema = object []
+  , opInSchema = singleStringSchema "question" "The question to present to the human operator."
   , opOutSchema = object []
   , opAuthorize =
       maybe (Left "ASK_HUMAN requires {question:string}") (const (Right ())) . strField "question"
