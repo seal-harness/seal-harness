@@ -26,6 +26,7 @@ import qualified Seal.Handles.TranscriptSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.ClassSpec
 import qualified Seal.ISA.DispatchSpec
+import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.RegistrySpec
 
 main :: IO ()
@@ -54,4 +55,5 @@ main = hspec $ do
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.ClassSpec.spec
   Seal.ISA.DispatchSpec.spec
+  Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.RegistrySpec.spec
