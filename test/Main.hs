@@ -25,6 +25,7 @@ import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Handles.TranscriptSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.ClassSpec
+import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
@@ -56,6 +57,7 @@ main = hspec $ do
   Seal.Handles.TranscriptSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.ClassSpec.spec
+  Seal.Agent.LoopSpec.spec
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.Ops.FileSpec.spec
