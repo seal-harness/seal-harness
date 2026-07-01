@@ -6,14 +6,14 @@ module Seal.Channel.Cli
   ( runCliTui
   , interpretDisposition
   , handlePlain
+  , resolveSessionProvider
+  , mkSessionAgentEnv
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Either (fromRight)
+import Data.IORef (readIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
-import Network.HTTP.Client.TLS (newTlsManager)
 import System.Console.Haskeline
   ( InputT
   , Settings (..)
@@ -24,30 +24,31 @@ import System.Console.Haskeline
   , runInputT
   )
 import System.Directory (getCurrentDirectory)
-import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
-import Seal.Config.Paths (SealPaths (..))
-import Seal.Core.Types (ModelId (..), mkSessionId)
-import Seal.Handles.Transcript (withTranscript)
+import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
+import Seal.Core.Types (ModelId (..), SessionId)
+import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Providers.Anthropic (mkAnthropic)
 import Seal.Providers.Class (SomeProvider (..))
+import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Security.Secrets (mkApiKey)
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (SessionRuntime (..))
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Vault.Commands (VaultRuntime)
+import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -67,18 +68,50 @@ interpretDisposition caps plainHandler = \case
 handlePlain :: AgentEnv -> Env -> Text -> IO ()
 handlePlain agentEnv env t = runApp env (runTurn agentEnv t)
 
+-- | Resolve the active session's provider from the vault, or explain why not.
+-- Key bytes never surface: 'resolveProvider' returns an opaque 'SomeProvider'.
+resolveSessionProvider
+  :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
+resolveSessionProvider pr meta =
+  case parseProvider (smProvider meta) of
+    Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
+    Just kp -> do
+      mh <- readIORef (vrHandleRef (prVault pr))
+      case mh of
+        Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
+        Just vh -> do
+          let model = ModelId (smModel meta)
+          fmap (fmap (, model)) (resolveProvider vh (prManager pr) kp model)
+
+-- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
+mkSessionAgentEnv
+  :: ChannelCaps -> SomeProvider -> ModelId -> SessionId
+  -> ISA.Registry -> TranscriptHandle -> AgentEnv
+mkSessionAgentEnv caps provider model sid isaReg tHandle = AgentEnv
+  { aeProvider   = provider
+  , aeModel      = model
+  , aeRegistry   = isaReg
+  , aeTranscript = tHandle
+  , aeBackend    = localBackend
+  , aeCaps       = caps
+  , aeSession    = sid
+  , aeMaxTurns   = 12
+  }
+
 -- | Run the Haskeline TUI loop.
 --
--- History is persisted at @\<state\>\/history@; the agent transcript is appended
--- to @\<state\>\/transcript.jsonl@. EOF (Ctrl-D) exits.
---
--- The provider is resolved best-effort from @ANTHROPIC_API_KEY@: when present a
--- TLS-backed Anthropic provider drives plain text; when absent, plain text gets
--- a one-line hint instead so the REPL still runs.
-runCliTui :: SealPaths -> VaultRuntime -> Registry -> PreprocessChain -> IO ()
-runCliTui paths rt registry chain = do
+-- History is persisted at @\<state\>\/history@; the agent transcript is written
+-- under the session directory (@\<state\>\/sessions\/\<id\>\/transcript.jsonl@).
+-- EOF (Ctrl-D) exits. The provider and model are resolved from the active
+-- session on every turn so mid-session @\/model use@ changes take effect
+-- immediately.
+runCliTui
+  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
+  -> Registry -> PreprocessChain -> IO ()
+runCliTui paths rt pr sr registry chain = do
+  active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
-      transcriptPath = spState paths </> "transcript.jsonl"
+      transcriptPath = sessionTranscriptPath paths (smId active0)
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = ChannelCaps
@@ -92,14 +125,6 @@ runCliTui paths rt registry chain = do
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
         }
-  -- Resolve the provider once, before the loop. Key acquisition + manager
-  -- creation belong in startup, not in the per-turn handler.
-  mProvider <- lookupEnv "ANTHROPIC_API_KEY" >>= \case
-    Nothing     -> pure Nothing
-    Just keyStr -> do
-      mgr <- newTlsManager
-      let apiKey = mkApiKey (TE.encodeUtf8 (T.pack keyStr))
-      pure (Just (SomeProvider (mkAnthropic mgr apiKey model)))
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
   -- The transcript bracket wraps the whole loop so every turn shares one writer.
@@ -112,28 +137,17 @@ runCliTui paths rt registry chain = do
           , fileReadOp wsRoot
           , secretGetOp rt
           ]
-        plainHandler t = case mProvider of
-          Nothing ->
-            ccSend caps
-              "No provider configured — set ANTHROPIC_API_KEY to chat with the agent."
-          Just provider ->
-            handlePlain (mkAgentEnv caps provider isaReg tHandle) appEnv t
+        plainHandler t = do
+          meta  <- readIORef (srActive sr)
+          eprov <- resolveSessionProvider pr meta
+          case eprov of
+            Left err            -> ccSend caps err
+            Right (prov, model) ->
+              handlePlain
+                (mkSessionAgentEnv caps prov model (smId meta) isaReg tHandle)
+                appEnv t
     runInputT hlSettings (loop caps plainHandler)
   where
-    model = ModelId "claude-opus-4-8"
-    -- "cli" is a literal valid session id, so the Left case is unreachable.
-    sid = fromRight (error "unreachable: literal session id")
-                    (mkSessionId "cli")
-    mkAgentEnv caps provider isaReg tHandle = AgentEnv
-      { aeProvider   = provider
-      , aeModel      = model
-      , aeRegistry   = isaReg
-      , aeTranscript = tHandle
-      , aeBackend    = localBackend
-      , aeCaps       = caps
-      , aeSession    = sid
-      , aeMaxTurns   = 12
-      }
     loop :: ChannelCaps -> (Text -> IO ()) -> InputT IO ()
     loop caps plainHandler = do
       mLine <- getInputLine "> "

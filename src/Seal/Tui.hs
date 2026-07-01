@@ -91,4 +91,4 @@ runTui = do
         , sessionCommandSpec sr
         , modelCommandSpec sr
         ]
-  runCliTui paths rt registry emptyChain
+  runCliTui paths rt pr sr registry emptyChain
