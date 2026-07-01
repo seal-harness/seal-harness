@@ -23,8 +23,14 @@ module Seal.Providers.Anthropic.OAuth
   , parseTokenResponse
   , serializeTokens
   , deserializeTokens
+    -- * HTTP: request-body builders + code exchange + refresh
+  , authorizationCodeBody
+  , refreshTokenBody
+  , exchangeCode
+  , refreshTokens
   ) where
 
+import Control.Exception (SomeException, try)
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.Aeson (Value, eitherDecodeStrict', object, withObject, (.:), (.=))
 import Data.Aeson qualified as A
@@ -35,8 +41,13 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time.Clock (UTCTime, addUTCTime)
+import Data.Text.Encoding.Error qualified as TEE
+import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+import Network.HTTP.Client
+  ( Manager, RequestBody (RequestBodyLBS), Response, httpLbs, parseRequest
+  , requestBody, requestHeaders, responseBody, responseStatus )
+import Network.HTTP.Types (statusCode)
 import Network.HTTP.Types.URI (renderSimpleQuery)
 
 import Seal.Security.Crypto (getRandomBytes)
@@ -180,3 +191,67 @@ deserializeTokens bs =
         , otRefresh   = mkRefreshToken (TE.encodeUtf8 ref)
         , otExpiresAt = posixSecondsToUTCTime (fromIntegral (exp' :: Int))
         }
+
+-- HTTP: request-body builders + code exchange + refresh -----------------------
+
+-- | JSON body for the authorization_code grant (the code exchange).
+authorizationCodeBody :: Pkce -> Text -> Text -> Value
+authorizationCodeBody pkce code state = object
+  [ "grant_type"    .= ("authorization_code" :: Text)
+  , "client_id"     .= oauthClientId
+  , "code"          .= code
+  , "state"         .= state
+  , "redirect_uri"  .= oauthRedirectUri
+  , "code_verifier" .= pkceVerifier pkce
+  ]
+
+-- | JSON body for the refresh_token grant. Carries the refresh secret into the
+-- request body via the CPS accessor (the token endpoint needs it).
+refreshTokenBody :: OAuthTokens -> Value
+refreshTokenBody ts =
+  withRefreshToken (otRefresh ts) $ \ref -> object
+    [ "grant_type"    .= ("refresh_token" :: Text)
+    , "client_id"     .= oauthClientId
+    , "refresh_token" .= TE.decodeUtf8 ref
+    ]
+
+-- | POST the token endpoint with the given JSON body, then parse the response
+-- with @now@ as the expiry reference. Non-2xx returns Left with status + body
+-- (no secret is present in the body).
+postToken :: Manager -> UTCTime -> Value -> IO (Either Text OAuthTokens)
+postToken mgr now body = do
+  initReq <- parseRequest ("POST " <> T.unpack oauthTokenUrl)
+  let req = initReq
+        { requestBody    = RequestBodyLBS (A.encode body)
+        , requestHeaders =
+            [ ("content-type",      "application/json")
+            , ("anthropic-version", TE.encodeUtf8 anthropicVersion)
+            , ("anthropic-beta",    TE.encodeUtf8 anthropicBeta)
+            ]
+        }
+  result <- try (httpLbs req mgr) :: IO (Either SomeException (Response BL.ByteString))
+  pure $ case result of
+    Left _     -> Left "OAuth token request failed (connection or transport error)"
+    Right resp ->
+      let code = statusCode (responseStatus resp)
+      in if code >= 200 && code <= 299
+         then case A.eitherDecode (responseBody resp) of
+                Left e  -> Left (T.pack e)
+                Right v -> parseTokenResponse now v
+         else Left $ "OAuth token endpoint returned HTTP " <> T.pack (show code)
+                <> ": " <> lazyBodyText resp
+  where
+    lazyBodyText =
+      TE.decodeUtf8With TEE.lenientDecode . BL.toStrict . responseBody
+
+-- | Exchange an authorization code (+ state) for tokens.
+exchangeCode :: Manager -> Pkce -> Text -> Text -> IO (Either Text OAuthTokens)
+exchangeCode mgr pkce code state = do
+  now <- getCurrentTime
+  postToken mgr now (authorizationCodeBody pkce code state)
+
+-- | Refresh an access token; the response rotates the refresh token.
+refreshTokens :: Manager -> OAuthTokens -> IO (Either Text OAuthTokens)
+refreshTokens mgr ts = do
+  now <- getCurrentTime
+  postToken mgr now (refreshTokenBody ts)

@@ -11,6 +11,7 @@ import Test.Hspec
 import Seal.Providers.Anthropic.OAuth
 import Seal.Security.Secrets (mkBearerToken, mkRefreshToken, withBearerToken, withRefreshToken)
 
+
 spec :: Spec
 spec = describe "Seal.Providers.Anthropic.OAuth" $ do
 
@@ -81,3 +82,29 @@ spec = describe "Seal.Providers.Anthropic.OAuth" $ do
           withBearerToken  (otAccess ts')  id `shouldBe` "acc-9"
           withRefreshToken (otRefresh ts') id `shouldBe` "ref-9"
           otExpiresAt ts' `shouldBe` posixSecondsToUTCTime 1700000000
+
+  describe "authorizationCodeBody" $
+    it "builds the authorization_code grant body with the verifier" $
+      authorizationCodeBody (Pkce "vrfy" "chal") "the-code" "the-state"
+        `shouldBe` object
+          [ "grant_type"    .= ("authorization_code" :: T.Text)
+          , "client_id"     .= ("9d1c250a-e61b-44d9-88ed-5944d1962f5e" :: T.Text)
+          , "code"          .= ("the-code" :: T.Text)
+          , "state"         .= ("the-state" :: T.Text)
+          , "redirect_uri"  .= ("https://console.anthropic.com/oauth/code/callback" :: T.Text)
+          , "code_verifier" .= ("vrfy" :: T.Text)
+          ]
+
+  describe "refreshTokenBody" $
+    it "builds the refresh_token grant body carrying the refresh token" $ do
+      let ts = OAuthTokens (mkBearerToken "acc") (mkRefreshToken "the-refresh")
+                           (posixSecondsToUTCTime 0)
+      refreshTokenBody ts `shouldBe` object
+        [ "grant_type"    .= ("refresh_token" :: T.Text)
+        , "client_id"     .= ("9d1c250a-e61b-44d9-88ed-5944d1962f5e" :: T.Text)
+        , "refresh_token" .= ("the-refresh" :: T.Text)
+        ]
+
+  describe "exchangeCode / refreshTokens (live)" $
+    it "needs a real OAuth endpoint" $
+      pendingWith "live OAuth flow — exercised manually with a Claude subscription"
