@@ -123,6 +123,7 @@ test-suite tests
       , directory
       , filepath
       , hspec
+      , http-client
       , optparse-applicative
       , temporary
       , text
@@ -153,6 +154,7 @@ test-suite tests
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
+        Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.ClassSpec
         Seal.Providers.RegistrySpec
