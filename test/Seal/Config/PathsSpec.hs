@@ -10,6 +10,15 @@ import System.Posix.Files (fileMode, getFileStatus, intersectFileModes)
 import Test.Hspec
 
 import Seal.Config.Paths
+  ( SealPaths (..)
+  , resolveSealHome, getSealPaths, ensureSealDirs
+  , configFilePath, vaultFilePath
+  , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
+  )
+import Seal.Core.Types (mkSessionId)
+
+import Data.Text (pack)
+import Data.Either (fromRight)
 
 spec :: Spec
 spec = describe "Seal.Config.Paths" $ do
@@ -83,6 +92,17 @@ spec = describe "Seal.Config.Paths" $ do
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           vaultFilePath paths `shouldBe` tmp </> "config" </> "vault" </> "vault.age"
+
+  describe "session paths" $ do
+    it "derives sessions root, dir, meta and transcript paths under state/" $ do
+      let paths = SealPaths
+            { spHome = "/h", spConfig = "/h/config"
+            , spState = "/h/state", spKeys = "/h/keys" }
+          sid = fromRight (error "Invalid session ID") (mkSessionId (pack "20260701-120000-042"))
+      sessionsRoot paths          `shouldBe` "/h/state/sessions"
+      sessionDir paths sid        `shouldBe` "/h/state/sessions/20260701-120000-042"
+      sessionMetaPath paths sid   `shouldBe` "/h/state/sessions/20260701-120000-042/session.json"
+      sessionTranscriptPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/transcript.jsonl"
 
 -- | Run an action with SEAL_HOME set to the given path, restoring the
 -- previous value (or unsetting) on exit, even if the action throws.
