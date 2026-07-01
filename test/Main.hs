@@ -15,6 +15,7 @@ import qualified Seal.Security.PolicySpec
 import qualified Seal.Security.CommandSpec
 import qualified Seal.Command.HelpSpec
 import qualified Seal.Command.ParseSpec
+import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Vault.BackendSpec
@@ -49,6 +50,7 @@ main = hspec $ do
   Seal.Security.CommandSpec.spec
   Seal.Command.HelpSpec.spec
   Seal.Command.ParseSpec.spec
+  Seal.Command.ProviderSpec.spec
   Seal.Command.SpecSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Vault.BackendSpec.spec
