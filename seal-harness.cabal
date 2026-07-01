@@ -51,6 +51,7 @@ library
         Seal.Config.Paths
         Seal.Ingest
         Seal.Session.Meta
+        Seal.Session.Store
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -154,6 +155,7 @@ test-suite tests
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
         Seal.Session.MetaSpec
+        Seal.Session.StoreSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
