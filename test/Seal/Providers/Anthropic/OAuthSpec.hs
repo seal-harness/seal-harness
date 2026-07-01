@@ -1,11 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Providers.Anthropic.OAuthSpec (spec) where
 
+import Data.Aeson (object, (.=))
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Time.Clock (addUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Test.Hspec
 
 import Seal.Providers.Anthropic.OAuth
+import Seal.Security.Secrets (mkBearerToken, mkRefreshToken, withBearerToken, withRefreshToken)
 
 spec :: Spec
 spec = describe "Seal.Providers.Anthropic.OAuth" $ do
@@ -44,3 +48,36 @@ spec = describe "Seal.Providers.Anthropic.OAuth" $ do
       p <- newPkce
       T.length (pkceVerifier p) `shouldBe` 43
       pkceChallenge p `shouldBe` codeChallenge (TE.encodeUtf8 (pkceVerifier p))
+
+  describe "parseTokenResponse" $ do
+    it "parses access/refresh and computes expiresAt = now + expires_in" $ do
+      let now = posixSecondsToUTCTime 1000
+          v   = object
+            [ "access_token"  .= ("acc-1" :: T.Text)
+            , "refresh_token" .= ("ref-1" :: T.Text)
+            , "expires_in"    .= (3600 :: Int)
+            ]
+      case parseTokenResponse now v of
+        Left e   -> expectationFailure (T.unpack e)
+        Right ts -> do
+          withBearerToken  (otAccess ts)  id `shouldBe` "acc-1"
+          withRefreshToken (otRefresh ts) id `shouldBe` "ref-1"
+          otExpiresAt ts `shouldBe` addUTCTime 3600 now
+
+    it "fails clearly when a field is missing" $ do
+      let now = posixSecondsToUTCTime 0
+          v   = object ["access_token" .= ("only" :: T.Text)]
+      case parseTokenResponse now v of
+        Left _  -> pure ()
+        Right _ -> expectationFailure "expected Left for a malformed token response"
+
+  describe "serializeTokens / deserializeTokens" $
+    it "round-trips through the vault blob" $ do
+      let ts = OAuthTokens (mkBearerToken "acc-9") (mkRefreshToken "ref-9")
+                           (posixSecondsToUTCTime 1700000000)
+      case deserializeTokens (serializeTokens ts) of
+        Left e    -> expectationFailure (T.unpack e)
+        Right ts' -> do
+          withBearerToken  (otAccess ts')  id `shouldBe` "acc-9"
+          withRefreshToken (otRefresh ts') id `shouldBe` "ref-9"
+          otExpiresAt ts' `shouldBe` posixSecondsToUTCTime 1700000000

@@ -19,19 +19,29 @@ module Seal.Providers.Anthropic.OAuth
   , buildAuthorizeUrl
   , parsePastedCode
   , newPkce
+    -- * Token-response parser + vault-blob codec
+  , parseTokenResponse
+  , serializeTokens
+  , deserializeTokens
   ) where
 
 import Crypto.Hash (Digest, SHA256, hash)
+import Data.Aeson (Value, eitherDecodeStrict', object, withObject, (.:), (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.Types (parseEither)
 import Data.ByteArray.Encoding (Base (Base16, Base64URLUnpadded), convertFromBase, convertToBase)
 import Data.ByteString (ByteString)
+import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, addUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Network.HTTP.Types.URI (renderSimpleQuery)
 
 import Seal.Security.Crypto (getRandomBytes)
-import Seal.Security.Secrets (BearerToken, RefreshToken)
+import Seal.Security.Secrets
+  (BearerToken, RefreshToken, mkBearerToken, mkRefreshToken, withBearerToken, withRefreshToken)
 
 -- | A PKCE verifier/challenge pair. In this flow @state@ == the verifier.
 data Pkce = Pkce
@@ -121,3 +131,52 @@ newPkce = do
   raw <- getRandomBytes 32
   let verifier = TE.decodeUtf8 (convertToBase Base64URLUnpadded raw)
   pure (Pkce verifier (codeChallenge (TE.encodeUtf8 verifier)))
+
+-- Token-response parser + vault-blob codec ------------------------------------
+
+-- | Parse the token endpoint's JSON response. @now@ is the reference time used
+-- to turn the relative @expires_in@ (seconds) into an absolute expiry.
+-- @token_type@ and @scope@ are ignored.
+parseTokenResponse :: UTCTime -> Value -> Either Text OAuthTokens
+parseTokenResponse now = mapLeft T.pack . parseEither parse
+  where
+    mapLeft f = either (Left . f) Right
+    parse = withObject "token response" $ \o -> do
+      acc     <- o .: "access_token"
+      ref     <- o .: "refresh_token"
+      expires <- o .: "expires_in"
+      pure OAuthTokens
+        { otAccess    = mkBearerToken (TE.encodeUtf8 acc)
+        , otRefresh   = mkRefreshToken (TE.encodeUtf8 ref)
+        , otExpiresAt = addUTCTime (fromIntegral (expires :: Int)) now
+        }
+
+-- | Encode tokens as the vault blob. This is the ONLY place token bytes are
+-- serialized; the target is the encrypted vault.
+serializeTokens :: OAuthTokens -> ByteString
+serializeTokens ts =
+  withBearerToken (otAccess ts) $ \acc ->
+    withRefreshToken (otRefresh ts) $ \ref ->
+      BL.toStrict $ A.encode $ object
+        [ "access_token"  .= TE.decodeUtf8 acc
+        , "refresh_token" .= TE.decodeUtf8 ref
+        , "expires_at"    .= (round (utcTimeToPOSIXSeconds (otExpiresAt ts)) :: Int)
+        ]
+
+-- | Decode the vault blob back into tokens.
+deserializeTokens :: ByteString -> Either Text OAuthTokens
+deserializeTokens bs =
+  case eitherDecodeStrict' bs of
+    Left e  -> Left (T.pack e)
+    Right v -> mapLeft T.pack (parseEither parse v)
+  where
+    mapLeft f = either (Left . f) Right
+    parse = withObject "oauth tokens blob" $ \o -> do
+      acc  <- o .: "access_token"
+      ref  <- o .: "refresh_token"
+      exp' <- o .: "expires_at"
+      pure OAuthTokens
+        { otAccess    = mkBearerToken (TE.encodeUtf8 acc)
+        , otRefresh   = mkRefreshToken (TE.encodeUtf8 ref)
+        , otExpiresAt = posixSecondsToUTCTime (fromIntegral (exp' :: Int))
+        }
