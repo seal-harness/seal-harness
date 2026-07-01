@@ -36,6 +36,7 @@ library
     exposed-modules:
         Seal.Core.Types
         Seal.Providers.Anthropic
+        Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
         Seal.Providers.Registry
         Seal.Transcript.Types
@@ -166,6 +167,7 @@ test-suite tests
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
+        Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
