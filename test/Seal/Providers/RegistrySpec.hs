@@ -2,10 +2,12 @@
 module Seal.Providers.RegistrySpec (spec) where
 
 import Data.Text qualified as T
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Test.Hspec
 
 import Seal.Core.Types (ModelId (..), ProviderId (..))
+import Seal.Providers.Anthropic.OAuth (OAuthTokens (..), serializeTokens)
 import Seal.Providers.Class
   ( CompletionResponse (..), Provider (..), SomeProvider (..)
   , StopReason (..), Usage (..) )
@@ -20,6 +22,7 @@ import Seal.Providers.Registry
   , resolveProvider
   , vaultKeyName
   )
+import Seal.Security.Secrets (mkBearerToken, mkRefreshToken)
 import Seal.TestHelpers.FakeVault (makeFakeVault, makeLockedVault)
 
 newtype Canned = Canned (Either T.Text CompletionResponse)
@@ -82,3 +85,24 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for a locked vault"
+
+    it "resolves via OAuth tokens when only they are present (no HTTP for a fresh token)" $ do
+      let toks = OAuthTokens (mkBearerToken "acc") (mkRefreshToken "ref")
+                             (posixSecondsToUTCTime 4102444800) -- 2100: fresh
+      vh  <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", serializeTokens toks)]
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider vh mgr AnthropicProvider (ModelId "claude-opus-4-8")
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right (OAuth), got Left: " <> show e)
+
+    it "prefers OAuth over an API key: a corrupt OAuth blob fails rather than falling back" $ do
+      vh  <- makeFakeVault
+               [ ("ANTHROPIC_OAUTH_TOKENS", "not-json")
+               , ("ANTHROPIC_API_KEY",      "sk-fallback")
+               ]
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider vh mgr AnthropicProvider (ModelId "m")
+      case r of
+        Left e  -> e `shouldSatisfy` ("OAuth" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left: corrupt OAuth blob must not fall back to the API key"

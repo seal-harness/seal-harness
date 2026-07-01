@@ -17,12 +17,16 @@ module Seal.Providers.Registry
   , vaultErrText
   ) where
 
+import Data.IORef (newIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 
 import Seal.Core.Types (ModelId (..), ProviderId (..))
-import Seal.Providers.Anthropic (mkAnthropic)
+import Seal.Providers.Anthropic
+  ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
+import Seal.Providers.Anthropic.OAuth
+  ( deserializeTokens, refreshTokens, serializeTokens )
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
 import Seal.Security.Secrets (mkApiKey)
@@ -59,18 +63,32 @@ vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
 
--- | Build a live provider by reading its API key from the vault. The key
--- bytes flow straight into 'mkApiKey' (opaque) — never returned or logged.
+-- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
+-- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
+-- re-run @\/provider login@) rather than silently falling back.
 resolveProvider
   :: VaultHandle -> Manager -> KnownProvider -> ModelId
   -> IO (Either Text SomeProvider)
-resolveProvider vh mgr kp model = do
-  eKey <- vhGet vh (vaultKeyName kp)
-  pure $ case eKey of
-    Left e         -> Left (credErr kp e)
-    Right keyBytes -> Right (build kp mgr (mkApiKey keyBytes) model)
-  where
-    build AnthropicProvider m k md = SomeProvider (mkAnthropic m k md)
+resolveProvider vh mgr AnthropicProvider model = do
+  eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
+  case eOAuth of
+    Right blob -> case deserializeTokens blob of
+      Left e     -> pure (Left ("stored Anthropic OAuth tokens are unreadable ("
+                                  <> e <> ") — run /provider login anthropic"))
+      Right toks -> do
+        ref <- newIORef toks
+        let sess = OAuthSession
+              { osTokens  = ref
+              , osRefresh = refreshTokens mgr
+              , osPersist = \t -> vhPut vh "ANTHROPIC_OAUTH_TOKENS" (serializeTokens t) >> pure ()
+              }
+        _ <- ensureFresh sess
+        pure (Right (SomeProvider (mkAnthropicOAuth mgr sess model)))
+    Left _ -> do
+      eKey <- vhGet vh (vaultKeyName AnthropicProvider)
+      pure $ case eKey of
+        Left e         -> Left (credErr AnthropicProvider e)
+        Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
