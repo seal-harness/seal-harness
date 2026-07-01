@@ -11,8 +11,9 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps)
+import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
-import Seal.Command.Spec (CommandSpec (..), runCommandAction)
+import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
 import Seal.Config.File (FileConfig (..), loadFileConfig)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..))
@@ -139,6 +140,13 @@ spec = do
       withSystemTempDirectory "seal-prov" $ \dir -> do
         pr <- mkPR (dir </> "config.toml") Nothing
         csSynopsis (providerCommandSpec pr) `shouldSatisfy` (not . T.null)
+
+    it "appears under the Providers group in the help index" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        pr <- mkPR (dir </> "config.toml") Nothing
+        let idx = renderHelpIndex (mkRegistry [providerCommandSpec pr])
+        idx `shouldSatisfy` ("Providers" `T.isInfixOf`)
+        idx `shouldSatisfy` ("/provider" `T.isInfixOf`)
 
     it "live: /provider test anthropic round-trips against the real API" $
       pending  -- requires ANTHROPIC_API_KEY + network; run manually

@@ -6,7 +6,10 @@ import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
+import Network.HTTP.Client.TLS (newTlsManager)
+
 import Seal.Channel.Cli (runCliTui)
+import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -63,5 +66,13 @@ runTui = do
             , vrConfigPath = cfgPath
             , vrHandleRef  = ref
             }
-      registry = mkRegistry [vaultCommandSpec rt]
+  -- A dedicated manager for the /provider test round-trip. (M2 consolidates
+  -- this with the chat provider's manager when the startup hardcode is removed.)
+  mgr <- newTlsManager
+  let pr = ProviderRuntime
+            { prConfigPath = cfgPath
+            , prVault      = rt
+            , prManager    = mgr
+            }
+      registry = mkRegistry [vaultCommandSpec rt, providerCommandSpec pr]
   runCliTui paths rt registry emptyChain
