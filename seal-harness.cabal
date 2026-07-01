@@ -46,6 +46,7 @@ library
         Seal.Command.Help
         Seal.Command.Parse
         Seal.Command.Provider
+        Seal.Command.Session
         Seal.Command.Spec
         Seal.Config.File
         Seal.Config.Paths
@@ -144,6 +145,7 @@ test-suite tests
         Seal.Command.HelpSpec
         Seal.Command.ParseSpec
         Seal.Command.ProviderSpec
+        Seal.Command.SessionSpec
         Seal.Command.SpecSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec

@@ -22,6 +22,7 @@ newtype CommandName = CommandName Text
 data CommandGroup
   = GroupGeneral
   | GroupProvider
+  | GroupSession
   | GroupVault
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 

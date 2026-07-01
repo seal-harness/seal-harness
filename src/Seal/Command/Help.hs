@@ -80,6 +80,7 @@ renderHelpIndex reg =
     groupHeader :: CommandGroup -> Text
     groupHeader GroupGeneral  = "General"
     groupHeader GroupProvider = "Providers"
+    groupHeader GroupSession  = "Sessions"
     groupHeader GroupVault    = "Vault"
 
     renderSpec :: CommandSpec -> Text
