@@ -7,8 +7,15 @@
   # integrity. Honored automatically in CI (accept-flake-config = true); locally
   # you must be a trusted user or pass --accept-flake-config the first time.
   nixConfig = {
-    extra-substituters = [ "s3://seal-harness-nix-cache?region=us-east-1" ];
+    # cache.iog.io serves haskell.nix's prebuilt GHCs and Hackage deps — without
+    # it, Nix compiles GHC from source (multi-hour). Must stay in sync with the
+    # compiler-nix-name below: ghc9122 is prebuilt and cached there.
+    extra-substituters = [
+      "https://cache.iog.io"
+      "s3://seal-harness-nix-cache?region=us-east-1"
+    ];
     extra-trusted-public-keys = [
+      "hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk="
       "seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo="
     ];
   };
@@ -28,7 +35,10 @@
             sealHarnessProject =
               final.haskell-nix.cabalProject' {
                 src = ./.;
-                compiler-nix-name = "ghc912";
+                # Concrete patch version that haskell.nix prebuilds and pushes to
+                # cache.iog.io (see nixConfig above). The bare "ghc912" alias
+                # resolved to an uncached GHC, forcing a source build in CI.
+                compiler-nix-name = "ghc9122";
                 # Used by `nix develop .` to open a dev shell for
                 # `cabal`, `ghcid` and `hlint`.
                 shell.tools = {
