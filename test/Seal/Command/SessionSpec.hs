@@ -11,8 +11,10 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps)
+import Seal.Command.Help (renderHelpIndex)
+import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Session (renderSessionInfo, renderSessionLine, sessionCommandSpec)
-import Seal.Command.Spec (CommandSpec (..), runCommandAction)
+import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
@@ -72,3 +74,12 @@ spec = describe "Seal.Command.Session" $ do
         runSess sr ["info"] caps
         sent <- getSent fc
         T.unlines sent `shouldSatisfy` ("20260701-120000-009" `T.isInfixOf`)
+
+    it "session and model appear under their groups in the help index" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        sr <- mkSR root (meta "20260701-120000-000")
+        let idx = renderHelpIndex (mkRegistry [sessionCommandSpec sr, modelCommandSpec sr])
+        idx `shouldSatisfy` ("Sessions" `T.isInfixOf`)
+        idx `shouldSatisfy` ("/session" `T.isInfixOf`)
+        idx `shouldSatisfy` ("Model" `T.isInfixOf`)
+        idx `shouldSatisfy` ("/model" `T.isInfixOf`)

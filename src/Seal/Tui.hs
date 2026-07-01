@@ -9,7 +9,9 @@ import qualified Data.Text as T
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Seal.Channel.Cli (runCliTui)
+import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
+import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -21,6 +23,7 @@ import Seal.Config.Paths
   )
 import Seal.Ingest (emptyChain)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
@@ -74,5 +77,18 @@ runTui = do
             , prVault      = rt
             , prManager    = mgr
             }
-      registry = mkRegistry [vaultCommandSpec rt, providerCommandSpec pr]
+  -- Every launch starts a fresh session (resume is a follow-on milestone).
+  sessionMeta <- initSession paths cfg
+  activeRef   <- newIORef sessionMeta
+  let sr = SessionRuntime
+             { srPaths      = paths
+             , srConfigPath = cfgPath
+             , srActive     = activeRef
+             }
+      registry = mkRegistry
+        [ vaultCommandSpec rt
+        , providerCommandSpec pr
+        , sessionCommandSpec sr
+        , modelCommandSpec sr
+        ]
   runCliTui paths rt registry emptyChain
