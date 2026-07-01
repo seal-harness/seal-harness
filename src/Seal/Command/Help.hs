@@ -78,8 +78,9 @@ renderHelpIndex reg =
       ++ [ "" ]
 
     groupHeader :: CommandGroup -> Text
-    groupHeader GroupGeneral = "General"
-    groupHeader GroupVault   = "Vault"
+    groupHeader GroupGeneral  = "General"
+    groupHeader GroupProvider = "Providers"
+    groupHeader GroupVault    = "Vault"
 
     renderSpec :: CommandSpec -> Text
     renderSpec s =
