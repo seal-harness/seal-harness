@@ -10,14 +10,19 @@ module Seal.Command.Provider
   , providerCommandSpec
   ) where
 
+import Control.Exception (SomeException, try)
 import Data.IORef (readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client (Manager)
 import Options.Applicative
+import System.Info (os)
+import System.Process.Typed (ExitCode (..), proc, runProcess)
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Providers.Anthropic.OAuth
+  ( buildAuthorizeUrl, exchangeCode, newPkce, parsePastedCode, serializeTokens )
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
@@ -31,6 +36,12 @@ import Seal.Providers.Registry
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | The vault key under which Anthropic OAuth tokens are stored.
+-- Kept local so this module needs no registry dep beyond the label vocabulary
+-- it already imports.
+anthropicOAuthKey :: Text
+anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 
 -- | A minimal completion used to prove a provider responds.
 pingRequest :: ModelId -> CompletionRequest
@@ -82,6 +93,9 @@ providerParser pr = hsubparser
   (  command "add"
        (info (addCmd pr <$> provArg)
              (progDesc "Store a provider API key (hidden prompt) in the vault"))
+  <> command "login"
+       (info (loginCmd pr <$> provArg)
+             (progDesc "Log in via OAuth (Claude subscription) and store tokens"))
   <> command "list"
        (info (pure (listCmd pr))
              (progDesc "List known providers and their credential status"))
@@ -140,14 +154,56 @@ listCmd pr = CommandAction $ \caps ->
     mapM_ (reportOne caps vh def) knownProviders
   where
     reportOne caps vh def kp = do
-      eGet <- vhGet vh (vaultKeyName kp)
-      let cred = case eGet of
-            Right _                   -> "credential: present"
-            Left (VaultKeyNotFound _) -> "credential: absent"
-            Left VaultLocked          -> "credential: (vault locked)"
-            Left e                    -> "credential: " <> vaultErrText e
+      eOAuth <- vhGet vh anthropicOAuthKey
+      eKey   <- vhGet vh (vaultKeyName kp)
+      let auth = case (eOAuth, eKey) of
+            (Right _, _)          -> "auth: oauth"
+            (_, Right _)          -> "auth: api-key"
+            (Left VaultLocked, _) -> "auth: (vault locked)"
+            _                     -> "auth: none"
           mark = if Just (providerLabel kp) == def then " (default)" else ""
-      ccSend caps (providerLabel kp <> mark <> " — " <> cred)
+      ccSend caps (providerLabel kp <> mark <> " — " <> auth)
+
+-- | OAuth login flow. Anthropic-only for this milestone. Prints the authorize
+-- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges
+-- it for tokens, and stores them in the vault. Tokens are never echoed.
+loginCmd :: ProviderRuntime -> Text -> CommandAction
+loginCmd pr lbl = CommandAction $ \caps ->
+  withProvider caps lbl $ \kp ->
+    if providerLabel kp /= "anthropic"
+      then ccSend caps
+             ("OAuth login is only supported for anthropic (got: " <> providerLabel kp <> ")")
+      else withVaultHandle pr caps $ \vh -> do
+        pkce <- newPkce
+        let url = buildAuthorizeUrl pkce
+        ccSend caps "Open this URL, approve access, then paste the code shown:"
+        ccSend caps url
+        openBrowser url
+        pasted <- ccPrompt caps "code: "
+        let (code, state) = parsePastedCode pasted
+        eTokens <- exchangeCode (prManager pr) pkce code state
+        case eTokens of
+          Left e       -> ccSend caps ("login failed: " <> e)
+          Right tokens -> do
+            res <- vhPut vh anthropicOAuthKey (serializeTokens tokens)
+            case res of
+              Left e   -> ccSend caps (vaultErrText e)
+              Right () -> do
+                _ <- updateFileConfig (prConfigPath pr) (seedDefaults kp)
+                ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
+  where
+    seedDefaults kp fc = fc
+      { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
+      , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
+      }
+
+-- | Best-effort browser open; failure is silently ignored (headless-friendly).
+openBrowser :: Text -> IO ()
+openBrowser url = do
+  let opener = if os == "darwin" then "open" else "xdg-open"
+  _ <- try (runProcess (proc opener [T.unpack url]))
+         :: IO (Either SomeException ExitCode)
+  pure ()
 
 testCmd :: ProviderRuntime -> Text -> CommandAction
 testCmd pr lbl = CommandAction $ \caps ->
@@ -168,13 +224,21 @@ removeCmd :: ProviderRuntime -> Text -> CommandAction
 removeCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
-      res <- vhDelete vh (vaultKeyName kp)
-      case res of
-        Left e   -> ccSend caps (vaultErrText e)
-        Right () -> do
+      r1 <- deleteIfPresent vh (vaultKeyName kp)
+      r2 <- deleteIfPresent vh anthropicOAuthKey
+      case (r1, r2) of
+        (Left e, _) -> ccSend caps (vaultErrText e)
+        (_, Left e) -> ccSend caps (vaultErrText e)
+        _           -> do
           _ <- updateFileConfig (prConfigPath pr) (clearDefault kp)
-          ccSend caps ("Removed credential for " <> providerLabel kp <> ".")
+          ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
   where
+    -- | Delete a key; a missing key is not an error.
+    deleteIfPresent vh k = do
+      res <- vhDelete vh k
+      pure $ case res of
+        Left (VaultKeyNotFound _) -> Right ()
+        other                     -> other
     clearDefault kp fc
       | fcDefaultProvider fc == Just (providerLabel kp) =
           fc { fcDefaultProvider = Nothing, fcDefaultModel = Nothing }

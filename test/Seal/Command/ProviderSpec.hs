@@ -2,6 +2,7 @@
 module Seal.Command.ProviderSpec (spec) where
 
 import Data.ByteString (ByteString)
+import Data.Either (isLeft)
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -100,7 +101,7 @@ spec = do
         sent <- getSent fc
         T.unlines sent `shouldSatisfy` ("anthropic" `T.isInfixOf`)
         T.unlines sent `shouldSatisfy` ("default" `T.isInfixOf`)
-        T.unlines sent `shouldSatisfy` ("present" `T.isInfixOf`)
+        T.unlines sent `shouldSatisfy` ("api-key" `T.isInfixOf`)
 
     it "remove deletes the credential and clears a matching default" $
       withSystemTempDirectory "seal-prov" $ \dir -> do
@@ -116,6 +117,51 @@ spec = do
         fcDefaultProvider cfg `shouldBe` Nothing
         sent <- getSent fc
         sent `shouldSatisfy` any ("Removed" `T.isInfixOf`)
+
+    it "list reports auth: oauth when an OAuth blob is stored" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", "{}")]
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        (any ("oauth" `T.isInfixOf`) out) `shouldBe` True
+
+    it "list reports auth: api-key when only an API key is stored" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk-x")]
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        (any ("api-key" `T.isInfixOf`) out) `shouldBe` True
+
+    it "list reports auth: none when nothing is stored" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        (any ("none" `T.isInfixOf`) out) `shouldBe` True
+
+    it "remove clears BOTH the API key and the OAuth blob" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault
+                [ ("ANTHROPIC_API_KEY",      "sk-x")
+                , ("ANTHROPIC_OAUTH_TOKENS", "{}")
+                ]
+        pr <- mkPR cfg (Just vh)
+        (_, caps) <- makeFakeCaps []
+        runProv pr ["remove", "anthropic"] caps
+        gotKey <- vhGet vh "ANTHROPIC_API_KEY"
+        gotTok <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
+        gotKey `shouldSatisfy` isLeft
+        gotTok `shouldSatisfy` isLeft
 
     it "rejects an unknown provider" $
       withSystemTempDirectory "seal-prov" $ \dir -> do
