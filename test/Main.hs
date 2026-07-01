@@ -4,6 +4,7 @@ import Test.Hspec
 
 import qualified Seal.Core.TypesSpec
 import qualified Seal.AppMainSpec
+import qualified Seal.Session.MetaSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -39,6 +40,7 @@ main :: IO ()
 main = hspec $ do
   Seal.Core.TypesSpec.spec
   Seal.AppMainSpec.spec
+  Seal.Session.MetaSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
