@@ -17,6 +17,7 @@ module Seal.Providers.Registry
   , vaultErrText
   ) where
 
+import Control.Monad (void)
 import Data.IORef (newIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -80,7 +81,7 @@ resolveProvider vh mgr AnthropicProvider model = do
         let sess = OAuthSession
               { osTokens  = ref
               , osRefresh = refreshTokens mgr
-              , osPersist = \t -> vhPut vh "ANTHROPIC_OAUTH_TOKENS" (serializeTokens t) >> pure ()
+              , osPersist = void . vhPut vh "ANTHROPIC_OAUTH_TOKENS" . serializeTokens
               }
         _ <- ensureFresh sess
         pure (Right (SomeProvider (mkAnthropicOAuth mgr sess model)))
