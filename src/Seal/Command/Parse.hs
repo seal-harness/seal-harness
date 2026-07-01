@@ -83,10 +83,18 @@ data ParseOutcome
 -- | Parse a full slash-command line; input MUST begin with @\/@.
 --
 -- Routing rules (in order):
---   1. head word == "help" (case-insensitive) -> 'ParseHelp'
---   2. "--help" or "-h" anywhere in tokens    -> 'ParseHelp' (Just head)
---   3. head word found in registry            -> 'execParserPure' -> 'ParsedAction' or 'ParseFailure'
---   4. head word not in registry              -> 'ParseFailure'
+--   1. head word == "help" (case-insensitive)     -> 'ParseHelp'
+--   2. "--help"/"-h" is the command's SOLE argument -> 'ParseHelp' (Just head):
+--      top-level help for the command itself.
+--   3. head word found in registry                 -> 'execParserPure' -> 'ParsedAction'
+--      or 'ParseFailure'. A help flag that follows a subcommand token (e.g.
+--      @provider add -h@) falls through to here: 'execParserPure' handles
+--      @--help@/@-h@ natively at every level (the command parsers use
+--      'hsubparser', which gives each subcommand its own help), so the
+--      subcommand's help is rendered — as 'ParseFailure' text, which the caller
+--      echoes identically to any other help. Rule 2 is deliberately narrow so
+--      it never swallows a subcommand-scoped help flag.
+--   4. head word not in registry                   -> 'ParseFailure'
 --
 -- 'CompletionInvoked' from 'execParserPure' is reserved for future
 -- shell-completion integration (seal --bash-completion-*); the TUI
@@ -101,13 +109,16 @@ parseSlash registry fullLine =
       let headName = CommandName h
           -- case-insensitive "help" check
           isHelp   = T.toCaseFold h == "help"
-          -- --help / -h flag present anywhere in the remaining tokens
-          hasHelpFlag = "--help" `elem` rest || "-h" `elem` rest
+          -- A help flag that is the command's SOLE argument requests the
+          -- command's own (top-level) help. A help flag with other tokens
+          -- present (a subcommand) is left for execParserPure to dispatch to
+          -- the right subcommand — see rule 3 in the Haddock above.
+          isTopLevelHelp = rest == ["--help"] || rest == ["-h"]
       in if isHelp
          then ParseHelp (case rest of
                 []    -> Nothing
                 (n:_) -> Just (CommandName n))
-         else if hasHelpFlag
+         else if isTopLevelHelp
               then ParseHelp (Just headName)
               else case lookupSpec registry headName of
                 Nothing   -> ParseFailure ("unknown command: " <> h)
