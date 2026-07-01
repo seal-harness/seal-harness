@@ -38,7 +38,7 @@
                 # Concrete patch version that haskell.nix prebuilds and pushes to
                 # cache.iog.io (see nixConfig above). The bare "ghc912" alias
                 # resolved to an uncached GHC, forcing a source build in CI.
-                compiler-nix-name = "ghc9122";
+                compiler-nix-name = "ghc912";
                 # Used by `nix develop .` to open a dev shell for
                 # `cabal`, `ghcid` and `hlint`.
                 shell.tools = {

@@ -134,7 +134,7 @@ jobs:
       # the step is skipped. Also skipped when the secrets aren't configured.
       # ─────────────────────────────────────────────────────────────────────
       - name: Push to S3 Nix cache
-        if: env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
+        # if: env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
         # `nix copy --to s3://…` authenticates via the AWS SDK, which reads the
         # standard AWS_* env vars. The job-level NIX_CACHE_AWS_* vars exist only
         # so the `if` above can gate on them (secrets aren't allowed in `if`), so
@@ -142,10 +142,9 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
         run: |
           # Region must match the substituter URL in flake.nix.
-          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET }}?region=us-east-1'
+          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET }}'
           KEY=/tmp/nix-cache-priv-key.pem
           echo "$NIX_CACHE_SIGNING_KEY" > "$KEY"
 
