@@ -81,6 +81,7 @@ renderHelpIndex reg =
     groupHeader GroupGeneral  = "General"
     groupHeader GroupProvider = "Providers"
     groupHeader GroupSession  = "Sessions"
+    groupHeader GroupModel    = "Model"
     groupHeader GroupVault    = "Vault"
 
     renderSpec :: CommandSpec -> Text
