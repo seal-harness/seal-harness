@@ -67,6 +67,21 @@ spec = describe "Seal.Providers.Anthropic" $ do
       lookup "anthropic-beta" hs `shouldBe` Just "oauth-2025-04-20"
       lookup "x-api-key" hs `shouldBe` Nothing
 
+  describe "httpErrorText" $ do
+    it "429 gives a friendly rate-limit message and does not echo the raw body" $ do
+      let raw = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Error\"}}"
+          msg = httpErrorText 429 raw
+      msg `shouldSatisfy` ("429" `T.isInfixOf`)
+      msg `shouldSatisfy` ("rate limit" `T.isInfixOf`)
+      msg `shouldSatisfy` ("retry" `T.isInfixOf`)
+      -- the terse body is unhelpful, so it must NOT be dumped into the message
+      T.isInfixOf "rate_limit_error" msg `shouldBe` False
+
+    it "other statuses include the code and the full response body" $ do
+      let msg = httpErrorText 400 "invalid request: bad field"
+      msg `shouldSatisfy` ("400" `T.isInfixOf`)
+      msg `shouldSatisfy` ("invalid request: bad field" `T.isInfixOf`)
+
   describe "ensureFresh" $ do
     it "refreshes, updates the ref, and persists when the token is expired" $ do
       let stale = OAuthTokens (mkBearerToken "old") (mkRefreshToken "old-r")
@@ -78,7 +93,7 @@ spec = describe "Seal.Providers.Anthropic" $ do
       let sess = OAuthSession
             { osTokens  = ref
             , osRefresh = \_ -> pure (Right fresh)
-            , osPersist = \t -> writeIORef persisted (Just t)
+            , osPersist = writeIORef persisted . Just
             }
       r <- ensureFresh sess
       case r of

@@ -13,6 +13,7 @@ module Seal.Providers.Anthropic
   , ensureFresh
   , apiKeyHeaders
   , oauthHeaders
+  , httpErrorText
   , encodeRequest
   , decodeResponse
   ) where
@@ -188,9 +189,21 @@ sendMessages mgr hdrs cr = do
         then pure $ case eitherDecode (responseBody resp) of
           Left e  -> Left (T.pack e)
           Right v -> decodeResponse v
-        else pure $ Left $
-          "Anthropic API returned HTTP " <> T.pack (show code) <> ": "
-            <> TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp))
+        else pure $ Left $ httpErrorText code
+          (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))
+
+-- | Render a non-2xx Anthropic response into a user-facing message. HTTP 429
+-- gets a friendlier hint: the subscription backend's rate-limit body is terse
+-- and unhelpful (e.g. @{"error":{"type":"rate_limit_error","message":"Error"}}@),
+-- so we explain the likely cause and next steps instead of echoing it. Every
+-- other status keeps the full response body, which is diagnostic and key-safe.
+httpErrorText :: Int -> Text -> Text
+httpErrorText 429 _ =
+  "Anthropic rate limit (HTTP 429) — the account behind this credential is being \
+  \throttled; a subscription usage cap is the common cause. Wait a moment and \
+  \retry, or switch models with /model use."
+httpErrorText code body =
+  "Anthropic API returned HTTP " <> T.pack (show code) <> ": " <> body
 
 -- Provider instance --------------------------------------------------------
 
