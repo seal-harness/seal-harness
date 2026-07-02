@@ -46,6 +46,10 @@ sketch and are the substance of this spec:
 - Two separate provider entries for local vs cloud — explicitly rejected in favor of one
   `ollama` provider with a configurable base URL.
 - OAuth for Ollama (cloud uses a bearer API key only).
+- Zero-vault local Ollama. `resolveSessionProvider` still gates on a configured vault
+  handle, so a vault must exist (even empty/unlocked) for local Ollama to resolve —
+  `resolveProvider` then treats a missing `OLLAMA_API_KEY` as local. Removing the
+  vault-handle precondition entirely overlaps the M2b resolve-seam rework; revisit there.
 
 ## Guiding principle
 

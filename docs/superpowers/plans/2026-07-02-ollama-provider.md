@@ -1065,7 +1065,78 @@ git commit -m "feat(provider): ollama add flow (base url + optional key) and loc
 
 ---
 
-### Task 7: Full-suite verification + docs
+### Task 7: Provider-aware session default model
+
+Fix a latent bug flagged by the M2 whole-branch review (M3-earmarked): `defaultSessionSelection` in `Seal.Session.Store` hardcodes the model fallback to `defaultModelFor AnthropicProvider` regardless of the configured provider, so a config with `default_provider = "ollama"` and no `default_model` starts a session as `("ollama", "claude-opus-4-8")`. Fall back to `defaultModelFor` of the **parsed** provider instead.
+
+**Files:**
+- Modify: `src/Seal/Session/Store.hs`
+- Test: `test/Seal/Session/StoreSpec.hs`
+
+**Interfaces:**
+- Consumes: `parseProvider`, `defaultModelFor` (Registry — the latter already imported; add `parseProvider`).
+- Produces: `defaultSessionSelection :: FileConfig -> (Text, Text)` (signature unchanged; behavior now provider-aware).
+
+- [ ] **Step 1: Write the failing test**
+
+In `test/Seal/Session/StoreSpec.hs`, add to the `defaultSessionSelection` describe block (create it if absent, importing `defaultSessionSelection` and `Seal.Config.File (defaultFileConfig, FileConfig (..))`):
+
+```haskell
+  describe "defaultSessionSelection" $ do
+    it "uses the parsed provider's default model when no model is configured" $ do
+      let cfg = defaultFileConfig { fcDefaultProvider = Just "ollama" }
+      defaultSessionSelection cfg `shouldBe` ("ollama", "llama3.2")
+
+    it "keeps an explicitly configured model" $ do
+      let cfg = defaultFileConfig
+                  { fcDefaultProvider = Just "ollama"
+                  , fcDefaultModel    = Just "qwen3" }
+      defaultSessionSelection cfg `shouldBe` ("ollama", "qwen3")
+
+    it "falls back to anthropic + its model when nothing is configured" $
+      defaultSessionSelection defaultFileConfig `shouldBe` ("anthropic", "claude-opus-4-8")
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cabal test --test-options='--match "defaultSessionSelection"'`
+Expected: FAIL — the first example gets `("ollama", "claude-opus-4-8")`.
+
+- [ ] **Step 3: Make the fallback provider-aware**
+
+In `src/Seal/Session/Store.hs`, add `parseProvider` to the Registry import, and rewrite `defaultSessionSelection`:
+
+```haskell
+-- | The provider label + model a new session should start with: the configured
+-- defaults, falling back to the configured provider's own default model (or
+-- Anthropic when no provider is configured).
+defaultSessionSelection :: FileConfig -> (Text, Text)
+defaultSessionSelection cfg =
+  ( provLabel
+  , fromMaybe fallbackModel (fcDefaultModel cfg) )
+  where
+    provLabel = fromMaybe "anthropic" (fcDefaultProvider cfg)
+    ModelId fallbackModel =
+      maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider provLabel)
+```
+
+Confirm `AnthropicProvider` and `KnownProvider (..)` are already imported (they are — `import Seal.Providers.Registry (KnownProvider (..), defaultModelFor)`); add `parseProvider` to that import list.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `cabal test --test-options='--match "defaultSessionSelection"'`
+Expected: PASS (all three examples).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Seal/Session/Store.hs test/Seal/Session/StoreSpec.hs
+git commit -m "fix(session): default model follows the configured provider"
+```
+
+---
+
+### Task 8: Full-suite verification + docs
 
 Confirm the whole suite is green and the build is `-Werror` clean end-to-end, and record the milestone.
 
@@ -1118,6 +1189,8 @@ git commit -m "chore(ollama): finalize M3 — full suite green"
 - Endpoints `/api/chat` + `/api/tags`, base-URL join → Tasks 2 (URLs) + 4 (round-trip). ✅
 - Key-safe errors (connection hint, 401, generic) → Task 3 + used in Task 4. ✅
 - `max_tokens → options.num_predict` → Task 2 `encodeRequest`. ✅
+- Provider-aware session default model (M2-review M3 note) → Task 7. ✅
+- Zero-vault local Ollama → documented non-goal (spec); not implemented in M3. ✅ (out of scope)
 - Testing: pure codec round-trips, registry resolution (local/cloud/locked), config parse, `/provider` command tests, pending live test → Tasks 1–6. ✅
 - Non-goals (streaming, embeddings, `[providers.*]` tables, two entries, OAuth) → not introduced. ✅
 
