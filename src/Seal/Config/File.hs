@@ -35,6 +35,9 @@ data FileConfig = FileConfig
     -- ^ Provider id used for new sessions (e.g. @\"anthropic\"@).
   , fcDefaultModel :: Maybe Text
     -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
+  , fcOllamaBaseUrl :: Maybe Text
+    -- ^ Ollama host base URL (default @http:\/\/localhost:11434@ applied by the
+    -- Ollama provider). @https:\/\/ollama.com@ for Ollama Cloud.
   } deriving stock (Eq, Show)
 
 -- | Starting state: all fields absent, before @\/vault setup@ is run.
@@ -47,6 +50,7 @@ defaultFileConfig = FileConfig
   , fcVaultKeyType   = Nothing
   , fcDefaultProvider = Nothing
   , fcDefaultModel    = Nothing
+  , fcOllamaBaseUrl   = Nothing
   }
 
 -- ---------------------------------------------------------------------------
@@ -65,6 +69,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "vault_key_type")  .= fcVaultKeyType
   <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
   <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
+  <*> Toml.dioptional (Toml.text "ollama_base_url")  .= fcOllamaBaseUrl
 
 -- ---------------------------------------------------------------------------
 -- Public API

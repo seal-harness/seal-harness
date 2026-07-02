@@ -25,6 +25,7 @@ spec = describe "Seal.Config.File" $ do
         , fcVaultKeyType   = Nothing
         , fcDefaultProvider = Nothing
         , fcDefaultModel    = Nothing
+        , fcOllamaBaseUrl   = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -54,6 +55,15 @@ spec = describe "Seal.Config.File" $ do
             fcDefaultProvider cfg `shouldBe` Nothing
             fcDefaultModel    cfg `shouldBe` Nothing
 
+    it "parses ollama_base_url" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "ollama_base_url = \"https://ollama.com\"\n"
+        result <- loadFileConfig path
+        case result of
+          Left err  -> expectationFailure ("parse failed: " <> T.unpack err)
+          Right cfg -> fcOllamaBaseUrl cfg `shouldBe` Just "https://ollama.com"
+
     it "returns Left on malformed TOML" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do
         let path = dir </> "config.toml"
@@ -75,6 +85,7 @@ spec = describe "Seal.Config.File" $ do
               , fcVaultKeyType   = Just "x25519"
               , fcDefaultProvider = Nothing
               , fcDefaultModel    = Nothing
+              , fcOllamaBaseUrl   = Just "http://localhost:11434"
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
