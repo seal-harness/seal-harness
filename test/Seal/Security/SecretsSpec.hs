@@ -26,6 +26,13 @@ spec = describe "Seal.Security.Secrets" $ do
     it "withBearerToken provides access to the underlying value" $
       withBearerToken (mkBearerToken "token-xyz") id `shouldBe` ("token-xyz" :: ByteString)
 
+  describe "RefreshToken" $ do
+    it "Show is redacted" $
+      show (mkRefreshToken "rt-supersecret") `shouldBe` "RefreshToken <redacted>"
+
+    it "withRefreshToken provides access to the underlying value" $
+      withRefreshToken (mkRefreshToken "rt-abc") id `shouldBe` ("rt-abc" :: ByteString)
+
   describe "SecretKey" $ do
     it "Show is redacted" $
       show (mkSecretKey "0123456789abcdef") `shouldBe` "SecretKey <redacted>"

@@ -6,7 +6,12 @@ import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
+import Network.HTTP.Client.TLS (newTlsManager)
+
 import Seal.Channel.Cli (runCliTui)
+import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
+import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -18,6 +23,7 @@ import Seal.Config.Paths
   )
 import Seal.Ingest (emptyChain)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
@@ -63,5 +69,26 @@ runTui = do
             , vrConfigPath = cfgPath
             , vrHandleRef  = ref
             }
-      registry = mkRegistry [vaultCommandSpec rt]
-  runCliTui paths registry emptyChain
+  -- A dedicated manager for the /provider test round-trip. (M2 consolidates
+  -- this with the chat provider's manager when the startup hardcode is removed.)
+  mgr <- newTlsManager
+  let pr = ProviderRuntime
+            { prConfigPath = cfgPath
+            , prVault      = rt
+            , prManager    = mgr
+            }
+  -- Every launch starts a fresh session (resume is a follow-on milestone).
+  sessionMeta <- initSession paths cfg
+  activeRef   <- newIORef sessionMeta
+  let sr = SessionRuntime
+             { srPaths      = paths
+             , srConfigPath = cfgPath
+             , srActive     = activeRef
+             }
+      registry = mkRegistry
+        [ vaultCommandSpec rt
+        , providerCommandSpec pr
+        , sessionCommandSpec sr
+        , modelCommandSpec sr
+        ]
+  runCliTui paths rt pr sr registry emptyChain

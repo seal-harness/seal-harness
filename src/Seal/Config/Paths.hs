@@ -5,12 +5,20 @@ module Seal.Config.Paths
   , ensureSealDirs
   , configFilePath
   , vaultFilePath
+  , sessionsRoot
+  , sessionDir
+  , sessionMetaPath
+  , sessionTranscriptPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), takeDirectory)
 import System.Posix.Files (setFileMode)
+
+import Data.Text qualified as T
+
+import Seal.Core.Types (SessionId, sessionIdText)
 
 -- | All paths derived from the seal home directory.
 --
@@ -75,4 +83,20 @@ configFilePath paths = spConfig paths </> "config.toml"
 -- @\<config\>\/vault\/vault.age@.
 vaultFilePath :: SealPaths -> FilePath
 vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
+
+-- | Root directory holding one subdirectory per session: @\<state\>\/sessions@.
+sessionsRoot :: SealPaths -> FilePath
+sessionsRoot paths = spState paths </> "sessions"
+
+-- | Directory for one session: @\<state\>\/sessions\/\<id\>@.
+sessionDir :: SealPaths -> SessionId -> FilePath
+sessionDir paths sid = sessionsRoot paths </> T.unpack (sessionIdText sid)
+
+-- | The session's metadata file: @\<sessionDir\>\/session.json@.
+sessionMetaPath :: SealPaths -> SessionId -> FilePath
+sessionMetaPath paths sid = sessionDir paths sid </> "session.json"
+
+-- | The session's transcript: @\<sessionDir\>\/transcript.jsonl@.
+sessionTranscriptPath :: SealPaths -> SessionId -> FilePath
+sessionTranscriptPath paths sid = sessionDir paths sid </> "transcript.jsonl"
 
