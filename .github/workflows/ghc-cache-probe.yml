@@ -1,0 +1,72 @@
+name: GHC cache probe
+
+# Fast, throwaway diagnostic: for each candidate GHC, resolve its store path on
+# the *actual* runner and ask cache.iog.io whether it's prebuilt. Never builds
+# GHC or the project, so it finishes in minutes instead of hours. Used to pick a
+# compiler-nix-name that is cached for BOTH systems.
+on:
+  push:
+    branches: [ci/ghc-cache-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://cache.iog.io
+            extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk=
+
+      - name: Probe candidate GHC versions against cache.iog.io
+        run: |
+          cat > /tmp/probe.nix <<'NIX'
+          { system }:
+          let
+            hn = builtins.getFlake (toString ./.);
+            pkgs = import hn.inputs.nixpkgs {
+              inherit system;
+              overlays = [ hn.inputs.haskellNix.overlay ];
+              inherit ((import hn.inputs.haskellNix {})) config;
+            };
+          in pkgs.haskell-nix.compiler
+          NIX
+
+          SYS='${{ matrix.system }}'
+          {
+            echo "## GHC cache probe — $SYS"
+            echo ""
+            echo "| compiler-nix-name | cache.iog.io | store path |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for V in ghc984 ghc9102 ghc9103 ghc9121 ghc9122 ghc9123 ghc9124; do
+            P=$(nix eval --raw --impure --expr \
+              "let c = import /tmp/probe.nix { system = \"$SYS\"; }; in if c ? \"$V\" then c.\"$V\".outPath else \"\"" \
+              2>/dev/null || true)
+            if [ -z "$P" ]; then
+              echo "$V: <no such attr for this haskell.nix pin>"
+              echo "| \`$V\` | n/a | — |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if nix path-info --store https://cache.iog.io "$P" >/dev/null 2>&1; then
+              echo "$V: CACHED   $P"
+              echo "| \`$V\` | ✅ cached | \`$P\` |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$V: NOT CACHED (would build from source)   $P"
+              echo "| \`$V\` | ❌ source build | \`$P\` |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
