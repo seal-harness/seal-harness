@@ -38,6 +38,7 @@ library
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
+        Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Transcript.Types
         Seal.Handles.Transcript
@@ -169,6 +170,7 @@ test-suite tests
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
+        Seal.Providers.OllamaSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
