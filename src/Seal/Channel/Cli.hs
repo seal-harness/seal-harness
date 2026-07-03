@@ -127,6 +127,9 @@ runCliTui paths rt pr sr registry chain = do
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
         }
+  -- Startup diagnostic: show which provider+model the active session will use
+  -- for plain-text turns (resolved from config at session creation).
+  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0)
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
   -- The transcript bracket wraps the whole loop so every turn shares one writer.

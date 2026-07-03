@@ -80,7 +80,7 @@ runTurn env userText = do
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
             then liftIO (ccSend (aeCaps env)
-                   (T.intercalate "\n" [t | CbText t <- rsContent resp]))
+                   ("MODEL> " <> T.intercalate "\n" [t | CbText t <- rsContent resp]))
             else do
               results <- mapM dispatchOne toolUses
               let assistantMsg = Message Assistant (rsContent resp)

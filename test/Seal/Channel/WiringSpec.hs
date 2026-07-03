@@ -46,4 +46,4 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc
-    sent `shouldBe` ["hello from model"]
+    sent `shouldBe` ["MODEL> hello from model"]

@@ -69,4 +69,4 @@ spec = describe "Seal.Agent.Loop" $
                 8
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
-    readIORef sent `shouldReturn` ["all done"]
+    readIORef sent `shouldReturn` ["MODEL> all done"]
