@@ -15,7 +15,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
-import Seal.Config.File (FileConfig (..), loadFileConfig)
+import Seal.Config.File (FileConfig (..), fcOllamaBaseUrl, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
@@ -162,6 +162,39 @@ spec = do
         gotTok <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
         gotKey `shouldSatisfy` isLeft
         gotTok `shouldSatisfy` isLeft
+
+    it "add ollama saves the base url to config and stores a key when given" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        -- scripted answers: base url (ccPrompt) then key (ccPromptSecret)
+        (_, caps) <- makeFakeCaps ["https://ollama.com", "k-cloud"]
+        runProv pr ["add", "ollama"] caps
+        vhGet vh "OLLAMA_API_KEY" >>= (`shouldBe` Right ("k-cloud" :: ByteString))
+        Right cfg <- loadFileConfig cfgPath
+        fcOllamaBaseUrl cfg `shouldBe` Just "https://ollama.com"
+
+    it "add ollama with a blank key configures local (no key stored)" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        -- blank base url keeps the default; blank key => local
+        (_, caps) <- makeFakeCaps ["", ""]
+        runProv pr ["add", "ollama"] caps
+        vhGet vh "OLLAMA_API_KEY" >>= (`shouldSatisfy` either (const True) (const False))
+
+    it "list reports ollama as none (local) when no key is stored" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        T.unlines out `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        T.unlines out `shouldSatisfy` ("local" `T.isInfixOf`)
 
     it "rejects an unknown provider" $
       withSystemTempDirectory "seal-prov" $ \dir -> do

@@ -134,18 +134,46 @@ unknownProviderMsg lbl =
 addCmd :: ProviderRuntime -> Text -> CommandAction
 addCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp ->
-    withVaultHandle pr caps $ \vh -> do
-      val <- ccPromptSecret caps ("API key for " <> providerLabel kp <> ": ")
-      res <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 val)
-      case res of
-        Left e   -> ccSend caps (vaultErrText e)
-        Right () -> do
-          _ <- updateFileConfig (prConfigPath pr) (seedDefaults kp)
-          ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
+    withVaultHandle pr caps $ \vh ->
+      if providerLabel kp == "ollama"
+        then addOllama pr caps vh kp
+        else do
+          val <- ccPromptSecret caps ("API key for " <> providerLabel kp <> ": ")
+          res <- vhPut vh (vaultKeyName kp) (TE.encodeUtf8 val)
+          case res of
+            Left e   -> ccSend caps (vaultErrText e)
+            Right () -> do
+              _ <- updateFileConfig (prConfigPath pr) (seedDefaults kp)
+              ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
   where
     seedDefaults kp fc = fc
       { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
       , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
+      }
+
+-- | Ollama onboarding: prompt for the base URL (blank keeps the default),
+-- persist it to config, then prompt for an optional API key (blank => local,
+-- nothing stored). Seeds provider/model defaults like the generic path.
+addOllama :: ProviderRuntime -> ChannelCaps -> VaultHandle -> KnownProvider -> IO ()
+addOllama pr caps vh kp = do
+  urlIn <- ccPrompt caps
+             ("Ollama base URL [" <> defaultOllamaBaseUrl <> "] (blank = default): ")
+  let mUrl = if T.null (T.strip urlIn) then Nothing else Just (T.strip urlIn)
+  keyIn <- ccPromptSecret caps "Ollama API key (blank for local): "
+  keyRes <-
+    if T.null keyIn
+      then pure (Right ())
+      else vhPut vh (vaultKeyName kp) (TE.encodeUtf8 keyIn)
+  case keyRes of
+    Left e   -> ccSend caps (vaultErrText e)
+    Right () -> do
+      _ <- updateFileConfig (prConfigPath pr) (seedAll mUrl)
+      ccSend caps "Configured ollama."
+  where
+    seedAll mUrl fc = fc
+      { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
+      , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
+      , fcOllamaBaseUrl   = mUrl <|> fcOllamaBaseUrl fc
       }
 
 listCmd :: ProviderRuntime -> CommandAction
@@ -156,15 +184,24 @@ listCmd pr = CommandAction $ \caps ->
     mapM_ (reportOne caps vh def) knownProviders
   where
     reportOne caps vh def kp = do
-      eOAuth <- vhGet vh anthropicOAuthKey
-      eKey   <- vhGet vh (vaultKeyName kp)
-      let auth = case (eOAuth, eKey) of
+      eKey <- vhGet vh (vaultKeyName kp)
+      auth <- authLabel vh kp eKey
+      let mark = if Just (providerLabel kp) == def then " (default)" else ""
+      ccSend caps (providerLabel kp <> mark <> " — " <> auth)
+
+    authLabel vh kp eKey
+      | providerLabel kp == "ollama" =
+          pure $ case eKey of
+            Right _          -> "auth: api-key"
+            Left VaultLocked -> "auth: (vault locked)"
+            _                -> "auth: none (local)"
+      | otherwise = do
+          eOAuth <- vhGet vh anthropicOAuthKey
+          pure $ case (eOAuth, eKey) of
             (Right _, _)          -> "auth: oauth"
             (_, Right _)          -> "auth: api-key"
             (Left VaultLocked, _) -> "auth: (vault locked)"
             _                     -> "auth: none"
-          mark = if Just (providerLabel kp) == def then " (default)" else ""
-      ccSend caps (providerLabel kp <> mark <> " — " <> auth)
 
 -- | OAuth login flow. Anthropic-only for this milestone. Prints the authorize
 -- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges
