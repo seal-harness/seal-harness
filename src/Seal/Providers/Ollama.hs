@@ -234,4 +234,4 @@ instance Provider Ollama where
 withHeaders :: Ollama -> (RequestHeaders -> IO r) -> IO r
 withHeaders o k = case olApiKey o of
   Nothing  -> k (ollamaHeaders Nothing)
-  Just key -> withApiKey key (\kb -> k (ollamaHeaders (Just kb)))
+  Just key -> withApiKey key (k . ollamaHeaders . Just)

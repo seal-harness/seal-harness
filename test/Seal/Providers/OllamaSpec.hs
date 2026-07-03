@@ -162,16 +162,16 @@ spec = describe "Seal.Providers.Ollama" $ do
   describe "ollamaErrorText / unreachableMsg" $ do
     it "401 points the user at /provider add ollama" $ do
       let m = ollamaErrorText 401 "unauthorized"
-      m `shouldSatisfy` (T.isInfixOf "401")
-      m `shouldSatisfy` (T.isInfixOf "/provider add ollama")
+      m `shouldSatisfy` T.isInfixOf "401"
+      m `shouldSatisfy` T.isInfixOf "/provider add ollama"
     it "other statuses include the code and body" $ do
       let m = ollamaErrorText 400 "bad model"
-      m `shouldSatisfy` (T.isInfixOf "400")
-      m `shouldSatisfy` (T.isInfixOf "bad model")
+      m `shouldSatisfy` T.isInfixOf "400"
+      m `shouldSatisfy` T.isInfixOf "bad model"
     it "unreachable mentions the base url and how to start ollama" $ do
       let m = unreachableMsg "http://localhost:11434"
-      m `shouldSatisfy` (T.isInfixOf "http://localhost:11434")
-      m `shouldSatisfy` (T.isInfixOf "ollama serve")
+      m `shouldSatisfy` T.isInfixOf "http://localhost:11434"
+      m `shouldSatisfy` T.isInfixOf "ollama serve"
 
   describe "Provider Ollama (live)" $
     it "chat + tags round-trip against a running ollama" $

@@ -126,7 +126,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("oauth" `T.isInfixOf`) out) `shouldBe` True
+        any ("oauth" `T.isInfixOf`) out `shouldBe` True
 
     it "list reports auth: api-key when only an API key is stored" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -136,7 +136,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("api-key" `T.isInfixOf`) out) `shouldBe` True
+        any ("api-key" `T.isInfixOf`) out `shouldBe` True
 
     it "list reports auth: none when nothing is stored" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -146,7 +146,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("none" `T.isInfixOf`) out) `shouldBe` True
+        any ("none" `T.isInfixOf`) out `shouldBe` True
 
     it "remove clears BOTH the API key and the OAuth blob" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -227,5 +227,5 @@ spec = do
         idx `shouldSatisfy` ("Providers" `T.isInfixOf`)
         idx `shouldSatisfy` ("/provider" `T.isInfixOf`)
 
-    it "live: /provider test anthropic round-trips against the real API" $
+    it "live: /provider test anthropic round-trips against the real API"
       pending  -- requires ANTHROPIC_API_KEY + network; run manually
