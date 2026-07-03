@@ -87,10 +87,11 @@ resolveSessionProvider pr meta =
 
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
-  :: ChannelCaps -> SomeProvider -> ModelId -> SessionId
+  :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> ISA.Registry -> TranscriptHandle -> AgentEnv
-mkSessionAgentEnv caps provider model sid isaReg tHandle = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
   { aeProvider   = provider
+  , aeProviderLabel = provLabel
   , aeModel      = model
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
@@ -149,7 +150,7 @@ runCliTui paths rt pr sr registry chain = do
             Left err            -> ccSend caps err
             Right (prov, model) ->
               handlePlain
-                (mkSessionAgentEnv caps prov model (smId meta) isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
                 appEnv t
     runInputT hlSettings (loop caps plainHandler)
   where
