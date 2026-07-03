@@ -84,14 +84,16 @@ The shortest path to "test the provider from the REPL."
 
 *User-testable:* multi-provider switching across Anthropic and Ollama.
 
-### M4 — Spine probe commands
+### M4 — Spine probe commands — CANCELLED (2026-07-03)
 
-- `/show <text>`, `/ask <text>`, `/read <path>`, `/secret <name>` — directly drive the
-  SHOW_HUMAN / ASK_HUMAN / FILE_READ / SECRET_GET opcodes through the existing dispatch
-  (ACK-before-execute preserved for the Untrusted `/read`).
-- Chat-driven tool calls continue to exercise the same opcodes indirectly.
-
-*User-testable:* every spine opcode exercisable on demand.
+**Dropped as unnecessary.** The idea was operator `/`-commands (`/show`, `/ask`,
+`/read`, `/secret`) that directly drive SHOW_HUMAN / ASK_HUMAN / FILE_READ /
+SECRET_GET. On review none were needed: the model already reaches all four
+opcodes as **tool calls** (they are registered in the ISA registry), secrets are
+managed through the `/vault` command family, and SHOW/ASK are the model talking
+*to* the human (not the reverse). The opcodes remain tool-call-only; no operator
+commands ship. See `../plans/2026-07-03-phase-3-m4-spine-commands.md` (retained
+as a cancelled planning record).
 
 ## Components
 
