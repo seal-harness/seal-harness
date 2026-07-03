@@ -70,7 +70,7 @@ spec = describe "Seal.Providers.Ollama" $ do
           req = CompletionRequest (ModelId "m") Nothing [user] [] ToolAuto 16
       parseMaybe (withObject "req" (.: "messages")) (encodeRequest req) `shouldBe`
         Just [ object ["role" .= ("tool" :: String), "content" .= ("one" :: String)]
-             , object ["role" .= ("tool" :: String), "content" .= ("two" :: String)] ]
+             , object ["role" .= ("tool" :: String), "content" .= ("[tool error] two" :: String)] ]
 
     it "includes a tools array only when tools are present" $ do
       let tool = ToolDefinition (OpName "FILE_READ") "read a file"
@@ -136,6 +136,28 @@ spec = describe "Seal.Providers.Ollama" $ do
             [ "message" .= object ["role" .= ("assistant" :: String), "content" .= ("x" :: String)] ]
       decodeResponse body `shouldBe`
         Right (CompletionResponse [CbText "x"] StopEnd (Usage 0 0))
+
+    it "defaults arguments to an empty object when the function omits it" $ do
+      let body = object
+            [ "message" .= object
+                [ "role" .= ("assistant" :: String)
+                , "content" .= ("" :: String)
+                , "tool_calls" .=
+                    [ object ["function" .= object ["name" .= ("FILE_READ" :: String)]] ]
+                ]
+            , "done_reason" .= ("stop" :: String)
+            ]
+      decodeResponse body `shouldBe`
+        Right (CompletionResponse
+                [ CbToolUse (ToolCallId "call_0") (OpName "FILE_READ") (object []) ]
+                StopToolUse
+                (Usage 0 0))
+
+    it "parses a fully-empty response with no text block, no tool calls, zero usage" $ do
+      let body = object
+            [ "message" .= object ["role" .= ("assistant" :: String), "content" .= ("" :: String)] ]
+      decodeResponse body `shouldBe`
+        Right (CompletionResponse [] StopEnd (Usage 0 0))
 
   describe "ollamaErrorText / unreachableMsg" $ do
     it "401 points the user at /provider add ollama" $ do

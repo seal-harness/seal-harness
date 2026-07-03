@@ -91,8 +91,8 @@ encMsg (Message User blocks) =
         [ object ["role" .= ("user" :: Text), "content" .= T.intercalate "\n" texts]
         | not (null texts) ]
       toolMsgs =
-        [ object ["role" .= ("tool" :: Text), "content" .= joinParts parts]
-        | CbToolResult _ parts _ <- blocks ]
+        [ object ["role" .= ("tool" :: Text), "content" .= renderToolContent isErr parts]
+        | CbToolResult _ parts isErr <- blocks ]
   in userMsg <> toolMsgs
 encMsg (Message Assistant blocks) =
   let content = T.intercalate "\n" [t | CbText t <- blocks]
@@ -102,10 +102,12 @@ encMsg (Message Assistant blocks) =
       tc = ["tool_calls" .= toolCalls | not (null toolCalls)]
   in [object (["role" .= ("assistant" :: Text), "content" .= content] <> tc)]
 
--- | Ollama's tool role has no error channel, so cbIsError is folded into the
--- content text; parts are newline-joined.
-joinParts :: [ToolResultPart] -> Text
-joinParts parts = T.intercalate "\n" [t | TrpText t <- parts]
+-- | Ollama's tool role carries no structured error flag, so an errored result
+-- is marked in-band: its text is prefixed so the model can see the call failed.
+renderToolContent :: Bool -> [ToolResultPart] -> Text
+renderToolContent isErr parts =
+  let body = T.intercalate "\n" [t | TrpText t <- parts]
+  in if isErr then "[tool error] " <> body else body
 
 encTool :: ToolDefinition -> Value
 encTool (ToolDefinition (OpName n) d sch) =
