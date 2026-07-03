@@ -7,7 +7,8 @@
 > tool-exposure gating that gives them teeth are the **next** milestone (M-b) —
 > see "Deferred / next milestone" below.
 
-**Status:** APPROVED (brainstorming, 2026-07-03).
+**Status:** APPROVED (brainstorming, 2026-07-03). Revised after design-review
+gate round 1 (see "Review-gate revision log" at the end).
 
 **Goal:** ship the pieces of Phase 3's "self-describing ISA + Dynamic Retrieval"
 work that have immediate, gating-independent value: a generic page sizer, a
@@ -29,9 +30,14 @@ native tools each turn via `registryToolDefs (aeRegistry env)`. The ISA is
 "data" (`Seal.ISA.Opcode`): an `Opcode` carries `opName`, `opTrust`, `opDesc`,
 `opInSchema`, `opOutSchema`, a pure `opAuthorize`, and an effectful `opRun ::
 BackendExec -> Value -> App OpResult`. `FILE_READ` (`Seal.ISA.Ops.File`) is the
-lone Untrusted seed opcode: it resolves a `SafePath` and returns the **entire**
-file as a single `TrpText` part, routed through `dispatch`, which does
-`recordAndAck` **before** `opRun` (ACK-before-execute).
+lone Untrusted seed opcode: it resolves a `SafePath`, then **reads at most
+`maxReadBytes = 65536` (64 KiB)** via `BS.hGet` and returns the decoded text as
+a single `TrpText` part — routed through `dispatch`, which does `recordAndAck`
+**before** `opRun` (ACK-before-execute). All its IO is funnelled through the
+`BackendExec` seam (`runLocal backend`) and guarded by `try @IOError`. Its own
+comment states: *"Phase-3 Dynamic-Retrieval will implement proper paging."* That
+64 KiB bound is a memory-safety property this milestone must **preserve**, not
+drop.
 
 Two roadmap deliverables motivate this milestone:
 
@@ -53,158 +59,255 @@ files*; binary files would want a different abstraction and are out of scope.
 
 ## Architecture
 
-Two new pure-ish modules plus a retrofit of one existing opcode. No changes to
+Two new modules plus a retrofit of one existing opcode. No changes to
 `Seal.ISA.Opcode`, `Registry`, `Dispatch`, or `Seal.Agent.Loop`.
 
 | Module | Kind | Purpose |
 |---|---|---|
-| `Seal.ISA.Paging` | new, pure | The Dynamic Retrieval sizer + a generic `paginate`. File-agnostic, so it is reused by future list-returning opcodes (memory rows, session lists, the M-b discovery ops), not just files. |
-| `Seal.Text.LineFile` | new, pure core + one IO fn | The reusable line-oriented text-file abstraction: a `LineWindow` built on `Paging`, a pure `windowLines`, a thin `readLineWindow`, and a `renderWindow`. The seam agent-def / skills / generic file CRUD reuse later. |
-| `Seal.ISA.Ops.File` | modify | Retrofit `FILE_READ` to resolve its `SafePath` (unchanged) and then delegate to `LineFile`, exposing optional `offset` / `limit`. |
+| `Seal.Core.Paging` | new, pure | The Dynamic Retrieval sizer + a generic `paginate`. File-agnostic and placed at a neutral leaf namespace, so it is reused by future list-returning opcodes (memory rows, session lists, the M-b discovery ops) without those consumers depending on `Seal.ISA.*` or `Seal.Text.*`. |
+| `Seal.Text.LineFile` | new, pure core + one IO fn | The reusable line-oriented text-file abstraction: a `LineWindow` built on `Seal.Core.Paging`, a pure `windowLines`, a **bounded** `readLineWindow` taking an opaque `SafePath`, and a `renderWindow`. The seam agent-def / skills / generic file CRUD reuse later. |
+| `Seal.ISA.Ops.File` | modify | Retrofit `FILE_READ` to resolve its `SafePath` (unchanged), then delegate to `LineFile` through the `BackendExec` seam, exposing optional `offset` / `limit`. |
 
 **Why split `Paging` from `LineFile`.** The count→page-size math is not
 file-specific — the M-b discovery ops page over *opcodes*, and future Audited
-opcodes page over memory rows and session lists. Keeping the sizer
-file-agnostic is what makes it reusable; `LineFile` layers the line-oriented
-text semantics on top.
+opcodes page over memory rows and session lists. Keeping the sizer file-agnostic
+is what makes it reusable; `LineFile` layers the line-oriented text semantics on
+top.
 
-**Namespaces.** `Seal.ISA.Paging` sits with the ISA machinery it primarily
-serves. `Seal.Text.LineFile` introduces a new `Seal.Text.*` namespace for pure
-text utilities (the roadmap namespace list has `Seal.Tools`, but this is a pure
-text util with no tool/effect character, so `Seal.Text` reads truer). Both are
-easy to rename before code lands if preferred.
+**Namespaces (resolved after gate feedback).** The pager goes to
+**`Seal.Core.Paging`**, not `Seal.ISA.Paging`: it is claimed file- and
+ISA-agnostic and is imported by `Seal.Text.LineFile` (itself reusable outside the
+ISA), so homing it under `Seal.ISA.*` would make every non-ISA `LineFile`
+consumer transitively depend on the ISA — the dependency arrow would read
+backwards. `Seal.Core` is the existing leaf namespace for shared vocabulary, so
+the arrow becomes `Seal.Text → Seal.Core` (clean) and `Seal.ISA.Ops.File →
+{Seal.Core.Paging, Seal.Text.LineFile}` (clean). `Seal.Text.*` is a **new**
+namespace for pure text utilities; the roadmap's namespace list is illustrative
+("matching the README architecture"), and a dedicated `Seal.Text` reads truer for
+this than shoehorning a text util into `Seal.Tools` (which is earmarked for
+tool/opcode *execution*, e.g. `Seal.Tools.Exec.*` in Phase 4). *If the maintainer
+prefers `Seal.Tools.LineFile`, it is a mechanical rename.*
 
 ---
 
-## Component 1 — `Seal.ISA.Paging` (pure)
+## Component 1 — `Seal.Core.Paging` (pure)
 
 ```haskell
 data PageParams = PageParams
-  { ppFloor   :: Int      -- minimum page size
+  { ppFloor   :: Int      -- minimum page size (invariant: 1 <= ppFloor <= ppCeiling)
   , ppCeiling :: Int      -- maximum page size
-  , ppCoeff   :: Double   -- A in round(A·√total)
+  , ppCoeff   :: Double   -- A in round(A·√total)  (invariant: ppCoeff >= 0)
   }
 
 data Page a = Page
   { pgItems   :: [a]
   , pgOffset  :: Int      -- offset this page starts at (clamped to [0, total])
-  , pgTotal   :: Int      -- total item count
+  , pgTotal   :: Int      -- total item count (= length of the input list)
   , pgHasMore :: Bool     -- pgOffset + length pgItems < pgTotal
   }
 
--- clamp(ppFloor, round(ppCoeff · sqrt total), ppCeiling)
+-- clamp ppFloor..ppCeiling of round(ppCoeff * sqrt (fromIntegral total))
 pageSize :: PageParams -> Int -> Int
 
--- paginate params offset mLimit items:
---   size   = maybe (pageSize params total) (clamp 1 ppCeiling) mLimit
---   window = take size (drop offset' items)   where offset' = clamp 0 total offset
+-- paginate params offset mLimit items, where total = length items:
+--   offset' = clamp 0 total offset
+--   size    = maybe (pageSize params total) (clamp 1 ppCeiling) mLimit
+--   window  = take size (drop offset' items)
 paginate :: PageParams -> Int -> Maybe Int -> [a] -> Page a
 
-defaultPageParams :: PageParams   -- PageParams 10 200 4.0
+defaultPageParams :: PageParams   -- PageParams { ppFloor = 10, ppCeiling = 200, ppCoeff = 4.0 }
 ```
+
+`clamp lo hi x = max lo (min hi x)` — value last, matching `Data.Ord.clamp (lo,hi) x`.
 
 **Tuning layers.** *Call layer* is live: `mLimit` (an explicit per-call limit)
 overrides the computed size and is itself clamped to `[1, ppCeiling]` so a caller
-cannot request an unbounded window. *Config / session layers* are **deferred**:
-`PageParams` is a plain record, so threading a `[retrieval]` config section (and
-later a per-session override) in is purely additive; this milestone uses
+cannot request an unbounded window — an explicit limit may reach `ppCeiling` but
+never exceed it. *Config / session layers* are **deferred**: `PageParams` is a
+plain record, so threading a `[retrieval]` config section (and later a
+per-session override) in is purely additive; this milestone uses
 `defaultPageParams` everywhere.
 
-**Properties (QuickCheck):**
-- `pageSize` result is always within `[ppFloor, ppCeiling]` (given `floor ≤ ceiling`).
-- `pageSize` is monotonic non-decreasing in `total`.
-- `paginate`: `pgOffset + length pgItems ≤ pgTotal`; `pgHasMore ⇔ pgOffset + length pgItems < pgTotal`; `pgItems` is a contiguous slice of `items`.
-- Explicit `mLimit` wins over the computed size and is clamped to `[1, ppCeiling]`.
+**Properties (QuickCheck).** Arbitrary `PageParams` is generated under the
+invariants (`1 <= ppFloor <= ppCeiling`, `ppCoeff >= 0`); `total = length items`:
+- `pageSize` result is always within `[ppFloor, ppCeiling]`.
+- `pageSize` is monotonic non-decreasing in `total` (both `sqrt` and `round` are
+  monotone non-decreasing; test expectations near `x.5` account for Haskell
+  banker's rounding, e.g. `round 2.5 == 2`).
+- `paginate`: `pgOffset + length pgItems <= pgTotal`; `pgHasMore ⇔ pgOffset +
+  length pgItems < pgTotal`; `pgItems` is exactly `take size (drop pgOffset items)`
+  (a contiguous slice, order preserved).
+- **Security invariant (dedicated case):** for *any* `offset` (incl. negative or
+  huge) and *any* `mLimit` (incl. negative or huge), `length pgItems <=
+  ppCeiling` and `pgOffset ∈ [0, total]`. Negative offsets, over-large offsets,
+  and unbounded limits are all defused here.
 
 ---
 
-## Component 2 — `Seal.Text.LineFile` (pure core + thin IO)
+## Component 2 — `Seal.Text.LineFile` (pure core + one bounded IO fn)
 
 ```haskell
 data LineWindow = LineWindow
-  { lwLines   :: [Text]   -- the windowed lines, in file order
-  , lwStart   :: Int      -- 0-based index of first returned line
-  , lwEnd      :: Int     -- 0-based index just past the last returned line (== lwStart + length lwLines)
-  , lwTotal   :: Int      -- total line count in the file
-  , lwHasMore :: Bool     -- lwEnd < lwTotal
+  { lwLines     :: [Text]  -- the windowed lines, in file order
+  , lwStart     :: Int     -- 0-based index of first returned line (== the Page pgOffset)
+  , lwEnd       :: Int     -- 0-based index just past the last returned line (lwStart + length lwLines)
+  , lwTotal     :: Int     -- total line count (see truncation note)
+  , lwHasMore   :: Bool    -- lwEnd < lwTotal, OR the scan was truncated at the byte ceiling
+  , lwTruncated :: Bool    -- True if the file exceeded the scan byte ceiling (lwTotal is a lower bound)
   }
 
--- Pure: window over lines already split. Built directly on Paging.paginate.
+-- Pure: window over lines already split. Built directly on Seal.Core.Paging.
 windowLines :: PageParams -> Int -> Maybe Int -> [Text] -> LineWindow
 
--- Thin IO: read an ALREADY-RESOLVED path, split into lines, window it.
--- SafePath confinement is the caller's responsibility, so non-opcode callers
--- (future CRUD) reuse this without the ISA.
-readLineWindow :: PageParams -> Int -> Maybe Int -> FilePath -> IO LineWindow
+-- Bounded IO: read an opaque, already-confined SafePath and window it WITHOUT
+-- materializing the whole file. SafePath (from Seal.Security.Path, not the ISA)
+-- keeps workspace confinement type-enforced for every caller — opcode or future
+-- CRUD — while still allowing reuse "without the ISA".
+readLineWindow :: PageParams -> Int -> Maybe Int -> SafePath -> IO LineWindow
 
 -- Content + a machine-actionable footer telling the model how to page forward.
 renderWindow :: LineWindow -> Text
 ```
 
-`renderWindow` example output:
+### Line semantics (pinned)
 
-```
-…the windowed lines…
-[lines 1–72 of 320; 248 more — read with offset=72 for the next window]
-```
+Lines are produced by **`Data.Text.lines`** (never `T.splitOn "\n"`). This is the
+correctness-critical choice the red tests assert against. Worked examples:
 
-(Numbers illustrative: `defaultPageParams` gives `round(4·√320)=72` for a
-320-line file. The footer displays 1-based line numbers for humans; the `offset`
-param is 0-based, so `offset=72` is the line shown as "73". When `lwHasMore` is
-`False` the footer states the full range with no "more".)
+| Input bytes | `T.lines` result | `lwTotal` |
+|---|---|---|
+| `"a\nb\nc\n"` | `["a","b","c"]` | 3 |
+| `"a\nb\nc"` (no final newline) | `["a","b","c"]` | 3 |
+| `""` (empty file) | `[]` | 0 |
 
-**Line semantics.** Lines are split on `\n`. A missing final newline still counts
-the last line. A single very long line is returned whole — line-oriented text is
-the contract; byte-capping pathological lines and binary handling are a separate,
-future abstraction (explicitly out of scope). Empty file → `lwTotal = 0`, empty
-window.
+`T.splitOn "\n"` is wrong here: it would yield `["a","b","c",""]` (4) for the
+first row, inflating `lwTotal` and every footer count. Because `T.lines` collapses
+the trailing-newline distinction, the reassembly property (below) is stated over
+the **line list**, not byte-identity to the original file. A `\r` from a CRLF file
+is returned **verbatim** on each line (line-oriented text contract; no
+normalization).
 
-**Properties (QuickCheck) + one IO test:**
-- `lwLines` is a contiguous slice of the input lines, order preserved.
-- `lwStart`/`lwEnd`/`lwTotal` consistent; `lwEnd = lwStart + length lwLines`.
-- `lwHasMore ⇔ lwEnd < lwTotal`.
-- **Reassembly:** paging from offset 0 with successive `lwEnd` values, concatenated, reconstructs the original line list exactly.
-- `offset ≥ total` → empty window, `lwHasMore = False`.
-- One temp-file test exercises `readLineWindow` end to end.
+### Bounded memory (the fix for the gate's #1 blocker)
+
+`readLineWindow` MUST NOT hold the whole file in memory. Guarantee: peak memory is
+`O(window size + O(1))`; the full file is never materialized as `[Text]`.
+Recommended mechanism — two streaming passes over the file `Handle`:
+
+1. **Count pass:** stream lines, counting `lwTotal`, holding O(1) memory. Enforce
+   a scan byte ceiling `maxScanBytes` (a bounded constant; the plan sets the exact
+   value, e.g. reuse/relocate the current `maxReadBytes` or a larger bounded cap).
+   If the ceiling is hit before EOF, stop; set `lwTruncated = True` and let
+   `lwTotal` be the count so far (a lower bound).
+2. **Compute** `size` from `PageParams`/`mLimit` and `lwTotal`, then a
+   **window pass:** stream again, `drop lwStart`, `take size` lines into the
+   window (O(window) memory).
+
+`lwHasMore = (lwEnd < lwTotal) || lwTruncated`. This preserves paging to the tail
+of a large file *and* bounds memory — closing the 64 KiB-drop regression. (A
+single pass that reads up to the ceiling, splits, and windows is an acceptable
+simpler implementation **iff** it still never exceeds the ceiling in memory and
+reports `lwTruncated`/`lwHasMore` honestly; the two-pass form is preferred because
+it can page past the ceiling.)
+
+### `renderWindow` output (pinned for all states)
+
+Windowed lines are joined with `"\n"` (`T.intercalate "\n"`, preserving line
+content), then a blank line, then exactly one footer line. Footers use **ASCII
+hyphen-minus** and 1-based inclusive display line numbers (`lwStart+1 .. lwEnd`);
+the `offset=` value in the footer is the **0-based** `lwEnd` (copy-paste ready):
+
+| State | Condition | Footer |
+|---|---|---|
+| More available | `lwHasMore && not lwTruncated && lwTotal>0` | `[lines {lwStart+1}-{lwEnd} of {lwTotal}; {lwTotal-lwEnd} more - read with offset={lwEnd} for the next window]` |
+| Final window | `not lwHasMore && lwTotal>0` | `[lines {lwStart+1}-{lwEnd} of {lwTotal} (end of file)]` |
+| Truncated at ceiling | `lwTruncated` | `[lines {lwStart+1}-{lwEnd} of >={lwTotal} (file exceeds scan limit; more may exist) - read with offset={lwEnd} for the next window]` |
+| Empty file | `lwTotal == 0` | `[empty file (0 lines)]` |
+| Offset past end | `lwTotal>0 && lwStart==lwEnd==lwTotal` | `[offset {lwStart} is past end of file ({lwTotal} lines); read with offset=0 to start over]` |
+
+No state ever emits an inverted range like `321-320`. (Numbers illustrative:
+`defaultPageParams` gives `round(4·√320)=72` for a 320-line file, so the first
+window of such a file footers as `[lines 1-72 of 320; 248 more - read with
+offset=72 for the next window]`.)
+
+### Properties (QuickCheck) + IO tests
+
+- `windowLines`: `lwLines` is a contiguous slice of the input lines, order
+  preserved; `lwEnd == lwStart + length lwLines`; `lwHasMore ⇔ lwEnd < lwTotal`
+  (pure path, `lwTruncated=False`).
+- **Reassembly:** paging from offset 0 with successive `lwEnd` values,
+  concatenating `lwLines`, reconstructs the original **`T.lines` list** exactly.
+- `offset >= total` → empty window, `lwHasMore = False`, offset-past-end footer.
+- IO: temp-file tests for `readLineWindow` covering a small multi-line file
+  (exact window + footer), a no-trailing-newline file (`lwTotal` correct), an
+  empty file, and a file engineered to exceed `maxScanBytes`
+  (`lwTruncated = True`, memory stays bounded).
 
 ---
 
 ## Component 3 — `FILE_READ` retrofit (`Seal.ISA.Ops.File`)
 
-**Schema.** Add two optional integer properties to the existing input schema:
-`offset` (default `0`) and `limit` (default: pager-computed). `path` stays
-required. `opOutSchema` documents the windowed-text-plus-footer shape.
+**Schema.** `path` stays required; add two optional integer properties `offset`
+(default `0`) and `limit` (default: pager-computed). The single-required-string
+`singleStringSchema` helper cannot express this, so add a small **local** schema
+builder in `Ops/File.hs` (do not prematurely share it; `singleStringSchema` stays
+for the other ops). The `offset` property's `description` states the 0-based
+convention explicitly ("0-based line index; the line displayed as N is offset
+N-1"). `opOutSchema` stays lightweight (the output is a single free-text part —
+windowed content plus footer — not an exhaustively-schema'd object).
+
+**Input parsing (the gate's #5 blocker).** `path`, `offset`, `limit` are parsed
+leniently from the model-supplied JSON: missing → default; a non-integer,
+malformed, or negative value → the default (`offset` 0, `limit` = computed), never
+a throw. The clamps in `paginate` (`offset`→`[0,total]`, `limit`→`[1,ceiling]`)
+are the second line of defense; parsing is the first. `opAuthorize` still requires
+`path`.
 
 **Behavior.** Unchanged front half: authorize, resolve the `SafePath` against the
-workspace root, keep the existing `IOError`→error-result guard. New back half:
-instead of reading the whole file, call
-`readLineWindow defaultPageParams offset mLimit resolvedPath` and return
-`renderWindow` as a single `TrpText` part.
+workspace root via `runLocal backend (mkSafePath root rel)`, keep the existing
+`Left PathError` denial branch. New back half, still funnelled through the seam
+and `try @IOError` exactly as today:
+
+```haskell
+Right safe -> do
+  eWin <- runLocal backend (try @IOError (readLineWindow defaultPageParams offset mLimit safe))
+  case eWin of
+    Left ioErr -> pure (OpResult [TrpText (T.pack (show ioErr))] True (object ["path" .= rel, "offset" .= offset]))
+    Right win  -> pure (OpResult [TrpText (renderWindow win)] False (object ["path" .= rel, "offset" .= offset, "limit" .= mLimit]))
+```
 
 **Preserved invariants (must not regress):**
 - Trust stays **Untrusted** → `dispatch` still does `recordAndAck` before `opRun`
   (ACK-before-execute).
-- `SafePath` still rejects traversal / absolute-escape / out-of-workspace paths.
-- `orRecorded` stays the secret-free invocation shape (path + offset/limit);
-  content is not added to the transcript beyond today's behavior.
+- `SafePath` still rejects traversal / absolute-escape / blocked-name / symlink
+  escapes, and now the seam type (`SafePath`) makes an unconfined read
+  impossible to express, in `FILE_READ` and in every future reuse site.
+- All IO funnelled through `BackendExec` (`runLocal backend`) so Phase 4's remote
+  executor still slots in; `try @IOError` retained.
+- **Memory stays bounded** (`maxScanBytes`), preserving today's protection.
+- `orRecorded` stays the secret-free invocation shape — now `path` + `offset` +
+  `limit`, all non-secret request metadata (matching the existing "path is
+  secret-free metadata" comment). File content still flows only to `orParts`,
+  never to `orRecorded`/transcript, and `renderWindow`'s footer text is derived
+  from counts only — it never echoes file content into `orRecorded`.
 
-**Behavioral change (intended):** reading a large file now returns a bounded
-first window with a "more available / next offset" footer rather than the entire
-file. The existing `FILE_READ` tests that assert full-file content are updated to
-assert the windowed content + footer; the SafePath-rejection and ACK tests are
-untouched.
+**Behavioral change (intended):** reading a large file now returns a bounded first
+window with a next-offset footer rather than a 64 KiB byte-truncated blob. The
+existing `FILE_READ` tests that assert full/64 KiB content are updated to assert
+the windowed content + footer; a new test asserts a large file returns bounded
+content (`lwHasMore` true / bounded line count), **not** the whole file. The
+SafePath-rejection and ACK tests are untouched.
 
 ---
 
 ## Error handling
 
 Standard `Either Text` / non-fatal `OpResult` with `orIsError = True`. No new
-error ADT. Specifically:
-- A path that fails `SafePath` → the existing denial path (unchanged).
-- An `IOError` during read → the existing error-result guard (unchanged).
-- `offset`/`limit` out of range are **not** errors: `offset` is clamped to
-  `[0, total]`, `limit` to `[1, ceiling]`; an offset past the end yields a
-  well-formed empty window whose footer says so.
+error ADT.
+- A path that fails `SafePath` → the existing denial branch (unchanged).
+- An `IOError` during read → the existing `try @IOError` error-result branch.
+- `offset`/`limit` out of range or malformed are **not** errors: they degrade to
+  defaults (parse layer) and are clamped (`paginate` layer); an offset past the
+  end yields a well-formed empty window whose footer says so.
 
 ---
 
@@ -212,15 +315,22 @@ error ADT. Specifically:
 
 | Unit | Coverage |
 |---|---|
-| `Seal.ISA.Paging` | QuickCheck: size bounds, monotonicity, slice/`hasMore`/offset invariants, explicit-limit override + clamp. |
-| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly, offset-past-end; one temp-file IO test for `readLineWindow`. |
-| `Seal.ISA.Ops.File` | First-window read + footer; offset paging to the tail; `limit` override; offset-past-end; empty file; **SafePath rejection unchanged; ACK-before-execute unchanged.** |
+| `Seal.Core.Paging` | QuickCheck under generated invariants: size bounds, monotonicity (banker's-rounding-aware), slice/`hasMore`/offset invariants, explicit-limit override + clamp, and the security case (any offset/limit ⇒ bounded window, offset ∈ [0,total]). |
+| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly over the `T.lines` list, offset-past-end; `renderWindow` exact strings for all five states; IO temp-file tests incl. no-trailing-newline, empty, and over-`maxScanBytes` (bounded + `lwTruncated`). |
+| `Seal.ISA.Ops.File` | Lenient offset/limit parsing (malformed→default, no throw); first-window read + footer; offset paging to the tail; `limit` override; **large file → bounded content, not full file**; empty file; **SafePath rejection unchanged; ACK-before-execute unchanged; IO through the seam.** |
 
-All under the Nix dev shell: `cabal build all` `-Werror` clean, `cabal test`
-green (incl. new properties), `hlint src/ test/` clean. New library modules
-registered alphabetically in `seal-harness.cabal` `exposed-modules`; new test
-specs in `other-modules` and wired into `test/Main.hs` (alphabetical). One commit
-per task.
+All under the Nix dev shell: `cabal build all` `-Werror` clean (strict warning
+set), `cabal test` green (incl. new properties), `hlint src/ test/` clean. New
+library modules registered alphabetically in `seal-harness.cabal`
+`exposed-modules`; new test specs in `other-modules` and wired into `test/Main.hs`
+(alphabetical). One commit per task. Clean-room throughout.
+
+**Interactive smoke (manual, not a gate):** the milestone is user-testable via the
+**CLI channel** (`seal tui` with `ANTHROPIC_API_KEY`), where the agent loop offers
+`FILE_READ` as a native tool — ask the model to read a large file and observe a
+bounded window plus a correct next-offset footer, then a follow-up read at that
+offset. (The web channel named in the master roadmap was never built; Phase 2
+shipped the CLI slice, so CLI is the live channel here.)
 
 ---
 
@@ -230,8 +340,8 @@ Consciously out of scope here, recorded so the sequencing is explicit:
 
 - **Tools (Meta) discovery opcodes** — `TOOL_LIST` (read-only catalog),
   `TOOL_SEARCH` (find opcodes by intent), `TOOL_DESCRIBE` (full detail incl.
-  trust + output schema). These page over the registry using
-  `Seal.ISA.Paging` built here, so this milestone is their dependency.
+  trust + output schema). These page over the registry using `Seal.Core.Paging`
+  built here, so this milestone is their dependency.
 - **Tool-exposure gating** — a configurable policy that, above a registry-size
   threshold, stops offering the full opcode set natively and instead gates
   *discovery* (not invocation): `TOOL_SEARCH`/`TOOL_DESCRIBE` **activate** an
@@ -242,12 +352,46 @@ Consciously out of scope here, recorded so the sequencing is explicit:
   absent from the native list; the activation-feeds-native-list mechanism above
   makes it unnecessary — everything is always called directly.
 
-## Deviations from the master roadmap (recorded)
+## Deviations from the master roadmap (recorded, and mirrored into the roadmap)
 
 - The roadmap's Phase 3 deliverable 1 names four meta opcodes including
   `TOOL_CALL`; this design **drops `TOOL_CALL`** in favor of gate-discovery /
-  call-directly (rationale above).
+  call-directly.
 - The roadmap pairs the Meta group and Dynamic Retrieval in one phase; this
   design **sequences them** — retrieval core first (this milestone), meta ops +
-  gating next — because the meta ops depend on the pager and have no live
-  consumer until gating exists.
+  gating next — because the meta ops depend on the pager and have no live consumer
+  until gating exists.
+
+The master roadmap's Phase 3 section is updated in lockstep to record the M-a/M-b
+re-slice and the `TOOL_CALL` drop, so the two documents do not diverge.
+
+---
+
+## Review-gate revision log
+
+Design-review gate round 1: PM APPROVED; Architect / CTO / Security / Designer
+NEEDS_REVISION. Consolidated blockers, all addressed above:
+
+1. **Unbounded-memory regression** (Architect/CTO/Security) — the whole-file
+   `[Text]` read dropped today's 64 KiB bound. Fixed: `readLineWindow` is
+   `O(window)`-memory via streaming with a `maxScanBytes` ceiling +
+   `lwTruncated`/`lwHasMore` reporting.
+2. **Raw `FilePath` seam** (Architect/Security) — pushed SafePath confinement onto
+   callers by convention. Fixed: `readLineWindow` takes opaque `SafePath`;
+   confinement is type-enforced for all present and future callers, and non-ISA
+   reuse is preserved (SafePath ∈ `Seal.Security.Path`).
+3. **Split semantics** (Architect/CTO) — pinned `T.lines` with worked examples;
+   reassembly restated over the line list; CRLF returned verbatim.
+4. **`renderWindow` undefined for empty/degenerate windows** (Designer/CTO/
+   Architect) — all five footer states pinned with exact strings; no inverted
+   ranges.
+5. **Model-input validation** (Security) — lenient offset/limit parsing (→default,
+   never throw) plus the `paginate` clamps.
+
+Folded-in suggestions: route `readLineWindow` through the `BackendExec` seam +
+`try @IOError`; pager moved to the neutral leaf `Seal.Core.Paging` (layering);
+`PageParams` invariants + constrained Arbitrary + banker's-rounding note;
+`total = length items` pinned; local FILE_READ schema builder; `lwStart := Page
+pgOffset` correspondence documented; large-file-bounded test (PM); roadmap updated
+in lockstep (Architect/PM question). Open judgment call surfaced to the
+maintainer: the new `Seal.Text` namespace vs `Seal.Tools`.

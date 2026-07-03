@@ -443,7 +443,23 @@ Untrusted reads blocked until their audit entry is durably written.
 
 ## Phase 3 — ISA build-out: core Trusted opcodes (highest-value feature)
 
-**Detailed plan:** to be written at the start of Phase 3.
+**Detailed plan:** written per-milestone at the start of each. The
+multi-provider-sessions work (M1–M3, merged) was inserted ahead of this original
+Trusted-ISA build-out; the ISA build-out resumes here, sliced into user-testable
+milestones.
+
+> **Re-slice + `TOOL_CALL` drop (2026-07-03).** Deliverables 1 and 2 below are
+> split and re-sequenced. **M-a** ships the Dynamic Retrieval pattern
+> (deliverable 2) *first* — a generic page sizer, a reusable line-oriented
+> text-file abstraction (for later agent-def/skills/file CRUD), and a paged
+> `FILE_READ` — because the Meta ops depend on the pager and have no live consumer
+> until tool-exposure gating exists. **M-b** then ships the Tools (Meta) group
+> (deliverable 1) as discovery-only ops (`TOOL_LIST`/`TOOL_SEARCH`/`TOOL_DESCRIBE`)
+> plus the configurable exposure gating. **`TOOL_CALL` is dropped:** its only role
+> was invoking a tool absent from the native list; gating instead gates
+> *discovery* and injects a discovered opcode's real `ToolDefinition` into the
+> native tool list, so the model always calls tools directly. Design:
+> `docs/superpowers/specs/2026-07-03-dynamic-retrieval-linefile-design.md`.
 
 **Why this is the highest-value feature:** the formal, classified instruction
 set *is* the product. With the spine in place, the value compounds fastest by
@@ -452,9 +468,11 @@ agent uses to manage itself and its work — each with a defined schema, trust
 class, atomicity guarantee, transcript format, and authorization gate.
 
 **Deliverables (task groups), Trusted unless noted:**
-1. **Tools (Meta) group** — `TOOL_SEARCH`, `TOOL_DESCRIBE`, `TOOL_CALL`,
-   `TOOL_LIST`. Self-describing ISA over the registry; the agent discovers and
-   invokes opcodes dynamically. Establishes the *dynamic retrieval* pattern.
+1. **Tools (Meta) group** — `TOOL_SEARCH`, `TOOL_DESCRIBE`, `TOOL_LIST`
+   (`TOOL_CALL` dropped — see the 2026-07-03 note above). Self-describing ISA
+   over the registry; the agent discovers opcodes and, under exposure gating,
+   activates them into the native tool list to call directly. Ships as M-b atop
+   the M-a *dynamic retrieval* pattern.
 2. **Dynamic Retrieval pattern** — the shared "stat first, then adapt"
    page-sizing (`page_size = clamp(floor, round(A·total^0.5), ceiling)`),
    configurable at config/session/call layers. Retrofit `FILE_READ`; reuse
