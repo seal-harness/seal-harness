@@ -30,11 +30,11 @@ import System.Directory
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 
-import Seal.Config.File (FileConfig (..))
+import Seal.Config.File (FileConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), mkSessionId)
-import Seal.Providers.Registry (KnownProvider (..), defaultModelFor, parseProvider)
+import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 
 -- | The mutable active-session ref plus the paths the commands need.
@@ -105,8 +105,7 @@ defaultSessionSelection cfg =
   , fromMaybe fallbackModel (fcDefaultModel cfg) )
   where
     provLabel = fromMaybe "anthropic" (fcDefaultProvider cfg)
-    ModelId fallbackModel =
-      maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider provLabel)
+    ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
 
 -- | Create a new session from the config defaults, on the @cli@ channel.
 initSession :: SealPaths -> FileConfig -> IO SessionMeta

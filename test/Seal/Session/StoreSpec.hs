@@ -13,7 +13,8 @@ import Test.Hspec
 import qualified Data.Text as T
 import qualified Seal.Core.Types
 
-import Seal.Config.File (defaultFileConfig, FileConfig (..))
+import Seal.Config.File
+  (ProviderConfig (..), defaultFileConfig, upsertProvider, FileConfig (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.Types (isValidSessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
@@ -86,6 +87,16 @@ spec = describe "Seal.Session.Store" $ do
 
     it "falls back to anthropic + its model when nothing is configured" $
       defaultSessionSelection defaultFileConfig `shouldBe` ("anthropic", "claude-opus-4-8")
+
+    it "uses the provider's configured section default when set" $ do
+      let cfg = upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" })
+                  (defaultFileConfig { fcDefaultProvider = Just "ollama" })
+      defaultSessionSelection cfg `shouldBe` ("ollama", "glm-5.2:cloud")
+
+    it "still lets a global default_model win when present" $ do
+      let cfg = (defaultFileConfig { fcDefaultProvider = Just "ollama"
+                                   , fcDefaultModel = Just "override" })
+      defaultSessionSelection cfg `shouldBe` ("ollama", "override")
 
   describe "initSession" $
     it "creates a session from the config defaults on the cli channel" $
