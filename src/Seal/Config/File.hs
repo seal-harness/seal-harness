@@ -46,9 +46,6 @@ data FileConfig = FileConfig
     -- ^ Provider id used for new sessions (e.g. @\"anthropic\"@).
   , fcDefaultModel :: Maybe Text
     -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
-  , fcOllamaBaseUrl :: Maybe Text
-    -- ^ Ollama host base URL (default @http:\/\/localhost:11434@ applied by the
-    -- Ollama provider). @https:\/\/ollama.com@ for Ollama Cloud.
   , fcProviders :: Map Text ProviderConfig
     -- ^ Per-provider config sections (@[providers.<label>]@).
   } deriving stock (Eq, Show)
@@ -72,7 +69,6 @@ defaultFileConfig = FileConfig
   , fcVaultKeyType   = Nothing
   , fcDefaultProvider = Nothing
   , fcDefaultModel    = Nothing
-  , fcOllamaBaseUrl   = Nothing
   , fcProviders       = Map.empty
   }
 
@@ -92,7 +88,6 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "vault_key_type")  .= fcVaultKeyType
   <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
   <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
-  <*> Toml.dioptional (Toml.text "ollama_base_url")  .= fcOllamaBaseUrl
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.

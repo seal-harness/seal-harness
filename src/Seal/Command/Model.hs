@@ -17,7 +17,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
-import Seal.Config.File (fcOllamaBaseUrl, loadFileConfig)
+import Seal.Config.File (loadFileConfig, providerBaseUrl)
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
@@ -79,7 +79,7 @@ listCmd pr _ (Just provLbl) = CommandAction $ \caps ->
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
       eCfg <- loadFileConfig (prConfigPath pr)
-      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) fcOllamaBaseUrl eCfg)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
       eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp)
       case eProv of

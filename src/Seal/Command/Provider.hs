@@ -28,7 +28,8 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
-  ( FileConfig (..), loadFileConfig, updateFileConfig )
+  ( FileConfig (..), ProviderConfig (..), loadFileConfig, providerBaseUrl
+  , updateFileConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
@@ -170,11 +171,14 @@ addOllama pr caps vh kp = do
       _ <- updateFileConfig (prConfigPath pr) (seedAll mUrl)
       ccSend caps "Configured ollama."
   where
-    seedAll mUrl fc = fc
-      { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
-      , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
-      , fcOllamaBaseUrl   = mUrl <|> fcOllamaBaseUrl fc
-      }
+    seedAll mUrl fc =
+      let fc' = fc
+            { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
+            , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
+            }
+      in case mUrl of
+           Nothing -> fc'
+           Just u  -> upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Just u }) fc'
 
 listCmd :: ProviderRuntime -> CommandAction
 listCmd pr = CommandAction $ \caps ->
@@ -253,7 +257,7 @@ testCmd pr lbl = CommandAction $ \caps ->
             Right c | Just m <- fcDefaultModel c -> ModelId m
             _                                    -> defaultModelFor kp
           baseUrl = fromMaybe defaultOllamaBaseUrl
-                      (either (const Nothing) fcOllamaBaseUrl eCfg)
+                      (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model
       case eProv of
         Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
