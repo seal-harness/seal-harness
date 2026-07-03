@@ -109,9 +109,14 @@ data Page a = Page
 -- clamp ppFloor..ppCeiling of round(ppCoeff * sqrt (fromIntegral total))
 pageSize :: PageParams -> Int -> Int
 
+-- The single source of truth for "how many items to return", shared by
+-- paginate (list path) and readLineWindow (streaming path) so they cannot drift:
+--   windowSize params total mLimit = maybe (pageSize params total) (clamp 1 ppCeiling) mLimit
+windowSize :: PageParams -> Int -> Maybe Int -> Int
+
 -- paginate params offset mLimit items, where total = length items:
 --   offset' = clamp 0 total offset
---   size    = maybe (pageSize params total) (clamp 1 ppCeiling) mLimit
+--   size    = windowSize params total mLimit
 --   window  = take size (drop offset' items)
 paginate :: PageParams -> Int -> Maybe Int -> [a] -> Page a
 
@@ -194,39 +199,57 @@ normalization).
 Recommended mechanism — two streaming passes over the file `Handle`:
 
 1. **Count pass:** stream lines, counting `lwTotal`, holding O(1) memory. Enforce
-   a scan byte ceiling `maxScanBytes` (a bounded constant; the plan sets the exact
-   value, e.g. reuse/relocate the current `maxReadBytes` or a larger bounded cap).
-   If the ceiling is hit before EOF, stop; set `lwTruncated = True` and let
-   `lwTotal` be the count so far (a lower bound).
-2. **Compute** `size` from `PageParams`/`mLimit` and `lwTotal`, then a
-   **window pass:** stream again, `drop lwStart`, `take size` lines into the
-   window (O(window) memory).
+   the scan byte ceiling `maxScanBytes` **at the byte/chunk level while
+   accumulating a line** — never read a whole line and then check the ceiling, or
+   a single newline-free file would blow the bound before the check runs. If the
+   ceiling is hit before EOF, stop; set `lwTruncated = True` and let `lwTotal` be
+   the count so far (a lower bound; it may be `0` for a newline-free file, handled
+   by footer guard 1).
+2. **Compute** `size` from `PageParams`/`mLimit` and `lwTotal` (via the shared
+   `windowSize` helper — see Paging), then a **window pass:** stream again,
+   `drop lwStart`, `take size` lines into the window (O(window) memory).
 
-`lwHasMore = (lwEnd < lwTotal) || lwTruncated`. This preserves paging to the tail
-of a large file *and* bounds memory — closing the 64 KiB-drop regression. (A
-single pass that reads up to the ceiling, splits, and windows is an acceptable
-simpler implementation **iff** it still never exceeds the ceiling in memory and
-reports `lwTruncated`/`lwHasMore` honestly; the two-pass form is preferred because
-it can page past the ceiling.)
+`lwHasMore = (lwEnd < lwTotal) || lwTruncated`. Peak memory is `O(window +
+O(1))`; the whole file is never materialized — closing the 64 KiB-drop
+regression. `maxScanBytes` is a **fixed compile-time constant ≥ the current
+65536**, never model- or call-influenced, so the memory bound cannot be widened
+at call time. Because both passes scan from the file start bounded by
+`maxScanBytes`, paging is supported *within* the scanned region only; tail-paging
+of a file larger than `maxScanBytes` is **not** a goal of this milestone —
+`lwTruncated`/`lwHasMore` communicate the truncation honestly. The two passes read
+the file twice, so a concurrent external mutation between passes could make
+`lwTotal` (pass 1) disagree with the pass-2 window; the result stays bounded and
+well-formed (best-effort snapshot semantics, same TOCTOU window class as today's
+`mkSafePath`→`withFile`).
 
-### `renderWindow` output (pinned for all states)
+### `renderWindow` output (pinned for all states, with evaluation order)
 
 Windowed lines are joined with `"\n"` (`T.intercalate "\n"`, preserving line
 content), then a blank line, then exactly one footer line. Footers use **ASCII
 hyphen-minus** and 1-based inclusive display line numbers (`lwStart+1 .. lwEnd`);
-the `offset=` value in the footer is the **0-based** `lwEnd` (copy-paste ready):
+the `offset=` value in the footer is the **0-based** `lwEnd` (copy-paste ready).
 
-| State | Condition | Footer |
-|---|---|---|
-| More available | `lwHasMore && not lwTruncated && lwTotal>0` | `[lines {lwStart+1}-{lwEnd} of {lwTotal}; {lwTotal-lwEnd} more - read with offset={lwEnd} for the next window]` |
-| Final window | `not lwHasMore && lwTotal>0` | `[lines {lwStart+1}-{lwEnd} of {lwTotal} (end of file)]` |
-| Truncated at ceiling | `lwTruncated` | `[lines {lwStart+1}-{lwEnd} of >={lwTotal} (file exceeds scan limit; more may exist) - read with offset={lwEnd} for the next window]` |
-| Empty file | `lwTotal == 0` | `[empty file (0 lines)]` |
-| Offset past end | `lwTotal>0 && lwStart==lwEnd==lwTotal` | `[offset {lwStart} is past end of file ({lwTotal} lines); read with offset=0 to start over]` |
+The footer states **overlap** (an empty window at end-of-file satisfies both
+"offset past end" and "final"; a newline-free file over the cap satisfies both
+"empty" and "truncated"), so the footer is chosen by this **total, ordered**
+guard — first match wins. Implement it in exactly this order; do NOT reproduce a
+table in some other order:
 
-No state ever emits an inverted range like `321-320`. (Numbers illustrative:
-`defaultPageParams` gives `round(4·√320)=72` for a 320-line file, so the first
-window of such a file footers as `[lines 1-72 of 320; 248 more - read with
+1. `lwTotal == 0 && lwTruncated` → `[no line break within the scan limit; file may be a single long line or non-line-oriented]`
+2. `lwTotal == 0` → `[empty file (0 lines)]`
+3. `lwStart == lwEnd` (empty window on a non-empty file — offset at/past the counted end):
+   - if `lwTruncated`: `[offset {lwStart} reached the scan limit ({lwTotal}+ lines counted so far); read with offset=0 to restart]`
+   - else: `[offset {lwStart} is past end of file ({lwTotal} lines); read with offset=0 to start over]`
+4. `lwTruncated` → `[lines {lwStart+1}-{lwEnd} of >={lwTotal} (file exceeds scan limit; more may exist) - read with offset={lwEnd} for the next window]`
+5. `lwEnd < lwTotal` → `[lines {lwStart+1}-{lwEnd} of {lwTotal}; {lwTotal-lwEnd} more - read with offset={lwEnd} for the next window]`
+6. otherwise (`lwEnd == lwTotal`, `lwStart < lwEnd`) → `[lines {lwStart+1}-{lwEnd} of {lwTotal} (end of file)]`
+
+Guards 1–3 catch every empty/degenerate window, so the range-printing states
+(4–6) fire only when `lwStart < lwEnd`. Therefore **no state can ever emit an
+inverted range** like `321-320` — this is now enforced by the guard order, not
+merely asserted, and is checked by a dedicated property (see Testing). (Numbers
+illustrative: `defaultPageParams` gives `round(4·√320)=72` for a 320-line file,
+so its first window footers as `[lines 1-72 of 320; 248 more - read with
 offset=72 for the next window]`.)
 
 ### Properties (QuickCheck) + IO tests
@@ -270,9 +293,10 @@ and `try @IOError` exactly as today:
 ```haskell
 Right safe -> do
   eWin <- runLocal backend (try @IOError (readLineWindow defaultPageParams offset mLimit safe))
+  let recorded = object ["path" .= rel, "offset" .= offset, "limit" .= mLimit]  -- uniform in both branches
   case eWin of
-    Left ioErr -> pure (OpResult [TrpText (T.pack (show ioErr))] True (object ["path" .= rel, "offset" .= offset]))
-    Right win  -> pure (OpResult [TrpText (renderWindow win)] False (object ["path" .= rel, "offset" .= offset, "limit" .= mLimit]))
+    Left ioErr -> pure (OpResult [TrpText (T.pack (show ioErr))] True recorded)
+    Right win  -> pure (OpResult [TrpText (renderWindow win)] False recorded)
 ```
 
 **Preserved invariants (must not regress):**
@@ -316,7 +340,7 @@ error ADT.
 | Unit | Coverage |
 |---|---|
 | `Seal.Core.Paging` | QuickCheck under generated invariants: size bounds, monotonicity (banker's-rounding-aware), slice/`hasMore`/offset invariants, explicit-limit override + clamp, and the security case (any offset/limit ⇒ bounded window, offset ∈ [0,total]). |
-| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly over the `T.lines` list, offset-past-end; `renderWindow` exact strings for all five states; IO temp-file tests incl. no-trailing-newline, empty, and over-`maxScanBytes` (bounded + `lwTruncated`). |
+| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly over the `T.lines` list, offset-past-end; `renderWindow` exact strings for all six ordered states with the guard order asserted; a **no-inverted-range property** (whenever a footer prints a numeric range, `lwStart+1 <= lwEnd`) that mechanically enforces the guarantee across all states; IO temp-file tests incl. no-trailing-newline, empty, over-`maxScanBytes` (assert `lwTruncated` **and** that the read stays bounded, not just the flag), and a **newline-free file exceeding `maxScanBytes`** (`lwTotal==0 && lwTruncated` → footer guard 1, memory still bounded). |
 | `Seal.ISA.Ops.File` | Lenient offset/limit parsing (malformed→default, no throw); first-window read + footer; offset paging to the tail; `limit` override; **large file → bounded content, not full file**; empty file; **SafePath rejection unchanged; ACK-before-execute unchanged; IO through the seam.** |
 
 All under the Nix dev shell: `cabal build all` `-Werror` clean (strict warning
@@ -395,3 +419,19 @@ Folded-in suggestions: route `readLineWindow` through the `BackendExec` seam +
 pgOffset` correspondence documented; large-file-bounded test (PM); roadmap updated
 in lockstep (Architect/PM question). Open judgment call surfaced to the
 maintainer: the new `Seal.Text` namespace vs `Seal.Tools`.
+
+Design-review gate round 2: Architect / CTO / Security **APPROVED** (all round-1
+blockers verified fixed). Designer **NEEDS_REVISION** with one precise blocker,
+corroborated by CTO and Security: the footer states were pinned as exact strings
+but their **evaluation precedence** was not, and two states overlap
+(final/offset-past-end; empty/truncated), so a first-match implementation could
+re-emit an inverted `321-320` range. Fixed: `renderWindow` now specifies a single
+**total, ordered** guard (six cases, empty/degenerate windows caught by guards
+1–3 before any range-printing state), plus a `no-inverted-range` property.
+Round-2 refinements folded: `maxScanBytes` enforced at byte level and pinned as a
+fixed compile-time constant ≥ 65536; the inaccurate "can page past the ceiling"
+claim removed (tail-paging beyond the cap is explicitly out of scope); shared
+`windowSize` helper so the list and streaming paths can't drift; uniform
+`orRecorded` (`path`+`offset`+`limit`) in both FILE_READ branches; best-effort
+two-pass snapshot semantics noted. Out of scope, tracked: per-loop FILE_READ rate
+limiting (Security medium-risk).
