@@ -172,3 +172,7 @@ spec = describe "Seal.Providers.Ollama" $ do
       let m = unreachableMsg "http://localhost:11434"
       m `shouldSatisfy` (T.isInfixOf "http://localhost:11434")
       m `shouldSatisfy` (T.isInfixOf "ollama serve")
+
+  describe "Provider Ollama (live)" $
+    it "chat + tags round-trip against a running ollama" $
+      pendingWith "needs a local `ollama serve` at http://localhost:11434"

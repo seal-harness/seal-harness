@@ -19,18 +19,23 @@ module Seal.Providers.Ollama
   , decodeResponse
   ) where
 
+import Control.Exception (try)
 import Data.Aeson
 import Data.Aeson.Types (Parser, parseEither)
 import Data.ByteString (ByteString)
+import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Text.Encoding.Error qualified as TEE
 import Network.HTTP.Client
+import Network.HTTP.Types (statusCode)
 import Network.HTTP.Types.Header (RequestHeaders)
 
-import Seal.Core.Types (ModelId, OpName (..), ToolCallId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
-import Seal.Security.Secrets (ApiKey)
+import Seal.Security.Secrets (ApiKey, withApiKey)
 
 -- Data type ----------------------------------------------------------------
 
@@ -165,3 +170,68 @@ unreachableMsg :: Text -> Text
 unreachableMsg base =
   "could not reach Ollama at " <> base
     <> " — is it running and the URL correct? (try: ollama serve)"
+
+-- HTTP round-trip ----------------------------------------------------------
+
+-- | POST {base}/api/chat with the given headers; decode, or return a key-safe
+-- transport / HTTP-status error.
+sendChat
+  :: Manager -> Text -> RequestHeaders -> CompletionRequest
+  -> IO (Either Text CompletionResponse)
+sendChat mgr base hdrs cr = do
+  result <- try $ do
+    initReq <- parseRequest (T.unpack ("POST " <> chatUrl base))
+    let req = initReq
+          { requestBody     = RequestBodyLBS (encode (encodeRequest cr))
+          , requestHeaders  = hdrs
+          }
+    httpLbs req mgr
+  case result of
+    Left (_ :: HttpException) -> pure (Left (unreachableMsg base))
+    Right resp -> do
+      let code = statusCode (responseStatus resp)
+      if code >= 200 && code <= 299
+        then pure $ case eitherDecode (responseBody resp) of
+          Left e  -> Left (T.pack e)
+          Right v -> decodeResponse v
+        else pure $ Left $ ollamaErrorText code
+          (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))
+
+-- | GET {base}/api/tags → the installed model names.
+listTags :: Manager -> Text -> RequestHeaders -> IO (Either Text [ModelId])
+listTags mgr base hdrs = do
+  result <- try $ do
+    initReq <- parseRequest (T.unpack ("GET " <> tagsUrl base))
+    httpLbs initReq { requestHeaders = hdrs } mgr
+  case result of
+    Left (_ :: HttpException) -> pure (Left (unreachableMsg base))
+    Right resp -> do
+      let code = statusCode (responseStatus resp)
+      if code >= 200 && code <= 299
+        then pure $ case eitherDecode (responseBody resp) of
+          Left e  -> Left (T.pack e)
+          Right v -> parseTags v
+        else pure $ Left $ ollamaErrorText code
+          (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))
+
+parseTags :: Value -> Either Text [ModelId]
+parseTags = mapLeft T.pack . parseEither p
+  where
+    mapLeft f = either (Left . f) Right
+    p = withObject "tags" $ \o -> do
+      models <- o .:? "models" .!= ([] :: [Value])
+      traverse (withObject "model" (\m -> ModelId <$> m .: "name")) models
+
+-- Provider instance --------------------------------------------------------
+
+instance Provider Ollama where
+  listModels o = withHeaders o (listTags (olManager o) (olBaseUrl o))
+  complete o cr =
+    withHeaders o (\hdrs -> sendChat (olManager o) (olBaseUrl o) hdrs cr)
+
+-- | Run @k@ with request headers built from the optional key; the key bytes
+-- live only inside the 'withApiKey' continuation.
+withHeaders :: Ollama -> (RequestHeaders -> IO r) -> IO r
+withHeaders o k = case olApiKey o of
+  Nothing  -> k (ollamaHeaders Nothing)
+  Just key -> withApiKey key (\kb -> k (ollamaHeaders (Just kb)))
