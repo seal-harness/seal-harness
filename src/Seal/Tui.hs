@@ -89,6 +89,6 @@ runTui = do
         [ vaultCommandSpec rt
         , providerCommandSpec pr
         , sessionCommandSpec sr
-        , modelCommandSpec sr
+        , modelCommandSpec pr sr
         ]
   runCliTui paths rt pr sr registry emptyChain

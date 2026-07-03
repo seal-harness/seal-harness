@@ -32,6 +32,7 @@ import qualified Seal.Handles.TranscriptSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
+import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
@@ -72,6 +73,7 @@ main = hspec $ do
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
+  Seal.Providers.OllamaSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
   Seal.ISA.DispatchSpec.spec

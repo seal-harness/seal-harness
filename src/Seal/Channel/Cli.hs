@@ -12,6 +12,7 @@ module Seal.Channel.Cli
 
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Console.Haskeline
@@ -31,6 +32,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
+import Seal.Config.File (loadFileConfig, providerBaseUrl)
 import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
@@ -41,6 +43,7 @@ import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (SomeProvider (..))
+import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -76,19 +79,19 @@ resolveSessionProvider pr meta =
   case parseProvider (smProvider meta) of
     Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
     Just kp -> do
+      eCfg <- loadFileConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
+          model   = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
-      case mh of
-        Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-        Just vh -> do
-          let model = ModelId (smModel meta)
-          fmap (fmap (, model)) (resolveProvider vh (prManager pr) kp model)
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
 
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
-  :: ChannelCaps -> SomeProvider -> ModelId -> SessionId
+  :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> ISA.Registry -> TranscriptHandle -> AgentEnv
-mkSessionAgentEnv caps provider model sid isaReg tHandle = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
   { aeProvider   = provider
+  , aeProviderLabel = provLabel
   , aeModel      = model
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
@@ -125,6 +128,9 @@ runCliTui paths rt pr sr registry chain = do
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
         }
+  -- Startup diagnostic: show which provider+model the active session will use
+  -- for plain-text turns (resolved from config at session creation).
+  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0)
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
   -- The transcript bracket wraps the whole loop so every turn shares one writer.
@@ -144,7 +150,7 @@ runCliTui paths rt pr sr registry chain = do
             Left err            -> ccSend caps err
             Right (prov, model) ->
               handlePlain
-                (mkSessionAgentEnv caps prov model (smId meta) isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
                 appEnv t
     runInputT hlSettings (loop caps plainHandler)
   where

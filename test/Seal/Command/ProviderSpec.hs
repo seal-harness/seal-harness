@@ -15,7 +15,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
-import Seal.Config.File (FileConfig (..), loadFileConfig)
+import Seal.Config.File (FileConfig (..), loadFileConfig, providerBaseUrl, providerDefaultModel)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
@@ -85,7 +85,7 @@ spec = do
         vhGet vh "ANTHROPIC_API_KEY" >>= (`shouldBe` Right ("sk-secret" :: ByteString))
         Right cfg <- loadFileConfig cfgPath
         fcDefaultProvider cfg `shouldBe` Just "anthropic"
-        fcDefaultModel    cfg `shouldBe` Just "claude-opus-4-8"
+        providerDefaultModel cfg "anthropic" `shouldBe` Just "claude-opus-4-8"
         sent <- getSent fc
         sent `shouldSatisfy` any ("Stored API key" `T.isInfixOf`)
 
@@ -126,7 +126,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("oauth" `T.isInfixOf`) out) `shouldBe` True
+        any ("oauth" `T.isInfixOf`) out `shouldBe` True
 
     it "list reports auth: api-key when only an API key is stored" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -136,7 +136,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("api-key" `T.isInfixOf`) out) `shouldBe` True
+        any ("api-key" `T.isInfixOf`) out `shouldBe` True
 
     it "list reports auth: none when nothing is stored" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -146,7 +146,7 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["list"] caps
         out <- getSent fc
-        (any ("none" `T.isInfixOf`) out) `shouldBe` True
+        any ("none" `T.isInfixOf`) out `shouldBe` True
 
     it "remove clears BOTH the API key and the OAuth blob" $
       withSystemTempDirectory "prov" $ \dir -> do
@@ -162,6 +162,74 @@ spec = do
         gotTok <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
         gotKey `shouldSatisfy` isLeft
         gotTok `shouldSatisfy` isLeft
+
+    it "add ollama saves the base url to config and stores a key when given" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        -- scripted answers: base url (ccPrompt) then key (ccPromptSecret)
+        (_, caps) <- makeFakeCaps ["https://ollama.com", "k-cloud"]
+        runProv pr ["add", "ollama"] caps
+        vhGet vh "OLLAMA_API_KEY" >>= (`shouldBe` Right ("k-cloud" :: ByteString))
+        Right cfg <- loadFileConfig cfgPath
+        providerBaseUrl cfg "ollama" `shouldBe` Just "https://ollama.com"
+        providerDefaultModel cfg "ollama" `shouldBe` Just "llama3.2"
+
+    it "add ollama with a blank key configures local (no key stored)" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        -- blank base url keeps the default; blank key => local
+        (_, caps) <- makeFakeCaps ["", ""]
+        runProv pr ["add", "ollama"] caps
+        vhGet vh "OLLAMA_API_KEY" >>= (`shouldSatisfy` either (const True) (const False))
+
+    it "list reports ollama as none (local) when no key is stored" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        T.unlines out `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        T.unlines out `shouldSatisfy` ("local" `T.isInfixOf`)
+
+    it "default sets default_provider without needing a vault" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        pr <- mkPR cfgPath Nothing            -- no vault: config-only command
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["default", "ollama"] caps
+        Right cfg <- loadFileConfig cfgPath
+        fcDefaultProvider cfg `shouldBe` Just "ollama"
+        sent <- getSent fc
+        -- confirmation names the provider and its resolved default model
+        T.unlines sent `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        T.unlines sent `shouldSatisfy` ("llama3.2" `T.isInfixOf`)
+
+    it "default reassigns an already-set default provider" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        (_, addCaps) <- makeFakeCaps ["sk"]
+        runProv pr ["add", "anthropic"] addCaps   -- seeds default_provider = anthropic
+        (_, caps) <- makeFakeCaps []
+        runProv pr ["default", "ollama"] caps      -- must override, not <|>-keep
+        Right cfg <- loadFileConfig cfgPath
+        fcDefaultProvider cfg `shouldBe` Just "ollama"
+
+    it "default rejects an unknown provider" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        pr <- mkPR cfgPath Nothing
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["default", "bogus"] caps
+        sent <- getSent fc
+        T.unlines sent `shouldSatisfy` ("unknown provider" `T.isInfixOf`)
 
     it "rejects an unknown provider" $
       withSystemTempDirectory "seal-prov" $ \dir -> do
@@ -194,5 +262,5 @@ spec = do
         idx `shouldSatisfy` ("Providers" `T.isInfixOf`)
         idx `shouldSatisfy` ("/provider" `T.isInfixOf`)
 
-    it "live: /provider test anthropic round-trips against the real API" $
+    it "live: /provider test anthropic round-trips against the real API"
       pending  -- requires ANTHROPIC_API_KEY + network; run manually

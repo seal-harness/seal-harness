@@ -14,6 +14,7 @@ import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Core.Types (ModelId (..))
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Handles.Transcript (TranscriptHandle (..))
 import Seal.ISA.Dispatch (dispatch)
@@ -79,8 +80,11 @@ runTurn env userText = do
               }
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
-            then liftIO (ccSend (aeCaps env)
-                   (T.intercalate "\n" [t | CbText t <- rsContent resp]))
+            then liftIO $
+                   let ModelId m = aeModel env
+                       prefix    = aeProviderLabel env <> "/" <> m <> "> "
+                   in ccSend (aeCaps env)
+                        (prefix <> T.intercalate "\n" [t | CbText t <- rsContent resp])
             else do
               results <- mapM dispatchOne toolUses
               let assistantMsg = Message Assistant (rsContent resp)

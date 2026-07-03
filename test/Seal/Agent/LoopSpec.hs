@@ -60,6 +60,7 @@ spec = describe "Seal.Agent.Loop" $
     (h, _) <- fakeTranscript
     let env = AgentEnv
                 (SomeProvider (ScriptProvider ref))
+                "ollama"
                 (ModelId "m")
                 (mkRegistry [stubOp])
                 h
@@ -69,4 +70,4 @@ spec = describe "Seal.Agent.Loop" $
                 8
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
-    readIORef sent `shouldReturn` ["all done"]
+    readIORef sent `shouldReturn` ["ollama/m> all done"]

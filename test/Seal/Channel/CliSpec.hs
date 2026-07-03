@@ -121,7 +121,7 @@ spec = do
       (th, _)   <- fakeTranscript
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
-          env = mkSessionAgentEnv caps (SomeProvider StubProvider)
+          env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid (ISA.mkRegistry []) th
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid

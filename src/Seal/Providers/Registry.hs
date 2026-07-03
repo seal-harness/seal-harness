@@ -12,8 +12,10 @@ module Seal.Providers.Registry
   , parseProvider
   , vaultKeyName
   , defaultModelFor
+  , resolveDefaultModel
   , resolveProvider
   , completeSome
+  , listSome
   , vaultErrText
   ) where
 
@@ -30,6 +32,7 @@ import Seal.Providers.Anthropic.OAuth
   ( deserializeTokens, refreshTokens, serializeTokens )
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
+import Seal.Providers.Ollama (mkOllama, ollamaNeedsKey)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -37,7 +40,7 @@ import Seal.Security.Vault.Age (VaultError (..))
 -- | Every provider Seal can build. M1 ships Anthropic only; later milestones
 -- extend this sum (the totality of the functions below forces each addition to
 -- be handled everywhere).
-data KnownProvider = AnthropicProvider
+data KnownProvider = AnthropicProvider | OllamaProvider
   deriving stock (Eq, Show, Enum, Bounded)
 
 knownProviders :: [KnownProvider]
@@ -46,6 +49,7 @@ knownProviders = [minBound .. maxBound]
 -- | The user-facing id typed at the @/provider@ prompt.
 providerLabel :: KnownProvider -> Text
 providerLabel AnthropicProvider = "anthropic"
+providerLabel OllamaProvider    = "ollama"
 
 providerId :: KnownProvider -> ProviderId
 providerId = ProviderId . providerLabel
@@ -59,18 +63,29 @@ parseProvider t =
 -- | The vault secret name under which this provider's API key is stored.
 vaultKeyName :: KnownProvider -> Text
 vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
+vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
 
 -- | The model used when the user has not chosen one.
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
+defaultModelFor OllamaProvider    = ModelId "llama3.2"
+
+-- | A provider's default model: the configured value if given, else the
+-- provider's hardcoded default (Anthropic's for an unrecognized label).
+resolveDefaultModel :: Maybe Text -> Text -> ModelId
+resolveDefaultModel (Just m) _   = ModelId m
+resolveDefaultModel Nothing  lbl =
+  maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider lbl)
 
 -- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
 -- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
 -- re-run @\/provider login@) rather than silently falling back.
 resolveProvider
-  :: VaultHandle -> Manager -> KnownProvider -> ModelId
+  :: Maybe VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
   -> IO (Either Text SomeProvider)
-resolveProvider vh mgr AnthropicProvider model = do
+resolveProvider Nothing _ _ AnthropicProvider _ =
+  pure (Left "vault not configured \x2014 run /vault setup")
+resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model = do
   eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
   case eOAuth of
     Right blob -> case deserializeTokens blob of
@@ -90,10 +105,26 @@ resolveProvider vh mgr AnthropicProvider model = do
       pure $ case eKey of
         Left e         -> Left (credErr AnthropicProvider e)
         Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
+resolveProvider mvh mgr baseUrl OllamaProvider model
+  | not (ollamaNeedsKey baseUrl) =
+      -- local/custom host: keyless, never touch the vault
+      pure (Right (SomeProvider (mkOllama mgr baseUrl Nothing model)))
+  | otherwise = case mvh of
+      Nothing ->
+        pure (Left "Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama")
+      Just vh -> do
+        eKey <- vhGet vh (vaultKeyName OllamaProvider)
+        pure $ case eKey of
+          Right kb -> Right (SomeProvider (mkOllama mgr baseUrl (Just (mkApiKey kb)) model))
+          Left e   -> Left (vaultErrText e)
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
 completeSome (SomeProvider p) = complete p
+
+-- | List a provider's models through an existentially-wrapped provider.
+listSome :: SomeProvider -> IO (Either Text [ModelId])
+listSome (SomeProvider p) = listModels p
 
 -- | Provider-aware credential error: a missing key points the user at the
 -- exact @/provider add@ they need.

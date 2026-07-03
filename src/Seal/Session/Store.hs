@@ -30,11 +30,11 @@ import System.Directory
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 
-import Seal.Config.File (FileConfig (..))
+import Seal.Config.File (FileConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), mkSessionId)
-import Seal.Providers.Registry (KnownProvider (..), defaultModelFor)
+import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 
 -- | The mutable active-session ref plus the paths the commands need.
@@ -97,12 +97,15 @@ listSessions paths = do
       pure (sortOn (Down . smLastActive) (catMaybes metas))
 
 -- | The provider label + model a new session should start with: the configured
--- defaults, falling back to Anthropic and its default model.
+-- defaults, falling back to the configured provider's own default model (or
+-- Anthropic when no provider is configured).
 defaultSessionSelection :: FileConfig -> (Text, Text)
 defaultSessionSelection cfg =
-  ( fromMaybe "anthropic" (fcDefaultProvider cfg)
-  , fromMaybe modelText (fcDefaultModel cfg) )
-  where ModelId modelText = defaultModelFor AnthropicProvider
+  ( provLabel
+  , fromMaybe fallbackModel (fcDefaultModel cfg) )
+  where
+    provLabel = fromMaybe "anthropic" (fcDefaultProvider cfg)
+    ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
 
 -- | Create a new session from the config defaults, on the @cli@ channel.
 initSession :: SealPaths -> FileConfig -> IO SessionMeta
