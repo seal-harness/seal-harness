@@ -236,13 +236,8 @@ loginCmd pr lbl = CommandAction $ \caps ->
             case res of
               Left e   -> ccSend caps (vaultErrText e)
               Right () -> do
-                _ <- updateFileConfig (prConfigPath pr) (seedDefaults kp)
+                _ <- updateFileConfig (prConfigPath pr) (seedProviderDefaults kp)
                 ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
-  where
-    seedDefaults kp fc = fc
-      { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
-      , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
-      }
 
 -- | Best-effort browser open; failure is silently ignored (headless-friendly).
 openBrowser :: Text -> IO ()
