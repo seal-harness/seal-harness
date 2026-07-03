@@ -113,12 +113,35 @@ gets an actionable vault message. No secret bytes in any message.
 **Manual (now possible against a running daemon):** `/model use ollama <name>` then a
 chat turn reaches `localhost:11434` with no vault unlock.
 
-## Non-goals / open question
+## Follow-up (approved): `/model list <provider>` — live model listing
 
-- **Deferred UX (awaiting user):** live model listing in `/model list` (query `/api/tags`)
-  and/or live validation in `/model use ollama <model>` (PureClaw's `/target` behavior).
-  Not included here; needs the user's choice and threads a `Manager` into the model
-  command. Tracked separately.
+Motivated by a real failure: `/model use ollama glm-5.2` → `HTTP 404: model 'glm-5.2'
+not found`, because the local daemon exposes that cloud model as `glm-5.2:cloud` (the
+`:cloud` tag). Cloud models *are* handled (verified: `glm-5.2:cloud` returns a
+completion); the gap is **discoverability of the exact model names**. The fix is a
+command that lists a provider's live models.
+
+- **Command:** extend the existing `/model list`. `/model list` (no arg) keeps today's
+  behavior (each known provider + its default model, plus the active selection).
+  `/model list <provider>` resolves that provider and prints its live `listModels`
+  result — for Ollama this is the daemon's `/api/tags` (e.g. `glm-5.2:cloud`,
+  `llama3.2:latest`, …); for Anthropic it is the single configured model.
+- **List-only, no validation.** `/model use` stays permissive (a wrong name still fails
+  at send time with the provider's 404). Validating `use` against the live list is
+  intentionally out of scope (extra per-switch network call + a daemon-down failure
+  mode); trivially added later if wanted.
+- **Plumbing:** `modelCommandSpec` gains the provider-resolution context (the existing
+  `ProviderRuntime`: HTTP `Manager` + vault handle-ref + config path) so it can call
+  `resolveProvider` (the `Maybe VaultHandle` form above) + a new
+  `listSome :: SomeProvider -> IO (Either Text [ModelId])` (mirrors `completeSome`).
+  Local Ollama lists keyless (no vault); Anthropic/cloud-Ollama resolution still needs
+  the vault, so `/model list anthropic` without an unlocked vault reports the resolve
+  error.
+
+Testing: pure `listSome` pass-through; a `/model list ollama` handler test driven by a
+scripted in-process provider (asserts the model lines and the empty case); `/model list`
+with no arg unchanged. Manual: `/model list ollama` against the running daemon shows the
+`:cloud` tag.
 - `/provider test ollama` without any vault handle (keeps requiring a handle to exist).
 - Parsing the URL host rigorously — a substring check for `ollama.com` is sufficient and
   clear; revisit only if a real host legitimately contains that substring without being
