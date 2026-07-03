@@ -176,3 +176,13 @@ spec = describe "Seal.Providers.Ollama" $ do
   describe "Provider Ollama (live)" $
     it "chat + tags round-trip against a running ollama" $
       pendingWith "needs a local `ollama serve` at http://localhost:11434"
+
+  describe "ollamaNeedsKey" $ do
+    it "is False for a local daemon" $ do
+      ollamaNeedsKey "http://localhost:11434" `shouldBe` False
+    it "is False for a LAN host" $ do
+      ollamaNeedsKey "http://192.168.1.10:11434" `shouldBe` False
+    it "is True for the cloud host" $ do
+      ollamaNeedsKey "https://ollama.com" `shouldBe` True
+    it "is True for the cloud api host" $ do
+      ollamaNeedsKey "https://api.ollama.com" `shouldBe` True

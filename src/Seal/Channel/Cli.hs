@@ -79,15 +79,11 @@ resolveSessionProvider pr meta =
   case parseProvider (smProvider meta) of
     Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
     Just kp -> do
+      eCfg <- loadFileConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) fcOllamaBaseUrl eCfg)
+          model   = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
-      case mh of
-        Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
-        Just vh -> do
-          let model = ModelId (smModel meta)
-          eCfg <- loadFileConfig (prConfigPath pr)
-          let baseUrl = fromMaybe defaultOllamaBaseUrl
-                          (either (const Nothing) fcOllamaBaseUrl eCfg)
-          fmap (fmap (, model)) (resolveProvider vh (prManager pr) baseUrl kp model)
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
 
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv

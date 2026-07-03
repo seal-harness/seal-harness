@@ -78,7 +78,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves Anthropic when the credential is present" $ do
       vh  <- makeFakeVault [("ANTHROPIC_API_KEY", "sk-test")]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8")
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure $ "expected Right, got Left: " <> show e
@@ -86,7 +86,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "reports a missing credential with an actionable hint" $ do
       vh  <- makeFakeVault []
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
       case r of
         Left e  -> e `shouldSatisfy` ("provider add" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for a missing credential"
@@ -94,7 +94,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "reports a locked vault" $ do
       vh  <- makeLockedVault
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
         Right _ -> expectationFailure "expected a Left for a locked vault"
@@ -104,7 +104,7 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
                              (posixSecondsToUTCTime 4102444800) -- 2100: fresh
       vh  <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", serializeTokens toks)]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "claude-opus-4-8")
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (OAuth), got Left: " <> show e)
@@ -115,16 +115,23 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
                , ("ANTHROPIC_API_KEY",      "sk-fallback")
                ]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
       case r of
         Left e  -> e `shouldSatisfy` ("OAuth" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left: corrupt OAuth blob must not fall back to the API key"
+
+    it "reports vault not configured for Anthropic with no vault handle" $ do
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider Nothing mgr "http://localhost:11434" AnthropicProvider (ModelId "m")
+      case r of
+        Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
+        Right _ -> expectationFailure "expected Left for no vault handle"
 
   describe "resolveProvider (ollama)" $ do
     it "resolves local Ollama with no stored key" $ do
       vh  <- makeFakeVault []
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" OllamaProvider (ModelId "llama3.2")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" OllamaProvider (ModelId "llama3.2")
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (local), got Left: " <> show e)
@@ -132,15 +139,37 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
     it "resolves cloud Ollama when a key is present" $ do
       vh  <- makeFakeVault [("OLLAMA_API_KEY", "k-cloud")]
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "https://ollama.com" OllamaProvider (ModelId "m")
+      r   <- resolveProvider (Just vh) mgr "https://ollama.com" OllamaProvider (ModelId "m")
       case r of
         Right _ -> pure ()
         Left e  -> expectationFailure ("expected Right (cloud), got Left: " <> show e)
 
-    it "surfaces a locked vault rather than treating it as local" $ do
+    it "resolves local Ollama with no vault handle at all (keyless, vault untouched)" $ do
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider Nothing mgr "http://localhost:11434" OllamaProvider (ModelId "m")
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right (local, no vault), got Left: " <> show e)
+
+    it "resolves local Ollama even with a locked vault (vault untouched)" $ do
       vh  <- makeLockedVault
       mgr <- newManager defaultManagerSettings
-      r   <- resolveProvider vh mgr "http://localhost:11434" OllamaProvider (ModelId "m")
+      r   <- resolveProvider (Just vh) mgr "http://localhost:11434" OllamaProvider (ModelId "m")
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("expected Right (local, locked vault untouched), got Left: " <> show e)
+
+    it "reports a missing key for the cloud host with no vault handle" $ do
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider Nothing mgr "https://ollama.com" OllamaProvider (ModelId "m")
+      case r of
+        Left e  -> e `shouldSatisfy` (\t -> "key" `T.isInfixOf` t || "provider add" `T.isInfixOf` t)
+        Right _ -> expectationFailure "expected Left for cloud host with no vault"
+
+    it "surfaces a locked vault for the cloud host" $ do
+      vh  <- makeLockedVault
+      mgr <- newManager defaultManagerSettings
+      r   <- resolveProvider (Just vh) mgr "https://ollama.com" OllamaProvider (ModelId "m")
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
-        Right _ -> expectationFailure "expected Left for a locked vault"
+        Right _ -> expectationFailure "expected Left for a locked vault on the cloud host"

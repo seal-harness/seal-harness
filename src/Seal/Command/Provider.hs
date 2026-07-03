@@ -254,7 +254,7 @@ testCmd pr lbl = CommandAction $ \caps ->
             _                                    -> defaultModelFor kp
           baseUrl = fromMaybe defaultOllamaBaseUrl
                       (either (const Nothing) fcOllamaBaseUrl eCfg)
-      eProv <- resolveProvider vh (prManager pr) baseUrl kp model
+      eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model
       case eProv of
         Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
         Right sp -> do

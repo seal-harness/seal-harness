@@ -10,6 +10,7 @@ module Seal.Providers.Ollama
   ( Ollama (..)
   , mkOllama
   , defaultOllamaBaseUrl
+  , ollamaNeedsKey
   , chatUrl
   , tagsUrl
   , ollamaHeaders
@@ -53,6 +54,13 @@ mkOllama mgr base mKey model = Ollama model mgr base mKey
 
 defaultOllamaBaseUrl :: Text
 defaultOllamaBaseUrl = "http://localhost:11434"
+
+-- | Does this Ollama base URL require an API key? Only the Ollama Cloud direct
+-- API (@ollama.com@) does; a local or custom-host daemon needs none. A local
+-- daemon that proxies @*:cloud@ models still needs no Seal-held key (the daemon
+-- authenticates to the cloud itself).
+ollamaNeedsKey :: Text -> Bool
+ollamaNeedsKey base = "ollama.com" `T.isInfixOf` base
 
 stripTrailingSlash :: Text -> Text
 stripTrailingSlash t = fromMaybe t (T.stripSuffix "/" t)

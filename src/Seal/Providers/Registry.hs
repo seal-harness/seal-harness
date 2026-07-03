@@ -30,7 +30,7 @@ import Seal.Providers.Anthropic.OAuth
   ( deserializeTokens, refreshTokens, serializeTokens )
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
-import Seal.Providers.Ollama (mkOllama)
+import Seal.Providers.Ollama (mkOllama, ollamaNeedsKey)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -72,9 +72,11 @@ defaultModelFor OllamaProvider    = ModelId "llama3.2"
 -- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
 -- re-run @\/provider login@) rather than silently falling back.
 resolveProvider
-  :: VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
+  :: Maybe VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
   -> IO (Either Text SomeProvider)
-resolveProvider vh mgr _baseUrl AnthropicProvider model = do
+resolveProvider Nothing _ _ AnthropicProvider _ =
+  pure (Left "vault not configured \x2014 run /vault setup")
+resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model = do
   eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
   case eOAuth of
     Right blob -> case deserializeTokens blob of
@@ -94,12 +96,18 @@ resolveProvider vh mgr _baseUrl AnthropicProvider model = do
       pure $ case eKey of
         Left e         -> Left (credErr AnthropicProvider e)
         Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
-resolveProvider vh mgr baseUrl OllamaProvider model = do
-  eKey <- vhGet vh (vaultKeyName OllamaProvider)
-  pure $ case eKey of
-    Right keyBytes            -> Right (SomeProvider (mkOllama mgr baseUrl (Just (mkApiKey keyBytes)) model))
-    Left (VaultKeyNotFound _) -> Right (SomeProvider (mkOllama mgr baseUrl Nothing model))   -- local, no key
-    Left e                    -> Left (vaultErrText e)
+resolveProvider mvh mgr baseUrl OllamaProvider model
+  | not (ollamaNeedsKey baseUrl) =
+      -- local/custom host: keyless, never touch the vault
+      pure (Right (SomeProvider (mkOllama mgr baseUrl Nothing model)))
+  | otherwise = case mvh of
+      Nothing ->
+        pure (Left "Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama")
+      Just vh -> do
+        eKey <- vhGet vh (vaultKeyName OllamaProvider)
+        pure $ case eKey of
+          Right kb -> Right (SomeProvider (mkOllama mgr baseUrl (Just (mkApiKey kb)) model))
+          Left e   -> Left (vaultErrText e)
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
