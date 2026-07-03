@@ -12,6 +12,7 @@ module Seal.Channel.Cli
 
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Console.Haskeline
@@ -31,6 +32,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
+import Seal.Config.File (fcOllamaBaseUrl, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
@@ -41,6 +43,7 @@ import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (SomeProvider (..))
+import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -81,7 +84,10 @@ resolveSessionProvider pr meta =
         Nothing -> pure (Left "vault not configured \x2014 run /vault setup")
         Just vh -> do
           let model = ModelId (smModel meta)
-          fmap (fmap (, model)) (resolveProvider vh (prManager pr) kp model)
+          eCfg <- loadFileConfig (prConfigPath pr)
+          let baseUrl = fromMaybe defaultOllamaBaseUrl
+                          (either (const Nothing) fcOllamaBaseUrl eCfg)
+          fmap (fmap (, model)) (resolveProvider vh (prManager pr) baseUrl kp model)
 
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv

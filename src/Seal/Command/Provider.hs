@@ -12,6 +12,7 @@ module Seal.Command.Provider
 
 import Control.Exception (SomeException, try)
 import Data.IORef (readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -30,6 +31,7 @@ import Seal.Config.File
   ( FileConfig (..), loadFileConfig, updateFileConfig )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
+import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider, completeSome, defaultModelFor, knownProviders
   , parseProvider, providerLabel, resolveProvider, vaultErrText, vaultKeyName )
@@ -213,7 +215,9 @@ testCmd pr lbl = CommandAction $ \caps ->
       let model = case eCfg of
             Right c | Just m <- fcDefaultModel c -> ModelId m
             _                                    -> defaultModelFor kp
-      eProv <- resolveProvider vh (prManager pr) kp model
+          baseUrl = fromMaybe defaultOllamaBaseUrl
+                      (either (const Nothing) fcOllamaBaseUrl eCfg)
+      eProv <- resolveProvider vh (prManager pr) baseUrl kp model
       case eProv of
         Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
         Right sp -> do
