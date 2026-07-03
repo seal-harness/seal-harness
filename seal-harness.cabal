@@ -104,6 +104,8 @@ library
       , tomland
       , typed-process
       , unix
+      , unordered-containers
+      , validation-selective
     hs-source-dirs: src
 
 executable seal

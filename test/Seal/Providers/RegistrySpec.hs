@@ -20,6 +20,7 @@ import Seal.Providers.Registry
   , parseProvider
   , providerId
   , providerLabel
+  , resolveDefaultModel
   , resolveProvider
   , vaultKeyName
   )
@@ -186,3 +187,12 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       case r of
         Left e  -> e `shouldSatisfy` ("locked" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left for a locked vault on the cloud host"
+
+  describe "resolveDefaultModel" $ do
+    it "uses the configured value when present" $
+      resolveDefaultModel (Just "glm-5.2:cloud") "ollama" `shouldBe` ModelId "glm-5.2:cloud"
+    it "falls back to the provider's hardcoded default" $ do
+      resolveDefaultModel Nothing "ollama"    `shouldBe` ModelId "llama3.2"
+      resolveDefaultModel Nothing "anthropic" `shouldBe` ModelId "claude-opus-4-8"
+    it "falls back to anthropic for an unknown label" $
+      resolveDefaultModel Nothing "who" `shouldBe` ModelId "claude-opus-4-8"

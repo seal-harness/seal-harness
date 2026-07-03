@@ -12,6 +12,7 @@ module Seal.Providers.Registry
   , parseProvider
   , vaultKeyName
   , defaultModelFor
+  , resolveDefaultModel
   , resolveProvider
   , completeSome
   , listSome
@@ -68,6 +69,13 @@ vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
 defaultModelFor OllamaProvider    = ModelId "llama3.2"
+
+-- | A provider's default model: the configured value if given, else the
+-- provider's hardcoded default (Anthropic's for an unrecognized label).
+resolveDefaultModel :: Maybe Text -> Text -> ModelId
+resolveDefaultModel (Just m) _   = ModelId m
+resolveDefaultModel Nothing  lbl =
+  maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider lbl)
 
 -- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
 -- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
