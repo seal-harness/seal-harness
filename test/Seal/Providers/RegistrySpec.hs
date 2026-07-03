@@ -16,6 +16,7 @@ import Seal.Providers.Registry
   , completeSome
   , defaultModelFor
   , knownProviders
+  , listSome
   , parseProvider
   , providerId
   , providerLabel
@@ -29,6 +30,13 @@ newtype Canned = Canned (Either T.Text CompletionResponse)
 instance Provider Canned where
   complete (Canned r) _ = pure r
   listModels _ = pure (Right [])
+
+-- | A tiny provider whose 'listModels' returns a fixed, non-empty list — used
+-- to assert 'listSome' really passes the result through (not a tautology).
+newtype CannedModels = CannedModels [ModelId]
+instance Provider CannedModels where
+  complete _ _ = pure (Left "CannedModels.complete not exercised")
+  listModels (CannedModels ms) = pure (Right ms)
 
 spec :: Spec
 spec = describe "Seal.Providers.Registry vocabulary" $ do
@@ -73,6 +81,11 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       r <- completeSome (SomeProvider (Canned (Right resp)))
                         (error "request not forced")
       r `shouldBe` Right resp
+
+  describe "listSome" $
+    it "passes listModels through the wrapped provider" $ do
+      r <- listSome (SomeProvider (CannedModels [ModelId "m1", ModelId "m2"]))
+      r `shouldBe` Right [ModelId "m1", ModelId "m2"]
 
   describe "resolveProvider" $ do
     it "resolves Anthropic when the credential is present" $ do

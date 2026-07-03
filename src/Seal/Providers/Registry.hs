@@ -14,6 +14,7 @@ module Seal.Providers.Registry
   , defaultModelFor
   , resolveProvider
   , completeSome
+  , listSome
   , vaultErrText
   ) where
 
@@ -112,6 +113,10 @@ resolveProvider mvh mgr baseUrl OllamaProvider model
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
 completeSome (SomeProvider p) = complete p
+
+-- | List a provider's models through an existentially-wrapped provider.
+listSome :: SomeProvider -> IO (Either Text [ModelId])
+listSome (SomeProvider p) = listModels p
 
 -- | Provider-aware credential error: a missing key points the user at the
 -- exact @/provider add@ they need.
