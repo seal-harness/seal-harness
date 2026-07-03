@@ -15,6 +15,8 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
+import Seal.Config.File
+  (ProviderConfig (..), loadFileConfig, providerDefaultModel, updateFileConfig, upsertProvider)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Security.Vault (VaultHandle)
@@ -102,3 +104,42 @@ spec = describe "Seal.Command.Model" $ do
       let out = T.unlines sent
       out `shouldSatisfy` ("could not list anthropic models" `T.isInfixOf`)
       out `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
+
+  it "default sets a provider's section default model" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["default", "ollama", "glm-5.2:cloud"] caps
+      Right cfg <- loadFileConfig (srConfigPath sr)
+      providerDefaultModel cfg "ollama" `shouldBe` Just "glm-5.2:cloud"
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("glm-5.2:cloud" `T.isInfixOf`)
+
+  it "use without a model uses the provider's default" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      _ <- updateFileConfig (srConfigPath sr)
+             (upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" }))
+      (_, caps) <- makeFakeCaps []
+      runModel pr sr ["use", "ollama"] caps
+      active <- readIORef (srActive sr)
+      smProvider active `shouldBe` "ollama"
+      smModel active    `shouldBe` "glm-5.2:cloud"
+
+  it "use without a model and no config falls back to the hardcoded default" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      (_, caps) <- makeFakeCaps []
+      runModel pr sr ["use", "ollama"] caps
+      active <- readIORef (srActive sr)
+      smModel active `shouldBe` "llama3.2"
+
+  it "list shows a configured section default" $
+    withSystemTempDirectory "seal-model" $ \root -> do
+      sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
+      _ <- updateFileConfig (srConfigPath sr)
+             (upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" }))
+      (fc, caps) <- makeFakeCaps []
+      runModel pr sr ["list"] caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("glm-5.2:cloud" `T.isInfixOf`)
