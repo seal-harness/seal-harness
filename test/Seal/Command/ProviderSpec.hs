@@ -15,7 +15,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
-import Seal.Config.File (FileConfig (..), loadFileConfig, providerBaseUrl)
+import Seal.Config.File (FileConfig (..), loadFileConfig, providerBaseUrl, providerDefaultModel)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
@@ -85,7 +85,7 @@ spec = do
         vhGet vh "ANTHROPIC_API_KEY" >>= (`shouldBe` Right ("sk-secret" :: ByteString))
         Right cfg <- loadFileConfig cfgPath
         fcDefaultProvider cfg `shouldBe` Just "anthropic"
-        fcDefaultModel    cfg `shouldBe` Just "claude-opus-4-8"
+        providerDefaultModel cfg "anthropic" `shouldBe` Just "claude-opus-4-8"
         sent <- getSent fc
         sent `shouldSatisfy` any ("Stored API key" `T.isInfixOf`)
 
@@ -174,6 +174,7 @@ spec = do
         vhGet vh "OLLAMA_API_KEY" >>= (`shouldBe` Right ("k-cloud" :: ByteString))
         Right cfg <- loadFileConfig cfgPath
         providerBaseUrl cfg "ollama" `shouldBe` Just "https://ollama.com"
+        providerDefaultModel cfg "ollama" `shouldBe` Just "llama3.2"
 
     it "add ollama with a blank key configures local (no key stored)" $
       withSystemTempDirectory "seal-prov" $ \dir -> do

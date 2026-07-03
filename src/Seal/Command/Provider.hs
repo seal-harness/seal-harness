@@ -12,7 +12,7 @@ module Seal.Command.Provider
 
 import Control.Exception (SomeException, try)
 import Data.IORef (readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -29,7 +29,7 @@ import Seal.Command.Spec
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( FileConfig (..), ProviderConfig (..), loadFileConfig, providerBaseUrl
-  , updateFileConfig, upsertProvider )
+  , providerDefaultModel, updateFileConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
@@ -132,6 +132,18 @@ unknownProviderMsg lbl =
 
 -- Subcommand handlers -------------------------------------------------------
 
+-- | Seed the default provider (if unset) and, only if that provider's
+-- section has no default model yet, seed its @[providers.<label>]@
+-- @default_model@. Never touches the global @default_model@ key, so a
+-- later @/model default@ isn't shadowed by a stale global value.
+seedProviderDefaults :: KnownProvider -> FileConfig -> FileConfig
+seedProviderDefaults kp fc0 =
+  let fc1 = fc0 { fcDefaultProvider = fcDefaultProvider fc0 <|> Just (providerLabel kp) }
+      lbl = providerLabel kp
+  in if isJust (providerDefaultModel fc1 lbl)
+       then fc1
+       else upsertProvider lbl (\p -> p { pcDefaultModel = Just (modelText (defaultModelFor kp)) }) fc1
+
 addCmd :: ProviderRuntime -> Text -> CommandAction
 addCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp ->
@@ -144,13 +156,8 @@ addCmd pr lbl = CommandAction $ \caps ->
           case res of
             Left e   -> ccSend caps (vaultErrText e)
             Right () -> do
-              _ <- updateFileConfig (prConfigPath pr) (seedDefaults kp)
+              _ <- updateFileConfig (prConfigPath pr) (seedProviderDefaults kp)
               ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
-  where
-    seedDefaults kp fc = fc
-      { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
-      , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
-      }
 
 -- | Ollama onboarding: prompt for the base URL (blank keeps the default),
 -- persist it to config, then prompt for an optional API key (blank => local,
@@ -172,10 +179,7 @@ addOllama pr caps vh kp = do
       ccSend caps "Configured ollama."
   where
     seedAll mUrl fc =
-      let fc' = fc
-            { fcDefaultProvider = fcDefaultProvider fc <|> Just (providerLabel kp)
-            , fcDefaultModel    = fcDefaultModel fc    <|> Just (modelText (defaultModelFor kp))
-            }
+      let fc' = seedProviderDefaults kp fc
       in case mUrl of
            Nothing -> fc'
            Just u  -> upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Just u }) fc'
