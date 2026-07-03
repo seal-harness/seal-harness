@@ -74,14 +74,18 @@ spec = describe "Seal.Session.Store" $ do
           `shouldBe` ["20260701-120000-002", "20260701-120000-001"]
 
   describe "defaultSessionSelection" $ do
-    it "falls back to anthropic + its default model when config is empty" $
-      defaultSessionSelection defaultFileConfig
-        `shouldBe` ("anthropic", "claude-opus-4-8")
+    it "uses the parsed provider's default model when no model is configured" $ do
+      let cfg = defaultFileConfig { fcDefaultProvider = Just "ollama" }
+      defaultSessionSelection cfg `shouldBe` ("ollama", "llama3.2")
 
-    it "honours configured defaults" $
-      defaultSessionSelection defaultFileConfig
-        { fcDefaultProvider = Just "ollama", fcDefaultModel = Just "llama3" }
-        `shouldBe` ("ollama", "llama3")
+    it "keeps an explicitly configured model" $ do
+      let cfg = defaultFileConfig
+                  { fcDefaultProvider = Just "ollama"
+                  , fcDefaultModel    = Just "qwen3" }
+      defaultSessionSelection cfg `shouldBe` ("ollama", "qwen3")
+
+    it "falls back to anthropic + its model when nothing is configured" $
+      defaultSessionSelection defaultFileConfig `shouldBe` ("anthropic", "claude-opus-4-8")
 
   describe "initSession" $
     it "creates a session from the config defaults on the cli channel" $
