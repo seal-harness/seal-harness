@@ -35,7 +35,8 @@ import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Ro
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider, completeSome, defaultModelFor, knownProviders
-  , parseProvider, providerLabel, resolveProvider, vaultErrText, vaultKeyName )
+  , parseProvider, providerLabel, resolveDefaultModel, resolveProvider
+  , vaultErrText, vaultKeyName )
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -252,9 +253,10 @@ testCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
       eCfg <- loadFileConfig (prConfigPath pr)
-      let model = case eCfg of
-            Right c | Just m <- fcDefaultModel c -> ModelId m
-            _                                    -> defaultModelFor kp
+      let canonLbl = providerLabel kp
+          model = case eCfg of
+            Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
+            Left _  -> defaultModelFor kp
           baseUrl = fromMaybe defaultOllamaBaseUrl
                       (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model
