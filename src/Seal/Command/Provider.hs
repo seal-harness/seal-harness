@@ -106,6 +106,9 @@ providerParser pr = hsubparser
   <> command "test"
        (info (testCmd pr <$> provArg)
              (progDesc "Run a live round-trip to verify a provider works"))
+  <> command "default"
+       (info (defaultCmd pr <$> provArg)
+             (progDesc "Set the default provider for new sessions"))
   <> command "remove"
        (info (removeCmd pr <$> provArg)
              (progDesc "Remove a provider's stored credential"))
@@ -184,6 +187,28 @@ addOllama pr caps vh kp = do
       in case mUrl of
            Nothing -> fc'
            Just u  -> upsertProvider (providerLabel kp) (\p -> p { pcBaseUrl = Just u }) fc'
+
+-- | Set the default provider for new sessions (writes @default_provider@).
+-- Only a valid provider label is accepted; no credential or vault is required,
+-- so a keyless local provider can be made the default before any key exists.
+-- Unlike the @<|>@ seeding on @/provider add@, this reassigns an existing
+-- default. The confirmation echoes the provider's resolved default model so it
+-- is clear what new sessions will start with.
+defaultCmd :: ProviderRuntime -> Text -> CommandAction
+defaultCmd pr lbl = CommandAction $ \caps ->
+  withProvider caps lbl $ \kp -> do
+    let plabel = providerLabel kp
+    res <- updateFileConfig (prConfigPath pr)
+             (\fc -> fc { fcDefaultProvider = Just plabel })
+    case res of
+      Left e   -> ccSend caps e
+      Right () -> do
+        eCfg <- loadFileConfig (prConfigPath pr)
+        let ModelId m = resolveDefaultModel
+                          (either (const Nothing) (`providerDefaultModel` plabel) eCfg)
+                          plabel
+        ccSend caps
+          ("default provider set to " <> plabel <> " (model: " <> m <> ")")
 
 listCmd :: ProviderRuntime -> CommandAction
 listCmd pr = CommandAction $ \caps ->

@@ -197,6 +197,40 @@ spec = do
         T.unlines out `shouldSatisfy` ("ollama" `T.isInfixOf`)
         T.unlines out `shouldSatisfy` ("local" `T.isInfixOf`)
 
+    it "default sets default_provider without needing a vault" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        pr <- mkPR cfgPath Nothing            -- no vault: config-only command
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["default", "ollama"] caps
+        Right cfg <- loadFileConfig cfgPath
+        fcDefaultProvider cfg `shouldBe` Just "ollama"
+        sent <- getSent fc
+        -- confirmation names the provider and its resolved default model
+        T.unlines sent `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        T.unlines sent `shouldSatisfy` ("llama3.2" `T.isInfixOf`)
+
+    it "default reassigns an already-set default provider" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfgPath (Just vh)
+        (_, addCaps) <- makeFakeCaps ["sk"]
+        runProv pr ["add", "anthropic"] addCaps   -- seeds default_provider = anthropic
+        (_, caps) <- makeFakeCaps []
+        runProv pr ["default", "ollama"] caps      -- must override, not <|>-keep
+        Right cfg <- loadFileConfig cfgPath
+        fcDefaultProvider cfg `shouldBe` Just "ollama"
+
+    it "default rejects an unknown provider" $
+      withSystemTempDirectory "seal-prov" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        pr <- mkPR cfgPath Nothing
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["default", "bogus"] caps
+        sent <- getSent fc
+        T.unlines sent `shouldSatisfy` ("unknown provider" `T.isInfixOf`)
+
     it "rejects an unknown provider" $
       withSystemTempDirectory "seal-prov" $ \dir -> do
         let cfgPath = dir </> "config.toml"
