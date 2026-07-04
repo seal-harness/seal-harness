@@ -34,6 +34,7 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.Paging
         Seal.Core.Types
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
@@ -63,6 +64,7 @@ library
         Seal.Security.Secrets
         Seal.Security.Vault
         Seal.Security.Vault.Age
+        Seal.Text.LineFile
         Seal.Tui
         Seal.Types.App
         Seal.Types.Command
@@ -142,6 +144,7 @@ test-suite tests
     hs-source-dirs: test
     other-modules:
         Seal.Core.TypesSpec
+        Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
         Seal.Handles.TranscriptSpec
         Seal.AppMainSpec
@@ -164,6 +167,7 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
+        Seal.Text.LineFileSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
