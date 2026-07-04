@@ -36,6 +36,14 @@ After writing a design document, you can request a review:
 | `/prime` | Load relevant knowledge from the BEADS knowledge base |
 | `/start-task` | Begin tracked work on a task with complexity assessment |
 | `/review-design` | Architecture-focused design review (single `@architect-agent` in this POC, not the full 5-agent gate) |
+| `/design-review-gate` | Automatic review gate that runs after brainstorming completes |
+| `/orchestrated-execution` | 4-phase execution loop for work units |
+| `/setup` | Interactive project setup — detects your project, configures metaswarm |
+| `/self-reflect` | Extract learnings from recent PR reviews and session patterns to update the knowledge base |
+| `/handoff` | Write a self-contained handoff document so a fresh agent can resume the work |
+| `/status` | Show metaswarm diagnostic information |
+| `/handle-pr-comments` | Systematically address PR review comments with iteration loop until all threads resolved |
+| `/external-tools-health` | Check status of external AI tools (Codex CLI, Gemini CLI) |
 
 ### Available Agents
 
@@ -63,13 +71,13 @@ After writing a design document, you can request a review:
 
 ## POC Scope
 
-Full agent roster is registered (19/19). All 13 metaswarm skills are loaded from `.opencode/skills/` (discovered automatically, no `opencode.json` registration needed). Commands are partially wired: 6 of 13 commands registered. Remaining commands will be added incrementally in follow-up PRs.
+Full agent roster is registered (19/19). All 13 metaswarm skills are loaded from `.opencode/skills/` (discovered automatically, no `opencode.json` registration needed). Commands are partially wired: 11 of 13 commands registered. Remaining commands will be added incrementally in follow-up PRs.
 
 ## Current Limitations
 
 - BEADS integration via `.opencode/plugins` is not yet implemented
 - Session hooks (compacting, session events) are not configured — `hooks/hooks.json` + `hooks/session-start.sh` exist upstream but use Claude Code's `${CLAUDE_PLUGIN_ROOT}` variable; porting to opencode's hook config is pending
-- Commands: 7 of 13 not yet registered (`/self-reflect`, `/handoff`, `/status`, `/migrate`, `/handling-pr-comments`, `/visual-review`, `/external-tools`) — the skills backing these commands are loaded; only the `opencode.json` `command` entries are missing
+- Commands: 2 of 13 not yet registered (`/migrate`, `/visual-review`) — these are skills only with no upstream slash-command counterpart; the remaining 11 commands are registered
 - Top-level `rubrics/` and `knowledge/` directories not yet committed (skill-bundled rubrics under `skills/*/rubrics/` are in place; the top-level copies are referenced by some agents via absolute paths and need porting)
 - `.coverage-thresholds.json` `enforcement.command` still says `pnpm test:coverage` — needs updating to the Haskell/cabal test command for this repo
 - Design review gate runs only `@architect-agent`; the other 4 reviewers (PM, Designer, Security Design, CTO) are now registered and can be invoked, but the `/review-design` command itself still routes to a single reviewer until the parallel gate is wired up (the `design-review-gate` skill is loaded and can be invoked directly)

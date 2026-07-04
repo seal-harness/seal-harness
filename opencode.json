@@ -25,6 +25,26 @@
     "orchestrated-execution": {
       "template": "{file:.opencode/commands/orchestrated-execution.md}",
       "description": "4-phase execution loop for work units - IMPLEMENT, VALIDATE, ADVERSARIAL REVIEW, COMMIT"
+    },
+    "self-reflect": {
+      "template": "{file:.opencode/commands/self-reflect.md}",
+      "description": "Extract learnings from recent PR reviews, conversations, and session patterns to update the knowledge base"
+    },
+    "handoff": {
+      "template": "{file:.opencode/commands/handoff.md}",
+      "description": "Analyze the session and write a self-contained handoff document so a fresh agent can resume the work — outputs a single \"Read XXX.md and do YYY.\" sentence"
+    },
+    "status": {
+      "template": "{file:.opencode/commands/status.md}",
+      "description": "Show metaswarm diagnostic information — installation state, project setup, BEADS plugin status, external tools, coverage config"
+    },
+    "handle-pr-comments": {
+      "template": "{file:.opencode/commands/handle-pr-comments.md}",
+      "description": "Systematically address PR review comments from automated tools and human reviewers, with iteration loop until all threads resolved"
+    },
+    "external-tools-health": {
+      "template": "{file:.opencode/commands/external-tools-health.md}",
+      "description": "Check the status of external AI tools (Codex CLI, Gemini CLI) and their configuration"
     }
   },
   "agent": {
