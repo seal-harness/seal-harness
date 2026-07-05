@@ -29,6 +29,7 @@ spec = describe "Seal.Config.File" $ do
         , fcVaultKeyType   = Nothing
         , fcDefaultProvider = Nothing
         , fcDefaultModel    = Nothing
+        , fcDefaultAgent    = Nothing
         , fcProviders       = Map.empty
         , fcRetrieval       = Nothing
         }
@@ -81,6 +82,7 @@ spec = describe "Seal.Config.File" $ do
               , fcVaultKeyType   = Just "x25519"
               , fcDefaultProvider = Nothing
               , fcDefaultModel    = Nothing
+              , fcDefaultAgent    = Nothing
               , fcProviders       = Map.empty
               , fcRetrieval       = Nothing
               }

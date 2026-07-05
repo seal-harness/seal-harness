@@ -8,10 +8,12 @@ import qualified Data.Text as T
 
 import Network.HTTP.Client.TLS (newTlsManager)
 
-import Seal.Channel.Cli (runCliTui)
+import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
+import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
+import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -85,10 +87,16 @@ runTui = do
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
-      registry = mkRegistry
+  -- The evolutionary-store backends are created once and shared between the
+  -- @\/skill@ \/ @\/agent@ command specs (read-only) and the ISA opcodes
+  -- (mutate). They materialize from the Audited log inside runCliTui.
+  backends <- newBackends
+  let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
         , sessionCommandSpec sr
         , modelCommandSpec pr sr
+        , skillCommandSpec (bSkills backends)
+        , agentCommandSpec (bAgentDefs backends) cfgPath
         ]
-  runCliTui paths rt pr sr registry emptyChain
+  runCliTui paths rt pr sr registry emptyChain backends

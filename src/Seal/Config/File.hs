@@ -51,6 +51,9 @@ data FileConfig = FileConfig
     -- ^ Provider id used for new sessions (e.g. @\"anthropic\"@).
   , fcDefaultModel :: Maybe Text
     -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
+  , fcDefaultAgent :: Maybe Text
+    -- ^ Agent def id used by default for agent-driven flows (set via
+    -- @\/agent default@). 'Nothing' means no default agent is selected.
   , fcProviders :: Map Text ProviderConfig
     -- ^ Per-provider config sections (@[providers.<label>]@).
   , fcRetrieval :: Maybe RetrievalConfig
@@ -86,6 +89,7 @@ defaultFileConfig = FileConfig
   , fcVaultKeyType   = Nothing
   , fcDefaultProvider = Nothing
   , fcDefaultModel    = Nothing
+  , fcDefaultAgent    = Nothing
   , fcProviders       = Map.empty
   , fcRetrieval       = Nothing
   }
@@ -116,6 +120,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "vault_key_type")  .= fcVaultKeyType
   <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
   <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
+  <*> Toml.dioptional (Toml.text "default_agent")    .= fcDefaultAgent
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
 

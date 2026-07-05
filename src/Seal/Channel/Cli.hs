@@ -8,6 +8,8 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , mkSessionAgentEnv
+  , Backends (..)
+  , newBackends
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -59,7 +61,7 @@ import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (AgentDef (..))
-import Seal.Agent.Runtime.Registry (newAgentRuntime)
+import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -70,6 +72,29 @@ import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | The evolutionary-store backends + the in-process agent runtime, created
+-- once at startup and shared between the command specs (which read them via
+-- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). All three
+-- backends are in-memory 'noneBackend' impls for now (the Audited log is
+-- canonical); they materialize from Audited-log replay inside the
+-- 'withAuditedLog' bracket in 'runCliTui'.
+data Backends = Backends
+  { bMemory    :: Mem.MemoryBackend
+  , bSkills    :: Skill.SkillBackend
+  , bAgentDefs :: Def.AgentDefBackend
+  , bRuntime   :: AgentRuntime
+  }
+
+-- | Construct the backends with their in-memory 'noneBackend' impls. The
+-- Audited-log materialization happens later, inside 'runCliTui' once the
+-- Audited handle is open.
+newBackends :: IO Backends
+newBackends = Backends
+  <$> Mem.noneBackend
+  <*> Skill.noneBackend
+  <*> Def.noneBackend
+  <*> newAgentRuntime
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -141,8 +166,8 @@ mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle audited = Age
 -- immediately.
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> IO ()
-runCliTui paths rt pr sr registry chain = do
+  -> Registry -> PreprocessChain -> Backends -> IO ()
+runCliTui paths rt pr sr registry chain backends = do
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
       sessionDirPath = sessionDir paths (smId active0)
@@ -178,14 +203,14 @@ runCliTui paths rt pr sr registry chain = do
   -- @conversation.jsonl@ + @entries.jsonl@ pair. The Audited log bracket wraps
   -- the same scope so Audited opcodes (Memory/Skills/AgentDef/Config — added in
   -- M2+) write to both the session transcript and the cross-session Audited log.
-  -- The memory backend is the in-memory ('none') impl for M2; SQLite/Markdown
-  -- follow. The skill backend is the in-memory ('none') impl for M3; Markdown
-  -- follows. Both materialize from Audited-log replay at startup so the
-  -- backends match the canonical log.
-  memoryBackend <- Mem.noneBackend
-  skillBackend  <- Skill.noneBackend
-  agentDefBackend <- Def.noneBackend
-  agentRuntime  <- newAgentRuntime
+  -- The backends are the in-memory ('none') impls, shared with the @\/skill@
+  -- and @\/agent@ command specs (built in 'Seal.Tui.runTui' from the same
+  -- 'Backends' record). They materialize from Audited-log replay at startup so
+  -- the backends match the canonical log.
+  let memoryBackend    = bMemory backends
+      skillBackend     = bSkills backends
+      agentDefBackend  = bAgentDefs backends
+      agentRuntime     = bRuntime backends
   withTwoFileTranscript sessionDirPath $ \tHandle ->
     withAuditedLog (auditedLogPath paths) $ \audited -> do
       -- Materialize the memory + skill + agent-def backends from the Audited
