@@ -11,8 +11,9 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.File
-  ( FileConfig (..), ProviderConfig (..), defaultFileConfig
-  , loadFileConfig, providerBaseUrl, providerDefaultModel, saveFileConfig
+  ( FileConfig (..), ProviderConfig (..), RetrievalConfig (..), defaultFileConfig
+  , defaultRetrievalMaxScanBytes, loadFileConfig, providerBaseUrl
+  , providerDefaultModel, retrievalMaxScanBytes, saveFileConfig
   , updateFileConfig, upsertProvider )
 
 spec :: Spec
@@ -29,6 +30,7 @@ spec = describe "Seal.Config.File" $ do
         , fcDefaultProvider = Nothing
         , fcDefaultModel    = Nothing
         , fcProviders       = Map.empty
+        , fcRetrieval       = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -80,6 +82,7 @@ spec = describe "Seal.Config.File" $ do
               , fcDefaultProvider = Nothing
               , fcDefaultModel    = Nothing
               , fcProviders       = Map.empty
+              , fcRetrieval       = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
@@ -183,3 +186,40 @@ spec = describe "Seal.Config.File" $ do
         saveFileConfig path cfg
         Right back <- loadFileConfig path
         fcProviders back `shouldBe` fcProviders cfg
+
+  describe "retrieval section" $ do
+    it "parses a [retrieval] table with max_scan_bytes" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[retrieval]"
+          , "max_scan_bytes = 262144"
+          ]
+        Right cfg <- loadFileConfig path
+        fcRetrieval cfg `shouldBe` Just (RetrievalConfig { rcMaxScanBytes = Just 262144 })
+
+    it "round-trips a [retrieval] section through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig { fcRetrieval = Just (RetrievalConfig { rcMaxScanBytes = Just 65536 }) }
+        saveFileConfig path cfg
+        Right back <- loadFileConfig path
+        fcRetrieval back `shouldBe` fcRetrieval cfg
+
+    it "absent [retrieval] section decodes to Nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "vault_path = \"/tmp/vault.age\"\n"
+        Right cfg <- loadFileConfig path
+        fcRetrieval cfg `shouldBe` Nothing
+
+    it "retrievalMaxScanBytes falls back to the default when [retrieval] is absent" $ do
+      retrievalMaxScanBytes defaultFileConfig `shouldBe` defaultRetrievalMaxScanBytes
+
+    it "retrievalMaxScanBytes falls back to the default when max_scan_bytes is absent" $ do
+      let cfg = defaultFileConfig { fcRetrieval = Just (RetrievalConfig Nothing) }
+      retrievalMaxScanBytes cfg `shouldBe` defaultRetrievalMaxScanBytes
+
+    it "retrievalMaxScanBytes returns the configured value when present" $ do
+      let cfg = defaultFileConfig { fcRetrieval = Just (RetrievalConfig (Just 65536)) }
+      retrievalMaxScanBytes cfg `shouldBe` 65536

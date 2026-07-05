@@ -7,11 +7,15 @@
 module Seal.Config.File
   ( FileConfig (..)
   , ProviderConfig (..)
+  , RetrievalConfig (..)
   , defaultFileConfig
+  , defaultRetrievalConfig
+  , defaultRetrievalMaxScanBytes
   , emptyProviderConfig
   , loadFileConfig
   , providerBaseUrl
   , providerDefaultModel
+  , retrievalMaxScanBytes
   , saveFileConfig
   , updateFileConfig
   , upsertProvider
@@ -20,6 +24,7 @@ module Seal.Config.File
 import Data.HashMap.Strict qualified as HashMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
@@ -48,12 +53,24 @@ data FileConfig = FileConfig
     -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
   , fcProviders :: Map Text ProviderConfig
     -- ^ Per-provider config sections (@[providers.<label>]@).
+  , fcRetrieval :: Maybe RetrievalConfig
+    -- ^ Optional @[retrieval]@ section (Dynamic Retrieval tuning). Absent
+    -- means 'defaultRetrievalConfig' applies at resolution time.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+  } deriving stock (Eq, Show)
+
+-- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is
+-- optional; a missing key decodes as 'Nothing' and the resolved default
+-- applies at the call site.
+newtype RetrievalConfig = RetrievalConfig
+  { rcMaxScanBytes :: Maybe Int
+    -- ^ Operator-configured upper bound on bytes scanned per 'FILE_READ'
+    -- (and future retrieval opcodes). Absent → 'defaultRetrievalMaxScanBytes'.
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
@@ -70,7 +87,18 @@ defaultFileConfig = FileConfig
   , fcDefaultProvider = Nothing
   , fcDefaultModel    = Nothing
   , fcProviders       = Map.empty
+  , fcRetrieval       = Nothing
   }
+
+-- | 'RetrievalConfig' with all fields absent (operator did not set them).
+defaultRetrievalConfig :: RetrievalConfig
+defaultRetrievalConfig = RetrievalConfig { rcMaxScanBytes = Nothing }
+
+-- | The compiled-in default for the operator ceiling on bytes scanned per
+-- retrieval (≥ the prior 'FILE_READ' 65536 bound). Used when the
+-- @[retrieval]@ section is absent or its @max_scan_bytes@ key is missing.
+defaultRetrievalMaxScanBytes :: Int
+defaultRetrievalMaxScanBytes = 131072   -- 128 KiB
 
 -- ---------------------------------------------------------------------------
 -- Codec
@@ -89,12 +117,18 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
   <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
+  <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+
+-- | Bidirectional tomland codec for the @[retrieval]@ section.
+retrievalConfigCodec :: Toml.TomlCodec RetrievalConfig
+retrievalConfigCodec = RetrievalConfig
+  <$> Toml.dioptional (Toml.int "max_scan_bytes") .= rcMaxScanBytes
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization
@@ -177,6 +211,14 @@ providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (fcProviders cf
 -- | The configured base URL for provider @lbl@, if any.
 providerBaseUrl :: FileConfig -> Text -> Maybe Text
 providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (fcProviders cfg)
+
+-- | The resolved operator ceiling on bytes scanned per retrieval. Falls back
+-- to 'defaultRetrievalMaxScanBytes' (128 KiB) when the @[retrieval]@ section
+-- or its @max_scan_bytes@ key is absent. This is the hard upper bound the
+-- model's per-call @max_scan_bytes@ request is clamped down to.
+retrievalMaxScanBytes :: FileConfig -> Int
+retrievalMaxScanBytes cfg =
+  fromMaybe defaultRetrievalMaxScanBytes (fcRetrieval cfg >>= rcMaxScanBytes)
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).

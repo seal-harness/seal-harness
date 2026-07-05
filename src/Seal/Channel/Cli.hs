@@ -32,7 +32,8 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
-import Seal.Config.File (loadFileConfig, providerBaseUrl)
+import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
+                          defaultRetrievalMaxScanBytes)
 import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
 import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
@@ -133,6 +134,12 @@ runCliTui paths rt pr sr registry chain = do
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0)
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
+  -- Resolve the operator-configured retrieval ceiling (the hard upper bound
+  -- on bytes scanned per FILE_READ). Falls back to the 128 KiB default when
+  -- the [retrieval] section is absent. Loaded once at startup; a config
+  -- change takes effect on the next session.
+  eCfg <- loadFileConfig (prConfigPath pr)
+  let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   -- The transcript bracket wraps the whole loop so every turn shares one writer.
   -- The opcodes (and thus the ISA registry) close over `caps`, so they are built
   -- here where both `caps` and the transcript handle are in scope.
@@ -140,7 +147,7 @@ runCliTui paths rt pr sr registry chain = do
     let isaReg = ISA.mkRegistry
           [ showHumanOp caps
           , askHumanOp caps
-          , fileReadOp wsRoot
+          , fileReadOp wsRoot operatorCeiling
           , secretGetOp rt
           ]
         plainHandler t = do

@@ -6,9 +6,10 @@
 -- errors when multiple spec modules are compiled into the same test binary.
 module Seal.TestHelpers.Arbitrary () where
 
-import Data.Text (pack)
+import Data.Text (Text, pack)
 import Test.QuickCheck
 
+import Seal.Core.Paging (PageParams (..))
 import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), ToolCallId (..))
 
 instance Arbitrary ToolCallId where
@@ -22,3 +23,18 @@ instance Arbitrary ProviderId where
 
 instance Arbitrary ModelId where
   arbitrary = ModelId . pack <$> arbitrary
+
+-- | 'Data.Text.Text' wrapper around an arbitrary 'String'. Generates a small
+-- alphabet of printable characters; no newlines (so a generated value is a
+-- single line).
+instance Arbitrary Text where
+  arbitrary = pack <$> listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> " .,!?"++"-_"))
+
+-- | 'Seal.Core.Paging.PageParams' under the invariants
+-- (1 <= ppFloor <= ppCeiling, ppCoeff >= 0).
+instance Arbitrary PageParams where
+  arbitrary = do
+    floor'   <- chooseInt (1, 200)
+    ceiling' <- (floor' +) <$> chooseInt (0, 400)
+    coeff    <- choose (0, 100 :: Double)
+    pure (PageParams floor' ceiling' coeff)

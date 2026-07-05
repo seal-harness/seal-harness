@@ -3,9 +3,11 @@ module Main (main) where
 import Test.Hspec
 
 import qualified Seal.Core.TypesSpec
+import qualified Seal.Core.PagingSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
+import qualified Seal.Text.LineFileSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -44,9 +46,11 @@ import qualified Seal.ISA.RegistrySpec
 main :: IO ()
 main = hspec $ do
   Seal.Core.TypesSpec.spec
+  Seal.Core.PagingSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
+  Seal.Text.LineFileSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
