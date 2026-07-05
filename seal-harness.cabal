@@ -43,6 +43,7 @@ library
         Seal.Providers.Registry
         Seal.Transcript.Types
         Seal.Transcript.Conv
+        Seal.Transcript.Entries
         Seal.Handles.Transcript
         Seal.AppMain
         Seal.Channel.Caps
@@ -148,6 +149,7 @@ test-suite tests
         Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
+        Seal.Transcript.EntriesSpec
         Seal.Handles.TranscriptSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec

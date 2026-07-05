@@ -31,6 +31,7 @@ import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
+import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Handles.TranscriptSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
@@ -75,6 +76,7 @@ main = hspec $ do
   Seal.Channel.WiringSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
+  Seal.Transcript.EntriesSpec.spec
   Seal.Handles.TranscriptSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec

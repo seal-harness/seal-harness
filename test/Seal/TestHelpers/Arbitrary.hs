@@ -15,7 +15,9 @@ import Seal.Core.Paging (PageParams (..))
 import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), ToolCallId (..))
 import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Message (..)
-  , Role (..), StopReason (..), Usage (..), ToolResultPart (..) )
+  , Role (..), StopReason (..), Usage (..), ToolChoice (..)
+  , ToolDefinition (..), ToolResultPart (..) )
+import Seal.Transcript.Entries (EnvelopeDelta (..))
 
 instance Arbitrary ToolCallId where
   arbitrary = ToolCallId . pack <$> arbitrary
@@ -73,3 +75,17 @@ instance Arbitrary StopReason where
 
 instance Arbitrary CompletionResponse where
   arbitrary = CompletionResponse <$> arbitrary <*> arbitrary <*> arbitrary
+
+instance Arbitrary ToolDefinition where
+  arbitrary = ToolDefinition <$> arbitrary <*> arbitrary <*> pure Null
+
+instance Arbitrary ToolChoice where
+  arbitrary = elements [ToolAuto, ToolNone]
+
+instance Arbitrary EnvelopeDelta where
+  arbitrary = EnvelopeDelta
+    <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
