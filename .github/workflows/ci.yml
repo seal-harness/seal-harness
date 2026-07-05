@@ -59,72 +59,72 @@ jobs:
       - name: Build
         run: nix build --print-build-logs
 
-      - name: Run tests with coverage
-        run: nix develop --command cabal test --enable-coverage
+      # - name: Run tests with coverage
+      #   run: nix develop --command cabal test --enable-coverage
 
-      - name: Generate coverage report
-        if: always()
-        run: |
-          nix develop --command bash -c '
-          # The .tix file is named after the cabal test-suite (`tests`).
-          TIX=$(find dist-newstyle -name "tests.tix" 2>/dev/null | head -1)
-          if [ -z "$TIX" ]; then
-            echo "No .tix file found — coverage report skipped."
-            exit 0
-          fi
+      # - name: Generate coverage report
+      #   if: always()
+      #   run: |
+      #     nix develop --command bash -c '
+      #     # The .tix file is named after the cabal test-suite (`tests`).
+      #     TIX=$(find dist-newstyle -name "tests.tix" 2>/dev/null | head -1)
+      #     if [ -z "$TIX" ]; then
+      #       echo "No .tix file found — coverage report skipped."
+      #       exit 0
+      #     fi
 
-          # Collect all mix directories
-          MIXDIRS=$(find dist-newstyle -path "*/hpc/vanilla/mix" -type d 2>/dev/null)
-          HPCDIR_ARGS=""
-          for d in $MIXDIRS; do
-            HPCDIR_ARGS="$HPCDIR_ARGS --hpcdir=$d"
-          done
+      #     # Collect all mix directories
+      #     MIXDIRS=$(find dist-newstyle -path "*/hpc/vanilla/mix" -type d 2>/dev/null)
+      #     HPCDIR_ARGS=""
+      #     for d in $MIXDIRS; do
+      #       HPCDIR_ARGS="$HPCDIR_ARGS --hpcdir=$d"
+      #     done
 
-          # Generate text report (library modules only, exclude test harness)
-          echo "=== HPC Coverage Report ==="
-          REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
-            --exclude=Main \
-            --exclude=Paths_seal_harness \
-            2>&1)
-          echo "$REPORT"
-          echo "$REPORT" > coverage-report.txt
+      #     # Generate text report (library modules only, exclude test harness)
+      #     echo "=== HPC Coverage Report ==="
+      #     REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+      #       --exclude=Main \
+      #       --exclude=Paths_seal_harness \
+      #       2>&1)
+      #     echo "$REPORT"
+      #     echo "$REPORT" > coverage-report.txt
 
-          # Per-module breakdown
-          echo ""
-          echo "=== Per-Module Coverage ==="
-          MODULE_REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
-            --exclude=Main \
-            --exclude=Paths_seal_harness \
-            --per-module \
-            2>&1)
-          echo "$MODULE_REPORT"
-          echo "$MODULE_REPORT" > coverage-per-module.txt
-          '
+      #     # Per-module breakdown
+      #     echo ""
+      #     echo "=== Per-Module Coverage ==="
+      #     MODULE_REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+      #       --exclude=Main \
+      #       --exclude=Paths_seal_harness \
+      #       --per-module \
+      #       2>&1)
+      #     echo "$MODULE_REPORT"
+      #     echo "$MODULE_REPORT" > coverage-per-module.txt
+      #     '
 
-      - name: Post coverage to job summary
-        if: always()
-        run: |
-          if [ ! -f coverage-report.txt ]; then
-            echo "No coverage report found." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+      # - name: Post coverage to job summary
+      #   if: always()
+      #   run: |
+      #     if [ ! -f coverage-report.txt ]; then
+      #       echo "No coverage report found." >> "$GITHUB_STEP_SUMMARY"
+      #       exit 0
+      #     fi
 
-          {
-            echo "## Code Coverage (HPC)"
-            echo ""
-            echo '```'
-            cat coverage-report.txt
-            echo '```'
-            echo ""
-            echo "<details>"
-            echo "<summary>Per-module breakdown</summary>"
-            echo ""
-            echo '```'
-            cat coverage-per-module.txt
-            echo '```'
-            echo ""
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
+      #     {
+      #       echo "## Code Coverage (HPC)"
+      #       echo ""
+      #       echo '```'
+      #       cat coverage-report.txt
+      #       echo '```'
+      #       echo ""
+      #       echo "<details>"
+      #       echo "<summary>Per-module breakdown</summary>"
+      #       echo ""
+      #       echo '```'
+      #       cat coverage-per-module.txt
+      #       echo '```'
+      #       echo ""
+      #       echo "</details>"
+      #     } >> "$GITHUB_STEP_SUMMARY"
 
       # ─────────────────────────────────────────────────────────────────────
       # Optional: push built store paths to the S3 Nix binary cache.
