@@ -38,8 +38,31 @@ pingSpec = CommandSpec
     toPingAction (PingOpts loud) = CommandAction $ \caps ->
       ccSend caps (if loud then "PONG!" else "pong")
 
+-- A command WITH subcommands (via hsubparser), mirroring the real /vault,
+-- /provider, /session, /model command groups. Used to exercise subcommand-level
+-- help dispatch (@/grp add -h@ must render the @add@ subcommand's help, not the
+-- top-level group help).
+grpSpec :: CommandSpec
+grpSpec = CommandSpec
+  { csName         = CommandName "grp"
+  , csAliases      = []
+  , csGroup        = GroupGeneral
+  , csSynopsis     = "A grouped command"
+  , csParserInfo   = info (grpParser <**> helper)
+                          (progDesc "Grouped command with subcommands")
+  , csAvailability = AlwaysAvailable
+  }
+  where
+    noop      = CommandAction (\_ -> pure ())
+    grpParser = hsubparser
+      (  command "add"
+           (info (pure noop) (progDesc "Add an item to the group"))
+      <> command "list"
+           (info (pure noop) (progDesc "List items in the group"))
+      )
+
 testRegistry :: Registry
-testRegistry = mkRegistry [pingSpec]
+testRegistry = mkRegistry [pingSpec, grpSpec]
 
 -- ---------------------------------------------------------------------------
 -- A "word" safe for the tokenizer QuickCheck: non-empty, no spaces, no quotes.
@@ -140,6 +163,24 @@ spec = describe "Seal.Command.Parse" $ do
       case parseSlash testRegistry "/ping -h" of
         ParseHelp (Just (CommandName "ping")) -> pure ()
         _ -> expectationFailure "expected ParseHelp (Just ping) for -h flag"
+
+    it "/grp -h (sole flag) -> ParseHelp (Just grp): top-level group help" $
+      case parseSlash testRegistry "/grp -h" of
+        ParseHelp (Just (CommandName "grp")) -> pure ()
+        _ -> expectationFailure "expected ParseHelp (Just grp) for a sole -h flag"
+
+    it "/grp add -h -> renders the ADD subcommand's help, not the group help" $
+      case parseSlash testRegistry "/grp add -h" of
+        ParseFailure msg -> do
+          T.isInfixOf "Add an item to the group" msg `shouldBe` True
+          T.isInfixOf "Grouped command with subcommands" msg `shouldBe` False
+        _ -> expectationFailure "expected subcommand help (ParseFailure text) for /grp add -h"
+
+    it "/grp add --help -> renders the ADD subcommand's help (long flag)" $
+      case parseSlash testRegistry "/grp add --help" of
+        ParseFailure msg ->
+          T.isInfixOf "Add an item to the group" msg `shouldBe` True
+        _ -> expectationFailure "expected subcommand help for /grp add --help"
 
     it "/unknown -> ParseFailure with the unknown command name" $
       case parseSlash testRegistry "/nosuchcmd" of

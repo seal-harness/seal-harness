@@ -34,15 +34,28 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.Types
+        Seal.Providers.Anthropic
+        Seal.Providers.Anthropic.OAuth
+        Seal.Providers.Class
+        Seal.Providers.Ollama
+        Seal.Providers.Registry
+        Seal.Transcript.Types
+        Seal.Handles.Transcript
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
         Seal.Command.Help
+        Seal.Command.Model
         Seal.Command.Parse
+        Seal.Command.Provider
+        Seal.Command.Session
         Seal.Command.Spec
         Seal.Config.File
         Seal.Config.Paths
         Seal.Ingest
+        Seal.Session.Meta
+        Seal.Session.Store
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -57,6 +70,14 @@ library
         Seal.Types.Env
         Seal.Vault.Backend
         Seal.Vault.Commands
+        Seal.Agent.Env
+        Seal.Agent.Loop
+        Seal.ISA.Dispatch
+        Seal.ISA.Opcode
+        Seal.ISA.Ops.Human
+        Seal.ISA.Ops.File
+        Seal.ISA.Ops.Secret
+        Seal.ISA.Registry
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -77,9 +98,14 @@ library
       , stm
       , text
       , time
+      , http-client
+      , http-client-tls
+      , http-types
       , tomland
       , typed-process
       , unix
+      , unordered-containers
+      , validation-selective
     hs-source-dirs: src
 
 executable seal
@@ -106,17 +132,26 @@ test-suite tests
       , directory
       , filepath
       , hspec
+      , http-client
       , optparse-applicative
       , temporary
       , text
+      , time
       , typed-process
       , unix
     hs-source-dirs: test
     other-modules:
+        Seal.Core.TypesSpec
+        Seal.Transcript.TypesSpec
+        Seal.Handles.TranscriptSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
+        Seal.Channel.WiringSpec
         Seal.Command.HelpSpec
+        Seal.Command.ModelSpec
         Seal.Command.ParseSpec
+        Seal.Command.ProviderSpec
+        Seal.Command.SessionSpec
         Seal.Command.SpecSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec
@@ -127,8 +162,23 @@ test-suite tests
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
+        Seal.Session.MetaSpec
+        Seal.Session.StoreSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
+        Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
+        Seal.TestHelpers.FakeVault
+        Seal.Providers.AnthropicSpec
+        Seal.Providers.Anthropic.OAuthSpec
+        Seal.Providers.ClassSpec
+        Seal.Providers.OllamaSpec
+        Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
         Seal.Vault.CommandsSpec
+        Seal.Agent.LoopSpec
+        Seal.ISA.DispatchSpec
+        Seal.ISA.Ops.HumanSpec
+        Seal.ISA.Ops.FileSpec
+        Seal.ISA.Ops.SecretSpec
+        Seal.ISA.RegistrySpec

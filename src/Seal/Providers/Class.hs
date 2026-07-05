@@ -1,0 +1,97 @@
+{-# LANGUAGE ExistentialQuantification #-}
+{-# OPTIONS_GHC -Wno-partial-fields #-}
+-- | The provider-agnostic message/content/request/response model and the
+-- 'Provider' capability class. Concrete providers (Anthropic, …) implement it;
+-- 'SomeProvider' lets config pick one at runtime.
+module Seal.Providers.Class
+  ( Role (..)
+  , ToolResultPart (..)
+  , ContentBlock (..)
+  , Message (..)
+  , textMsg
+  , ToolDefinition (..)
+  , ToolChoice (..)
+  , CompletionRequest (..)
+  , Usage (..)
+  , StopReason (..)
+  , CompletionResponse (..)
+  , Provider (..)
+  , SomeProvider (..)
+  ) where
+
+import Data.Aeson
+import Data.Text (Text)
+import GHC.Generics (Generic)
+
+import Seal.Core.Types (ModelId, OpName, ToolCallId)
+
+data Role = User | Assistant deriving stock (Eq, Show, Generic)
+instance ToJSON Role
+instance FromJSON Role
+
+newtype ToolResultPart = TrpText Text deriving stock (Eq, Show, Generic)
+instance ToJSON ToolResultPart
+instance FromJSON ToolResultPart
+
+-- | A single block of content in a message.
+--
+-- __Partial field selectors warning:__ The record fields 'cbId', 'cbName',
+-- 'cbInput', 'cbForId', 'cbParts', and 'cbIsError' are only defined on their
+-- respective constructors ('CbToolUse' and 'CbToolResult'). They are partial
+-- across the full type and will throw a runtime error if applied to the wrong
+-- constructor. Always access them inside a constructor-specific pattern match;
+-- never use them as bare accessor functions.
+data ContentBlock
+  = CbText Text
+  | CbToolUse    { cbId :: ToolCallId, cbName :: OpName, cbInput :: Value }
+  | CbToolResult { cbForId :: ToolCallId, cbParts :: [ToolResultPart], cbIsError :: Bool }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON ContentBlock
+instance FromJSON ContentBlock
+
+data Message = Message { msgRole :: Role, msgContent :: [ContentBlock] }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON Message
+instance FromJSON Message
+
+textMsg :: Role -> Text -> Message
+textMsg r t = Message r [CbText t]
+
+data ToolDefinition = ToolDefinition
+  { tdName :: OpName, tdDescription :: Text, tdInputSchema :: Value }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON ToolDefinition
+instance FromJSON ToolDefinition
+
+data ToolChoice = ToolAuto | ToolNone deriving stock (Eq, Show, Generic)
+instance ToJSON ToolChoice
+instance FromJSON ToolChoice
+
+data CompletionRequest = CompletionRequest
+  { crModel :: ModelId, crSystem :: Maybe Text, crMessages :: [Message]
+  , crTools :: [ToolDefinition], crToolChoice :: ToolChoice, crMaxTokens :: Int }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON CompletionRequest
+instance FromJSON CompletionRequest
+
+data Usage = Usage { uInput :: Int, uOutput :: Int }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON Usage
+instance FromJSON Usage
+
+data StopReason = StopEnd | StopToolUse | StopMaxTokens | StopOther Text
+  deriving stock (Eq, Show, Generic)
+instance ToJSON StopReason
+instance FromJSON StopReason
+
+data CompletionResponse = CompletionResponse
+  { rsContent :: [ContentBlock], rsStop :: StopReason, rsUsage :: Usage }
+  deriving stock (Eq, Show, Generic)
+instance ToJSON CompletionResponse
+instance FromJSON CompletionResponse
+
+class Provider p where
+  complete   :: p -> CompletionRequest -> IO (Either Text CompletionResponse)
+  listModels :: p -> IO (Either Text [ModelId])
+
+data SomeProvider = forall p. Provider p => SomeProvider p
