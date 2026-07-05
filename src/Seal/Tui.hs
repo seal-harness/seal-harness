@@ -17,12 +17,13 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
-  ( SealPaths
+  ( SealPaths (..)
   , configFilePath
   , ensureSealDirs
   , getSealPaths
   , vaultFilePath
   )
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
@@ -87,10 +88,17 @@ runTui = do
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
-  -- The evolutionary-store backends are created once and shared between the
-  -- @\/skill@ \/ @\/agent@ command specs (read-only) and the ISA opcodes
-  -- (mutate). They materialize from the Audited log inside runCliTui.
-  backends <- newBackends
+  -- The config directory is a git repo (versioning + audit for the
+  -- evolutionary stores: skills, agent-defs, memory live as Markdown files
+  -- under config/skills, config/agents, config/memory). ensureConfigRepo
+  -- runs `git init` + an initial empty commit if needed; idempotent.
+  let cfgRoot = spConfig paths
+  ensureConfigRepo cfgRoot
+  let repo = openConfigRepo cfgRoot
+  -- The evolutionary-store backends are disk-backed (Markdown + git), created
+  -- once and shared between the @\/skill@ \/ @\/agent@ command specs
+  -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
+  backends <- newBackends cfgRoot repo
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr

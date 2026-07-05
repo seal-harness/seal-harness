@@ -59,7 +59,7 @@ bodyField v = fromMaybe "" (parseMaybe (withObject "in" (.: "body")) v)
 skillCreateOp :: SkillBackend -> SessionId -> Opcode
 skillCreateOp backend session = Opcode
   { opName = OpName "SKILL_CREATE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Define an agent skill by id (insert or replace)."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -115,7 +115,7 @@ skillCreateOp backend session = Opcode
 skillReadOp :: SkillBackend -> Opcode
 skillReadOp backend = Opcode
   { opName = OpName "SKILL_READ"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Read one agent skill by id into the prompt."
   , opInSchema = singleStringSchema "id" "The skill id to read."
   , opOutSchema = object []
@@ -151,7 +151,7 @@ skillReadOp backend = Opcode
 skillUpdateOp :: SkillBackend -> Opcode
 skillUpdateOp backend = Opcode
   { opName = OpName "SKILL_UPDATE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Update an existing skill's description and/or body."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -214,7 +214,7 @@ skillUpdateOp backend = Opcode
 skillListOp :: SkillBackend -> Opcode
 skillListOp backend = Opcode
   { opName = OpName "SKILL_LIST"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "List all defined agent skills (id + description)."
   , opInSchema = object
       [ "type" .= ("object" :: Text)

@@ -1,16 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Memory.BackendSpec (spec) where
 
-import Data.Aeson (object, (.=))
 import Data.Text (Text)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Audited.Replay (AuditedEvent (..))
-import Seal.Audited.Types (AuditedKind (..))
-import Seal.Core.Types (OpName (..), SessionId (..))
+import Seal.Core.Types (SessionId (..))
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Memory.Backend
-import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
+import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId, memoryIdText)
 import Seal.TestHelpers.Arbitrary ()
 
 sampleTime :: UTCTime
@@ -25,50 +26,28 @@ mkEntry :: Text -> MemoryEntry
 mkEntry content = MemoryEntry
   { meId = sampleMemoryId
   , meContent = content
-  , meTags = []
+  , meTags = ["greeting", "demo"]
   , meCreatedAt = sampleTime
   , meUpdatedAt = sampleTime
   , meSession = SessionId "s1"
   }
 
--- | An AuditedEvent for a MEMORY_STORE. The payload is the opcode INPUT shape
--- (id/content/tags); the event's timestamp and session supply the rest.
-storeEvent :: MemoryEntry -> AuditedEvent
-storeEvent e = AuditedEvent
-  { aeEvOpcode = OpName "MEMORY_STORE"
-  , aeEvKind = AKMemory
-  , aeEvPayload = object
-      [ "id" .= meId e
-      , "content" .= meContent e
-      , "tags" .= meTags e
-      ]
-  , aeEvSession = meSession e
-  , aeEvTs = meCreatedAt e
-  }
-
--- | An AuditedEvent for a MEMORY_DELETE of the given id.
-deleteEvent :: MemoryId -> AuditedEvent
-deleteEvent mid = AuditedEvent
-  { aeEvOpcode = OpName "MEMORY_DELETE"
-  , aeEvKind = AKMemory
-  , aeEvPayload = object ["id" .= mid]
-  , aeEvSession = SessionId "s1"
-  , aeEvTs = sampleTime
-  }
-
--- | An AuditedEvent for a non-memory kind (should be ignored by the materializer).
-nonMemoryEvent :: AuditedEvent
-nonMemoryEvent = AuditedEvent
-  { aeEvOpcode = OpName "SKILL_CREATE"
-  , aeEvKind = AKSkill
-  , aeEvPayload = object []
-  , aeEvSession = SessionId "s1"
-  , aeEvTs = sampleTime
-  }
-
 spec :: Spec
 spec = describe "Seal.Memory.Backend" $ do
-  describe "noneBackend direct ops" $ do
+  describe "encodeMemory / decodeMemory" $ do
+    it "round-trips an entry with tags" $ do
+      let e = mkEntry "hello world"
+      decodeMemory (encodeMemory e) `shouldBe` Just e
+
+    it "round-trips an entry with empty tags" $ do
+      let e = (mkEntry "x") { meTags = [] }
+      decodeMemory (encodeMemory e) `shouldBe` Just e
+
+    it "round-trips an entry with no system (empty body)" $ do
+      let e = (mkEntry "") { meTags = [] }
+      decodeMemory (encodeMemory e) `shouldBe` Just e
+
+  describe "noneBackend" $ do
     it "store then recall round-trips" $ do
       backend <- noneBackend
       mbStore backend (mkEntry "hello")
@@ -80,43 +59,52 @@ spec = describe "Seal.Memory.Backend" $ do
       mbDelete backend sampleMemoryId
       mbRecall backend sampleMemoryId `shouldReturn` Nothing
 
-    it "delete is idempotent (deleting a missing id does not throw)" $ do
-      backend <- noneBackend
-      mbDelete backend sampleMemoryId
-      mbRecall backend sampleMemoryId `shouldReturn` Nothing
-
     it "list returns all entries" $ do
       backend <- noneBackend
       mbStore backend (mkEntry "a")
       mbList backend `shouldReturn` [mkEntry "a"]
 
-  describe "materializeMemory" $ do
-    it "replaying a STORE event populates the backend" $ do
-      backend <- noneBackend
-      let events = [storeEvent (mkEntry "from-replay")]
-      materializeMemory events backend
-      mbRecall backend sampleMemoryId `shouldReturn` Just (mkEntry "from-replay")
+  describe "markdownMemoryBackend" $ do
+    it "store writes a file and recall reads it back" $
+      withSystemTempDirectory "seal-mem" $ \root -> do
+        let cfgRoot = root </> "config"
+            memDir  = cfgRoot </> "memory"
+        ensureConfigRepo cfgRoot
+        backend <- markdownMemoryBackend memDir (openConfigRepo cfgRoot)
+        mbStore backend (mkEntry "from-disk")
+        doesFileExist (memDir </> "m1.md") `shouldReturn` True
+        m <- mbRecall backend sampleMemoryId
+        case m of
+          Just e  -> meContent e `shouldBe` "from-disk"
+          Nothing -> expectationFailure "memory not read back"
 
-    it "replaying STORE then DELETE leaves the backend empty" $ do
-      backend <- noneBackend
-      let events = [storeEvent (mkEntry "x"), deleteEvent sampleMemoryId]
-      materializeMemory events backend
-      mbRecall backend sampleMemoryId `shouldReturn` Nothing
+    it "store auto-commits to the git repo" $
+      withSystemTempDirectory "seal-mem" $ \root -> do
+        let cfgRoot = root </> "config"
+            memDir  = cfgRoot </> "memory"
+        ensureConfigRepo cfgRoot
+        backend <- markdownMemoryBackend memDir (openConfigRepo cfgRoot)
+        mbStore backend (mkEntry "committed")
+        gitHasCommits (openConfigRepo cfgRoot) `shouldReturn` True
 
-    it "ignores non-memory events" $ do
-      backend <- noneBackend
-      let events = [nonMemoryEvent, storeEvent (mkEntry "kept")]
-      materializeMemory events backend
-      mbList backend `shouldReturn` [mkEntry "kept"]
+    it "list enumerates the directory sorted by id" $
+      withSystemTempDirectory "seal-mem" $ \root -> do
+        let cfgRoot = root </> "config"
+            memDir  = cfgRoot </> "memory"
+        ensureConfigRepo cfgRoot
+        backend <- markdownMemoryBackend memDir (openConfigRepo cfgRoot)
+        mbStore backend ((mkEntry "a") { meId = case mkMemoryId "zeta" of Right i -> i; Left _ -> sampleMemoryId })
+        mbStore backend ((mkEntry "b") { meId = case mkMemoryId "alpha" of Right i -> i; Left _ -> sampleMemoryId })
+        entries <- mbList backend
+        map (memoryIdText . meId) entries `shouldBe` ["alpha", "zeta"]
 
-    it "replaying the same log twice is idempotent" $ do
-      backend <- noneBackend
-      let events = [storeEvent (mkEntry "x")]
-      materializeMemory events backend
-      materializeMemory events backend
-      mbList backend `shouldReturn` [mkEntry "x"]
-
-    it "replaying an empty log leaves the backend empty" $ do
-      backend <- noneBackend
-      materializeMemory [] backend
-      mbList backend `shouldReturn` []
+    it "delete removes the file" $
+      withSystemTempDirectory "seal-mem" $ \root -> do
+        let cfgRoot = root </> "config"
+            memDir  = cfgRoot </> "memory"
+        ensureConfigRepo cfgRoot
+        backend <- markdownMemoryBackend memDir (openConfigRepo cfgRoot)
+        mbStore backend (mkEntry "x")
+        mbDelete backend sampleMemoryId
+        doesFileExist (memDir </> "m1.md") `shouldReturn` False
+        mbRecall backend sampleMemoryId `shouldReturn` Nothing

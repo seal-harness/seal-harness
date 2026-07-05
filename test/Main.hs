@@ -36,10 +36,6 @@ import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.TranscriptSpec
-import qualified Seal.Audited.TypesSpec
-import qualified Seal.Audited.ChainSpec
-import qualified Seal.Audited.ReplaySpec
-import qualified Seal.Handles.AuditedSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
@@ -99,10 +95,6 @@ main = hspec $ do
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.TranscriptSpec.spec
-  Seal.Audited.TypesSpec.spec
-  Seal.Audited.ChainSpec.spec
-  Seal.Audited.ReplaySpec.spec
-  Seal.Handles.AuditedSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec

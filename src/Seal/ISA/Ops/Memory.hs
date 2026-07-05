@@ -88,7 +88,7 @@ offsetField v =
 memoryStoreOp :: MemoryBackend -> SessionId -> Opcode
 memoryStoreOp backend session = Opcode
   { opName = OpName "MEMORY_STORE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Store an agent memory by id (insert or replace)."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -143,7 +143,7 @@ memoryStoreOp backend session = Opcode
 memoryRecallOp :: PageParams -> MemoryBackend -> Opcode
 memoryRecallOp params backend = Opcode
   { opName = OpName "MEMORY_RECALL"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Recall agent memories, optionally filtered by a substring query."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -199,7 +199,7 @@ memoryRecallOp params backend = Opcode
 memoryUpdateOp :: MemoryBackend -> Opcode
 memoryUpdateOp backend = Opcode
   { opName = OpName "MEMORY_UPDATE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Update an existing memory's content and/or tags."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -260,7 +260,7 @@ memoryUpdateOp backend = Opcode
 memoryDeleteOp :: MemoryBackend -> Opcode
 memoryDeleteOp backend = Opcode
   { opName = OpName "MEMORY_DELETE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Delete an agent memory by id (idempotent)."
   , opInSchema = singleStringSchema "id" "The memory id to delete."
   , opOutSchema = object []

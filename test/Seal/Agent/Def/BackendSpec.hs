@@ -1,17 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.Def.BackendSpec (spec) where
 
-import Data.Aeson (object, (.=))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
-import Seal.Audited.Replay (AuditedEvent (..))
-import Seal.Audited.Types (AuditedKind (..))
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.Arbitrary ()
 
@@ -29,107 +30,74 @@ mkDef name = AgentDef
   , adName = name
   , adProvider = "ollama"
   , adModel = ModelId "llama3"
-  , adSystem = Nothing
+  , adSystem = Just "be nice"
   , adTools = AllowAll
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = SessionId "s1"
   }
 
--- | An AuditedEvent for an AGENT_DEF_CREATE. The payload is the opcode INPUT
--- shape (id/name/provider/model/system/tools); the event's timestamp and
--- session supply the rest.
-createEvent :: AgentDef -> AuditedEvent
-createEvent d = AuditedEvent
-  { aeEvOpcode = OpName "AGENT_DEF_CREATE"
-  , aeEvKind = AKAgentDef
-  , aeEvPayload = object
-      [ "id" .= adId d
-      , "name" .= adName d
-      , "provider" .= adProvider d
-      , "model" .= adModel d
-      , "tools" .= ("all" :: Text)
-      ]
-  , aeEvSession = adSession d
-  , aeEvTs = adCreatedAt d
-  }
-
--- | An AuditedEvent for a non-agent-def kind (should be ignored by the
--- materializer).
-nonAgentDefEvent :: AuditedEvent
-nonAgentDefEvent = AuditedEvent
-  { aeEvOpcode = OpName "MEMORY_STORE"
-  , aeEvKind = AKMemory
-  , aeEvPayload = object []
-  , aeEvSession = SessionId "s1"
-  , aeEvTs = sampleTime
-  }
-
 spec :: Spec
 spec = describe "Seal.Agent.Def.Backend" $ do
-  describe "noneBackend direct ops" $ do
+  describe "encodeAgentDef / decodeAgentDef" $ do
+    it "round-trips a def with AllowAll tools" $ do
+      let d = mkDef "greeter"
+      decodeAgentDef (encodeAgentDef d) `shouldBe` Just d
+
+    it "round-trips a def with AllowOnly tools" $ do
+      let tools = AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])
+          d = (mkDef "toolsy") { adTools = tools }
+      decodeAgentDef (encodeAgentDef d) `shouldBe` Just d
+
+    it "round-trips a def with no system prompt" $ do
+      let d = (mkDef "nosys") { adSystem = Nothing }
+      decodeAgentDef (encodeAgentDef d) `shouldBe` Just d
+
+  describe "noneBackend" $ do
     it "update then read round-trips" $ do
       backend <- noneBackend
       adbUpdate backend (mkDef "greeter")
       adbRead backend sampleDefId `shouldReturn` Just (mkDef "greeter")
-
-    it "update replaces an existing def" $ do
-      backend <- noneBackend
-      adbUpdate backend (mkDef "old")
-      adbUpdate backend (mkDef "new")
-      m <- adbRead backend sampleDefId
-      case m of
-        Just d  -> adName d `shouldBe` "new"
-        Nothing -> expectationFailure "def not found"
 
     it "list returns all defs" $ do
       backend <- noneBackend
       adbUpdate backend (mkDef "a")
       adbList backend `shouldReturn` [mkDef "a"]
 
-    it "read of a missing id returns Nothing" $ do
-      backend <- noneBackend
-      adbRead backend sampleDefId `shouldReturn` Nothing
+  describe "markdownAgentDefBackend" $ do
+    it "update writes a file and read reads it back" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        adbUpdate backend (mkDef "greeter")
+        doesFileExist (agentsDir </> "a1.md") `shouldReturn` True
+        m <- adbRead backend sampleDefId
+        case m of
+          Just d  -> adName d `shouldBe` "greeter"
+          Nothing -> expectationFailure "def not read back"
 
-  describe "materializeAgentDefs" $ do
-    it "replaying a CREATE event populates the backend" $ do
-      backend <- noneBackend
-      let events = [createEvent (mkDef "from-replay")]
-      materializeAgentDefs events backend
-      m <- adbRead backend sampleDefId
-      case m of
-        Just d  -> adName d `shouldBe` "from-replay"
-        Nothing -> expectationFailure "def not materialized"
+    it "update auto-commits to the git repo" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        adbUpdate backend (mkDef "greeter")
+        gitHasCommits (openConfigRepo cfgRoot) `shouldReturn` True
 
-    it "ignores non-agent-def events" $ do
-      backend <- noneBackend
-      let events = [nonAgentDefEvent, createEvent (mkDef "kept")]
-      materializeAgentDefs events backend
-      adbList backend `shouldReturn` [mkDef "kept"]
-
-    it "replaying the same log twice is idempotent" $ do
-      backend <- noneBackend
-      let events = [createEvent (mkDef "x")]
-      materializeAgentDefs events backend
-      materializeAgentDefs events backend
-      adbList backend `shouldReturn` [mkDef "x"]
-
-    it "replaying an empty log leaves the backend empty" $ do
-      backend <- noneBackend
-      materializeAgentDefs [] backend
-      adbList backend `shouldReturn` []
-
-    it "replays AllowOnly tools from an array payload" $ do
-      backend <- noneBackend
-      let ev = (createEvent (mkDef "toolsy")) { aeEvPayload = object
-                [ "id" .= sampleDefId
-                , "name" .= ("toolsy" :: Text)
-                , "provider" .= ("ollama" :: Text)
-                , "model" .= ("llama3" :: Text)
-                , "tools" .= (["FILE_READ" :: Text, "ASK_HUMAN"] :: [Text])
-                ] }
-      materializeAgentDefs [ev] backend
-      m <- adbRead backend sampleDefId
-      case m of
-        Just d  -> adTools d `shouldBe` AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])
-        Nothing -> expectationFailure "def not materialized"
+    it "list enumerates the directory sorted by id" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        case mkAgentDefId "zeta" of
+          Right zid -> adbUpdate backend ((mkDef "z") { adId = zid })
+          Left _    -> expectationFailure "invalid id"
+        case mkAgentDefId "alpha" of
+          Right aid -> adbUpdate backend ((mkDef "a") { adId = aid })
+          Left _    -> expectationFailure "invalid id"
+        defs <- adbList backend
+        map (agentDefIdText . adId) defs `shouldBe` ["alpha", "zeta"]

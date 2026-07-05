@@ -46,10 +46,6 @@ library
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Transcript
-        Seal.Audited.Types
-        Seal.Audited.Chain
-        Seal.Audited.Replay
-        Seal.Handles.Audited
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -63,6 +59,8 @@ library
         Seal.Command.Spec
         Seal.Config.File
         Seal.Config.Paths
+        Seal.Git.Repo
+        Seal.Store.Markdown
         Seal.Ingest
         Seal.Session.Meta
         Seal.Session.Store
@@ -170,10 +168,6 @@ test-suite tests
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.TranscriptSpec
-        Seal.Audited.TypesSpec
-        Seal.Audited.ChainSpec
-        Seal.Audited.ReplaySpec
-        Seal.Handles.AuditedSpec
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
         Seal.Skills.TypesSpec

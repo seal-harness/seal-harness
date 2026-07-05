@@ -1,64 +1,59 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The memory store backend. A capability record ('MemoryBackend') with one
--- in-memory implementation ('noneBackend') for M2; SQLite and Markdown
--- backends follow the same shape. All backends materialize by Audited-log
--- replay at startup ('materializeMemory').
+-- | The memory store backend. Disk is canonical: memory entries live as
+-- Markdown files under @config\/memory\/\<id\>.md@ (frontmatter + body, where
+-- the body is the memory content and tags/created/updated/session live in
+-- frontmatter). 'markdownMemoryBackend' reads by enumerating the directory
+-- and writes by atomic file replace + auto-commit; delete removes the file and
+-- commits. 'noneBackend' (in-memory) is kept for tests.
 --
--- The Audited log is canonical; the backend is a materialized view. Opcode
--- writes go through the backend (which mutates the in-memory/SQLite/Markdown
--- store) AND through the dispatcher's Audited-log write (which is canonical).
--- On a cold start, 'materializeMemory' folds the Audited log into the backend
--- so the two stay in sync.
+-- The git repo is the versioning + audit layer; model-authored writes
+-- (@MEMORY_STORE@ \/ @MEMORY_UPDATE@ \/ @MEMORY_DELETE@, which are Trusted
+-- file writes) auto-commit.
 module Seal.Memory.Backend
   ( MemoryBackend (..)
   , noneBackend
-  , materializeMemory
-  , MemEvent (..)
+  , markdownMemoryBackend
+  , encodeMemory
+  , decodeMemory
   ) where
 
-import Control.Monad (forM_)
-import Data.Aeson.Key (fromString)
-import Data.Aeson.KeyMap qualified as KeyMap
-import Data.Aeson.Types (Value (..))
-import Data.Foldable (toList)
+import Control.Monad (forM)
+import Data.Aeson (Value (..), encode)
+import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Text.IO qualified as TIO
+import Data.Time (UTCTime (..))
+import Data.Time.Calendar (fromGregorian)
+import Data.Time.Clock (secondsToDiffTime)
+import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Data.Vector qualified as V
+import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
+import System.FilePath ((</>), (<.>))
+import System.Posix.Files (setFileMode)
 
-import Seal.Audited.Replay (AuditedEvent (..))
-import Seal.Audited.Types (AuditedKind (..))
-import Seal.Core.Types (OpName (..))
-import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
+import Seal.Core.Types (SessionId (..))
+import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId, memoryIdText)
+import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList)
 
--- | The memory store capability. Each operation is IO (the backends may be
--- SQLite/Markdown on disk); 'mbList' supports the dynamic-retrieval pager.
+-- | The memory store capability. Each operation is IO (the Markdown backend
+-- writes to disk + git); 'mbList' returns all memories sorted by id.
 data MemoryBackend = MemoryBackend
   { mbStore  :: MemoryEntry -> IO ()
-  -- ^ Insert or replace a memory by id.
   , mbRecall :: MemoryId -> IO (Maybe MemoryEntry)
-  -- ^ Fetch one memory by id.
   , mbList   :: IO [MemoryEntry]
-  -- ^ All memories, in insertion order.
   , mbUpdate :: MemoryEntry -> IO ()
-  -- ^ Update an existing memory (same as 'mbStore' for the in-memory backend;
-  -- a SQLite backend may use an UPDATE vs INSERT distinction).
   , mbDelete :: MemoryId -> IO ()
-  -- ^ Remove a memory by id.
   }
 
--- | A store-agnostic mutation event derived from an 'AuditedEvent' whose
--- 'aeEvKind' is 'AKMemory'. The materializer dispatches on the opcode name to
--- produce one of these; the backend applies it.
-data MemEvent
-  = MemStore MemoryEntry
-  | MemDelete MemoryId
-
--- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests and by
--- the @none@ config option (opt-out of persistent memory). The map is keyed by
--- 'MemoryId'; 'mbList' returns entries in Map key order (deterministic for
--- tests).
+-- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
 noneBackend :: IO MemoryBackend
 noneBackend = do
   ref <- newIORef (Map.empty :: Map MemoryId MemoryEntry)
@@ -70,76 +65,115 @@ noneBackend = do
     , mbDelete = modifyIORef' ref . Map.delete
     }
 
--- | Fold the Audited log into a memory backend, populating it from scratch.
--- Each 'AKMemory' event is routed to 'mbStore' or 'mbDelete' based on its
--- opcode. Events for other kinds are ignored. Idempotent: replaying the same
--- log twice yields the same backend state (Store is upsert, Delete is
--- idempotent).
-materializeMemory :: [AuditedEvent] -> MemoryBackend -> IO ()
-materializeMemory events backend =
-  forM_ events $ \ev ->
-    case (aeEvKind ev, toMemEvent ev) of
-      (AKMemory, Just me) -> applyMemEvent backend me
-      _                   -> pure ()
+-- | The Markdown backend. One file per memory under @dir@ (the
+-- @config/memory@ directory); writes are atomic (tmp → chmod 0600 → rename)
+-- and auto-committed to the config git repo; delete removes the file and
+-- commits. Reads enumerate the directory. Malformed files are skipped.
+markdownMemoryBackend :: FilePath -> ConfigRepo -> IO MemoryBackend
+markdownMemoryBackend dir repo = pure MemoryBackend
+  { mbStore  = writeMemory dir repo
+  , mbRecall = readMemory dir
+  , mbList   = listMemories dir
+  , mbUpdate = writeMemory dir repo
+  , mbDelete = deleteMemory dir repo
+  }
 
--- | Decode an 'AuditedEvent' into a 'MemEvent' based on its opcode name. The
--- payload is the opcode INPUT (id/content/tags for store, id for delete); the
--- 'aeEvTs' and 'aeEvSession' fields of the event supply the timestamps and
--- provenance the input lacks, so the reconstructed 'MemoryEntry' is complete.
-toMemEvent :: AuditedEvent -> Maybe MemEvent
-toMemEvent ev =
-  case T.unpack (unOpName (aeEvOpcode ev)) of
-    "MEMORY_STORE"  -> MemStore <$> decodeStorePayload ev
-    "MEMORY_UPDATE" -> MemStore <$> decodeStorePayload ev
-    "MEMORY_DELETE" -> MemDelete <$> decodeDeletePayload ev
-    _               -> Nothing
+-- | The filename for a memory: @\<id\>.md@.
+memoryFile :: FilePath -> MemoryId -> FilePath
+memoryFile dir mid = dir </> T.unpack (memoryIdText mid) <.> "md"
+
+-- | Encode a 'MemoryEntry' as a Markdown document (frontmatter + body, where
+-- the body is the memory content).
+encodeMemory :: MemoryEntry -> Text
+encodeMemory e = encodeDoc fm (meContent e)
   where
-    unOpName (OpName t) = t
+    fm = Map.fromList
+      [ ("id", memoryIdText (meId e))
+      , ("tags", renderTags (meTags e))
+      , ("created_at", isoTime (meCreatedAt e))
+      , ("updated_at", isoTime (meUpdatedAt e))
+      , ("session", sessionIdText (meSession e))
+      ]
+    sessionIdText (SessionId t) = t
 
--- | Decode a store/update payload (the opcode input) into a 'MemoryEntry',
--- filling in 'meCreatedAt'/'meUpdatedAt' from the event's timestamp and
--- 'meSession' from the event's session id. The input carries id/content/tags.
-decodeStorePayload :: AuditedEvent -> Maybe MemoryEntry
-decodeStorePayload ev = do
-  mid   <- idFromPayload (aeEvPayload ev)
-  content <- contentFromPayload (aeEvPayload ev)
-  let tags = tagsFromPayload (aeEvPayload ev)
-  pure MemoryEntry
-    { meId = mid
-    , meContent = content
-    , meTags = tags
-    , meCreatedAt = aeEvTs ev
-    , meUpdatedAt = aeEvTs ev
-    , meSession = aeEvSession ev
-    }
+-- | Decode a Markdown document into a 'MemoryEntry'. Returns 'Nothing' if the
+-- id field is missing or fails 'mkMemoryId'.
+decodeMemory :: Text -> Maybe MemoryEntry
+decodeMemory content =
+  case decodeDoc content of
+    (fm, body) -> do
+      midT <- fmLookup "id" fm
+      mid  <- either (const Nothing) Just (mkMemoryId midT)
+      Just MemoryEntry
+        { meId = mid
+        , meContent = body
+        , meTags = fromMaybe [] (fmLookupList "tags" fm)
+        , meCreatedAt = parseTime (fmLookup "created_at" fm)
+        , meUpdatedAt = parseTime (fmLookup "updated_at" fm)
+        , meSession = SessionId (fromMaybe "unknown" (fmLookup "session" fm))
+        }
 
--- | Decode a delete payload's id field.
-decodeDeletePayload :: AuditedEvent -> Maybe MemoryId
-decodeDeletePayload ev = idFromPayload (aeEvPayload ev)
+-- | Write one memory to disk (atomic) and auto-commit.
+writeMemory :: FilePath -> ConfigRepo -> MemoryEntry -> IO ()
+writeMemory dir repo e = do
+  let path = memoryFile dir (meId e)
+      tmp  = path <.> "tmp"
+  TIO.writeFile tmp (encodeMemory e)
+  setFileMode tmp 0o600
+  renameFile tmp path
+  let rel = "memory" </> (T.unpack (memoryIdText (meId e)) <.> "md")
+  _ <- gitCommitAll repo rel ("seal: MEMORY write " <> memoryIdText (meId e))
+  pure ()
 
--- | Extract the @id@ field from a payload object.
-idFromPayload :: Value -> Maybe MemoryId
-idFromPayload (Object o) = case KeyMap.lookup (fromString "id") o of
-  Just (String t) -> either (const Nothing) Just (mkMemoryId t)
-  _               -> Nothing
-idFromPayload _ = Nothing
+-- | Read one memory by id. Returns 'Nothing' if the file is absent or malformed.
+readMemory :: FilePath -> MemoryId -> IO (Maybe MemoryEntry)
+readMemory dir mid = do
+  let path = memoryFile dir mid
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      content <- TIO.readFile path
+      pure (decodeMemory content)
 
--- | Extract the @content@ field (defaults to empty when absent).
-contentFromPayload :: Value -> Maybe Text
-contentFromPayload (Object o) = case KeyMap.lookup (fromString "content") o of
-  Just (String t) -> Just t
-  _               -> Just ""
-contentFromPayload _ = Just ""
+-- | Enumerate all memories in the directory, sorted by id. Malformed files
+-- are skipped.
+listMemories :: FilePath -> IO [MemoryEntry]
+listMemories dir = do
+  entries <- listDirectory dir
+  let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` T.pack e]
+  mems <- forM mdFiles $ \e -> do
+    content <- TIO.readFile (dir </> e)
+    pure (decodeMemory content)
+  pure (sortOn (memoryIdText . meId) (catMaybes mems))
 
--- | Extract the @tags@ array field (defaults to [] when absent).
-tagsFromPayload :: Value -> [Text]
-tagsFromPayload (Object o) = case KeyMap.lookup (fromString "tags") o of
-  Just (Array xs) -> [t | String t <- toList xs]
-  _               -> []
-tagsFromPayload _ = []
+-- | Delete one memory file and auto-commit. Idempotent.
+deleteMemory :: FilePath -> ConfigRepo -> MemoryId -> IO ()
+deleteMemory dir repo mid = do
+  let path = memoryFile dir mid
+  exists <- doesFileExist path
+  if not exists
+    then pure ()
+    else do
+      removeFile path
+      let rel = "memory" </> (T.unpack (memoryIdText mid) <.> "md")
+      _ <- gitCommitAll repo rel ("seal: MEMORY delete " <> memoryIdText mid)
+      pure ()
 
--- | Apply one mutation to the backend.
-applyMemEvent :: MemoryBackend -> MemEvent -> IO ()
-applyMemEvent backend = \case
-  MemStore e  -> mbStore backend e
-  MemDelete i -> mbDelete backend i
+-- | Render the tags list as a JSON array string for the frontmatter line.
+renderTags :: [Text] -> Text
+renderTags ts = TE.decodeUtf8 (BL.toStrict (encode (V.fromList (map String ts))))
+
+-- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
+isoTime :: UTCTime -> Text
+isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+-- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
+-- when absent or unparseable.
+parseTime :: Maybe Text -> UTCTime
+parseTime Nothing    = epochZero
+parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
+
+-- | The epoch fallback for missing/unparseable timestamps.
+epochZero :: UTCTime
+epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)

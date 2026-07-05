@@ -1,16 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Phase 5 capstone: the end-to-end Definition-of-Done scenario. One chat
--- session creates a memory, recalls it, defines a skill, defines an agent,
--- starts the agent in a forked session, and stops it — with every mutation
--- landing in the Audited log (cross-session canonical) and every session
--- transcript in the two-file format. This is the whole-phase gate from
--- @docs/superpowers/plans/2026-07-05-phase-5-audited-stores.md@.
+-- | Phase 5 capstone: the end-to-end Definition-of-Done scenario, rewritten
+-- for the git-backed design. One chat session creates a memory, recalls it,
+-- defines a skill, defines an agent, starts the agent in a forked session,
+-- and stops it — with every mutation landing as a Markdown file under
+-- @config\/@ (disk is canonical) and auto-committed to the config git repo.
+-- The session transcript stays in the two-file format.
 module Seal.Phase5Spec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Data.Aeson (object, (.=))
 import Data.IORef
 import Data.Text (Text)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -19,11 +22,10 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Agent.Runtime.Registry
   ( AgentStatus (..), agentStatus, newAgentRuntime )
-import Seal.Audited.Types (AuditedEntry, AuditedKind (..), aeKind, aeOpcode)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..))
-import Seal.Handles.Audited (fakeAuditedLog)
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend)
@@ -63,9 +65,7 @@ sampleSession = SessionId "s1"
 
 -- | The script for the capstone turn: the model emits four tool calls in one
 -- response (MEMORY_STORE, MEMORY_RECALL, SKILL_CREATE, AGENT_DEF_CREATE), then
--- a final text response. runTurn dispatches each tool call through 'dispatch'
--- (which writes BOTH the session transcript and the Audited log for Audited
--- opcodes), then loops with the tool results, then gets the final text.
+-- a final text response.
 capstoneScript :: [CompletionResponse]
 capstoneScript =
   [ CompletionResponse
@@ -94,15 +94,14 @@ capstoneScript =
   , CompletionResponse [CbText "all four evolutionary mutations applied"] StopEnd (Usage 0 0)
   ]
 
--- | Build the full ISA registry the capstone turn uses. The AGENT_START worker
--- is a fake (records it ran, then blocks) so the test can assert lifecycle
--- without a live provider.
-buildRegistry :: IORef Int -> SessionId -> IO ISA.Registry
-buildRegistry workerRan sid = do
-  memBackend <- Mem.noneBackend
-  skillBackend <- Skill.noneBackend
-  defBackend <- Def.noneBackend
-  rt <- newAgentRuntime
+-- | Build the full ISA registry the capstone turn uses, backed by disk + git.
+buildRegistry :: FilePath -> IORef Int -> SessionId -> IO ISA.Registry
+buildRegistry cfgRoot workerRan sid = do
+  let repo = openConfigRepo cfgRoot
+  memBackend    <- Mem.markdownMemoryBackend (cfgRoot </> "memory") repo
+  skillBackend  <- Skill.markdownSkillBackend (cfgRoot </> "skills") repo
+  defBackend    <- Def.markdownAgentDefBackend (cfgRoot </> "agents") repo
+  rt            <- newAgentRuntime
   pure $ ISA.mkRegistry
     [ memoryStoreOp memBackend sid
     , memoryRecallOp defaultPageParams memBackend
@@ -121,93 +120,87 @@ buildRegistry workerRan sid = do
     , agentStopOp rt
     ]
 
--- | The kinds/opcodes of the Audited entries written by a dispatch, in order.
-auditedKinds :: [AuditedEntry] -> [(AuditedKind, OpName)]
-auditedKinds = map (\e -> (aeKind e, aeOpcode e))
-
 spec :: Spec
-spec = describe "Phase 5 capstone (DoD scenario)" $ do
-  it "one chat turn: MEMORY_STORE + RECALL + SKILL_CREATE + AGENT_DEF_CREATE — every mutation in the Audited log, transcript in two-file format" $ do
-    sent <- newIORef ([] :: [Text])
-    workerRan <- newIORef (0 :: Int)
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "")
-    reg <- buildRegistry workerRan sampleSession
-    ref <- newIORef capstoneScript
-    (tHandle, readTranscript) <- fakeTwoFileTranscript
-    (audited, readAudited) <- fakeAuditedLog
-    let env = AgentEnv
-                { aeProvider = SomeProvider (ScriptProvider ref)
-                , aeProviderLabel = "ollama"
-                , aeModel = ModelId "llama3"
-                , aeRegistry = reg
-                , aeTranscript = tHandle
-                , aeAudited = audited
-                , aeBackend = localBackend
-                , aeCaps = caps
-                , aeSession = sampleSession
-                , aeMaxTurns = 8
-                }
-    runTestApp (runTurn env "run the capstone")
-    -- 1. The Audited log carries all four mutations, with the right kinds.
-    auditedEntries <- readAudited
-    auditedKinds auditedEntries `shouldBe`
-      [ (AKMemory,   OpName "MEMORY_STORE")
-      , (AKMemory,   OpName "MEMORY_RECALL")
-      , (AKSkill,    OpName "SKILL_CREATE")
-      , (AKAgentDef, OpName "AGENT_DEF_CREATE")
-      ]
-    -- 2. The session transcript (two-file) has the request + the responses.
-    (msgs, entries) <- readTranscript
-    length msgs `shouldSatisfy` (> 0)
-    length entries `shouldSatisfy` (>= 2)  -- request + final response (tool turn adds entries too)
-    -- 3. The model saw the final text.
-    readIORef sent `shouldReturn` ["ollama/llama3> all four evolutionary mutations applied"]
+spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
+  it "one chat turn: MEMORY_STORE + RECALL + SKILL_CREATE + AGENT_DEF_CREATE — files land on disk + git, transcript in two-file format" $
+    withSystemTempDirectory "seal-phase5" $ \root -> do
+      let cfgRoot = root </> "config"
+      ensureConfigRepo cfgRoot
+      sent <- newIORef ([] :: [Text])
+      workerRan <- newIORef (0 :: Int)
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+      reg <- buildRegistry cfgRoot workerRan sampleSession
+      ref <- newIORef capstoneScript
+      (tHandle, readTranscript) <- fakeTwoFileTranscript
+      let env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "llama3"
+                  , aeRegistry = reg
+                  , aeTranscript = tHandle
+                  , aeBackend = localBackend
+                  , aeCaps = caps
+                  , aeSession = sampleSession
+                  , aeMaxTurns = 8
+                  }
+      runTestApp (runTurn env "run the capstone")
+      -- 1. Each mutation landed as a Markdown file under config/.
+      doesFileExist (cfgRoot </> "memory" </> "greeting.md") `shouldReturn` True
+      doesFileExist (cfgRoot </> "skills" </> "greet.md") `shouldReturn` True
+      doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
+      -- 2. The config git repo has commits (the auto-commits fired).
+      gitHasCommits (openConfigRepo cfgRoot) `shouldReturn` True
+      -- 3. The session transcript (two-file) has the request + responses.
+      (msgs, entries) <- readTranscript
+      length msgs `shouldSatisfy` (> 0)
+      length entries `shouldSatisfy` (>= 2)
+      -- 4. The model saw the final text.
+      readIORef sent `shouldReturn` ["ollama/llama3> all four evolutionary mutations applied"]
 
-  it "AGENT_START forks a worker in a fresh session; AGENT_STATUS reads Running; AGENT_STOP stops it (Trusted, not in Audited log)" $ do
-    workerRan <- newIORef (0 :: Int)
-    defBackend <- Def.noneBackend
-    rt <- newAgentRuntime
-    let sid = sampleSession
-        reg = ISA.mkRegistry
-          [ agentDefCreateOp defBackend sid
-          , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
-          , agentStatusOp rt
-          , agentStopOp rt
-          ]
-        workerDef = case mkAgentDefId "worker" of
-          Right aid -> aid
-          Left _    -> error "unreachable: worker always validates"
-    (tHandle, _) <- fakeTwoFileTranscript
-    (audited, readAudited) <- fakeAuditedLog
-    -- Define the agent via dispatch (Audited — lands in the Audited log).
-    _ <- runTestApp (dispatch reg tHandle audited localBackend (OpName "AGENT_DEF_CREATE")
-                       (object
-                         [ "id" .= ("worker" :: Text)
-                         , "name" .= ("worker" :: Text)
-                         , "provider" .= ("ollama" :: Text)
-                         , "model" .= ("llama3" :: Text)
-                         ]))
-    -- Start it via dispatch (Trusted — does NOT land in the Audited log).
-    rStart <- runTestApp (dispatch reg tHandle audited localBackend (OpName "AGENT_START")
+  it "AGENT_START forks a worker; AGENT_STATUS reads Running; AGENT_STOP stops it (Trusted file-write, no Audited log)" $
+    withSystemTempDirectory "seal-phase5" $ \root -> do
+      let cfgRoot = root </> "config"
+      ensureConfigRepo cfgRoot
+      workerRan <- newIORef (0 :: Int)
+      defBackend <- Def.markdownAgentDefBackend (cfgRoot </> "agents") (openConfigRepo cfgRoot)
+      rt <- newAgentRuntime
+      let sid = sampleSession
+          reg = ISA.mkRegistry
+            [ agentDefCreateOp defBackend sid
+            , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
+            , agentStatusOp rt
+            , agentStopOp rt
+            ]
+      (tHandle, _) <- fakeTwoFileTranscript
+      -- Define the agent via dispatch (writes the file + auto-commits).
+      _ <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_DEF_CREATE")
+                         (object
+                           [ "id" .= ("worker" :: Text)
+                           , "name" .= ("worker" :: Text)
+                           , "provider" .= ("ollama" :: Text)
+                           , "model" .= ("llama3" :: Text)
+                           ]))
+      -- The def file landed on disk.
+      doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
+      -- Start it via dispatch (Trusted — no file write, just runtime).
+      rStart <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_START")
+                              (object ["id" .= ("worker" :: Text)]))
+      rStart `shouldSatisfy` isRight
+      threadDelay 50000
+      readIORef workerRan `shouldReturn` 1
+      let workerDef = case mkAgentDefId "worker" of
+            Right aid -> aid
+            Left _    -> error "unreachable: worker always validates"
+      mStatus <- agentStatus rt workerDef
+      mStatus `shouldSatisfy` (Just Running ==)
+      -- Stop it via dispatch (Trusted).
+      rStop <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_STOP")
                             (object ["id" .= ("worker" :: Text)]))
-    rStart `shouldSatisfy` isRight
-    threadDelay 50000  -- let the fork run the worker
-    readIORef workerRan `shouldReturn` 1
-    mStatus <- agentStatus rt workerDef
-    mStatus `shouldSatisfy` (Just Running ==)
-    -- Stop it via dispatch (Trusted).
-    rStop <- runTestApp (dispatch reg tHandle audited localBackend (OpName "AGENT_STOP")
-                          (object ["id" .= ("worker" :: Text)]))
-    rStop `shouldSatisfy` isRight
-    agentStatus rt workerDef `shouldReturn` Nothing
-    -- The Audited log has exactly ONE entry: the AGENT_DEF_CREATE. The two
-    -- Trusted lifecycle ops (START/STOP) did NOT write to the Audited log.
-    auditedEntries <- readAudited
-    length auditedEntries `shouldBe` 1
-    auditedKinds auditedEntries `shouldBe` [(AKAgentDef, OpName "AGENT_DEF_CREATE")]
+      rStop `shouldSatisfy` isRight
+      agentStatus rt workerDef `shouldReturn` Nothing
 
 isRight :: Either a b -> Bool
 isRight (Right _) = True

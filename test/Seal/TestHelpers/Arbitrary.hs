@@ -22,7 +22,6 @@ import Seal.Providers.Class
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
-import Seal.Audited.Types (AuditedEntry (..), AuditedKind (..))
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
@@ -99,9 +98,6 @@ instance Arbitrary EnvelopeDelta where
     <*> arbitrary
     <*> arbitrary
 
-instance Arbitrary AuditedKind where
-  arbitrary = elements [AKMemory, AKSkill, AKAgentDef, AKConfig]
-
 -- | A bounded 'UTCTime' generator: a day in 2020-2030 + a time-of-day in
 -- [0, 24h). Keeps generated entries ordered-ish and avoids overflow.
 instance Arbitrary UTCTime where
@@ -112,15 +108,6 @@ instance Arbitrary UTCTime where
     secs  <- chooseInt (0, 86399)
     pure (UTCTime (fromGregorian (fromIntegral year) month day)
                   (secondsToDiffTime (fromIntegral secs)))
-
-instance Arbitrary AuditedEntry where
-  arbitrary = AuditedEntry
-    <$> arbitrary
-    <*> arbitrary
-    <*> (SessionId <$> arbitrary)
-    <*> arbitrary
-    <*> arbitrary
-    <*> arbitrary
 
 -- | A 'MemoryId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
 instance Arbitrary MemoryId where

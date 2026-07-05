@@ -37,11 +37,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), agentSessionDir, auditedLogPath, sessionDir)
-import Seal.Audited.Replay (replay)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
-import Seal.Handles.Audited (AuditedHandle (..), withAuditedLog)
+import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
@@ -75,10 +74,10 @@ import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | The evolutionary-store backends + the in-process agent runtime, created
 -- once at startup and shared between the command specs (which read them via
--- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). All three
--- backends are in-memory 'noneBackend' impls for now (the Audited log is
--- canonical); they materialize from Audited-log replay inside the
--- 'withAuditedLog' bracket in 'runCliTui'.
+-- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). The three
+-- store backends are disk-backed (Markdown files under @config\/@); disk is
+-- canonical and git is the versioning + audit layer. The agent runtime is an
+-- in-process STM registry (lifecycle only — not persisted).
 data Backends = Backends
   { bMemory    :: Mem.MemoryBackend
   , bSkills    :: Skill.SkillBackend
@@ -86,15 +85,19 @@ data Backends = Backends
   , bRuntime   :: AgentRuntime
   }
 
--- | Construct the backends with their in-memory 'noneBackend' impls. The
--- Audited-log materialization happens later, inside 'runCliTui' once the
--- Audited handle is open.
-newBackends :: IO Backends
-newBackends = Backends
-  <$> Mem.noneBackend
-  <*> Skill.noneBackend
-  <*> Def.noneBackend
-  <*> newAgentRuntime
+-- | Construct the disk-backed backends for the given config repo. The three
+-- stores read their directories on demand (no startup materialization needed
+-- — disk is canonical, so @\/skill list@ etc. just enumerate the dir).
+newBackends :: FilePath -> ConfigRepo -> IO Backends
+newBackends cfgRoot repo = do
+  let skillsDir    = cfgRoot </> "skills"
+      agentsDir    = cfgRoot </> "agents"
+      memoryDir    = cfgRoot </> "memory"
+  Backends
+    <$> Mem.markdownMemoryBackend memoryDir repo
+    <*> Skill.markdownSkillBackend skillsDir repo
+    <*> Def.markdownAgentDefBackend agentsDir repo
+    <*> newAgentRuntime
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -143,14 +146,13 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> ISA.Registry -> TwoFileHandle -> AuditedHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle audited = AgentEnv
+  -> ISA.Registry -> TwoFileHandle -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
-  , aeAudited    = audited
   , aeBackend    = localBackend
   , aeCaps       = caps
   , aeSession    = sid
@@ -200,87 +202,75 @@ runCliTui paths rt pr sr registry chain backends = do
   -- they are built here where both `caps` and the transcript handle are in
   -- scope. Legacy sessions with an existing @transcript.jsonl@ are left
   -- untouched (the legacy read path handles them); new sessions get the
-  -- @conversation.jsonl@ + @entries.jsonl@ pair. The Audited log bracket wraps
-  -- the same scope so Audited opcodes (Memory/Skills/AgentDef/Config — added in
-  -- M2+) write to both the session transcript and the cross-session Audited log.
-  -- The backends are the in-memory ('none') impls, shared with the @\/skill@
-  -- and @\/agent@ command specs (built in 'Seal.Tui.runTui' from the same
-  -- 'Backends' record). They materialize from Audited-log replay at startup so
-  -- the backends match the canonical log.
+  -- @conversation.jsonl@ + @entries.jsonl@ pair. The evolutionary-store
+  -- backends (memory/skills/agent-defs) are disk-backed Markdown files under
+  -- @config\/@, shared with the @\/skill@ and @\/agent@ command specs (built in
+  -- 'Seal.Tui.runTui' from the same 'Backends' record). Disk is canonical;
+  -- git is the versioning + audit layer. No startup materialization is needed
+  -- — the backends read their directories on demand.
   let memoryBackend    = bMemory backends
       skillBackend     = bSkills backends
       agentDefBackend  = bAgentDefs backends
       agentRuntime     = bRuntime backends
-  withTwoFileTranscript sessionDirPath $ \tHandle ->
-    withAuditedLog (auditedLogPath paths) $ \audited -> do
-      -- Materialize the memory + skill + agent-def backends from the Audited
-      -- log so a cold start sees the agent's persisted evolutionary state.
-      auditedEntries <- readAudited audited
-      let events = replay auditedEntries
-      Mem.materializeMemory events memoryBackend
-      Skill.materializeSkills events skillBackend
-      Def.materializeAgentDefs events agentDefBackend
-      let sid0 = smId active0
-          -- Mint a fresh SessionId for a forked agent instance. Each start
-          -- gets its own timestamped id (a re-start of the same def does not
-          -- append to a prior instance's transcript).
-          mintAgentSession = do
-            now <- getCurrentTime
-            case mkSessionId (formatSessionId now) of
-              Right s  -> pure s
-              -- unreachable: formatSessionId only emits digits and dashes
-              Left _e  -> pure sid0
-          -- The AGENT_START worker-builder: resolve the def's provider+model,
-          -- open a fresh two-file transcript under
-          -- @\<parent-session\>\/agents\/\<child-id\>@, build a fresh AgentEnv
-          -- bound to the new session + child transcript, and run a turn. The
-          -- sub-agent shares the parent's AuditedHandle (the Audited log is
-          -- cross-session and canonical; the child's mutations land there
-          -- tagged with the child's SessionId as provenance). The child gets
-          -- its OWN TwoFileHandle so its conversation/entries stay separate
-          -- from the parent's — mixing them would corrupt the two-file
-          -- format's per-session erConvLen and envelope-delta fold.
-          mkWorker def sid = do
-            let childDir = agentSessionDir paths sid0 sid
-            createDirectoryIfMissing True childDir
-            eprov <- resolveDefProvider pr (adProvider def) (adModel def)
-            case eprov of
-              Left err              -> ccSend caps ("agent start failed: " <> err)
-              Right (prov, model)   ->
-                withTwoFileTranscript childDir $ \childTHandle -> do
-                  let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg childTHandle audited
-                  runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
-          isaReg = ISA.mkRegistry
-            [ showHumanOp caps
-            , askHumanOp caps
-            , fileReadOp wsRoot operatorCeiling
-            , secretGetOp rt
-            , memoryStoreOp memoryBackend sid0
-            , memoryRecallOp defaultPageParams memoryBackend
-            , memoryUpdateOp memoryBackend
-            , memoryDeleteOp memoryBackend
-            , skillCreateOp skillBackend sid0
-            , skillReadOp skillBackend
-            , skillUpdateOp skillBackend
-            , skillListOp skillBackend
-            , agentDefCreateOp agentDefBackend sid0
-            , agentDefReadOp agentDefBackend
-            , agentDefUpdateOp agentDefBackend
-            , agentListOp agentRuntime
-            , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
-            , agentStatusOp agentRuntime
-            , agentStopOp agentRuntime
-            ]
-          plainHandler t = do
-            meta  <- readIORef (srActive sr)
-            eprov <- resolveSessionProvider pr meta
-            case eprov of
-              Left err            -> ccSend caps err
-              Right (prov, model) ->
-                handlePlain
-                  (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle audited)
-                  appEnv t
-      runInputT hlSettings (loop caps plainHandler)
+  withTwoFileTranscript sessionDirPath $ \tHandle -> do
+    let sid0 = smId active0
+        -- Mint a fresh SessionId for a forked agent instance. Each start
+        -- gets its own timestamped id (a re-start of the same def does not
+        -- append to a prior instance's transcript).
+        mintAgentSession = do
+          now <- getCurrentTime
+          case mkSessionId (formatSessionId now) of
+            Right s  -> pure s
+            -- unreachable: formatSessionId only emits digits and dashes
+            Left _e  -> pure sid0
+        -- The AGENT_START worker-builder: resolve the def's provider+model,
+        -- open a fresh two-file transcript under
+        -- @\<parent-session\>\/agents\/\<child-id\>@, build a fresh AgentEnv
+        -- bound to the new session + child transcript, and run a turn. The
+        -- child gets its OWN TwoFileHandle so its conversation/entries stay
+        -- separate from the parent's — mixing them would corrupt the two-file
+        -- format's per-session erConvLen and envelope-delta fold.
+        mkWorker def sid = do
+          let childDir = agentSessionDir paths sid0 sid
+          createDirectoryIfMissing True childDir
+          eprov <- resolveDefProvider pr (adProvider def) (adModel def)
+          case eprov of
+            Left err              -> ccSend caps ("agent start failed: " <> err)
+            Right (prov, model)   ->
+              withTwoFileTranscript childDir $ \childTHandle -> do
+                let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg childTHandle
+                runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
+        isaReg = ISA.mkRegistry
+          [ showHumanOp caps
+          , askHumanOp caps
+          , fileReadOp wsRoot operatorCeiling
+          , secretGetOp rt
+          , memoryStoreOp memoryBackend sid0
+          , memoryRecallOp defaultPageParams memoryBackend
+          , memoryUpdateOp memoryBackend
+          , memoryDeleteOp memoryBackend
+          , skillCreateOp skillBackend sid0
+          , skillReadOp skillBackend
+          , skillUpdateOp skillBackend
+          , skillListOp skillBackend
+          , agentDefCreateOp agentDefBackend sid0
+          , agentDefReadOp agentDefBackend
+          , agentDefUpdateOp agentDefBackend
+          , agentListOp agentRuntime
+          , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
+          , agentStatusOp agentRuntime
+          , agentStopOp agentRuntime
+          ]
+        plainHandler t = do
+          meta  <- readIORef (srActive sr)
+          eprov <- resolveSessionProvider pr meta
+          case eprov of
+            Left err            -> ccSend caps err
+            Right (prov, model) ->
+              handlePlain
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
+                appEnv t
+    runInputT hlSettings (loop caps plainHandler)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> InputT IO ()
     loop caps plainHandler = do

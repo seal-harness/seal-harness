@@ -7,7 +7,6 @@ import Test.Hspec
 import Seal.Agent.Env
 import Seal.Channel.Cli
 import Seal.Core.Types
-import Seal.Handles.Audited (fakeAuditedLog)
 import Seal.Handles.Transcript
 import Seal.ISA.Opcode
 import qualified Seal.ISA.Registry as ISA
@@ -35,14 +34,12 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     ref <- newIORef
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
     (h, _) <- fakeTwoFileTranscript
-    (audited, _) <- fakeAuditedLog
     let agentEnv = AgentEnv
           (SomeProvider (ScriptProvider ref))
           "ollama"
           (ModelId "test-model")
           (ISA.mkRegistry [])
           h
-          audited
           localBackend
           caps
           (either (error "sid") id (mkSessionId "cli"))

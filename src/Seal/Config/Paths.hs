@@ -12,7 +12,6 @@ module Seal.Config.Paths
   , sessionConversationPath
   , sessionEntriesPath
   , agentSessionDir
-  , auditedLogPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -122,8 +121,4 @@ sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
 agentSessionDir :: SealPaths -> SessionId -> SessionId -> FilePath
 agentSessionDir paths parentSid childSid =
   sessionDir paths parentSid </> "agents" </> T.unpack (sessionIdText childSid)
-
--- | The unified cross-session Audited log: @\<state\>\/audited.log@.
-auditedLogPath :: SealPaths -> FilePath
-auditedLogPath paths = spState paths </> "audited.log"
 

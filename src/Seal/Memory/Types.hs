@@ -4,7 +4,8 @@
 -- non-empty, no leading dot). 'MemoryEntry' is the agent's own persistent
 -- memory — content the agent chooses to remember across sessions. It is NOT a
 -- vault secret (those live in 'Seal.Security.Secrets'); memory content is
--- recorded in full in both the session transcript and the Audited log.
+-- agent-visible data, recorded in full as a Markdown file under
+-- @config\/memory\/@ (disk is canonical; git is the versioning layer).
 module Seal.Memory.Types
   ( MemoryId (..)
   , mkMemoryId
@@ -22,7 +23,7 @@ import GHC.Generics (Generic)
 import Seal.Core.Types (SessionId)
 
 -- | Opaque memory key. Smart-constructed via 'mkMemoryId'; the charset
--- predicate guards every Audited-log / path / SQL-parameter position.
+-- predicate guards every path / filename position.
 newtype MemoryId = MemoryId Text
   deriving stock (Eq, Ord, Show)
   deriving newtype (ToJSON, FromJSON)
@@ -45,8 +46,8 @@ memoryIdText :: MemoryId -> Text
 memoryIdText (MemoryId t) = t
 
 -- | One agent memory entry. The content is agent-visible data (not a vault
--- secret); it is recorded in full in both the session transcript and the
--- Audited log. 'meSession' is the originating session (provenance).
+-- secret); it is recorded in full as a Markdown file. 'meSession' is the
+-- originating session (provenance).
 data MemoryEntry = MemoryEntry
   { meId        :: MemoryId
   , meContent   :: Text

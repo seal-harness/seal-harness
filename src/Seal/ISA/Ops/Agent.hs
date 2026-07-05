@@ -86,7 +86,7 @@ toolsField v =
 agentDefCreateOp :: AgentDefBackend -> SessionId -> Opcode
 agentDefCreateOp backend session = Opcode
   { opName = OpName "AGENT_DEF_CREATE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Define an agent by id (insert or replace)."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
@@ -151,7 +151,7 @@ agentDefCreateOp backend session = Opcode
 agentDefReadOp :: AgentDefBackend -> Opcode
 agentDefReadOp backend = Opcode
   { opName = OpName "AGENT_DEF_READ"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Read one agent definition by id."
   , opInSchema = singleStringSchema "id" "The agent def id to read."
   , opOutSchema = object []
@@ -179,7 +179,7 @@ agentDefReadOp backend = Opcode
 agentDefUpdateOp :: AgentDefBackend -> Opcode
 agentDefUpdateOp backend = Opcode
   { opName = OpName "AGENT_DEF_UPDATE"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Update an existing agent definition's name/system/tools."
   , opInSchema = object
       [ "type" .= ("object" :: Text)
