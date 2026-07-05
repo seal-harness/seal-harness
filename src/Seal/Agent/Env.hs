@@ -8,7 +8,7 @@ import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.Types (ModelId, SessionId)
-import Seal.Handles.Transcript (TranscriptHandle)
+import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
@@ -20,7 +20,7 @@ data AgentEnv = AgentEnv
   , aeProviderLabel :: Text
   , aeModel :: ModelId
   , aeRegistry :: Registry
-  , aeTranscript :: TranscriptHandle
+  , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId

@@ -9,10 +9,11 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Types
-import Seal.Handles.Transcript (fakeTranscript)
+import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Providers.Class
+import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -36,7 +37,7 @@ runTestApp act = do
   runApp env act
 
 spec :: Spec
-spec = describe "Seal.Agent.Loop" $
+spec = describe "Seal.Agent.Loop" $ do
   it "dispatches a tool call then emits the final text" $ do
     sent <- newIORef ([] :: [Text])
     ran <- newIORef (0 :: Int)
@@ -57,7 +58,7 @@ spec = describe "Seal.Agent.Loop" $
           , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
           ]
     ref <- newIORef script
-    (h, _) <- fakeTranscript
+    (h, _) <- fakeTwoFileTranscript
     let env = AgentEnv
                 (SomeProvider (ScriptProvider ref))
                 "ollama"
@@ -71,3 +72,34 @@ spec = describe "Seal.Agent.Loop" $
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
+
+  it "writes the conversation + entries to the two-file transcript" $ do
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        script =
+          [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
+    ref <- newIORef script
+    (h, readState) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                (SomeProvider (ScriptProvider ref))
+                "ollama"
+                (ModelId "m")
+                (mkRegistry [])
+                h
+                localBackend
+                caps
+                (either (error "sid") id (mkSessionId "s1"))
+                8
+    runTestApp (runTurn env "hi")
+    (msgs, entries) <- readState
+    -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)
+    length msgs `shouldBe` 2
+    -- entries.jsonl: one Request (user) + one Response (assistant) = 2 entries
+    length entries `shouldBe` 2
+    -- the response entry carries usage
+    case drop 1 entries of
+      [resp] -> erUsage resp `shouldBe` Just (Usage 1 2)
+      _      -> expectationFailure "expected exactly one response entry"

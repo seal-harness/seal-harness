@@ -33,7 +33,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     (fc, caps) <- makeFakeCaps []
     ref <- newIORef
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
-    (h, _) <- fakeTranscript
+    (h, _) <- fakeTwoFileTranscript
     let agentEnv = AgentEnv
           (SomeProvider (ScriptProvider ref))
           "ollama"

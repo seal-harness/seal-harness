@@ -34,9 +34,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
+import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
-import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
+import Seal.Handles.Transcript
+  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Ops.File (fileReadOp)
@@ -89,7 +90,7 @@ resolveSessionProvider pr meta =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> ISA.Registry -> TranscriptHandle -> AgentEnv
+  -> ISA.Registry -> TwoFileHandle -> AgentEnv
 mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
@@ -115,7 +116,7 @@ runCliTui
 runCliTui paths rt pr sr registry chain = do
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
-      transcriptPath = sessionTranscriptPath paths (smId active0)
+      sessionDirPath = sessionDir paths (smId active0)
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = ChannelCaps
@@ -140,10 +141,13 @@ runCliTui paths rt pr sr registry chain = do
   -- change takes effect on the next session.
   eCfg <- loadFileConfig (prConfigPath pr)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-  -- The transcript bracket wraps the whole loop so every turn shares one writer.
-  -- The opcodes (and thus the ISA registry) close over `caps`, so they are built
-  -- here where both `caps` and the transcript handle are in scope.
-  withTranscript transcriptPath $ \tHandle -> do
+  -- The two-file transcript bracket wraps the whole loop so every turn shares
+  -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
+  -- they are built here where both `caps` and the transcript handle are in
+  -- scope. Legacy sessions with an existing @transcript.jsonl@ are left
+  -- untouched (the legacy read path handles them); new sessions get the
+  -- @conversation.jsonl@ + @entries.jsonl@ pair.
+  withTwoFileTranscript sessionDirPath $ \tHandle -> do
     let isaReg = ISA.mkRegistry
           [ showHumanOp caps
           , askHumanOp caps
