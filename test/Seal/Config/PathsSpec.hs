@@ -14,6 +14,7 @@ import Seal.Config.Paths
   , resolveSealHome, getSealPaths, ensureSealDirs
   , configFilePath, vaultFilePath
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
+  , sessionConversationPath, sessionEntriesPath
   )
 import Seal.Core.Types (mkSessionId)
 
@@ -103,6 +104,8 @@ spec = describe "Seal.Config.Paths" $ do
       sessionDir paths sid        `shouldBe` "/h/state/sessions/20260701-120000-042"
       sessionMetaPath paths sid   `shouldBe` "/h/state/sessions/20260701-120000-042/session.json"
       sessionTranscriptPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/transcript.jsonl"
+      sessionConversationPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/conversation.jsonl"
+      sessionEntriesPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/entries.jsonl"
 
 -- | Run an action with SEAL_HOME set to the given path, restoring the
 -- previous value (or unsetting) on exit, even if the action throws.

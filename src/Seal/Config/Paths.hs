@@ -9,6 +9,8 @@ module Seal.Config.Paths
   , sessionDir
   , sessionMetaPath
   , sessionTranscriptPath
+  , sessionConversationPath
+  , sessionEntriesPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -99,4 +101,12 @@ sessionMetaPath paths sid = sessionDir paths sid </> "session.json"
 -- | The session's transcript: @\<sessionDir\>\/transcript.jsonl@.
 sessionTranscriptPath :: SealPaths -> SessionId -> FilePath
 sessionTranscriptPath paths sid = sessionDir paths sid </> "transcript.jsonl"
+
+-- | The session's conversation file (new two-file format): @\<sessionDir\>\/conversation.jsonl@.
+sessionConversationPath :: SealPaths -> SessionId -> FilePath
+sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl"
+
+-- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
+sessionEntriesPath :: SealPaths -> SessionId -> FilePath
+sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
 
