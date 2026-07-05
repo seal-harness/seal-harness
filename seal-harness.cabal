@@ -44,6 +44,7 @@ library
         Seal.Transcript.Types
         Seal.Transcript.Conv
         Seal.Transcript.Entries
+        Seal.Transcript.Reconstruct
         Seal.Handles.Transcript
         Seal.AppMain
         Seal.Channel.Caps
@@ -150,6 +151,7 @@ test-suite tests
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
+        Seal.Transcript.ReconstructSpec
         Seal.Handles.TranscriptSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec

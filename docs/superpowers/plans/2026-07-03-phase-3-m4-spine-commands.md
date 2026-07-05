@@ -25,8 +25,7 @@
 - **Error convention:** `Either Text` / render `DispatchError` via `show`. No new error ADT.
 - **Clean-room:** no reference to any prior/other implementation in code, identifiers, comments, docs, or commit messages.
 - **Cabal registration:** new library modules go in `seal-harness.cabal` `exposed-modules`, new test specs in `other-modules`, both in **alphabetical order**; new test specs are wired into `test/Main.hs` (import + call).
-- **Commits:** one per task; end every commit message with the trailer
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- **Commits:** one per task;
 - **Build/test commands** (prefix with `nix develop --command` if not already in the dev shell):
   - Build: `cabal build all`
   - Full test: `cabal test`
