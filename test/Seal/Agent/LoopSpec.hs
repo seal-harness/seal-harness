@@ -9,6 +9,7 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Types
+import Seal.Handles.Audited (fakeAuditedLog)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
@@ -59,12 +60,14 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    (audited, _) <- fakeAuditedLog
     let env = AgentEnv
                 (SomeProvider (ScriptProvider ref))
                 "ollama"
                 (ModelId "m")
                 (mkRegistry [stubOp])
                 h
+                audited
                 localBackend
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
@@ -83,12 +86,14 @@ spec = describe "Seal.Agent.Loop" $ do
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
     (h, readState) <- fakeTwoFileTranscript
+    (audited, _) <- fakeAuditedLog
     let env = AgentEnv
                 (SomeProvider (ScriptProvider ref))
                 "ollama"
                 (ModelId "m")
                 (mkRegistry [])
                 h
+                audited
                 localBackend
                 caps
                 (either (error "sid") id (mkSessionId "s1"))

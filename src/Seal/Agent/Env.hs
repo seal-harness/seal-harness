@@ -8,6 +8,7 @@ import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.Types (ModelId, SessionId)
+import Seal.Handles.Audited (AuditedHandle (..))
 import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
@@ -21,6 +22,7 @@ data AgentEnv = AgentEnv
   , aeModel :: ModelId
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
+  , aeAudited :: AuditedHandle
   , aeBackend :: BackendExec
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId

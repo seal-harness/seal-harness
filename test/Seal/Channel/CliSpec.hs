@@ -17,6 +17,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Handles.Audited (fakeAuditedLog)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.Ingest (Disposition (..))
 import qualified Seal.ISA.Registry as ISA
@@ -119,10 +120,11 @@ spec = do
     it "carries the session's model and id into the AgentEnv" $ do
       (_, caps) <- makeFakeCaps []
       (th, _)   <- fakeTwoFileTranscript
+      (audited, _) <- fakeAuditedLog
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid (ISA.mkRegistry []) th
+                  (ModelId "claude-haiku-4-5") sid (ISA.mkRegistry []) th audited
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
 

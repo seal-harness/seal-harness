@@ -34,6 +34,10 @@ import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.TranscriptSpec
+import qualified Seal.Audited.TypesSpec
+import qualified Seal.Audited.ChainSpec
+import qualified Seal.Audited.ReplaySpec
+import qualified Seal.Handles.AuditedSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -80,6 +84,10 @@ main = hspec $ do
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.TranscriptSpec.spec
+  Seal.Audited.TypesSpec.spec
+  Seal.Audited.ChainSpec.spec
+  Seal.Audited.ReplaySpec.spec
+  Seal.Handles.AuditedSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

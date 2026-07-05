@@ -46,6 +46,10 @@ library
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Transcript
+        Seal.Audited.Types
+        Seal.Audited.Chain
+        Seal.Audited.Replay
+        Seal.Handles.Audited
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -153,6 +157,10 @@ test-suite tests
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.TranscriptSpec
+        Seal.Audited.TypesSpec
+        Seal.Audited.ChainSpec
+        Seal.Audited.ReplaySpec
+        Seal.Handles.AuditedSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec

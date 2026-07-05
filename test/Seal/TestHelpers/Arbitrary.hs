@@ -9,15 +9,17 @@ module Seal.TestHelpers.Arbitrary () where
 
 import Data.Aeson (Value (..))
 import Data.Text (Text, pack)
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.QuickCheck
 
 import Seal.Core.Paging (PageParams (..))
-import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), ToolCallId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), SessionId (..), ToolCallId (..))
 import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Message (..)
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
+import Seal.Audited.Types (AuditedEntry (..), AuditedKind (..))
 
 instance Arbitrary ToolCallId where
   arbitrary = ToolCallId . pack <$> arbitrary
@@ -86,6 +88,29 @@ instance Arbitrary EnvelopeDelta where
   arbitrary = EnvelopeDelta
     <$> arbitrary
     <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+
+instance Arbitrary AuditedKind where
+  arbitrary = elements [AKMemory, AKSkill, AKAgentDef, AKConfig]
+
+-- | A bounded 'UTCTime' generator: a day in 2020-2030 + a time-of-day in
+-- [0, 24h). Keeps generated entries ordered-ish and avoids overflow.
+instance Arbitrary UTCTime where
+  arbitrary = do
+    year  <- chooseInt (2020, 2030)
+    month <- chooseInt (1, 12)
+    day   <- chooseInt (1, 28)
+    secs  <- chooseInt (0, 86399)
+    pure (UTCTime (fromGregorian (fromIntegral year) month day)
+                  (secondsToDiffTime (fromIntegral secs)))
+
+instance Arbitrary AuditedEntry where
+  arbitrary = AuditedEntry
+    <$> arbitrary
+    <*> arbitrary
+    <*> (SessionId <$> arbitrary)
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary

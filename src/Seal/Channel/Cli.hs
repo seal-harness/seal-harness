@@ -34,8 +34,9 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Config.Paths (SealPaths (..), auditedLogPath, sessionDir)
 import Seal.Core.Types (ModelId (..), SessionId)
+import Seal.Handles.Audited (AuditedHandle, withAuditedLog)
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
@@ -90,13 +91,14 @@ resolveSessionProvider pr meta =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> ISA.Registry -> TwoFileHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
+  -> ISA.Registry -> TwoFileHandle -> AuditedHandle -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle audited = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
+  , aeAudited    = audited
   , aeBackend    = localBackend
   , aeCaps       = caps
   , aeSession    = sid
@@ -146,24 +148,27 @@ runCliTui paths rt pr sr registry chain = do
   -- they are built here where both `caps` and the transcript handle are in
   -- scope. Legacy sessions with an existing @transcript.jsonl@ are left
   -- untouched (the legacy read path handles them); new sessions get the
-  -- @conversation.jsonl@ + @entries.jsonl@ pair.
-  withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    let isaReg = ISA.mkRegistry
-          [ showHumanOp caps
-          , askHumanOp caps
-          , fileReadOp wsRoot operatorCeiling
-          , secretGetOp rt
-          ]
-        plainHandler t = do
-          meta  <- readIORef (srActive sr)
-          eprov <- resolveSessionProvider pr meta
-          case eprov of
-            Left err            -> ccSend caps err
-            Right (prov, model) ->
-              handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
-                appEnv t
-    runInputT hlSettings (loop caps plainHandler)
+  -- @conversation.jsonl@ + @entries.jsonl@ pair. The Audited log bracket wraps
+  -- the same scope so Audited opcodes (Memory/Skills/AgentDef/Config — added in
+  -- M2+) write to both the session transcript and the cross-session Audited log.
+  withTwoFileTranscript sessionDirPath $ \tHandle ->
+    withAuditedLog (auditedLogPath paths) $ \audited -> do
+      let isaReg = ISA.mkRegistry
+            [ showHumanOp caps
+            , askHumanOp caps
+            , fileReadOp wsRoot operatorCeiling
+            , secretGetOp rt
+            ]
+          plainHandler t = do
+            meta  <- readIORef (srActive sr)
+            eprov <- resolveSessionProvider pr meta
+            case eprov of
+              Left err            -> ccSend caps err
+              Right (prov, model) ->
+                handlePlain
+                  (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle audited)
+                  appEnv t
+      runInputT hlSettings (loop caps plainHandler)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> InputT IO ()
     loop caps plainHandler = do

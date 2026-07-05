@@ -11,6 +11,7 @@ module Seal.Config.Paths
   , sessionTranscriptPath
   , sessionConversationPath
   , sessionEntriesPath
+  , auditedLogPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -109,4 +110,8 @@ sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl
 -- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | The unified cross-session Audited log: @\<state\>\/audited.log@.
+auditedLogPath :: SealPaths -> FilePath
+auditedLogPath paths = spState paths </> "audited.log"
 
