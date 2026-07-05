@@ -35,16 +35,21 @@ import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
 import Seal.Config.Paths (SealPaths (..), auditedLogPath, sessionDir)
+import Seal.Audited.Replay (replay)
+import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId)
-import Seal.Handles.Audited (AuditedHandle, withAuditedLog)
+import Seal.Handles.Audited (AuditedHandle (..), withAuditedLog)
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
+import Seal.ISA.Ops.Memory
+  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
+import Seal.Memory.Backend (materializeMemory, noneBackend)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -151,13 +156,26 @@ runCliTui paths rt pr sr registry chain = do
   -- @conversation.jsonl@ + @entries.jsonl@ pair. The Audited log bracket wraps
   -- the same scope so Audited opcodes (Memory/Skills/AgentDef/Config — added in
   -- M2+) write to both the session transcript and the cross-session Audited log.
+  -- The memory backend is the in-memory ('none') impl for M2; SQLite/Markdown
+  -- follow. It materializes from Audited-log replay at startup so the backend
+  -- matches the canonical log.
+  memoryBackend <- noneBackend
   withTwoFileTranscript sessionDirPath $ \tHandle ->
     withAuditedLog (auditedLogPath paths) $ \audited -> do
-      let isaReg = ISA.mkRegistry
+      -- Materialize the memory backend from the Audited log so a cold start
+      -- sees the agent's persisted memories.
+      auditedEntries <- readAudited audited
+      materializeMemory (replay auditedEntries) memoryBackend
+      let sid0 = smId active0
+          isaReg = ISA.mkRegistry
             [ showHumanOp caps
             , askHumanOp caps
             , fileReadOp wsRoot operatorCeiling
             , secretGetOp rt
+            , memoryStoreOp memoryBackend sid0
+            , memoryRecallOp defaultPageParams memoryBackend
+            , memoryUpdateOp memoryBackend
+            , memoryDeleteOp memoryBackend
             ]
           plainHandler t = do
             meta  <- readIORef (srActive sr)

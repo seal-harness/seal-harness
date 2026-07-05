@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 -- | Shared 'Arbitrary' instances for the 'Seal.Core.Types' newtypes and the
 -- provider-agnostic message model.
@@ -7,6 +8,7 @@
 -- errors when multiple spec modules are compiled into the same test binary.
 module Seal.TestHelpers.Arbitrary () where
 
+import Data.Either (fromRight)
 import Data.Aeson (Value (..))
 import Data.Text (Text, pack)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -20,6 +22,7 @@ import Seal.Providers.Class
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
 import Seal.Audited.Types (AuditedEntry (..), AuditedKind (..))
+import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
 
 instance Arbitrary ToolCallId where
   arbitrary = ToolCallId . pack <$> arbitrary
@@ -114,3 +117,19 @@ instance Arbitrary AuditedEntry where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
+
+-- | A 'MemoryId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
+instance Arbitrary MemoryId where
+  arbitrary = do
+    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+    pure (fromRight (MemoryId "x") (mkMemoryId (pack (c : cs))))
+
+instance Arbitrary MemoryEntry where
+  arbitrary = MemoryEntry
+    <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> (SessionId <$> arbitrary)
