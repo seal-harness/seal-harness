@@ -12,7 +12,7 @@
     # compiler-nix-name below: ghc9122 is prebuilt and cached there.
     extra-substituters = [
       "https://cache.iog.io"
-      "s3://seal-harness-nix-cache?region=us-east-1"
+      "https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com"
     ];
     extra-trusted-public-keys = [
       "hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk="
