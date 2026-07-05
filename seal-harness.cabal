@@ -81,6 +81,9 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.Def.Types
+        Seal.Agent.Def.Backend
+        Seal.Agent.Runtime.Registry
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
@@ -88,6 +91,7 @@ library
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
         Seal.ISA.Ops.Skills
+        Seal.ISA.Ops.Agent
         Seal.ISA.Registry
         Seal.Memory.Types
         Seal.Memory.Backend
@@ -121,6 +125,7 @@ library
       , unix
       , unordered-containers
       , validation-selective
+      , vector
     hs-source-dirs: src
 
 executable seal
@@ -171,8 +176,12 @@ test-suite tests
         Seal.Memory.BackendSpec
         Seal.Skills.TypesSpec
         Seal.Skills.BackendSpec
+        Seal.Agent.Def.TypesSpec
+        Seal.Agent.Def.BackendSpec
+        Seal.Agent.Runtime.RegistrySpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
+        Seal.ISA.Ops.AgentSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec

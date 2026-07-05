@@ -42,8 +42,12 @@ import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Skills.BackendSpec
+import qualified Seal.Agent.Def.TypesSpec
+import qualified Seal.Agent.Def.BackendSpec
+import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
+import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -98,8 +102,12 @@ main = hspec $ do
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec
   Seal.Skills.BackendSpec.spec
+  Seal.Agent.Def.TypesSpec.spec
+  Seal.Agent.Def.BackendSpec.spec
+  Seal.Agent.Runtime.RegistrySpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
+  Seal.ISA.Ops.AgentSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

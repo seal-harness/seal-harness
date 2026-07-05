@@ -51,8 +51,14 @@ import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Skills
   ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+import Seal.ISA.Ops.Agent
+  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
+  , agentListOp, agentStartOp, agentStatusOp, agentStopOp )
 import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Backend qualified as Skill
+import Seal.Agent.Def.Backend qualified as Def
+import Seal.Agent.Def.Types (AgentDef (..))
+import Seal.Agent.Runtime.Registry (newAgentRuntime)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -93,6 +99,18 @@ resolveSessionProvider pr meta =
       eCfg <- loadFileConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
           model   = ModelId (smModel meta)
+      mh <- readIORef (vrHandleRef (prVault pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
+
+-- | Resolve a provider+model from explicit labels (for AGENT_START, which
+-- builds a fresh AgentEnv from a def rather than the active session).
+resolveDefProvider :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
+resolveDefProvider pr providerLabel model =
+  case parseProvider providerLabel of
+    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel))
+    Just kp -> do
+      eCfg <- loadFileConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
 
@@ -165,15 +183,29 @@ runCliTui paths rt pr sr registry chain = do
   -- backends match the canonical log.
   memoryBackend <- Mem.noneBackend
   skillBackend  <- Skill.noneBackend
+  agentDefBackend <- Def.noneBackend
+  agentRuntime  <- newAgentRuntime
   withTwoFileTranscript sessionDirPath $ \tHandle ->
     withAuditedLog (auditedLogPath paths) $ \audited -> do
-      -- Materialize the memory + skill backends from the Audited log so a cold
-      -- start sees the agent's persisted memories and skills.
+      -- Materialize the memory + skill + agent-def backends from the Audited
+      -- log so a cold start sees the agent's persisted evolutionary state.
       auditedEntries <- readAudited audited
       let events = replay auditedEntries
       Mem.materializeMemory events memoryBackend
       Skill.materializeSkills events skillBackend
+      Def.materializeAgentDefs events agentDefBackend
       let sid0 = smId active0
+          -- The AGENT_START worker-builder: resolve the def's provider+model,
+          -- build a fresh AgentEnv bound to the new session, and run a turn.
+          -- Reuses the active session's transcript/audited handles (a true
+          -- per-instance transcript would need a fresh session dir, deferred).
+          mkWorker def sid = do
+            eprov <- resolveDefProvider pr (adProvider def) (adModel def)
+            case eprov of
+              Left err              -> ccSend caps ("agent start failed: " <> err)
+              Right (prov, model)   ->
+                let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg tHandle audited
+                in runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
           isaReg = ISA.mkRegistry
             [ showHumanOp caps
             , askHumanOp caps
@@ -187,6 +219,13 @@ runCliTui paths rt pr sr registry chain = do
             , skillReadOp skillBackend
             , skillUpdateOp skillBackend
             , skillListOp skillBackend
+            , agentDefCreateOp agentDefBackend sid0
+            , agentDefReadOp agentDefBackend
+            , agentDefUpdateOp agentDefBackend
+            , agentListOp agentRuntime
+            , agentStartOp agentDefBackend agentRuntime (pure sid0) mkWorker
+            , agentStatusOp agentRuntime
+            , agentStopOp agentRuntime
             ]
           plainHandler t = do
             meta  <- readIORef (srActive sr)

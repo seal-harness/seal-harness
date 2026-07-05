@@ -10,6 +10,7 @@ module Seal.TestHelpers.Arbitrary () where
 
 import Data.Either (fromRight)
 import Data.Aeson (Value (..))
+import Data.Set qualified as Set
 import Data.Text (Text, pack)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.QuickCheck
@@ -24,6 +25,8 @@ import Seal.Transcript.Entries (EnvelopeDelta (..))
 import Seal.Audited.Types (AuditedEntry (..), AuditedKind (..))
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
+import Seal.Security.Policy (AllowList (..))
 
 instance Arbitrary ToolCallId where
   arbitrary = ToolCallId . pack <$> arbitrary
@@ -145,6 +148,33 @@ instance Arbitrary SkillId where
 instance Arbitrary Skill where
   arbitrary = Skill
     <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> (SessionId <$> arbitrary)
+
+-- | An 'AgentDefId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
+instance Arbitrary AgentDefId where
+  arbitrary = do
+    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+    pure (fromRight (AgentDefId "x") (mkAgentDefId (pack (c : cs))))
+
+-- | An 'AllowList OpName' generator: half 'AllowAll', half a small 'AllowOnly'
+-- set (kept small to avoid huge generated defs).
+instance Arbitrary (AllowList OpName) where
+  arbitrary = oneof
+    [ pure AllowAll
+    , AllowOnly . Set.fromList <$> listOf arbitrary
+    ]
+
+instance Arbitrary AgentDef where
+  arbitrary = AgentDef
+    <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
