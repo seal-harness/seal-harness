@@ -54,15 +54,21 @@ windowLines params offset mLimit ls =
        , lwTruncated = False
        }
 
--- | Fixed compile-time scan byte ceiling (>= 65536, the prior FILE_READ bound).
--- Never model- or call-influenced; the memory bound cannot be widened at call
--- time.
+-- | The compiled-in default scan byte ceiling (>= 65536, the prior FILE_READ
+-- bound). Used by callers that do not have an operator-configured ceiling;
+-- 'FILE_READ' resolves the ceiling from the @[retrieval]@ config section (via
+-- 'Seal.Config.File.retrievalMaxScanBytes') and passes it in, so this default
+-- only applies to bare reuse (e.g. tests, future CRUD) that wants the same
+-- out-of-the-box bound.
 maxScanBytes :: Int
 maxScanBytes = 131072   -- 128 KiB
 
 -- | Bounded IO: read an opaque, already-confined 'SafePath' and window it
--- WITHOUT materializing the whole file. Two streaming passes over the file
--- 'Handle', each reading at most 'maxScanBytes' bytes:
+-- WITHOUT materializing the whole file. The @maxScanBytes@ argument is the
+-- byte ceiling for both streaming passes; the caller ('FILE_READ') resolves
+-- it from the config-layer operator bound and the call-layer model request
+-- (clamped down, never above the operator bound). Two streaming passes over
+-- the file 'Handle', each reading at most @maxScanBytes@ bytes:
 --
 --   1. __Count pass__: stream lines, counting @lwTotal@, holding O(1) memory.
 --      The byte ceiling is enforced at the chunk level while accumulating a
@@ -72,14 +78,14 @@ maxScanBytes = 131072   -- 128 KiB
 --      count so far (a lower bound; may be @0@ for a newline-free file).
 --   2. __Window pass__: stream again, @drop lwStart@, @take size@ lines into the
 --      window (O(window) memory).
-readLineWindow :: PageParams -> Int -> Maybe Int -> SafePath -> IO LineWindow
-readLineWindow params offset mLimit safe =
+readLineWindow :: PageParams -> Int -> Maybe Int -> Int -> SafePath -> IO LineWindow
+readLineWindow params offset mLimit scanBytes safe =
   withFile (getSafePath safe) ReadMode $ \h -> do
-    (total, truncated) <- countLines h
+    (total, truncated) <- countLines h scanBytes
     hSeek h AbsoluteSeek 0
     let size  = windowSize params total mLimit
         start = clamp 0 total offset
-    win <- windowPass h start size truncated
+    win <- windowPass h start size scanBytes truncated
     pure LineWindow
       { lwLines     = win
       , lwStart     = start
@@ -89,19 +95,19 @@ readLineWindow params offset mLimit safe =
       , lwTruncated = truncated
       }
 
--- | Count complete lines in the file, streaming, up to 'maxScanBytes'.
+-- | Count complete lines in the file, streaming, up to @maxScanBytes@.
 -- Returns @(count, truncated)@. At EOF (not truncated) a non-empty trailing
 -- partial line is counted (matching @Data.Text.lines@). If the byte ceiling is
 -- hit before EOF, the in-progress partial line is NOT counted (so @lwTotal@ is
 -- a lower bound; a newline-free file yields @0@).
-countLines :: Handle -> IO (Int, Bool)
-countLines h = do
+countLines :: Handle -> Int -> IO (Int, Bool)
+countLines h scanBytes = do
   bytesRef <- newIORef (0 :: Int)
   countRef <- newIORef (0 :: Int)
   resRef   <- newIORef BS.empty
   let go = do
         bytes <- readIORef bytesRef
-        if bytes >= maxScanBytes
+        if bytes >= scanBytes
           then pure True
           else do
             chunk <- BS.hGet h 4096
@@ -112,23 +118,34 @@ countLines h = do
                   then pure False
                   else do modifyIORef' countRef (+ 1); pure False
               else do
-                modifyIORef' bytesRef (+ BS.length chunk)
+                -- Enforce the ceiling at the byte/chunk level: truncate this
+                -- chunk to the remaining budget so a single read never blows
+                -- the bound. If the chunk is clipped, the next loop iteration
+                -- sees bytes == scanBytes and stops (truncated).
+                let remaining = scanBytes - bytes
+                    chunk'    = if BS.length chunk <= remaining
+                                  then chunk
+                                  else BS.take remaining chunk
+                    clipped   = BS.length chunk' < BS.length chunk
+                modifyIORef' bytesRef (+ BS.length chunk')
                 res0 <- readIORef resRef
-                let (ls, newRes) = splitLines (res0 <> chunk)
+                let (ls, newRes) = splitLines (res0 <> chunk')
                 writeIORef resRef newRes
                 modifyIORef' countRef (+ length ls)
-                go
+                if clipped
+                  then pure True   -- hit the ceiling mid-chunk
+                  else go
   truncated <- go
   count <- readIORef countRef
   pure (count, truncated)
 
 -- | Re-stream the file, drop @start@ complete lines, take up to @size@ into the
--- window. Stops at 'maxScanBytes' or EOF. When @not truncated@, a non-empty
+-- window. Stops at @maxScanBytes@ or EOF. When @not truncated@, a non-empty
 -- trailing partial line at EOF is emitted as a final line (matching
 -- @Data.Text.lines@); when @truncated@ the trailing partial is discarded (it
 -- was not counted in the count pass).
-windowPass :: Handle -> Int -> Int -> Bool -> IO [Text]
-windowPass h start size truncated
+windowPass :: Handle -> Int -> Int -> Int -> Bool -> IO [Text]
+windowPass h start size scanBytes truncated
   | size <= 0 = pure []
   | otherwise = do
       bytesRef    <- newIORef (0 :: Int)
@@ -157,15 +174,22 @@ windowPass h start size truncated
               then pure ()
               else do
                 bytes <- readIORef bytesRef
-                if bytes >= maxScanBytes
+                if bytes >= scanBytes
                   then pure ()
                   else do
                     chunk <- BS.hGet h 4096
                     if BS.null chunk
                       then pure ()
                       else do
-                        modifyIORef' bytesRef (+ BS.length chunk)
-                        processChunk chunk
+                        -- Truncate this chunk to the remaining byte budget so
+                        -- a single read never blows the bound; matches the
+                        -- count pass.
+                        let remaining = scanBytes - bytes
+                            chunk'    = if BS.length chunk <= remaining
+                                          then chunk
+                                          else BS.take remaining chunk
+                        modifyIORef' bytesRef (+ BS.length chunk')
+                        processChunk chunk'
                         go
       go
       -- Flush a trailing partial line at EOF (only when not truncated; if we

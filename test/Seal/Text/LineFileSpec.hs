@@ -168,10 +168,15 @@ spec = describe "Seal.Text.LineFile" $ do
 
   describe "readLineWindow" $ do
 
+    -- A reduced ceiling so the truncation path is exercisable without writing
+    -- a >128 KiB fixture. The spec's IO truncation tests pass this explicitly
+    -- as the @maxScanBytes@ argument.
+    let cap = 64
+
     it "reads a small multi-line file: exact window + footer" $
       withSystemTempDirectory "seal-lf" $ \dir ->
         withSafeFile dir "a\nb\nc\n" $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
           lwLines win `shouldBe` ["a", "b", "c"]
           lwStart win `shouldBe` 0
           lwEnd win `shouldBe` 3
@@ -182,7 +187,7 @@ spec = describe "Seal.Text.LineFile" $ do
     it "no-trailing-newline file: lwTotal correct (3, not 4)" $
       withSystemTempDirectory "seal-lf" $ \dir ->
         withSafeFile dir "a\nb\nc" $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
           lwTotal win `shouldBe` 3
           lwLines win `shouldBe` ["a", "b", "c"]
           lwTruncated win `shouldBe` False
@@ -191,7 +196,7 @@ spec = describe "Seal.Text.LineFile" $ do
     it "empty file: 0 lines, guard-2 footer" $
       withSystemTempDirectory "seal-lf" $ \dir ->
         withSafeFile dir "" $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
           lwTotal win `shouldBe` 0
           lwLines win `shouldBe` []
           lwTruncated win `shouldBe` False
@@ -199,10 +204,10 @@ spec = describe "Seal.Text.LineFile" $ do
 
     it "file exceeding maxScanBytes: lwTruncated True, read stays bounded" $
       withSystemTempDirectory "seal-lf" $ \dir -> do
-        -- A file with one long line (no newline) larger than maxScanBytes.
-        let big = BS.replicate (maxScanBytes + 1000) 65  -- 'A's, no newline
+        -- A file with one long line (no newline) larger than the cap.
+        let big = BS.replicate (cap + 1000) 65  -- 'A's, no newline
         withSafeFile dir big $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing cap safe
           lwTruncated win `shouldBe` True
           lwTotal win `shouldBe` 0    -- no complete line within the scan
           lwLines win `shouldBe` []    -- window pass took 0 lines
@@ -214,9 +219,9 @@ spec = describe "Seal.Text.LineFile" $ do
 
     it "newline-free file exceeding maxScanBytes: guard 1, memory bounded" $
       withSystemTempDirectory "seal-lf" $ \dir -> do
-        let big = BS.replicate (maxScanBytes + 5000) 90  -- 'Z's, no newline
+        let big = BS.replicate (cap + 5000) 90  -- 'Z's, no newline
         withSafeFile dir big $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing cap safe
           lwTruncated win `shouldBe` True
           lwTotal win `shouldBe` 0
           lwLines win `shouldBe` []
@@ -225,16 +230,16 @@ spec = describe "Seal.Text.LineFile" $ do
 
     it "file with many short lines over the byte ceiling: truncated, partial not counted" $
       withSystemTempDirectory "seal-lf" $ \dir -> do
-        -- "x\n" repeated: each line is 2 bytes. maxScanBytes/2 lines fit within
+        -- "x\n" repeated: each line is 2 bytes. cap `div` 2 lines fit within
         -- the cap; then the cap is hit mid-stream. lwTotal is the count of
         -- complete lines within the cap.
         let unit = "x\n"
-            n    = maxScanBytes `div` 2 + 100
+            n    = cap `div` 2 + 100
             body = BS.concat (replicate n unit)
         withSafeFile dir body $ \safe -> do
-          win <- readLineWindow defaultPageParams 0 Nothing safe
+          win <- readLineWindow defaultPageParams 0 Nothing cap safe
           lwTruncated win `shouldBe` True
-          lwTotal win `shouldBe` (maxScanBytes `div` 2)
+          lwTotal win `shouldBe` (cap `div` 2)
 
     it "offset paging reaches the tail" $
       withSystemTempDirectory "seal-lf" $ \dir -> do
@@ -243,11 +248,11 @@ spec = describe "Seal.Text.LineFile" $ do
         withSafeFile dir body $ \safe -> do
           -- defaultPageParams: pageSize = clamp 10 200 (round(4*sqrt 30)) =
           -- clamp 10 200 (round 21.90) = 22.
-          w1 <- readLineWindow defaultPageParams 0 Nothing safe
+          w1 <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
           length (lwLines w1) `shouldBe` 22
           lwHasMore w1 `shouldBe` True
           -- Page to offset = lwEnd w1 (the copy-paste footer value).
-          w2 <- readLineWindow defaultPageParams (lwEnd w1) Nothing safe
+          w2 <- readLineWindow defaultPageParams (lwEnd w1) Nothing maxScanBytes safe
           lwStart w2 `shouldBe` 22
           lwLines w2 `shouldBe` drop 22 ls
           lwHasMore w2 `shouldBe` False
@@ -257,10 +262,23 @@ spec = describe "Seal.Text.LineFile" $ do
         let ls  = [T.pack (show i) | i <- [1..50 :: Int]]
             body = BS.intercalate "\n" (map TE.encodeUtf8 ls) <> "\n"
         withSafeFile dir body $ \safe -> do
-          w <- readLineWindow defaultPageParams 0 (Just 3) safe
+          w <- readLineWindow defaultPageParams 0 (Just 3) maxScanBytes safe
           length (lwLines w) `shouldBe` 3
           lwLines w `shouldBe` take 3 ls
           lwHasMore w `shouldBe` True
+
+    it "model-requested smaller maxScanBytes narrows the scan" $
+      withSystemTempDirectory "seal-lf" $ \dir -> do
+        -- 10 short lines of 2 bytes each = 20 bytes. A cap of 5 bytes scans
+        -- only the first 2 lines (4 bytes); the 5th byte is the start of the
+        -- 3rd line's content but the cap is hit mid-line so the partial is not
+        -- counted. lwTruncated = True, lwTotal = 2.
+        let body = BS.concat (replicate 10 "x\n")
+        withSafeFile dir body $ \safe -> do
+          win <- readLineWindow defaultPageParams 0 Nothing 5 safe
+          lwTruncated win `shouldBe` True
+          lwTotal win `shouldBe` 2
+          lwLines win `shouldBe` ["x", "x"]
 
     prop "IO readLineWindow matches windowLines on T.lines-decoded content" $
       forAll (resize 60 genLines) $ \ls ->
@@ -270,7 +288,7 @@ spec = describe "Seal.Text.LineFile" $ do
                        then BS.empty
                        else BS.intercalate "\n" (map TE.encodeUtf8 ls) <> "\n"
             withSafeFile dir body $ \safe -> do
-              win <- readLineWindow defaultPageParams 0 Nothing safe
+              win <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
               let expected = windowLines defaultPageParams 0 Nothing
                               (T.lines (TE.decodeUtf8Lenient body))
               pure $ lwLines win == lwLines expected

@@ -125,13 +125,17 @@ defaultPageParams :: PageParams   -- PageParams { ppFloor = 10, ppCeiling = 200,
 
 `clamp lo hi x = max lo (min hi x)` — value last, matching `Data.Ord.clamp (lo,hi) x`.
 
-**Tuning layers.** *Call layer* is live: `mLimit` (an explicit per-call limit)
-overrides the computed size and is itself clamped to `[1, ppCeiling]` so a caller
-cannot request an unbounded window — an explicit limit may reach `ppCeiling` but
-never exceed it. *Config / session layers* are **deferred**: `PageParams` is a
-plain record, so threading a `[retrieval]` config section (and later a
-per-session override) in is purely additive; this milestone uses
-`defaultPageParams` everywhere.
+**Tuning layers.** *Call layer* is live for the **line count**: `mLimit` (an
+explicit per-call limit) overrides the computed size and is itself clamped to
+`[1, ppCeiling]` so a caller cannot request an unbounded window — an explicit
+limit may reach `ppCeiling` but never exceed it. *Config / session layers* are
+**deferred** for `PageParams` itself: `PageParams` is a plain record, so
+threading a per-session override of the floor/ceiling/coeff in is purely
+additive; this milestone uses `defaultPageParams` everywhere. The **byte
+ceiling** (`maxScanBytes`, see Component 2) is separately tunable at the
+*config layer* (operator sets an upper bound) with the model able to request a
+*smaller* value at the call layer, clamped to the operator's bound — see
+Component 2 and the FILE_READ retrofit.
 
 **Properties (QuickCheck).** Arbitrary `PageParams` is generated under the
 invariants (`1 <= ppFloor <= ppCeiling`, `ppCoeff >= 0`); `total = length items`:
@@ -167,8 +171,11 @@ windowLines :: PageParams -> Int -> Maybe Int -> [Text] -> LineWindow
 -- Bounded IO: read an opaque, already-confined SafePath and window it WITHOUT
 -- materializing the whole file. SafePath (from Seal.Security.Path, not the ISA)
 -- keeps workspace confinement type-enforced for every caller — opcode or future
--- CRUD — while still allowing reuse "without the ISA".
-readLineWindow :: PageParams -> Int -> Maybe Int -> SafePath -> IO LineWindow
+-- CRUD — while still allowing reuse "without the ISA". The `maxScanBytes`
+-- argument is the byte ceiling for the two streaming passes; the caller
+-- (FILE_READ) supplies it resolved from the config-layer operator bound and the
+-- call-layer model request (clamped down, never above the operator bound).
+readLineWindow :: PageParams -> Int -> Maybe Int -> Int -> SafePath -> IO LineWindow
 
 -- Content + a machine-actionable footer telling the model how to page forward.
 renderWindow :: LineWindow -> Text
@@ -211,16 +218,20 @@ Recommended mechanism — two streaming passes over the file `Handle`:
 
 `lwHasMore = (lwEnd < lwTotal) || lwTruncated`. Peak memory is `O(window +
 O(1))`; the whole file is never materialized — closing the 64 KiB-drop
-regression. `maxScanBytes` is a **fixed compile-time constant ≥ the current
-65536**, never model- or call-influenced, so the memory bound cannot be widened
-at call time. Because both passes scan from the file start bounded by
-`maxScanBytes`, paging is supported *within* the scanned region only; tail-paging
-of a file larger than `maxScanBytes` is **not** a goal of this milestone —
-`lwTruncated`/`lwHasMore` communicate the truncation honestly. The two passes read
-the file twice, so a concurrent external mutation between passes could make
-`lwTotal` (pass 1) disagree with the pass-2 window; the result stays bounded and
-well-formed (best-effort snapshot semantics, same TOCTOU window class as today's
-`mkSafePath`→`withFile`).
+regression. `maxScanBytes` is supplied per call by `FILE_READ` (see the
+retrofit), resolved as `clamp floor operatorCeiling modelRequest` where the
+`operatorCeiling` comes from the `[retrieval]` config section (default 131072,
+≥ the prior 65536) and `modelRequest` is the optional call-layer JSON value.
+The clamp guarantees the **operator's ceiling is a hard upper bound**: the
+model can request a *smaller* scan window but can never widen the memory bound
+above what the operator configured. Because both passes scan from the file
+start bounded by `maxScanBytes`, paging is supported *within* the scanned
+region only; tail-paging of a file larger than `maxScanBytes` is **not** a goal
+of this milestone — `lwTruncated`/`lwHasMore` communicate the truncation
+honestly. The two passes read the file twice, so a concurrent external mutation
+between passes could make `lwTotal` (pass 1) disagree with the pass-2 window;
+the result stays bounded and well-formed (best-effort snapshot semantics, same
+TOCTOU window class as today's `mkSafePath`→`withFile`).
 
 ### `renderWindow` output (pinned for all states, with evaluation order)
 
@@ -269,21 +280,37 @@ offset=72 for the next window]`.)
 
 ## Component 3 — `FILE_READ` retrofit (`Seal.ISA.Ops.File`)
 
-**Schema.** `path` stays required; add two optional integer properties `offset`
-(default `0`) and `limit` (default: pager-computed). The single-required-string
-`singleStringSchema` helper cannot express this, so add a small **local** schema
-builder in `Ops/File.hs` (do not prematurely share it; `singleStringSchema` stays
-for the other ops). The `offset` property's `description` states the 0-based
-convention explicitly ("0-based line index; the line displayed as N is offset
-N-1"). `opOutSchema` stays lightweight (the output is a single free-text part —
-windowed content plus footer — not an exhaustively-schema'd object).
+**Schema.** `path` stays required; add three optional integer properties:
+`offset` (default `0`), `limit` (default: pager-computed line count), and
+`max_scan_bytes` (default: the operator-configured ceiling — see below). The
+single-required-string `singleStringSchema` helper cannot express this, so add
+a small **local** schema builder in `Ops/File.hs` (do not prematurely share it;
+`singleStringSchema` stays for the other ops). The `offset` property's
+`description` states the 0-based convention explicitly ("0-based line index;
+the line displayed as N is offset N-1"). The `max_scan_bytes` property's
+`description` states it is a per-call ceiling on bytes scanned, clamped to the
+operator's configured upper bound, and that out-of-range/malformed values fall
+back to the default. `opOutSchema` stays lightweight (the output is a single
+free-text part — windowed content plus footer — not an exhaustively-schema'd
+object).
 
-**Input parsing (the gate's #5 blocker).** `path`, `offset`, `limit` are parsed
-leniently from the model-supplied JSON: missing → default; a non-integer,
-malformed, or negative value → the default (`offset` 0, `limit` = computed), never
-a throw. The clamps in `paginate` (`offset`→`[0,total]`, `limit`→`[1,ceiling]`)
-are the second line of defense; parsing is the first. `opAuthorize` still requires
-`path`.
+**Input parsing (the gate's #5 blocker).** `path`, `offset`, `limit`, and
+`max_scan_bytes` are parsed leniently from the model-supplied JSON: missing →
+default; a non-integer, malformed, or negative value → the default (`offset`
+0, `limit` = computed, `max_scan_bytes` = operator ceiling), never a throw.
+The clamps in `paginate` (`offset`→`[0,total]`, `limit`→`[1,ceiling]`) are the
+second line of defense for the line count; the `max_scan_bytes` clamp
+(`clamp 1 operatorCeiling`) is the second line of defense for the byte ceiling
+— parsing is the first. `opAuthorize` still requires `path`.
+
+**Config-layer operator ceiling.** A new optional `[retrieval]` section in
+`config.toml` carries `max_scan_bytes` (Int, default 131072 = 128 KiB, ≥ the
+prior 65536). `fileReadOp` now takes the resolved operator ceiling as a
+parameter (threaded from `loadFileConfig` at the CLI wiring site, like
+`WorkspaceRoot`), so the opcode closes over the operator's bound. The
+per-call `max_scan_bytes` is resolved as `clamp 1 operatorCeiling modelRequest`
+— the model can request a *smaller* scan window but can never widen the memory
+bound above the operator's configured ceiling.
 
 **Behavior.** Unchanged front half: authorize, resolve the `SafePath` against the
 workspace root via `runLocal backend (mkSafePath root rel)`, keep the existing
@@ -292,8 +319,9 @@ and `try @IOError` exactly as today:
 
 ```haskell
 Right safe -> do
-  eWin <- runLocal backend (try @IOError (readLineWindow defaultPageParams offset mLimit safe))
-  let recorded = object ["path" .= rel, "offset" .= offset, "limit" .= mLimit]  -- uniform in both branches
+  let scanBytes = clamp 1 operatorCeiling modelScanBytes
+  eWin <- runLocal backend (try @IOError (readLineWindow defaultPageParams offset mLimit scanBytes safe))
+  let recorded = object ["path" .= rel, "offset" .= offset, "limit" .= mLimit, "max_scan_bytes" .= scanBytes]  -- uniform in both branches
   case eWin of
     Left ioErr -> pure (OpResult [TrpText (T.pack (show ioErr))] True recorded)
     Right win  -> pure (OpResult [TrpText (renderWindow win)] False recorded)
@@ -307,12 +335,15 @@ Right safe -> do
   impossible to express, in `FILE_READ` and in every future reuse site.
 - All IO funnelled through `BackendExec` (`runLocal backend`) so Phase 4's remote
   executor still slots in; `try @IOError` retained.
-- **Memory stays bounded** (`maxScanBytes`), preserving today's protection.
+- **Memory stays bounded** (`maxScanBytes ≤ operatorCeiling`), preserving
+  today's protection. The operator's configured ceiling is a hard upper bound;
+  the model can only narrow the scan, never widen it.
 - `orRecorded` stays the secret-free invocation shape — now `path` + `offset` +
-  `limit`, all non-secret request metadata (matching the existing "path is
-  secret-free metadata" comment). File content still flows only to `orParts`,
-  never to `orRecorded`/transcript, and `renderWindow`'s footer text is derived
-  from counts only — it never echoes file content into `orRecorded`.
+  `limit` + the resolved `max_scan_bytes`, all non-secret request metadata
+  (matching the existing "path is secret-free metadata" comment). File content
+  still flows only to `orParts`, never to `orRecorded`/transcript, and
+  `renderWindow`'s footer text is derived from counts only — it never echoes
+  file content into `orRecorded`.
 
 **Behavioral change (intended):** reading a large file now returns a bounded first
 window with a next-offset footer rather than a 64 KiB byte-truncated blob. The
@@ -329,9 +360,12 @@ Standard `Either Text` / non-fatal `OpResult` with `orIsError = True`. No new
 error ADT.
 - A path that fails `SafePath` → the existing denial branch (unchanged).
 - An `IOError` during read → the existing `try @IOError` error-result branch.
-- `offset`/`limit` out of range or malformed are **not** errors: they degrade to
-  defaults (parse layer) and are clamped (`paginate` layer); an offset past the
-  end yields a well-formed empty window whose footer says so.
+- `offset`/`limit`/`max_scan_bytes` out of range or malformed are **not**
+  errors: they degrade to defaults (parse layer) and are clamped (`paginate`
+  for line count; `clamp 1 operatorCeiling` for the byte ceiling); an offset
+  past the end yields a well-formed empty window whose footer says so. A
+  `max_scan_bytes` request above the operator ceiling silently clamps down to
+  the operator ceiling (also not an error).
 
 ---
 
@@ -340,8 +374,9 @@ error ADT.
 | Unit | Coverage |
 |---|---|
 | `Seal.Core.Paging` | QuickCheck under generated invariants: size bounds, monotonicity (banker's-rounding-aware), slice/`hasMore`/offset invariants, explicit-limit override + clamp, and the security case (any offset/limit ⇒ bounded window, offset ∈ [0,total]). |
-| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly over the `T.lines` list, offset-past-end; `renderWindow` exact strings for all six ordered states with the guard order asserted; a **no-inverted-range property** (whenever a footer prints a numeric range, `lwStart+1 <= lwEnd`) that mechanically enforces the guarantee across all states; IO temp-file tests incl. no-trailing-newline, empty, over-`maxScanBytes` (assert `lwTruncated` **and** that the read stays bounded, not just the flag), and a **newline-free file exceeding `maxScanBytes`** (`lwTotal==0 && lwTruncated` → footer guard 1, memory still bounded). |
-| `Seal.ISA.Ops.File` | Lenient offset/limit parsing (malformed→default, no throw); first-window read + footer; offset paging to the tail; `limit` override; **large file → bounded content, not full file**; empty file; **SafePath rejection unchanged; ACK-before-execute unchanged; IO through the seam.** |
+| `Seal.Text.LineFile` | QuickCheck: slice/order/consistency, reassembly over the `T.lines` list, offset-past-end; `renderWindow` exact strings for all six ordered states with the guard order asserted; a **no-inverted-range property** (whenever a footer prints a numeric range, `lwStart+1 <= lwEnd`) that mechanically enforces the guarantee across all states; IO temp-file tests incl. no-trailing-newline, empty, over-`maxScanBytes` (assert `lwTruncated` **and** that the read stays bounded, not just the flag), and a **newline-free file exceeding `maxScanBytes`** (`lwTotal==0 && lwTruncated` → footer guard 1, memory still bounded). The over-`maxScanBytes` tests pass a reduced `maxScanBytes` argument (e.g. 64) so the ceiling is exercisable without writing a >128 KiB fixture. |
+| `Seal.ISA.Ops.File` | Lenient offset/limit/`max_scan_bytes` parsing (malformed→default, no throw); first-window read + footer; offset paging to the tail; `limit` override; **`max_scan_bytes` request above operator ceiling clamps down** (operator ceiling is a hard upper bound); **large file → bounded content, not full file**; empty file; **SafePath rejection unchanged; ACK-before-execute unchanged; IO through the seam.** |
+| `Seal.Config.File` | The `[retrieval]` section round-trips `max_scan_bytes` through TOML; absent key → `Nothing` (FILE_READ then uses the 131072 default). |
 
 All under the Nix dev shell: `cabal build all` `-Werror` clean (strict warning
 set), `cabal test` green (incl. new properties), `hlint src/ test/` clean. New
@@ -435,3 +470,20 @@ claim removed (tail-paging beyond the cap is explicitly out of scope); shared
 `orRecorded` (`path`+`offset`+`limit`) in both FILE_READ branches; best-effort
 two-pass snapshot semantics noted. Out of scope, tracked: per-loop FILE_READ rate
 limiting (Security medium-risk).
+
+**Post-implementation revision (config + model tuning of `maxScanBytes`).**
+After shipping M-a, the maintainer revisited the round-2 Security-gate decision
+that pinned `maxScanBytes` as a fixed compile-time constant. The chosen
+design: the **operator** sets an upper bound via a new optional `[retrieval]`
+config section (`max_scan_bytes`, default 131072); the **model** may request a
+*smaller* per-call value via an optional `max_scan_bytes` JSON arg, clamped to
+`[1, operatorCeiling]`. The operator's configured ceiling remains a **hard
+upper bound** — the model can narrow the scan but can never widen the memory
+bound above what the operator configured — so the round-1 unbounded-memory
+regression stays closed, and the operator retains the gate's safety property.
+`readLineWindow` now takes `maxScanBytes` as a parameter (the call site
+resolves it); `FILE_READ` closes over the operator ceiling (threaded from
+`loadFileConfig` at the CLI wiring site, like `WorkspaceRoot`); `orRecorded`
+adds the resolved `max_scan_bytes`. The over-`maxScanBytes` IO tests pass a
+reduced ceiling argument so the truncation path is exercisable without a
+>128 KiB fixture.
