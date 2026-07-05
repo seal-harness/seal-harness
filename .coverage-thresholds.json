@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Coverage thresholds for orchestrator agents and CI. Portable across projects — adjust values per-repo.",
+  "$comment-project": "seal-harness is a Haskell/cabal project. Tests run via `make test` (wraps `nix develop --command cabal test`). HPC (Haskell Program Coverage) instrumentation is not yet wired into the build — until it is, the enforcement command runs the test suite and the line/branch/function/statement thresholds below are aspirational (not measured). To enable real coverage enforcement, add `cabal test --enable-coverage` (or an HPC wrapper) and update this file.",
+  "thresholds": {
+    "lines": 95,
+    "branches": 95,
+    "functions": 95,
+    "statements": 95
+  },
+  "enforcement": {
+    "command": "make test",
+    "blockPRCreation": true,
+    "blockTaskCompletion": true,
+    "description": "Orchestrator agents MUST run the enforcement command and check coverage against these thresholds before marking any task complete or creating a PR. If coverage drops below any threshold, the task fails. NOTE: HPC instrumentation is pending for this repo; until then the command runs the test suite but does not measure line/branch/function/statement coverage."
+  }
+}
