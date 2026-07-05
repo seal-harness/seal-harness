@@ -49,7 +49,10 @@ import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Memory.Backend (materializeMemory, noneBackend)
+import Seal.ISA.Ops.Skills
+  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+import Seal.Memory.Backend qualified as Mem
+import Seal.Skills.Backend qualified as Skill
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -157,15 +160,19 @@ runCliTui paths rt pr sr registry chain = do
   -- the same scope so Audited opcodes (Memory/Skills/AgentDef/Config — added in
   -- M2+) write to both the session transcript and the cross-session Audited log.
   -- The memory backend is the in-memory ('none') impl for M2; SQLite/Markdown
-  -- follow. It materializes from Audited-log replay at startup so the backend
-  -- matches the canonical log.
-  memoryBackend <- noneBackend
+  -- follow. The skill backend is the in-memory ('none') impl for M3; Markdown
+  -- follows. Both materialize from Audited-log replay at startup so the
+  -- backends match the canonical log.
+  memoryBackend <- Mem.noneBackend
+  skillBackend  <- Skill.noneBackend
   withTwoFileTranscript sessionDirPath $ \tHandle ->
     withAuditedLog (auditedLogPath paths) $ \audited -> do
-      -- Materialize the memory backend from the Audited log so a cold start
-      -- sees the agent's persisted memories.
+      -- Materialize the memory + skill backends from the Audited log so a cold
+      -- start sees the agent's persisted memories and skills.
       auditedEntries <- readAudited audited
-      materializeMemory (replay auditedEntries) memoryBackend
+      let events = replay auditedEntries
+      Mem.materializeMemory events memoryBackend
+      Skill.materializeSkills events skillBackend
       let sid0 = smId active0
           isaReg = ISA.mkRegistry
             [ showHumanOp caps
@@ -176,6 +183,10 @@ runCliTui paths rt pr sr registry chain = do
             , memoryRecallOp defaultPageParams memoryBackend
             , memoryUpdateOp memoryBackend
             , memoryDeleteOp memoryBackend
+            , skillCreateOp skillBackend sid0
+            , skillReadOp skillBackend
+            , skillUpdateOp skillBackend
+            , skillListOp skillBackend
             ]
           plainHandler t = do
             meta  <- readIORef (srActive sr)

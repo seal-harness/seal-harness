@@ -87,9 +87,12 @@ library
         Seal.ISA.Ops.File
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
+        Seal.ISA.Ops.Skills
         Seal.ISA.Registry
         Seal.Memory.Types
         Seal.Memory.Backend
+        Seal.Skills.Types
+        Seal.Skills.Backend
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -166,7 +169,10 @@ test-suite tests
         Seal.Handles.AuditedSpec
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
+        Seal.Skills.TypesSpec
+        Seal.Skills.BackendSpec
         Seal.ISA.Ops.MemorySpec
+        Seal.ISA.Ops.SkillsSpec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec

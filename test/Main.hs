@@ -40,7 +40,10 @@ import qualified Seal.Audited.ReplaySpec
 import qualified Seal.Handles.AuditedSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
+import qualified Seal.Skills.TypesSpec
+import qualified Seal.Skills.BackendSpec
 import qualified Seal.ISA.Ops.MemorySpec
+import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -93,7 +96,10 @@ main = hspec $ do
   Seal.Handles.AuditedSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
+  Seal.Skills.TypesSpec.spec
+  Seal.Skills.BackendSpec.spec
   Seal.ISA.Ops.MemorySpec.spec
+  Seal.ISA.Ops.SkillsSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

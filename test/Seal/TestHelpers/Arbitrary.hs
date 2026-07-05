@@ -23,6 +23,7 @@ import Seal.Providers.Class
 import Seal.Transcript.Entries (EnvelopeDelta (..))
 import Seal.Audited.Types (AuditedEntry (..), AuditedKind (..))
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
+import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 
 instance Arbitrary ToolCallId where
   arbitrary = ToolCallId . pack <$> arbitrary
@@ -127,6 +128,22 @@ instance Arbitrary MemoryId where
 
 instance Arbitrary MemoryEntry where
   arbitrary = MemoryEntry
+    <$> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
+    <*> (SessionId <$> arbitrary)
+
+-- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
+instance Arbitrary SkillId where
+  arbitrary = do
+    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+    pure (fromRight (SkillId "x") (mkSkillId (pack (c : cs))))
+
+instance Arbitrary Skill where
+  arbitrary = Skill
     <$> arbitrary
     <*> arbitrary
     <*> arbitrary
