@@ -15,6 +15,7 @@ import Seal.Config.Paths
   , configFilePath, vaultFilePath
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionEntriesPath
+  , agentSessionDir
   )
 import Seal.Core.Types (mkSessionId)
 
@@ -106,6 +107,16 @@ spec = describe "Seal.Config.Paths" $ do
       sessionTranscriptPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/transcript.jsonl"
       sessionConversationPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/conversation.jsonl"
       sessionEntriesPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/entries.jsonl"
+
+  describe "agentSessionDir" $ do
+    it "nests a sub-agent transcript dir under the parent session dir" $ do
+      let paths = SealPaths
+            { spHome = "/h", spConfig = "/h/config"
+            , spState = "/h/state", spKeys = "/h/keys" }
+          parent = fromRight (error "Invalid parent id") (mkSessionId (pack "20260701-120000-042"))
+          child  = fromRight (error "Invalid child id")  (mkSessionId (pack "20260701-120001-999"))
+      agentSessionDir paths parent child
+        `shouldBe` "/h/state/sessions/20260701-120000-042/agents/20260701-120001-999"
 
 -- | Run an action with SEAL_HOME set to the given path, restoring the
 -- previous value (or unsetting) on exit, even if the action throws.

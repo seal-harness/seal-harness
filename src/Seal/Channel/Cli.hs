@@ -15,6 +15,7 @@ import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Time (getCurrentTime)
 import System.Console.Haskeline
   ( InputT
   , Settings (..)
@@ -24,7 +25,7 @@ import System.Console.Haskeline
   , noCompletion
   , runInputT
   )
-import System.Directory (getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
@@ -34,10 +35,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), auditedLogPath, sessionDir)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, auditedLogPath, sessionDir)
 import Seal.Audited.Replay (replay)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Handles.Audited (AuditedHandle (..), withAuditedLog)
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
@@ -64,7 +65,7 @@ import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..))
+import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -195,17 +196,35 @@ runCliTui paths rt pr sr registry chain = do
       Skill.materializeSkills events skillBackend
       Def.materializeAgentDefs events agentDefBackend
       let sid0 = smId active0
+          -- Mint a fresh SessionId for a forked agent instance. Each start
+          -- gets its own timestamped id (a re-start of the same def does not
+          -- append to a prior instance's transcript).
+          mintAgentSession = do
+            now <- getCurrentTime
+            case mkSessionId (formatSessionId now) of
+              Right s  -> pure s
+              -- unreachable: formatSessionId only emits digits and dashes
+              Left _e  -> pure sid0
           -- The AGENT_START worker-builder: resolve the def's provider+model,
-          -- build a fresh AgentEnv bound to the new session, and run a turn.
-          -- Reuses the active session's transcript/audited handles (a true
-          -- per-instance transcript would need a fresh session dir, deferred).
+          -- open a fresh two-file transcript under
+          -- @\<parent-session\>\/agents\/\<child-id\>@, build a fresh AgentEnv
+          -- bound to the new session + child transcript, and run a turn. The
+          -- sub-agent shares the parent's AuditedHandle (the Audited log is
+          -- cross-session and canonical; the child's mutations land there
+          -- tagged with the child's SessionId as provenance). The child gets
+          -- its OWN TwoFileHandle so its conversation/entries stay separate
+          -- from the parent's — mixing them would corrupt the two-file
+          -- format's per-session erConvLen and envelope-delta fold.
           mkWorker def sid = do
+            let childDir = agentSessionDir paths sid0 sid
+            createDirectoryIfMissing True childDir
             eprov <- resolveDefProvider pr (adProvider def) (adModel def)
             case eprov of
               Left err              -> ccSend caps ("agent start failed: " <> err)
               Right (prov, model)   ->
-                let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg tHandle audited
-                in runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
+                withTwoFileTranscript childDir $ \childTHandle -> do
+                  let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg childTHandle audited
+                  runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
           isaReg = ISA.mkRegistry
             [ showHumanOp caps
             , askHumanOp caps
@@ -223,7 +242,7 @@ runCliTui paths rt pr sr registry chain = do
             , agentDefReadOp agentDefBackend
             , agentDefUpdateOp agentDefBackend
             , agentListOp agentRuntime
-            , agentStartOp agentDefBackend agentRuntime (pure sid0) mkWorker
+            , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
             , agentStatusOp agentRuntime
             , agentStopOp agentRuntime
             ]

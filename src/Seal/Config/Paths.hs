@@ -11,6 +11,7 @@ module Seal.Config.Paths
   , sessionTranscriptPath
   , sessionConversationPath
   , sessionEntriesPath
+  , agentSessionDir
   , auditedLogPath
   ) where
 
@@ -110,6 +111,17 @@ sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl
 -- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | Directory for a sub-agent's transcript, nested under its parent session:
+-- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent
+-- instance gets its own two-file transcript here so the parent's
+-- @conversation.jsonl@ \/ @entries.jsonl@ stay uncontaminated (the two-file
+-- format's @erConvLen@ and envelope-delta fold are per-session; mixing a
+-- sub-agent's entries into the parent's files would corrupt reconstruction).
+-- The Audited log is shared (cross-session and canonical).
+agentSessionDir :: SealPaths -> SessionId -> SessionId -> FilePath
+agentSessionDir paths parentSid childSid =
+  sessionDir paths parentSid </> "agents" </> T.unpack (sessionIdText childSid)
 
 -- | The unified cross-session Audited log: @\<state\>\/audited.log@.
 auditedLogPath :: SealPaths -> FilePath
