@@ -182,6 +182,7 @@ test-suite tests
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.Phase5Spec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
