@@ -102,8 +102,7 @@ Inherited from the roadmap verbatim where the spec is exact:
 - **Cabal registration:** new library modules in `exposed-modules`, new test
   specs in `other-modules`, both alphabetical; new specs wired into
   `test/Main.hs`.
-- **Commits:** one per task; trailer
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+- **Commits:** one per task.
 - **Build/verify:** `nix develop --command cabal build all`,
   `nix develop --command cabal test`,
   `nix develop --command cabal test --test-options='--match "<needle>"'`,
