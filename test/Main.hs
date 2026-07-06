@@ -35,6 +35,7 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.ClassSpec
+import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
 import qualified Seal.Channels.Signal.TransportSpec
 import qualified Seal.Transcript.TypesSpec
@@ -103,6 +104,7 @@ main = hspec $ do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.ClassSpec.spec
+  Seal.Channels.SignalSpec.spec
   Seal.Channels.Signal.EnvelopeSpec.spec
   Seal.Channels.Signal.TransportSpec.spec
   Seal.Transcript.TypesSpec.spec
