@@ -54,6 +54,7 @@ import qualified Seal.Harness.ReconcileSpec
 import qualified Seal.Harness.TmuxSpec
 import qualified Seal.Harness.TmuxIOSpec
 import qualified Seal.Harness.DiscoverySpec
+import qualified Seal.Tabs.TypesSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
@@ -135,6 +136,7 @@ main = hspec $ do
   Seal.Harness.TmuxSpec.spec
   Seal.Harness.TmuxIOSpec.spec
   Seal.Harness.DiscoverySpec.spec
+  Seal.Tabs.TypesSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec

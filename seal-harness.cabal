@@ -60,6 +60,7 @@ library
         Seal.Harness.Discovery
         Seal.Security.Adoption
         Seal.Session.Kind
+        Seal.Tabs.Types
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -195,6 +196,7 @@ test-suite tests
         Seal.Harness.TmuxSpec
         Seal.Harness.TmuxIOSpec
         Seal.Harness.DiscoverySpec
+        Seal.Tabs.TypesSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
