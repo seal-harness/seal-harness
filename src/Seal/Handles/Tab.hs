@@ -16,7 +16,7 @@ module Seal.Handles.Tab
   ) where
 
 import Data.Aeson (FromJSON, ToJSON)
-import Data.Char (toLower)
+import Data.Char (isAsciiLower, isDigit, toLower)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
@@ -50,9 +50,9 @@ tabIndexFromChar :: Char -> Either Text TabIndex
 tabIndexFromChar c =
   let lo = toLower c
   in case lo of
-       _ | lo >= '0' && lo <= '9' -> mkTabIndex (fromEnum lo - fromEnum '0')
-         | lo >= 'a' && lo <= 'z' -> mkTabIndex (fromEnum lo - fromEnum 'a' + 10)
-         | otherwise              -> Left ("not a tab index char: " <> T.pack [c])
+       _ | isDigit lo      -> mkTabIndex (fromEnum lo - fromEnum '0')
+         | isAsciiLower lo -> mkTabIndex (fromEnum lo - fromEnum 'a' + 10)
+         | otherwise       -> Left ("not a tab index char: " <> T.pack [c])
 
 -- | The closed enumeration of tab kinds.
 data TabKind
