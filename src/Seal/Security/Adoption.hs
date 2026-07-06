@@ -1,5 +1,4 @@
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE OverloadedStrings #-}
 -- | Consent-gated adoption of an external tmux window. A discovered window
 -- requires @consent_confirmed@ from an interactive channel; a headless run
 -- cannot confirm, so adoption fail-closes (the user must confirm via an
