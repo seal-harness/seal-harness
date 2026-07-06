@@ -57,6 +57,7 @@ import qualified Seal.Harness.DiscoverySpec
 import qualified Seal.Tabs.TypesSpec
 import qualified Seal.TabsSpec
 import qualified Seal.Tabs.RelaySpec
+import qualified Seal.Tabs.WizardSpec
 import qualified Seal.Routing.RouteSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
@@ -142,6 +143,7 @@ main = hspec $ do
   Seal.Tabs.TypesSpec.spec
   Seal.TabsSpec.spec
   Seal.Tabs.RelaySpec.spec
+  Seal.Tabs.WizardSpec.spec
   Seal.Routing.RouteSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
