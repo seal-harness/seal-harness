@@ -34,6 +34,7 @@ import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
+import qualified Seal.Channels.ClassSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
@@ -97,6 +98,7 @@ main = hspec $ do
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
+  Seal.Channels.ClassSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.EntriesSpec.spec

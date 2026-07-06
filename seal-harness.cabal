@@ -53,6 +53,7 @@ library
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
+        Seal.Channels.Class
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
@@ -190,6 +191,7 @@ test-suite tests
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
+        Seal.Channels.ClassSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec
@@ -214,6 +216,7 @@ test-suite tests
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
+        Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
