@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tabs.TypesSpec (spec) where
 
-import Data.Either (isLeft, isRight)
+import Data.Either (isLeft, isRight, fromRight)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Test.Hspec
@@ -21,21 +21,21 @@ spec = describe "Seal.Tabs.Types" $ do
 
     it "insertTab places at slot 0 for an empty list" $
       case insertTab (BoundSession (sid "a")) KindAi Nothing emptyTabList of
-        Right tl -> map tabIndexToInt (map tIndex (tlTabs tl)) `shouldBe` [0]
+        Right tl -> map (tabIndexToInt . tIndex) (tlTabs tl) `shouldBe` [0]
         Left e   -> expectationFailure ("unexpected Left: " <> show e)
 
     it "insertTab places at the lowest free slot (slot 1 after one insert)" $ do
       let eTl1 = insertTab (BoundSession (sid "a")) KindAi Nothing emptyTabList
       case eTl1 of
         Right tl1 -> case insertTab (BoundSession (sid "b")) KindAi Nothing tl1 of
-          Right tl -> map tabIndexToInt (map tIndex (tlTabs tl)) `shouldBe` [0, 1]
+          Right tl -> map (tabIndexToInt . tIndex) (tlTabs tl) `shouldBe` [0, 1]
           Left e   -> expectationFailure ("second insert Left: " <> show e)
         Left e   -> expectationFailure ("first insert Left: " <> show e)
 
     it "removeTab compacts: indices renumber to 0..n-2" $
       case ins3 of
         Right tl -> case removeTab tl (mkIdx 1) of
-          Right tl' -> map tabIndexToInt (map tIndex (tlTabs tl')) `shouldBe` [0, 1]
+          Right tl' -> map (tabIndexToInt . tIndex) (tlTabs tl') `shouldBe` [0, 1]
           Left e    -> expectationFailure ("removeTab Left: " <> show e)
         Left e -> expectationFailure ("ins3 Left: " <> show e)
 
@@ -56,7 +56,7 @@ spec = describe "Seal.Tabs.Types" $ do
   describe "36-slot cap" $ do
     it "insertTab fails after 36 tabs" $ do
       let sids = [sid (T.pack (show (n :: Int))) | n <- [0..35]]
-          tl  = foldl (\acc s -> either (const acc) id (insertTab (BoundSession s) KindAi Nothing acc)) emptyTabList (take 36 sids)
+          tl  = foldl (\acc s -> fromRight acc (insertTab (BoundSession s) KindAi Nothing acc)) emptyTabList (take 36 sids)
       tabCount tl `shouldBe` 36
       insertTab (BoundSession (sid "overflow")) KindAi Nothing tl `shouldSatisfy` isLeft
 
@@ -103,7 +103,7 @@ spec = describe "Seal.Tabs.Types" $ do
       forAll genOps $ \ops ->
         let tl = applyOps ops emptyTabList
         in tabCount tl == length (tlTabs tl)
-           && map tabIndexToInt (map tIndex (tlTabs tl)) == [0 .. tabCount tl - 1]
+           && map (tabIndexToInt . tIndex) (tlTabs tl) == [0 .. tabCount tl - 1]
 
     prop "I2: no two tabs share a TabRef" $
       forAll genOps $ \ops ->
@@ -153,9 +153,9 @@ applyOps :: [Op] -> TabList -> TabList
 applyOps [] tl = tl
 applyOps (OpInsert n : rest) tl =
   let ref = BoundSession (sid (T.pack ("s" <> show n)))
-  in applyOps rest (either (const tl) id (insertTab ref KindAi Nothing tl))
+  in applyOps rest (fromRight tl (insertTab ref KindAi Nothing tl))
 applyOps (OpRemove i : rest) tl =
-  applyOps rest (either (const tl) id (removeTab tl i))
+  applyOps rest (fromRight tl (removeTab tl i))
 
 -- | nub by equality (a local nub to avoid an import).
 nubEq :: Eq a => [a] -> [a]
