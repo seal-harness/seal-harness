@@ -139,6 +139,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
                   , aeModel = ModelId "llama3"
+                  , aeSystem = Nothing
                   , aeRegistry = reg
                   , aeTranscript = tHandle
                   , aeBackend = localBackend

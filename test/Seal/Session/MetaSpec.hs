@@ -6,6 +6,7 @@ import Data.Either (fromRight)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 
+import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 
@@ -17,7 +18,8 @@ sampleMeta =
   let sid = fromRight (error "bad id") (mkSessionId "20260701-120000-042")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "cli", smCreatedAt = sampleTime, smLastActive = sampleTime }
+       , smChannel = "cli", smAgent = Nothing
+       , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 spec :: Spec
 spec = describe "Seal.Session.Meta" $ do
@@ -36,3 +38,17 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smChannel (decode (encode j)) `shouldBe` Just "cli"
+
+  it "defaults agent to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smAgent (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smAgent = Just aid" $ do
+    let aid = fromRight (error "bad agent id") (mkAgentDefId "zoe")
+        m = sampleMeta { smAgent = Just aid }
+    fmap smAgent (decode (encode m)) `shouldBe` Just (Just aid)

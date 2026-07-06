@@ -38,7 +38,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" t t
+  in SessionMeta sid p m "cli" Nothing t t
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
@@ -122,7 +122,7 @@ spec = do
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid (ISA.mkRegistry []) th
+                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
 

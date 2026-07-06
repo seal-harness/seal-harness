@@ -80,14 +80,6 @@ runTui = do
             , prVault      = rt
             , prManager    = mgr
             }
-  -- Every launch starts a fresh session (resume is a follow-on milestone).
-  sessionMeta <- initSession paths cfg
-  activeRef   <- newIORef sessionMeta
-  let sr = SessionRuntime
-             { srPaths      = paths
-             , srConfigPath = cfgPath
-             , srActive     = activeRef
-             }
   -- The config directory is a git repo (versioning + audit for the
   -- evolutionary stores: skills, agent-defs, memory live as Markdown files
   -- under config/skills, config/agents, config/memory). ensureConfigRepo
@@ -98,7 +90,18 @@ runTui = do
   -- The evolutionary-store backends are disk-backed (Markdown + git), created
   -- once and shared between the @\/skill@ \/ @\/agent@ command specs
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
+  -- Built before initSession so the default agent can be resolved from disk.
   backends <- newBackends cfgRoot repo
+  -- Every launch starts a fresh session (resume is a follow-on milestone).
+  -- The default agent (if set in config) is bound here: its id persists in
+  -- smAgent and its non-empty provider/model override the config defaults.
+  sessionMeta <- initSession paths cfg (bAgentDefs backends)
+  activeRef   <- newIORef sessionMeta
+  let sr = SessionRuntime
+             { srPaths      = paths
+             , srConfigPath = cfgPath
+             , srActive     = activeRef
+             }
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr

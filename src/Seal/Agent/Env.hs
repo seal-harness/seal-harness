@@ -19,6 +19,10 @@ data AgentEnv = AgentEnv
     -- 'aeProvider' is existential and carries no name of its own.
   , aeProviderLabel :: Text
   , aeModel :: ModelId
+  , aeSystem :: Maybe Text
+    -- ^ The system prompt injected at the start of every turn. For the
+    -- main session this comes from the bound default agent's 'adSystem';
+    -- for a forked sub-agent it comes from the def's 'adSystem'.
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec

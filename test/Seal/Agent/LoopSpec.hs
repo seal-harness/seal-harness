@@ -63,6 +63,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (SomeProvider (ScriptProvider ref))
                 "ollama"
                 (ModelId "m")
+                Nothing
                 (mkRegistry [stubOp])
                 h
                 localBackend
@@ -87,6 +88,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (SomeProvider (ScriptProvider ref))
                 "ollama"
                 (ModelId "m")
+                Nothing
                 (mkRegistry [])
                 h
                 localBackend

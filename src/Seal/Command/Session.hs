@@ -11,6 +11,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
 
+import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
@@ -74,6 +75,7 @@ renderSessionInfo m =
   , "provider:    " <> smProvider m
   , "model:       " <> smModel m
   , "channel:     " <> smChannel m
+  , "agent:       " <> maybe "(none)" agentDefIdText (smAgent m)
   , "created:     " <> T.pack (show (smCreatedAt m))
   , "last active: " <> T.pack (show (smLastActive m))
   ]

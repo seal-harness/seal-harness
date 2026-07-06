@@ -38,6 +38,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           (SomeProvider (ScriptProvider ref))
           "ollama"
           (ModelId "test-model")
+          Nothing
           (ISA.mkRegistry [])
           h
           localBackend

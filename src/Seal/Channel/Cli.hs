@@ -146,11 +146,12 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> ISA.Registry -> TwoFileHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
+  , aeSystem     = system
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
@@ -248,8 +249,8 @@ runCliTui paths rt pr sr registry chain backends = do
             Left err              -> ccSend caps ("agent start failed: " <> err)
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
-                let env = mkSessionAgentEnv caps prov fallBackProvider model sid isaReg childTHandle
-                runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
+                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle
+                runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
           [ showHumanOp caps
           , askHumanOp caps
@@ -276,9 +277,15 @@ runCliTui paths rt pr sr registry chain backends = do
           eprov <- resolveSessionProvider pr meta
           case eprov of
             Left err            -> ccSend caps err
-            Right (prov, model) ->
+            Right (prov, model) -> do
+              -- Resolve the bound agent's system prompt (re-read per turn;
+              -- agent dirs are small). Nothing when no agent is bound or
+              -- the def has no system prompt.
+              mSystem <- case smAgent meta of
+                Nothing -> pure Nothing
+                Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle)
                 appEnv t
     runInputT hlSettings (loop caps plainHandler)
   where

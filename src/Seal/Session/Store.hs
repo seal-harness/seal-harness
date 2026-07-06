@@ -30,6 +30,8 @@ import System.Directory
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 
+import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Config.File (FileConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
@@ -55,15 +57,16 @@ formatSessionId t =
   in T.pack (base <> "-" <> mmm)
 
 -- | Create a fresh session directory + session.json for the given selection.
-newSession :: SealPaths -> Text -> Text -> Text -> IO SessionMeta
-newSession paths provider model channel = do
+newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
+newSession paths provider model channel mAgent = do
   now <- getCurrentTime
   sid <- case mkSessionId (formatSessionId now) of
     Right s -> pure s
     Left e  -> ioError (userError ("session id generation failed: " <> T.unpack e))
   let meta = SessionMeta
         { smId = sid, smProvider = provider, smModel = model
-        , smChannel = channel, smCreatedAt = now, smLastActive = now }
+        , smChannel = channel, smAgent = mAgent
+        , smCreatedAt = now, smLastActive = now }
   saveSessionMeta paths meta
   pure meta
 
@@ -107,8 +110,40 @@ defaultSessionSelection cfg =
     provLabel = fromMaybe "anthropic" (fcDefaultProvider cfg)
     ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
 
+-- | Resolve the default agent for a new session. Returns 'Nothing' if
+-- @default_agent@ is unset, the id fails validation, or the def is not on
+-- disk (a warning is emitted in the latter case). Otherwise returns the
+-- bound 'AgentDefId' and the def's provider/model overrides (non-empty
+-- values that should replace the config defaults).
+resolveDefaultAgent
+  :: AgentDefBackend -> FileConfig -> IO (Maybe AgentDefId, Maybe Text, Maybe Text)
+resolveDefaultAgent backend cfg =
+  case fcDefaultAgent cfg of
+    Nothing -> pure (Nothing, Nothing, Nothing)
+    Just raw ->
+      case mkAgentDefId raw of
+        Left _ -> do
+          putStrLn ("warning: default_agent " <> T.unpack raw <> " is not a valid id; proceeding without one")
+          pure (Nothing, Nothing, Nothing)
+        Right aid -> do
+          mDef <- adbRead backend aid
+          case mDef of
+            Nothing -> do
+              putStrLn ("warning: default agent " <> T.unpack raw <> " not found; proceeding without one")
+              pure (Nothing, Nothing, Nothing)
+            Just d  -> pure (Just aid, override (adProvider d), overrideModel (adModel d))
+  where
+    override t = if T.null t then Nothing else Just t
+    overrideModel (ModelId m) = if T.null m then Nothing else Just m
+
 -- | Create a new session from the config defaults, on the @cli@ channel.
-initSession :: SealPaths -> FileConfig -> IO SessionMeta
-initSession paths cfg =
-  let (p, m) = defaultSessionSelection cfg
-  in newSession paths p m "cli"
+-- If @default_agent@ is set and the def exists, its id is persisted in
+-- 'smAgent' and its non-empty provider/model override the config defaults
+-- (PureClaw @resolveOverride@ precedence: frontmatter > config > default).
+initSession :: SealPaths -> FileConfig -> AgentDefBackend -> IO SessionMeta
+initSession paths cfg backend = do
+  (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe cfgProv mProv
+      model    = fromMaybe cfgModel mModel
+  newSession paths provider model "cli" mAgent
