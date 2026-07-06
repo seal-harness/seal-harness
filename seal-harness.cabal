@@ -54,6 +54,7 @@ library
         Seal.Channel.Caps
         Seal.Channel.Cli
         Seal.Channels.Class
+        Seal.Channels.Signal.Transport
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
@@ -193,6 +194,7 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.ClassSpec
+        Seal.Channels.Signal.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec
