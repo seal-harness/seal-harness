@@ -33,17 +33,18 @@ observeClaudeCode screen markers
   | not hasSealId                    = LvOrphaned
   | T.isInfixOf "Thinking" stripped  = LvThinking
   | T.isInfixOf "Working" stripped   = LvThinking
-  | isAwaiting stripped               = LvAwaitingInput
+  | isAwaiting screen                 = LvAwaitingInput
   | otherwise                        = LvIdle
   where
     hasSealId = Map.member "seal_id" markers
     paneDead  = Map.lookup "pane_dead" markers == Just "1"
     stripped  = T.strip screen
     isAwaiting s =
-      T.isSuffixOf "> " (lastLine s)           -- the bare prompt
-      || T.isInfixOf "? (y/n)" s
-      || T.isInfixOf "? Yes/No" s
-      || T.isInfixOf "Press Enter" s
+      let ll = T.strip (lastLine s)
+      in ll == ">" || ll == ">"
+         || T.isInfixOf "? (y/n)" s
+         || T.isInfixOf "? Yes/No" s
+         || T.isInfixOf "Press Enter" s
 
 -- | The last non-empty line of a captured screen.
 lastLine :: Text -> Text

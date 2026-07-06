@@ -106,6 +106,7 @@ library
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
+        Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
         Seal.ISA.Ops.Skills
@@ -212,6 +213,7 @@ test-suite tests
         Seal.ISA.Ops.AgentSpec
         Seal.Phase2aSpec
         Seal.Phase2bSpec
+        Seal.Phase6aSpec
         Seal.Phase5Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
