@@ -35,6 +35,7 @@ library
     import: settings
     exposed-modules:
         Seal.Core.ChannelKind
+        Seal.Core.MessageSource
         Seal.Core.Paging
         Seal.Core.Types
         Seal.Providers.Anthropic
@@ -163,6 +164,7 @@ test-suite tests
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
+        Seal.Core.MessageSourceSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
