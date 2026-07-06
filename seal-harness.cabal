@@ -42,6 +42,9 @@ library
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Transcript.Types
+        Seal.Transcript.Conv
+        Seal.Transcript.Entries
+        Seal.Transcript.Reconstruct
         Seal.Handles.Transcript
         Seal.AppMain
         Seal.Channel.Caps
@@ -51,9 +54,13 @@ library
         Seal.Command.Parse
         Seal.Command.Provider
         Seal.Command.Session
+        Seal.Command.Skill
+        Seal.Command.Agent
         Seal.Command.Spec
         Seal.Config.File
         Seal.Config.Paths
+        Seal.Git.Repo
+        Seal.Store.Markdown
         Seal.Ingest
         Seal.Session.Meta
         Seal.Session.Store
@@ -74,12 +81,22 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.Def.Types
+        Seal.Agent.Def.Backend
+        Seal.Agent.Runtime.Registry
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
         Seal.ISA.Ops.Secret
+        Seal.ISA.Ops.Memory
+        Seal.ISA.Ops.Skills
+        Seal.ISA.Ops.Agent
         Seal.ISA.Registry
+        Seal.Memory.Types
+        Seal.Memory.Backend
+        Seal.Skills.Types
+        Seal.Skills.Backend
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -108,6 +125,7 @@ library
       , unix
       , unordered-containers
       , validation-selective
+      , vector
     hs-source-dirs: src
 
 executable seal
@@ -146,7 +164,21 @@ test-suite tests
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
+        Seal.Transcript.ConvSpec
+        Seal.Transcript.EntriesSpec
+        Seal.Transcript.ReconstructSpec
         Seal.Handles.TranscriptSpec
+        Seal.Memory.TypesSpec
+        Seal.Memory.BackendSpec
+        Seal.Skills.TypesSpec
+        Seal.Skills.BackendSpec
+        Seal.Agent.Def.TypesSpec
+        Seal.Agent.Def.BackendSpec
+        Seal.Agent.Runtime.RegistrySpec
+        Seal.ISA.Ops.MemorySpec
+        Seal.ISA.Ops.SkillsSpec
+        Seal.ISA.Ops.AgentSpec
+        Seal.Phase5Spec
         Seal.AppMainSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
@@ -155,6 +187,8 @@ test-suite tests
         Seal.Command.ParseSpec
         Seal.Command.ProviderSpec
         Seal.Command.SessionSpec
+        Seal.Command.SkillSpec
+        Seal.Command.AgentSpec
         Seal.Command.SpecSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec

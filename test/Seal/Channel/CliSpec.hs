@@ -17,7 +17,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..), mkSessionId)
-import Seal.Handles.Transcript (fakeTranscript)
+import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.Ingest (Disposition (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (Provider (..), SomeProvider (..))
@@ -38,7 +38,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" t t
+  in SessionMeta sid p m "cli" Nothing t t
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
@@ -118,11 +118,11 @@ spec = do
   describe "mkSessionAgentEnv" $
     it "carries the session's model and id into the AgentEnv" $ do
       (_, caps) <- makeFakeCaps []
-      (th, _)   <- fakeTranscript
+      (th, _)   <- fakeTwoFileTranscript
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid (ISA.mkRegistry []) th
+                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
 

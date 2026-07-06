@@ -8,19 +8,22 @@ import qualified Data.Text as T
 
 import Network.HTTP.Client.TLS (newTlsManager)
 
-import Seal.Channel.Cli (runCliTui)
+import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
+import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
+import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
-  ( SealPaths
+  ( SealPaths (..)
   , configFilePath
   , ensureSealDirs
   , getSealPaths
   , vaultFilePath
   )
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
@@ -77,18 +80,34 @@ runTui = do
             , prVault      = rt
             , prManager    = mgr
             }
+  -- The config directory is a git repo (versioning + audit for the
+  -- evolutionary stores: skills, agent-defs, memory live as Markdown files
+  -- under config/skills, config/agents, config/memory). ensureConfigRepo
+  -- runs `git init` + an initial empty commit if needed; idempotent.
+  let cfgRoot = spConfig paths
+  ensureConfigRepo cfgRoot
+  let repo = openConfigRepo cfgRoot
+  -- The evolutionary-store backends are disk-backed (Markdown + git), created
+  -- once and shared between the @\/skill@ \/ @\/agent@ command specs
+  -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
+  -- Built before initSession so the default agent can be resolved from disk.
+  backends <- newBackends cfgRoot repo
   -- Every launch starts a fresh session (resume is a follow-on milestone).
-  sessionMeta <- initSession paths cfg
+  -- The default agent (if set in config) is bound here: its id persists in
+  -- smAgent and its non-empty provider/model override the config defaults.
+  sessionMeta <- initSession paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
-      registry = mkRegistry
+  let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
         , sessionCommandSpec sr
         , modelCommandSpec pr sr
+        , skillCommandSpec (bSkills backends)
+        , agentCommandSpec (bAgentDefs backends) cfgPath
         ]
-  runCliTui paths rt pr sr registry emptyChain
+  runCliTui paths rt pr sr registry emptyChain backends

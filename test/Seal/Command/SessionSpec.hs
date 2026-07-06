@@ -30,7 +30,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 meta :: T.Text -> SessionMeta
 meta idText =
   let sid = fromRight (error $ "invalid session id: " <> show idText) (mkSessionId idText)
-  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" aTime aTime
+  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing aTime aTime
 
 mkSR :: FilePath -> SessionMeta -> IO SessionRuntime
 mkSR root active = do
@@ -74,7 +74,7 @@ spec = describe "Seal.Command.Session" $ do
     it "list shows saved sessions" $
       withSystemTempDirectory "seal-sess" $ \root -> do
         sr <- mkSR root (meta "20260701-000000-000")
-        _  <- newSession (srPaths sr) "anthropic" "claude-opus-4-8" "cli"
+        _  <- newSession (srPaths sr) "anthropic" "claude-opus-4-8" "cli" Nothing
         (fc, caps) <- makeFakeCaps []
         runSess sr ["list"] caps
         sent <- getSent fc

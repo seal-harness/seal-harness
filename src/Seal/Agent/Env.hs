@@ -8,7 +8,7 @@ import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.Types (ModelId, SessionId)
-import Seal.Handles.Transcript (TranscriptHandle)
+import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
@@ -19,8 +19,12 @@ data AgentEnv = AgentEnv
     -- 'aeProvider' is existential and carries no name of its own.
   , aeProviderLabel :: Text
   , aeModel :: ModelId
+  , aeSystem :: Maybe Text
+    -- ^ The system prompt injected at the start of every turn. For the
+    -- main session this comes from the bound default agent's 'adSystem';
+    -- for a forked sub-agent it comes from the def's 'adSystem'.
   , aeRegistry :: Registry
-  , aeTranscript :: TranscriptHandle
+  , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId

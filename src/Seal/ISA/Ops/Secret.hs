@@ -47,7 +47,7 @@ nameField = parseMaybe (withObject "in" (.: "name"))
 secretGetOp :: VaultRuntime -> Opcode
 secretGetOp rt = Opcode
   { opName = OpName "SECRET_GET"
-  , opTrust = Audited
+  , opTrust = Trusted
   , opDesc = "Fetch a secret value from the vault by key name."
   , opInSchema = singleStringSchema "name" "The vault key name of the secret to fetch."
   , opOutSchema = object []

@@ -20,7 +20,7 @@
 - Session id format: **`YYYYMMDD-HHMMSS-mmm`** (millisecond-padded, timestamp-leading so lexicographic = chronological); must satisfy `Seal.Core.Types.isValidSessionId`.
 - No manifest/index file — the session list is derived by enumerating `state/sessions/`.
 - Clean-room: **no prior/reference runtime named** in code, comments, docs, or commit messages.
-- TDD: failing test → fail → minimal impl → pass → commit. Each task ends green (`cabal build` + `cabal test`). Register new library modules in `seal-harness.cabal` `exposed-modules`; new specs in test-suite `other-modules` + `test/Main.hs`. One commit per task with trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+- TDD: failing test → fail → minimal impl → pass → commit. Each task ends green (`cabal build` + `cabal test`). Register new library modules in `seal-harness.cabal` `exposed-modules`; new specs in test-suite `other-modules` + `test/Main.hs`. One commit per task.
 - Test-run: full `nix develop -c cabal test`; focused `nix develop -c cabal test --test-options='-m "<pattern>"'`.
 
 **Consumes from M1 (already merged):** `Seal.Providers.Registry` — `KnownProvider (..)`, `knownProviders`, `parseProvider :: Text -> Maybe KnownProvider`, `providerLabel :: KnownProvider -> Text`, `defaultModelFor :: KnownProvider -> ModelId`, `resolveProvider :: VaultHandle -> Manager -> KnownProvider -> ModelId -> IO (Either Text SomeProvider)`; `Seal.Command.Provider` — `ProviderRuntime (..)` (`prConfigPath`, `prVault :: VaultRuntime`, `prManager :: Manager`); `Seal.Config.File` — `FileConfig (..)` incl. `fcDefaultProvider`/`fcDefaultModel`.

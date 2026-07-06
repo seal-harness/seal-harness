@@ -9,7 +9,7 @@ module Seal.Core.Types
   , ModelId (..)
   , ToolCallId (..)
   , OpName (..)
-  , SessionId
+  , SessionId (..)
   , mkSessionId
   , sessionIdText
   , isValidSessionId

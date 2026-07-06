@@ -22,6 +22,8 @@ import qualified Seal.Command.ModelSpec
 import qualified Seal.Command.ParseSpec
 import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SessionSpec
+import qualified Seal.Command.SkillSpec
+import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Vault.BackendSpec
@@ -30,7 +32,21 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Transcript.TypesSpec
+import qualified Seal.Transcript.ConvSpec
+import qualified Seal.Transcript.EntriesSpec
+import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.TranscriptSpec
+import qualified Seal.Memory.TypesSpec
+import qualified Seal.Memory.BackendSpec
+import qualified Seal.Skills.TypesSpec
+import qualified Seal.Skills.BackendSpec
+import qualified Seal.Agent.Def.TypesSpec
+import qualified Seal.Agent.Def.BackendSpec
+import qualified Seal.Agent.Runtime.RegistrySpec
+import qualified Seal.ISA.Ops.MemorySpec
+import qualified Seal.ISA.Ops.SkillsSpec
+import qualified Seal.ISA.Ops.AgentSpec
+import qualified Seal.Phase5Spec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -65,6 +81,8 @@ main = hspec $ do
   Seal.Command.ParseSpec.spec
   Seal.Command.ProviderSpec.spec
   Seal.Command.SessionSpec.spec
+  Seal.Command.SkillSpec.spec
+  Seal.Command.AgentSpec.spec
   Seal.Command.SpecSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Vault.BackendSpec.spec
@@ -73,7 +91,21 @@ main = hspec $ do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Transcript.TypesSpec.spec
+  Seal.Transcript.ConvSpec.spec
+  Seal.Transcript.EntriesSpec.spec
+  Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.TranscriptSpec.spec
+  Seal.Memory.TypesSpec.spec
+  Seal.Memory.BackendSpec.spec
+  Seal.Skills.TypesSpec.spec
+  Seal.Skills.BackendSpec.spec
+  Seal.Agent.Def.TypesSpec.spec
+  Seal.Agent.Def.BackendSpec.spec
+  Seal.Agent.Runtime.RegistrySpec.spec
+  Seal.ISA.Ops.MemorySpec.spec
+  Seal.ISA.Ops.SkillsSpec.spec
+  Seal.ISA.Ops.AgentSpec.spec
+  Seal.Phase5Spec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

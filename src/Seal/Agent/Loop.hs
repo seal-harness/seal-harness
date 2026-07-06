@@ -7,7 +7,6 @@ module Seal.Agent.Loop
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (toJSON)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -16,34 +15,44 @@ import Data.Time (getCurrentTime)
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.Types (ModelId (..))
 import Seal.Channel.Caps (ChannelCaps (..))
-import Seal.Handles.Transcript (TranscriptHandle (..))
+import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (OpResult (..))
 import Seal.ISA.Registry (registryToolDefs)
 import Seal.Providers.Class
-import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Transcript.Entries
+  ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
-  -- Record the initial user message once.
-  -- We do NOT record continuation CompletionRequests because those carry
-  -- CbToolResult blocks whose cbParts may contain secret values returned by
-  -- SECRET_GET. Recording them would violate the hard rule that no secret is
-  -- ever serialized to the transcript. The dispatcher records each opcode
-  -- invocation separately in a secret-free format.
+  -- Record the initial user message as a Request entry. The envelope delta
+  -- carries the full envelope in effect for this turn (model / system / tools
+  -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
   liftIO $ do
     now <- getCurrentTime
-    recordAsync (aeTranscript env) TranscriptEntry
-      { teId = ""
-      , teTimestamp = now
-      , teModel = Just (aeModel env)
-      , teDirection = Request
-      , tePayload = toJSON userText
-      , teDurationMs = Nothing
-      , teCorrelation = Nothing
-      , teMeta = Map.empty
-      }
+    let userMsg = textMsg User userText
+        env0 = EnvelopeDelta
+          { edModel = Just (aeModel env)
+          , edSystem = Just (aeSystem env)
+          , edTools = Just (registryToolDefs (aeRegistry env))
+          , edToolChoice = Just ToolAuto
+          , edMaxTokens = Just 4096
+          }
+        entry = EntryRecord
+          { erId = ""
+          , erTimestamp = now
+          , erKind = EKRequest
+          , erConvLen = 1
+          , erEnvelope = Just env0
+          , erUsage = Nothing
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Nothing
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+    tfwRecordAsync (aeTranscript env) (TwoFileWrite [userMsg] entry)
   go (aeMaxTurns env) [textMsg User userText]
   where
     go :: Int -> [Message] -> App ()
@@ -51,7 +60,7 @@ runTurn env userText = do
     go n msgs = do
       let req = CompletionRequest
                   { crModel = aeModel env
-                  , crSystem = Nothing
+                  , crSystem = aeSystem env
                   , crMessages = msgs
                   , crTools = registryToolDefs (aeRegistry env)
                   , crToolChoice = ToolAuto
@@ -62,22 +71,30 @@ runTurn env userText = do
         Left err ->
           liftIO (ccSend (aeCaps env) ("provider error: " <> err))
         Right resp -> do
-          -- Record each provider response. Safe because CompletionResponse only
+          -- Record the provider response. Safe because CompletionResponse only
           -- contains CbText and CbToolUse blocks (model output + tool-call
           -- INPUTS). It never contains CbToolResult, so a vault secret value
-          -- cannot appear here.
+          -- cannot appear here. The assistant message is appended to the
+          -- conversation file; the response metadata (usage / stop) goes to
+          -- the entries file.
           liftIO $ do
             now <- getCurrentTime
-            recordAsync (aeTranscript env) TranscriptEntry
-              { teId = ""
-              , teTimestamp = now
-              , teModel = Just (aeModel env)
-              , teDirection = Response
-              , tePayload = toJSON (rsContent resp)
-              , teDurationMs = Nothing
-              , teCorrelation = Nothing
-              , teMeta = Map.empty
-              }
+            let assistantMsg = Message Assistant (rsContent resp)
+                conv = msgs <> [assistantMsg]
+                entry = EntryRecord
+                  { erId = ""
+                  , erTimestamp = now
+                  , erKind = EKResponse
+                  , erConvLen = length conv
+                  , erEnvelope = Nothing
+                  , erUsage = Just (rsUsage resp)
+                  , erStop = Just (rsStop resp)
+                  , erDurationMs = Nothing
+                  , erHarness = Nothing
+                  , erCorrelation = Nothing
+                  , erMeta = Map.empty
+                  }
+            tfwRecordAsync (aeTranscript env) (TwoFileWrite conv entry)
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
             then liftIO $

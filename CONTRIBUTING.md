@@ -176,8 +176,7 @@ fail, then make it pass.
 3. **Include tests** for new behavior, and reference the issue you're closing
    (`Closes #NN`).
 4. **Never** use `git commit --no-verify` or skip CI gates.
-5. Write a clear commit message describing the *why*. If a change was AI-assisted,
-   you may add a `Co-Authored-By:` trailer.
+5. Write a clear commit message describing the *why*.
 
 CI builds and tests on Linux and macOS via Nix; a PR cannot merge red.
 

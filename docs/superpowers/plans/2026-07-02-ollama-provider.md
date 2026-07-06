@@ -18,7 +18,7 @@
   - Build: `cabal build all`
   - Full test: `cabal test`
   - Focused test: `cabal test --test-options='--match "<needle>"'`
-- **Commit style:** frequent, one per task. End commit messages with the repo's `Co-Authored-By` trailer only if the user's git config expects it; otherwise a plain conventional-commit subject is fine.
+- **Commit style:** frequent, one per task.
 
 ---
 

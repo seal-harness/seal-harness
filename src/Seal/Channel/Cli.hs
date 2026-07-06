@@ -8,6 +8,8 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , mkSessionAgentEnv
+  , Backends (..)
+  , newBackends
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -15,6 +17,7 @@ import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Time (getCurrentTime)
 import System.Console.Haskeline
   ( InputT
   , Settings (..)
@@ -24,7 +27,7 @@ import System.Console.Haskeline
   , noCompletion
   , runInputT
   )
-import System.Directory (getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
@@ -34,25 +37,67 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), sessionTranscriptPath)
-import Seal.Core.Types (ModelId (..), SessionId)
-import Seal.Handles.Transcript (TranscriptHandle, withTranscript)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
+import Seal.Core.Paging (defaultPageParams)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
+import Seal.Git.Repo (ConfigRepo (..))
+import Seal.Handles.Transcript
+  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
+import Seal.ISA.Ops.Memory
+  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
+import Seal.ISA.Ops.Skills
+  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+import Seal.ISA.Ops.Agent
+  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
+  , agentListOp, agentStartOp, agentStatusOp, agentStopOp )
+import Seal.Memory.Backend qualified as Mem
+import Seal.Skills.Backend qualified as Skill
+import Seal.Agent.Def.Backend qualified as Def
+import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
+import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..))
+import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | The evolutionary-store backends + the in-process agent runtime, created
+-- once at startup and shared between the command specs (which read them via
+-- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). The three
+-- store backends are disk-backed (Markdown files under @config\/@); disk is
+-- canonical and git is the versioning + audit layer. The agent runtime is an
+-- in-process STM registry (lifecycle only — not persisted).
+data Backends = Backends
+  { bMemory    :: Mem.MemoryBackend
+  , bSkills    :: Skill.SkillBackend
+  , bAgentDefs :: Def.AgentDefBackend
+  , bRuntime   :: AgentRuntime
+  }
+
+-- | Construct the disk-backed backends for the given config repo. The three
+-- stores read their directories on demand (no startup materialization needed
+-- — disk is canonical, so @\/skill list@ etc. just enumerate the dir).
+newBackends :: FilePath -> ConfigRepo -> IO Backends
+newBackends cfgRoot repo = do
+  let skillsDir    = cfgRoot </> "skills"
+      agentsDir    = cfgRoot </> "agents"
+      memoryDir    = cfgRoot </> "memory"
+  Backends
+    <$> Mem.markdownMemoryBackend memoryDir repo
+    <*> Skill.markdownSkillBackend skillsDir repo
+    <*> Def.markdownAgentDefBackend agentsDir repo
+    <*> newAgentRuntime
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -86,14 +131,27 @@ resolveSessionProvider pr meta =
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
 
+-- | Resolve a provider+model from explicit labels (for AGENT_START, which
+-- builds a fresh AgentEnv from a def rather than the active session).
+resolveDefProvider :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
+resolveDefProvider pr providerLabel model =
+  case parseProvider providerLabel of
+    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel))
+    Just kp -> do
+      eCfg <- loadFileConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
+      mh <- readIORef (vrHandleRef (prVault pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
+
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> ISA.Registry -> TranscriptHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
+  , aeSystem     = system
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
@@ -111,11 +169,11 @@ mkSessionAgentEnv caps provider provLabel model sid isaReg tHandle = AgentEnv
 -- immediately.
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> IO ()
-runCliTui paths rt pr sr registry chain = do
+  -> Registry -> PreprocessChain -> Backends -> IO ()
+runCliTui paths rt pr sr registry chain backends = do
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
-      transcriptPath = sessionTranscriptPath paths (smId active0)
+      sessionDirPath = sessionDir paths (smId active0)
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = ChannelCaps
@@ -130,8 +188,12 @@ runCliTui paths rt pr sr registry chain = do
               pure (maybe "" T.pack mPass)
         }
   -- Startup diagnostic: show which provider+model the active session will use
-  -- for plain-text turns (resolved from config at session creation).
-  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0)
+  -- for plain-text turns (resolved from config at session creation), and the
+  -- bound default agent (if any).
+  let agentLine = case smAgent active0 of
+        Nothing -> ""
+        Just aid -> "  agent: " <> agentDefIdText aid
+  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
   -- Resolve the operator-configured retrieval ceiling (the hard upper bound
@@ -140,24 +202,94 @@ runCliTui paths rt pr sr registry chain = do
   -- change takes effect on the next session.
   eCfg <- loadFileConfig (prConfigPath pr)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-  -- The transcript bracket wraps the whole loop so every turn shares one writer.
-  -- The opcodes (and thus the ISA registry) close over `caps`, so they are built
-  -- here where both `caps` and the transcript handle are in scope.
-  withTranscript transcriptPath $ \tHandle -> do
-    let isaReg = ISA.mkRegistry
+  -- The two-file transcript bracket wraps the whole loop so every turn shares
+  -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
+  -- they are built here where both `caps` and the transcript handle are in
+  -- scope. Legacy sessions with an existing @transcript.jsonl@ are left
+  -- untouched (the legacy read path handles them); new sessions get the
+  -- @conversation.jsonl@ + @entries.jsonl@ pair. The evolutionary-store
+  -- backends (memory/skills/agent-defs) are disk-backed Markdown files under
+  -- @config\/@, shared with the @\/skill@ and @\/agent@ command specs (built in
+  -- 'Seal.Tui.runTui' from the same 'Backends' record). Disk is canonical;
+  -- git is the versioning + audit layer. No startup materialization is needed
+  -- — the backends read their directories on demand.
+  let memoryBackend    = bMemory backends
+      skillBackend     = bSkills backends
+      agentDefBackend  = bAgentDefs backends
+      agentRuntime     = bRuntime backends
+  withTwoFileTranscript sessionDirPath $ \tHandle -> do
+    let sid0 = smId active0
+        -- Mint a fresh SessionId for a forked agent instance. Each start
+        -- gets its own timestamped id (a re-start of the same def does not
+        -- append to a prior instance's transcript).
+        mintAgentSession = do
+          now <- getCurrentTime
+          case mkSessionId (formatSessionId now) of
+            Right s  -> pure s
+            -- unreachable: formatSessionId only emits digits and dashes
+            Left _e  -> pure sid0
+        -- The AGENT_START worker-builder: resolve the def's provider+model,
+        -- open a fresh two-file transcript under
+        -- @\<parent-session\>\/agents\/\<child-id\>@, build a fresh AgentEnv
+        -- bound to the new session + child transcript, and run a turn. The
+        -- child gets its OWN TwoFileHandle so its conversation/entries stay
+        -- separate from the parent's — mixing them would corrupt the two-file
+        -- format's per-session erConvLen and envelope-delta fold.
+        mkWorker def sid = do
+          let childDir = agentSessionDir paths sid0 sid
+          createDirectoryIfMissing True childDir
+          -- Resolve the def's provider+model. Empty fields (e.g. a
+          -- DirScheme agent with no AGENTS.md frontmatter) fall back to
+          -- the active session's provider+model (symmetric). A
+          -- non-empty-but-unknown provider still fails with the existing
+          -- error.
+          active <- readIORef (srActive sr)
+          let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+              fallBackModel = case adModel def of
+                ModelId m | T.null m -> smModel active
+                          | otherwise -> m
+          eprov <- resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
+          case eprov of
+            Left err              -> ccSend caps ("agent start failed: " <> err)
+            Right (prov, model)   ->
+              withTwoFileTranscript childDir $ \childTHandle -> do
+                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle
+                runApp appEnv (runTurn env "")
+        isaReg = ISA.mkRegistry
           [ showHumanOp caps
           , askHumanOp caps
           , fileReadOp wsRoot operatorCeiling
           , secretGetOp rt
+          , memoryStoreOp memoryBackend sid0
+          , memoryRecallOp defaultPageParams memoryBackend
+          , memoryUpdateOp memoryBackend
+          , memoryDeleteOp memoryBackend
+          , skillCreateOp skillBackend sid0
+          , skillReadOp skillBackend
+          , skillUpdateOp skillBackend
+          , skillListOp skillBackend
+          , agentDefCreateOp agentDefBackend sid0
+          , agentDefReadOp agentDefBackend
+          , agentDefUpdateOp agentDefBackend
+          , agentListOp agentRuntime
+          , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
+          , agentStatusOp agentRuntime
+          , agentStopOp agentRuntime
           ]
         plainHandler t = do
           meta  <- readIORef (srActive sr)
           eprov <- resolveSessionProvider pr meta
           case eprov of
             Left err            -> ccSend caps err
-            Right (prov, model) ->
+            Right (prov, model) -> do
+              -- Resolve the bound agent's system prompt (re-read per turn;
+              -- agent dirs are small). Nothing when no agent is bound or
+              -- the def has no system prompt.
+              mSystem <- case smAgent meta of
+                Nothing -> pure Nothing
+                Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle)
                 appEnv t
     runInputT hlSettings (loop caps plainHandler)
   where
