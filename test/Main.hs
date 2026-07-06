@@ -2,6 +2,7 @@ module Main (main) where
 
 import Test.Hspec
 
+import qualified Seal.Core.ChannelKindSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.AppMainSpec
@@ -61,6 +62,7 @@ import qualified Seal.ISA.RegistrySpec
 
 main :: IO ()
 main = hspec $ do
+  Seal.Core.ChannelKindSpec.spec
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
   Seal.AppMainSpec.spec

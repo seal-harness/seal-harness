@@ -34,6 +34,7 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.ChannelKind
         Seal.Core.Paging
         Seal.Core.Types
         Seal.Providers.Anthropic
@@ -161,6 +162,7 @@ test-suite tests
       , unix
     hs-source-dirs: test
     other-modules:
+        Seal.Core.ChannelKindSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
