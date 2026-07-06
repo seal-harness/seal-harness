@@ -121,7 +121,7 @@ mkSid :: Text -> SessionId
 mkSid t = case mkSessionId t of Right s -> s; Left _ -> error "bad sid"
 
 runCommand :: CommandAction -> ChannelCaps -> IO ()
-runCommand act caps = runCommandAction act caps
+runCommand = runCommandAction
 
 -- | Render a ParseOutcome for error messages (it has no Show instance).
 showPO :: ParseOutcome -> String
