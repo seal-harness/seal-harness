@@ -49,6 +49,7 @@ library
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
+        Seal.Handles.Harness
         Seal.Handles.Transcript
         Seal.Harness.Id
         Seal.AppMain
@@ -184,6 +185,7 @@ test-suite tests
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
+        Seal.Handles.HarnessSpec
         Seal.Handles.TranscriptSpec
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
