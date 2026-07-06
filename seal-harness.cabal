@@ -192,6 +192,7 @@ test-suite tests
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.AgentSpec
         Seal.Phase2aSpec
+        Seal.Phase2bSpec
         Seal.Phase5Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
