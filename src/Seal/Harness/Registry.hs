@@ -23,7 +23,7 @@ module Seal.Harness.Registry
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -79,8 +79,9 @@ lookupById :: HarnessRegistry -> HarnessId -> STM (Maybe HarnessEntry)
 lookupById (HarnessRegistry tv) hid = Map.lookup hid <$> readTVar tv
 
 lookupByLabel :: HarnessRegistry -> Text -> STM (Maybe HarnessEntry)
-lookupByLabel (HarnessRegistry tv) label =
-  Map.elems <$> readTVar tv >>= \es -> pure (es ? label)
+lookupByLabel (HarnessRegistry tv) label = do
+  es <- Map.elems <$> readTVar tv
+  pure (es ? label)
   where
     es ? lbl = case filter (\e -> heLabel e == lbl) es of
       (e:_) -> Just e
@@ -99,7 +100,7 @@ delete (HarnessRegistry tv) hid = writeTVar tv . Map.delete hid =<< readTVar tv
 -- | All entries, sorted by id (deterministic snapshot order).
 snapshot :: HarnessRegistry -> IO [HarnessEntry]
 snapshot (HarnessRegistry tv) =
-  sortOn heId . Map.elems <$> atomically (readTVar tv)
+  sortOn heId . Map.elems <$> readTVarIO tv
 
 -- | Merge a list of observed harnesses (from the reconcile sweep) into the
 -- registry **inside one STM transaction**, so concurrent inserts never
@@ -114,7 +115,7 @@ mergeReconcile (HarnessRegistry tv) observed = do
   m0 <- readTVar tv
   let m1 = foldl applyObs m0 observed
   writeTVar tv m1
-  pure [ e | e <- Map.elems m1, heId e `elem` (map ohId observed) ]
+  pure [ e | e <- Map.elems m1, heId e `elem` map ohId observed ]
   where
     applyObs m oh =
       let hid = ohId oh
