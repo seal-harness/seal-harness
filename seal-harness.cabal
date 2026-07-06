@@ -44,6 +44,7 @@ library
         Seal.Providers.Class
         Seal.Providers.Ollama
         Seal.Providers.Registry
+        Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
         Seal.Transcript.Entries
@@ -197,6 +198,7 @@ test-suite tests
         Seal.Harness.TmuxIOSpec
         Seal.Harness.DiscoverySpec
         Seal.Tabs.TypesSpec
+        Seal.Routing.RouteSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
