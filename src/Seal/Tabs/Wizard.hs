@@ -43,7 +43,7 @@ data WizardReply
 buildWizard :: TabKind -> [AttachTarget] -> WizardState
 buildWizard kind targets =
   WizardState
-    { wsTargets = zipWith (,) (map mkIdx [1..]) targets
+    { wsTargets = zip (map mkIdx [1..]) targets
     , wsKind    = kind
     }
   where
