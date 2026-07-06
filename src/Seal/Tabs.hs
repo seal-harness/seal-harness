@@ -12,7 +12,7 @@ module Seal.Tabs
   , focusTabH
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.Text (Text)
 
 import Seal.Handles.Tab (TabIndex, TabKind)
@@ -28,7 +28,7 @@ newTabsHandle :: IO TabsHandle
 newTabsHandle = TabsHandle <$> newTVarIO emptyTabList
 
 snapshotTabs :: TabsHandle -> IO TabList
-snapshotTabs (TabsHandle tv) = atomically (readTVar tv)
+snapshotTabs (TabsHandle tv) = readTVarIO tv
 
 -- | Insert a tab at the lowest free slot. 'Right' the new index; 'Left' on
 -- I2 (duplicate ref) or full.
