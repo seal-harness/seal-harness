@@ -21,7 +21,7 @@ import Seal.Tabs.Types
   ( ForceMode (..), TabKindArg (..), TabSlashCommand (..) )
 
 -- | A parse error from the routing grammar.
-data ParseError = ParseError Text
+newtype ParseError = ParseError Text
   deriving stock (Eq, Show)
 
 -- | The Layer-1 routing decision.
