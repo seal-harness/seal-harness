@@ -110,13 +110,16 @@ defaultCmd backend cfgPath mArg = CommandAction $ \caps ->
                 Left e   -> ccSend caps e
                 Right () -> ccSend caps ("default agent set to: " <> agentDefIdText aid)
 
--- | One line per def for @/agent list@.
+-- | One line per def for @/agent list@. Empty provider/model (e.g. a
+-- DirScheme agent with no @AGENTS.md@ frontmatter) render as @default@.
 renderAgentLine :: AgentDef -> Text
 renderAgentLine d =
   agentDefIdText (adId d) <> "  " <> adName d
-    <> "  (" <> adProvider d <> "/" <> modelName <> ")"
+    <> "  (" <> providerLabel <> "/" <> modelLabel <> ")"
   where
     ModelId modelName = adModel d
+    providerLabel = if T.null (adProvider d) then "default" else adProvider d
+    modelLabel = if T.null modelName then "default" else modelName
 
 -- | Multi-line detail for @/agent info@.
 renderAgentInfo :: AgentDef -> [Text]

@@ -233,12 +233,22 @@ runCliTui paths rt pr sr registry chain backends = do
         mkWorker def sid = do
           let childDir = agentSessionDir paths sid0 sid
           createDirectoryIfMissing True childDir
-          eprov <- resolveDefProvider pr (adProvider def) (adModel def)
+          -- Resolve the def's provider+model. Empty fields (e.g. a
+          -- DirScheme agent with no AGENTS.md frontmatter) fall back to
+          -- the active session's provider+model (symmetric). A
+          -- non-empty-but-unknown provider still fails with the existing
+          -- error.
+          active <- readIORef (srActive sr)
+          let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+              fallBackModel = case adModel def of
+                ModelId m | T.null m -> smModel active
+                          | otherwise -> m
+          eprov <- resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
           case eprov of
             Left err              -> ccSend caps ("agent start failed: " <> err)
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
-                let env = mkSessionAgentEnv caps prov (adProvider def) model sid isaReg childTHandle
+                let env = mkSessionAgentEnv caps prov fallBackProvider model sid isaReg childTHandle
                 runApp appEnv (runTurn env (fromMaybe "" (adSystem def)))
         isaReg = ISA.mkRegistry
           [ showHumanOp caps

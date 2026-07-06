@@ -25,6 +25,7 @@ module Seal.Store.Markdown
   , fmLookup
   , fmLookupList
   , splitFrontmatter
+  , splitFrontmatterRaw
   , encodeDoc
   , decodeDoc
   , renderValue
@@ -64,6 +65,25 @@ splitFrontmatter content =
                 Nothing   -> afterBreak  -- malformed; keep as-is
                 Just after -> T.dropWhile (== '\n') after
           in (fm, body)
+
+-- | Split a frontmatter fence off the front of a document, returning the
+-- **raw** inner block (unparsed) and the body after the closing fence.
+-- Mirrors PureClaw's @extractFrontmatter@: recognizes a leading @"---\\n"@
+-- and a terminating @"\\n---\\n"@. Returns @('Nothing', originalInput)@ when
+-- the document does not start with a fence or the fence is not closed. Use
+-- this when the frontmatter is a non-YAML-ish dialect (e.g. TOML, as in
+-- PureClaw-style @AGENTS.md@) and the caller wants to decode the inner
+-- block with a dedicated codec rather than 'parseFrontmatter'.
+splitFrontmatterRaw :: Text -> (Maybe Text, Text)
+splitFrontmatterRaw input =
+  case T.stripPrefix "---\n" input of
+    Nothing -> (Nothing, input)
+    Just rest ->
+      case T.breakOn "\n---\n" rest of
+        (_, "") -> (Nothing, input)  -- no closing fence
+        (inner, afterBreak) ->
+          let body = T.drop (T.length ("\n---\n" :: Text)) afterBreak
+          in (Just inner, body)
 
 -- | Parse a block of @key: value@ lines into a 'Frontmatter' map. Blank lines
 -- and lines starting with @#@ are skipped.
