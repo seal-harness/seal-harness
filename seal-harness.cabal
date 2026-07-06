@@ -185,6 +185,7 @@ test-suite tests
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
         Seal.Harness.TmuxSpec
+        Seal.Harness.TmuxIOSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
