@@ -9,14 +9,20 @@ module Seal.Channels.Signal.Transport
   , mkMockSignalTransport
   , mkRealSignalTransport
   , chunkMessage
+  , SignalEnvelope (..)
+  , parseSignalEnvelope
+  , conversationIdForSignal
   ) where
 
 import Control.Concurrent.STM (atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Exception (IOException, try)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -27,6 +33,8 @@ import System.Process
   ( CreateProcess (..), StdStream (..), proc, terminateProcess, waitForProcess
   , withCreateProcess )
 import System.Timeout (timeout)
+
+import Seal.Core.MessageSource (ConversationId (..), UserId (..), mkConversationId, mkUserId)
 
 -- | The testability seam over signal-cli.
 data SignalTransport = SignalTransport
@@ -189,3 +197,108 @@ findLineBreak limit s =
   in case T.breakOnEnd "\n" window of
        (pre, _post) | not (T.null pre) -> Just (T.length pre)
        _ -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- SignalEnvelope — parsed inbound envelope + server-derived conversation id
+-- ---------------------------------------------------------------------------
+
+-- | A parsed inbound signal-cli envelope: the peer-derived conversation id,
+-- the sender's user id, and the message body. The conversation id is
+-- **server-derived from authenticated transport metadata** (the peer's
+-- phone number + UUID), never read from the message body — enforced
+-- structurally by 'conversationIdForSignal' taking only the peer fields.
+data SignalEnvelope = SignalEnvelope
+  { seConversationId :: ConversationId
+  , seSender         :: UserId
+  , seBody           :: Text
+  } deriving stock (Eq, Show)
+
+-- | Derive the server-side 'ConversationId' from the peer's authenticated
+-- transport metadata. signal-cli envelopes carry both a phone number
+-- (@source@) and a UUID (@sourceUuid@); the conversation id is
+-- @sig:<source>:<sourceUuid>@ (or @sig:<source>@ when the UUID is absent).
+-- Never reads the message body. A missing or empty @source@ is rejected
+-- (a peer phone number is required).
+conversationIdForSignal :: Maybe Text -> Maybe Text -> Either Text ConversationId
+conversationIdForSignal mSource mUuid =
+  case mSource of
+    Nothing        -> Left "signal envelope missing source (peer phone number)"
+    Just src
+      | T.null src -> Left "signal envelope source is empty"
+      | otherwise  -> mkConversationId full
+      where
+        full = case mUuid of
+          Nothing   -> "sig:" <> src
+          Just uuid -> "sig:" <> src <> ":" <> uuid
+
+-- | Parse a raw signal-cli JSON value into a 'SignalEnvelope'. Handles both
+-- raw envelopes (@{"envelope": {...}}@) and JSON-RPC-wrapped messages
+-- (@{"jsonrpc":"2.0","method":"receive","params":{"envelope":{...}}}@).
+-- Returns 'Left' on a malformed value, a missing peer field, or a
+-- conversation-id smart-constructor failure. The body is taken from the
+-- envelope's @dataMessage.message@; a @conversationId@ key in the body is
+-- IGNORED (the conversation id is always server-derived via
+-- 'conversationIdForSignal').
+parseSignalEnvelope :: Value -> Either Text SignalEnvelope
+parseSignalEnvelope v = do
+  env <- unwrapEnvelope v
+  source <- fieldText "source" env
+  let mUuid = fieldTextMaybe "sourceUuid" env
+  cid <- conversationIdForSignal (Just source) mUuid
+  uid <- case mkUserId source of
+    Right u  -> Right u
+    Left err -> Left ("signal sender not a valid UserId: " <> err)
+  let body = extractBody env
+  Right SignalEnvelope
+    { seConversationId = cid
+    , seSender         = uid
+    , seBody           = body
+    }
+
+-- | Unwrap a raw envelope (@{"envelope": {...}}@) or a JSON-RPC-wrapped
+-- message (@{"params": {"envelope": {...}}}@) to the inner envelope object.
+-- Returns 'Left' if neither shape is present or the value is not an object.
+unwrapEnvelope :: Value -> Either Text Value
+unwrapEnvelope v =
+  case v of
+    A.Object o ->
+      case KeyMap.lookup (Key.fromString "envelope") o of
+        Just env -> Right env
+        Nothing -> case KeyMap.lookup (Key.fromString "params") o of
+          Just (A.Object p) -> case KeyMap.lookup (Key.fromString "envelope") p of
+            Just env -> Right env
+            Nothing  -> Left "signal envelope: no envelope in params"
+          _ -> Left "signal envelope: no envelope and no params"
+    _ -> Left "signal envelope: not an object"
+
+-- | Extract a required text field from an object, failing on absence or
+-- non-text value.
+fieldText :: Text -> Value -> Either Text Text
+fieldText key v =
+  case v of
+    A.Object o -> case KeyMap.lookup (Key.fromString (T.unpack key)) o of
+      Just (A.String t) -> Right t
+      _ -> Left ("signal envelope missing or non-text field: " <> key)
+    _ -> Left ("signal envelope field " <> key <> ": not an object")
+
+-- | Extract an optional text field from an object.
+fieldTextMaybe :: Text -> Value -> Maybe Text
+fieldTextMaybe key v = do
+  inner <- fieldValueMaybe key v
+  case inner of
+    A.String t -> Just t
+    _ -> Nothing
+
+-- | Extract an optional sub-value from an object.
+fieldValueMaybe :: Text -> Value -> Maybe Value
+fieldValueMaybe key v =
+  case v of
+    A.Object o -> KeyMap.lookup (Key.fromString (T.unpack key)) o
+    _ -> Nothing
+
+-- | Extract the message body from @dataMessage.message@. Empty when absent
+-- (a non-data envelope, e.g. a receipt — the caller drops these).
+extractBody :: Value -> Text
+extractBody v = fromMaybe "" $ do
+  dm <- fieldValueMaybe "dataMessage" v
+  fieldTextMaybe "message" dm

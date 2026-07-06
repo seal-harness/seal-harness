@@ -194,6 +194,7 @@ test-suite tests
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.ClassSpec
+        Seal.Channels.Signal.EnvelopeSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
