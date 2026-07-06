@@ -53,7 +53,10 @@ library
         Seal.Handles.Transcript
         Seal.Harness.Id
         Seal.Harness.Registry
+        Seal.Harness.Observer
+        Seal.Harness.Reconcile
         Seal.Harness.Tmux
+        Seal.Session.Kind
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -184,6 +187,7 @@ test-suite tests
         Seal.Core.PagingSpec
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
+        Seal.Harness.ReconcileSpec
         Seal.Harness.TmuxSpec
         Seal.Harness.TmuxIOSpec
         Seal.Transcript.TypesSpec
