@@ -57,6 +57,11 @@ ensureConfigRepo root = do
     then ensureInitialCommit root
     else do
       _ <- runGit root ["init"]
+      -- Set a local identity so commits succeed in environments without a
+      -- global git config (e.g. CI runners). Local config is scoped to this
+      -- repo and never touches the user's global settings.
+      _ <- runGit root ["config", "user.name", "seal"]
+      _ <- runGit root ["config", "user.email", "seal@localhost"]
       ensureInitialCommit root
   -- The three evolutionary-store subdirectories. Created here (not in the
   -- backends) so a hand-edit user who drops a file finds the dirs ready, and
