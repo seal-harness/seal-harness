@@ -59,7 +59,7 @@ import Seal.ISA.Ops.Agent
 import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
-import Seal.Agent.Def.Types (AgentDef (..))
+import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
 import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
@@ -188,8 +188,12 @@ runCliTui paths rt pr sr registry chain backends = do
               pure (maybe "" T.pack mPass)
         }
   -- Startup diagnostic: show which provider+model the active session will use
-  -- for plain-text turns (resolved from config at session creation).
-  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0)
+  -- for plain-text turns (resolved from config at session creation), and the
+  -- bound default agent (if any).
+  let agentLine = case smAgent active0 of
+        Nothing -> ""
+        Just aid -> "  agent: " <> agentDefIdText aid
+  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
   wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
   -- Resolve the operator-configured retrieval ceiling (the hard upper bound
