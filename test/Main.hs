@@ -4,6 +4,7 @@ import Test.Hspec
 
 import qualified Seal.Core.ChannelKindSpec
 import qualified Seal.Core.MessageSourceSpec
+import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.AppMainSpec
@@ -65,6 +66,7 @@ main :: IO ()
 main = hspec $ do
   Seal.Core.ChannelKindSpec.spec
   Seal.Core.MessageSourceSpec.spec
+  Seal.Core.AllowListSpec.spec
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
   Seal.AppMainSpec.spec

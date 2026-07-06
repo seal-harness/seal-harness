@@ -7,15 +7,13 @@ module Seal.Security.Policy
   , isCommandAllowed
   ) where
 
-import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 
+import Seal.Core.AllowList (AllowList (..))
+
 newtype CommandName = CommandName Text
   deriving stock (Eq, Ord, Show)
-
-data AllowList a = AllowAll | AllowOnly (Set a)
-  deriving stock (Eq, Show)
 
 data AutonomyLevel = Full | Supervised | Deny
   deriving stock (Eq, Show)

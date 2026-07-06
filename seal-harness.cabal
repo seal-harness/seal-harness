@@ -34,6 +34,7 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.AllowList
         Seal.Core.ChannelKind
         Seal.Core.MessageSource
         Seal.Core.Paging
@@ -165,6 +166,7 @@ test-suite tests
     other-modules:
         Seal.Core.ChannelKindSpec
         Seal.Core.MessageSourceSpec
+        Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Transcript.TypesSpec
