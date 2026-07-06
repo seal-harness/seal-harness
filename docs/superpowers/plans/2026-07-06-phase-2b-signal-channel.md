@@ -29,12 +29,14 @@ must run on a non-CLI channel, and the `ChannelHandle` must back a real
 
 ## Tech Stack
 
-Haskell (GHC2021), Cabal, Nix dev shell. New deps: **`process`** (the
-`System.Process` family — `createProcess`/`pipeHandle`/`hGetLine`/`hPutStrLn`/`waitForProcess`).
-**Do NOT use `typed-process`** in the new Signal transport code — use
-`process` (System.Process) directly. (Existing modules — `Vault.Age`,
-`Git.Repo`, `Provider`, `Backend` — still use `typed-process`; they are
-untouched in 2b. A repo-wide migration off `typed-process` is out of scope.)
+Haskell (GHC2021), Cabal, Nix dev shell. Uses **`process`**
+(`System.Process` — `createProcess`/`withCreateProcess`/`waitForProcess`/
+`hGetLine`/`hPutStrLn`). The repo was migrated off `typed-process` to
+`process` in the commit preceding this plan (see
+`Seal.Security.Vault.Age.readProcessBinary` /
+`Seal.Vault.Backend.readProcessNoInput` /
+`Seal.Git.Repo.readProcessBinaryCwd` for the established binary-capture
+helper pattern — reuse it for the signal-cli transport).
 
 Existing deps used: `aeson`, `text`, `bytestring`, `stm` (the inbox
 `TQueue`), `containers`. Build/test via `nix develop --command cabal build
@@ -170,15 +172,21 @@ chunkMessage :: Int -> Text -> [Text]
 
 ### `mkRealSignalTransport` — `process` usage
 
-Uses `System.Process` (`createProcess` with `std_in`/`std_out`/`std_err` =
-`CreatePipe`, no shell, fixed argv). The argv is built from the
+Uses `System.Process` — `withCreateProcess` with `std_in`/`std_out` =
+`CreatePipe` (`std_err` = `Inherit` so signal-cli diagnostics surface on
+the harness's stderr), no shell, fixed argv. The argv is built from the
 smart-constructed `SignalAccount` (T2) so option injection fails to
 compile. Line-buffered: `stReceive` is `hGetLine` on the child's stdout +
 `decode` (aeson); `stSend` is `hPutStrLn` on the child's stdin (a JSON-RPC
 `send` frame). `stClose` is `hClose` on both handles + `terminateProcess` +
 `waitForProcess` (with a timeout — use `System.Timeout.timeout`). A
-preflight `signal-cli --version` probe (mirroring `Vault.Age`'s `age
---version` preflight) fails fast if the binary is absent.
+preflight `signal-cli --version` probe (mirroring `Vault.Age`'s
+`callProcessNoOutput "age" ["--version"]`) fails fast if the binary is
+absent. Reuse the binary-capture helper pattern from
+`Seal.Security.Vault.Age.readProcessBinary` if a one-shot capture is
+needed, but the transport is a long-lived streaming process so
+`withCreateProcess` + persistent handles is the right shape here (not
+`readProcessBinary`).
 
 ### `chunkMessage` invariants (QuickCheck)
 
@@ -214,7 +222,8 @@ the last chunk has none; `concat == id`.
 - [ ] **Red-verify.** Fails (module missing).
 - [ ] **Green.** Implement `src/Seal/Channels/Signal/Transport.hs`.
   Register `Seal.Channels.Signal.Transport` in `exposed-modules` (under
-  `Seal.Channels.Class`). Add `process` to the library + test `build-depends`.
+  `Seal.Channels.Class`). (`process` is already in `build-depends` from the
+  migration commit; ` stm`/`aeson`/`bytestring` are already present.)
 - [ ] **Green-verify.** Build + test + hlint clean.
 - [ ] **Commit.** `feat(signal): transport seam + chunkMessage`
 
