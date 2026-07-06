@@ -50,6 +50,7 @@ library
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
         Seal.Handles.Transcript
+        Seal.Harness.Id
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
@@ -135,6 +136,8 @@ library
       , unordered-containers
       , validation-selective
       , vector
+      , random
+      , uuid-types
     hs-source-dirs: src
 
 executable seal
@@ -175,6 +178,7 @@ test-suite tests
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
+        Seal.Harness.IdSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec

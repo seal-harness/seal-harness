@@ -45,6 +45,7 @@ import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.ChannelSpec
 import qualified Seal.Handles.TranscriptSpec
+import qualified Seal.Harness.IdSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
@@ -116,6 +117,7 @@ main = hspec $ do
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.ChannelSpec.spec
   Seal.Handles.TranscriptSpec.spec
+  Seal.Harness.IdSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec
