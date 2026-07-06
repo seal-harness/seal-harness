@@ -78,6 +78,7 @@ library
         Seal.Command.Provider
         Seal.Command.Session
         Seal.Command.Skill
+        Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Spec
         Seal.Config.File
@@ -244,6 +245,7 @@ test-suite tests
         Seal.Command.SkillSpec
         Seal.Command.AgentSpec
         Seal.Command.SpecSpec
+        Seal.Command.TabSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
