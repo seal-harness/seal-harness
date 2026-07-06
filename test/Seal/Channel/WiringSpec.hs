@@ -45,6 +45,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           caps
           (either (error "sid") id (mkSessionId "cli"))
           4
+          Nothing
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc

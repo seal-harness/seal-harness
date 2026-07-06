@@ -146,6 +146,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeCaps = caps
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
                   }
       runTestApp (runTurn env "run the capstone")
       -- 1. Each mutation landed as a Markdown file under config/.

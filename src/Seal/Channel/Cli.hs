@@ -158,6 +158,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
+  , aeMessageSource = Nothing
   }
 
 -- | Run the Haskeline TUI loop.

@@ -7,12 +7,16 @@ module Seal.Agent.Loop
   ) where
 
 import Control.Monad.IO.Class (liftIO)
+import Data.Aeson (Value (..))
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Core.ChannelKind (channelKindToText)
+import Seal.Core.MessageSource
+  ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..))
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
@@ -24,11 +28,25 @@ import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
 
+-- | Fold the 'aeMessageSource' into the request @erMeta@: a @channel@
+-- key carrying the 'ChannelKind' text tag, and a @conversationId@ key
+-- carrying the server-derived conversation id. 'Nothing' (the CLI TUI
+-- path) yields an empty map, leaving the transcript unchanged.
+requestMeta :: Maybe MessageSource -> Map.Map Text Value
+requestMeta Nothing = Map.empty
+requestMeta (Just ms) = Map.fromList
+  [ ("channel", String (channelKindToText (msChannelKind ms)))
+  , ("conversationId", String (conversationIdText (msConversationId ms)))
+  ]
+
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
   -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
+  -- The request's @erMeta@ carries the channel + conversation id when
+  -- 'aeMessageSource' is present (Signal), so the transcript records which
+  -- channel + conversation this turn served.
   liftIO $ do
     now <- getCurrentTime
     let userMsg = textMsg User userText
@@ -50,7 +68,7 @@ runTurn env userText = do
           , erDurationMs = Nothing
           , erHarness = Nothing
           , erCorrelation = Nothing
-          , erMeta = Map.empty
+          , erMeta = requestMeta (aeMessageSource env)
           }
     tfwRecordAsync (aeTranscript env) (TwoFileWrite [userMsg] entry)
   go (aeMaxTurns env) [textMsg User userText]

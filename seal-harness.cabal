@@ -55,6 +55,7 @@ library
         Seal.Channel.Cli
         Seal.Channels.Class
         Seal.Channels.Signal
+        Seal.Channels.Signal.Run
         Seal.Channels.Signal.Transport
         Seal.Command.Help
         Seal.Command.Model
@@ -199,6 +200,7 @@ test-suite tests
         Seal.Channels.ClassSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
+        Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec

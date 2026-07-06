@@ -11,8 +11,8 @@ module Seal.Channels.Signal
   , withSignalChannel
   ) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, readTQueue, writeTQueue)
+import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Exception (bracket, SomeException, try)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -37,6 +37,9 @@ data SignalChannel = SignalChannel
   , scInbox        :: TQueue (MessageSource, Text)
   , scTransport    :: SignalTransport
   , scLastSender   :: IORef (Maybe UserId)
+  , scReaderAlive  :: IORef Bool
+    -- ^ 'True' while the reader thread is running. 'chReceive' stops
+    -- returning once the inbox drains and this is 'False'.
   }
 
 instance Channel SignalChannel where
@@ -68,6 +71,7 @@ withSignalChannel (allow, chunkLimit) account transport action =
     before = do
       inbox      <- newTQueueIO
       lastSender <- newIORef Nothing
+      alive      <- newIORef True
       let ch = SignalChannel
             { scAllowList  = allow
             , scChunkLimit = chunkLimit
@@ -75,6 +79,7 @@ withSignalChannel (allow, chunkLimit) account transport action =
             , scInbox      = inbox
             , scTransport  = transport
             , scLastSender = lastSender
+            , scReaderAlive = alive
             }
       tid <- forkIO (readerLoop ch)
       pure (tid, ch)
@@ -95,8 +100,14 @@ readerLoop ch = go
     go = do
       eVal <- try @SomeException (stReceive (scTransport ch))
       case eVal of
-        Left e -> logErr ("reader thread exception: " <> T.pack (show e))
-        Right (Left err) -> logErr ("reader receive error: " <> err)
+        Left e -> do
+          logErr ("reader thread exception: " <> T.pack (show e))
+          writeIORef (scReaderAlive ch) False
+        Right (Left err) -> do
+          -- Transport reports an error / closed inbox. Stop the reader so
+          -- 'chReceive' can return EOF rather than block forever.
+          logErr ("reader exiting: " <> err)
+          writeIORef (scReaderAlive ch) False
         Right (Right val) -> do
           case parseSignalEnvelope val of
             Left err -> logErr ("envelope parse error: " <> err)
@@ -132,9 +143,22 @@ sendRaw ch t = do
     Nothing -> hPutStrLn stderr "signal: dropping chunk — no last sender yet"
     Just uid -> stSend (scTransport ch) (userIdText uid) t
 
--- | Pull the next @(MessageSource, body)@ from the inbox, blocking until
--- one is available. Returns @(Just ms, body)@.
+-- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:
+-- returns @(Nothing, "")@ when the inbox is empty AND the reader thread has
+-- exited (transport closed / EOF). Returns @(Nothing, "")@ immediately in
+-- that state so 'runSignalLoop' can terminate rather than block forever.
 receiveFromInbox :: SignalChannel -> IO (Maybe MessageSource, Text)
 receiveFromInbox ch = do
-  (ms, body) <- atomically (readTQueue (scInbox ch))
-  pure (Just ms, body)
+  mNext <- atomically (tryReadTQueue (scInbox ch))
+  case mNext of
+    Just (ms, body) -> pure (Just ms, body)
+    Nothing -> do
+      alive <- readIORef (scReaderAlive ch)
+      if alive
+        then do
+          -- Inbox momentarily empty but reader still running: retry once
+          -- after a brief yield to let the reader push the next envelope.
+          -- (A real transport blocks in stReceive; a mock drains fast.)
+          threadDelay 1000  -- 1ms
+          receiveFromInbox ch
+        else pure (Nothing, "")
