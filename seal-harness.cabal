@@ -50,6 +50,7 @@ library
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
         Seal.Handles.Harness
+        Seal.Handles.Tab
         Seal.Handles.Transcript
         Seal.Harness.Id
         Seal.Harness.Registry
@@ -200,6 +201,7 @@ test-suite tests
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
         Seal.Handles.HarnessSpec
+        Seal.Handles.TabSpec
         Seal.Handles.TranscriptSpec
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
