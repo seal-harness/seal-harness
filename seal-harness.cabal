@@ -61,6 +61,8 @@ library
         Seal.Harness.Discovery
         Seal.Security.Adoption
         Seal.Session.Kind
+        Seal.Tabs
+        Seal.Tabs.Relay
         Seal.Tabs.Types
         Seal.AppMain
         Seal.Channel.Caps
@@ -198,6 +200,8 @@ test-suite tests
         Seal.Harness.TmuxIOSpec
         Seal.Harness.DiscoverySpec
         Seal.Tabs.TypesSpec
+        Seal.TabsSpec
+        Seal.Tabs.RelaySpec
         Seal.Routing.RouteSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec

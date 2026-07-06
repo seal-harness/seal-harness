@@ -55,6 +55,8 @@ import qualified Seal.Harness.TmuxSpec
 import qualified Seal.Harness.TmuxIOSpec
 import qualified Seal.Harness.DiscoverySpec
 import qualified Seal.Tabs.TypesSpec
+import qualified Seal.TabsSpec
+import qualified Seal.Tabs.RelaySpec
 import qualified Seal.Routing.RouteSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
@@ -138,6 +140,8 @@ main = hspec $ do
   Seal.Harness.TmuxIOSpec.spec
   Seal.Harness.DiscoverySpec.spec
   Seal.Tabs.TypesSpec.spec
+  Seal.TabsSpec.spec
+  Seal.Tabs.RelaySpec.spec
   Seal.Routing.RouteSpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
