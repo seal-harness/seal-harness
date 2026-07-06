@@ -70,6 +70,7 @@ library
         Seal.Ingest
         Seal.Session.Meta
         Seal.Session.Store
+        Seal.Signal.Config
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -191,6 +192,7 @@ test-suite tests
         Seal.Phase2aSpec
         Seal.Phase5Spec
         Seal.AppMainSpec
+        Seal.Signal.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.ClassSpec

@@ -34,6 +34,8 @@ import Toml ((.=))
 import Toml qualified
 import Toml.Type.Key (pattern (:||))
 
+import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
+
 -- | All user-editable vault settings persisted in @config\/config.toml@.
 -- Every field is optional; a missing key decodes as 'Nothing'.
 data FileConfig = FileConfig
@@ -59,6 +61,9 @@ data FileConfig = FileConfig
   , fcRetrieval :: Maybe RetrievalConfig
     -- ^ Optional @[retrieval]@ section (Dynamic Retrieval tuning). Absent
     -- means 'defaultRetrievalConfig' applies at resolution time.
+  , fcSignal :: Maybe SignalConfig
+    -- ^ Optional @[signal]@ section (Signal channel config). Absent means
+    -- the Signal channel is not configured.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -92,6 +97,7 @@ defaultFileConfig = FileConfig
   , fcDefaultAgent    = Nothing
   , fcProviders       = Map.empty
   , fcRetrieval       = Nothing
+  , fcSignal          = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -123,6 +129,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.text "default_agent")    .= fcDefaultAgent
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
+  <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig

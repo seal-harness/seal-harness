@@ -55,6 +55,7 @@ import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase5Spec
+import qualified Seal.Signal.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -122,6 +123,7 @@ main = hspec $ do
   Seal.ISA.Ops.AgentSpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase5Spec.spec
+  Seal.Signal.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

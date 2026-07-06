@@ -32,6 +32,7 @@ spec = describe "Seal.Config.File" $ do
         , fcDefaultAgent    = Nothing
         , fcProviders       = Map.empty
         , fcRetrieval       = Nothing
+        , fcSignal          = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -85,6 +86,7 @@ spec = describe "Seal.Config.File" $ do
               , fcDefaultAgent    = Nothing
               , fcProviders       = Map.empty
               , fcRetrieval       = Nothing
+              , fcSignal          = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
