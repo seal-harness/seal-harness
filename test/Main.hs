@@ -20,6 +20,7 @@ import qualified Seal.Security.Vault.AgeSpec
 import qualified Seal.Security.VaultSpec
 import qualified Seal.Security.PolicySpec
 import qualified Seal.Security.CommandSpec
+import qualified Seal.Security.AdoptionSpec
 import qualified Seal.Command.HelpSpec
 import qualified Seal.Command.ModelSpec
 import qualified Seal.Command.ParseSpec
@@ -51,6 +52,7 @@ import qualified Seal.Harness.RegistrySpec
 import qualified Seal.Harness.ReconcileSpec
 import qualified Seal.Harness.TmuxSpec
 import qualified Seal.Harness.TmuxIOSpec
+import qualified Seal.Harness.DiscoverySpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
@@ -97,6 +99,7 @@ main = hspec $ do
   Seal.Security.VaultSpec.spec
   Seal.Security.PolicySpec.spec
   Seal.Security.CommandSpec.spec
+  Seal.Security.AdoptionSpec.spec
   Seal.Command.HelpSpec.spec
   Seal.Command.ModelSpec.spec
   Seal.Command.ParseSpec.spec
@@ -128,6 +131,7 @@ main = hspec $ do
   Seal.Harness.ReconcileSpec.spec
   Seal.Harness.TmuxSpec.spec
   Seal.Harness.TmuxIOSpec.spec
+  Seal.Harness.DiscoverySpec.spec
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec

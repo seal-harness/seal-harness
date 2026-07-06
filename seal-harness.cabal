@@ -56,6 +56,8 @@ library
         Seal.Harness.Observer
         Seal.Harness.Reconcile
         Seal.Harness.Tmux
+        Seal.Harness.Discovery
+        Seal.Security.Adoption
         Seal.Session.Kind
         Seal.AppMain
         Seal.Channel.Caps
@@ -190,6 +192,7 @@ test-suite tests
         Seal.Harness.ReconcileSpec
         Seal.Harness.TmuxSpec
         Seal.Harness.TmuxIOSpec
+        Seal.Harness.DiscoverySpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
@@ -232,6 +235,7 @@ test-suite tests
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
+        Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
