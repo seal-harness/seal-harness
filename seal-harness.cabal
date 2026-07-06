@@ -126,7 +126,7 @@ library
       , http-client-tls
       , http-types
       , tomland
-      , typed-process
+      , process
       , unix
       , unordered-containers
       , validation-selective
@@ -162,7 +162,7 @@ test-suite tests
       , temporary
       , text
       , time
-      , typed-process
+      , process
       , unix
     hs-source-dirs: test
     other-modules:

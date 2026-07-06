@@ -5,7 +5,6 @@ import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.MVar (MVar)
 import Data.Bits (xor)
 import Data.ByteString qualified as BS
-import Data.ByteString.Lazy qualified as BL
 import Data.Either (isLeft, isRight)
 import Data.List (sort)
 import Data.Text qualified as T
@@ -14,11 +13,11 @@ import Data.Word (Word8)
 import System.Directory (doesFileExist, findExecutable)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process.Typed (proc, readProcess)
 import Test.Hspec
 
 import Seal.Security.Vault
 import Seal.Security.Vault.Age
+import Seal.Vault.Backend (readProcessNoInput)
 
 -- | Build a mock encryptor using XOR with the given mask.
 mockXor :: Word8 -> VaultEncryptor
@@ -251,9 +250,9 @@ spec = describe "Seal.Security.Vault" $ do
         (Nothing, _) -> pendingWith "age not installed"
         (_, Nothing) -> pendingWith "age-keygen not installed"
         _ -> withSystemTempDirectory "seal-vault-age" $ \dir -> do
-          (_, identityBs, stderrBs) <- readProcess (proc "age-keygen" [])
-          let identityContent = BL.toStrict identityBs
-              stderrText = TE.decodeUtf8Lenient (BL.toStrict stderrBs)
+          (_, identityBs, stderrBs) <- readProcessNoInput "age-keygen" []
+          let identityContent = identityBs
+              stderrText = TE.decodeUtf8Lenient stderrBs
               pubKeyLines = filter (T.isPrefixOf "Public key: ") (T.lines stderrText)
           case pubKeyLines of
             [] -> pendingWith "age-keygen output format not recognised"

@@ -6,13 +6,12 @@ import Data.IORef (newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.ByteString.Lazy qualified as BL
 import Data.Text.Encoding qualified as TE
 import Options.Applicative (defaultPrefs, execParserPure, renderFailure, ParserResult (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process.Typed (ExitCode (..), proc, readProcess)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
@@ -22,7 +21,7 @@ import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), VaultStatus (..), UnlockMode (..), openVault)
 import Seal.Security.Vault.Age (VaultError (..), mkMockEncryptor)
 import Seal.TestHelpers.FakeCaps (FakeCaps, makeFakeCaps, getSent)
-import Seal.Vault.Backend (detectAgePlugins)
+import Seal.Vault.Backend (detectAgePlugins, readProcessNoInput)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
 -- ---------------------------------------------------------------------------
@@ -316,12 +315,12 @@ spec = describe "Seal.Vault.Commands" $ do
                 -- Step 3: generate a second age identity for the rekey.
                 let ident2Path = tmpDir </> "second.identity"
                 (ec2, _out2, stderr2) <-
-                  readProcess (proc "age-keygen" ["-o", ident2Path])
+                  readProcessNoInput "age-keygen" ["-o", ident2Path]
                 case ec2 of
                   ExitFailure _ ->
                     expectationFailure "age-keygen failed to generate second identity"
                   ExitSuccess -> do
-                    let stderrText = TE.decodeUtf8Lenient (BL.toStrict stderr2)
+                    let stderrText = TE.decodeUtf8Lenient stderr2
                         recipient2 = case filter (T.isPrefixOf "Public key: ") (T.lines stderrText) of
                           (l:_) -> T.strip (T.drop (T.length "Public key: ") l)
                           []    -> ""

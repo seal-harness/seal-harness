@@ -21,14 +21,17 @@ module Seal.Git.Repo
   ) where
 
 import Control.Exception (try, SomeException)
-import Data.ByteString.Lazy qualified as BL
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Process.Typed
-  ( ExitCode (..), proc, readProcess, setWorkingDir )
+import System.IO (hClose, hFlush)
+import System.Process
+  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
 
 -- | A handle to the config git repo. The repo root is the @config@ directory.
 newtype ConfigRepo = ConfigRepo
@@ -123,10 +126,34 @@ gitCommitAll repo path msg = do
 -- PATH) as an ExitFailure-like result rather than throwing.
 runGit :: FilePath -> [String] -> IO (ExitCode, Text, Text)
 runGit root args = do
-  let p = setWorkingDir root (proc "git" args)
-  res <- try @SomeException (readProcess p)
+  res <- try @SomeException (readProcessBinaryCwd (Just root) "git" args BS.empty)
   case res of
-    Right (ec, outBs, errBs) ->
-      pure (ec, TE.decodeUtf8Lenient (BL.toStrict outBs), TE.decodeUtf8Lenient (BL.toStrict errBs))
+    Right (ec, out, err) ->
+      pure (ec, TE.decodeUtf8Lenient out, TE.decodeUtf8Lenient err)
     Left e ->
       pure (ExitFailure 127, "", T.pack (show e))
+
+-- | Run a process with an optional working directory and a strict
+-- 'ByteString' stdin, capturing stdout and stderr as strict 'ByteString's.
+-- Used by the git seam (commit messages may carry non-ASCII bytes).
+readProcessBinaryCwd :: Maybe FilePath -> FilePath -> [String] -> ByteString
+                    -> IO (ExitCode, ByteString, ByteString)
+readProcessBinaryCwd mCwd cmdPath args input =
+  withCreateProcess
+    ( (proc cmdPath args)
+        { cwd = mCwd
+        , std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe
+        }
+    ) $ \mIn mOut mErr ph -> do
+      (hIn, hOut, hErr) <- case (mIn, mOut, mErr) of
+        (Just a, Just b, Just c) -> pure (a, b, c)
+        _ -> error "readProcessBinaryCwd: pipe creation failed (unreachable)"
+      BS.hPutStr hIn input
+      hFlush hIn
+      hClose hIn
+      out <- BS.hGetContents hOut
+      err <- BS.hGetContents hErr
+      ec  <- waitForProcess ph
+      let !_ = BS.length out
+          !_ = BS.length err
+      pure (ec, out, err)

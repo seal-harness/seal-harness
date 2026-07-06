@@ -14,21 +14,23 @@ module Seal.Vault.Backend
   , setupUserSupplied
   , parseUnlockMode
   , resolveEncryptor
+  , readProcessNoInput   -- exported for test reuse
   ) where
 
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
 import Data.Either (fromRight)
-import Data.ByteString.Lazy qualified as BL
 import Data.List (isPrefixOf, nub, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory (doesPathExist, findExecutable, listDirectory)
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
 import System.FilePath (splitSearchPath, (</>))
 import System.Posix.Files (setFileMode)
-import System.Process.Typed (ExitCode (..), proc, readProcess)
+import System.Process
+  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.File (FileConfig (..))
@@ -42,6 +44,25 @@ import Seal.Security.Vault.Age
   , VaultError (..)
   , mkAgeEncryptor
   )
+
+-- | Run a process with no stdin, capturing stdout and stderr as strict
+-- 'ByteString's. Used by the age-keygen / age-plugin-yubikey setup seams
+-- (their output may carry non-ASCII recipient strings).
+readProcessNoInput :: FilePath -> [String] -> IO (ExitCode, BS.ByteString, BS.ByteString)
+readProcessNoInput cmdPath args =
+  withCreateProcess
+    ( (proc cmdPath args)
+        { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe }
+    ) $ \_ mOut mErr ph -> do
+      (hOut, hErr) <- case (mOut, mErr) of
+        (Just a, Just b) -> pure (a, b)
+        _ -> error "readProcessNoInput: pipe creation failed (unreachable)"
+      out <- BS.hGetContents hOut
+      err <- BS.hGetContents hErr
+      ec  <- waitForProcess ph
+      let !_ = BS.length out
+          !_ = BS.length err
+      pure (ec, out, err)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -112,12 +133,12 @@ setupLocalAgeKey paths name = do
     Right safePath -> do
       let identPath = getSafeKeyPath safePath
       (exitCode, _stdout, stderrBs) <-
-        readProcess (proc "age-keygen" ["-o", identPath])
+        readProcessNoInput "age-keygen" ["-o", identPath]
       case exitCode of
         ExitFailure n ->
           pure (Left ("age-keygen exited with code " <> T.pack (show n)))
         ExitSuccess -> do
-          let stderrText = TE.decodeUtf8Lenient (BL.toStrict stderrBs)
+          let stderrText = TE.decodeUtf8Lenient stderrBs
           case parseAgePublicKey stderrText of
             Nothing  -> pure (Left "age-keygen: could not parse public key from stderr")
             Just pub -> do
@@ -154,12 +175,12 @@ setupYubiKey paths name touchRequired pinRequired caps = do
               touchPolicy = if touchRequired then "always" else "never"
               pinPolicy   = if pinRequired then "once" else "never"
           (exitCode, stdoutBs, _) <-
-            readProcess (proc "age-plugin-yubikey"
+            readProcessNoInput "age-plugin-yubikey"
               [ "--generate"
               , "--touch-policy", touchPolicy
               , "--pin-policy", pinPolicy
-              ])
-          let stdoutText = TE.decodeUtf8Lenient (BL.toStrict stdoutBs)
+              ]
+          let stdoutText = TE.decodeUtf8Lenient stdoutBs
           mRecipient <-
             if exitCode == ExitSuccess && not (T.null (T.strip stdoutText))
               then do
