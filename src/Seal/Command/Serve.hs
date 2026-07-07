@@ -76,12 +76,20 @@ runServeMain = do
         , adProviders       = knownProviders
         }
   -- Start the WS stream server on the WS port.
-  -- The Origin allowlist is the configured list PLUS the HTTP server's own
-  -- origin (derived from host + port), so a non-loopback bind auto-admits
-  -- browsers reaching it through that address without manual whitelisting.
+  -- The Origin allowlist is the configured list PLUS origins derived from
+  -- the HTTP server's host + port. A wildcard host (0.0.0.0) means "bind all
+  -- interfaces" — the browser may reach the server via any of them, so we
+  -- can't enumerate the allowed origins ahead of time. In that case, pass an
+  -- empty allowlist to the WS guard, which triggers wildcard mode (accept
+  -- any Origin) — overriding even the default loopback origin. For a specific
+  -- host, derive the origin + prepend it to the configured list.
   broker <- newStreamBroker 1024
-  let httpOrigin = "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
-      origins = httpOrigin : gcAllowedOrigins gwCfg
+  let isWildcard = gcHost gwCfg == "0.0.0.0" || gcHost gwCfg == "::"
+      httpOrigins = [ "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
+                    | not isWildcard ]
+      origins = if isWildcard
+                  then []  -- wildcard host → empty allowlist → Stream.hs accepts any
+                  else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
   -- Run the HTTP gateway (blocks)

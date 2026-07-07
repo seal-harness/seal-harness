@@ -50,8 +50,9 @@ streamApp guard broker pending = do
       origin = lookupHeader "origin" reqHead
       allowed = map T.unpack (sgAllowedOrigins guard)
   case origin of
-    Just o | o `elem` allowed -> acceptConn
     Nothing                   -> acceptConn  -- no Origin header (local dev client); accept
+    Just _  | null allowed    -> acceptConn  -- wildcard mode (host=0.0.0.0); accept any
+    Just o | o `elem` allowed -> acceptConn
     Just o                    -> hPutStrLn stderr ("ws: rejected Origin " <> show o)
   where
     acceptConn = do

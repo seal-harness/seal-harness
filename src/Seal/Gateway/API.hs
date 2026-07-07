@@ -13,7 +13,8 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive qualified as CI
-import Data.Maybe (mapMaybe)
+import Data.IORef (readIORef)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -29,7 +30,8 @@ import Data.Text.IO qualified as TIO
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
-import Seal.Config.Paths (sessionEntriesPath)
+import Data.Time (UTCTime, defaultTimeLocale, formatTime)
+import Seal.Config.Paths (sessionConversationPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (HarnessId (..), newHarnessId)
@@ -338,23 +340,98 @@ sessionInfoJson m = object
   , "channelUserId" .= (Nothing :: Maybe Text)
   ]
 
--- | T11: handle GET /api/sessions/:id/transcript. Reads the session's
--- @entries.jsonl@ line by line, parses each line as JSON, and returns the
--- array. Missing file -> @[]@; unparseable lines are skipped.
+-- | T11: handle GET /api/sessions/:id/transcript. Returns the session's
+-- transcript as the frontend's @TranscriptEntry@ shape
+-- (@id@/@timestamp@/@direction@/@payload@/@model@/@harness@/@raw@).
+--
+-- Two on-disk formats are supported:
+--   1. The legacy @transcript.jsonl@ (one Haskell 'TranscriptEntry' per line,
+--      @te*@-prefixed fields). Each line is mapped to the frontend shape.
+--   2. The new two-file @conversation.jsonl@ (one 'Message' per line,
+--      @msgRole@/@msgContent@). Each line is synthesized into a
+--      @TranscriptEntry@-shaped JSON (User → request, Assistant → response);
+--      timestamps/model are not available in this file so they're set to
+--      the session's @smCreatedAt@/@smModel@ from @session.json@.
+--
+-- Missing files -> @[]@; unparseable lines are skipped.
 handleTranscript :: ApiDeps -> Text -> IO Response
 handleTranscript deps sidTxt =
   case mkSessionId sidTxt of
     Left _  -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
     Right sid -> do
-      let path = sessionEntriesPath (srPaths (adSessionRuntime deps)) sid
-      exists <- doesFileExist path
-      if not exists
-        then pure (jsonLBS status200 (A.encode ([] :: [Value])))
-        else do
-          raw <- TIO.readFile path
+      let paths = srPaths (adSessionRuntime deps)
+          legacyPath = sessionTranscriptPath paths sid
+          convPath   = sessionConversationPath paths sid
+      legacyExists <- doesFileExist legacyPath
+      convExists   <- doesFileExist convPath
+      if legacyExists
+        then do
+          raw <- TIO.readFile legacyPath
           let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                               (filter (not . T.null) (T.lines raw))
-          pure (jsonLBS status200 (A.encode (vals :: [Value])))
+          pure (jsonLBS status200 (A.encode (map teLineToFrontend vals)))
+        else if convExists
+          then do
+            raw <- TIO.readFile convPath
+            let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                                (filter (not . T.null) (T.lines raw))
+            -- Load session.json for the model + createdAt fallback.
+            active <- readIORef (srActive (adSessionRuntime deps))
+            let model = smModel active
+                ts = showIso (smCreatedAt active)
+            pure (jsonLBS status200 (A.encode (map (convLineToFrontend model ts) msgs)))
+          else pure (jsonLBS status200 (A.encode ([] :: [Value])))
+  where
+    -- | Map a legacy on-disk transcript line (Haskell TranscriptEntry JSON
+    -- with @te*@-prefixed fields) to the frontend's TranscriptEntry shape.
+    teLineToFrontend :: A.Value -> A.Value
+    teLineToFrontend rawLine =
+      let o = case rawLine of
+            A.Object m -> m
+            _          -> KeyMap.empty
+          k = Key.fromText
+          lookupT key = case KeyMap.lookup (k key) o of
+            Just (A.String t) -> Just t
+            _                 -> Nothing
+          payloadStr = maybe mempty A.encode (KeyMap.lookup (k "tePayload") o)
+      in object
+         [ "id"        .= lookupT "teId"
+         , "timestamp" .= lookupT "teTimestamp"
+         , "direction" .= lookupT "teDirection"
+         , "payload"   .= TE.decodeUtf8 (BL.toStrict payloadStr)
+         , "harness"   .= lookupT "teCorrelation"
+         , "model"     .= lookupT "teModel"
+         , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
+         ]
+    -- | Synthesize a frontend TranscriptEntry from a conversation.jsonl line
+    -- (@msgRole@/@msgContent@). User → request; Assistant → response.
+    convLineToFrontend :: Text -> String -> A.Value -> A.Value
+    convLineToFrontend model ts rawLine =
+      let o = case rawLine of
+            A.Object m -> m
+            _          -> KeyMap.empty
+          k = Key.fromText
+          role = case KeyMap.lookup (k "msgRole") o of
+            Just (A.String t) -> t
+            _                  -> "user"
+          content = fromMaybe A.Null (KeyMap.lookup (k "msgContent") o)
+          direction :: Text
+          direction = if T.toCaseFold role == "user" then "request" else "response"
+          -- Build the payload JSON the frontend expects to parse:
+          --   request  → {"messages":[{"role":"user","content":<content>}]}
+          --   response → {"content":<content>}
+          payloadJson = if direction == "request"
+            then A.object ["messages" A..= [A.object ["role" A..= ("user" :: Text), "content" A..= content]]]
+            else A.object ["content" A..= content]
+      in object
+         [ "id"        .= ("" :: Text)            -- not tracked in conversation.jsonl
+         , "timestamp" .= T.pack ts
+         , "direction" .= direction
+         , "payload"   .= TE.decodeUtf8 (BL.toStrict (A.encode payloadJson))
+         , "harness"   .= (Nothing :: Maybe Text)
+         , "model"     .= model
+         , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
+         ]
 
 -- | Map an 'AgentDef' to the frontend's 'AgentInfo' JSON shape. @isDefault@
 -- is a UI convenience; T11 returns @false@ for all (the configured default
@@ -428,3 +505,7 @@ jsonHeader = (mkHN "Content-Type", "application/json")
 -- | Make a HeaderName from a String.
 mkHN :: String -> HeaderName
 mkHN = CI.mk . BC.pack
+
+-- | ISO-8601 with milliseconds + Z (the frontend's expected timestamp shape).
+showIso :: UTCTime -> String
+showIso = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%3QZ"
