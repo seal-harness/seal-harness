@@ -75,7 +75,7 @@ streamApp guard broker pending = do
         readerLoop `catch` \(_e :: SomeException) -> pure ()
 
 -- | The focus op the client sends to change its focused session.
-data FocusOp = FocusOp { foSession :: Text }
+newtype FocusOp = FocusOp { foSession :: Text }
   deriving stock (Eq, Show)
 
 instance A.FromJSON FocusOp where
