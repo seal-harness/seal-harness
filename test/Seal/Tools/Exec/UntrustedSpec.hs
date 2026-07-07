@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tools.Exec.UntrustedSpec (spec) where
 
-import Data.Either (isRight)
+import Data.Either (isLeft, isRight)
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Arbitrary (..), Gen, elements, forAll)
@@ -31,6 +31,61 @@ spec = describe "Seal.Tools.Exec.Untrusted" $ do
         case mkUntrustedExecBackend b of
           Right _ -> case b of TbSsh _ -> True; _ -> False
           Left _  -> case b of TbSsh _ -> False; _ -> True
+
+  describe "selectUntrustedBackend" $ do
+
+    it "mode=remote + TbSsh configured -> Right (the Ssh backend)" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      selectUntrustedBackend cfg (TbSsh sshCfg) `shouldSatisfy` isRight
+
+    it "mode=remote + no remote configured -> Left ExecRemoteRequired" $ do
+      let cfg = UntrustedExecConfig UemRemote Nothing
+      selectUntrustedBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
+
+    it "mode=remote + TbLocal -> Left ExecLocalNotPermittedForUntrusted (never Local)" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      selectUntrustedBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
+
+    it "mode=local + anything -> Left ExecLocalNotPermittedForUntrusted (never yields Local)" $ do
+      let cfg = UntrustedExecConfig UemLocal (Just sshCfg)
+      selectUntrustedBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
+
+    prop "mode=remote never yields a Local-capable backend (always Ssh-or-Left)" $
+      forAll genBackend $ \b ->
+        let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+        in case selectUntrustedBackend cfg b of
+             Right _ -> case b of TbSsh _ -> True; _ -> False
+             Left _  -> True
+
+    prop "mode=local never yields Right (always Left, never Local)" $
+      forAll genBackend $ \b ->
+        let cfg = UntrustedExecConfig UemLocal (Just sshCfg)
+        in selectUntrustedBackend cfg b `shouldSatisfy` isLeft
+
+  describe "selectExecBackend" $ do
+
+    it "mode=local + TbLocal -> Right (EbLocal ...)" $ do
+      let cfg = UntrustedExecConfig UemLocal Nothing
+      selectExecBackend cfg TbLocal `shouldSatisfy` isRight
+
+    it "mode=remote + TbSsh configured -> Right (EbRemote ...)" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      selectExecBackend cfg (TbSsh sshCfg) `shouldSatisfy` isRight
+
+    it "mode=remote + TbLocal -> Left (no local fallback)" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      selectExecBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
+
+    it "mode=remote + no remote configured + TbSsh -> Left ExecRemoteRequired" $ do
+      let cfg = UntrustedExecConfig UemRemote Nothing
+      selectExecBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
+
+    prop "mode=remote never yields EbLocal (no local fallback)" $
+      forAll genBackend $ \b ->
+        let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+        in case selectExecBackend cfg b of
+             Right (EbLocal _) -> False
+             _                 -> True
 
 -- | A generator covering all four 'TerminalBackend' constructors. Kept
 -- local (no global Arbitrary instance) so the spec stays self-contained.
