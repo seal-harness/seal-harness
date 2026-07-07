@@ -12,7 +12,8 @@ module Seal.Gateway.StreamBroker
   , subscriberCount
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar, when)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Monad (when)
 import Data.Aeson (Value)
 
 import Seal.Core.Types (SessionId)
