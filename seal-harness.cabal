@@ -206,6 +206,7 @@ test-suite tests
       , wai
       , warp
       , http-types
+      , vector
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
