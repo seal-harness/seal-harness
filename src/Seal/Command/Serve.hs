@@ -78,7 +78,7 @@ runServeMain = do
   -- Start the WS stream server on the WS port
   broker <- newStreamBroker 1024
   let guard = StreamGuard { sgAllowedOrigins = gcAllowedOrigins gwCfg, sgGlobalCap = 1024 }
-  _ <- forkIO (runStreamServer (gcWsPort gwCfg) guard broker)
+  _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
 

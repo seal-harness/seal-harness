@@ -17,7 +17,7 @@ spec = describe "Seal.Gateway.Stream" $ do
     broker <- newStreamBroker 10
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
         port = 18080
-    _ <- forkIO (runStreamServer port guard broker)
+    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 100000  -- wait for the server to bind
     let client :: ClientApp ()
         client conn = do
@@ -31,7 +31,7 @@ spec = describe "Seal.Gateway.Stream" $ do
     broker <- newStreamBroker 10
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
         port = 18081
-    _ <- forkIO (runStreamServer port guard broker)
+    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 100000
     let client :: ClientApp ()
         client conn = do

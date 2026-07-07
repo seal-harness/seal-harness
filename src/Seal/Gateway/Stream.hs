@@ -38,9 +38,9 @@ data StreamGuard = StreamGuard
 
 -- | Run the WebSocket stream server on the given port. Blocks (run in a
 -- forked thread from @seal serve@).
-runStreamServer :: Int -> StreamGuard -> StreamBroker -> IO ()
-runStreamServer port guard broker =
-  WS.runServer (T.unpack "127.0.0.1") port (streamApp guard broker)
+runStreamServer :: Text -> Int -> StreamGuard -> StreamBroker -> IO ()
+runStreamServer host port guard broker =
+  WS.runServer (T.unpack host) port (streamApp guard broker)
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.

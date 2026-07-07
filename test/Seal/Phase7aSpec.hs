@@ -71,7 +71,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     broker <- newStreamBroker 10
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
         port = 18095
-    _ <- forkIO (runStreamServer port guard broker)
+    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 200000
     let client :: ClientApp ()
         client conn = do
