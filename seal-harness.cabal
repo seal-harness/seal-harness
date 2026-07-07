@@ -79,6 +79,7 @@ library
         Seal.Command.Parse
         Seal.Command.Provider
         Seal.Command.Session
+        Seal.Command.Serve
         Seal.Command.Skill
         Seal.Command.Tab
         Seal.Command.Agent
@@ -264,6 +265,7 @@ test-suite tests
         Seal.Command.ParseSpec
         Seal.Command.ProviderSpec
         Seal.Command.SessionSpec
+        Seal.Command.ServeSpec
         Seal.Command.SkillSpec
         Seal.Command.AgentSpec
         Seal.Command.SpecSpec
