@@ -4,3 +4,9 @@ result
 *.swp
 dist-newstyle/
 .superpowers/
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+# BEADS working state (the plan docs under docs/superpowers/plans/ are tracked)
+.beads/plans/active-plan.md
+.beads/plans/active-plan.md.bak
