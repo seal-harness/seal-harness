@@ -5,10 +5,13 @@
 -- anything that can reach the address).
 module Seal.Gateway.Config
   ( GatewayConfig (..)
+  , PartialGatewayConfig (..)
   , defaultGatewayConfig
   , gatewayConfigCodec
+  , withGatewayDefaults
   ) where
 
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Toml ((.=))
 import Toml qualified
@@ -32,14 +35,44 @@ defaultGatewayConfig = GatewayConfig
   , gcAllowedOrigins = ["http://localhost:8080"]
   }
 
--- | Bidirectional tomland codec for the @[gateway]@ section.
-gatewayConfigCodec :: Toml.TomlCodec GatewayConfig
-gatewayConfigCodec = GatewayConfig
-  <$> Toml.int  "port"            .= gcPort
-  <*> Toml.int  "ws_port"         .= gcWsPort
-  <*> Toml.text "host"            .= gcHost
-  <*> Toml.dioptional (Toml.text "static_dir") .= gcStaticDir
-  <*> originsCodec                 .= gcAllowedOrigins
+-- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
+-- optional: a missing key decodes as 'Nothing', then 'withGatewayDefaults'
+-- (called by 'Seal.Command.Serve.runServeMain') fills in the
+-- 'defaultGatewayConfig' values. This lets a user set just @host@ or just
+-- @port@ without specifying the rest.
+gatewayConfigCodec :: Toml.TomlCodec PartialGatewayConfig
+gatewayConfigCodec = PartialGatewayConfig
+  <$> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "port")) .= pgcPort
+  <*> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "ws_port")) .= pgcWsPort
+  <*> Toml.dioptional (Toml.text "host") .= pgcHost
+  <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
+  <*> originsCodec .= pgcAllowedOrigins
+
+-- | A partial gateway config where every field is optional. 'withGatewayDefaults'
+-- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
+data PartialGatewayConfig = PartialGatewayConfig
+  { pgcPort           :: Maybe Int
+  , pgcWsPort         :: Maybe Int
+  , pgcHost           :: Maybe Text
+  , pgcStaticDir      :: Maybe Text
+  , pgcAllowedOrigins :: [Text]
+  } deriving stock (Eq, Show)
+
+-- | Merge a partial gateway config with the compiled-in defaults, producing
+-- a complete 'GatewayConfig'. Each 'Nothing' field falls back to
+-- 'defaultGatewayConfig'; an empty 'pgcAllowedOrigins' also falls back (so
+-- omitting @allowed_origins@ keeps the safe loopback default rather than
+-- opening to all origins).
+withGatewayDefaults :: PartialGatewayConfig -> GatewayConfig
+withGatewayDefaults p = GatewayConfig
+  { gcPort           = fromMaybe (gcPort defaultGatewayConfig) (pgcPort p)
+  , gcWsPort         = fromMaybe (gcWsPort defaultGatewayConfig) (pgcWsPort p)
+  , gcHost           = fromMaybe (gcHost defaultGatewayConfig) (pgcHost p)
+  , gcStaticDir      = pgcStaticDir p  -- Nothing = no static serving (the default)
+  , gcAllowedOrigins = if null (pgcAllowedOrigins p)
+                         then gcAllowedOrigins defaultGatewayConfig
+                         else pgcAllowedOrigins p
+  }
 
 -- | Codec for the @allowed_origins@ array (a TOML array of strings).
 originsCodec :: Toml.TomlCodec [Text]

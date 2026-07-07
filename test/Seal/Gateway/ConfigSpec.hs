@@ -19,24 +19,65 @@ spec = describe "Seal.Gateway.Config" $ do
       gcStaticDir defaultGatewayConfig `shouldBe` Nothing
       gcAllowedOrigins defaultGatewayConfig `shouldBe` ["http://localhost:8080"]
 
+  describe "withGatewayDefaults" $ do
+    it "fills in defaults for missing fields" $ do
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Nothing, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [] }
+          full = withGatewayDefaults partial
+      gcPort full `shouldBe` 9090
+      gcWsPort full `shouldBe` 8081   -- default
+      gcHost full `shouldBe` "0.0.0.0"
+      gcStaticDir full `shouldBe` Nothing
+      gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
+
+    it "preserves all set fields" $ do
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcWsPort = Just 9091, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"] }
+          full = withGatewayDefaults partial
+      gcPort full `shouldBe` 9090
+      gcWsPort full `shouldBe` 9091
+      gcHost full `shouldBe` "0.0.0.0"
+      gcStaticDir full `shouldBe` Just "/srv/seal"
+      gcAllowedOrigins full `shouldBe` ["http://example.com"]
+
   describe "TOML round-trip" $ do
-    it "round-trips a [gateway] section" $
+    it "round-trips a [gateway] section with all fields set" $
       withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg = defaultFileConfig
-                    { fcGateway = Just defaultGatewayConfig
-                        { gcPort = 9090
-                        , gcWsPort = 9091
-                        , gcHost = "0.0.0.0"
-                        , gcStaticDir = Just "/srv/seal"
-                        , gcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
-                        }
-                    }
+            partial = PartialGatewayConfig
+              { pgcPort = Just 9090
+              , pgcWsPort = Just 9091
+              , pgcHost = Just "0.0.0.0"
+              , pgcStaticDir = Just "/srv/seal"
+              , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
+              }
+            cfg = defaultFileConfig { fcGateway = Just partial }
         saveFileConfig path cfg
         result <- loadFileConfig path
         case result of
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
-          Right loaded -> fcGateway loaded `shouldBe` fcGateway cfg
+          Right loaded -> fcGateway loaded `shouldBe` Just partial
+
+    it "round-trips a [gateway] section with only some fields set (rest default)" $
+      withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
+        let path = dir </> "config.toml"
+            -- A user who sets only host + port, omitting ws_port + static_dir.
+            partial = PartialGatewayConfig
+              { pgcPort = Just 9090
+              , pgcWsPort = Nothing
+              , pgcHost = Just "0.0.0.0"
+              , pgcStaticDir = Nothing
+              , pgcAllowedOrigins = []
+              }
+            cfg = defaultFileConfig { fcGateway = Just partial }
+        saveFileConfig path cfg
+        result <- loadFileConfig path
+        case result of
+          Left err -> expectationFailure ("load failed: " <> T.unpack err)
+          Right loaded -> do
+            fcGateway loaded `shouldBe` Just partial
+            -- The merge fills in ws_port + allowed_origins from defaults.
+            let full = maybe defaultGatewayConfig withGatewayDefaults (fcGateway loaded)
+            gcWsPort full `shouldBe` 8081
+            gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]
 
     it "absent section decodes as Nothing" $
       withSystemTempDirectory "seal-gw-cfg" $ \dir -> do

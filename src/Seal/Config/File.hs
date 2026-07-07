@@ -35,7 +35,7 @@ import Toml qualified
 import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
-import Seal.Gateway.Config (GatewayConfig (..), gatewayConfigCodec)
+import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
 
 -- | All user-editable vault settings persisted in @config\/config.toml@.
 -- Every field is optional; a missing key decodes as 'Nothing'.
@@ -65,9 +65,10 @@ data FileConfig = FileConfig
   , fcSignal :: Maybe SignalConfig
     -- ^ Optional @[signal]@ section (Signal channel config). Absent means
     -- the Signal channel is not configured.
-  , fcGateway :: Maybe GatewayConfig
+  , fcGateway :: Maybe PartialGatewayConfig
     -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
-    -- gateway is not configured.
+    -- gateway is not configured. Each field inside is optional too; the
+    -- call site merges with 'Seal.Gateway.Config.withGatewayDefaults'.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.

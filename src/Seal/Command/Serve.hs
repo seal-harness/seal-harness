@@ -17,7 +17,7 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths)
 import Seal.Gateway.API (ApiDeps (..))
-import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig)
+import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker)
@@ -66,7 +66,7 @@ runServeMain = do
              , srActive     = activeRef
              }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg = fromMaybe defaultGatewayConfig (fcGateway cfg)
+  let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)
       deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
