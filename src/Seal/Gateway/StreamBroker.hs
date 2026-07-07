@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
 -- | The in-process broker that fans 'BrokerEvent's to every subscribed WS
 -- connection, filtering by each connection's focused session. STM-backed:
 -- a 'TVar' of subscribers + a global cap.
@@ -13,7 +12,7 @@ module Seal.Gateway.StreamBroker
   , subscriberCount
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar, when)
 import Data.Aeson (Value)
 
 import Seal.Core.Types (SessionId)
@@ -46,20 +45,19 @@ newStreamBroker cap = StreamBroker <$> newTVarIO [] <*> pure cap
 subscribe :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO ()
 subscribe broker session sendfn = atomically $ do
   subs <- readTVar (sbSubs broker)
-  if length subs < sbCap broker
-    then writeTVar (sbSubs broker) (subs <> [Subscriber session sendfn])
-    else pure ()  -- over cap: silently drop (the WS handler should close)
+  when (length subs < sbCap broker) $
+    writeTVar (sbSubs broker) (subs <> [Subscriber session sendfn])
 
 -- | Fan one event to every subscriber whose focused session matches. For
 -- 'BeListsSnapshot' (a broadcast to all), every subscriber receives it
 -- regardless of focus.
 broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
-  subs <- atomically (readTVar (sbSubs broker))
+  subs <- readTVarIO (sbSubs broker)
   case event of
-    BeListsSnapshot _ -> mapM_ (\s -> subSend s event) subs
-    BeEntryRecorded sid _ -> mapM_ (\s -> if subSession s == sid then subSend s event else pure ()) subs
-    BeHarnessStatus _ -> mapM_ (\s -> subSend s event) subs  -- harness status → all (the frontend's sidebar shows all harnesses)
+    BeListsSnapshot _ -> mapM_ (`subSend` event) subs
+    BeEntryRecorded sid _ -> mapM_ (\s -> when (subSession s == sid) (subSend s event)) subs
+    BeHarnessStatus _ -> mapM_ (`subSend` event) subs  -- harness status → all (the frontend's sidebar shows all harnesses)
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()
@@ -67,4 +65,4 @@ broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)
 
 -- | The current subscriber count (for diagnostics / the global cap check).
 subscriberCount :: StreamBroker -> IO Int
-subscriberCount broker = length <$> atomically (readTVar (sbSubs broker))
+subscriberCount broker = length <$> readTVarIO (sbSubs broker)
