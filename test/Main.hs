@@ -8,6 +8,7 @@ import qualified Seal.Core.AllowListSpec
 import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.Gateway.ConfigSpec
+import qualified Seal.Gateway.ApiSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
 import qualified Seal.AppMainSpec
@@ -99,6 +100,7 @@ main = hspec $ do
   Seal.Core.TypesSpec.spec
   Seal.Core.PagingSpec.spec
   Seal.Gateway.ConfigSpec.spec
+  Seal.Gateway.ApiSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
   Seal.AppMainSpec.spec

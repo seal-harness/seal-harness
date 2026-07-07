@@ -100,6 +100,7 @@ library
         Seal.Security.Vault.Age
         Seal.Text.LineFile
         Seal.Gateway.Config
+        Seal.Gateway.API
         Seal.Gateway.Stream
         Seal.Gateway.StreamBroker
         Seal.Tui
@@ -199,6 +200,9 @@ test-suite tests
       , unix
       , websockets
       , case-insensitive
+      , wai
+      , warp
+      , http-types
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -207,6 +211,7 @@ test-suite tests
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
+        Seal.Gateway.ApiSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
         Seal.Harness.IdSpec
