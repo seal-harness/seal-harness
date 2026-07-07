@@ -62,7 +62,9 @@ library
         Seal.Security.Adoption
         Seal.Session.Kind
         Seal.Tabs
+        Seal.Tabs.Persist
         Seal.Tabs.Relay
+        Seal.Tabs.Runtimes
         Seal.Tabs.Types
         Seal.Tabs.Wizard
         Seal.AppMain

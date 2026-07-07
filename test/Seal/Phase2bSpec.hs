@@ -17,6 +17,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channels.Signal.Run (runSignalLoop)
+import Seal.Tabs (newTabsHandle)
 import Seal.Channels.Signal.Transport (mkMockSignalTransport)
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
@@ -115,7 +116,8 @@ spec = describe "Seal.Phase2bSpec" $ do
         plainHandler h mSrc body = case mSrc of
           Just ms -> runOneTurn h ms body
           Nothing -> pure ()
-    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport plainHandler
+    tabsH <- newTabsHandle
+    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH plainHandler
     cap <- getCaptured
     -- /ping dispatched → pong sent via the handle
     map snd cap `shouldContain` ["pong"]

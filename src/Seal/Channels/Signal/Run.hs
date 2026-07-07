@@ -34,16 +34,21 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, sessionDir, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (SessionId)
+import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
-import Seal.Handles.Transcript (withTwoFileTranscript)
 import Seal.Handles.Channel (ChannelHandle (..))
+import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
+import Seal.Handles.Transcript (withTwoFileTranscript)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
+import Seal.Routing.Route qualified
+import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
+import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
@@ -72,22 +77,23 @@ import Seal.Vault.Commands (VaultRuntime (..))
 -- unresolved.
 runSignal
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends
+  -> Registry -> PreprocessChain -> Backends -> TabsHandle
   -> (SignalAccount, Int, AllowList UserId)
   -> IO ()
-runSignal paths rt pr sr registry chain backends (account, chunkLimit, allow) = do
+runSignal paths rt pr sr registry chain backends tabsH (account, chunkLimit, allow) = do
   let accountLabel = signalAccountText account
   eTransport <- mkRealSignalTransport accountLabel
   case eTransport of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
     Right transport ->
-      runSignalLoop registry chain (allow, chunkLimit) account transport $
+      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH $
         \h -> plainTurn paths rt pr sr backends h
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
--- pulls @(MessageSource, body)@ from 'chReceive', classifies via 'ingest',
--- dispatches slash commands via a 'ChannelCaps' adapter over the
--- 'ChannelHandle', and routes plain messages to the supplied
+-- pulls @(MessageSource, body)@ from 'chReceive', classifies via
+-- 'Seal.Routing.Route' (Layer-1 terse grammar + /tab commands BEFORE the
+-- /-command registry), dispatches slash commands via a 'ChannelCaps' adapter
+-- over the 'ChannelHandle', and routes plain messages to the supplied
 -- 'plainHandler' (which runs 'runTurn' with 'aeMessageSource' = @Just ms@,
 -- using the supplied 'ChannelHandle' for any sends).
 -- Terminates when 'chReceive' returns EOF (@(Nothing, "")@ with the reader
@@ -98,9 +104,10 @@ runSignalLoop
   -> (AllowList UserId, Int)
   -> SignalAccount
   -> SignalTransport
+  -> TabsHandle
   -> (ChannelHandle -> Maybe MessageSource -> Text -> IO ())
   -> IO ()
-runSignalLoop registry chain (allow, chunkLimit) account transport plainHandler =
+runSignalLoop registry chain (allow, chunkLimit) account transport tabsH plainHandler =
   withSignalChannel (allow, chunkLimit) account transport $ \ch -> do
     let h = toHandle ch
         handleCaps = ChannelCaps
@@ -115,12 +122,75 @@ runSignalLoop registry chain (allow, chunkLimit) account transport plainHandler 
       case mSrc of
         Nothing -> pure ()  -- EOF: reader exited + inbox drained
         Just _ms -> do
-          d <- ingest registry chain (RawInbound body)
-          case d of
-            DispatchAction a -> runCommandAction a handleCaps >> loop h handleCaps
-            ShowText t       -> chSend h t >> loop h handleCaps
-            PlainMessage t   -> plainHandler h mSrc t >> loop h handleCaps
-            Rejected msg     -> chSend h msg >> loop h handleCaps
+          -- Layer-1 routing: check the terse /N grammar + /tab commands
+          -- BEFORE the /-command registry.
+          case Seal.Routing.Route.route body of
+            Right (Seal.Routing.Route.Focus idx) -> do
+              _ <- focusTabH tabsH idx
+              chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
+              loop h handleCaps
+            Right (Seal.Routing.Route.Inject idx payload) -> do
+              _ <- focusTabH tabsH idx
+              plainHandler h mSrc payload
+              loop h handleCaps
+            Right (Seal.Routing.Route.TabCommand tsc) -> do
+              _ <- handleTabCommand' h tabsH tsc
+              loop h handleCaps
+            Right (Seal.Routing.Route.SlashCommand _) -> do
+              d <- ingest registry chain (RawInbound body)
+              case d of
+                DispatchAction a -> runCommandAction a handleCaps >> loop h handleCaps
+                ShowText t       -> chSend h t >> loop h handleCaps
+                PlainMessage t   -> plainHandler h mSrc t >> loop h handleCaps
+                Rejected msg     -> chSend h msg >> loop h handleCaps
+            Right (Seal.Routing.Route.Plain t) -> do
+              plainHandler h mSrc t
+              loop h handleCaps
+            Left (Seal.Routing.Route.ParseError e) -> do
+              chSend h e
+              loop h handleCaps
+
+-- | Handle a parsed 'TabSlashCommand' over the Signal channel (mutates the
+-- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.
+handleTabCommand' :: ChannelHandle -> TabsHandle -> TabSlashCommand -> IO ()
+handleTabCommand' h tabsH = \case
+  TabListCmd -> do
+    tl <- snapshotTabs tabsH
+    if tabCount tl == 0
+      then chSend h "no tabs"
+      else mapM_ (chSend h . renderTab) (tlTabs tl)
+  TabNewCmd _mKind -> do
+    r <- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing
+    case r of
+      Left e  -> chSend h ("tab new failed: " <> e)
+      Right i -> chSend h ("tab " <> T.singleton (tabIndexToChar i) <> " created")
+  TabCloseCmd idx force -> do
+    r <- removeTabH tabsH idx
+    case r of
+      Left e  -> chSend h (if force == Force then "force close: " <> e else "close failed: " <> e)
+      Right _ -> chSend h ("tab " <> T.singleton (tabIndexToChar idx) <> " closed")
+  TabFocusCmd idx -> do
+    r <- focusTabH tabsH idx
+    case r of
+      Left e  -> chSend h ("focus failed: " <> e)
+      Right _ -> chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
+  TabResumeCmd sid -> do
+    r <- insertTabH tabsH (BoundSession sid) KindAi Nothing
+    case r of
+      Left e  -> chSend h ("resume failed: " <> e)
+      Right i -> chSend h ("tab " <> T.singleton (tabIndexToChar i) <> " resumed")
+  TabRenameCmd idx name -> do
+    r <- renameTabH tabsH idx name
+    case r of
+      Left e  -> chSend h ("rename failed: " <> e)
+      Right _ -> chSend h ("tab " <> T.singleton (tabIndexToChar idx) <> " renamed to " <> name)
+  where
+    placeholderSid = case mkSessionId "tab-session" of
+      Right s -> s
+      Left _  -> error "placeholder session id"
+    renderTab t =
+      T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+        <> maybe "" ("  " <>) (tLabel t)
 
 -- | Run one plain-text turn through the agent loop with the
 -- 'MessageSource' threaded into 'aeMessageSource'. Mirrors 'runCliTui's
@@ -234,18 +304,22 @@ runSignalMain = do
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
+  tabsH <- newTabsHandle
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
         ]
   -- Resolve the [signal] section + an optional vault-supplied account.
   -- For now the vault-supplied account is Nothing (the account comes from
   -- config); a future phase may pull it from the vault via CPS.
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
-    Right resolved -> runSignal paths rt pr sr registry emptyChain backends resolved
+    Right resolved -> runSignal paths rt pr sr registry emptyChain backends tabsH resolved
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone

@@ -30,6 +30,7 @@ import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Provider (..), SomeProvider (..)
   , StopReason (..), Usage (..) )
 import Seal.Signal.Config (SignalAccount (..), mkSignalAccount)
+import Seal.Tabs (newTabsHandle)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App (runApp)
 import Seal.Types.Command (Command (..), pCommand)
@@ -127,7 +128,8 @@ spec = do
           plainHandler h mSrc body = case mSrc of
             Just ms -> runOneTurn h ms body
             Nothing -> pure ()
-      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport plainHandler
+      tabsH <- newTabsHandle
+      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH plainHandler
       -- /ping dispatched → pong sent via the handle
       -- hello routed → "hi from model" sent via the handle
       cap <- getCaptured
