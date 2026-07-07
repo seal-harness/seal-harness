@@ -46,6 +46,19 @@
                   ghcid = { };
                   hlint = { };
                 };
+                # Frontend toolchain (Phase 7b T0b): `node`/`npm`/`npx` for
+                # the Vite build + Vitest + Playwright driver. The browser
+                # binary is NOT provided here — `pkgs.chromium` fails to
+                # evaluate on darwin (`driverLink not supported`), so the
+                # Playwright capstone (T13) runs `npx playwright install
+                # chromium` once on first use (the @playwright/test npm
+                # package installs the driver + downloads a matching
+                # browser into a user cache). These go through mkShell
+                # passthrough (NOT `shell.tools`, which is haskell-nix's
+                # attrset for Hackage Haskell tools only).
+                shell.buildInputs = with final; [
+                  nodejs_22
+                ];
               };
           })
         ];

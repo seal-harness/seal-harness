@@ -244,28 +244,27 @@ Add to the `sealHarnessProject` `cabalProject'` call (sibling to `shell.tools`):
 shell.tools = { cabal = { }; ghcid = { }; hlint = { }; };
 shell.buildInputs = with pkgs; [
   nodejs_22           # provides node + npm + npx
-  chromium            # the browser Playwright drives (system-libs-included)
 ];
-# The @playwright/test npm package (installed via `npm install` in T0) provides
-# the driver; `PLAYWRIGHT_BROWSERS_PATH` points it at the nix-provided chromium
-# so `npx playwright install` is a no-op (or set `--with-deps` if needed).
+# NOTE: `pkgs.chromium` was evaluated but fails to build on darwin
+# (`driverLink not supported`); the Playwright browser is instead
+# downloaded by `npx playwright install chromium` (the @playwright/test
+# npm package's one-time step, run inside `nix develop`).
 ```
 
 Two viable approaches for the driver:
 - (a) `pkgs.nodePackages.playwright` — the npm package wrapped by nixpkgs
-  (if available in the nixpkgs-unstable pin). Adds the driver to the shell
-  PATH; the `@playwright/test` npm dep still installs the driver into
-  `frontend/node_modules`, but the nix wrapper handles the system-lib
-  bootstrap.
+  (if available in the nixpkgs-unstable pin). NOTE: `nodePackages` has been
+  removed from recent nixpkgs (the evaluator reports "nodePackages has been
+  removed. Many packages are now available at the top level"); this approach
+  is no longer viable as of the pinned nixpkgs-unstable.
 - (b) Rely on `@playwright/test` from `npm install` (T0's `package.json`)
-  + add `pkgs.chromium` to `shell.buildInputs` for the browser binary, and
-  set `PLAYWRIGHT_BROWSERS_PATH` in `shellHook` to point at the nix-provided
-  chromium so `npx playwright install chromium` is a no-op. Preferred (simpler
-  + no nixpkgs-wrapping needed).
+  for the driver + run `npx playwright install chromium` once on first use
+  to download the browser binary into a user cache. **This is the path T0b
+  actually takes on darwin** (approach (a) is gone; `pkgs.chromium` fails on
+  darwin). Preferred (simplest + no nixpkgs-wrapping needed).
 
-If neither `nodejs_22` nor `chromium` is available in the pinned
-nixpkgs-unstable, fall back to: provide `nodejs` (any LTS) via
-`shell.buildInputs` and document that
+If neither `nodejs_22` is available in the pinned nixpkgs-unstable, fall back
+to: provide any `nodejs` LTS via `shell.buildInputs` and document that
 `nix develop --command bash -c 'cd frontend && npx playwright install
 chromium'` must run once on first use (the npm `@playwright/test` package
 installs the driver; the browser download is the one-time step). In that
