@@ -197,7 +197,7 @@ describe('tab mutators', () => {
 
   it('createTab includes branch_from when provided', async () => {
     setNextResponse({ tab_index: 1, session_id: 's2', kind: 'session:anthropic' })
-    await createTab({ kind: 'provider', provider: 'anthropic', branchFrom: 's1' })
+    await createTab({ kind: 'provider', provider: 'anthropic', branch_from: 's1' })
     const call = fetchCalls.find((c) => c.url === '/api/tabs/new')!
     expect(JSON.parse(call.init!.body as string)).toEqual({ kind: 'provider', provider: 'anthropic', branch_from: 's1' })
   })

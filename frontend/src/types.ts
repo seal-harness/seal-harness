@@ -175,6 +175,11 @@ export interface AgentInfo {
 
 export interface ProviderInfo {
   name: string
+  /** True for the provider Seal is configured to use (from CLI flag or
+   *  config file). At most one entry has it set to true. */
+  isDefault?: boolean
+  /** The configured default model for this provider, if any. */
+  defaultModel?: string
 }
 
 // ── Transcript ─────────────────────────────────────────────────────────

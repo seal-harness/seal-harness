@@ -398,15 +398,15 @@ export interface NewTabResponse {
  *  type; the remaining fields are kind-specific. `shell`/`ssh` kinds are
  *  stubbed 501 by the gateway until Phase 4 wires the executor.
  *
- *  Note: the TS interface uses camelCase (`branchFrom`); `createTab`
- *  serializes to the wire's snake_case (`branch_from`). */
+ *  Note: TS fields use the WIRE's snake_case (`branch_from`, `harness_id`)
+ *  directly — `createTab` passes them through unchanged. */
 export interface CreateTabBody {
   kind: string                  // "provider" | "harness" | "branch" | "attach"
   provider?: string
   model?: string
   agent?: string
-  branchFrom?: string
-  harnessId?: string
+  branch_from?: string
+  harness_id?: string
 }
 
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For
@@ -414,17 +414,10 @@ export interface CreateTabBody {
  *  load the transcript; for raw shell tabs it is null. */
 export async function createTab(body: CreateTabBody): Promise<NewTabResponse | null> {
   try {
-    // Map camelCase TS fields → snake_case wire fields.
-    const wire: Record<string, unknown> = { kind: body.kind }
-    if (body.provider !== undefined) wire.provider = body.provider
-    if (body.model !== undefined) wire.model = body.model
-    if (body.agent !== undefined) wire.agent = body.agent
-    if (body.branchFrom !== undefined) wire.branch_from = body.branchFrom
-    if (body.harnessId !== undefined) wire.harness_id = body.harnessId
     const res = await fetch('/api/tabs/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(wire),
+      body: JSON.stringify(body),
     })
     if (!res.ok) return null
     return await res.json() as NewTabResponse
