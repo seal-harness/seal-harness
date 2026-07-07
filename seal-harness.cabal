@@ -229,6 +229,7 @@ test-suite tests
         Seal.Phase2aSpec
         Seal.Phase2bSpec
         Seal.Phase6aSpec
+        Seal.Phase6bSpec
         Seal.Phase5Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
