@@ -327,7 +327,7 @@ handleTabCommand caps tabsH = \case
       then ccSend caps "no tabs"
       else mapM_ (ccSend caps . renderTab) (tlTabs tl)
   TabNewCmd _mKind -> do
-    r <- insertTabH tabsH (BoundSession (placeholderSid)) KindAi Nothing
+    r <- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing
     case r of
       Left e  -> ccSend caps ("tab new failed: " <> e)
       Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")

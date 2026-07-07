@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
 -- | The per-tab runtime wiring: a session tab runs the agent loop, a harness
 -- tab drives the harness handle. **Stub for 6b** (the per-tab runtime is the
 -- 7a gateway's job; 6b delivers the view + the commands, not the live

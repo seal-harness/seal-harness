@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
 -- | Tab list persistence — the 'TabList' survives a restart; tabs are
 -- re-resolved to their 'TabRef's at boot. **Stub for 6b** (persistence is a
 -- follow-up that needs the session store + a boot-time re-resolve pass);
