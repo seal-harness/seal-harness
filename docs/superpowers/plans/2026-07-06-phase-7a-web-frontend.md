@@ -34,13 +34,16 @@ Also reuse `aeson`, `http-types` (already present). Frontend: React 18 +
 TypeScript + Vite + Tailwind (a `frontend/` directory, built to
 `frontend/dist/`); the Nix dev shell should provide `node` + `npm`.
 
-**Decision on the WS upgrade path:** the repo has `wai`/`warp`/`websockets`
-available via cabal (they'll be added as deps). The cleanest WAI-WS bridge is
-`wai-app-websockets` (a small adapter that turns a WAI app into a
-`websockets` handler). If that package isn't available in the nix shell's
-Hackage snapshot, fall back to `warp`'s raw `ResponseRaw` + the
-`websockets` package directly (the reference uses this path). **T0's first
-step is to verify which packages are available + add them to cabal.**
+**Decision on the WS upgrade path:** `wai-app-websockets` is NOT available
+in the nix snapshot (T0 verified). Rather than hand-roll a raw-socket
+hijack via `warp`'s `ResponseRaw` (fragile, complex), **7a runs the
+WebSocket server on a separate port** from the REST + static WARP server
+(a common pattern: `http://localhost:8080` for REST + static, `ws://localhost:8081`
+for the WS stream). `seal serve` spawns both servers. The WS server uses
+`Network.WebSockets.runServer` directly. The `[gateway]` config gains a
+`ws_port` field (default 8081). This avoids the `wai`-WS bridge entirely
+and keeps 7a shippable; 7b can revisit if a single-port integration is
+needed.
 
 Build/test via `nix develop --command cabal build all`, `… cabal test`,
 `… hlint src/ test/`. The frontend builds via

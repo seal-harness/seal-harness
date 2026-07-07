@@ -12,8 +12,9 @@ import Seal.Gateway.Config
 spec :: Spec
 spec = describe "Seal.Gateway.Config" $ do
   describe "defaultGatewayConfig" $ do
-    it "has port 8080, host 127.0.0.1" $ do
+    it "has port 8080, ws_port 8081, host 127.0.0.1" $ do
       gcPort defaultGatewayConfig `shouldBe` 8080
+      gcWsPort defaultGatewayConfig `shouldBe` 8081
       gcHost defaultGatewayConfig `shouldBe` "127.0.0.1"
       gcStaticDir defaultGatewayConfig `shouldBe` Nothing
       gcAllowedOrigins defaultGatewayConfig `shouldBe` ["http://localhost:8080"]
@@ -25,6 +26,7 @@ spec = describe "Seal.Gateway.Config" $ do
             cfg = defaultFileConfig
                     { fcGateway = Just defaultGatewayConfig
                         { gcPort = 9090
+                        , gcWsPort = 9091
                         , gcHost = "0.0.0.0"
                         , gcStaticDir = Just "/srv/seal"
                         , gcAllowedOrigins = ["http://example.com", "http://localhost:8080"]

@@ -15,7 +15,8 @@ import Toml qualified
 
 -- | The gateway config section.
 data GatewayConfig = GatewayConfig
-  { gcPort           :: Int        -- ^ default 8080
+  { gcPort           :: Int        -- ^ default 8080 (REST + static)
+  , gcWsPort         :: Int        -- ^ default 8081 (WS stream)
   , gcHost           :: Text       -- ^ default "127.0.0.1"
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
@@ -25,6 +26,7 @@ data GatewayConfig = GatewayConfig
 defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
   { gcPort = 8080
+  , gcWsPort = 8081
   , gcHost = "127.0.0.1"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
@@ -34,6 +36,7 @@ defaultGatewayConfig = GatewayConfig
 gatewayConfigCodec :: Toml.TomlCodec GatewayConfig
 gatewayConfigCodec = GatewayConfig
   <$> Toml.int  "port"            .= gcPort
+  <*> Toml.int  "ws_port"         .= gcWsPort
   <*> Toml.text "host"            .= gcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= gcStaticDir
   <*> originsCodec                 .= gcAllowedOrigins
