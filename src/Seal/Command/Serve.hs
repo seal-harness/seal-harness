@@ -75,9 +75,14 @@ runServeMain = do
         , adAgentDefs       = bAgentDefs backends
         , adProviders       = knownProviders
         }
-  -- Start the WS stream server on the WS port
+  -- Start the WS stream server on the WS port.
+  -- The Origin allowlist is the configured list PLUS the HTTP server's own
+  -- origin (derived from host + port), so a non-loopback bind auto-admits
+  -- browsers reaching it through that address without manual whitelisting.
   broker <- newStreamBroker 1024
-  let guard = StreamGuard { sgAllowedOrigins = gcAllowedOrigins gwCfg, sgGlobalCap = 1024 }
+  let httpOrigin = "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
+      origins = httpOrigin : gcAllowedOrigins gwCfg
+      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
