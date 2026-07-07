@@ -19,7 +19,7 @@ import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client (Manager)
 import Options.Applicative
 import System.Info (os)
-import System.Process.Typed (ExitCode (..), proc, runProcess)
+import System.Process (callProcess)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Providers.Anthropic.OAuth
@@ -269,8 +269,7 @@ loginCmd pr lbl = CommandAction $ \caps ->
 openBrowser :: Text -> IO ()
 openBrowser url = do
   let opener = if os == "darwin" then "open" else "xdg-open"
-  _ <- try (runProcess (proc opener [T.unpack url]))
-         :: IO (Either SomeException ExitCode)
+  _ <- try @SomeException (callProcess opener [T.unpack url])
   pure ()
 
 testCmd :: ProviderRuntime -> Text -> CommandAction

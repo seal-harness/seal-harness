@@ -64,7 +64,11 @@ import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
+import Seal.Routing.Route qualified
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
+import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..))
+import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Types.App (runApp)
@@ -158,6 +162,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
+  , aeMessageSource = Nothing
   }
 
 -- | Run the Haskeline TUI loop.
@@ -169,8 +174,8 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
 -- immediately.
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends -> IO ()
-runCliTui paths rt pr sr registry chain backends = do
+  -> Registry -> PreprocessChain -> Backends -> TabsHandle -> IO ()
+runCliTui paths rt pr sr registry chain backends tabsH = do
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
       sessionDirPath = sessionDir paths (smId active0)
@@ -291,14 +296,65 @@ runCliTui paths rt pr sr registry chain backends = do
               handlePlain
                 (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle)
                 appEnv t
-    runInputT hlSettings (loop caps plainHandler)
+    runInputT hlSettings (loop caps plainHandler tabsH)
   where
-    loop :: ChannelCaps -> (Text -> IO ()) -> InputT IO ()
-    loop caps plainHandler = do
+    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> InputT IO ()
+    loop caps plainHandler th = do
       mLine <- getInputLine "> "
       case mLine of
         Nothing   -> pure ()   -- EOF / Ctrl-D
         Just line -> do
-          d <- liftIO $ ingest registry chain (RawInbound (T.pack line))
-          liftIO $ interpretDisposition caps plainHandler d
-          loop caps plainHandler
+          case Seal.Routing.Route.route (T.pack line) of
+            Right (Seal.Routing.Route.Focus idx) -> liftIO (focusTabH th idx) >>= \r -> liftIO $ ccSend caps (case r of Left e -> "focus: " <> e; Right _ -> "focused tab " <> T.singleton (tabIndexToChar idx))
+            Right (Seal.Routing.Route.Inject idx payload) -> liftIO $ do
+              _ <- focusTabH th idx
+              plainHandler payload
+            Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
+            Right (Seal.Routing.Route.SlashCommand _) -> do
+              d <- liftIO $ ingest registry chain (RawInbound (T.pack line))
+              liftIO $ interpretDisposition caps plainHandler d
+            Right (Seal.Routing.Route.Plain t) -> liftIO $ plainHandler t
+            Left (Seal.Routing.Route.ParseError e) -> liftIO $ ccSend caps e
+          loop caps plainHandler th
+
+-- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
+-- replying via the channel caps. Pure-ish (the handle mutations are STM).
+handleTabCommand :: ChannelCaps -> TabsHandle -> TabSlashCommand -> IO ()
+handleTabCommand caps tabsH = \case
+  TabListCmd -> do
+    tl <- snapshotTabs tabsH
+    if tabCount tl == 0
+      then ccSend caps "no tabs"
+      else mapM_ (ccSend caps . renderTab) (tlTabs tl)
+  TabNewCmd _mKind -> do
+    r <- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing
+    case r of
+      Left e  -> ccSend caps ("tab new failed: " <> e)
+      Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " created")
+  TabCloseCmd idx force -> do
+    r <- removeTabH tabsH idx
+    case r of
+      Left e  -> ccSend caps (if force == Force then "force close: " <> e else "close failed: " <> e)
+      Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar idx) <> " closed")
+  TabFocusCmd idx -> do
+    r <- focusTabH tabsH idx
+    case r of
+      Left e  -> ccSend caps ("focus failed: " <> e)
+      Right _ -> ccSend caps ("focused tab " <> T.singleton (tabIndexToChar idx))
+  TabResumeCmd sid -> do
+    r <- insertTabH tabsH (BoundSession sid) KindAi Nothing
+    case r of
+      Left e  -> ccSend caps ("resume failed: " <> e)
+      Right i -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " resumed")
+  TabRenameCmd idx name -> do
+    r <- renameTabH tabsH idx name
+    case r of
+      Left e  -> ccSend caps ("rename failed: " <> e)
+      Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar idx) <> " renamed to " <> name)
+  where
+    placeholderSid = case mkSessionId "tab-session" of
+      Right s -> s
+      Left _  -> error "placeholder session id"
+    renderTab t =
+      T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+        <> maybe "" ("  " <>) (tLabel t)

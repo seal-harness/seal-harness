@@ -34,27 +34,55 @@ common settings
 library
     import: settings
     exposed-modules:
+        Seal.Core.AllowList
+        Seal.Core.ChannelKind
+        Seal.Core.MessageSource
         Seal.Core.Paging
         Seal.Core.Types
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
+        Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
+        Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
+        Seal.Handles.Channel
+        Seal.Handles.Harness
+        Seal.Handles.Tab
         Seal.Handles.Transcript
+        Seal.Harness.Id
+        Seal.Harness.Registry
+        Seal.Harness.Observer
+        Seal.Harness.Reconcile
+        Seal.Harness.Tmux
+        Seal.Harness.Discovery
+        Seal.Security.Adoption
+        Seal.Session.Kind
+        Seal.Tabs
+        Seal.Tabs.Persist
+        Seal.Tabs.Relay
+        Seal.Tabs.Runtimes
+        Seal.Tabs.Types
+        Seal.Tabs.Wizard
         Seal.AppMain
         Seal.Channel.Caps
         Seal.Channel.Cli
+        Seal.Channels.Class
+        Seal.Channels.Signal
+        Seal.Channels.Signal.Run
+        Seal.Channels.Signal.Transport
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
         Seal.Command.Provider
         Seal.Command.Session
+        Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Spec
         Seal.Config.File
@@ -64,6 +92,7 @@ library
         Seal.Ingest
         Seal.Session.Meta
         Seal.Session.Store
+        Seal.Signal.Config
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -72,6 +101,11 @@ library
         Seal.Security.Vault
         Seal.Security.Vault.Age
         Seal.Text.LineFile
+        Seal.Gateway.Config
+        Seal.Gateway.API
+        Seal.Gateway.Server
+        Seal.Gateway.Stream
+        Seal.Gateway.StreamBroker
         Seal.Tui
         Seal.Types.App
         Seal.Types.Command
@@ -88,6 +122,7 @@ library
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
+        Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
         Seal.ISA.Ops.Skills
@@ -121,11 +156,17 @@ library
       , http-client-tls
       , http-types
       , tomland
-      , typed-process
+      , process
       , unix
       , unordered-containers
       , validation-selective
       , vector
+      , random
+      , uuid-types
+      , wai
+      , warp
+      , websockets
+      , case-insensitive
     hs-source-dirs: src
 
 executable seal
@@ -154,19 +195,48 @@ test-suite tests
       , hspec
       , http-client
       , optparse-applicative
+      , stm
       , temporary
       , text
       , time
-      , typed-process
+      , process
       , unix
+      , websockets
+      , case-insensitive
+      , wai
+      , warp
+      , http-types
+      , vector
     hs-source-dirs: test
     other-modules:
+        Seal.Core.ChannelKindSpec
+        Seal.Core.MessageSourceSpec
+        Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
+        Seal.Gateway.ConfigSpec
+        Seal.Gateway.ApiSpec
+        Seal.Gateway.ServerSpec
+        Seal.Gateway.StreamBrokerSpec
+        Seal.Gateway.StreamSpec
+        Seal.Harness.IdSpec
+        Seal.Harness.RegistrySpec
+        Seal.Harness.ReconcileSpec
+        Seal.Harness.TmuxSpec
+        Seal.Harness.TmuxIOSpec
+        Seal.Harness.DiscoverySpec
+        Seal.Tabs.TypesSpec
+        Seal.TabsSpec
+        Seal.Tabs.RelaySpec
+        Seal.Tabs.WizardSpec
+        Seal.Routing.RouteSpec
         Seal.Transcript.TypesSpec
         Seal.Transcript.ConvSpec
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
+        Seal.Handles.ChannelSpec
+        Seal.Handles.HarnessSpec
+        Seal.Handles.TabSpec
         Seal.Handles.TranscriptSpec
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
@@ -178,23 +248,37 @@ test-suite tests
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.Phase2aSpec
+        Seal.Phase2bSpec
+        Seal.Phase6aSpec
+        Seal.Phase6bSpec
+        Seal.Phase7aSpec
         Seal.Phase5Spec
         Seal.AppMainSpec
+        Seal.Signal.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
+        Seal.Channels.ClassSpec
+        Seal.Channels.SignalSpec
+        Seal.Channels.Signal.EnvelopeSpec
+        Seal.Channels.Signal.RunSpec
+        Seal.Channels.Signal.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec
         Seal.Command.ProviderSpec
         Seal.Command.SessionSpec
+        Seal.Command.ServeSpec
         Seal.Command.SkillSpec
         Seal.Command.AgentSpec
         Seal.Command.SpecSpec
+        Seal.Command.TabSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
+        Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
@@ -206,6 +290,7 @@ test-suite tests
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
         Seal.TestHelpers.FakeCaps
+        Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec

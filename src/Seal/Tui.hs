@@ -14,6 +14,7 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths
@@ -27,6 +28,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
+import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
@@ -92,6 +94,7 @@ runTui = do
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
   -- Built before initSession so the default agent can be resolved from disk.
   backends <- newBackends cfgRoot repo
+  tabsH   <- newTabsHandle
   -- Every launch starts a fresh session (resume is a follow-on milestone).
   -- The default agent (if set in config) is bound here: its id persists in
   -- smAgent and its non-empty provider/model override the config defaults.
@@ -109,5 +112,8 @@ runTui = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
         ]
-  runCliTui paths rt pr sr registry emptyChain backends
+  runCliTui paths rt pr sr registry emptyChain backends tabsH

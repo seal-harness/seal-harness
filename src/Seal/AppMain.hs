@@ -12,6 +12,8 @@ import Seal.Types.Command
 import Seal.Types.Env
 import Seal.Types.App
 import qualified Seal.Tui
+import qualified Seal.Channels.Signal.Run
+import qualified Seal.Command.Serve
 
 -- | Program information for 'runWithConfiguration'. Provides @--config-file@,
 -- @--print-config@, and @--help@ automatically.
@@ -24,8 +26,10 @@ dispatch :: Config -> IO ()
 dispatch cfg = do
   env <- mkEnv cfg
   runApp env $ case _config_command cfg of
-    CommandNoOp -> pure ()
-    CommandTui  -> liftIO Seal.Tui.runTui
+    CommandNoOp   -> pure ()
+    CommandTui   -> liftIO Seal.Tui.runTui
+    CommandSignal -> liftIO Seal.Channels.Signal.Run.runSignalMain
+    CommandServe  -> liftIO Seal.Command.Serve.runServeMain
 
 -- | Map the process arguments so that an empty argument list behaves as if
 -- @--help@ was passed. Running @seal@ with no arguments should print usage

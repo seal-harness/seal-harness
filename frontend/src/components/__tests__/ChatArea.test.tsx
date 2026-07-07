@@ -1,0 +1,495 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
+import type { Agent, Message, SessionInfo, TranscriptEntry } from '../../types'
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function makeAgent(overrides: Partial<Agent> = {}): Agent {
+  return {
+    id: 'agent-1',
+    name: 'Seal',
+    status: 'idle',
+    tokenCount: '0',
+    ...overrides,
+  }
+}
+
+function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
+  return {
+    id: 's1',
+    agent: null,
+    runtime: 'session:anthropic',
+    model: 'claude-sonnet-4-20250514',
+    lastActive: new Date().toISOString(),
+    createdAt: new Date('2024-01-01T00:00:00Z').toISOString(),
+    description: null,
+    autoSummary: null,
+    firstMessageSnippet: null,
+    channel: null,
+    channelUserId: null,
+    ...overrides,
+  }
+}
+
+function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
+  return {
+    id: 'e1',
+    timestamp: '2024-06-01T12:00:00Z',
+    direction: 'request',
+    payload: '{}',
+    harness: null,
+    model: null,
+    raw: '{}',
+    ...overrides,
+  }
+}
+
+/** A 3-entry transcript: user request, assistant response with a tool_use,
+ *  then a user request carrying the matching tool_result. */
+function threeEntryTranscript(): TranscriptEntry[] {
+  return [
+    makeEntry({
+      id: 'e1',
+      direction: 'request',
+      payload: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        system_prompt: 'You are a helpful assistant.',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'Hello, please list files.' }] },
+        ],
+      }),
+      raw: JSON.stringify({
+        _te_id: 'e1',
+        _te_direction: 'request',
+        _te_payload: '…',
+        _te_timestamp: '2024-06-01T12:00:00Z',
+      }),
+    }),
+    makeEntry({
+      id: 'e2',
+      direction: 'response',
+      model: 'claude-sonnet-4-20250514',
+      payload: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        content: [
+          { type: 'text', text: 'Let me list the files.' },
+          { type: 'tool_use', id: 'tool-1', name: 'shell', input: { command: 'ls' } },
+        ],
+        usage: { input_tokens: 10, output_tokens: 5 },
+      }),
+      raw: JSON.stringify({ _te_id: 'e2', _te_direction: 'response' }),
+    }),
+    makeEntry({
+      id: 'e3',
+      direction: 'request',
+      payload: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'tool-1',
+                content: 'file_a.txt\nfile_b.txt',
+                is_error: false,
+              },
+            ],
+          },
+        ],
+      }),
+      raw: JSON.stringify({ _te_id: 'e3', _te_direction: 'request' }),
+    }),
+  ]
+}
+
+beforeEach(() => {
+  cleanup()
+  if (typeof window !== 'undefined' && window.location.hash !== '') {
+    window.history.replaceState(null, '', window.location.pathname)
+  }
+})
+
+// ── transcriptToMessages ────────────────────────────────────────────────────
+
+describe('transcriptToMessages', () => {
+  it('maps a TranscriptEntry[] to Message[] — text block, system prompt, tool call matched with result', () => {
+    const msgs = transcriptToMessages(threeEntryTranscript())
+    // Expect: System row, user row (e1), assistant row with tool call (e2), then
+    // e3's request carries the tool_result but its last message is a user with
+    // a tool_result content (no text) — so no user-text row for e3.
+    const agents = msgs.map((m) => m.agentName)
+    expect(agents).toContain('System')
+    expect(agents).toContain('You')
+    expect(agents).toContain('claude-sonnet-4-20250514')
+
+    // The assistant row carries a tool_call block whose result is matched.
+    const asst = msgs.find((m) => m.agentName === 'claude-sonnet-4-20250514')!
+    expect(asst).toBeTruthy()
+    const tcBlock = asst.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('shell')
+    expect(tcBlock!.toolCall!.result).toBe('file_a.txt\nfile_b.txt')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+  })
+
+  it('emits a text block for a plain user message', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi there' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const userRow = msgs.find((m) => m.agentName === 'You')
+    expect(userRow).toBeTruthy()
+    expect(userRow!.blocks[0]!.text).toBe('hi there')
+  })
+
+  it('carries the verbatim raw json through to the row', () => {
+    const raw = '{"_te_id":"e1","_te_payload":"abc"}'
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+        raw,
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const userRow = msgs.find((m) => m.agentName === 'You')
+    expect(userRow).toBeTruthy()
+    expect(userRow!.rawJson).toBe(raw)
+    expect(userRow!.entryId).toBe('u1')
+  })
+
+  it('flags streaming on response rows when the entry is streaming', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'r1',
+        direction: 'response',
+        model: 'claude-sonnet-4-20250514',
+        streaming: true,
+        payload: JSON.stringify({
+          content: [{ type: 'text', text: 'partial' }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs[0]!.streaming).toBe(true)
+  })
+})
+
+// ── ChatArea rendering ──────────────────────────────────────────────────────
+
+describe('ChatArea', () => {
+  it('renders a 3-message transcript (user / assistant-with-tool-call / system)', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'System',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', collapsedText: 'You are a helpful assistant.' }],
+      },
+      {
+        id: 'm2',
+        entryId: 'e1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:01',
+        blocks: [{ id: 'b2', text: 'Hello, please list files.' }],
+        rawJson: '{"_te_id":"e1"}',
+      },
+      {
+        id: 'm3',
+        entryId: 'e2',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:02',
+        blocks: [
+          { id: 'b3', text: 'Let me list the files.' },
+          {
+            id: 'b4',
+            toolCall: {
+              id: 'tool-1',
+              name: 'shell',
+              input: { command: 'ls' },
+              result: 'file_a.txt',
+              resultIsError: false,
+            },
+          },
+        ],
+        rawJson: '{"_te_id":"e2"}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    expect(screen.getByText('Hello, please list files.')).toBeTruthy()
+    expect(screen.getByText('Let me list the files.')).toBeTruthy()
+    // The tool call name appears in the collapsed header.
+    expect(screen.getByText('shell')).toBeTruthy()
+    // System row collapses by default but is present in the DOM.
+    expect(document.querySelector('.addressable-block')).toBeTruthy()
+  })
+
+  it('branch-from-here on a user row triggers the composer callback with the entry id', () => {
+    const onBranch = vi.fn()
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'branch me' }],
+        rawJson: '{}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onBranch={onBranch}
+      />,
+    )
+    const branchBtn = screen.getByLabelText('branch session from here')
+    fireEvent.click(branchBtn)
+    expect(onBranch).toHaveBeenCalledWith('e1')
+  })
+
+  it('raw JSON modal toggles open/closed', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'open the json modal' }],
+        rawJson: '{"hello":"world"}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // Modal not present initially.
+    expect(screen.queryByTestId('raw-json-modal')).toBeNull()
+    // Click the "View raw JSON (message)" button.
+    fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
+    expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    expect(screen.getByTestId('raw-json-backdrop')).toBeTruthy()
+    // Close via the close button.
+    fireEvent.click(screen.getByLabelText('Close raw JSON view'))
+    expect(screen.queryByTestId('raw-json-modal')).toBeNull()
+  })
+
+  it('slash bubble renders transiently with the "command output — not saved" label', () => {
+    const messages: Message[] = [
+      {
+        id: 'slash-1',
+        agentName: 'Seal',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        slashBubble: true,
+        blocks: [{ id: 'b1', text: '/help output here' }],
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    expect(screen.getByTestId('slash-bubble')).toBeTruthy()
+    // The em-dash in the source is rendered as the HTML entity &mdash; in the
+    // markup; match against the visible text.
+    expect(screen.getByText(/command output/)).toBeTruthy()
+    expect(screen.getByText(/not saved/)).toBeTruthy()
+  })
+
+  it('per-session model dropdown change calls the provided onModelChange', () => {
+    const onModelChange = vi.fn()
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'hi' }],
+        rawJson: '{}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        currentModel="claude-sonnet-4-20250514"
+        availableModels={['claude-sonnet-4-20250514', 'claude-opus-4-20250514']}
+        onModelChange={onModelChange}
+      />,
+    )
+    const select = screen.getByLabelText('session model')
+    expect(select).toBeTruthy()
+    fireEvent.change(select, { target: { value: 'claude-opus-4-20250514' } })
+    expect(onModelChange).toHaveBeenCalledWith('claude-opus-4-20250514')
+  })
+
+  it('in-place description edit calls setSessionDescription', () => {
+    const onSetDescription = vi.fn()
+    const session = makeSession({ id: 's1', description: 'Old title' })
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'hi' }],
+        rawJson: '{}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        selectedSession={session}
+        onSetDescription={onSetDescription}
+        messages={messages}
+      />,
+    )
+    // Click the title to enter edit mode.
+    fireEvent.click(screen.getByTitle('Click to set a session title'))
+    const input = screen.getByLabelText('Session title') as HTMLInputElement
+    expect(input.value).toBe('Old title')
+    // Type a new title + commit with Enter.
+    fireEvent.change(input, { target: { value: 'New title' } })
+    fireEvent.keyDown(input, { key: 'Enter', preventDefault: () => {} })
+    expect(onSetDescription).toHaveBeenCalledWith('s1', 'New title')
+  })
+
+  it('TypingIndicator renders when a message isGenerating or streaming', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'thinking',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'thinking…' }],
+        isGenerating: true,
+        streaming: true,
+      },
+    ]
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent({ status: 'thinking' })}
+        messages={messages}
+      />,
+    )
+    // The typing indicator renders three .typing-dot elements.
+    const dots = container.querySelectorAll('.typing-dot')
+    expect(dots.length).toBe(3)
+  })
+
+  it('renders the BottomBar with the supplied token stats', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        tokensUsed={5000}
+        contextWindow={200000}
+        sessionStart="2024-01-01T00:00:00Z"
+      />,
+    )
+    // BottomBar shows the token count and the percentage.
+    expect(screen.getByText(/5k/)).toBeTruthy()
+    expect(screen.getByText(/200k/)).toBeTruthy()
+  })
+
+  it('renders the empty-state message when there are no messages and no setup props', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+      />,
+    )
+    expect(screen.getByText(/No messages yet/)).toBeTruthy()
+  })
+
+  it('does NOT render any reference product name', () => {
+    const { container } = render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+      />,
+    )
+    expect(container.textContent).not.toMatch(/pureclaw/i)
+  })
+})
+
+// ── computeTokensUsed + providerFromRuntime ──────────────────────────────────
+
+describe('computeTokensUsed', () => {
+  it('returns real usage (last input_tokens + cumulative output_tokens) when present', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'r1',
+        direction: 'response',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 100, output_tokens: 20 } }),
+      }),
+      makeEntry({
+        id: 'r2',
+        direction: 'response',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'hi2' }], usage: { input_tokens: 150, output_tokens: 30 } }),
+      }),
+    ]
+    // last input (150) + cumulative output (20+30=50) = 200
+    expect(computeTokensUsed(entries)).toBe(200)
+  })
+
+  it('falls back to a 4-char-per-token estimate when no usage is present', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u1',
+        direction: 'request',
+        payload: 'a'.repeat(40), // 10 tokens
+      }),
+      makeEntry({
+        id: 'r1',
+        direction: 'response',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'b'.repeat(40) }] }), // 10 tokens
+      }),
+    ]
+    // Non-JSON request payload contributes ceil(40/4)=10 to estimatedTokens;
+    // the response's text block contributes ceil(40/4)=10; the fallback then
+    // adds the last-request-payload estimate (ceil(40/4)=10). Total = 30.
+    expect(computeTokensUsed(entries)).toBe(30)
+  })
+})
+
+describe('providerFromRuntime', () => {
+  it('extracts the provider from a "session:<provider>" runtime string', () => {
+    expect(providerFromRuntime('session:anthropic')).toBe('anthropic')
+    expect(providerFromRuntime('session:openai')).toBe('openai')
+  })
+  it('returns null for a runtime string not in the expected shape', () => {
+    expect(providerFromRuntime('harness')).toBeNull()
+    expect(providerFromRuntime(undefined)).toBeNull()
+  })
+})

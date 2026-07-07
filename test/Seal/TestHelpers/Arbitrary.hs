@@ -148,9 +148,9 @@ instance Arbitrary AgentDefId where
     cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
     pure (fromRight (AgentDefId "x") (mkAgentDefId (pack (c : cs))))
 
--- | An 'AllowList OpName' generator: half 'AllowAll', half a small 'AllowOnly'
--- set (kept small to avoid huge generated defs).
-instance Arbitrary (AllowList OpName) where
+-- | An 'AllowList a' generator: half 'AllowAll', half a small 'AllowOnly'
+-- set (kept small to avoid huge generated defs). Needs 'Ord' for 'Set.fromList'.
+instance (Ord a, Arbitrary a) => Arbitrary (AllowList a) where
   arbitrary = oneof
     [ pure AllowAll
     , AllowOnly . Set.fromList <$> listOf arbitrary

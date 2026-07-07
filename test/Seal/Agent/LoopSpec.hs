@@ -70,6 +70,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
+                Nothing
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
@@ -95,6 +96,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
+                Nothing
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
     -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)

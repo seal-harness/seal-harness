@@ -16,12 +16,44 @@ import Control.Exception (IOException, try)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Process.Typed
-  ( ExitCode (..), byteStringInput, proc, readProcess, runProcess, setStdin )
+import System.Exit (ExitCode (..))
+import System.IO (hClose, hFlush)
+import System.Process
+  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
+
+-- | Run a process with a strict 'ByteString' stdin, capturing stdout and
+-- stderr as strict 'ByteString's. Used by the age encrypt/decrypt seam
+-- where the payload is binary (ciphertext) and must not be round-tripped
+-- through 'String'. Closes all handles and waits for the child before
+-- returning.
+readProcessBinary :: FilePath -> [String] -> ByteString
+                 -> IO (ExitCode, ByteString, ByteString)
+readProcessBinary cmdPath args input =
+  withCreateProcess
+    ( (proc cmdPath args)
+        { std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }
+    ) $ \mIn mOut mErr ph -> do
+      (hIn, hOut, hErr) <- case (mIn, mOut, mErr) of
+        (Just a, Just b, Just c) -> pure (a, b, c)
+        _ -> error "readProcessBinary: pipe creation failed (unreachable)"
+      -- Feed stdin on a child thread so we can read stdout/stderr
+      -- concurrently without deadlocking on a large payload.
+      BS.hPutStr hIn input
+      hFlush hIn
+      hClose hIn
+      -- Read stdout/stderr fully after stdin is closed (age reads the
+      -- whole plaintext before emitting ciphertext, so this is safe).
+      out <- BS.hGetContents hOut
+      err <- BS.hGetContents hErr
+      ec  <- waitForProcess ph
+      -- Force the lazy hGetContents results so the handles are fully read
+      -- before withCreateProcess closes them.
+      let !_ = BS.length out
+          !_ = BS.length err
+      pure (ec, out, err)
 
 -- | The vault's error type. The first four constructors are matched on to
 -- drive control flow (so they earn being a sum type per the haskell-coder
@@ -48,7 +80,7 @@ data VaultEncryptor = VaultEncryptor
 -- reports a 'VaultBackendError' install hint if the binary is absent.
 mkAgeEncryptor :: AgeRecipient -> AgeIdentity -> IO (Either VaultError VaultEncryptor)
 mkAgeEncryptor (AgeRecipient recipient) (AgeIdentity identity) = do
-  versionResult <- try @IOException (runProcess (proc "age" ["--version"]))
+  versionResult <- try @IOException (callProcessNoOutput "age" ["--version"])
   case versionResult of
     Right ExitSuccess ->
       pure (Right VaultEncryptor
@@ -61,11 +93,18 @@ mkAgeEncryptor (AgeRecipient recipient) (AgeIdentity identity) = do
       Left (VaultBackendError "age not installed; see https://age-encryption.org")
     run :: [String] -> ByteString -> IO (Either VaultError ByteString)
     run args input = do
-      let cfg = setStdin (byteStringInput (BL.fromStrict input)) (proc "age" args)
-      (code, out, err) <- readProcess cfg
+      (code, out, err) <- readProcessBinary "age" args input
       pure $ case code of
-        ExitSuccess   -> Right (BL.toStrict out)
-        ExitFailure _ -> Left (VaultBackendError (TE.decodeUtf8Lenient (BL.toStrict err)))
+        ExitSuccess   -> Right out
+        ExitFailure _ -> Left (VaultBackendError (TE.decodeUtf8Lenient err))
+
+-- | Run a process, ignoring its stdout/stderr, returning only the exit code.
+-- Used for the @age --version@ preflight. Catches a launch failure as
+-- 'ExitFailure 127' (consistent with the git seam's convention).
+callProcessNoOutput :: FilePath -> [String] -> IO ExitCode
+callProcessNoOutput cmdPath args =
+  withCreateProcess ((proc cmdPath args) { std_out = NoStream, std_err = NoStream }) $
+    \_ _ _ ph -> waitForProcess ph
 
 -- | XOR-with-0xAB mock; reversible, no binary required.
 mkMockEncryptor :: VaultEncryptor

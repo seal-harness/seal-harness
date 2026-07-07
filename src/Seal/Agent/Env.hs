@@ -7,6 +7,7 @@ module Seal.Agent.Env
 import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
+import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Types (ModelId, SessionId)
 import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
@@ -29,4 +30,12 @@ data AgentEnv = AgentEnv
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int
+  , aeMessageSource :: Maybe MessageSource
+    -- ^ The authenticated-transport identity of the inbound message this
+    -- turn is answering. 'Nothing' for the CLI TUI (which bypasses
+    -- 'MessageSource'); @'Just' ms@ for channels that carry one (Signal).
+    -- 'runTurn' folds the 'msChannelKind' into the request 'EntryRecord's
+    -- @erMeta@ @channel@ field and the 'msConversationId' into
+    -- @conversationId@, so the transcript records which channel + conversation
+    -- each turn served.
   }

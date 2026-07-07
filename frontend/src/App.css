@@ -1,0 +1,698 @@
+@import '../design-tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Animations ──────────────────────────────────────────────────────── */
+
+@keyframes needsPulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--needs-input-glow); }
+  50% { box-shadow: 0 0 0 3px transparent; }
+}
+
+@keyframes thinkingGradient {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* Ping-style: sharp onset, ease-out expansion, then hold at zero so each
+   cycle reads as a discrete pulse instead of a continuous wash. The sharp
+   leading edge is what makes the pulse register peripherally. */
+@keyframes thinkingHalo {
+  0%        { box-shadow: 0 0 0 0    rgba(124, 108, 246, 0.7); }
+  70%       { box-shadow: 0 0 0 10px rgba(124, 108, 246, 0);   }
+  100%      { box-shadow: 0 0 0 10px rgba(124, 108, 246, 0);   }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes typingDot {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+/* ── Status Dots ─────────────────────────────────────────────────────── */
+
+.dot {
+  width: var(--dot-size);
+  height: var(--dot-size);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-sm {
+  width: var(--dot-size-sm);
+  height: var(--dot-size-sm);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-needs {
+  background: var(--needs-input);
+  animation: needsPulse var(--pulse-duration) ease-in-out infinite;
+}
+
+.dot-thinking {
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  background-size: 200% 200%;
+  /* Gradient shift keeps the dot "alive" up close; the halo gives it a
+     peripheral-vision-visible pulse on an 8px target. */
+  animation:
+    thinkingGradient var(--gradient-duration)        ease                       infinite,
+    thinkingHalo     var(--thinking-halo-duration)   cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.dot-idle {
+  background: var(--text-muted);
+  opacity: 0.35;
+}
+
+.dot-completed {
+  background: var(--success);
+  opacity: 0.5;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+
+.agent-row {
+  border-left: 2px solid transparent;
+  transition: background var(--duration-fast) var(--ease-out),
+              border-color var(--duration-fast) var(--ease-out);
+  cursor: pointer;
+}
+
+.agent-row:hover:not(.selected) {
+  background: var(--surface-hover);
+}
+
+.agent-row.selected {
+  border-left-color: var(--accent-primary);
+  background: var(--bg-elevated);
+}
+
+.agent-row.shimmer {
+  background-image: linear-gradient(90deg, transparent 0%, rgba(124,108,246,0.04) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer var(--shimmer-duration) infinite;
+}
+
+.agent-row.shimmer.selected {
+  background-color: var(--bg-elevated);
+}
+
+/* Orphaned harness (no live tmux window): a greyed/muted row awaiting Dismiss
+   or auto-eviction after the grace window. Mutes the whole row so it reads as
+   "gone but still listed" — distinct from a live row, consistent with the
+   muted-text tokens used elsewhere. */
+.agent-row.tab-orphaned {
+  opacity: 0.55;
+}
+
+.agent-row.tab-orphaned .text-sm {
+  color: var(--text-muted);
+}
+
+/* Stale: last-known liveness is held because a reconcile sweep/capture blipped.
+   A subtle dim cue (no distinct glyph) — distinct-but-subtle vs. orphaned so a
+   transient blip never looks like a hard orphan. Combines with .tab-orphaned
+   (an orphaned row can also be stale) without over-fading. */
+.agent-row.tab-stale {
+  opacity: 0.8;
+}
+
+.agent-row.tab-orphaned.tab-stale {
+  opacity: 0.5;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────── */
+
+.btn {
+  transition: background var(--duration-fast) ease, box-shadow var(--duration-fast) ease, transform 80ms ease;
+  cursor: pointer;
+  outline: none;
+  border: none;
+}
+
+.btn:focus-visible {
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 4px rgba(124, 108, 246, 0.4);
+}
+
+.btn:active { transform: translateY(0.5px); }
+.btn-primary { background: var(--accent-primary); color: white; }
+.btn-primary:hover { background: #8B7DF7; }
+.btn-ghost { background: var(--bg-elevated); color: var(--text-muted); border: 1px solid var(--border); }
+.btn-ghost:hover { background: #252A40; color: var(--text-primary); }
+.btn-danger-ghost { background: rgba(255, 107, 107, 0.08); color: #FF6B6B; border: 1px solid rgba(255, 107, 107, 0.15); }
+.btn-danger-ghost:hover { background: rgba(255, 107, 107, 0.14); }
+
+/* ── Chat ─────────────────────────────────────────────────────────────── */
+
+.message-group {
+  animation: fadeIn var(--duration-slow) var(--ease-out) both;
+}
+
+.code-block {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px 16px;
+  overflow-x: auto;
+  color: var(--text-muted);
+}
+
+.code-block .kw { color: var(--accent-primary); }
+.code-block .str { color: var(--success); }
+.code-block .fn { color: var(--accent-secondary); }
+.code-block .cm { color: var(--text-faint); }
+
+/* ── Typing indicator ────────────────────────────────────────────────── */
+
+.typing-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  display: inline-block;
+  animation: typingDot 1.4s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* ── Scrollbars ──────────────────────────────────────────────────────── */
+
+.sidebar-scroll { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.sidebar-scroll::-webkit-scrollbar { width: 4px; }
+.sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+.sidebar-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.chat-scroll { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.chat-scroll::-webkit-scrollbar { width: 6px; }
+.chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.chat-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ── Misc ─────────────────────────────────────────────────────────────── */
+
+.progress-fill {
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: var(--accent-gradient);
+}
+
+.topbar-bg {
+  background: linear-gradient(135deg, rgba(124,108,246,0.08) 0%, rgba(79,142,247,0.04) 100%);
+}
+
+.pill {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  font-weight: var(--font-medium);
+  line-height: 1.5;
+}
+
+.token-count {
+  background: var(--bg-base);
+  color: var(--text-faint);
+}
+
+.inline-code {
+  font-size: var(--text-xs);
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--accent-secondary);
+}
+
+.kbd {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.15);
+  border: 1px solid rgba(255,255,255,0.2);
+  color: rgba(255,255,255,0.6);
+  font-family: inherit;
+}
+
+/* ── Addressable blocks (Context Reachability) ────────────────────────── */
+
+.anchor-handle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: var(--font-regular);
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease;
+  flex-shrink: 0;
+}
+
+.anchor-handle:hover {
+  background: var(--surface-hover);
+  color: var(--accent-primary);
+}
+.anchor-handle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 2px var(--accent-primary);
+}
+
+.anchor-handle svg { display: block; }
+
+/* Square icon-only button used for inline header affordances (Link, JSON).
+   24x24 hit target, primary-color glyph, subtle hover background. Adjacent
+   icon-btns nudge closer so a pair reads as one unit. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--accent-primary);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease;
+}
+.icon-btn:hover {
+  background: var(--surface-hover);
+}
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 2px var(--accent-primary);
+}
+.icon-btn-success {
+  color: var(--success);
+}
+.icon-btn svg { display: block; }
+.icon-btn + .icon-btn { margin-left: -4px; }
+
+/* ── Raw-JSON modal ───────────────────────────────────────────────────── */
+
+.raw-json-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  padding: 32px;
+}
+
+.raw-json-modal {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  width: 100%;
+  height: 100%;
+  max-width: 1400px;
+  max-height: 1100px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.raw-json-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sunken);
+  flex-shrink: 0;
+}
+
+.raw-json-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.raw-json-close {
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease,
+              border-color var(--duration-fast) ease;
+}
+.raw-json-close:hover {
+  background: var(--needs-input, #ff6b6b);
+  border-color: var(--needs-input, #ff6b6b);
+  color: #fff;
+}
+.raw-json-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-primary);
+}
+
+.raw-json-copy {
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium, 500);
+  line-height: 1;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease,
+              border-color var(--duration-fast) ease;
+}
+.raw-json-copy:hover {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: #fff;
+}
+.raw-json-copy:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-primary);
+}
+.raw-json-copy-copied {
+  color: var(--success);
+  border-color: var(--success);
+}
+.raw-json-copy-copied:hover {
+  background: var(--success);
+  color: #fff;
+}
+.raw-json-copy-failed {
+  color: var(--needs-input);
+  border-color: var(--needs-input);
+}
+.raw-json-copy-failed:hover {
+  background: var(--needs-input);
+  color: #fff;
+}
+
+.raw-json-body {
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  white-space: pre;
+  flex: 1;
+}
+
+.raw-json-body-tree {
+  white-space: normal;
+  padding: 12px 8px;
+}
+
+.raw-json-body-empty {
+  white-space: normal;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-style: italic;
+}
+
+.raw-json-tabs {
+  display: inline-flex;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.raw-json-tab {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium, 500);
+  line-height: 1;
+  padding: 6px 12px;
+  border-radius: calc(var(--radius-sm) - 1px);
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.raw-json-tab:hover {
+  color: var(--text-primary);
+}
+.raw-json-tab-active {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.raw-json-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-primary);
+}
+
+/* ── JSON tree (Formatted tab) ────────────────────────────────────────── */
+
+.json-tree {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+
+.json-row {
+  display: block;
+  white-space: nowrap;
+}
+
+.json-key { color: var(--accent-secondary); }
+.json-string { color: var(--success); }
+.json-number { color: var(--accent-primary); }
+.json-boolean { color: var(--accent-primary); }
+.json-null { color: var(--text-faint); font-style: italic; }
+.json-punct { color: var(--text-muted); }
+.json-collapsed-summary { color: var(--text-faint); font-style: italic; }
+
+.json-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 9px;
+  line-height: 1;
+  padding: 0 6px 0 0;
+  font-family: var(--font-mono);
+}
+.json-toggle:hover { color: var(--accent-primary); }
+.json-toggle:focus-visible {
+  outline: none;
+  color: var(--accent-primary);
+}
+
+.json-string-block {
+  margin: 4px 0;
+  padding: 8px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--success);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  max-width: calc(100% - 32px);
+}
+
+/* ── Chat-header editable title ───────────────────────────────────────── */
+
+.editable-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 360px;
+  padding: 2px 6px;
+  margin: -2px -6px;          /* keep visual bounds identical to the static span it replaces */
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+  cursor: text;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.editable-title:hover { background: var(--bg-elevated); }
+.editable-title:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 4px rgba(124, 108, 246, 0.4);
+}
+.editable-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.editable-title-pencil {
+  flex-shrink: 0;
+  /* Always visible (muted) for discoverability; brightens to accent on hover. */
+  opacity: 1;
+  color: var(--text-faint);
+  transition: opacity var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.editable-title:hover .editable-title-pencil { color: var(--accent-primary); }
+
+.editable-title-input {
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  margin: -2px -6px;
+  outline: none;
+  min-width: 200px;
+  max-width: 360px;
+}
+.editable-title-input::placeholder {
+  color: var(--text-faint);
+  font-weight: var(--font-regular);
+}
+
+/* ── Chat-header scroll buttons (top / bottom) ────────────────────────── */
+
+.header-scroll-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease,
+              border-color var(--duration-fast) ease;
+  flex-shrink: 0;
+}
+.header-scroll-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--accent-primary);
+  border-color: var(--border);
+}
+.header-scroll-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 4px rgba(124, 108, 246, 0.4);
+}
+.header-scroll-btn svg { display: block; }
+
+/* ── Sidebar session archive button ───────────────────────────────────── */
+
+.session-archive {
+  /* Hidden by default so the pill stays flush right. Switched to
+   * inline-flex on row hover / button focus. */
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease,
+              color var(--duration-fast) ease;
+  flex-shrink: 0;
+}
+.session-row:hover .session-archive,
+.session-archive:focus-visible {
+  display: inline-flex;
+}
+.session-archive:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-surface), 0 0 0 4px rgba(124, 108, 246, 0.4);
+}
+.session-archive:hover {
+  background: var(--bg-elevated);
+  color: var(--accent-primary);
+}
+.session-archive svg { display: block; }
