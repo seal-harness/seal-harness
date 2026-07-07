@@ -35,6 +35,7 @@ import Toml qualified
 import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
+import Seal.Gateway.Config (GatewayConfig (..), gatewayConfigCodec)
 
 -- | All user-editable vault settings persisted in @config\/config.toml@.
 -- Every field is optional; a missing key decodes as 'Nothing'.
@@ -64,6 +65,9 @@ data FileConfig = FileConfig
   , fcSignal :: Maybe SignalConfig
     -- ^ Optional @[signal]@ section (Signal channel config). Absent means
     -- the Signal channel is not configured.
+  , fcGateway :: Maybe GatewayConfig
+    -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
+    -- gateway is not configured.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -98,6 +102,7 @@ defaultFileConfig = FileConfig
   , fcProviders       = Map.empty
   , fcRetrieval       = Nothing
   , fcSignal          = Nothing
+  , fcGateway         = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -130,6 +135,7 @@ fileConfigCodec = FileConfig
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
+  <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig

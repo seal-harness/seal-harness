@@ -99,6 +99,7 @@ library
         Seal.Security.Vault
         Seal.Security.Vault.Age
         Seal.Text.LineFile
+        Seal.Gateway.Config
         Seal.Tui
         Seal.Types.App
         Seal.Types.Command
@@ -156,6 +157,9 @@ library
       , vector
       , random
       , uuid-types
+      , wai
+      , warp
+      , websockets
     hs-source-dirs: src
 
 executable seal
@@ -197,6 +201,7 @@ test-suite tests
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
+        Seal.Gateway.ConfigSpec
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
         Seal.Harness.ReconcileSpec
