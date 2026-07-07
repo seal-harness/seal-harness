@@ -15,6 +15,8 @@ import Test.Hspec
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Server
+import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import System.FilePath ((</>))
@@ -38,9 +40,10 @@ runAppStatus app req = do
 mkDeps :: IO ApiDeps
 mkDeps = do
   tabsH <- newTabsHandle
+  reg   <- newHarnessRegistry
   activeRef <- newIORef fakeMeta
   let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
-  pure (ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH })
+  pure (ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH, adHarnessRegistry = reg, adAdoptConsent = Just CcWeb })
 
 spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do

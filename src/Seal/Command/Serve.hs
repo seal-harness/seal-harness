@@ -22,6 +22,8 @@ import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle)
@@ -54,6 +56,7 @@ runServeMain = do
   let repo = openConfigRepo cfgRoot
   backends <- newBackends cfgRoot repo
   tabsH   <- newTabsHandle
+  reg     <- newHarnessRegistry
   sessionMeta <- initSession paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime
@@ -63,7 +66,12 @@ runServeMain = do
              }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = fromMaybe defaultGatewayConfig (fcGateway cfg)
-      deps = ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH }
+      deps = ApiDeps
+        { adSessionRuntime  = sr
+        , adTabsHandle      = tabsH
+        , adHarnessRegistry = reg
+        , adAdoptConsent    = Just CcWeb
+        }
   -- Start the WS stream server on the WS port
   broker <- newStreamBroker 1024
   let guard = StreamGuard { sgAllowedOrigins = gcAllowedOrigins gwCfg, sgGlobalCap = 1024 }
