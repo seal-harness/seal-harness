@@ -42,6 +42,7 @@ library
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
+        Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Routing.Route

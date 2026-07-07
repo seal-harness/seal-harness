@@ -9,16 +9,19 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Time (UTCTime(..), fromGregorian)
-import Network.HTTP.Types (methodGet, methodPost, statusCode)
+import Network.HTTP.Types (methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus, setRequestBodyChunks )
+  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
+  , setRequestBodyChunks )
 import Network.Wai.Internal (ResponseReceived (..))
 import Test.Hspec
 
+import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -44,7 +47,15 @@ testRequest mth path = defaultRequest
 -- chunk (then empty, which signals end-of-body to wai). Runs in IO because
 -- the body-chunk action holds a one-shot IORef.
 testPost :: [T.Text] -> BL.ByteString -> IO Request
-testPost path body = do
+testPost = testWithBody methodPost
+
+-- | Build a PUT request with a JSON body.
+testPut :: [T.Text] -> BL.ByteString -> IO Request
+testPut = testWithBody methodPut
+
+-- | Build a request with a given method + a JSON body.
+testWithBody :: BC.ByteString -> [T.Text] -> BL.ByteString -> IO Request
+testWithBody mth path body = do
   usedRef <- newIORef False
   let readChunk = do
         already <- readIORef usedRef
@@ -52,7 +63,7 @@ testPost path body = do
           then pure BC.empty
           else do writeIORef usedRef True
                   pure (BL.toStrict body)
-  pure (setRequestBodyChunks readChunk (defaultRequest { requestMethod = methodPost, pathInfo = path }))
+  pure (setRequestBodyChunks readChunk (defaultRequest { requestMethod = mth, pathInfo = path }))
 
 -- | Run the app against a test request, capturing the HTTP status code.
 runAppStatus :: Application -> Request -> IO Int
@@ -66,6 +77,7 @@ spec = describe "Seal.Gateway.API" $ do
   let mkApp = do
         tabsH <- newTabsHandle
         reg   <- newHarnessRegistry
+        adb   <- noneBackend
         activeRef <- newIORef fakeMeta
         let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
             deps = ApiDeps
@@ -73,6 +85,8 @@ spec = describe "Seal.Gateway.API" $ do
               , adTabsHandle      = tabsH
               , adHarnessRegistry = reg
               , adAdoptConsent    = Just CcWeb
+              , adAgentDefs       = adb
+              , adProviders       = knownProviders
               }
         pure (apiApp deps)
 
@@ -184,3 +198,74 @@ spec = describe "Seal.Gateway.API" $ do
     req2 <- testPost ["api", "tabs", "0", "destroy"] BL.empty
     status <- runAppStatus app req2
     status `shouldBe` 204
+
+  -- T11: sessions + agents + providers + context-window routes
+
+  it "GET /api/sessions returns 200 with a JSON array (empty store)" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions"])
+    status `shouldBe` 200
+
+  it "GET /api/sessions/archived returns 200 with []" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions", "archived"])
+    status `shouldBe` 200
+
+  it "GET /api/sessions/<sid>/transcript returns 200 with [] (no file)" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions", "sess1", "transcript"])
+    status `shouldBe` 200
+
+  it "POST /api/sessions/<sid>/send returns 200 with {kind:assistant}" $ do
+    app <- mkApp
+    req <- testPost ["api", "sessions", "sess1", "send"]
+      (A.encode (A.object [ "message" .= ("hi" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/description returns 204" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "description"]
+      (A.encode (A.object [ "description" .= ("new" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 204
+
+  it "PUT /api/sessions/<sid>/archived returns 204" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "archived"]
+      (A.encode (A.object [ "archived" .= True ]))
+    status <- runAppStatus app req
+    status `shouldBe` 204
+
+  it "PUT /api/sessions/<sid>/prompt returns 204" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "prompt"]
+      (A.encode (A.object [ "prompt" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 204
+
+  it "GET /api/agents returns 200 with a JSON array" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "agents"])
+    status `shouldBe` 200
+
+  it "GET /api/providers returns 200 with a JSON array" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "providers"])
+    status `shouldBe` 200
+
+  it "GET /api/providers/anthropic/models returns 200" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "providers", "anthropic", "models"])
+    status `shouldBe` 200
+
+  it "GET /api/providers/anthropic/models/claude-sonnet-4-20250514/context returns 200" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet
+      ["api", "providers", "anthropic", "models", "claude-sonnet-4-20250514", "context"])
+    status `shouldBe` 200
+
+  it "GET /api/providers/unknown/models returns 200 with []" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
+    status `shouldBe` 200

@@ -19,6 +19,7 @@ import Network.Wai.Internal (ResponseReceived (..))
 import Network.WebSockets (ClientApp, runClient, receiveData)
 import Test.Hspec
 
+import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
@@ -26,6 +27,7 @@ import Seal.Gateway.Server (gatewayApp)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -50,9 +52,17 @@ spec = describe "Seal.Phase7aSpec" $ do
   it "the assembled gateway serves /api/health (200)" $ do
     tabsH <- newTabsHandle
     reg   <- newHarnessRegistry
+    adb   <- noneBackend
     activeRef <- newIORef fakeMeta
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
-        deps = ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH, adHarnessRegistry = reg, adAdoptConsent = Just CcWeb }
+        deps = ApiDeps
+          { adSessionRuntime = sr
+          , adTabsHandle = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent = Just CcWeb
+          , adAgentDefs = adb
+          , adProviders = knownProviders
+          }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
     status `shouldBe` 200
@@ -80,9 +90,17 @@ spec = describe "Seal.Phase7aSpec" $ do
   it "GET /api/tabs returns 200 via the assembled gateway" $ do
     tabsH <- newTabsHandle
     reg   <- newHarnessRegistry
+    adb   <- noneBackend
     activeRef <- newIORef fakeMeta
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
-        deps = ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH, adHarnessRegistry = reg, adAdoptConsent = Just CcWeb }
+        deps = ApiDeps
+          { adSessionRuntime = sr
+          , adTabsHandle = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent = Just CcWeb
+          , adAgentDefs = adb
+          , adProviders = knownProviders
+          }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })
     status `shouldBe` 200

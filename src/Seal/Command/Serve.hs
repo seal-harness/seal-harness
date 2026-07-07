@@ -23,6 +23,7 @@ import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
@@ -71,6 +72,8 @@ runServeMain = do
         , adTabsHandle      = tabsH
         , adHarnessRegistry = reg
         , adAdoptConsent    = Just CcWeb
+        , adAgentDefs       = bAgentDefs backends
+        , adProviders       = knownProviders
         }
   -- Start the WS stream server on the WS port
   broker <- newStreamBroker 1024

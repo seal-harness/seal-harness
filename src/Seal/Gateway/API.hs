@@ -13,25 +13,34 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive qualified as CI
-import Data.IORef (readIORef)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.Read (decimal)
 import Network.HTTP.Types
-  ( Header, HeaderName, Status, methodGet, methodOptions, methodPost
+  ( Header, HeaderName, Status, methodGet, methodOptions, methodPost, methodPut
   , status200, status204, status400, status403, status404, status501 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
+import System.Directory (doesFileExist)
+import Data.Text.IO qualified as TIO
 
+import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
+import Seal.Config.Paths (sessionEntriesPath)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (HarnessId (..), newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
+import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
+import Seal.Providers.Registry
+  ( KnownProvider (..), parseProvider, providerLabel )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..))
+import Seal.Session.Store (SessionRuntime (..), listSessions)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 
@@ -41,6 +50,8 @@ data ApiDeps = ApiDeps
   , adTabsHandle      :: TabsHandle
   , adHarnessRegistry :: HarnessRegistry    -- ^ the live harness registry
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
+  , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11)
+  , adProviders       :: [KnownProvider]      -- ^ for /api/providers; the configured provider list (T11)
   }
 
 -- | The REST API as a WAI Application.
@@ -53,14 +64,72 @@ apiApp deps req respond =
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
       respond (jsonLBS status200 (A.encode tabsJson))
+    -- T11: GET /api/sessions -> the recent, non-archived sessions. The
+    -- backend does not persist an @archived@ flag on 'SessionMeta' yet, so
+    -- this returns ALL sessions; @/api/sessions/archived@ returns @[]@ (the
+    -- archive flag is a UI hint the backend doesn't track yet).
     (m', ["api", "sessions"]) | m' == methodGet -> do
-      active <- readIORef (srActive (adSessionRuntime deps))
-      respond (jsonOk (object ["id" .= sessionIdText (smId active), "provider" .= smProvider active, "model" .= smModel active]))
+      metas <- listSessions (srPaths (adSessionRuntime deps))
+      respond (jsonLBS status200 (A.encode (map sessionInfoJson metas)))
+    -- T11: archived sessions — the backend doesn't persist an archive flag,
+    -- so this is always @[]@ for now.
+    (m', ["api", "sessions", "archived"]) | m' == methodGet ->
+      respond (jsonLBS status200 (A.encode ([] :: [Value])))
+    -- T11: GET /api/sessions/:id/transcript -> the parsed @entries.jsonl@
+    -- lines, as a JSON array. Missing file -> @[]@; unparseable lines are
+    -- skipped.
+    (m', ["api", "sessions", sid, "transcript"]) | m' == methodGet ->
+      respond =<< handleTranscript deps sid
+    -- T11 STUB: POST /api/sessions/:id/send. The real wiring routes the
+    -- message through 'Seal.Ingest' (the agent loop), which is a deeper
+    -- integration; T11 just needs the endpoint to exist + respond per the
+    -- frontend's contract so the manual smoke + Playwright capstone can
+    -- exercise the wiring. Returns @{kind: "assistant"}@.
+    (m', ["api", "sessions", _sid, "send"]) | m' == methodPost -> do
+      _body <- collectBody req
+      respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
+    -- T11 STUB: PUT /api/sessions/:id/description — 204 (no persistence yet;
+    -- 'SessionMeta' has no description field).
+    (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
+      _body <- collectBody req
+      respond noContent
+    -- T11 STUB: PUT /api/sessions/:id/archived — 204 (no persistence yet).
+    (m', ["api", "sessions", _sid, "archived"]) | m' == methodPut -> do
+      _body <- collectBody req
+      respond noContent
+    -- T11 STUB: PUT /api/sessions/:id/prompt — 204 (no persistence yet).
+    (m', ["api", "sessions", _sid, "prompt"]) | m' == methodPut -> do
+      _body <- collectBody req
+      respond noContent
     (m', ["api", "harnesses"]) | m' == methodGet -> do
       entries <- snapshot (adHarnessRegistry deps)
       respond (jsonLBS status200 (A.encode entries))
     (m', ["api", "harnesses", "discover"]) | m' == methodGet ->
       respond (jsonLBS status200 (A.encode ([] :: [Value])))
+    -- T11: GET /api/agents -> the agent defs. @isDefault@ is a UI
+    -- convenience; 'ApiDeps' doesn't carry the configured default agent id,
+    -- so T11 returns @isDefault: false@ for all.
+    (m', ["api", "agents"]) | m' == methodGet -> do
+      defs <- adbList (adAgentDefs deps)
+      respond (jsonLBS status200 (A.encode (map agentInfoJson defs)))
+    -- T11: GET /api/providers -> the configured provider list. @isDefault@
+    -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
+    -- T11, so only @name@ is emitted.
+    (m', ["api", "providers"]) | m' == methodGet ->
+      respond (jsonLBS status200 (A.encode (map providerInfoJson (adProviders deps))))
+    -- T11: GET /api/providers/:p/models -> a STATIC list of models for the
+    -- provider (the real /v1/models upstream call needs vault credentials +
+    -- a live HTTP request and is out of scope). Context windows come from
+    -- 'Seal.Providers.ContextWindow'.
+    (m', ["api", "providers", p, "models"]) | m' == methodGet ->
+      respond (jsonLBS status200 (A.encode (providerModelsJson p)))
+    -- T11: GET /api/providers/:p/models/:m/context -> the context-window +
+    -- max-output-tokens for the model (from 'Seal.Providers.ContextWindow').
+    (m', ["api", "providers", _p, "models", m, "context"]) | m' == methodGet ->
+      respond (jsonOk (object
+        [ "contextWindow" .= modelContextWindow m
+        , "maxOutputTokens" .= modelMaxOutputTokens m
+        ]))
     (m', ["api", "tabs", "new"]) | m' == methodPost -> do
       body <- collectBody req
       case A.decode body :: Maybe A.Value of
@@ -248,6 +317,85 @@ statusWire _ Live = "idle"
 sessionWire :: TabRef -> Maybe Text
 sessionWire (BoundSession sid) = Just (sessionIdText sid)
 sessionWire (BoundHarness _)   = Nothing
+
+-- | Map a 'SessionMeta' to the frontend's 'SessionInfo' JSON shape
+-- (camelCase). The on-disk 'SessionMeta' uses snake_case; the gateway maps
+-- to the frontend's shape without changing 'SessionMeta's instance.
+-- Fields the backend doesn't track yet (@description@, @autoSummary@,
+-- @firstMessageSnippet@, @channelUserId@) are returned as @null@.
+sessionInfoJson :: SessionMeta -> Value
+sessionInfoJson m = object
+  [ "id" .= sessionIdText (smId m)
+  , "agent" .= (agentDefIdText <$> smAgent m)
+  , "runtime" .= ("session:" <> smProvider m)
+  , "model" .= smModel m
+  , "lastActive" .= smLastActive m
+  , "createdAt" .= smCreatedAt m
+  , "description" .= (Nothing :: Maybe Text)
+  , "autoSummary" .= (Nothing :: Maybe Text)
+  , "firstMessageSnippet" .= (Nothing :: Maybe Text)
+  , "channel" .= smChannel m
+  , "channelUserId" .= (Nothing :: Maybe Text)
+  ]
+
+-- | T11: handle GET /api/sessions/:id/transcript. Reads the session's
+-- @entries.jsonl@ line by line, parses each line as JSON, and returns the
+-- array. Missing file -> @[]@; unparseable lines are skipped.
+handleTranscript :: ApiDeps -> Text -> IO Response
+handleTranscript deps sidTxt =
+  case mkSessionId sidTxt of
+    Left _  -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
+    Right sid -> do
+      let path = sessionEntriesPath (srPaths (adSessionRuntime deps)) sid
+      exists <- doesFileExist path
+      if not exists
+        then pure (jsonLBS status200 (A.encode ([] :: [Value])))
+        else do
+          raw <- TIO.readFile path
+          let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                              (filter (not . T.null) (T.lines raw))
+          pure (jsonLBS status200 (A.encode (vals :: [Value])))
+
+-- | Map an 'AgentDef' to the frontend's 'AgentInfo' JSON shape. @isDefault@
+-- is a UI convenience; T11 returns @false@ for all (the configured default
+-- agent id is not threaded into 'ApiDeps').
+agentInfoJson :: AgentDef -> Value
+agentInfoJson d = object
+  [ "name" .= adName d
+  , "isDefault" .= False
+  ]
+
+-- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
+-- emits only @name@; @isDefault@ / @defaultModel@ are UI conveniences not
+-- threaded into 'ApiDeps' for T11.
+providerInfoJson :: KnownProvider -> Value
+providerInfoJson p = object ["name" .= providerLabel p]
+
+-- | T11: the STATIC model list for a provider. The real @/v1/models@
+-- upstream call needs vault credentials + a live HTTP request and is out of
+-- scope. Unknown providers -> @[]@. Each model's @contextWindow@ comes from
+-- 'Seal.Providers.ContextWindow'.
+providerModelsJson :: Text -> [Value]
+providerModelsJson pTxt =
+  case parseProvider pTxt of
+    Nothing -> []
+    Just p  -> map (modelEntryJson p) (staticModelsFor p)
+
+-- | The static model id list for a provider (T11 best-known table).
+staticModelsFor :: KnownProvider -> [Text]
+staticModelsFor AnthropicProvider =
+  [ "claude-sonnet-4-20250514"
+  , "claude-opus-4-8"
+  , "claude-haiku-4-5"
+  ]
+staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
+
+-- | One model entry: @{name, contextWindow}@.
+modelEntryJson :: KnownProvider -> Text -> Value
+modelEntryJson _p mName = object
+  [ "name" .= mName
+  , "contextWindow" .= modelContextWindow mName
+  ]
 
 -- | A 200 OK with a JSON body + CORS headers.
 jsonOk :: Value -> Response

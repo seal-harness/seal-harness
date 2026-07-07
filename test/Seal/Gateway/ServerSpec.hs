@@ -12,10 +12,12 @@ import System.IO.Temp (withSystemTempDirectory)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
+import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.Server
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -41,9 +43,17 @@ mkDeps :: IO ApiDeps
 mkDeps = do
   tabsH <- newTabsHandle
   reg   <- newHarnessRegistry
+  adb   <- noneBackend
   activeRef <- newIORef fakeMeta
   let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
-  pure (ApiDeps { adSessionRuntime = sr, adTabsHandle = tabsH, adHarnessRegistry = reg, adAdoptConsent = Just CcWeb })
+  pure (ApiDeps
+    { adSessionRuntime = sr
+    , adTabsHandle = tabsH
+    , adHarnessRegistry = reg
+    , adAdoptConsent = Just CcWeb
+    , adAgentDefs = adb
+    , adProviders = knownProviders
+    })
 
 spec :: Spec
 spec = describe "Seal.Gateway.Server" $ do
