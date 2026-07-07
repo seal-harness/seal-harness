@@ -10,3 +10,7 @@ frontend/dist/
 # BEADS working state (the plan docs under docs/superpowers/plans/ are tracked)
 .beads/plans/active-plan.md
 .beads/plans/active-plan.md.bak
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
