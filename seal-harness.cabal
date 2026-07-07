@@ -101,6 +101,7 @@ library
         Seal.Security.Vault
         Seal.Security.Vault.Age
         Seal.Text.LineFile
+        Seal.Tools.Exec.Types
         Seal.Gateway.Config
         Seal.Gateway.API
         Seal.Gateway.Server
@@ -286,6 +287,7 @@ test-suite tests
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Text.LineFileSpec
+        Seal.Tools.Exec.TypesSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
