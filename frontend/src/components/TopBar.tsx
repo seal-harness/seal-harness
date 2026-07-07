@@ -1,4 +1,4 @@
-import logoSvg from '../../assets/logo.svg'
+import logoImg from '../../assets/SealLogo.png'
 
 export function TopBar({ taskTitle }: { taskTitle: string }) {
   return (
@@ -8,7 +8,7 @@ export function TopBar({ taskTitle }: { taskTitle: string }) {
     >
       <div className="flex items-center gap-2.5">
         <img
-          src={logoSvg}
+          src={logoImg}
           alt="Seal Harness"
           style={{ width: 'var(--logo-size)', height: 'var(--logo-size)', borderRadius: 'var(--radius-md)', objectFit: 'cover' }}
         />
