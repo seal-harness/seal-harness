@@ -59,14 +59,19 @@ contentTypeFor ext = case ext of
   ".ico"  -> "image/x-icon"
   _       -> "application/octet-stream"
 
--- | Run the gateway. Emits a non-loopback warning if the host isn't
--- 127.0.0.1/::1 (the full slash-command surface — including local code
--- execution — is reachable by anything that can reach the address).
+-- | Run the gateway. Prints a startup banner with the bind address + the
+-- served static dir, then emits a non-loopback warning if the host isn't
+-- 127.0.0.1/::1/localhost (the full slash-command surface — including local
+-- code execution — is reachable by anything that can reach the address).
 runGateway :: GatewayConfig -> ApiDeps -> IO ()
 runGateway cfg deps = do
   let host = gcHost cfg
+      port = gcPort cfg
+  hPutStrLn stderr "Seal Harness gateway"
+  hPutStrLn stderr ("  URL:      http://" <> T.unpack host <> ":" <> show port)
   when (host /= "127.0.0.1" && host /= "::1" && host /= "localhost") $
-    hPutStrLn stderr ("Warning: binding to " <> T.unpack host <> " — the full slash-command surface is reachable by anything that can reach this address")
+    hPutStrLn stderr ("Warning: binding to " <> T.unpack host
+                      <> " — the full slash-command surface is reachable by anything that can reach this address")
   let mStaticDir = fmap T.unpack (gcStaticDir cfg)
       app = gatewayApp deps mStaticDir
-  run (gcPort cfg) app
+  run port app
