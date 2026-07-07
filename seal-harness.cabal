@@ -101,6 +101,7 @@ library
         Seal.Text.LineFile
         Seal.Gateway.Config
         Seal.Gateway.API
+        Seal.Gateway.Server
         Seal.Gateway.Stream
         Seal.Gateway.StreamBroker
         Seal.Tui
@@ -212,6 +213,7 @@ test-suite tests
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.ApiSpec
+        Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
         Seal.Harness.IdSpec
