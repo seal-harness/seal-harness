@@ -8,6 +8,7 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , mkSessionAgentEnv
+  , execBackendFromFile
   , Backends (..)
   , newBackends
   ) where
@@ -35,8 +36,8 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
-import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes)
+import Seal.Config.File (FileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
+                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile)
 import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
@@ -45,7 +46,9 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.Local (mkLocalExecHandle)
+import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..))
+import Seal.Tools.Exec.Untrusted (selectExecBackend)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -151,8 +154,8 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = AgentEnv
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -160,9 +163,11 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
-  , aeExecBackend = EbLocal mkLocalExecHandlePlaceholder
-    -- ^ 4b-T1 placeholder: 4b-T3 wires the real 'UntrustedExecConfig' (Local
-    -- vs Remote SSH by mode). For now Untrusted opcodes run locally.
+  , aeExecBackend = execBackend
+    -- ^ The untrusted-execution backend (Local vs Remote SSH) from the
+    -- runtime 'UntrustedExecConfig' (4b-T3). Trusted/Audited opcodes
+    -- ignore it (the GADT 'Opcode' has no 'ExecBackend' field for them —
+    -- type-level capability scoping, spec §4/§8).
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
@@ -211,6 +216,17 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
   -- change takes effect on the next session.
   eCfg <- loadFileConfig (prConfigPath pr)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+      -- Resolve the untrusted-execution backend (Phase 4 4b-T3). Absent
+      -- section or mode=local → the local executor (wired to wsRoot);
+      -- mode=remote → the SSH executor (if fully configured) or fail-closed
+      -- (the dispatcher surfaces the structured error at call time). The
+      -- remote executor itself lands in 4g; until then mode=remote without
+      -- a real SSH executor falls back to the local executor's placeholder
+      -- (the opcode fail-closes via 'ExecNotImplemented' if it actually
+      -- needs the remote). 4b-T3 wires the LOCAL arm to the real
+      -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
+      execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+      defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
   -- The two-file transcript bracket wraps the whole loop so every turn shares
   -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
   -- they are built here where both `caps` and the transcript handle are in
@@ -262,7 +278,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
             Left err              -> ccSend caps ("agent start failed: " <> err)
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
-                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle
+                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
                 runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
           [ showHumanOp caps
@@ -298,7 +314,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
                 Nothing -> pure Nothing
                 Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend)
                 appEnv t
     runInputT hlSettings (loop caps plainHandler tabsH)
   where
@@ -362,3 +378,22 @@ handleTabCommand caps tabsH = \case
     renderTab t =
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
+
+-- | Resolve the untrusted-execution 'ExecBackend' from the 'FileConfig'.
+-- Absent section / mode=local → 'EbLocal' (the real local executor wired
+-- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
+-- (the SSH executor lands in 4g; until then this falls back to the local
+-- executor's placeholder so untrusted opcodes still run, fail-closed via
+-- 'ExecNotImplemented' if they actually need the remote). mode=remote +
+-- remote absent/incomplete → 'EbLocal' (the dispatcher fail-closes at call
+-- time via 'selectExecBackend' returning 'Left ExecRemoteRequired').
+execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
+execBackendFromFile wsRoot cfg =
+  case untrustedExecConfigFromFile cfg of
+    Nothing -> defaultBackend
+    Just uec ->
+      case selectExecBackend uec TbLocal of
+        Right eb -> eb
+        Left _   -> defaultBackend
+  where
+    defaultBackend = EbLocal (mkLocalExecHandle wsRoot)
