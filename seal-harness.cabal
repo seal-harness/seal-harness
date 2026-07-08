@@ -126,6 +126,7 @@ library
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
+        Seal.ISA.Ops.Shell
         Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
@@ -312,5 +313,6 @@ test-suite tests
         Seal.ISA.DispatchSpec
         Seal.ISA.Ops.HumanSpec
         Seal.ISA.Ops.FileSpec
+        Seal.ISA.Ops.ShellSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
