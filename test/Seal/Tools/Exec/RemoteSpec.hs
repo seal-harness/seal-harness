@@ -34,15 +34,15 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
     it "includes the host and user" $ do
       let cfg = sshCfg
           argv = sshExecArgv cfg "echo hi"
-      argv `shouldSatisfy` any (== "agent@exec.internal") -- the user@host form
+      argv `shouldSatisfy` elem "agent@exec.internal" -- the user@host form
       -- OR separate: -l agent exec.internal — either form is fine; the
       -- key constraint is the host and user are present.
 
     it "passes the command as a single arg (no shell interpreter)" $ do
       let cfg = sshCfg
           argv = sshExecArgv cfg "echo hello"
-      argv `shouldSatisfy` any (== "echo hello")
-      argv `shouldNotSatisfy` any (\a -> a == "-c")  -- no -c shell wrapper
+      argv `shouldSatisfy` elem "echo hello"
+      argv `shouldNotSatisfy` elem "-c"  -- no -c shell wrapper
 
     it "includes the port when non-default" $ do
       let cfg = sshCfg { scPort = 2222 }
@@ -59,7 +59,7 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
     prop "never includes -c (no shell interpreter for the remote command)" $ \cmd ->
       let cfg = sshCfg
           argv = sshExecArgv cfg (cmd :: Text)
-      in not (any (== "-c") argv)
+      in "-c" `notElem` argv
 
   describe "host-key mismatch (spec §7 row 3)" $ do
 
