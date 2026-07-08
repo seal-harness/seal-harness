@@ -92,6 +92,7 @@ import qualified Seal.Phase6aSpec
 import qualified Seal.Phase6bSpec
 import qualified Seal.Phase7aSpec
 import qualified Seal.Phase5Spec
+import qualified Seal.Phase4Spec
 import qualified Seal.Signal.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
@@ -202,6 +203,7 @@ main = hspec $ do
   Seal.Phase6bSpec.spec
   Seal.Phase7aSpec.spec
   Seal.Phase5Spec.spec
+  Seal.Phase4Spec.spec
   Seal.Signal.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec

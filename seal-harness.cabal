@@ -279,6 +279,7 @@ test-suite tests
         Seal.Phase6bSpec
         Seal.Phase7aSpec
         Seal.Phase5Spec
+        Seal.Phase4Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Channel.CliSpec
