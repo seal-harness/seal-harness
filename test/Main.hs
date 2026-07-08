@@ -20,6 +20,9 @@ import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
+import qualified Seal.Web.SearchSpec
+import qualified Seal.Web.ExtractSpec
+import qualified Seal.Web.BrowserSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -124,6 +127,9 @@ main = hspec $ do
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
+  Seal.Web.SearchSpec.spec
+  Seal.Web.ExtractSpec.spec
+  Seal.Web.BrowserSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec

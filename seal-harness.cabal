@@ -105,6 +105,9 @@ library
         Seal.Tools.Exec.Local
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
+        Seal.Web.Search
+        Seal.Web.Extract
+        Seal.Web.Browser
         Seal.Gateway.Config
         Seal.Gateway.API
         Seal.Gateway.Server
@@ -298,6 +301,9 @@ test-suite tests
         Seal.Tools.Exec.UntrustedSpec
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec
+        Seal.Web.SearchSpec
+        Seal.Web.ExtractSpec
+        Seal.Web.BrowserSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
