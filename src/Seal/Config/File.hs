@@ -8,6 +8,8 @@ module Seal.Config.File
   ( FileConfig (..)
   , ProviderConfig (..)
   , RetrievalConfig (..)
+  , UntrustedExecFileConfig (..)
+  , UntrustedExecRemoteFileConfig (..)
   , defaultFileConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
@@ -19,6 +21,7 @@ module Seal.Config.File
   , saveFileConfig
   , updateFileConfig
   , upsertProvider
+  , untrustedExecConfigFromFile
   ) where
 
 import Data.HashMap.Strict qualified as HashMap
@@ -36,6 +39,10 @@ import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
+import Seal.Tools.Exec.Types
+  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
+import Seal.Tools.Exec.Untrusted
+  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 
 -- | All user-editable vault settings persisted in @config\/config.toml@.
 -- Every field is optional; a missing key decodes as 'Nothing'.
@@ -69,6 +76,11 @@ data FileConfig = FileConfig
     -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
     -- gateway is not configured. Each field inside is optional too; the
     -- call site merges with 'Seal.Gateway.Config.withGatewayDefaults'.
+  , fcUntrustedExec :: Maybe UntrustedExecFileConfig
+    -- ^ Optional @[untrusted_execution]@ section (Phase 4 remote-only
+    -- untrusted execution, spec §3 Layer A). Absent means @mode=local@
+    -- (default). @mode=remote@ fail-closes at call time when the remote
+    -- block is absent or unreachable (boot still succeeds).
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -84,6 +96,31 @@ newtype RetrievalConfig = RetrievalConfig
   { rcMaxScanBytes :: Maybe Int
     -- ^ Operator-configured upper bound on bytes scanned per 'FILE_READ'
     -- (and future retrieval opcodes). Absent → 'defaultRetrievalMaxScanBytes'.
+  } deriving stock (Eq, Show)
+
+-- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
+-- @\"local\"@ (default) or @\"remote\"@ (fail-closed). The optional
+-- @[untrusted_execution.remote]@ sub-table carries the SSH coordinates;
+-- absent under @mode=local@ (no remote needed), and @mode=remote@ parses
+-- OK without it (fail-closed is at call time, not parse time — spec §7
+-- row 1).
+data UntrustedExecFileConfig = UntrustedExecFileConfig
+  { uefcMode   :: Text
+    -- ^ @\"local\"@ | @\"remote\"@
+  , uefcRemote :: Maybe UntrustedExecRemoteFileConfig
+  } deriving stock (Eq, Show)
+
+-- | The @[untrusted_execution.remote]@ sub-table (spec §5). Every field is
+-- optional at the TOML layer; the call site validates that the required
+-- fields (@host@/@user@/@known_hosts@/@workspace@) are present when
+-- @mode=remote@ (absent ⇒ fail-closed at call time).
+data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
+  { uerfcHost       :: Maybe Text
+  , uerfcUser       :: Maybe Text
+  , uerfcPort       :: Maybe Int
+  , uerfcIdentity   :: Maybe FilePath
+  , uerfcKnownHosts :: Maybe FilePath
+  , uerfcWorkspace  :: Maybe Text
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
@@ -104,6 +141,7 @@ defaultFileConfig = FileConfig
   , fcRetrieval       = Nothing
   , fcSignal          = Nothing
   , fcGateway         = Nothing
+  , fcUntrustedExec   = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -137,6 +175,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
+  <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -148,6 +187,23 @@ providerConfigCodec = ProviderConfig
 retrievalConfigCodec :: Toml.TomlCodec RetrievalConfig
 retrievalConfigCodec = RetrievalConfig
   <$> Toml.dioptional (Toml.int "max_scan_bytes") .= rcMaxScanBytes
+
+-- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
+untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
+untrustedExecConfigCodec = UntrustedExecFileConfig
+  <$> Toml.text "mode" .= uefcMode
+  <*> Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec "remote") .= uefcRemote
+
+-- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
+-- sub-table. Every field is optional at the TOML layer.
+untrustedExecRemoteConfigCodec :: Toml.TomlCodec UntrustedExecRemoteFileConfig
+untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
+  <$> Toml.dioptional (Toml.text "host")        .= uerfcHost
+  <*> Toml.dioptional (Toml.text "user")        .= uerfcUser
+  <*> Toml.dioptional (Toml.int "port")         .= uerfcPort
+  <*> Toml.dioptional (Toml.string "identity")  .= uerfcIdentity
+  <*> Toml.dioptional (Toml.string "known_hosts") .= uerfcKnownHosts
+  <*> Toml.dioptional (Toml.text "workspace")   .= uerfcWorkspace
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization
@@ -244,3 +300,46 @@ retrievalMaxScanBytes cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> FileConfig -> FileConfig
 upsertProvider lbl f cfg =
   cfg { fcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (fcProviders cfg) }
+
+-- | Resolve the 'FileConfig'\'s @[untrusted_execution]@ section to the
+-- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
+-- 'Nothing' when the section is absent OR @mode=local@ (the default —
+-- no remote needed, the local executor is wired by the call site in
+-- 4b-T3). Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
+-- with the remote 'SshConfig' if the remote block is fully present
+-- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
+-- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
+-- — fail-closed is at call time (spec §7 row 1), not at config resolution.
+untrustedExecConfigFromFile :: FileConfig -> Maybe UntrustedExecConfig
+untrustedExecConfigFromFile cfg = do
+  uec <- fcUntrustedExec cfg
+  let modeText = uefcMode uec
+      mode = if modeText == "remote" then UemRemote else UemLocal
+  case mode of
+    UemLocal  -> Nothing
+    UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemote uec))
+  where
+    -- Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
+    -- All four required fields (host/user/known_hosts/workspace) must be
+    -- present; any missing → fail-closed at call time (Nothing).
+    resolveRemote uec = do
+      r <- uefcRemote uec
+      host <- uerfcHost r
+      user <- uerfcUser r
+      let port = fromMaybe 22 (uerfcPort r)
+          identity = uerfcIdentity r
+      knownHosts <- uerfcKnownHosts r
+      workspace <- uerfcWorkspace r
+      case ( mkSshHost host
+           , mkSshUser user
+           , mkRemotePath workspace
+           ) of
+        (Right h, Right u, Right w) -> Just SshConfig
+          { scHost       = h
+          , scUser       = u
+          , scPort       = port
+          , scIdentity   = identity
+          , scKnownHosts = knownHosts
+          , scWorkspace  = w
+          }
+        _ -> Nothing
