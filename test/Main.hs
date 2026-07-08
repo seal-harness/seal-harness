@@ -18,6 +18,7 @@ import qualified Seal.Session.StoreSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
+import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
@@ -127,6 +128,7 @@ main = hspec $ do
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
+  Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Web.SearchSpec.spec

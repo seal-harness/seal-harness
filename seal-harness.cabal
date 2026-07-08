@@ -103,6 +103,7 @@ library
         Seal.Text.LineFile
         Seal.Tools.Args
         Seal.Tools.Exec.Local
+        Seal.Tools.Exec.Remote
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
         Seal.Web.Search
@@ -301,6 +302,7 @@ test-suite tests
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
+        Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec
         Seal.Web.SearchSpec
