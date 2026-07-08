@@ -40,15 +40,15 @@ singleStringSchema fieldName fieldDesc =
 -- | SHOW_HUMAN: emit @message@ to the human via the channel.
 -- Returns an empty, non-error result; the channel itself is the side-effect.
 showHumanOp :: ChannelCaps -> Opcode
-showHumanOp caps = Opcode
-  { opName = OpName "SHOW_HUMAN"
-  , opTrust = Trusted
-  , opDesc = "Display a message to the human operator."
-  , opInSchema = singleStringSchema "message" "The message to display to the human operator."
-  , opOutSchema = object []
-  , opAuthorize =
+showHumanOp caps = TrustedOpcode
+  { toName = OpName "SHOW_HUMAN"
+  , toTrust = Trusted
+  , toDesc = "Display a message to the human operator."
+  , toInSchema = singleStringSchema "message" "The message to display to the human operator."
+  , toOutSchema = object []
+  , toAuthorize =
       maybe (Left "SHOW_HUMAN requires {message:string}") (const (Right ())) . strField "message"
-  , opRun = \_ v -> do
+  , toRun = \_ v -> do
       let msg = fromMaybe "" (strField "message" v)
       liftIO (ccSend caps msg)
       pure (OpResult [] False Null)
@@ -56,15 +56,15 @@ showHumanOp caps = Opcode
 
 -- | ASK_HUMAN: send @question@ to the human and return their typed reply.
 askHumanOp :: ChannelCaps -> Opcode
-askHumanOp caps = Opcode
-  { opName = OpName "ASK_HUMAN"
-  , opTrust = Trusted
-  , opDesc = "Ask the human operator a question and return their reply."
-  , opInSchema = singleStringSchema "question" "The question to present to the human operator."
-  , opOutSchema = object []
-  , opAuthorize =
+askHumanOp caps = TrustedOpcode
+  { toName = OpName "ASK_HUMAN"
+  , toTrust = Trusted
+  , toDesc = "Ask the human operator a question and return their reply."
+  , toInSchema = singleStringSchema "question" "The question to present to the human operator."
+  , toOutSchema = object []
+  , toAuthorize =
       maybe (Left "ASK_HUMAN requires {question:string}") (const (Right ())) . strField "question"
-  , opRun = \_ v -> do
+  , toRun = \_ v -> do
       let q = fromMaybe "" (strField "question" v)
       ans <- liftIO (ccPrompt caps q)
       pure (OpResult [TrpText ans] False Null)

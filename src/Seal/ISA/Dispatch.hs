@@ -33,14 +33,19 @@ import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
+import Seal.Tools.Exec.Types (ExecBackend)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
 
+-- | Dispatch an opcode invocation. The dispatcher threads an 'ExecBackend'
+-- for Untrusted opcodes (the Local-vs-Remote-SSH selector); Trusted/Audited
+-- opcodes ignore it (they have no 'ExecBackend' in scope — type-level
+-- capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> OpName -> Value
+  :: Registry -> TwoFileHandle -> BackendExec -> ExecBackend -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend name input =
+dispatch reg h backend execBackend name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -48,19 +53,27 @@ dispatch reg h backend name input =
         Left why -> pure (Left (Denied why))
         Right () -> do
           entry <- liftIO (mkInvocationEntry name input)
-          case opTrust op of
-            Untrusted -> do
+          case op of
+            UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              Right <$> opRun op backend input
-            Trusted -> do
-              liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-              Right <$> opRun op backend input
-            Audited -> do
-              -- No Audited log remains; treat as Trusted (record to the
-              -- session transcript, then run). The evolutionary-store
-              -- opcodes that used to be Audited are now Trusted file writes.
-              liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-              Right <$> opRun op backend input
+              Right <$> uoRun op backend execBackend input
+            TrustedOpcode {} ->
+              case opTrust op of
+                Trusted -> do
+                  liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
+                  Right <$> toRun op backend input
+                Audited -> do
+                  -- No Audited log remains; treat as Trusted (record to the
+                  -- session transcript, then run). The evolutionary-store
+                  -- opcodes that used to be Audited are now Trusted file writes.
+                  liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
+                  Right <$> toRun op backend input
+                Untrusted ->
+                  -- Unreachable: an UntrustedOpcode would have matched above.
+                  -- Kept for exhaustiveness (the GADT already separates the
+                  -- arms; opTrust on a TrustedOpcode returns its stored tl,
+                  -- which the Opcode invariants guarantee is Trusted or Audited).
+                  error "dispatch: invariant violation — Untrusted trust on a TrustedOpcode"
 
 -- | Build the 'EntryRecord' for an opcode invocation. The opcode name and the
 -- secret-free input are recorded in 'erMeta'; the entry kind is 'EKHarness'.

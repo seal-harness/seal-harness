@@ -86,11 +86,11 @@ offsetField v =
 -- recorded in full (agent-visible data); 'orRecorded' carries the id + op
 -- name + content + tags (secret-free).
 memoryStoreOp :: MemoryBackend -> SessionId -> Opcode
-memoryStoreOp backend session = Opcode
-  { opName = OpName "MEMORY_STORE"
-  , opTrust = Trusted
-  , opDesc = "Store an agent memory by id (insert or replace)."
-  , opInSchema = object
+memoryStoreOp backend session = TrustedOpcode
+  { toName = OpName "MEMORY_STORE"
+  , toTrust = Trusted
+  , toDesc = "Store an agent memory by id (insert or replace)."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -108,9 +108,9 @@ memoryStoreOp backend session = Opcode
           ]
       , "required" .= (["id", "content"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "MEMORY_STORE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "MEMORY_STORE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid memory id"] True (object []))
@@ -141,11 +141,11 @@ memoryStoreOp backend session = Opcode
 -- | MEMORY_RECALL: return a paged window of memories, optionally filtered by a
 -- substring query. Uses the dynamic-retrieval pager.
 memoryRecallOp :: PageParams -> MemoryBackend -> Opcode
-memoryRecallOp params backend = Opcode
-  { opName = OpName "MEMORY_RECALL"
-  , opTrust = Trusted
-  , opDesc = "Recall agent memories, optionally filtered by a substring query."
-  , opInSchema = object
+memoryRecallOp params backend = TrustedOpcode
+  { toName = OpName "MEMORY_RECALL"
+  , toTrust = Trusted
+  , toDesc = "Recall agent memories, optionally filtered by a substring query."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "query" .= object
@@ -162,9 +162,9 @@ memoryRecallOp params backend = Opcode
               ]
           ]
       ]
-  , opOutSchema = object []
-  , opAuthorize = const (Right ())
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = const (Right ())
+  , toRun = \_ v -> do
       let mQuery = queryField v
           offset = offsetField v
           mLimit = limitField v
@@ -197,11 +197,11 @@ memoryRecallOp params backend = Opcode
 -- 'meSession' is preserved (the update is attributed to the session that
 -- created the memory, not the session that updated it).
 memoryUpdateOp :: MemoryBackend -> Opcode
-memoryUpdateOp backend = Opcode
-  { opName = OpName "MEMORY_UPDATE"
-  , opTrust = Trusted
-  , opDesc = "Update an existing memory's content and/or tags."
-  , opInSchema = object
+memoryUpdateOp backend = TrustedOpcode
+  { toName = OpName "MEMORY_UPDATE"
+  , toTrust = Trusted
+  , toDesc = "Update an existing memory's content and/or tags."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -219,9 +219,9 @@ memoryUpdateOp backend = Opcode
           ]
       , "required" .= (["id"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "MEMORY_UPDATE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "MEMORY_UPDATE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid memory id"] True (object []))
@@ -258,14 +258,14 @@ memoryUpdateOp backend = Opcode
 -- | MEMORY_DELETE: remove a memory by id. Idempotent (deleting a missing id is
 -- a success with a "not present" message, not an error).
 memoryDeleteOp :: MemoryBackend -> Opcode
-memoryDeleteOp backend = Opcode
-  { opName = OpName "MEMORY_DELETE"
-  , opTrust = Trusted
-  , opDesc = "Delete an agent memory by id (idempotent)."
-  , opInSchema = singleStringSchema "id" "The memory id to delete."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "MEMORY_DELETE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+memoryDeleteOp backend = TrustedOpcode
+  { toName = OpName "MEMORY_DELETE"
+  , toTrust = Trusted
+  , toDesc = "Delete an agent memory by id (idempotent)."
+  , toInSchema = singleStringSchema "id" "The memory id to delete."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "MEMORY_DELETE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid memory id"] True (object []))

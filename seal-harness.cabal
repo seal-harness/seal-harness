@@ -102,6 +102,7 @@ library
         Seal.Security.Vault.Age
         Seal.Text.LineFile
         Seal.Tools.Args
+        Seal.Tools.Exec.Local
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
         Seal.Gateway.Config
@@ -292,9 +293,11 @@ test-suite tests
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
         Seal.Tools.ArgsSpec
+        Seal.Tools.Exec.CapabilityScopingFailSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
+        Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeVault

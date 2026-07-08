@@ -13,6 +13,7 @@ import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
+import Seal.Tools.Exec.Types (ExecBackend)
 
 data AgentEnv = AgentEnv
   { aeProvider :: SomeProvider
@@ -27,6 +28,12 @@ data AgentEnv = AgentEnv
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
+  , aeExecBackend :: ExecBackend
+    -- ^ The untrusted-execution backend (Local vs Remote SSH) threaded to
+    -- 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes. Trusted/Audited
+    -- opcodes ignore it (the GADT 'Opcode' has no 'ExecBackend' field for
+    -- them — type-level capability scoping, spec §4/§8). 4b-T3 wires this
+    -- from the runtime 'UntrustedExecConfig'; 4b-T1 threads it through.
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int

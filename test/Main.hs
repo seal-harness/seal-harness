@@ -19,6 +19,7 @@ import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.ArgsSpec
+import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -117,6 +118,7 @@ main = hspec $ do
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.ArgsSpec.spec
+  Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec

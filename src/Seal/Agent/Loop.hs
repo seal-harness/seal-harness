@@ -128,7 +128,7 @@ runTurn env userText = do
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
-      res <- dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) name input
+      res <- dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeExecBackend env) name input
       pure $ case res of
         Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
         Right r -> CbToolResult tcid (orParts r) (orIsError r)

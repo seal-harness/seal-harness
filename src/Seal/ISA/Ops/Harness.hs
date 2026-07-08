@@ -34,16 +34,16 @@ import Seal.Session.Kind (HarnessFlavour (..))
 -- | HARNESS_LIST: return the registry snapshot as a JSON array of
 -- {id, label, liveness, flavour} objects.
 harnessListOp :: HarnessRegistry -> Opcode
-harnessListOp reg = Opcode
-  { opName = OpName "HARNESS_LIST"
-  , opTrust = Trusted
-  , opDesc = "List the live harnesses registered with the harness backend."
-  , opInSchema = object
+harnessListOp reg = TrustedOpcode
+  { toName = OpName "HARNESS_LIST"
+  , toTrust = Trusted
+  , toDesc = "List the live harnesses registered with the harness backend."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
       , "required" .= ([] :: [Text])
       ]
-  , opOutSchema = object
+  , toOutSchema = object
       [ "type" .= ("array" :: Text)
       , "items" .= object
           [ "type" .= ("object" :: Text)
@@ -54,8 +54,8 @@ harnessListOp reg = Opcode
               ]
           ]
       ]
-  , opAuthorize = const (Right ())
-  , opRun = \_back _input -> liftIO $ do
+  , toAuthorize = const (Right ())
+  , toRun = \_back _input -> liftIO $ do
       entries <- snapshot reg
       let arr = map entryToJson entries
           recorded = object ["harnesses" .= arr]
@@ -69,11 +69,11 @@ harnessListOp reg = Opcode
 harnessStartOp
   :: HarnessRegistry -> TmuxRunner -> TmuxIdent -> TmuxIdent
   -> HarnessFlavour -> IO HarnessId -> Opcode
-harnessStartOp reg runner session window flavour mintId = Opcode
-  { opName = OpName "HARNESS_START"
-  , opTrust = Trusted
-  , opDesc = "Start a harness in a tmux window and register it."
-  , opInSchema = object
+harnessStartOp reg runner session window flavour mintId = TrustedOpcode
+  { toName = OpName "HARNESS_START"
+  , toTrust = Trusted
+  , toDesc = "Start a harness in a tmux window and register it."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "flavour" .= object
@@ -83,13 +83,13 @@ harnessStartOp reg runner session window flavour mintId = Opcode
           ]
       , "required" .= (["flavour"] :: [Text])
       ]
-  , opOutSchema = object
+  , toOutSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object [fromText "id" .= object ["type" .= ("string" :: Text)]]
       , "required" .= (["id"] :: [Text])
       ]
-  , opAuthorize = const (Right ())
-  , opRun = \_back _input -> liftIO $ do
+  , toAuthorize = const (Right ())
+  , toRun = \_back _input -> liftIO $ do
       hid <- mintId
       r1 <- startTmuxSessionStatus runner session
       case r1 of
@@ -116,18 +116,18 @@ harnessStartOp reg runner session window flavour mintId = Opcode
 -- | HARNESS_STOP: stop a harness (kill the tmux window) + mark the entry
 -- LvExited. Takes the harness id in the input.
 harnessStopOp :: HarnessRegistry -> TmuxRunner -> Opcode
-harnessStopOp reg runner = Opcode
-  { opName = OpName "HARNESS_STOP"
-  , opTrust = Trusted
-  , opDesc = "Stop a harness (kill its tmux window) and mark it exited."
-  , opInSchema = object
+harnessStopOp reg runner = TrustedOpcode
+  { toName = OpName "HARNESS_STOP"
+  , toTrust = Trusted
+  , toDesc = "Stop a harness (kill its tmux window) and mark it exited."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object [fromText "id" .= object ["type" .= ("string" :: Text)]]
       , "required" .= (["id"] :: [Text])
       ]
-  , opOutSchema = object ["type" .= ("object" :: Text), "properties" .= object []]
-  , opAuthorize = const (Right ())
-  , opRun = \_back input -> liftIO $ do
+  , toOutSchema = object ["type" .= ("object" :: Text), "properties" .= object []]
+  , toAuthorize = const (Right ())
+  , toRun = \_back input -> liftIO $ do
       case idField input of
         Nothing -> pure (opErr "missing id")
         Just hidText -> case parseHarnessId hidText of

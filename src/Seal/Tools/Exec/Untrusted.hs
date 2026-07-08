@@ -93,7 +93,7 @@ selectExecBackend
   :: UntrustedExecConfig -> TerminalBackend -> Either ExecError ExecBackend
 selectExecBackend cfg = \case
   TbLocal        -> case uecMode cfg of
-                      UemLocal  -> Right (EbLocal LocalExecHandlePlaceholder)
+                      UemLocal  -> Right (EbLocal mkLocalExecHandlePlaceholder)
                       UemRemote -> Left ExecLocalNotPermittedForUntrusted
   TbSsh _        -> case (uecMode cfg, uecRemote cfg) of
                       (UemLocal, _)       -> Left ExecLocalNotPermittedForUntrusted

@@ -42,6 +42,7 @@ module Seal.Tools.Exec.Types
   , getRemotePath
   , ExecError (..)
   , LocalExecHandle (..)
+  , mkLocalExecHandlePlaceholder
   , ExecBackend (..)
   ) where
 
@@ -49,6 +50,8 @@ import Data.Char (isControl)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
+
+import Seal.Tools.Args (InterpName, ScriptArg, ShellCommand)
 
 -- ---------------------------------------------------------------------------
 -- TerminalBackend family
@@ -184,18 +187,34 @@ data ExecError
 -- LocalExecHandle (placeholder — widened in 4b-T1)
 -- ---------------------------------------------------------------------------
 
--- | The local-executor handle. 4a ships this as an opaque placeholder (no
--- exported constructors) so the 'ExecBackend' sum can reference the type.
--- 4b-T1 WIDENS this declaration IN this module to the real constructor
--- carrying the record of IO actions (the constructor stays here; the smart
--- constructor 'mkLocalExecHandle' lives in 'Seal.Tools.Exec.Local').
+-- | The local-executor handle. The TYPE and its CONSTRUCTOR both live here
+-- (Haskell requires a type and its constructors in the same module — the
+-- 4a placeholder was an opaque `data LocalExecHandle` with no constructors;
+-- 4b-T1 widens it to the real handle). The smart constructor that wires
+-- the real `System.Process`-backed IO actions lives in
+-- 'Seal.Tools.Exec.Local' ('mkLocalExecHandle'); the tests also use the
+-- placeholder constructor directly for fakes.
 --
--- The 4a form is intentionally uninhabited from the outside: only 'Types'
--- may construct it, and the 4a placeholder has nothing useful to put in
--- it, so the constructor is NOT exported. 4b-T1 will export it. The 4a
--- placeholder carries a phantom unit so 'ExecBackend' can derive 'Eq'/'Show'.
-data LocalExecHandle = LocalExecHandlePlaceholder   -- 4a: opaque (not exported)
-  deriving stock (Eq, Show)
+-- The fields are the IO actions the Untrusted opcodes call. Each returns
+-- an 'Either ExecError' so the opcode can surface a structured error
+-- (fail-closed) instead of throwing.
+data LocalExecHandle = LocalExecHandle
+  { lehExecShell :: ShellCommand -> Maybe RemotePath -> IO (Either ExecError Text)
+    -- ^ run a validated 'ShellCommand' via @/bin/sh -c@ (single arg, fixed
+    -- argv), with an optional cwd ('SafePath'-confined to the workspace root)
+  , lehExecProgram :: InterpName -> [ScriptArg] -> IO (Either ExecError Text)
+    -- ^ run a named interpreter (resolved on PATH, fixed argv:
+    -- @<name> <script>@) with validated script args
+  }
+
+-- | A placeholder constructor for tests that don't exercise the IO
+-- (mirrors the 4a opaque form). Real callers use
+-- 'Seal.Tools.Exec.Local.mkLocalExecHandle'.
+mkLocalExecHandlePlaceholder :: LocalExecHandle
+mkLocalExecHandlePlaceholder = LocalExecHandle
+  { lehExecShell = \_ _ -> pure (Right "")
+  , lehExecProgram = \_ _ -> pure (Right "")
+  }
 
 -- ---------------------------------------------------------------------------
 -- ExecBackend (added in 4a-T2)
@@ -206,7 +225,23 @@ data LocalExecHandle = LocalExecHandlePlaceholder   -- 4a: opaque (not exported)
 -- the 'EbRemote' arm is the SSH executor. 'selectExecBackend' (4a-T2)
 -- returns this; 'selectUntrustedBackend' (4a-T2) returns ONLY the remote
 -- arm (the spec's 'UntrustedExecBackend' is Ssh-only by construction).
+--
+-- No 'Eq' is derived: 'LocalExecHandle' carries IO actions which have no
+-- 'Eq' instances. A custom 'Show' is provided (the 'LocalExecHandle' shows
+-- as @<local>@, the 'SshConfig' via its own 'Show').
 data ExecBackend
   = EbLocal LocalExecHandle
   | EbRemote SshConfig
-  deriving stock (Eq, Show)
+
+instance Show ExecBackend where
+  show (EbLocal _) = "EbLocal <local executor>"
+  show (EbRemote c) = "EbRemote " <> show c
+
+-- | Structural 'Eq'. Two 'EbLocal' handles are always 'equal' (they carry
+-- opaque IO actions; no meaningful equality — used only by test `shouldBe`
+-- on the 'Left' arms, where both sides are 'Left'). Two 'EbRemote' compare
+-- by 'SshConfig'.
+instance Eq ExecBackend where
+  EbLocal _ == EbLocal _ = True
+  EbRemote a == EbRemote b = a == b
+  _ == _ = False

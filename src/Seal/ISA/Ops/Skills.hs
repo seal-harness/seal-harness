@@ -57,11 +57,11 @@ bodyField v = fromMaybe "" (parseMaybe (withObject "in" (.: "body")) v)
 -- recorded in full (agent-visible data); 'orRecorded' carries the id + op name
 -- + description + body (secret-free).
 skillCreateOp :: SkillBackend -> SessionId -> Opcode
-skillCreateOp backend session = Opcode
-  { opName = OpName "SKILL_CREATE"
-  , opTrust = Trusted
-  , opDesc = "Define an agent skill by id (insert or replace)."
-  , opInSchema = object
+skillCreateOp backend session = TrustedOpcode
+  { toName = OpName "SKILL_CREATE"
+  , toTrust = Trusted
+  , toDesc = "Define an agent skill by id (insert or replace)."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -79,9 +79,9 @@ skillCreateOp backend session = Opcode
           ]
       , "required" .= (["id", "description", "body"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "SKILL_CREATE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "SKILL_CREATE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
@@ -113,14 +113,14 @@ skillCreateOp backend session = Opcode
 -- skills is an evolutionary event worth logging, with secret-free metadata.
 -- The skill body is returned to the model (agent-visible) and recorded in full.
 skillReadOp :: SkillBackend -> Opcode
-skillReadOp backend = Opcode
-  { opName = OpName "SKILL_READ"
-  , opTrust = Trusted
-  , opDesc = "Read one agent skill by id into the prompt."
-  , opInSchema = singleStringSchema "id" "The skill id to read."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "SKILL_READ requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+skillReadOp backend = TrustedOpcode
+  { toName = OpName "SKILL_READ"
+  , toTrust = Trusted
+  , toDesc = "Read one agent skill by id into the prompt."
+  , toInSchema = singleStringSchema "id" "The skill id to read."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "SKILL_READ requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
@@ -149,11 +149,11 @@ skillReadOp backend = Opcode
 -- 'skSession' is preserved (the update is attributed to the session that
 -- created the skill, not the session that updated it).
 skillUpdateOp :: SkillBackend -> Opcode
-skillUpdateOp backend = Opcode
-  { opName = OpName "SKILL_UPDATE"
-  , opTrust = Trusted
-  , opDesc = "Update an existing skill's description and/or body."
-  , opInSchema = object
+skillUpdateOp backend = TrustedOpcode
+  { toName = OpName "SKILL_UPDATE"
+  , toTrust = Trusted
+  , toDesc = "Update an existing skill's description and/or body."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -171,9 +171,9 @@ skillUpdateOp backend = Opcode
           ]
       , "required" .= (["id"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "SKILL_UPDATE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "SKILL_UPDATE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
@@ -212,17 +212,17 @@ skillUpdateOp backend = Opcode
 -- (no skill bodies in the recorded payload; the model sees only the
 -- id+description summary).
 skillListOp :: SkillBackend -> Opcode
-skillListOp backend = Opcode
-  { opName = OpName "SKILL_LIST"
-  , opTrust = Trusted
-  , opDesc = "List all defined agent skills (id + description)."
-  , opInSchema = object
+skillListOp backend = TrustedOpcode
+  { toName = OpName "SKILL_LIST"
+  , toTrust = Trusted
+  , toDesc = "List all defined agent skills (id + description)."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
       ]
-  , opOutSchema = object []
-  , opAuthorize = const (Right ())
-  , opRun = \_ _ -> do
+  , toOutSchema = object []
+  , toAuthorize = const (Right ())
+  , toRun = \_ _ -> do
       allSkills <- liftIO (sbList backend)
       let rendered = case allSkills of
             [] -> "(no skills defined)"

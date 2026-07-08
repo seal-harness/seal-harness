@@ -84,11 +84,11 @@ toolsField v =
 -- provider, model, system prompt, and tool list are recorded in full
 -- (agent-visible data); 'orRecorded' carries the id + op name + fields.
 agentDefCreateOp :: AgentDefBackend -> SessionId -> Opcode
-agentDefCreateOp backend session = Opcode
-  { opName = OpName "AGENT_DEF_CREATE"
-  , opTrust = Trusted
-  , opDesc = "Define an agent by id (insert or replace)."
-  , opInSchema = object
+agentDefCreateOp backend session = TrustedOpcode
+  { toName = OpName "AGENT_DEF_CREATE"
+  , toTrust = Trusted
+  , toDesc = "Define an agent by id (insert or replace)."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -118,9 +118,9 @@ agentDefCreateOp backend session = Opcode
           ]
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_DEF_CREATE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_DEF_CREATE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
@@ -149,14 +149,14 @@ agentDefCreateOp backend session = Opcode
 -- secret-free metadata. The def fields are returned to the model (agent-visible)
 -- and recorded in full.
 agentDefReadOp :: AgentDefBackend -> Opcode
-agentDefReadOp backend = Opcode
-  { opName = OpName "AGENT_DEF_READ"
-  , opTrust = Trusted
-  , opDesc = "Read one agent definition by id."
-  , opInSchema = singleStringSchema "id" "The agent def id to read."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_DEF_READ requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+agentDefReadOp backend = TrustedOpcode
+  { toName = OpName "AGENT_DEF_READ"
+  , toTrust = Trusted
+  , toDesc = "Read one agent definition by id."
+  , toInSchema = singleStringSchema "id" "The agent def id to read."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_DEF_READ requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
@@ -177,11 +177,11 @@ agentDefReadOp backend = Opcode
 -- error result (the model should use AGENT_DEF_CREATE to define). The original
 -- 'adSession' (provenance) and 'adCreatedAt' are preserved.
 agentDefUpdateOp :: AgentDefBackend -> Opcode
-agentDefUpdateOp backend = Opcode
-  { opName = OpName "AGENT_DEF_UPDATE"
-  , opTrust = Trusted
-  , opDesc = "Update an existing agent definition's name/system/tools."
-  , opInSchema = object
+agentDefUpdateOp backend = TrustedOpcode
+  { toName = OpName "AGENT_DEF_UPDATE"
+  , toTrust = Trusted
+  , toDesc = "Update an existing agent definition's name/system/tools."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
           [ fromText "id" .= object
@@ -203,9 +203,9 @@ agentDefUpdateOp backend = Opcode
           ]
       , "required" .= (["id"] :: [Text])
       ]
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_DEF_UPDATE requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_DEF_UPDATE requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
@@ -241,17 +241,17 @@ agentDefUpdateOp backend = Opcode
 -- Trusted — listing running instances is harness-internal, not an evolutionary
 -- mutation.
 agentListOp :: AgentRuntime -> Opcode
-agentListOp runtime = Opcode
-  { opName = OpName "AGENT_LIST"
-  , opTrust = Trusted
-  , opDesc = "List running agent instances (id + status)."
-  , opInSchema = object
+agentListOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_LIST"
+  , toTrust = Trusted
+  , toDesc = "List running agent instances (id + status)."
+  , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
       ]
-  , opOutSchema = object []
-  , opAuthorize = const (Right ())
-  , opRun = \_ _ -> do
+  , toOutSchema = object []
+  , toAuthorize = const (Right ())
+  , toRun = \_ _ -> do
       insts <- liftIO (listAgents runtime)
       let rendered = case insts of
             [] -> "(no agents running)"
@@ -272,14 +272,14 @@ agentListOp runtime = Opcode
 -- session-minter produces a fresh 'SessionId' for the new instance.
 agentStartOp
   :: AgentDefBackend -> AgentRuntime -> IO SessionId -> AgentWorkerBuilder -> Opcode
-agentStartOp backend runtime mintSession mkWorker = Opcode
-  { opName = OpName "AGENT_START"
-  , opTrust = Trusted
-  , opDesc = "Start a running agent instance bound to a definition."
-  , opInSchema = singleStringSchema "id" "The agent def id to start."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_START requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+agentStartOp backend runtime mintSession mkWorker = TrustedOpcode
+  { toName = OpName "AGENT_START"
+  , toTrust = Trusted
+  , toDesc = "Start a running agent instance bound to a definition."
+  , toInSchema = singleStringSchema "id" "The agent def id to start."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_START requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
@@ -300,14 +300,14 @@ agentStartOp backend runtime mintSession mkWorker = Opcode
 
 -- | AGENT_STATUS: read one running agent's status. Trusted.
 agentStatusOp :: AgentRuntime -> Opcode
-agentStatusOp runtime = Opcode
-  { opName = OpName "AGENT_STATUS"
-  , opTrust = Trusted
-  , opDesc = "Read one running agent's status."
-  , opInSchema = singleStringSchema "id" "The agent def id."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_STATUS requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+agentStatusOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_STATUS"
+  , toTrust = Trusted
+  , toDesc = "Read one running agent's status."
+  , toInSchema = singleStringSchema "id" "The agent def id."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_STATUS requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
@@ -324,14 +324,14 @@ agentStatusOp runtime = Opcode
 -- Trusted. Idempotent (stopping a non-running def id is a success with a
 -- \"not running\" message).
 agentStopOp :: AgentRuntime -> Opcode
-agentStopOp runtime = Opcode
-  { opName = OpName "AGENT_STOP"
-  , opTrust = Trusted
-  , opDesc = "Stop a running agent instance (idempotent)."
-  , opInSchema = singleStringSchema "id" "The agent def id to stop."
-  , opOutSchema = object []
-  , opAuthorize = maybe (Left "AGENT_STOP requires {id:string}") checkId . idField
-  , opRun = \_ v -> do
+agentStopOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_STOP"
+  , toTrust = Trusted
+  , toDesc = "Stop a running agent instance (idempotent)."
+  , toInSchema = singleStringSchema "id" "The agent def id to stop."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_STOP requires {id:string}") checkId . idField
+  , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))

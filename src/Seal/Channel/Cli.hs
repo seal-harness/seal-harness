@@ -45,6 +45,7 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -159,6 +160,9 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
+  , aeExecBackend = EbLocal mkLocalExecHandlePlaceholder
+    -- ^ 4b-T1 placeholder: 4b-T3 wires the real 'UntrustedExecConfig' (Local
+    -- vs Remote SSH by mode). For now Untrusted opcodes run locally.
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12

@@ -18,6 +18,7 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Agent.Env
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Agent.Loop
 
 -- | A provider that returns a scripted list of responses, one per call.
@@ -45,11 +46,11 @@ spec = describe "Seal.Agent.Loop" $ do
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
                  (\_ -> pure "")
-        stubOp = Opcode (OpName "PING") Trusted "p" (object []) (object [])
-                   (const (Right ()))
-                   (\_ _ -> do
-                     liftIO (modifyIORef' ran (+ 1))
-                     pure (OpResult [TrpText "pong"] False Null))
+        stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                    (const (Right ()))
+                    (\_ _ -> do
+                      liftIO (modifyIORef' ran (+ 1))
+                      pure (OpResult [TrpText "pong"] False Null))
         script =
           [ CompletionResponse
               [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
@@ -67,6 +68,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (mkRegistry [stubOp])
                 h
                 localBackend
+                (EbLocal mkLocalExecHandlePlaceholder)
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
@@ -93,6 +95,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (mkRegistry [])
                 h
                 localBackend
+                (EbLocal mkLocalExecHandlePlaceholder)
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8

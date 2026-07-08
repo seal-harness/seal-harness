@@ -107,15 +107,14 @@ scanBytesField v =
 -- max_scan_bytes (secret-free metadata); file contents flow only to 'orParts'
 -- (model-visible).
 fileReadOp :: WorkspaceRoot -> Int -> Opcode
-fileReadOp root operatorCeiling = Opcode
-  { opName = OpName "FILE_READ"
-  , opTrust = Untrusted
-  , opDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
-  , opInSchema = fileReadSchema
-  , opOutSchema = object []
-  , opAuthorize =
+fileReadOp root operatorCeiling = UntrustedOpcode
+  { uoName = OpName "FILE_READ"
+  , uoDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
+  , uoInSchema = fileReadSchema
+  , uoOutSchema = object []
+  , uoAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField
-  , opRun = \backend v -> do
+  , uoRun = \backend _execBackend v -> do
       let rel       = maybe "" T.unpack (pathField v)
           offset    = offsetField v
           mLimit    = limitField v
