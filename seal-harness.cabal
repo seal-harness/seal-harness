@@ -320,5 +320,6 @@ test-suite tests
         Seal.ISA.Ops.ProcessSpec
         Seal.ISA.Ops.CodeSpec
         Seal.ISA.Ops.SearchSpec
+        Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
