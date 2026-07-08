@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | Haskeline-backed CLI TUI channel. Plain (non-slash) input is routed through
 -- the agent loop ('runTurn'); slash commands and rejections flow through the
@@ -46,7 +47,9 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
+#if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
+#endif
 import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp)
@@ -226,7 +229,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
       -- needs the remote). 4b-T3 wires the LOCAL arm to the real
       -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
       execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-      defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
+      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromFile
   -- The two-file transcript bracket wraps the whole loop so every turn shares
   -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
   -- they are built here where both `caps` and the transcript handle are in
@@ -386,7 +389,7 @@ handleTabCommand caps tabsH = \case
 -- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
 -- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
 execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
-execBackendFromFile wsRoot cfg =
+execBackendFromFile _wsRoot cfg =
   case untrustedExecConfigFromFile cfg of
     Nothing -> defaultBackend
     Just uec ->
@@ -397,5 +400,9 @@ execBackendFromFile wsRoot cfg =
             Right (EbRemote s) -> EbRemote s
             _ -> failClosedBackend
   where
-    defaultBackend = EbLocal (mkLocalExecHandle wsRoot)
+#if !defined(REMOTE_ONLY_UNTRUSTED)
+    defaultBackend = EbLocal (mkLocalExecHandle _wsRoot)
+#else
+    defaultBackend = failClosedBackend  -- local executor absent; fail-closed
+#endif
     failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed

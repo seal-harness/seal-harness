@@ -103,6 +103,18 @@ spec = describe "Seal.Tools.Exec.Untrusted" $ do
         Right (EbRemote s) -> scHost s `shouldBe` scHost sshCfg
         _ -> expectationFailure "expected Right (EbRemote ...)"
 
+  describe "enforceRemoteOnly (Cabal flag startup check)" $ do
+
+    it "mode=remote -> Right ()" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      enforceRemoteOnly cfg `shouldBe` Right ()
+
+    it "mode=local -> Left (startup error)" $ do
+      let cfg = UntrustedExecConfig UemLocal Nothing
+      enforceRemoteOnly cfg `shouldSatisfy` \case
+        Left _ -> True
+        Right _ -> False
+
 -- | A generator covering all four 'TerminalBackend' constructors. Kept
 -- local (no global Arbitrary instance) so the spec stays self-contained.
 genBackend :: Gen TerminalBackend

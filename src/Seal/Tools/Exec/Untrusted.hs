@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 -- | 'UntrustedExecBackend' — a smart-constructed type that can ONLY be
 -- built from an 'Ssh' backend (spec §4). A local container/VM shares the
 -- harness kernel and does NOT count as remote (spec §2 sharpening), so
@@ -15,8 +16,10 @@ module Seal.Tools.Exec.Untrusted
   , UntrustedExecConfig (..)
   , selectUntrustedBackend
   , selectExecBackend
+  , enforceRemoteOnly
   ) where
 
+import Data.Text (Text)
 import Seal.Tools.Exec.Types
 
 -- | A backend that untrusted dispatch is allowed to run through. Smart-
@@ -33,8 +36,22 @@ mkUntrustedExecBackend :: TerminalBackend -> Either ExecError UntrustedExecBacke
 mkUntrustedExecBackend = \case
   TbSsh cfg       -> Right (UntrustedExecBackend cfg)
   TbLocal         -> Left ExecLocalNotPermittedForUntrusted
-  TbTmux _        -> Left ExecNotImplemented
-  TbContainer _   -> Left ExecNotImplemented
+  TbTmux _       -> Left ExecNotImplemented
+  TbContainer _  -> Left ExecNotImplemented
+
+-- | The startup check for the @remote-only-untrusted@ Cabal flag (spec §3
+-- Layer B). When the flag is on (compiled in via CPP — see
+-- 'Seal.Tools.Exec.Local'\'s absence), a @mode=local@ value in the config
+-- is a startup configuration error: the local untrusted executor is
+-- absent from the binary, so @mode=local@ is unexecutable. Returns
+-- @Right ()@ when @mode=remote@; @Left err@ when @mode=local@.
+--
+-- This is a pure function so the startup check is testable without boot.
+enforceRemoteOnly :: UntrustedExecConfig -> Either Text ()
+enforceRemoteOnly cfg =
+  case uecMode cfg of
+    UemRemote -> Right ()
+    UemLocal  -> Left "remote-only-untrusted build: untrusted_execution.mode=local is rejected (the local executor is absent from this binary)"
 
 -- | Recover the 'SshConfig' from an 'UntrustedExecBackend' (the remote
 -- executor in 4g consumes this).

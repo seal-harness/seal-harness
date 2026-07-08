@@ -31,6 +31,10 @@ common settings
         -Wpartial-fields
         -Wredundant-constraints
 
+flag remote-only-untrusted
+    description: Omit the local untrusted executor from the build (hardened: untrusted execution can only run remotely over SSH)
+    default:     False
+
 library
     import: settings
     exposed-modules:
@@ -102,7 +106,6 @@ library
         Seal.Security.Vault.Age
         Seal.Text.LineFile
         Seal.Tools.Args
-        Seal.Tools.Exec.Local
         Seal.Tools.Exec.Remote
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
@@ -146,6 +149,14 @@ library
         Seal.Memory.Backend
         Seal.Skills.Types
         Seal.Skills.Backend
+    -- The local untrusted executor is omitted under -f remote-only-untrusted
+    -- (the hardened build: untrusted execution can only run remotely).
+    if !flag(remote-only-untrusted)
+        exposed-modules:
+            Seal.Tools.Exec.Local
+    if flag(remote-only-untrusted)
+        cpp-options: -DREMOTE_ONLY_UNTRUSTED
+        ghc-options: -Wno-missing-home-modules
     build-depends:
         base >= 4.18 && < 5
       , aeson
