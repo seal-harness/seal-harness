@@ -1,18 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications  #-}
 -- | FILE_READ (Untrusted): read a workspace file, confined by SafePath.
--- This is the opcode that exercises the ACK-before-execute path in the
--- dispatcher.
+-- FILE_WRITE (Untrusted): write/append a workspace file, confined by
+-- SafePath, bounded by the operator-configured max write size.
+-- This is the opcode module that exercises the ACK-before-execute path in
+-- the dispatcher.
 module Seal.ISA.Ops.File
   ( fileReadOp
+  , fileWriteOp
   ) where
 
 import Control.Exception (try)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
+import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types
@@ -163,3 +168,96 @@ clampScanBytes operatorCeiling mReq =
   case mReq of
     Nothing  -> operatorCeiling
     Just req -> max 1 (min operatorCeiling req)
+
+-- ---------------------------------------------------------------------------
+-- FILE_WRITE
+-- ---------------------------------------------------------------------------
+
+-- | FILE_WRITE opcode: write or append content to a workspace-relative file,
+-- confined by 'mkSafePath'. The @operatorWriteCeiling@ is the hard upper
+-- bound on bytes written per call; content exceeding it is rejected
+-- (bounded write, mirrors FILE_READ's @max_scan_bytes@ clamp). The
+-- @mode@ field is @\"write\"@ (default, truncate + create) or @\"append\"@.
+-- 'orRecorded' captures the path + mode + byte count (NOT the content —
+-- content may be large; the transcript records metadata only).
+fileWriteOp :: WorkspaceRoot -> Int -> Opcode
+fileWriteOp root operatorWriteCeiling = UntrustedOpcode
+  { uoName = OpName "FILE_WRITE"
+  , uoDesc = "Write or append to a workspace file (path is workspace-relative, bounded)."
+  , uoInSchema = fileWriteSchema
+  , uoOutSchema = object []
+  , uoAuthorize =
+      maybe (Left "FILE_WRITE requires {path:string, content:string}") (const (Right ()))
+        . pathField
+  , uoRun = \backend _execBackend v -> do
+      let rel     = maybe "" T.unpack (pathField v)
+          content = maybe "" T.unpack (contentField v)
+          mode    = case modeField v of
+            Just m | m == "append" -> (m :: Text)
+            _                      -> "write"  -- default
+          byteCount = BS.length (TE.encodeUtf8 (T.pack content))
+          recorded = object
+            [ "path" .= rel
+            , "mode" .= mode
+            , "bytes" .= byteCount
+            ]
+      if byteCount > operatorWriteCeiling
+        then pure $ OpResult
+          [TrpText ("FILE_WRITE: content (" <> T.pack (show byteCount) <> " bytes) exceeds operator ceiling ("
+                    <> T.pack (show operatorWriteCeiling) <> " bytes)")]
+          True
+          recorded
+        else do
+          mSafe <- runLocal backend (mkSafePathForWrite root rel)
+          case mSafe of
+            Left err ->
+              pure $ OpResult
+                [TrpText (T.pack (show err))]
+                True
+                recorded
+            Right safe -> do
+              eUnit <- runLocal backend $ try @IOError $
+                case mode :: Text of
+                  m | m == "append" -> BS.appendFile (getSafePath safe) (TE.encodeUtf8 (T.pack content))
+                  _                 -> BS.writeFile  (getSafePath safe) (TE.encodeUtf8 (T.pack content))
+              case eUnit of
+                Left ioErr ->
+                  pure $ OpResult
+                    [TrpText (T.pack (show ioErr))]
+                    True
+                    recorded
+                Right _ ->
+                  pure $ OpResult
+                    [TrpText ("wrote " <> T.pack (show byteCount) <> " bytes to " <> T.pack rel)]
+                    False
+                    recorded
+  }
+
+fileWriteSchema :: Value
+fileWriteSchema =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [ fromText "path" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Workspace-relative path of the file to write." :: Text)
+            ]
+        , fromText "content" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("The content to write (bounded by the operator ceiling)." :: Text)
+            ]
+        , fromText "mode" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("\"write\" (default, truncate+create) or \"append\"." :: Text)
+            ]
+        ]
+    , "required" .= (["path", "content"] :: [Text])
+    ]
+
+contentField :: Value -> Maybe Text
+contentField = parseMaybe (withObject "in" (.: "content"))
+
+modeField :: Value -> Maybe Text
+modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe Text) of
+  Just (Just m) -> Just m
+  _             -> Nothing

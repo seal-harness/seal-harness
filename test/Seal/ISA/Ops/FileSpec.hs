@@ -212,8 +212,68 @@ spec = describe "Seal.ISA.Ops.File" $ do
       r <- runTestApp (uoRun op localBackend testExecBackend (object ["path" .= ("adir" :: String)]))
       orIsError r `shouldBe` True
 
+  describe "FILE_WRITE" $ do
+
+    it "writes content to a file inside the workspace" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
+        r <- runTestApp (uoRun op localBackend testExecBackend (object
+          [ "path" .= ("out.txt" :: String)
+          , "content" .= ("hello world" :: String)
+          ]))
+        orIsError r `shouldBe` False
+        bs <- BS.readFile (root </> "out.txt")
+        bs `shouldBe` "hello world"
+
+    it "appends content when mode = append" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        BS.writeFile (root </> "out.txt") "first "
+        let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
+        r <- runTestApp (uoRun op localBackend testExecBackend (object
+          [ "path" .= ("out.txt" :: String)
+          , "content" .= ("second" :: String)
+          , "mode" .= ("append" :: String)
+          ]))
+        orIsError r `shouldBe` False
+        bs <- BS.readFile (root </> "out.txt")
+        bs `shouldBe` "first second"
+
+    it "orRecorded captures path + mode + byte count (not the content)" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
+        r <- runTestApp (uoRun op localBackend testExecBackend (object
+          [ "path" .= ("out.txt" :: String)
+          , "content" .= ("hi" :: String)
+          ]))
+        orRecorded r `shouldBe` object
+          [ "path" .= ("out.txt" :: String)
+          , "mode" .= ("write" :: String)
+          , "bytes" .= (2 :: Int)
+          ]
+
+    it "rejects a path traversal escape (no write)" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
+        r <- runTestApp (uoRun op localBackend testExecBackend (object
+          [ "path" .= ("../escape.txt" :: String)
+          , "content" .= ("bad" :: String)
+          ]))
+        orIsError r `shouldBe` True
+
+    it "rejects oversized content (bounded write)" $
+      withSystemTempDirectory "seal-ws" $ \root -> do
+        let op = fileWriteOp (WorkspaceRoot root) 5  -- max 5 bytes
+        r <- runTestApp (uoRun op localBackend testExecBackend (object
+          [ "path" .= ("big.txt" :: String)
+          , "content" .= ("this is way too long" :: String)
+          ]))
+        orIsError r `shouldBe` True
+
   where
     showN :: Int -> Text
     showN = T.pack . show
     unlinesStr :: [Text] -> ByteString
     unlinesStr xss = BS.intercalate "\n" (map TE.encodeUtf8 xss) <> "\n"
+
+maxWriteBytes :: Int
+maxWriteBytes = 65536   -- 64 KiB, mirrors the FILE_READ default
