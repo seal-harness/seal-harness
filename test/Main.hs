@@ -23,6 +23,8 @@ import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.ExtractSpec
 import qualified Seal.Web.BrowserSpec
+import qualified Seal.Media.ImageSpec
+import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -130,6 +132,8 @@ main = hspec $ do
   Seal.Web.SearchSpec.spec
   Seal.Web.ExtractSpec.spec
   Seal.Web.BrowserSpec.spec
+  Seal.Media.ImageSpec.spec
+  Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec

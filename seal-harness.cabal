@@ -108,6 +108,8 @@ library
         Seal.Web.Search
         Seal.Web.Extract
         Seal.Web.Browser
+        Seal.Media.Image
+        Seal.Media.Tts
         Seal.Gateway.Config
         Seal.Gateway.API
         Seal.Gateway.Server
@@ -304,6 +306,8 @@ test-suite tests
         Seal.Web.SearchSpec
         Seal.Web.ExtractSpec
         Seal.Web.BrowserSpec
+        Seal.Media.ImageSpec
+        Seal.Media.TtsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
