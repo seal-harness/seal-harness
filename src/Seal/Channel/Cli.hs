@@ -47,8 +47,8 @@ import Seal.Handles.Transcript
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
-import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..))
-import Seal.Tools.Exec.Untrusted (selectExecBackend)
+import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -382,18 +382,20 @@ handleTabCommand caps tabsH = \case
 -- | Resolve the untrusted-execution 'ExecBackend' from the 'FileConfig'.
 -- Absent section / mode=local → 'EbLocal' (the real local executor wired
 -- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
--- (the SSH executor lands in 4g; until then this falls back to the local
--- executor's placeholder so untrusted opcodes still run, fail-closed via
--- 'ExecNotImplemented' if they actually need the remote). mode=remote +
--- remote absent/incomplete → 'EbLocal' (the dispatcher fail-closes at call
--- time via 'selectExecBackend' returning 'Left ExecRemoteRequired').
+-- (the SSH executor; the opcodes run remotely). mode=remote + remote
+-- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
+-- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
 execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
 execBackendFromFile wsRoot cfg =
   case untrustedExecConfigFromFile cfg of
     Nothing -> defaultBackend
     Just uec ->
-      case selectExecBackend uec TbLocal of
-        Right eb -> eb
-        Left _   -> defaultBackend
+      case uecRemote uec of
+        Nothing -> failClosedBackend  -- mode=remote, no remote configured
+        Just sshCfg ->
+          case selectExecBackend uec (TbSsh sshCfg) of
+            Right (EbRemote s) -> EbRemote s
+            _ -> failClosedBackend
   where
     defaultBackend = EbLocal (mkLocalExecHandle wsRoot)
+    failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed

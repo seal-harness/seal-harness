@@ -87,6 +87,22 @@ spec = describe "Seal.Tools.Exec.Untrusted" $ do
              Right (EbLocal _) -> False
              _                 -> True
 
+  describe "fail-closed integration (spec §7 row 1+2)" $ do
+
+    it "mode=remote, no remote configured + TbLocal -> Left ExecLocalNotPermittedForUntrusted (no local fallback)" $ do
+      let cfg = UntrustedExecConfig UemRemote Nothing
+      selectExecBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
+
+    it "mode=remote, no remote configured + TbSsh -> Left ExecRemoteRequired (fail-closed at call time)" $ do
+      let cfg = UntrustedExecConfig UemRemote Nothing
+      selectExecBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
+
+    it "mode=remote, remote configured + TbSsh -> Right (EbRemote sshCfg)" $ do
+      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+      case selectExecBackend cfg (TbSsh sshCfg) of
+        Right (EbRemote s) -> scHost s `shouldBe` scHost sshCfg
+        _ -> expectationFailure "expected Right (EbRemote ...)"
+
 -- | A generator covering all four 'TerminalBackend' constructors. Kept
 -- local (no global Arbitrary instance) so the spec stays self-contained.
 genBackend :: Gen TerminalBackend
