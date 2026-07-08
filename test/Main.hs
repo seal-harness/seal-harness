@@ -97,6 +97,7 @@ import qualified Seal.ISA.DispatchSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
+import qualified Seal.ISA.Ops.ProcessSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
 
@@ -197,5 +198,6 @@ main = hspec $ do
   Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.Ops.FileSpec.spec
   Seal.ISA.Ops.ShellSpec.spec
+  Seal.ISA.Ops.ProcessSpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
