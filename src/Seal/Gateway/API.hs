@@ -497,11 +497,14 @@ handleTranscript deps sidTxt =
     -- the same file, so the frontend's dedup-by-id works.
     --
     -- @msgContent@ is a list of 'ContentBlock's in the on-disk
-    -- GHC-Generics shape (@{tag:"CbText", contents:"..."}@ etc.). The frontend
-    -- parses the Anthropic-style block shape (@{type:"text", text:...}@,
-    -- @{type:"tool_use", id, name, input}@, @{type:"tool_result",
-    -- tool_use_id, content, is_error}@), so each block is rewritten by
-    -- 'cbToFrontend' before being placed in the payload.
+    -- GHC-Generics 'TaggedObject' shape (@{tag:"CbText", contents:"..."}@
+    -- for single-field; @{tag:"CbToolUse", cbId:..., cbName:..., cbInput:...}@
+    -- for multi-field — fields at top level, no @contents@ wrapper). The
+    -- frontend parses the Anthropic-style block shape
+    -- (@{type:"text", text:...}@, @{type:"tool_use", id, name, input}@,
+    -- @{type:"tool_result", tool_use_id, content, is_error}@), so each
+    -- block is rewritten by 'cbToFrontend' before being placed in the
+    -- payload.
     convLineToFrontend :: Text -> [String] -> String -> Int -> A.Value -> A.Value
     convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
       let o = case rawLine of
@@ -539,10 +542,16 @@ handleTranscript deps sidTxt =
          , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
          ]
 
-    -- | Rewrite one on-disk 'ContentBlock' (GHC-Generics shape
-    -- @{tag, contents}@) into the Anthropic-style block the frontend parses.
-    -- Unknown / unparseable blocks fall back to a text block holding the raw
-    -- JSON, so the conversation is never silently dropped.
+    -- | Rewrite one on-disk 'ContentBlock' (GHC-Generics 'TaggedObject' shape)
+    -- into the Anthropic-style block the frontend parses.
+    --
+    -- aeson's default 'TaggedObject' encoding uses a @"tag"@ field to
+    -- distinguish constructors. For single-field constructors ('CbText'),
+    -- the value lives under @"contents"@. For multi-field constructors
+    -- ('CbToolUse', 'CbToolResult'), the fields sit at the TOP LEVEL
+    -- alongside @"tag"@ — there is no @"contents"@ wrapper. Unknown /
+    -- unparseable blocks fall back to a text block holding the raw JSON,
+    -- so the conversation is never silently dropped.
     cbToFrontend :: A.Value -> A.Value
     cbToFrontend blk =
       let bo = case blk of
@@ -553,9 +562,6 @@ handleTranscript deps sidTxt =
             Just (A.String t) -> Just t
             _                  -> Nothing
           contents = KeyMap.lookup (k "contents") bo
-          co = case contents of
-            Just (A.Object m) -> Just m
-            _                 -> Nothing
           lookupT key m = case KeyMap.lookup (k key) m of
             Just (A.String t) -> Just t
             _                 -> Nothing
@@ -566,22 +572,18 @@ handleTranscript deps sidTxt =
            Just "CbText" -> case contents of
              Just (A.String t) -> object ["type" .= ("text" :: Text), "text" .= t]
              _                 -> fallback
-           Just "CbToolUse" -> case co of
-             Just m -> object
-               [ "type"  .= ("tool_use" :: Text)
-               , "id"    .= fromMaybe "" (lookupT "cbId" m)
-               , "name"  .= fromMaybe "" (lookupT "cbName" m)
-               , "input" .= fromMaybe A.Null (KeyMap.lookup (k "cbInput") m)
-               ]
-             Nothing -> fallback
-           Just "CbToolResult" -> case co of
-             Just m -> object
-               [ "type"        .= ("tool_result" :: Text)
-               , "tool_use_id" .= fromMaybe "" (lookupT "cbForId" m)
-               , "content"     .= fromMaybe A.Null (KeyMap.lookup (k "cbParts") m)
-               , "is_error"    .= fromMaybe False (lookupB "cbIsError" m)
-               ]
-             Nothing -> fallback
+           Just "CbToolUse" -> object
+             [ "type"  .= ("tool_use" :: Text)
+             , "id"    .= fromMaybe "" (lookupT "cbId" bo)
+             , "name"  .= fromMaybe "" (lookupT "cbName" bo)
+             , "input" .= fromMaybe A.Null (KeyMap.lookup (k "cbInput") bo)
+             ]
+           Just "CbToolResult" -> object
+             [ "type"        .= ("tool_result" :: Text)
+             , "tool_use_id" .= fromMaybe "" (lookupT "cbForId" bo)
+             , "content"     .= fromMaybe A.Null (KeyMap.lookup (k "cbParts") bo)
+             , "is_error"    .= fromMaybe False (lookupB "cbIsError" bo)
+             ]
            _ -> fallback
       where
         fallback = object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]

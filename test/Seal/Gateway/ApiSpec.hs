@@ -36,8 +36,9 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..)
+  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
+import Seal.Core.Types (ToolCallId (..), OpName (..))
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault (VaultHandle)
@@ -338,6 +339,104 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> error "block not object"
       lookupK "type" blockObj `shouldBe` Just (A.String "text")
       lookupK "text" blockObj `shouldBe` Just (A.String "hello back")
+
+  it "GET /api/sessions/<sid>/transcript rewrites CbToolUse and CbToolResult blocks to Anthropic shape" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- Write a conversation with tool_use (Assistant) + tool_result (User).
+      -- The on-disk shape is aeson's default TaggedObject: CbToolUse fields
+      -- are at the TOP LEVEL alongside "tag" (no "contents" wrapper). If
+      -- cbToFrontend looks for them under "contents", it falls back to a
+      -- text block with raw JSON — which is the bug this test guards against.
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "list files"]
+                  , Message Assistant
+                      [ CbToolUse (ToolCallId "call_0") (OpName "FILE_READ")
+                          (A.object ["path" .= ("src/main.hs" :: T.Text)])
+                      ]
+                  , Message User
+                      [ CbToolResult (ToolCallId "call_0")
+                          [TrpText "module Main where"]
+                          False
+                      ]
+                  , Message Assistant [CbText "done"]
+                  ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 4
+      -- Entry 1 (Assistant tool_use) must produce a tool_use block, NOT a
+      -- fallback text block with raw JSON.
+      let respEntry = arr !! 1
+          ro = case respEntry of { A.Object m -> m; _ -> error "resp not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _ -> error "no resp payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "resp payload not JSON"
+          rcontent = case rparsed of
+            A.Object m -> case lookupK "content" m of
+              Just (A.Array a) -> a
+              _ -> error "no resp content array"
+            _ -> error "resp payload not object"
+          toolUseBlock = case rcontent V.! 0 of
+            A.Object m -> m
+            _ -> error "tool_use block not object"
+      lookupK "type" toolUseBlock `shouldBe` Just (A.String "tool_use")
+      lookupK "id"   toolUseBlock `shouldBe` Just (A.String "call_0")
+      lookupK "name" toolUseBlock `shouldBe` Just (A.String "FILE_READ")
+      -- Entry 2 (User tool_result) must produce a tool_result block, NOT a
+      -- fallback text block. This is the entry that was rendering as a "You"
+      -- message with raw JSON.
+      let reqEntry = arr !! 2
+          qo = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          qpayload = case lookupK "payload" qo of
+            Just (A.String t) -> t
+            _ -> error "no req payload"
+          qparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack qpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          qmsgs = case qparsed of
+            A.Object m -> case lookupK "messages" m of
+              Just (A.Array a) -> a
+              _ -> error "no messages array"
+            _ -> error "req payload not object"
+          qmsg = case qmsgs V.! 0 of
+            A.Object m -> case lookupK "content" m of
+              Just (A.Array a) -> a
+              _ -> error "no msg content array"
+            _ -> error "msg not object"
+          toolResultBlock = case qmsg V.! 0 of
+            A.Object m -> m
+            _ -> error "tool_result block not object"
+      lookupK "type"        toolResultBlock `shouldBe` Just (A.String "tool_result")
+      lookupK "tool_use_id" toolResultBlock `shouldBe` Just (A.String "call_0")
+      lookupK "is_error"    toolResultBlock `shouldBe` Just (A.Bool False)
 
   it "GET /api/sessions/<sid>/transcript pulls per-entry timestamps from entries.jsonl" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
