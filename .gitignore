@@ -14,3 +14,6 @@ frontend/dist/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Stray session dirs from test runs (shouldn't be created, but safety net)
+sessions/

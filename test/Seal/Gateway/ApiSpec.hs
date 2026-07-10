@@ -125,12 +125,24 @@ runAppBody app req = do
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
-  let mkApp = do
+  -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
+  -- kind=provider calls newSession, which writes session.json under
+  -- spState/sessions/. With spState="" that resolves to ./sessions/ in the
+  -- CWD, polluting the repo root. The temp dir isolates these writes.
+  -- runIO runs at spec-construction time; the OS cleans up $TMPDIR
+  -- (/var/folders/... on macOS) automatically.
+  sharedStateDir <- runIO $ do
+    dir <- withSystemTempDirectory "seal-api-spec" pure
+    createDirectoryIfMissing True (dir </> "sessions")
+    pure dir
+
+  let mkPaths = fakePaths { spState = sharedStateDir }
+      mkApp = do
         tabsH <- newTabsHandle
         reg   <- newHarnessRegistry
         adb   <- noneBackend
         activeRef <- newIORef fakeMeta
-        let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
+        let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
             deps = ApiDeps
               { adSessionRuntime  = sr
               , adTabsHandle      = tabsH
