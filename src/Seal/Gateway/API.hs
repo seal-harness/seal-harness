@@ -22,7 +22,7 @@ import Data.Text.Read (decimal)
 import Data.Vector qualified as V
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodGet, methodOptions, methodPost, methodPut
-  , status200, status204, status400, status403, status404, status501 )
+  , status200, status204, status400, status403, status404, status500, status501 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
@@ -30,12 +30,14 @@ import System.Directory (doesFileExist)
 import Data.Text.IO qualified as TIO
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
-import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
 import Data.Time (UTCTime, defaultTimeLocale, formatTime)
 import Seal.Config.Paths (sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
+import Seal.Gateway.Send
+  ( SendDeps (..), handleSend, sendOutcomeJson )
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
-import Seal.Harness.Id (HarnessId (..), newHarnessId)
+import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
@@ -43,7 +45,7 @@ import Seal.Providers.Registry
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions)
+import Seal.Session.Store (SessionRuntime (..), listSessions, newSession)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 
@@ -55,6 +57,7 @@ data ApiDeps = ApiDeps
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11)
   , adProviders       :: [KnownProvider]      -- ^ for /api/providers; the configured provider list (T11)
+  , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   }
 
 -- | The REST API as a WAI Application.
@@ -83,14 +86,23 @@ apiApp deps req respond =
     -- skipped.
     (m', ["api", "sessions", sid, "transcript"]) | m' == methodGet ->
       respond =<< handleTranscript deps sid
-    -- T11 STUB: POST /api/sessions/:id/send. The real wiring routes the
-    -- message through 'Seal.Ingest' (the agent loop), which is a deeper
-    -- integration; T11 just needs the endpoint to exist + respond per the
-    -- frontend's contract so the manual smoke + Playwright capstone can
-    -- exercise the wiring. Returns @{kind: "assistant"}@.
-    (m', ["api", "sessions", _sid, "send"]) | m' == methodPost -> do
-      _body <- collectBody req
-      respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
+    -- POST /api/sessions/:id/send. When the agent-loop plumbing is wired
+    -- ('adSend' = 'Just'), route the message through the real agent loop
+    -- (slash registry vs plain turn) and return the outcome. When 'adSend'
+    -- is 'Nothing' (tests without the full runtime), fall back to the stub
+    -- response so the contract is preserved.
+    (m', ["api", "sessions", sid, "send"]) | m' == methodPost -> do
+      body <- collectBody req
+      case adSend deps of
+        Nothing -> respond (jsonOk (object ["kind" .= ("assistant" :: Text)]))
+        Just sendDeps -> do
+          let msg = parseSendMessage body
+          case mkSessionId sid of
+            Left e   -> respond (errJson status400 ("invalid session id: " <> e))
+            Right sId -> do
+              outcome <- handleSend sendDeps sId msg
+              let (code, val) = sendOutcomeJson outcome
+              respond (jsonLBS (statusFromInt code) (A.encode val))
     -- T11 STUB: PUT /api/sessions/:id/description — 204 (no persistence yet;
     -- 'SessionMeta' has no description field).
     (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
@@ -166,12 +178,58 @@ collectBody req = go []
         then pure (BL.fromChunks (reverse acc))
         else go (chunk : acc)
 
+-- | Parse the @message@ field from a POST /send body. Returns "" on a
+-- missing/invalid body so the agent loop receives an empty turn (the routing
+-- grammar treats empty input as 'Plain ""').
+parseSendMessage :: BL.ByteString -> Text
+parseSendMessage body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "message") o of
+      Just (A.String t) -> t
+      _                 -> ""
+    _ -> ""
+
+-- | Map an integer HTTP status code to a 'Status'. The send outcome carries
+-- an Int (so 'Seal.Gateway.Send' doesn't depend on @http-types@); this
+-- rehydrates it. Unknown codes fall back to 500.
+statusFromInt :: Int -> Status
+statusFromInt 200 = status200
+statusFromInt 400 = status400
+statusFromInt 404 = status404
+statusFromInt 500 = status500
+statusFromInt _   = status500
+
 -- | Parse the @kind@ field from a JSON body.
 parseKind :: A.Value -> Maybe Text
 parseKind (A.Object o) = case KeyMap.lookup (Key.fromText "kind") o of
   Just (A.String k) -> Just k
   _                 -> Nothing
 parseKind _ = Nothing
+
+-- | Parse the @provider@ and @model@ fields from a POST /api/tabs/new body.
+-- Defaults to @("ollama", "llama3.2")@ when either is missing — the frontend
+-- always sends both (the NewTabComposer preselects them), so the fallback is
+-- purely defensive.
+parseProviderModel :: A.Value -> (Text, Text)
+parseProviderModel v = case v of
+  A.Object o ->
+    let lookupT k = case KeyMap.lookup (Key.fromText k) o of
+          Just (A.String t) | not (T.null t) -> Just t
+          _                                   -> Nothing
+    in ( fromMaybe "ollama" (lookupT "provider")
+       , fromMaybe "llama3.2" (lookupT "model") )
+  _ -> ("ollama", "llama3.2")
+
+-- | Parse the optional @agent@ field from a POST /api/tabs/new body into an
+-- 'AgentDefId'. Returns 'Nothing' when absent/empty/invalid.
+parseAgentField :: A.Value -> Maybe AgentDefId
+parseAgentField (A.Object o) =
+  case KeyMap.lookup (Key.fromText "agent") o of
+    Just (A.String t) | not (T.null t) -> eitherToMaybe (mkAgentDefId t)
+    _                                  -> Nothing
+  where eitherToMaybe (Right x) = Just x
+        eitherToMaybe (Left _)   = Nothing
+parseAgentField _ = Nothing
 
 -- | Handle POST /api/tabs/new.
 handleTabNew :: ApiDeps -> A.Value -> IO Response
@@ -182,7 +240,16 @@ handleTabNew deps v =
     Just "ssh"    -> pure (errJson status501 "shell/ssh tabs require Phase 4 untrusted execution")
     Just "attach" -> pure (errJson status501 "attach flow goes through /api/adopt")
     Just "provider" -> do
-      sid <- mintSessionId
+      -- Persist session.json so /send can resolve the provider+model. The
+      -- provider/model default to the config defaults when the body omits
+      -- them; the agent is bound when supplied. newSession mints its own
+      -- session id; we bind the tab to THAT id (not a pre-minted one) so
+      -- the tab and session.json agree.
+      let paths = srPaths (adSessionRuntime deps)
+          (provider, model) = parseProviderModel v
+          mAgent = parseAgentField v
+      meta <- newSession paths provider model "web" mAgent
+      let sid = smId meta
       res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
       pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
@@ -191,20 +258,6 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
-
--- | Mint a fresh SessionId. The real session store is T11; for T10 we mint a
--- unique id derived from a fresh 'HarnessId' (UUID v4) suffix. The candidate
--- is built from the hex prefix of a UUID (chars in the allowed alphabet),
--- so 'mkSessionId' always succeeds; the fallback is a known-good constant.
-mintSessionId :: IO SessionId
-mintSessionId = do
-  HarnessId t <- newHarnessId
-  let candidate = "sess" <> T.take 8 t
-  case mkSessionId candidate of
-    Right s  -> pure s
-    Left _e  -> case mkSessionId "sessfallback" of
-                  Right s  -> pure s
-                  Left _e2 -> pure (SessionId "sessfallback")  -- unreachable: literal is valid
 
 -- | Parse the @harness_id@ field (the flavour-name or @custom:<binary>@
 -- encoding) into the tab's label.

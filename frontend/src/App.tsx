@@ -19,6 +19,7 @@ import {
   releaseHarness,
   destroyHarness,
   type SendResult,
+  type NewTabResponse,
 } from './hooks/useApi'
 import { useListsStream } from './hooks/useListsStream'
 import { useNewTabSpec } from './hooks/useNewTabSpec'
@@ -385,13 +386,25 @@ export default function App() {
     setCustomPromptFile(null)
   }, [syncPath])
 
-  // The NewTabComposer owns the createTab/adoptWindow call; App just closes
-  // the composer on submit. The WS `lists` broadcast populates the sidebar
-  // with the new tab.
-  const handleComposerSubmit = useCallback(() => {
+  // The NewTabComposer owns the createTab/adoptWindow call; App navigates to
+  // the newly-created tab on success (so the chat input wires up to the new
+  // session) and closes the composer. The WS `lists` broadcast populates the
+  // sidebar with the new tab. For the attach kind, `res` is null (no
+  // createTab response) — the composer just closes and the user lands back
+  // on the previous selection.
+  const handleComposerSubmit = useCallback((res: NewTabResponse | null) => {
     setComposerOpen(false)
     setBranchFrom(undefined)
-  }, [])
+    if (res) {
+      // Prefer the session id when present — `session:<id>` resolves
+      // `currentSessionId` directly without waiting for the tabs list to
+      // refresh, so the chat input wires up immediately. Fall back to the
+      // tab index for shell-like tabs that carry no session.
+      const id = res.session_id ? `session:${res.session_id}` : `tab:${res.tab_index}`
+      setSelectedId(id)
+      syncPath(id)
+    }
+  }, [syncPath])
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)

@@ -62,6 +62,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adProviders = knownProviders
+          , adSend = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -100,6 +101,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adProviders = knownProviders
+          , adSend = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

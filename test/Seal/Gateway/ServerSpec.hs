@@ -53,6 +53,7 @@ mkDeps = do
     , adAdoptConsent = Just CcWeb
     , adAgentDefs = adb
     , adProviders = knownProviders
+    , adSend = Nothing
     })
 
 spec :: Spec

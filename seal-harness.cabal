@@ -115,8 +115,9 @@ library
         Seal.Media.Image
         Seal.Media.Tts
         Seal.Gateway.Config
-        Seal.Gateway.API
-        Seal.Gateway.Server
+         Seal.Gateway.API
+         Seal.Gateway.Send
+         Seal.Gateway.Server
         Seal.Gateway.Stream
         Seal.Gateway.StreamBroker
         Seal.Tui

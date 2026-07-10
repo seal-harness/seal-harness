@@ -9,10 +9,11 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
+import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
@@ -24,16 +25,38 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend)
+import Seal.Channel.Cli (Backends (..), newBackends)
+import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Spec (mkRegistry)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (mkSessionId)
+import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API
+import Seal.Gateway.Send (SendDeps (..))
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Ingest (emptyChain)
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (..), Role (..)
+  , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tabs (newTabsHandle)
+import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | A provider that returns a scripted list of responses, one per call
+-- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
+-- test so it's deterministic (no live Ollama/Anthropic call).
+newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
+instance Provider ScriptProvider where
+  listModels _ = pure (Right [])
+  complete (ScriptProvider ref) _ = do
+    rs <- readIORef ref
+    case rs of
+      (x:xs) -> writeIORef ref xs >> pure (Right x)
+      [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 fakePaths :: SealPaths
 fakePaths = SealPaths
@@ -114,6 +137,7 @@ spec = describe "Seal.Gateway.API" $ do
               , adAdoptConsent    = Just CcWeb
               , adAgentDefs       = adb
               , adProviders       = knownProviders
+              , adSend            = Nothing
               }
         pure (apiApp deps)
 
@@ -272,6 +296,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adProviders       = knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -347,6 +372,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adProviders       = knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -398,6 +424,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adProviders       = knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -470,3 +497,137 @@ spec = describe "Seal.Gateway.API" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
     status `shouldBe` 200
+
+  -- ── Wired send path (adSend = Just SendDeps) ──────────────────────────
+  -- A session that doesn't exist on disk returns 404. This exercises the
+  -- handleSend -> loadSessionMeta -> Nothing path without needing a real
+  -- provider/vault (the lookup happens before provider resolution).
+  it "POST /api/sessions/<sid>/send with adSend wired returns 404 for a missing session" $ do
+    withSystemTempDirectory "seal-send" $ \tmp -> do
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
+          sendDeps = SendDeps
+            { sdPaths      = fakePaths { spState = tmp }
+            , sdVault      = error "sdVault: unused on the 404 path"
+            , sdProvider   = error "sdProvider: unused on the 404 path"
+            , sdSession    = sr
+            , sdBackends   = error "sdBackends: unused on the 404 path"
+            , sdConfigRepo = error "sdConfigRepo: unused on the 404 path"
+            , sdPreprocess = error "sdPreprocess: unused on the 404 path"
+            , sdRegistry   = error "sdRegistry: unused on the 404 path"
+            , sdResolve    = error "sdResolve: unused on the 404 path"
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = knownProviders
+            , adSend            = Just sendDeps
+            }
+          app = apiApp deps
+      req <- testPost ["api", "sessions", "no-such-session", "send"]
+        (A.encode (A.object [ "message" .= ("hi" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 404
+
+  -- ── End-to-end: tabs/new -> send -> transcript ───────────────────────
+  -- Creates a provider session via POST /api/tabs/new, sends a message via
+  -- POST /api/sessions/:id/send, then reads the transcript back via GET
+  -- /api/sessions/:id/transcript and asserts the assistant reply landed.
+  -- A fake provider (ScriptProvider) is injected via sdResolve so the test
+  -- is deterministic (no live Ollama/Anthropic call).
+  it "e2e: tabs/new -> send -> transcript contains the assistant reply" $
+    withSystemTempDirectory "seal-e2e" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      let adb = bAgentDefs backends
+      -- A fake provider that returns one canned assistant reply.
+      providerRef <- newIORef
+        [ CompletionResponse [CbText "Hello from the fake provider"] StopEnd (Usage 0 0) ]
+      -- A real ProviderRuntime whose config path is nonexistent (loadFileConfig
+      -- fails -> defaults: 128KiB ceiling + fail-closed exec). The vault ref
+      -- holds Nothing so resolveSessionProvider would fail — but sdResolve is
+      -- stubbed, so the vault is never consulted.
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr }
+          paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+          meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
+      activeRef' <- newIORef meta0
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
+          resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
+          resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = mkRegistry []
+            , sdResolve    = resolveStub
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = knownProviders
+            , adSend            = Just sendDeps
+            }
+          app = apiApp deps
+      -- 1. Create a provider tab (persists session.json).
+      newReq <- testPost ["api", "tabs", "new"]
+        (A.encode (A.object
+          [ "kind" .= ("provider" :: T.Text)
+          , "provider" .= ("ollama" :: T.Text)
+          , "model" .= ("llama3.2" :: T.Text)
+          ]))
+      (newStatus, newBody) <- runAppBody app newReq
+      newStatus `shouldBe` 200
+      let newResp = A.decode newBody :: Maybe A.Value
+          mSid = case newResp of
+            Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+              Just (A.String s) -> Just s
+              _ -> Nothing
+            _ -> Nothing
+      case mSid of
+        Nothing -> expectationFailure "tabs/new did not return a session_id"
+        Just sidTxt -> do
+          -- 2. Send a message.
+          sendReq <- testPost ["api", "sessions", sidTxt, "send"]
+            (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+          (sendStatus, _sendBody) <- runAppBody app sendReq
+          sendStatus `shouldBe` 200
+          -- 3. Read the transcript; it should contain the assistant reply.
+          let transcriptReq = testRequest methodGet ["api", "sessions", sidTxt, "transcript"]
+          (transcriptStatus, transcriptBody) <- runAppBody app transcriptReq
+          transcriptStatus `shouldBe` 200
+          let arr = case A.decode transcriptBody :: Maybe A.Value of
+                Just (A.Array a) -> V.toList a
+                _ -> []
+          -- The transcript should have at least 2 entries (user request +
+          -- assistant response).
+          length arr `shouldSatisfy` (>= 2)
+          -- The canned reply text appears somewhere in the transcript JSON
+          -- (the frontend's block payload encodes it).
+          T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
+            `shouldBe` True
