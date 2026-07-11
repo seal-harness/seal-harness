@@ -148,6 +148,42 @@ spec = do
         out <- getSent fc
         any ("none" `T.isInfixOf`) out `shouldBe` True
 
+    it "list filters out anthropic when no credential is stored" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault []
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        -- ollama (local) is always configured; anthropic is not (no key, no OAuth)
+        T.unlines out `shouldSatisfy` ("ollama" `T.isInfixOf`)
+        T.unlines out `shouldNotSatisfy` ("anthropic" `T.isInfixOf`)
+
+    it "list shows anthropic when an API key is stored" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk-x")]
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        T.unlines out `shouldSatisfy` ("anthropic" `T.isInfixOf`)
+
+    it "list prints a hint when no providers are configured" $
+      withSystemTempDirectory "prov" $ \dir -> do
+        let cfg = dir </> "config.toml"
+            unconfiguredOllama =
+              "[providers.ollama]\nbase_url = \"https://ollama.com\"\n"
+        -- a cloud URL with no key => ollama is NOT configured either
+        _ <- appendFile cfg unconfiguredOllama
+        vh <- makeFakeVault []
+        pr <- mkPR cfg (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr ["list"] caps
+        out <- getSent fc
+        T.unlines out `shouldSatisfy` ("no providers configured" `T.isInfixOf`)
+
     it "remove clears BOTH the API key and the OAuth blob" $
       withSystemTempDirectory "prov" $ \dir -> do
         let cfg = dir </> "config.toml"

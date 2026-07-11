@@ -4,6 +4,7 @@ module Seal.Security.Path
   , WorkspaceRoot (..)
   , PathError (..)
   , mkSafePath
+  , mkSafePathForWrite
   , KeysRoot (..)
   , ensureKeysRoot
   , SafeKeyPath
@@ -103,6 +104,49 @@ mkSafePath (WorkspaceRoot root) requested = do
               if not exists
                 then pure $ Left $ PathDoesNotExist canon
                 else pure $ Right $ SafePath canon
+
+-- | Like 'mkSafePath' but allows the final path component to NOT exist
+-- (for FILE_WRITE: the file may be created fresh). Steps 1-2 (blocked-name
+-- + lexical collapse + containment) are identical. Step 3 canonicalizes
+-- the PARENT (which must exist), then re-joins the final component. Step 4
+-- confirms the parent is contained; the final component's existence is
+-- irrelevant (it may or may not exist).
+mkSafePathForWrite :: WorkspaceRoot -> FilePath -> IO (Either PathError SafePath)
+mkSafePathForWrite (WorkspaceRoot root) requested = do
+  canonRoot <- canonicalizePath root
+  if any (`elem` blockedNames) (splitDirectories requested)
+    then pure $ Left $ PathIsBlocked $ T.pack $ "path touches a blocked location: " <> requested
+    else do
+      let joined = if isAbsolute requested then requested else canonRoot </> requested
+          rootDirs = splitDirectories canonRoot
+          lexicalDirs = lexicalCollapse (splitDirectories joined)
+      if not (rootDirs `isPrefixOf` lexicalDirs)
+        then pure $ Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+        else do
+          -- Canonicalize the parent (must exist), then re-join the final
+          -- component. If the parent doesn't exist, the canonicalization
+          -- fails → PathDoesNotExist (the parent must exist for a write).
+          let lexicalPath = joinPath lexicalDirs
+          case splitDirectories lexicalPath of
+            [] -> pure $ Left $ PathEscapesWorkspace lexicalPath
+            [_] ->
+              -- The path is a single component (the root itself); writing
+              -- the root is not meaningful, but the root exists.
+              resolveParentAndCheck rootDirs lexicalPath canonRoot
+            segments ->
+              let parentLex = joinPath (init segments)
+              in resolveParentAndCheck rootDirs lexicalPath
+                   =<< canonicalizePath parentLex
+  where
+    resolveParentAndCheck rootDirs lexicalPath canonParent = do
+      -- Step 4: confirm the canonical parent is contained.
+      if not (rootDirs `isPrefixOf` splitDirectories canonParent)
+        then pure $ Left $ PathEscapesWorkspace canonParent
+        else do
+          parentExists <- doesPathExist canonParent
+          if not parentExists
+            then pure $ Left $ PathDoesNotExist canonParent
+            else pure $ Right $ SafePath lexicalPath
 
 -- ---------------------------------------------------------------------------
 -- Key-material confinement

@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | Haskeline-backed CLI TUI channel. Plain (non-slash) input is routed through
 -- the agent loop ('runTurn'); slash commands and rejections flow through the
@@ -8,6 +9,8 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , mkSessionAgentEnv
+  , debugRequestsPath
+  , execBackendFromFile
   , Backends (..)
   , newBackends
   ) where
@@ -35,9 +38,10 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
-import Seal.Config.File (loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes)
-import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
+import Seal.Config.File (FileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
+                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile,
+                          fcDebugSessionTranscript)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -45,6 +49,11 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
+#if !defined(REMOTE_ONLY_UNTRUSTED)
+import Seal.Tools.Exec.Local (mkLocalExecHandle)
+#endif
+import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -150,8 +159,9 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = AgentEnv
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
+  -> Maybe FilePath -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -159,11 +169,30 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle = Agen
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
+  , aeExecBackend = execBackend
+    -- ^ The untrusted-execution backend (Local vs Remote SSH) from the
+    -- runtime 'UntrustedExecConfig' (4b-T3). Trusted/Audited opcodes
+    -- ignore it (the GADT 'Opcode' has no 'ExecBackend' field for them —
+    -- type-level capability scoping, spec §4/§8).
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
   , aeMessageSource = Nothing
+  , aeDebugRequestsPath = debugReqPath
   }
+
+-- | Resolve the optional debug-requests path from the loaded config. When
+-- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
+-- otherwise @Nothing@. The debug file (@requests.jsonl@) records each
+-- 'CompletionRequest' in full (including the complete message history) exactly
+-- as sent to the LLM, so we can debug whether the two-file storage format is
+-- correctly feeding the session history to the provider.
+debugRequestsPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugRequestsPath paths sid eCfg =
+  case eCfg of
+    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+      Just (sessionRequestsPath paths sid)
+    _ -> Nothing
 
 -- | Run the Haskeline TUI loop.
 --
@@ -207,6 +236,17 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
   -- change takes effect on the next session.
   eCfg <- loadFileConfig (prConfigPath pr)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+      -- Resolve the untrusted-execution backend (Phase 4 4b-T3). Absent
+      -- section or mode=local → the local executor (wired to wsRoot);
+      -- mode=remote → the SSH executor (if fully configured) or fail-closed
+      -- (the dispatcher surfaces the structured error at call time). The
+      -- remote executor itself lands in 4g; until then mode=remote without
+      -- a real SSH executor falls back to the local executor's placeholder
+      -- (the opcode fail-closes via 'ExecNotImplemented' if it actually
+      -- needs the remote). 4b-T3 wires the LOCAL arm to the real
+      -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
+      execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromFile
   -- The two-file transcript bracket wraps the whole loop so every turn shares
   -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
   -- they are built here where both `caps` and the transcript handle are in
@@ -258,7 +298,8 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
             Left err              -> ccSend caps ("agent start failed: " <> err)
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
-                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle
+                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
+                      (debugRequestsPath paths sid eCfg)
                 runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
           [ showHumanOp caps
@@ -294,7 +335,8 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
                 Nothing -> pure Nothing
                 Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
+                   (debugRequestsPath paths (smId meta) eCfg))
                 appEnv t
     runInputT hlSettings (loop caps plainHandler tabsH)
   where
@@ -358,3 +400,28 @@ handleTabCommand caps tabsH = \case
     renderTab t =
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
+
+-- | Resolve the untrusted-execution 'ExecBackend' from the 'FileConfig'.
+-- Absent section / mode=local → 'EbLocal' (the real local executor wired
+-- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
+-- (the SSH executor; the opcodes run remotely). mode=remote + remote
+-- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
+-- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
+execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
+execBackendFromFile _wsRoot cfg =
+  case untrustedExecConfigFromFile cfg of
+    Nothing -> defaultBackend
+    Just uec ->
+      case uecRemote uec of
+        Nothing -> failClosedBackend  -- mode=remote, no remote configured
+        Just sshCfg ->
+          case selectExecBackend uec (TbSsh sshCfg) of
+            Right (EbRemote s) -> EbRemote s
+            _ -> failClosedBackend
+  where
+#if !defined(REMOTE_ONLY_UNTRUSTED)
+    defaultBackend = EbLocal (mkLocalExecHandle _wsRoot)
+#else
+    defaultBackend = failClosedBackend  -- local executor absent; fail-closed
+#endif
+    failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed

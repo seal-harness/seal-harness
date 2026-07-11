@@ -45,15 +45,15 @@ nameField = parseMaybe (withObject "in" (.: "name"))
 -- returns the value to the model. The recorded payload carries only the key
 -- name — never the secret value.
 secretGetOp :: VaultRuntime -> Opcode
-secretGetOp rt = Opcode
-  { opName = OpName "SECRET_GET"
-  , opTrust = Trusted
-  , opDesc = "Fetch a secret value from the vault by key name."
-  , opInSchema = singleStringSchema "name" "The vault key name of the secret to fetch."
-  , opOutSchema = object []
-  , opAuthorize =
+secretGetOp rt = TrustedOpcode
+  { toName = OpName "SECRET_GET"
+  , toTrust = Trusted
+  , toDesc = "Fetch a secret value from the vault by key name."
+  , toInSchema = singleStringSchema "name" "The vault key name of the secret to fetch."
+  , toOutSchema = object []
+  , toAuthorize =
       maybe (Left "SECRET_GET requires {name:string}") (const (Right ())) . nameField
-  , opRun = \_ v -> do
+  , toRun = \_ v -> do
       let key = fromMaybe "" (nameField v)
       val <- liftIO (vaultGetByName rt key)
       pure $ case val of

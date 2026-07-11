@@ -218,6 +218,18 @@ export interface ToolCallInfo {
   resultIsError?: boolean
 }
 
+/** A tool-definition block, shown collapsed by default. `count` and
+ *  `names` drive the compact collapsed header (e.g. "3 tools: shell, read,
+ *  edit"); `json` is the verbatim tools array the LLM was sent, rendered
+ *  in a pretty-printed <pre> when expanded. Mirrors the System-prompt row
+ *  so the user can see — at a glance and on demand — what the LLM was
+ *  told it could do. */
+export interface ToolDefsBlock {
+  count: number
+  names: string[]
+  json: string  // pretty-printed JSON of the tools array
+}
+
 export interface MessageContent {
   id?: string              // stable per-block id used for #fragment deep-links
   text?: string
@@ -228,6 +240,7 @@ export interface MessageContent {
   thinkingText?: string    // claude-code "thinking" block, collapsed by default under a "Thinking" label
   rawJson?: string         // raw JSON, hidden by default, toggleable
   toolCall?: ToolCallInfo  // assistant tool invocation (with matched result when available)
+  toolDefs?: ToolDefsBlock // tool definitions block, collapsed with count/names; full JSON on expand
 }
 
 export interface Message {

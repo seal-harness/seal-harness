@@ -7,10 +7,12 @@
 module Seal.Session.Store
   ( formatSessionId
   , newSession
+  , newSessionMeta
   , saveSessionMeta
   , listSessions
   , defaultSessionSelection
   , initSession
+  , initSessionMeta
   , SessionRuntime (..)
   ) where
 
@@ -56,17 +58,25 @@ formatSessionId t =
       mmm    = replicate (3 - length s) '0' <> s
   in T.pack (base <> "-" <> mmm)
 
--- | Create a fresh session directory + session.json for the given selection.
-newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
-newSession paths provider model channel mAgent = do
+-- | Mint a fresh 'SessionMeta' (id + timestamps) for the given selection,
+-- without writing anything to disk. Used by channels that want an
+-- in-memory active session without polluting the sessions list — the
+-- session is only persisted when the user actually sends a message.
+newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
+newSessionMeta _paths provider model channel mAgent = do
   now <- getCurrentTime
   sid <- case mkSessionId (formatSessionId now) of
     Right s -> pure s
     Left e  -> ioError (userError ("session id generation failed: " <> T.unpack e))
-  let meta = SessionMeta
-        { smId = sid, smProvider = provider, smModel = model
-        , smChannel = channel, smAgent = mAgent
-        , smCreatedAt = now, smLastActive = now }
+  pure SessionMeta
+    { smId = sid, smProvider = provider, smModel = model
+    , smChannel = channel, smAgent = mAgent
+    , smCreatedAt = now, smLastActive = now }
+
+-- | Create a fresh session directory + session.json for the given selection.
+newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
+newSession paths provider model channel mAgent = do
+  meta <- newSessionMeta paths provider model channel mAgent
   saveSessionMeta paths meta
   pure meta
 
@@ -147,3 +157,16 @@ initSession paths cfg backend = do
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
   newSession paths provider model "cli" mAgent
+
+-- | Build an in-memory 'SessionMeta' from the config defaults, on the @web@
+-- channel, WITHOUT persisting to disk. The web gateway uses this so the
+-- active-session ref has a valid meta (provider/model fallbacks) without
+-- polluting the sessions list. The session is persisted only when the user
+-- actually sends the first message (which writes the transcript).
+initSessionMeta :: SealPaths -> FileConfig -> AgentDefBackend -> IO SessionMeta
+initSessionMeta paths cfg backend = do
+  (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe cfgProv mProv
+      model    = fromMaybe cfgModel mModel
+  newSessionMeta paths provider model "web" mAgent

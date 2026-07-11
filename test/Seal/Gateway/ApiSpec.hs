@@ -9,10 +9,11 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
+import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
@@ -24,16 +25,39 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend)
+import Seal.Channel.Cli (Backends (..), newBackends)
+import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Spec (mkRegistry)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (mkSessionId)
+import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API
+import Seal.Gateway.Send (SendDeps (..))
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Providers.Registry (knownProviders)
+import Seal.Ingest (emptyChain)
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
+  , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
+import Seal.Core.Types (ToolCallId (..), OpName (..))
+import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tabs (newTabsHandle)
+import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | A provider that returns a scripted list of responses, one per call
+-- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
+-- test so it's deterministic (no live Ollama/Anthropic call).
+newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
+instance Provider ScriptProvider where
+  listModels _ = pure (Right [])
+  complete (ScriptProvider ref) _ = do
+    rs <- readIORef ref
+    case rs of
+      (x:xs) -> writeIORef ref xs >> pure (Right x)
+      [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 fakePaths :: SealPaths
 fakePaths = SealPaths
@@ -47,6 +71,11 @@ fakeMeta =
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
 lookupK key = KeyMap.lookup (Key.fromText key)
+
+-- | Predicate: the 'Value' is a JSON array.
+isJustArray :: Maybe A.Value -> Bool
+isJustArray (Just (A.Array _)) = True
+isJustArray _                  = False
 
 -- | Build a test request with a given method + path.
 testRequest :: BC.ByteString -> [T.Text] -> Request
@@ -101,19 +130,32 @@ runAppBody app req = do
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
-  let mkApp = do
+  -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
+  -- kind=provider calls newSession, which writes session.json under
+  -- spState/sessions/. With spState="" that resolves to ./sessions/ in the
+  -- CWD, polluting the repo root. The temp dir isolates these writes.
+  -- runIO runs at spec-construction time; the OS cleans up $TMPDIR
+  -- (/var/folders/... on macOS) automatically.
+  sharedStateDir <- runIO $ do
+    dir <- withSystemTempDirectory "seal-api-spec" pure
+    createDirectoryIfMissing True (dir </> "sessions")
+    pure dir
+
+  let mkPaths = fakePaths { spState = sharedStateDir }
+      mkApp = do
         tabsH <- newTabsHandle
         reg   <- newHarnessRegistry
         adb   <- noneBackend
         activeRef <- newIORef fakeMeta
-        let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
+        let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
             deps = ApiDeps
               { adSessionRuntime  = sr
               , adTabsHandle      = tabsH
               , adHarnessRegistry = reg
               , adAdoptConsent    = Just CcWeb
               , adAgentDefs       = adb
-              , adProviders       = knownProviders
+              , adProviders       = pure knownProviders
+              , adSend            = Nothing
               }
         pure (apiApp deps)
 
@@ -271,7 +313,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -314,6 +357,104 @@ spec = describe "Seal.Gateway.API" $ do
       lookupK "type" blockObj `shouldBe` Just (A.String "text")
       lookupK "text" blockObj `shouldBe` Just (A.String "hello back")
 
+  it "GET /api/sessions/<sid>/transcript rewrites CbToolUse and CbToolResult blocks to Anthropic shape" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- Write a conversation with tool_use (Assistant) + tool_result (User).
+      -- The on-disk shape is aeson's default TaggedObject: CbToolUse fields
+      -- are at the TOP LEVEL alongside "tag" (no "contents" wrapper). If
+      -- cbToFrontend looks for them under "contents", it falls back to a
+      -- text block with raw JSON — which is the bug this test guards against.
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "list files"]
+                  , Message Assistant
+                      [ CbToolUse (ToolCallId "call_0") (OpName "FILE_READ")
+                          (A.object ["path" .= ("src/main.hs" :: T.Text)])
+                      ]
+                  , Message User
+                      [ CbToolResult (ToolCallId "call_0")
+                          [TrpText "module Main where"]
+                          False
+                      ]
+                  , Message Assistant [CbText "done"]
+                  ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 4
+      -- Entry 1 (Assistant tool_use) must produce a tool_use block, NOT a
+      -- fallback text block with raw JSON.
+      let respEntry = arr !! 1
+          ro = case respEntry of { A.Object m -> m; _ -> error "resp not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _ -> error "no resp payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "resp payload not JSON"
+          rcontent = case rparsed of
+            A.Object m -> case lookupK "content" m of
+              Just (A.Array a) -> a
+              _ -> error "no resp content array"
+            _ -> error "resp payload not object"
+          toolUseBlock = case rcontent V.! 0 of
+            A.Object m -> m
+            _ -> error "tool_use block not object"
+      lookupK "type" toolUseBlock `shouldBe` Just (A.String "tool_use")
+      lookupK "id"   toolUseBlock `shouldBe` Just (A.String "call_0")
+      lookupK "name" toolUseBlock `shouldBe` Just (A.String "FILE_READ")
+      -- Entry 2 (User tool_result) must produce a tool_result block, NOT a
+      -- fallback text block. This is the entry that was rendering as a "You"
+      -- message with raw JSON.
+      let reqEntry = arr !! 2
+          qo = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          qpayload = case lookupK "payload" qo of
+            Just (A.String t) -> t
+            _ -> error "no req payload"
+          qparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack qpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          qmsgs = case qparsed of
+            A.Object m -> case lookupK "messages" m of
+              Just (A.Array a) -> a
+              _ -> error "no messages array"
+            _ -> error "req payload not object"
+          qmsg = case qmsgs V.! 0 of
+            A.Object m -> case lookupK "content" m of
+              Just (A.Array a) -> a
+              _ -> error "no msg content array"
+            _ -> error "msg not object"
+          toolResultBlock = case qmsg V.! 0 of
+            A.Object m -> m
+            _ -> error "tool_result block not object"
+      lookupK "type"        toolResultBlock `shouldBe` Just (A.String "tool_result")
+      lookupK "tool_use_id" toolResultBlock `shouldBe` Just (A.String "call_0")
+      lookupK "is_error"    toolResultBlock `shouldBe` Just (A.Bool False)
+
   it "GET /api/sessions/<sid>/transcript pulls per-entry timestamps from entries.jsonl" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
@@ -346,7 +487,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -368,6 +510,125 @@ spec = describe "Seal.Gateway.API" $ do
             []    -> error "expected at least one entry"
       tsOf firstEntry `shouldBe` Just (A.String "2026-07-01T12:00:00.100Z")
       tsOf (arr !! 1) `shouldBe` Just (A.String "2026-07-01T12:00:01.234Z")
+
+  it "GET /api/sessions/<sid>/transcript includes the system prompt in request payloads (two-file format)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "hello"] ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      -- entries.jsonl: one request entry carrying an envelope delta with
+      -- system = "You are a helpful assistant." The reconstruct path folds
+      -- this delta and the frontend's transcriptToMessages extracts the
+      -- `system` field into a collapsed "System" row at the top of the
+      -- session. Without the system field in the payload, the row is absent.
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        ]
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 1
+      -- The request entry's payload must carry a `system` field with the
+      -- system prompt text. The frontend reads `parsed.system` to synthesize
+      -- the collapsed "System" row.
+      let reqEntry = case arr of
+            (x:_) -> x
+            []    -> error "expected at least one entry"
+          ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _                 -> error "no req payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          systemField = case rparsed of
+            A.Object m -> lookupK "system" m
+            _          -> Nothing
+      systemField `shouldBe` Just (A.String "You are a helpful assistant.")
+
+  it "GET /api/sessions/<sid>/transcript lowercases message roles for the frontend (two-file format)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "hello world"] ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        ]
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 1
+      let reqEntry = case arr of
+            (x:_) -> x
+            []    -> error "expected at least one entry"
+          ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _                 -> error "no req payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          msgs = case rparsed of
+            A.Object m -> case lookupK "messages" m of
+              Just (A.Array a) -> a
+              _                -> error "no messages array"
+            _ -> error "payload not object"
+          firstMsg = case msgs V.! 0 of
+            A.Object m -> m
+            _          -> error "msg not object"
+      -- GHC-Generics encodes Role as "User"/"Assistant" (capitalized); the
+      -- frontend checks `msg.role === "user"` (lowercase). The rewrite must
+      -- lowercase the role or the user's first message won't render.
+      lookupK "role" firstMsg `shouldBe` Just (A.String "user")
+      lookupK "content" firstMsg `shouldSatisfy` isJustArray
 
   it "GET /api/sessions/<sid>/transcript falls back to smCreatedAt when entries.jsonl is absent" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
@@ -397,7 +658,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app
@@ -455,6 +717,38 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
+  it "GET /api/providers returns only the configured providers" $ do
+    -- adProviders is an IO action; a filtered list means only the configured
+    -- providers appear (here: ollama only, since no vault/credentials).
+    let mkAppFiltered = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          activeRef <- newIORef fakeMeta
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adProviders       = pure [OllamaProvider]
+                , adSend            = Nothing
+                }
+          pure (apiApp deps)
+    app <- mkAppFiltered
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers body: " ++ show body)
+    length arr `shouldBe` 1
+    let nm = case arr of
+          (A.Object o : _) -> case lookupK "name" o of
+            Just (A.String n) -> n
+            _ -> error "no name field"
+          _ -> error "not an object"
+    nm `shouldBe` "ollama"
+
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "anthropic", "models"])
@@ -470,3 +764,137 @@ spec = describe "Seal.Gateway.API" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
     status `shouldBe` 200
+
+  -- ── Wired send path (adSend = Just SendDeps) ──────────────────────────
+  -- A session that doesn't exist on disk returns 404. This exercises the
+  -- handleSend -> loadSessionMeta -> Nothing path without needing a real
+  -- provider/vault (the lookup happens before provider resolution).
+  it "POST /api/sessions/<sid>/send with adSend wired returns 404 for a missing session" $ do
+    withSystemTempDirectory "seal-send" $ \tmp -> do
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
+          sendDeps = SendDeps
+            { sdPaths      = fakePaths { spState = tmp }
+            , sdVault      = error "sdVault: unused on the 404 path"
+            , sdProvider   = error "sdProvider: unused on the 404 path"
+            , sdSession    = sr
+            , sdBackends   = error "sdBackends: unused on the 404 path"
+            , sdConfigRepo = error "sdConfigRepo: unused on the 404 path"
+            , sdPreprocess = error "sdPreprocess: unused on the 404 path"
+            , sdRegistry   = error "sdRegistry: unused on the 404 path"
+            , sdResolve    = error "sdResolve: unused on the 404 path"
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Just sendDeps
+            }
+          app = apiApp deps
+      req <- testPost ["api", "sessions", "no-such-session", "send"]
+        (A.encode (A.object [ "message" .= ("hi" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 404
+
+  -- ── End-to-end: tabs/new -> send -> transcript ───────────────────────
+  -- Creates a provider session via POST /api/tabs/new, sends a message via
+  -- POST /api/sessions/:id/send, then reads the transcript back via GET
+  -- /api/sessions/:id/transcript and asserts the assistant reply landed.
+  -- A fake provider (ScriptProvider) is injected via sdResolve so the test
+  -- is deterministic (no live Ollama/Anthropic call).
+  it "e2e: tabs/new -> send -> transcript contains the assistant reply" $
+    withSystemTempDirectory "seal-e2e" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      let adb = bAgentDefs backends
+      -- A fake provider that returns one canned assistant reply.
+      providerRef <- newIORef
+        [ CompletionResponse [CbText "Hello from the fake provider"] StopEnd (Usage 0 0) ]
+      -- A real ProviderRuntime whose config path is nonexistent (loadFileConfig
+      -- fails -> defaults: 128KiB ceiling + fail-closed exec). The vault ref
+      -- holds Nothing so resolveSessionProvider would fail — but sdResolve is
+      -- stubbed, so the vault is never consulted.
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr }
+          paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+          meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
+      activeRef' <- newIORef meta0
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
+          resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
+          resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = mkRegistry []
+            , sdResolve    = resolveStub
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Just sendDeps
+            }
+          app = apiApp deps
+      -- 1. Create a provider tab (persists session.json).
+      newReq <- testPost ["api", "tabs", "new"]
+        (A.encode (A.object
+          [ "kind" .= ("provider" :: T.Text)
+          , "provider" .= ("ollama" :: T.Text)
+          , "model" .= ("llama3.2" :: T.Text)
+          ]))
+      (newStatus, newBody) <- runAppBody app newReq
+      newStatus `shouldBe` 200
+      let newResp = A.decode newBody :: Maybe A.Value
+          mSid = case newResp of
+            Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+              Just (A.String s) -> Just s
+              _ -> Nothing
+            _ -> Nothing
+      case mSid of
+        Nothing -> expectationFailure "tabs/new did not return a session_id"
+        Just sidTxt -> do
+          -- 2. Send a message.
+          sendReq <- testPost ["api", "sessions", sidTxt, "send"]
+            (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+          (sendStatus, _sendBody) <- runAppBody app sendReq
+          sendStatus `shouldBe` 200
+          -- 3. Read the transcript; it should contain the assistant reply.
+          let transcriptReq = testRequest methodGet ["api", "sessions", sidTxt, "transcript"]
+          (transcriptStatus, transcriptBody) <- runAppBody app transcriptReq
+          transcriptStatus `shouldBe` 200
+          let arr = case A.decode transcriptBody :: Maybe A.Value of
+                Just (A.Array a) -> V.toList a
+                _ -> []
+          -- The transcript should have at least 2 entries (user request +
+          -- assistant response).
+          length arr `shouldSatisfy` (>= 2)
+          -- The canned reply text appears somewhere in the transcript JSON
+          -- (the frontend's block payload encodes it).
+          T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
+            `shouldBe` True

@@ -1,18 +1,25 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications  #-}
 -- | FILE_READ (Untrusted): read a workspace file, confined by SafePath.
--- This is the opcode that exercises the ACK-before-execute path in the
--- dispatcher.
+-- FILE_WRITE (Untrusted): write/append a workspace file, confined by
+-- SafePath, bounded by the operator-configured max write size.
+-- This is the opcode module that exercises the ACK-before-execute path in
+-- the dispatcher.
 module Seal.ISA.Ops.File
   ( fileReadOp
+  , fileWriteOp
+  , filePatchOp
   ) where
 
 import Control.Exception (try)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
+import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import System.Directory (renameFile)
 
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types
@@ -107,15 +114,14 @@ scanBytesField v =
 -- max_scan_bytes (secret-free metadata); file contents flow only to 'orParts'
 -- (model-visible).
 fileReadOp :: WorkspaceRoot -> Int -> Opcode
-fileReadOp root operatorCeiling = Opcode
-  { opName = OpName "FILE_READ"
-  , opTrust = Untrusted
-  , opDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
-  , opInSchema = fileReadSchema
-  , opOutSchema = object []
-  , opAuthorize =
+fileReadOp root operatorCeiling = UntrustedOpcode
+  { uoName = OpName "FILE_READ"
+  , uoDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
+  , uoInSchema = fileReadSchema
+  , uoOutSchema = object []
+  , uoAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField
-  , opRun = \backend v -> do
+  , uoRun = \backend _execBackend v -> do
       let rel       = maybe "" T.unpack (pathField v)
           offset    = offsetField v
           mLimit    = limitField v
@@ -164,3 +170,245 @@ clampScanBytes operatorCeiling mReq =
   case mReq of
     Nothing  -> operatorCeiling
     Just req -> max 1 (min operatorCeiling req)
+
+-- ---------------------------------------------------------------------------
+-- FILE_WRITE
+-- ---------------------------------------------------------------------------
+
+-- | FILE_WRITE opcode: write or append content to a workspace-relative file,
+-- confined by 'mkSafePath'. The @operatorWriteCeiling@ is the hard upper
+-- bound on bytes written per call; content exceeding it is rejected
+-- (bounded write, mirrors FILE_READ's @max_scan_bytes@ clamp). The
+-- @mode@ field is @\"write\"@ (default, truncate + create) or @\"append\"@.
+-- 'orRecorded' captures the path + mode + byte count (NOT the content —
+-- content may be large; the transcript records metadata only).
+fileWriteOp :: WorkspaceRoot -> Int -> Opcode
+fileWriteOp root operatorWriteCeiling = UntrustedOpcode
+  { uoName = OpName "FILE_WRITE"
+  , uoDesc = "Write or append to a workspace file (path is workspace-relative, bounded)."
+  , uoInSchema = fileWriteSchema
+  , uoOutSchema = object []
+  , uoAuthorize =
+      maybe (Left "FILE_WRITE requires {path:string, content:string}") (const (Right ()))
+        . pathField
+  , uoRun = \backend _execBackend v -> do
+      let rel     = maybe "" T.unpack (pathField v)
+          content = maybe "" T.unpack (contentField v)
+          mode    = case modeField v of
+            Just m | m == "append" -> (m :: Text)
+            _                      -> "write"  -- default
+          byteCount = BS.length (TE.encodeUtf8 (T.pack content))
+          recorded = object
+            [ "path" .= rel
+            , "mode" .= mode
+            , "bytes" .= byteCount
+            ]
+      if byteCount > operatorWriteCeiling
+        then pure $ OpResult
+          [TrpText ("FILE_WRITE: content (" <> T.pack (show byteCount) <> " bytes) exceeds operator ceiling ("
+                    <> T.pack (show operatorWriteCeiling) <> " bytes)")]
+          True
+          recorded
+        else do
+          mSafe <- runLocal backend (mkSafePathForWrite root rel)
+          case mSafe of
+            Left err ->
+              pure $ OpResult
+                [TrpText (T.pack (show err))]
+                True
+                recorded
+            Right safe -> do
+              eUnit <- runLocal backend $ try @IOError $
+                case mode :: Text of
+                  m | m == "append" -> BS.appendFile (getSafePath safe) (TE.encodeUtf8 (T.pack content))
+                  _                 -> BS.writeFile  (getSafePath safe) (TE.encodeUtf8 (T.pack content))
+              case eUnit of
+                Left ioErr ->
+                  pure $ OpResult
+                    [TrpText (T.pack (show ioErr))]
+                    True
+                    recorded
+                Right _ ->
+                  pure $ OpResult
+                    [TrpText ("wrote " <> T.pack (show byteCount) <> " bytes to " <> T.pack rel)]
+                    False
+                    recorded
+  }
+
+fileWriteSchema :: Value
+fileWriteSchema =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [ fromText "path" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Workspace-relative path of the file to write." :: Text)
+            ]
+        , fromText "content" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("The content to write (bounded by the operator ceiling)." :: Text)
+            ]
+        , fromText "mode" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("\"write\" (default, truncate+create) or \"append\"." :: Text)
+            ]
+        ]
+    , "required" .= (["path", "content"] :: [Text])
+    ]
+
+contentField :: Value -> Maybe Text
+contentField = parseMaybe (withObject "in" (.: "content"))
+
+modeField :: Value -> Maybe Text
+modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe Text) of
+  Just (Just m) -> Just m
+  _             -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- FILE_PATCH
+-- ---------------------------------------------------------------------------
+
+-- | FILE_PATCH opcode: apply a unified diff to a workspace-relative file,
+-- confined by 'SafePath'. The patch is applied via a pure Haskell diff-
+-- apply (no subprocess — the patch is parsed and applied in-process; an
+-- atomic temp+rename write lands the result). 'orRecorded' captures the
+-- path + patch line count + applied flag (NOT the patch body — it may be
+-- large; the transcript records metadata only).
+filePatchOp :: WorkspaceRoot -> Opcode
+filePatchOp root = UntrustedOpcode
+  { uoName = OpName "FILE_PATCH"
+  , uoDesc = "Apply a unified diff to a workspace file (SafePath-confined, atomic write)."
+  , uoInSchema = filePatchSchema
+  , uoOutSchema = object []
+  , uoAuthorize =
+      maybe (Left "FILE_PATCH requires {path:string, patch:string}") (const (Right ()))
+        . pathField
+  , uoRun = \backend _execBackend v -> do
+      let rel   = maybe "" T.unpack (pathField v)
+          patch = maybe "" T.unpack (patchField v)
+          recorded = object [ "path" .= rel, "patch_lines" .= length (T.lines (T.pack patch)) ]
+      mSafe <- runLocal backend (mkSafePath root rel)
+      case mSafe of
+        Left err ->
+          pure $ OpResult [TrpText (T.pack (show err))] True recorded
+        Right safe -> do
+          -- Read the existing file, apply the diff, write atomically.
+          eContent <- runLocal backend $ try @IOError (BS.readFile (getSafePath safe))
+          case eContent of
+            Left ioErr ->
+              pure $ OpResult [TrpText ("FILE_PATCH: read failed: " <> T.pack (show ioErr))] True recorded
+            Right content -> do
+              case applyUnifiedDiff (TE.decodeUtf8Lenient content) (T.pack patch) of
+                Left applyErr ->
+                  pure $ OpResult [TrpText ("FILE_PATCH: apply failed: " <> applyErr)] True recorded
+                Right newContent -> do
+                  eUnit <- runLocal backend $ try @IOError $ do
+                    let tmpPath = getSafePath safe <> ".seal-patch-tmp"
+                    BS.writeFile tmpPath (TE.encodeUtf8 newContent)
+                    renameFile tmpPath (getSafePath safe)
+                  case eUnit of
+                    Left ioErr ->
+                      pure $ OpResult [TrpText ("FILE_PATCH: write failed: " <> T.pack (show ioErr))] True recorded
+                    Right _ ->
+                      pure $ OpResult [TrpText ("patched " <> T.pack rel)] False recorded
+  }
+
+filePatchSchema :: Value
+filePatchSchema =
+  object
+    [ "type" .= ("object" :: Text)
+    , "properties" .= object
+        [ fromText "path" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Workspace-relative path of the file to patch." :: Text)
+            ]
+        , fromText "patch" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("The unified diff to apply (in-process, no shell)." :: Text)
+            ]
+        ]
+    , "required" .= (["path", "patch"] :: [Text])
+    ]
+
+patchField :: Value -> Maybe Text
+patchField = parseMaybe (withObject "in" (.: "patch"))
+
+-- | Apply a minimal unified diff to the original content. Returns
+-- @Left errMsg@ if the patch is malformed or the context doesn't match;
+-- @Right newContent@ on success. This is a simplified hunk applier: it
+-- parses @@ -start,len +start,len @@ headers and applies context/removed/
+-- added lines. Does NOT handle binary patches or rename-only hunks.
+applyUnifiedDiff :: Text -> Text -> Either Text Text
+applyUnifiedDiff original patch =
+  let origLines = T.lines original
+      patchLines = T.lines patch
+  in go origLines patchLines
+  where
+    go origLines [] = Right (T.intercalate "\n" origLines <> "\n")
+    go origLines (h : rest)
+      | T.isPrefixOf "@@ " h = applyHunk origLines h rest
+      | T.isPrefixOf "--- " h = go origLines rest  -- skip file header
+      | T.isPrefixOf "+++ " h = go origLines rest  -- skip file header
+      | T.null h = go origLines rest               -- skip blank lines
+      | otherwise = Left ("unexpected line in patch: " <> h)
+    -- Apply a single hunk: parse the @@ -a,b +c,d @@ header, then the
+    -- context/removed/added lines (until the next @@ or end).
+    applyHunk origLines header rest =
+      case parseHunkHeader header of
+        Left err -> Left err
+        Right (oldStart, _oldLen, _newStart, _newLen) ->
+          -- The hunk body is the lines after the header until the next @@ or end.
+          let (hunkLines, remainingPatch) = span isHunkLine rest
+              idx = max 0 (oldStart - 1)
+              (before, atAndAfter) = splitAt idx origLines
+          in case applyHunkLines atAndAfter hunkLines of
+               Left err -> Left err
+               Right patched ->
+                 let newOrig = before ++ patched
+                 in go newOrig remainingPatch
+    isHunkLine l =
+      T.null l
+      || T.isPrefixOf " " l
+      || T.isPrefixOf "-" l
+      || T.isPrefixOf "+" l
+      || T.isPrefixOf "\\" l  -- "\ No newline at end of file"
+    -- Apply the hunk lines against the original lines: context (space)
+    -- lines are kept (match the original); removed (-) lines must match and
+    -- are dropped; added (+) lines are inserted.
+    applyHunkLines orig [] = Right orig
+    applyHunkLines (o : os) (h : hs)
+      | T.isPrefixOf " " h = keep o (applyHunkLines os hs)   -- context: keep original
+      | T.isPrefixOf "-" h = applyHunkLines os hs           -- removed: drop original
+      | T.isPrefixOf "+" h = keep (T.drop 1 h) (applyHunkLines (o : os) hs)  -- added: insert before current
+      | T.isPrefixOf "\\" h = applyHunkLines (o : os) hs    -- no-newline marker: skip
+      | T.null h = applyHunkLines (o : os) hs               -- blank line in hunk
+      | otherwise = Left ("unexpected hunk line: " <> h)
+      where keep x acc = (x :) <$> acc
+    applyHunkLines [] (h : hs)
+      | T.isPrefixOf "+" h = keep (T.drop 1 h) (applyHunkLines [] hs)  -- added at end: insert
+      | T.isPrefixOf " " h = Left ("hunk context line past end of file: " <> h)
+      | T.isPrefixOf "-" h = Left ("hunk removed line past end of file: " <> h)
+      | T.isPrefixOf "\\" h = applyHunkLines [] hs
+      | T.null h = applyHunkLines [] hs
+      | otherwise = Left ("unexpected hunk line at end: " <> h)
+      where keep x acc = (x :) <$> acc
+    -- Parse @@ -oldStart,oldLen +newStart,newLen @@ <rest...>
+    parseHunkHeader h =
+      case T.stripPrefix "@@ -" h of
+        Nothing -> Left ("malformed hunk header: " <> h)
+        Just rest ->
+          case T.breakOn "," rest of
+            (oldStartStr, afterOldLen) ->
+              let oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int
+                  afterPlus = T.dropWhile (/= '+') (snd (T.breakOn " " (T.drop 1 afterOldLen)))
+                  afterPlus' = T.drop 1 afterPlus  -- drop the +
+                  (newStartStr, _) = T.breakOn "," afterPlus'
+                  newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
+              in case (oldStart, newStart) of
+                   (Just os_, Just ns_) -> Right (os_, Nothing, ns_, Nothing)
+                   _ -> Left ("malformed hunk header numbers: " <> h)
+      where
+        readMaybe :: String -> Maybe Int
+        readMaybe s = case reads s :: [(Int, String)] of
+          [(n, _)] -> Just n
+          _        -> Nothing

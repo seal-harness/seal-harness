@@ -24,7 +24,10 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), mkSessionAgentEnv, newBackends, resolveSessionProvider )
+  ( Backends (..), mkSessionAgentEnv, newBackends, resolveSessionProvider
+  , execBackendFromFile, debugRequestsPath )
+import Seal.Tools.Exec.Local (mkLocalExecHandle)
+import Seal.Tools.Exec.Types (ExecBackend (..))
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (SignalTransport, mkRealSignalTransport)
@@ -219,8 +222,11 @@ plainTurn paths rt pr sr backends h mSrc t = do
               , ccPrompt       = fmap (fromRight "") . chPrompt h
               , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
               }
+            execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+            defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
         let env = (mkSessionAgentEnv
-                     handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle)
+                     handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
+                     (debugRequestsPath paths sid eCfg))
                     { aeMessageSource = mSrc }
         runApp appEnv (runTurn env t)
 

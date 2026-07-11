@@ -13,6 +13,7 @@ import Test.Hspec
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..))
 import Seal.Config.Paths (SealPaths (..))
@@ -122,9 +123,15 @@ spec = do
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th
+                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (EbLocal mkLocalExecHandlePlaceholder)
+                  Nothing
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
+      aeDebugRequestsPath env `shouldBe` Nothing
+      -- The untrusted-execution backend is threaded into the env (4b-T3).
+      case aeExecBackend env of
+        EbLocal _ -> pure ()
+        EbRemote _ -> expectationFailure "expected EbLocal for the default test backend"
 
   describe "seal tui smoke (interactive — manual)" $
     it "seal tui launches and shows the > prompt" $

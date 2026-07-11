@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Providers.RegistrySpec (spec) where
 
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Test.Hspec
 
+import Seal.Config.File (FileConfig (..), ProviderConfig (..), defaultFileConfig)
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic.OAuth (OAuthTokens (..), serializeTokens)
 import Seal.Providers.Class
@@ -14,6 +16,7 @@ import Seal.Providers.Class
 import Seal.Providers.Registry
   ( KnownProvider (..)
   , completeSome
+  , configuredProviders
   , defaultModelFor
   , knownProviders
   , listSome
@@ -196,3 +199,57 @@ spec = describe "Seal.Providers.Registry vocabulary" $ do
       resolveDefaultModel Nothing "anthropic" `shouldBe` ModelId "claude-opus-4-8"
     it "falls back to anthropic for an unknown label" $
       resolveDefaultModel Nothing "who" `shouldBe` ModelId "claude-opus-4-8"
+
+  describe "configuredProviders" $ do
+    it "includes ollama (local) even with no vault and no credentials" $ do
+      ps <- configuredProviders Nothing defaultFileConfig
+      ps `shouldBe` [OllamaProvider]
+
+    it "includes ollama (local) with an empty vault" $ do
+      vh <- makeFakeVault []
+      ps <- configuredProviders (Just vh) defaultFileConfig
+      ps `shouldBe` [OllamaProvider]
+
+    it "includes anthropic when an API key is stored" $ do
+      vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk-x")]
+      ps <- configuredProviders (Just vh) defaultFileConfig
+      ps `shouldSatisfy` elem AnthropicProvider
+
+    it "includes anthropic when an OAuth blob is stored" $ do
+      let toks = OAuthTokens (mkBearerToken "acc") (mkRefreshToken "ref")
+                             (posixSecondsToUTCTime 4102444800)
+      vh <- makeFakeVault [("ANTHROPIC_OAUTH_TOKENS", serializeTokens toks)]
+      ps <- configuredProviders (Just vh) defaultFileConfig
+      ps `shouldSatisfy` elem AnthropicProvider
+
+    it "excludes anthropic when no credential is stored" $ do
+      vh <- makeFakeVault []
+      ps <- configuredProviders (Just vh) defaultFileConfig
+      ps `shouldNotSatisfy` elem AnthropicProvider
+
+    it "excludes ollama when the base URL is cloud and no key is stored" $ do
+      vh <- makeFakeVault []
+      let cfg = defaultFileConfig
+            { fcProviders = Map.fromList
+                [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
+                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+            }
+      ps <- configuredProviders (Just vh) cfg
+      ps `shouldNotSatisfy` elem OllamaProvider
+
+    it "includes ollama when the base URL is cloud and a key is stored" $ do
+      vh <- makeFakeVault [("OLLAMA_API_KEY", "k-cloud")]
+      let cfg = defaultFileConfig
+            { fcProviders = Map.fromList
+                [ ("ollama", ProviderConfig { pcDefaultModel = Nothing
+                                            , pcBaseUrl = Just "https://ollama.com" }) ]
+            }
+      ps <- configuredProviders (Just vh) cfg
+      ps `shouldSatisfy` elem OllamaProvider
+
+    it "excludes both when the vault is locked" $ do
+      vh <- makeLockedVault
+      ps <- configuredProviders (Just vh) defaultFileConfig
+      -- local ollama is keyless so it survives even a locked vault (it never
+      -- touches the vault); anthropic is excluded.
+      ps `shouldBe` [OllamaProvider]

@@ -11,6 +11,7 @@ module Seal.Command.Provider
   ) where
 
 import Control.Exception (SomeException, try)
+import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
@@ -28,15 +29,15 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
-  ( FileConfig (..), ProviderConfig (..), loadFileConfig, providerBaseUrl
-  , providerDefaultModel, updateFileConfig, upsertProvider )
+  ( FileConfig (..), ProviderConfig (..), defaultFileConfig, loadFileConfig
+  , providerBaseUrl, providerDefaultModel, updateFileConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
-  ( KnownProvider, completeSome, defaultModelFor, knownProviders
-  , parseProvider, providerLabel, resolveDefaultModel, resolveProvider
-  , vaultErrText, vaultKeyName )
+  ( KnownProvider, completeSome, configuredProviders, defaultModelFor
+  , knownProviders, parseProvider, providerLabel, resolveDefaultModel
+  , resolveProvider, vaultErrText, vaultKeyName )
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -214,8 +215,12 @@ listCmd :: ProviderRuntime -> CommandAction
 listCmd pr = CommandAction $ \caps ->
   withVaultHandle pr caps $ \vh -> do
     eCfg <- loadFileConfig (prConfigPath pr)
-    let def = either (const Nothing) fcDefaultProvider eCfg
-    mapM_ (reportOne caps vh def) knownProviders
+    let cfg = fromRight defaultFileConfig eCfg
+        def = fcDefaultProvider cfg
+    configured <- configuredProviders (Just vh) cfg
+    if null configured
+      then ccSend caps "no providers configured — run /provider add <provider>"
+      else mapM_ (reportOne caps vh def) configured
   where
     reportOne caps vh def kp = do
       eKey <- vhGet vh (vaultKeyName kp)

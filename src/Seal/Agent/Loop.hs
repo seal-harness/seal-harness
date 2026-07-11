@@ -6,12 +6,17 @@ module Seal.Agent.Loop
   ( runTurn
   ) where
 
+import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..))
+import Data.Aeson qualified as A
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
+import qualified System.IO as IO
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.ChannelKind (channelKindToText)
@@ -41,16 +46,26 @@ requestMeta (Just ms) = Map.fromList
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
+  -- Load the prior conversation from disk so the model sees the full history
+  -- (not just this turn's new message). The two-file writer's diff-based
+  -- appender requires the incoming message list to be a prefix-extension of
+  -- the on-disk conversation; without the prior messages, the diff falls back
+  -- to re-appending the whole list every iteration, corrupting
+  -- @conversation.jsonl@ with duplicate user + assistant lines.
+  prior <- liftIO (tfwReadConversation (aeTranscript env))
+  let userMsg = textMsg User userText
+      turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
   -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
   -- The request's @erMeta@ carries the channel + conversation id when
   -- 'aeMessageSource' is present (Signal), so the transcript records which
-  -- channel + conversation this turn served.
+  -- channel + conversation this turn served. @erConvLen@ is the full
+  -- conversation length in effect at this request (prior + new user message),
+  -- so reconstruction can slice the right prefix from @conversation.jsonl@.
   liftIO $ do
     now <- getCurrentTime
-    let userMsg = textMsg User userText
-        env0 = EnvelopeDelta
+    let env0 = EnvelopeDelta
           { edModel = Just (aeModel env)
           , edSystem = Just (aeSystem env)
           , edTools = Just (registryToolDefs (aeRegistry env))
@@ -61,7 +76,7 @@ runTurn env userText = do
           { erId = ""
           , erTimestamp = now
           , erKind = EKRequest
-          , erConvLen = 1
+          , erConvLen = length turn0
           , erEnvelope = Just env0
           , erUsage = Nothing
           , erStop = Nothing
@@ -70,8 +85,8 @@ runTurn env userText = do
           , erCorrelation = Nothing
           , erMeta = requestMeta (aeMessageSource env)
           }
-    tfwRecordAsync (aeTranscript env) (TwoFileWrite [userMsg] entry)
-  go (aeMaxTurns env) [textMsg User userText]
+    tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
+  go (aeMaxTurns env) turn0
   where
     go :: Int -> [Message] -> App ()
     go 0 _ = liftIO (ccSend (aeCaps env) "(stopped: too many tool turns)")
@@ -84,6 +99,7 @@ runTurn env userText = do
                   , crToolChoice = ToolAuto
                   , crMaxTokens = 4096
                   }
+      liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
       eresp <- liftIO (providerComplete (aeProvider env) req)
       case eresp of
         Left err ->
@@ -128,7 +144,7 @@ runTurn env userText = do
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
-      res <- dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) name input
+      res <- dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeExecBackend env) name input
       pure $ case res of
         Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
         Right r -> CbToolResult tcid (orParts r) (orIsError r)
@@ -136,3 +152,16 @@ runTurn env userText = do
 
 providerComplete :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
 providerComplete (SomeProvider p) = complete p
+
+-- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
+-- append the full 'CompletionRequest' (one JSONL line, with trailing newline)
+-- to @requests.jsonl@. The contract: each line is the complete request exactly
+-- as sent to the LLM, including the full 'crMessages' history. When the path
+-- is 'Nothing' (the default), this is a no-op. Best-effort: an IO error is
+-- swallowed (the debug file must never break the agent loop).
+appendDebugRequest :: Maybe FilePath -> CompletionRequest -> IO ()
+appendDebugRequest Nothing _ = pure ()
+appendDebugRequest (Just path) req =
+  let line = BL.toStrict (A.encode req) <> "\n"
+  in IO.withFile path IO.AppendMode (`BS.hPutStr` line)
+     `catch` \(_ :: SomeException) -> pure ()

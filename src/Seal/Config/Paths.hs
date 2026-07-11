@@ -11,6 +11,7 @@ module Seal.Config.Paths
   , sessionTranscriptPath
   , sessionConversationPath
   , sessionEntriesPath
+  , sessionRequestsPath
   , agentSessionDir
   ) where
 
@@ -110,6 +111,13 @@ sessionConversationPath paths sid = sessionDir paths sid </> "conversation.jsonl
 -- | The session's entry log (new two-file format): @\<sessionDir\>\/entries.jsonl@.
 sessionEntriesPath :: SealPaths -> SessionId -> FilePath
 sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
+
+-- | The session's debug requests file: @\<sessionDir\>\/requests.jsonl@. Each
+-- line is the complete 'CompletionRequest' JSON exactly as sent to the LLM,
+-- including the full @crMessages@ history. Only written when the
+-- @debug_session_transcript@ config flag is set.
+sessionRequestsPath :: SealPaths -> SessionId -> FilePath
+sessionRequestsPath paths sid = sessionDir paths sid </> "requests.jsonl"
 
 -- | Directory for a sub-agent's transcript, nested under its parent session:
 -- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent

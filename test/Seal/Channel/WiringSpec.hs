@@ -5,6 +5,7 @@ import Data.IORef
 import Test.Hspec
 
 import Seal.Agent.Env
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Channel.Cli
 import Seal.Core.Types
 import Seal.Handles.Transcript
@@ -42,9 +43,11 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           (ISA.mkRegistry [])
           h
           localBackend
+          (EbLocal mkLocalExecHandlePlaceholder)
           caps
           (either (error "sid") id (mkSessionId "cli"))
           4
+          Nothing
           Nothing
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"

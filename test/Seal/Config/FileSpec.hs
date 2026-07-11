@@ -14,7 +14,8 @@ import Seal.Config.File
   ( FileConfig (..), ProviderConfig (..), RetrievalConfig (..), defaultFileConfig
   , defaultRetrievalMaxScanBytes, loadFileConfig, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveFileConfig
-  , updateFileConfig, upsertProvider )
+  , updateFileConfig, upsertProvider, UntrustedExecFileConfig (..)
+  , UntrustedExecRemoteFileConfig (..), untrustedExecConfigFromFile )
 
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
@@ -34,6 +35,8 @@ spec = describe "Seal.Config.File" $ do
         , fcRetrieval       = Nothing
         , fcSignal          = Nothing
         , fcGateway          = Nothing
+        , fcUntrustedExec   = Nothing
+        , fcDebugSessionTranscript = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -89,6 +92,8 @@ spec = describe "Seal.Config.File" $ do
               , fcRetrieval       = Nothing
               , fcSignal          = Nothing
               , fcGateway          = Nothing
+        , fcUntrustedExec   = Nothing
+        , fcDebugSessionTranscript = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
@@ -229,3 +234,122 @@ spec = describe "Seal.Config.File" $ do
     it "retrievalMaxScanBytes returns the configured value when present" $ do
       let cfg = defaultFileConfig { fcRetrieval = Just (RetrievalConfig (Just 65536)) }
       retrievalMaxScanBytes cfg `shouldBe` 65536
+
+  describe "untrusted_execution section" $ do
+
+    it "absent [untrusted_execution] section decodes to Nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "vault_path = \"/tmp/vault.age\"\n"
+        Right cfg <- loadFileConfig path
+        fcUntrustedExec cfg `shouldBe` Nothing
+
+    it "parses [untrusted_execution] with mode = local (default)" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[untrusted_execution]"
+          , "mode = \"local\""
+          ]
+        Right cfg <- loadFileConfig path
+        fcUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
+          { uefcMode = "local"
+          , uefcRemote = Nothing
+          })
+
+    it "parses [untrusted_execution] with mode = remote and a [remote] sub-table" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[untrusted_execution]"
+          , "mode = \"remote\""
+          , "[untrusted_execution.remote]"
+          , "host = \"exec.internal\""
+          , "user = \"agent\""
+          , "port = 22"
+          , "known_hosts = \"/home/agent/.ssh/known_hosts\""
+          , "workspace = \"/srv/agent-workspace\""
+          ]
+        Right cfg <- loadFileConfig path
+        fcUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
+          { uefcMode = "remote"
+          , uefcRemote = Just (UntrustedExecRemoteFileConfig
+              { uerfcHost = Just "exec.internal"
+              , uerfcUser = Just "agent"
+              , uerfcPort = Just 22
+              , uerfcIdentity = Nothing
+              , uerfcKnownHosts = Just "/home/agent/.ssh/known_hosts"
+              , uerfcWorkspace = Just "/srv/agent-workspace"
+              })
+          })
+
+    it "parses mode=remote with no [remote] block (fail-closed is at call time, not parse time)" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path $ T.unlines
+          [ "[untrusted_execution]"
+          , "mode = \"remote\""
+          ]
+        Right cfg <- loadFileConfig path
+        fcUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
+          { uefcMode = "remote"
+          , uefcRemote = Nothing
+          })
+
+    it "round-trips an untrusted_execution section through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig
+              { fcUntrustedExec = Just (UntrustedExecFileConfig
+                  { uefcMode = "remote"
+                  , uefcRemote = Just (UntrustedExecRemoteFileConfig
+                      { uerfcHost = Just "h"
+                      , uerfcUser = Just "u"
+                      , uerfcPort = Just 2222
+                      , uerfcIdentity = Just "/key"
+                      , uerfcKnownHosts = Just "/kh"
+                      , uerfcWorkspace = Just "/ws"
+                      })
+                  })
+              }
+        saveFileConfig path cfg
+        Right back <- loadFileConfig path
+        fcUntrustedExec back `shouldBe` fcUntrustedExec cfg
+
+    it "untrustedExecConfigFromFile returns Nothing when the section is absent" $ do
+      untrustedExecConfigFromFile defaultFileConfig `shouldBe` Nothing
+
+    it "untrustedExecConfigFromFile returns Nothing when mode=local (no remote needed)" $ do
+      let cfg = defaultFileConfig
+            { fcUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
+      untrustedExecConfigFromFile cfg `shouldBe` Nothing
+
+  describe "debug_session_transcript flag" $ do
+    it "absent key decodes to Nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "vault_path = \"/tmp/vault.age\"\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Nothing
+
+    it "parses debug_session_transcript = true" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "debug_session_transcript = true\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Just True
+
+    it "parses debug_session_transcript = false" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "debug_session_transcript = false\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Just False
+
+    it "round-trips through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig { fcDebugSessionTranscript = Just True }
+        saveFileConfig path cfg
+        Right back <- loadFileConfig path
+        fcDebugSessionTranscript back `shouldBe` Just True

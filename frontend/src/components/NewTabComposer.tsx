@@ -5,7 +5,7 @@ import {
   type NewTabKind,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
-import { adoptWindow, createTab } from '../hooks/useApi'
+import { adoptWindow, createTab, type NewTabResponse } from '../hooks/useApi'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -27,9 +27,10 @@ const KIND_LABELS: Record<NewTabKind, string> = {
 interface NewTabComposerProps {
   spec: NewTabSpec
   /** Called after a successful createTab (provider/harness) or adoptWindow
-   *  (attach). The composer owns the network call; the parent refreshes its
-   *  tab list / navigates in response. */
-  onSubmit: () => void
+   *  (attach). The response is passed back so the parent can navigate to
+   *  the newly-created tab/session (null for the attach kind, which has no
+   *  createTab response). */
+  onSubmit: (res: NewTabResponse | null) => void
   onCancel: () => void
   /** When branching, pre-fills the `branch_from` field and locks the kind to
    *  provider (branching creates a provider session seeded from an existing
@@ -57,13 +58,13 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     if (spec.validationError) return
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
-      if (res.ok) onSubmit()
+      if (res.ok) onSubmit(null)
       return
     }
     const body = spec.buildBody()
     if (branchFrom) body.branch_from = branchFrom
     const res = await createTab(body)
-    if (res) onSubmit()
+    if (res) onSubmit(res)
   }
 
   return (

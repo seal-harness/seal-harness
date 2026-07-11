@@ -52,7 +52,8 @@ mkDeps = do
     , adHarnessRegistry = reg
     , adAdoptConsent = Just CcWeb
     , adAgentDefs = adb
-    , adProviders = knownProviders
+    , adProviders = pure knownProviders
+    , adSend = Nothing
     })
 
 spec :: Spec

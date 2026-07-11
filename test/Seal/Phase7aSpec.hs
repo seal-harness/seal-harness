@@ -61,7 +61,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
-          , adProviders = knownProviders
+          , adProviders = pure knownProviders
+          , adSend = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -99,7 +100,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
-          , adProviders = knownProviders
+          , adProviders = pure knownProviders
+          , adSend = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

@@ -123,6 +123,35 @@ backend introduced in Phase 4: `Local | Tmux | Ssh | Container`).
   execution. Backend selection is a pure function:
   `selectUntrustedBackend :: Config -> Opcode -> Either ExecError UntrustedExecBackend`,
   which is heavily QuickCheck-able (untrusted ⇒ `Ssh`-or-failure, never `Local`).
+
+  > **Amendment (recorded during Phase 4 planning, 2026-07-07):** the
+  > spec's single `selectUntrustedBackend :: Config -> Opcode -> Either
+  > ExecError UntrustedExecBackend` is ambiguous for `mode=local`:
+  > `UntrustedExecBackend` is Ssh-only by construction, so it cannot
+  > represent the local executor. The implementation (Phase 4 task 4a-T2)
+  > splits this into TWO pure functions and a sum type, both heavily
+  > QuickCheck-able:
+  >
+  >   - `ExecBackend` sum: `EbLocal LocalExecHandle | EbRemote
+  >     UntrustedExecBackend` (the dispatcher consumes this).
+  >   - `selectUntrustedBackend :: UntrustedExecConfig -> TerminalBackend
+  >     -> Either ExecError UntrustedExecBackend` — the spec's function,
+  >     narrowed to the remote arm; `mode=remote` ⇒ `Right` only if `Ssh`
+  >     configured, else `Left ExecRemoteRequired`; `mode=local` ⇒ always
+  >     `Left` (this fn never yields Local). The QuickCheck property
+  >     "untrusted ⇒ Ssh-or-failure, never Local" is preserved.
+  >   - `selectExecBackend :: UntrustedExecConfig -> TerminalBackend ->
+  >     Either ExecError ExecBackend` — the full-sum selector the
+  >     dispatcher actually wires; `mode=local` + `TbLocal` ⇒ `Right
+  >     (EbLocal ...)`; `mode=remote` + `TbSsh` ⇒ `Right (EbRemote ...)`;
+  >     `mode=remote` + no remote ⇒ `Left ExecRemoteRequired`; never a
+  >     local fallback under `mode=remote`.
+  >
+  > The core deliverable (untrusted ⇒ Ssh-or-failure, never Local under
+  > `mode=remote`) is preserved in both functions; the split just makes
+  > the `mode=local` case representable. This amendment is recorded here
+  > per the plan contract ("where the plan and the spec disagree the spec
+  > wins"; this is a clarification of an ambiguity, not a divergence).
 - **Capability scoping.** In the handle pattern, the `Shell` handle (and any
   command-running capability) is wired **only** into Untrusted-opcode
   implementations. Trusted/Audited implementations never receive it, so "a

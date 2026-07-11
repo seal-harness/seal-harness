@@ -29,6 +29,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend)
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.ISA.Ops.Agent
   ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp, agentListOp
   , agentStartOp, agentStatusOp, agentStopOp )
@@ -143,10 +144,12 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeRegistry = reg
                   , aeTranscript = tHandle
                   , aeBackend = localBackend
+                  , aeExecBackend = EbLocal mkLocalExecHandlePlaceholder
                   , aeCaps = caps
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
                   , aeMessageSource = Nothing
+                  , aeDebugRequestsPath = Nothing
                   }
       runTestApp (runTurn env "run the capstone")
       -- 1. Each mutation landed as a Markdown file under config/.
@@ -178,7 +181,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             ]
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
-      _ <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_DEF_CREATE")
+      _ <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_DEF_CREATE")
                          (object
                            [ "id" .= ("worker" :: Text)
                            , "name" .= ("worker" :: Text)
@@ -188,7 +191,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       -- The def file landed on disk.
       doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
       -- Start it via dispatch (Trusted — no file write, just runtime).
-      rStart <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_START")
+      rStart <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_START")
                               (object ["id" .= ("worker" :: Text)]))
       rStart `shouldSatisfy` isRight
       threadDelay 50000
@@ -199,7 +202,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       mStatus <- agentStatus rt workerDef
       mStatus `shouldSatisfy` (Just Running ==)
       -- Stop it via dispatch (Trusted).
-      rStop <- runTestApp (dispatch reg tHandle localBackend (OpName "AGENT_STOP")
+      rStop <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_STOP")
                             (object ["id" .= ("worker" :: Text)]))
       rStop `shouldSatisfy` isRight
       agentStatus rt workerDef `shouldReturn` Nothing

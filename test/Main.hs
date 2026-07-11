@@ -16,6 +16,16 @@ import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
 import qualified Seal.Text.LineFileSpec
+import qualified Seal.Tools.Exec.TypesSpec
+import qualified Seal.Tools.Exec.UntrustedSpec
+import qualified Seal.Tools.Exec.RemoteSpec
+import qualified Seal.Tools.ArgsSpec
+import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
+import qualified Seal.Web.SearchSpec
+import qualified Seal.Web.ExtractSpec
+import qualified Seal.Web.BrowserSpec
+import qualified Seal.Media.ImageSpec
+import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Security.CryptoSpec
@@ -82,6 +92,7 @@ import qualified Seal.Phase6aSpec
 import qualified Seal.Phase6bSpec
 import qualified Seal.Phase7aSpec
 import qualified Seal.Phase5Spec
+import qualified Seal.Phase4Spec
 import qualified Seal.Signal.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
@@ -92,6 +103,11 @@ import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
+import qualified Seal.ISA.Ops.ShellSpec
+import qualified Seal.ISA.Ops.ProcessSpec
+import qualified Seal.ISA.Ops.CodeSpec
+import qualified Seal.ISA.Ops.SearchSpec
+import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
 
@@ -111,6 +127,16 @@ main = hspec $ do
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
   Seal.Text.LineFileSpec.spec
+  Seal.Tools.Exec.TypesSpec.spec
+  Seal.Tools.Exec.UntrustedSpec.spec
+  Seal.Tools.Exec.RemoteSpec.spec
+  Seal.Tools.ArgsSpec.spec
+  Seal.Tools.Exec.CapabilityScopingFailSpec.spec
+  Seal.Web.SearchSpec.spec
+  Seal.Web.ExtractSpec.spec
+  Seal.Web.BrowserSpec.spec
+  Seal.Media.ImageSpec.spec
+  Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Security.CryptoSpec.spec
@@ -177,6 +203,7 @@ main = hspec $ do
   Seal.Phase6bSpec.spec
   Seal.Phase7aSpec.spec
   Seal.Phase5Spec.spec
+  Seal.Phase4Spec.spec
   Seal.Signal.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
@@ -187,5 +214,10 @@ main = hspec $ do
   Seal.ISA.DispatchSpec.spec
   Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.Ops.FileSpec.spec
+  Seal.ISA.Ops.ShellSpec.spec
+  Seal.ISA.Ops.ProcessSpec.spec
+  Seal.ISA.Ops.CodeSpec.spec
+  Seal.ISA.Ops.SearchSpec.spec
+  Seal.ISA.Ops.PatchSpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec

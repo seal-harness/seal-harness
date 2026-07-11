@@ -31,6 +31,10 @@ common settings
         -Wpartial-fields
         -Wredundant-constraints
 
+flag remote-only-untrusted
+    description: Omit the local untrusted executor from the build (hardened: untrusted execution can only run remotely over SSH)
+    default:     False
+
 library
     import: settings
     exposed-modules:
@@ -101,9 +105,19 @@ library
         Seal.Security.Vault
         Seal.Security.Vault.Age
         Seal.Text.LineFile
+        Seal.Tools.Args
+        Seal.Tools.Exec.Remote
+        Seal.Tools.Exec.Types
+        Seal.Tools.Exec.Untrusted
+        Seal.Web.Search
+        Seal.Web.Extract
+        Seal.Web.Browser
+        Seal.Media.Image
+        Seal.Media.Tts
         Seal.Gateway.Config
-        Seal.Gateway.API
-        Seal.Gateway.Server
+         Seal.Gateway.API
+         Seal.Gateway.Send
+         Seal.Gateway.Server
         Seal.Gateway.Stream
         Seal.Gateway.StreamBroker
         Seal.Tui
@@ -122,6 +136,10 @@ library
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human
         Seal.ISA.Ops.File
+        Seal.ISA.Ops.Shell
+        Seal.ISA.Ops.Process
+        Seal.ISA.Ops.Code
+        Seal.ISA.Ops.Search
         Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
@@ -132,6 +150,14 @@ library
         Seal.Memory.Backend
         Seal.Skills.Types
         Seal.Skills.Backend
+    -- The local untrusted executor is omitted under -f remote-only-untrusted
+    -- (the hardened build: untrusted execution can only run remotely).
+    if !flag(remote-only-untrusted)
+        exposed-modules:
+            Seal.Tools.Exec.Local
+    if flag(remote-only-untrusted)
+        cpp-options: -DREMOTE_ONLY_UNTRUSTED
+        ghc-options: -Wno-missing-home-modules
     build-depends:
         base >= 4.18 && < 5
       , aeson
@@ -254,6 +280,7 @@ test-suite tests
         Seal.Phase6bSpec
         Seal.Phase7aSpec
         Seal.Phase5Spec
+        Seal.Phase4Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Channel.CliSpec
@@ -286,9 +313,20 @@ test-suite tests
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Text.LineFileSpec
+        Seal.Tools.Exec.TypesSpec
+        Seal.Tools.Exec.UntrustedSpec
+        Seal.Tools.Exec.RemoteSpec
+        Seal.Tools.ArgsSpec
+        Seal.Tools.Exec.CapabilityScopingFailSpec
+        Seal.Web.SearchSpec
+        Seal.Web.ExtractSpec
+        Seal.Web.BrowserSpec
+        Seal.Media.ImageSpec
+        Seal.Media.TtsSpec
         Seal.Security.Vault.AgeSpec
         Seal.Security.VaultSpec
         Seal.TestHelpers.Arbitrary
+        Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeVault
@@ -303,5 +341,10 @@ test-suite tests
         Seal.ISA.DispatchSpec
         Seal.ISA.Ops.HumanSpec
         Seal.ISA.Ops.FileSpec
+        Seal.ISA.Ops.ShellSpec
+        Seal.ISA.Ops.ProcessSpec
+        Seal.ISA.Ops.CodeSpec
+        Seal.ISA.Ops.SearchSpec
+        Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec

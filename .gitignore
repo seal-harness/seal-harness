@@ -10,3 +10,10 @@ frontend/dist/
 # BEADS working state (the plan docs under docs/superpowers/plans/ are tracked)
 .beads/plans/active-plan.md
 .beads/plans/active-plan.md.bak
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+
+# Stray session dirs from test runs (shouldn't be created, but safety net)
+sessions/

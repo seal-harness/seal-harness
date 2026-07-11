@@ -14,6 +14,7 @@ import Options.Applicative (info, progDesc)
 import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channels.Signal.Run (runSignalLoop)
@@ -107,10 +108,12 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeRegistry = isaReg
                 , aeTranscript = tHandle
                 , aeBackend = localBackend
+                , aeExecBackend = EbLocal mkLocalExecHandlePlaceholder
                 , aeCaps = handleCaps
                 , aeSession = sid
                 , aeMaxTurns = 4
                 , aeMessageSource = Just ms
+                , aeDebugRequestsPath = Nothing
                 }
           in runApp appEnv (runTurn agentEnv body)
         plainHandler h mSrc body = case mSrc of

@@ -9,15 +9,21 @@ import Seal.Providers.Class (ToolDefinition (..))
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 
-stubOp :: OpName -> TrustLevel -> Opcode
-stubOp n tl = Opcode
-  { opName = n, opTrust = tl, opDesc = "desc", opInSchema = object [], opOutSchema = object []
-  , opAuthorize = const (Right ())
-  , opRun = \_ _ -> pure (OpResult [] False Null) }
+stubTrustedOp :: OpName -> Opcode
+stubTrustedOp n = TrustedOpcode
+  { toName = n, toTrust = Trusted, toDesc = "desc", toInSchema = object [], toOutSchema = object []
+  , toAuthorize = const (Right ())
+  , toRun = \_ _ -> pure (OpResult [] False Null) }
+
+stubUntrustedOp :: OpName -> Opcode
+stubUntrustedOp n = UntrustedOpcode
+  { uoName = n, uoDesc = "desc", uoInSchema = object [], uoOutSchema = object []
+  , uoAuthorize = const (Right ())
+  , uoRun = \_ _ _ -> pure (OpResult [] False Null) }
 
 spec :: Spec
 spec = describe "Seal.ISA.Registry" $ do
-  let reg = mkRegistry [stubOp (OpName "A") Trusted, stubOp (OpName "B") Untrusted]
+  let reg = mkRegistry [stubTrustedOp (OpName "A"), stubUntrustedOp (OpName "B")]
   it "looks up registered opcodes" $
     fmap opName (lookupOp reg (OpName "A")) `shouldBe` Just (OpName "A")
   it "misses unregistered" $
