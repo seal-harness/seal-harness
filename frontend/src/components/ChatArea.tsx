@@ -599,6 +599,14 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
     try { return JSON.stringify(tc.input, null, 2) } catch { return String(tc.input) }
   })()
 
+  // Determine success/failure. When an exit code is available (shell commands),
+  // it takes precedence: 0 = success, non-zero = failure. Otherwise fall back
+  // to the is_error flag from the tool_result.
+  const hasResult = tc.result !== undefined
+  const failed = tc.exitCode !== undefined && tc.exitCode !== null
+    ? tc.exitCode !== 0
+    : tc.resultIsError ?? false
+
   return (
     <div
       ref={ref}
@@ -618,7 +626,7 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
         <span style={{ fontSize: 10, opacity: 0.6 }}>{expanded ? '\u25BC' : '\u25B6'}</span>
         <span
           className="text-xs font-semibold"
-          style={{ color: tc.resultIsError ? 'var(--needs-input)' : 'var(--accent-secondary)' }}
+          style={{ color: failed ? 'var(--needs-input)' : 'var(--accent-secondary)' }}
         >
           {tc.name}
         </span>
@@ -628,14 +636,14 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
         >
           {summary}
         </span>
-        {tc.resultIsError && (
+        {hasResult && failed && (
           <span className="pill" style={{ background: 'rgba(255,107,107,0.12)', color: 'var(--needs-input)' }}>
-            error
+            {tc.exitCode !== undefined && tc.exitCode !== null ? `exit ${tc.exitCode}` : 'error'}
           </span>
         )}
-        {tc.result !== undefined && !tc.resultIsError && (
+        {hasResult && !failed && (
           <span className="pill" style={{ background: 'rgba(52,211,153,0.10)', color: 'var(--success)' }}>
-            ok
+            {tc.exitCode === 0 ? 'exit 0' : 'ok'}
           </span>
         )}
       </div>
@@ -647,10 +655,10 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
               {inputJson}
             </pre>
           </div>
-          {tc.result !== undefined && (
-            <ResultPreview text={tc.result} isError={tc.resultIsError} />
+          {hasResult && tc.result !== undefined && (
+            <ResultPreview text={tc.result} isError={failed} />
           )}
-          {tc.result === undefined && (
+          {!hasResult && (
             <div className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
               Awaiting result\u2026
             </div>
@@ -1021,30 +1029,60 @@ function SessionSetup({
 interface ToolResultRecord {
   content: string
   isError: boolean | undefined
+  exitCode: number | null
 }
 
-/** Index every tool_use_id we have a tool_result for, scanning the full transcript. */
+/** Index every tool_use_id we have a tool_result for, scanning the full transcript.
+ *  Tool results can appear in either `request` entries (the user's tool_result
+ *  message sent back to the provider) or `response` entries (reconstructed
+ *  assistant turns that include prior tool_result messages in their content),
+ *  so we scan both. */
 function buildToolResultIndex(entries: TranscriptEntry[]): Map<string, ToolResultRecord> {
   const map = new Map<string, ToolResultRecord>()
   for (const e of entries) {
-    if (e.direction !== 'request') continue
     const parsed = tryParseJson(e.payload)
     if (!parsed) continue
+    // Request entries: tool_result blocks live inside messages[].content[]
     const msgs = parsed.messages as Array<{ role: string; content: unknown }> | undefined
-    if (!msgs) continue
-    for (const m of msgs) {
-      if (m.role !== 'user' || !Array.isArray(m.content)) continue
-      for (const b of m.content as Array<{ type: string; tool_use_id?: string; content?: unknown; is_error?: boolean }>) {
+    if (msgs) {
+      for (const m of msgs) {
+        if (m.role !== 'user' || !Array.isArray(m.content)) continue
+        for (const b of m.content as Array<{ type: string; tool_use_id?: string; content?: unknown; is_error?: boolean }>) {
+          if (b.type === 'tool_result' && b.tool_use_id) {
+            const raw = formatToolResultContent(b.content)
+            map.set(b.tool_use_id, {
+              content: raw,
+              isError: b.is_error,
+              exitCode: parseExitCode(raw),
+            })
+          }
+        }
+      }
+    }
+    // Response entries: reconstructed assistant turns may carry prior
+    // tool_result blocks directly in the top-level content[] array.
+    const respContent = parsed.content as Array<{ type: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> | undefined
+    if (respContent) {
+      for (const b of respContent) {
         if (b.type === 'tool_result' && b.tool_use_id) {
+          const raw = formatToolResultContent(b.content)
           map.set(b.tool_use_id, {
-            content: formatToolResultContent(b.content),
+            content: raw,
             isError: b.is_error,
+            exitCode: parseExitCode(raw),
           })
         }
       }
     }
   }
   return map
+}
+
+/** Parse a trailing `[exit code: N]` annotation from a tool result string.
+ *  Returns the numeric exit code, or null when no annotation is present. */
+function parseExitCode(text: string): number | null {
+  const m = text.match(/\[exit code:\s*(\d+)\]\s*$/)
+  return m ? parseInt(m[1]!, 10) : null
 }
 
 function formatToolResultContent(content: unknown): string {
@@ -1054,9 +1092,12 @@ function formatToolResultContent(content: unknown): string {
     return content
       .map((b) => {
         if (b && typeof b === 'object') {
-          const o = b as { type?: string; text?: string }
+          const o = b as { type?: string; text?: string; tag?: string; contents?: string }
           if (o.type === 'text' && typeof o.text === 'string') return o.text
+          // Legacy GHC-Generics shape: {tag:"TrpText", contents:"..."}
+          if (o.tag === 'TrpText' && typeof o.contents === 'string') return o.contents
         }
+        if (typeof b === 'string') return b
         return JSON.stringify(b)
       })
       .join('\n')
@@ -1117,6 +1158,7 @@ function extractToolCalls(
         input: b.input,
         result: r?.content,
         resultIsError: r?.isError,
+        exitCode: r?.exitCode,
       }
     })
 }

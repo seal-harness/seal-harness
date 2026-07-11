@@ -322,7 +322,8 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
           , agentStatusOp agentRuntime
           , agentStopOp agentRuntime
           ]
-        plainHandler t = do
+    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    let plainHandler t = do
           meta  <- readIORef (srActive sr)
           eprov <- resolveSessionProvider pr meta
           case eprov of

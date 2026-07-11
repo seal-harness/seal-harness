@@ -41,6 +41,7 @@ import Seal.Providers.Class
 import Seal.Core.Types (ToolCallId (..), OpName (..))
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
@@ -454,6 +455,18 @@ spec = describe "Seal.Gateway.API" $ do
       lookupK "type"        toolResultBlock `shouldBe` Just (A.String "tool_result")
       lookupK "tool_use_id" toolResultBlock `shouldBe` Just (A.String "call_0")
       lookupK "is_error"    toolResultBlock `shouldBe` Just (A.Bool False)
+      -- The content field must be rewritten from the on-disk ToolResultPart
+      -- encoding (bare strings: ["module Main where"]) to the Anthropic
+      -- shape: [{type:"text", text:"module Main where"}].
+      case lookupK "content" toolResultBlock of
+        Just (A.Array parts) -> do
+          let p0 = case V.toList parts of (x : _) -> x; [] -> error "empty parts"
+          case p0 of
+            A.Object po -> do
+              lookupK "type" po `shouldBe` Just (A.String "text")
+              lookupK "text" po `shouldBe` Just (A.String "module Main where")
+            _ -> error ("content part is not an object: " ++ show p0)
+        other -> error ("content is not an array: " ++ show other)
 
   it "GET /api/sessions/<sid>/transcript pulls per-entry timestamps from entries.jsonl" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
@@ -786,6 +799,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdPreprocess = error "sdPreprocess: unused on the 404 path"
             , sdRegistry   = error "sdRegistry: unused on the 404 path"
             , sdResolve    = error "sdResolve: unused on the 404 path"
+            , sdAutonomy   = error "sdAutonomy: unused on the 404 path"
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -850,6 +864,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdPreprocess = emptyChain
             , sdRegistry   = mkRegistry []
             , sdResolve    = resolveStub
+            , sdAutonomy   = Policy.Full
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

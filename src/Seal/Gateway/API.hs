@@ -597,14 +597,43 @@ handleTranscript deps sidTxt =
              , "input" .= fromMaybe A.Null (KeyMap.lookup (k "cbInput") bo)
              ]
            Just "CbToolResult" -> object
-             [ "type"        .= ("tool_result" :: Text)
-             , "tool_use_id" .= fromMaybe "" (lookupT "cbForId" bo)
-             , "content"     .= fromMaybe A.Null (KeyMap.lookup (k "cbParts") bo)
-             , "is_error"    .= fromMaybe False (lookupB "cbIsError" bo)
-             ]
+              [ "type"        .= ("tool_result" :: Text)
+              , "tool_use_id" .= fromMaybe "" (lookupT "cbForId" bo)
+              , "content"     .= toolResultPartsToFrontend (KeyMap.lookup (k "cbParts") bo)
+              , "is_error"    .= fromMaybe False (lookupB "cbIsError" bo)
+              ]
            _ -> fallback
       where
          fallback = object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
+
+    -- | Rewrite the on-disk 'cbParts' value into the Anthropic-style array
+    -- the frontend parses (@[{type:"text", text:"..."}]@). 'ToolResultPart'
+    -- is a @newtype TrpText Text@, so aeson's derived 'ToJSON' serializes it
+    -- as a bare JSON string (not a 'TaggedObject'). The on-disk 'cbParts' is
+    -- thus @["text"]@, not @[{tag:"TrpText", contents:"text"}]@. Handles both
+    -- the bare-string shape and the object shape (defensive fallback).
+    toolResultPartsToFrontend :: Maybe A.Value -> A.Value
+    toolResultPartsToFrontend mparts =
+      case mparts of
+        Just (A.Array arr) ->
+          A.Array (V.fromList (map trpToFrontend (V.toList arr)))
+        other -> fromMaybe A.Null other
+
+    trpToFrontend :: A.Value -> A.Value
+    trpToFrontend blk =
+      case blk of
+        A.String t -> object ["type" .= ("text" :: Text), "text" .= t]
+        A.Object m ->
+          let tag = case KeyMap.lookup (Key.fromString "tag") m of
+                Just (A.String t) -> Just t
+                _                 -> Nothing
+              contents = KeyMap.lookup (Key.fromString "contents") m
+          in case tag of
+               Just "TrpText" -> case contents of
+                 Just (A.String t) -> object ["type" .= ("text" :: Text), "text" .= t]
+                 _                 -> object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
+               _ -> object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
+        _ -> object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
 
     -- | Map a reconstructed 'TranscriptEntry' (from 'reconstruct') to the
     -- frontend's TranscriptEntry JSON shape. The reconstructed payload is a

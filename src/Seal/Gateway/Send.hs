@@ -39,7 +39,7 @@ import Seal.Config.Paths (SealPaths, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId, SessionId)
 import Seal.Git.Repo (ConfigRepo)
-import Seal.Handles.Transcript (withTwoFileTranscript)
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
@@ -79,6 +79,10 @@ data SendDeps = SendDeps
   , sdResolve    :: SessionMeta -> IO (Either Text (SomeProvider, ModelId))
     -- ^ Resolve a session's provider+model. Defaults to
     -- 'resolveSessionProvider' (vault-backed); tests inject a fake.
+  , sdAutonomy   :: Policy.AutonomyLevel
+    -- ^ The CLI autonomy level (--yolo / --locked / default Supervised).
+    -- When 'Full', the approval gate bypasses prompting so untrusted
+    -- opcodes run without asking (ACK audit still recorded).
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -159,6 +163,12 @@ plainTurn deps meta t = do
         wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+        -- The web gate respects the CLI autonomy level. --yolo (Full) bypasses
+        -- prompting so untrusted opcodes run without asking. The default
+        -- (Supervised) uses a fail-closed prompt (web can't prompt inline
+        -- yet — a real approval card is Phase 7b).
+        gate <- mkApprovalGate (Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps))
+                               (\_ -> pure Deny) Nothing
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
@@ -176,6 +186,7 @@ plainTurn deps meta t = do
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
+        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         runApp appEnv (runTurn env t))
 
 -- | Build the ISA registry for a web turn. Mirrors
@@ -254,6 +265,8 @@ plainTurnWithCaps deps meta caps t = do
         wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+        gate <- mkApprovalGate (Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps))
+                               (\_ -> pure Deny) Nothing
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
@@ -265,4 +278,5 @@ plainTurnWithCaps deps meta caps t = do
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
+        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         runApp appEnv (runTurn env t))

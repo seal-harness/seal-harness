@@ -34,6 +34,7 @@ import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Tabs (newTabsHandle)
@@ -43,8 +44,8 @@ import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: IO ()
-runServeMain = do
+runServeMain :: AutonomyLevel -> IO ()
+runServeMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
@@ -108,6 +109,7 @@ runServeMain = do
         , sdPreprocess = emptyChain
         , sdRegistry   = registry
         , sdResolve    = resolveSessionProvider pr
+        , sdAutonomy   = autonomy
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)

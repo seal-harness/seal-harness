@@ -216,6 +216,7 @@ export interface ToolCallInfo {
   input: unknown            // argument payload
   result?: string           // matching tool_result content, pretty-printed
   resultIsError?: boolean
+  exitCode?: number | null  // exit code parsed from the result, when available
 }
 
 /** A tool-definition block, shown collapsed by default. `count` and
