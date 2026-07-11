@@ -81,6 +81,16 @@ data FileConfig = FileConfig
     -- untrusted execution, spec §3 Layer A). Absent means @mode=local@
     -- (default). @mode=remote@ fail-closes at call time when the remote
     -- block is absent or unreachable (boot still succeeds).
+  , fcDebugSessionTranscript :: Maybe Bool
+    -- ^ Optional @debug_session_transcript@ flag. When @true@, every
+    -- 'CompletionRequest' sent to the LLM is also appended (redundantly,
+    -- in full) to a @requests.jsonl@ file alongside the session's
+    -- @conversation.jsonl@ / @entries.jsonl@. The contract: each line is
+    -- the complete JSON-encoded 'CompletionRequest' exactly as passed to
+    -- the provider, including the full @crMessages@ history. Used to
+    -- debug whether the two-file storage format is correctly feeding the
+    -- session history to the LLM. Absent (the default) means the file is
+    -- not written.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -142,6 +152,7 @@ defaultFileConfig = FileConfig
   , fcSignal          = Nothing
   , fcGateway         = Nothing
   , fcUntrustedExec   = Nothing
+  , fcDebugSessionTranscript = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -176,6 +187,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
+  <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= fcDebugSessionTranscript
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig

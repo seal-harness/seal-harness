@@ -157,7 +157,7 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
           , respEntry 4
           ]
     case reconstruct conv entries of
-      [req1, resp1, _req2, _resp2] -> do
+      [req1, resp1, req2, _resp2] -> do
         -- The first response must carry ONLY the first assistant message
         -- ("hi there"), not the next user message ("what is 2+2?").
         case payloadField "content" resp1 of
@@ -169,10 +169,20 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
                 other -> expectationFailure ("expected 'hi there' CbText block, got " ++ show other)
               other -> expectationFailure ("expected 1 element, got " ++ show other)
           other -> expectationFailure ("expected a content array, got " ++ show other)
-        -- The first request must carry only the first user message.
+        -- The first request carries the full prefix at convLen=1: just the
+        -- first user message.
         case payloadField "messages" req1 of
           Just (A.Array arr) -> length arr `shouldBe` 1
           other -> expectationFailure ("expected a messages array, got " ++ show other)
+        -- The second request carries the FULL conversation prefix at
+        -- convLen=3 (user "hello" + assistant "hi there" + user "what is
+        -- 2+2?") — the complete message list the LLM was sent, including
+        -- the entire history. The "View raw JSON" modal must show this
+        -- full list, not just the new user message, so the user is not
+        -- misled into thinking the history was not sent.
+        case payloadField "messages" req2 of
+          Just (A.Array arr) -> length arr `shouldBe` 3
+          other -> expectationFailure ("expected a 3-element messages array, got " ++ show other)
       other -> expectationFailure ("expected 4 entries, got " ++ show (length other))
 
   -- Regression: an 'EKHarness' entry (an opcode invocation, e.g. FILE_READ)

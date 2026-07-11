@@ -33,8 +33,9 @@ import Seal.Channel.Cli
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
-  ( defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes )
-import Seal.Config.Paths (SealPaths, sessionDir)
+  ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
+  , fcDebugSessionTranscript )
+import Seal.Config.Paths (SealPaths, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId, SessionId)
 import Seal.Git.Repo (ConfigRepo)
@@ -96,6 +97,17 @@ sendOutcomeJson = \case
   SendSlash t    -> (200, object [ "kind" .= ("slash" :: Text), "response" .= t ])
   SendAssistant  -> (200, object [ "kind" .= ("assistant" :: Text), "response" .= ("" :: Text) ])
   SendError c m  -> (c, object [ "error" .= m ])
+
+-- | Resolve the optional debug-requests path from the loaded config. When
+-- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
+-- otherwise @Nothing@. The debug file records each 'CompletionRequest' in
+-- full (including the complete message history) exactly as sent to the LLM.
+debugPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugPath paths sid eCfg =
+  case eCfg of
+    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+      Just (sessionRequestsPath paths sid)
+    _ -> Nothing
 
 -- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
@@ -163,6 +175,7 @@ plainTurn deps meta t = do
               }
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+              (debugPath (sdPaths deps) sid eCfg)
         runApp appEnv (runTurn env t))
 
 -- | Build the ISA registry for a web turn. Mirrors
@@ -251,4 +264,5 @@ plainTurnWithCaps deps meta caps t = do
         let isaReg = buildWebRegistry (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+              (debugPath (sdPaths deps) sid eCfg)
         runApp appEnv (runTurn env t))

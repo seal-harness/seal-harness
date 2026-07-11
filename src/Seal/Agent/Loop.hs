@@ -6,12 +6,17 @@ module Seal.Agent.Loop
   ( runTurn
   ) where
 
+import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..))
+import Data.Aeson qualified as A
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
+import qualified System.IO as IO
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.ChannelKind (channelKindToText)
@@ -94,6 +99,7 @@ runTurn env userText = do
                   , crToolChoice = ToolAuto
                   , crMaxTokens = 4096
                   }
+      liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
       eresp <- liftIO (providerComplete (aeProvider env) req)
       case eresp of
         Left err ->
@@ -146,3 +152,16 @@ runTurn env userText = do
 
 providerComplete :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
 providerComplete (SomeProvider p) = complete p
+
+-- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
+-- append the full 'CompletionRequest' (one JSONL line, with trailing newline)
+-- to @requests.jsonl@. The contract: each line is the complete request exactly
+-- as sent to the LLM, including the full 'crMessages' history. When the path
+-- is 'Nothing' (the default), this is a no-op. Best-effort: an IO error is
+-- swallowed (the debug file must never break the agent loop).
+appendDebugRequest :: Maybe FilePath -> CompletionRequest -> IO ()
+appendDebugRequest Nothing _ = pure ()
+appendDebugRequest (Just path) req =
+  let line = BL.toStrict (A.encode req) <> "\n"
+  in IO.withFile path IO.AppendMode (`BS.hPutStr` line)
+     `catch` \(_ :: SomeException) -> pure ()

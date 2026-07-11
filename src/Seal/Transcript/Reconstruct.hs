@@ -49,10 +49,19 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 reconstruct :: [Message] -> [EntryRecord] -> [TranscriptEntry]
 reconstruct conv = go 0 Nothing
   where
-    -- @start@ is the conversation-line index where the current turn's request
+    -- @start@ is the conversation-line index where the current turn's new
     -- messages begin (i.e. the prior response's convLen, or 0 for the first
     -- turn). @mEnv@ is the effective envelope at the most recent request (used
     -- to reconstruct response payloads, which carry the request's model).
+    --
+    -- For 'EKRequest' entries, the payload carries the FULL conversation
+    -- prefix @conv[0:end]@ — every message the LLM was sent, including the
+    -- entire history — so the "View raw JSON" modal shows exactly what the
+    -- provider received. The frontend extracts only the last message for
+    -- display, so the chat view is unaffected. For 'EKResponse' entries, the
+    -- payload carries only the NEW assistant content @conv[start:end]@ (the
+    -- lines added since the prior turn), since responses don't re-send
+    -- history.
     go :: Int -> Maybe Envelope -> [EntryRecord] -> [TranscriptEntry]
     go _ _       [] = []
     go start mEnv (e : es) =
@@ -61,8 +70,9 @@ reconstruct conv = go 0 Nothing
           let env = effectiveAt e mEnv
               end = erConvLen e
               -- erConvLen is ABSOLUTE (the total conversation length at this
-              -- point), so the slice is conv[start:end], not take end (drop start).
-              msgs = take (end - start) (drop start conv)
+              -- point). The request payload carries the full prefix
+              -- conv[0:end] — the complete message list the LLM received.
+              msgs = take end conv
               payload = requestPayload env msgs
               entry = toEntry e Request payload
           in entry : go end (Just env) es

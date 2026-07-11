@@ -25,7 +25,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
   ( Backends (..), mkSessionAgentEnv, newBackends, resolveSessionProvider
-  , execBackendFromFile )
+  , execBackendFromFile, debugRequestsPath )
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 import Seal.Tools.Exec.Types (ExecBackend (..))
 import Seal.Channels.Class (Channel (..))
@@ -225,7 +225,8 @@ plainTurn paths rt pr sr backends h mSrc t = do
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
         let env = (mkSessionAgentEnv
-                     handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend)
+                     handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
+                     (debugRequestsPath paths sid eCfg))
                     { aeMessageSource = mSrc }
         runApp appEnv (runTurn env t)
 

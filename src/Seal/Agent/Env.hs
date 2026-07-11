@@ -45,4 +45,12 @@ data AgentEnv = AgentEnv
     -- @erMeta@ @channel@ field and the 'msConversationId' into
     -- @conversationId@, so the transcript records which channel + conversation
     -- each turn served.
+  , aeDebugRequestsPath :: Maybe FilePath
+    -- ^ When 'Just', every 'CompletionRequest' sent to the LLM is appended
+    -- (redundantly, in full) to this file as one JSONL line per request.
+    -- The contract: each line is the complete 'CompletionRequest' exactly as
+    -- passed to the provider — including the full 'crMessages' history — so
+    -- we can debug whether the two-file storage format is correctly feeding
+    -- the session history to the LLM. 'Nothing' (the default) means no
+    -- debug file is written.
   }

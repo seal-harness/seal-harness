@@ -36,6 +36,7 @@ spec = describe "Seal.Config.File" $ do
         , fcSignal          = Nothing
         , fcGateway          = Nothing
         , fcUntrustedExec   = Nothing
+        , fcDebugSessionTranscript = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -92,6 +93,7 @@ spec = describe "Seal.Config.File" $ do
               , fcSignal          = Nothing
               , fcGateway          = Nothing
         , fcUntrustedExec   = Nothing
+        , fcDebugSessionTranscript = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
@@ -321,3 +323,33 @@ spec = describe "Seal.Config.File" $ do
       let cfg = defaultFileConfig
             { fcUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
       untrustedExecConfigFromFile cfg `shouldBe` Nothing
+
+  describe "debug_session_transcript flag" $ do
+    it "absent key decodes to Nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "vault_path = \"/tmp/vault.age\"\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Nothing
+
+    it "parses debug_session_transcript = true" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "debug_session_transcript = true\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Just True
+
+    it "parses debug_session_transcript = false" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "debug_session_transcript = false\n"
+        Right cfg <- loadFileConfig path
+        fcDebugSessionTranscript cfg `shouldBe` Just False
+
+    it "round-trips through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig { fcDebugSessionTranscript = Just True }
+        saveFileConfig path cfg
+        Right back <- loadFileConfig path
+        fcDebugSessionTranscript back `shouldBe` Just True

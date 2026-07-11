@@ -124,8 +124,10 @@ spec = do
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (EbLocal mkLocalExecHandlePlaceholder)
+                  Nothing
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
+      aeDebugRequestsPath env `shouldBe` Nothing
       -- The untrusted-execution backend is threaded into the env (4b-T3).
       case aeExecBackend env of
         EbLocal _ -> pure ()

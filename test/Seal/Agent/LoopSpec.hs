@@ -1,14 +1,21 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.LoopSpec (spec) where
 
+import Control.Monad (zipWithM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object)
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BS8
+import Data.ByteString.Lazy qualified as BL
 import Data.IORef
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
+import qualified Data.Vector as V
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Types
@@ -16,7 +23,10 @@ import Seal.Handles.Transcript (fakeTwoFileTranscript, withTwoFileTranscript)
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Providers.Class
+import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryRecord (..))
+import Seal.Transcript.Reconstruct (reconstruct)
+import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -76,6 +86,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (either (error "sid") id (mkSessionId "s1"))
                 8
                 Nothing
+                Nothing
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
@@ -102,6 +113,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
+                Nothing
                 Nothing
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
@@ -149,6 +161,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (either (error "sid") id (mkSessionId "s1"))
                       8
                       Nothing
+                      Nothing
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- The on-disk conversation.jsonl must contain exactly 4 lines:
@@ -162,3 +175,123 @@ spec = describe "Seal.Agent.Loop" $ do
       -- observed the prior conversation by checking the final assistant
       -- text is "ok" and nothing was duplicated into the output.)
       readIORef sent `shouldReturn` ["ollama/m> hi back", "ollama/m> ok"]
+
+  -- Debug-transcript: when aeDebugRequestsPath is set, each LLM request is
+  -- written in full (including the complete message history) to requests.jsonl,
+  -- one line per request. This lets us verify the model actually received the
+  -- full conversation history (the bug hypothesis: the two-file storage format's
+  -- reconstruction was only surfacing the latest message, not the history).
+  it "writes the full CompletionRequest to requests.jsonl when aeDebugRequestsPath is set" $
+    withSystemTempDirectory "seal-loop-debug" $ \dir -> do
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
+          script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
+      ref <- newIORef (script1 ++ script2)
+      let reqPath = dir </> "requests.jsonl"
+      withTwoFileTranscript dir $ \h -> do
+        let mkEnv' = AgentEnv
+                      (SomeProvider (ScriptProvider ref))
+                      "ollama"
+                      (ModelId "m")
+                      Nothing
+                      (mkRegistry [])
+                      h
+                      localBackend
+                      (EbLocal mkLocalExecHandlePlaceholder)
+                      caps
+                      (either (error "sid") id (mkSessionId "s1"))
+                      8
+                      Nothing
+                      (Just reqPath)
+        runTestApp (runTurn mkEnv' "hi")
+        runTestApp (runTurn mkEnv' "how are you")
+      -- requests.jsonl has one line per provider call. Each line is the full
+      -- CompletionRequest JSON. Turn 1 sends 1 message (user "hi"); turn 2
+      -- sends 3 messages (user "hi", assistant "hi back", user "how are you").
+      reqContents <- BS8.readFile reqPath
+      let reqLines = BS8.lines reqContents
+      length reqLines `shouldBe` 2
+      -- Decode each line as a CompletionRequest and check crMessages length.
+      let decodeReq bs = case A.eitherDecodeStrict bs :: Either String CompletionRequest of
+            Right r  -> r
+            Left e   -> error ("failed to decode request line: " <> e)
+          reqs = map decodeReq reqLines
+      -- Turn 1: the model sees just the new user message.
+      case reqs of
+        (req1 : _) -> length (crMessages req1) `shouldBe` 1
+        []         -> expectationFailure "expected at least one request line"
+      -- Turn 2: the model sees the full history (prior 2 + new user message).
+      -- This is the key assertion — if the two-file format was not feeding
+      -- history, this would be 1 instead of 3.
+      case drop 1 reqs of
+        [req2] -> length (crMessages req2) `shouldBe` 3
+        _      -> expectationFailure "expected exactly two request lines"
+
+  -- Verification: the reconstructed Request payloads (from conversation.jsonl
+  -- + entries.jsonl) must match the actual CompletionRequests sent to the LLM
+  -- (captured in requests.jsonl via the debug flag). This is the contract
+  -- verification: the "View raw JSON" modal shows exactly what the provider
+  -- received — the full conversation history, not just the latest message.
+  it "reconstructed request payloads match the requests.jsonl debug file" $
+    withSystemTempDirectory "seal-loop-recon" $ \dir -> do
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
+          script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
+      ref <- newIORef (script1 ++ script2)
+      let reqPath = dir </> "requests.jsonl"
+      withTwoFileTranscript dir $ \h -> do
+        let mkEnv' = AgentEnv
+                      (SomeProvider (ScriptProvider ref))
+                      "ollama"
+                      (ModelId "m")
+                      Nothing
+                      (mkRegistry [])
+                      h
+                      localBackend
+                      (EbLocal mkLocalExecHandlePlaceholder)
+                      caps
+                      (either (error "sid") id (mkSessionId "s1"))
+                      8
+                      Nothing
+                      (Just reqPath)
+        runTestApp (runTurn mkEnv' "hi")
+        runTestApp (runTurn mkEnv' "how are you")
+      -- Read back the two-file format + the debug requests file.
+      convBs <- BS8.readFile (dir </> "conversation.jsonl")
+      entriesBs <- BS8.readFile (dir </> "entries.jsonl")
+      reqBs <- BS8.readFile reqPath
+      let conv = readConversation convBs
+          evs = mapMaybe (A.decode . BL.fromStrict) (BS8.lines entriesBs) :: [EntryRecord]
+          reconstructed = reconstruct conv evs
+          reqEntries = [te | te <- reconstructed, teDirection te == Request]
+          -- Extract the messages array length from each reconstructed Request
+          -- payload. The payload is a JSON object with a "messages" key whose
+          -- value is an array of Message objects.
+          extractMsgCount te =
+            case tePayload te of
+              A.Object o -> case KeyMap.lookup (Key.fromText "messages") o of
+                Just (A.Array arr) -> V.length arr
+                _ -> 0
+              _ -> 0
+          reconMsgCounts = map extractMsgCount reqEntries
+          -- Decode the debug requests.jsonl lines and extract message counts.
+          decodeReq bs = case A.eitherDecodeStrict bs :: Either String CompletionRequest of
+            Right r  -> r
+            Left _   -> error "failed to decode request line"
+          debugReqs = map decodeReq (BS8.lines reqBs)
+          debugMsgCounts = map (length . crMessages) debugReqs
+      -- The number of reconstructed Request entries must match the number of
+      -- debug requests (one per provider call).
+      length reconMsgCounts `shouldBe` length debugMsgCounts
+      -- Each reconstructed request's message count must match the
+      -- corresponding debug request's message count — the full conversation
+      -- history, not just the latest message.
+      zipWithM_ shouldBe reconMsgCounts debugMsgCounts

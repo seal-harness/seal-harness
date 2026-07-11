@@ -125,6 +125,7 @@ spec = do
                   , aeSession = sid
                   , aeMaxTurns = 4
                   , aeMessageSource = Just ms
+                  , aeDebugRequestsPath = Nothing
                   }
             in runApp appEnv (runTurn agentEnv body)
           plainHandler h mSrc body = case mSrc of

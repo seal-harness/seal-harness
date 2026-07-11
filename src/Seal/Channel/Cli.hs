@@ -9,6 +9,7 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , mkSessionAgentEnv
+  , debugRequestsPath
   , execBackendFromFile
   , Backends (..)
   , newBackends
@@ -38,8 +39,9 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File (FileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile)
-import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
+                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile,
+                          fcDebugSessionTranscript)
+import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -157,8 +159,9 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend = AgentEnv
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
+  -> Maybe FilePath -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -175,7 +178,21 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
   , aeSession    = sid
   , aeMaxTurns   = 12
   , aeMessageSource = Nothing
+  , aeDebugRequestsPath = debugReqPath
   }
+
+-- | Resolve the optional debug-requests path from the loaded config. When
+-- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
+-- otherwise @Nothing@. The debug file (@requests.jsonl@) records each
+-- 'CompletionRequest' in full (including the complete message history) exactly
+-- as sent to the LLM, so we can debug whether the two-file storage format is
+-- correctly feeding the session history to the provider.
+debugRequestsPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugRequestsPath paths sid eCfg =
+  case eCfg of
+    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+      Just (sessionRequestsPath paths sid)
+    _ -> Nothing
 
 -- | Run the Haskeline TUI loop.
 --
@@ -282,6 +299,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
                 let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
+                      (debugRequestsPath paths sid eCfg)
                 runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
           [ showHumanOp caps
@@ -317,7 +335,8 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
                 Nothing -> pure Nothing
                 Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend)
+                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
+                   (debugRequestsPath paths (smId meta) eCfg))
                 appEnv t
     runInputT hlSettings (loop caps plainHandler tabsH)
   where
