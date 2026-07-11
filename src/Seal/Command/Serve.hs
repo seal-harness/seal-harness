@@ -7,7 +7,7 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO)
-import Data.IORef (newIORef)
+import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -32,10 +32,10 @@ import Seal.Gateway.StreamBroker (newStreamBroker)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Ingest (emptyChain)
-import Seal.Providers.Registry (knownProviders)
+import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
-import Seal.Session.Store (SessionRuntime (..), initSession)
+import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
@@ -72,7 +72,12 @@ runServeMain = do
   backends <- newBackends cfgRoot repo
   tabsH   <- newTabsHandle
   reg     <- newHarnessRegistry
-  sessionMeta <- initSession paths cfg (bAgentDefs backends)
+  -- Build an in-memory active session (NOT persisted to disk) so the
+  -- active-session ref has valid provider/model fallbacks. The session
+  -- only lands on disk when the user sends the first message (the web send
+  -- handler writes the transcript to the session dir). This avoids
+  -- polluting the sessions list with an empty session on every `seal serve`.
+  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime
              { srPaths      = paths
@@ -112,7 +117,12 @@ runServeMain = do
         , adHarnessRegistry = reg
         , adAdoptConsent    = Just CcWeb
         , adAgentDefs       = bAgentDefs backends
-        , adProviders       = knownProviders
+        , adProviders       = do
+            -- The configured-provider list is computed on each request so
+            -- newly-added credentials are reflected without a restart. The
+            -- vault handle is read from the same ref the commands use.
+            mh <- readIORef (vrHandleRef rt)
+            configuredProviders mh cfg
         , adSend            = Just sendDeps
         }
   -- Start the WS stream server on the WS port.

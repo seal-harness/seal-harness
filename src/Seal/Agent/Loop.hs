@@ -41,16 +41,26 @@ requestMeta (Just ms) = Map.fromList
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
+  -- Load the prior conversation from disk so the model sees the full history
+  -- (not just this turn's new message). The two-file writer's diff-based
+  -- appender requires the incoming message list to be a prefix-extension of
+  -- the on-disk conversation; without the prior messages, the diff falls back
+  -- to re-appending the whole list every iteration, corrupting
+  -- @conversation.jsonl@ with duplicate user + assistant lines.
+  prior <- liftIO (tfwReadConversation (aeTranscript env))
+  let userMsg = textMsg User userText
+      turn0   = prior <> [userMsg]
   -- Record the initial user message as a Request entry. The envelope delta
   -- carries the full envelope in effect for this turn (model / system / tools
   -- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.
   -- The request's @erMeta@ carries the channel + conversation id when
   -- 'aeMessageSource' is present (Signal), so the transcript records which
-  -- channel + conversation this turn served.
+  -- channel + conversation this turn served. @erConvLen@ is the full
+  -- conversation length in effect at this request (prior + new user message),
+  -- so reconstruction can slice the right prefix from @conversation.jsonl@.
   liftIO $ do
     now <- getCurrentTime
-    let userMsg = textMsg User userText
-        env0 = EnvelopeDelta
+    let env0 = EnvelopeDelta
           { edModel = Just (aeModel env)
           , edSystem = Just (aeSystem env)
           , edTools = Just (registryToolDefs (aeRegistry env))
@@ -61,7 +71,7 @@ runTurn env userText = do
           { erId = ""
           , erTimestamp = now
           , erKind = EKRequest
-          , erConvLen = 1
+          , erConvLen = length turn0
           , erEnvelope = Just env0
           , erUsage = Nothing
           , erStop = Nothing
@@ -70,8 +80,8 @@ runTurn env userText = do
           , erCorrelation = Nothing
           , erMeta = requestMeta (aeMessageSource env)
           }
-    tfwRecordAsync (aeTranscript env) (TwoFileWrite [userMsg] entry)
-  go (aeMaxTurns env) [textMsg User userText]
+    tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
+  go (aeMaxTurns env) turn0
   where
     go :: Int -> [Message] -> App ()
     go 0 _ = liftIO (ccSend (aeCaps env) "(stopped: too many tool turns)")

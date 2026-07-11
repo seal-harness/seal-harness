@@ -7,6 +7,7 @@
 module Seal.Providers.Registry
   ( KnownProvider (..)
   , knownProviders
+  , configuredProviders
   , providerLabel
   , providerId
   , parseProvider
@@ -19,12 +20,14 @@ module Seal.Providers.Registry
   , vaultErrText
   ) where
 
-import Control.Monad (void)
+import Control.Monad (void, filterM)
 import Data.IORef (newIORef)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 
+import Seal.Config.File (FileConfig, providerBaseUrl)
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic
   ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
@@ -32,10 +35,16 @@ import Seal.Providers.Anthropic.OAuth
   ( deserializeTokens, refreshTokens, serializeTokens )
 import Seal.Providers.Class
   ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
-import Seal.Providers.Ollama (mkOllama, ollamaNeedsKey)
+import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
 import Seal.Security.Secrets (mkApiKey)
 import Seal.Security.Vault (VaultHandle (..))
 import Seal.Security.Vault.Age (VaultError (..))
+
+-- | The Anthropic OAuth token vault key (mirrors
+-- 'Seal.Command.Provider.anthropicOAuthKey'; duplicated here to avoid a
+-- circular import).
+anthropicOAuthKey :: Text
+anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 
 -- | Every provider Seal can build. M1 ships Anthropic only; later milestones
 -- extend this sum (the totality of the functions below forces each addition to
@@ -143,3 +152,48 @@ vaultErrText = \case
   VaultAlreadyExists  -> "vault already exists"
   VaultKeyNotFound k  -> "no such secret: " <> k
   VaultBackendError t -> "backend error: " <> t
+
+-- | The set of providers that are *configured* (have a usable credential or
+-- are usable keyless). A provider appears in @/provider list@ and in the
+-- frontend's provider select only when this returns 'True'. The rules mirror
+-- the auth labels in 'Seal.Command.Provider.listCmd':
+--
+--   * __Ollama__ is configured when its base URL needs no key (local daemon)
+--     OR an API key / OAuth blob is stored in the vault. A cloud URL
+--     (@ollama.com@) without a key is NOT configured.
+--   * __Anthropic__ is configured when either an OAuth blob or an API key is
+--     stored in the vault.
+--
+-- A missing vault ('Nothing') means no provider has credentials, so only a
+-- keyless local Ollama would survive the filter (and only when its base URL
+-- is the default local URL).
+configuredProviders :: Maybe VaultHandle -> FileConfig -> IO [KnownProvider]
+configuredProviders mvh cfg = filterM isConfigured knownProviders
+  where
+    isConfigured kp = case kp of
+      OllamaProvider -> do
+        let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg "ollama")
+        if not (ollamaNeedsKey baseUrl)
+          then pure True
+          else hasVaultKey mvh (vaultKeyName OllamaProvider)
+      AnthropicProvider ->
+        hasVaultKey mvh (vaultKeyName AnthropicProvider)
+          ||^ hasVaultKey mvh anthropicOAuthKey
+
+-- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
+-- (locked / key missing) → 'False'; a present key → 'True'.
+hasVaultKey :: Maybe VaultHandle -> Text -> IO Bool
+hasVaultKey Nothing _ = pure False
+hasVaultKey (Just vh) k = do
+  r <- vhGet vh k
+  pure $ case r of
+    Right _ -> True
+    Left _  -> False
+
+-- | Short-circuit OR for two 'IO' booleans (so the second is only run when the
+-- first is 'False'). Avoids touching OAuth when an API key is already present.
+infixr 2 ||^
+(||^) :: IO Bool -> IO Bool -> IO Bool
+a ||^ b = do
+  x <- a
+  if x then pure True else b

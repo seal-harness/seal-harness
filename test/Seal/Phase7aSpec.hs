@@ -61,7 +61,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
-          , adProviders = knownProviders
+          , adProviders = pure knownProviders
           , adSend = Nothing
           }
         app = gatewayApp deps Nothing
@@ -100,7 +100,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
-          , adProviders = knownProviders
+          , adProviders = pure knownProviders
           , adSend = Nothing
           }
         app = gatewayApp deps Nothing

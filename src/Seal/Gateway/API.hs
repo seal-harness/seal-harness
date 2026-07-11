@@ -15,6 +15,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive qualified as CI
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -42,12 +43,27 @@ import Seal.Harness.Registry (HarnessRegistry, snapshot)
 import Seal.Providers.ContextWindow (modelContextWindow, modelMaxOutputTokens)
 import Seal.Providers.Registry
   ( KnownProvider (..), parseProvider, providerLabel )
+import Seal.Providers.Class (Message)
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, newSession)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
+import Seal.Transcript.Entries (EntryRecord (..))
+import Seal.Transcript.Reconstruct (reconstruct)
+import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+
+-- | 'zipWith' + 'mapMaybe': apply a partial function across two lists
+-- in lockstep, dropping the elements for which the function returns
+-- 'Nothing'. Used by 'handleTranscript' to pass the entry index to
+-- 'reconEntryToFrontend' without a separate 'zip [0..]' + 'mapMaybe' pass.
+zipWithMaybe :: (a -> b -> Maybe c) -> [a] -> [b] -> [c]
+zipWithMaybe _ [] _ = []
+zipWithMaybe _ _ [] = []
+zipWithMaybe f (a : as) (b : bs) = case f a b of
+  Just c  -> c : zipWithMaybe f as bs
+  Nothing -> zipWithMaybe f as bs
 
 -- | The dependencies the API needs (injected so the test can supply fakes).
 data ApiDeps = ApiDeps
@@ -56,7 +72,7 @@ data ApiDeps = ApiDeps
   , adHarnessRegistry :: HarnessRegistry    -- ^ the live harness registry
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11)
-  , adProviders       :: [KnownProvider]      -- ^ for /api/providers; the configured provider list (T11)
+  , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   }
 
@@ -130,8 +146,9 @@ apiApp deps req respond =
     -- T11: GET /api/providers -> the configured provider list. @isDefault@
     -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
     -- T11, so only @name@ is emitted.
-    (m', ["api", "providers"]) | m' == methodGet ->
-      respond (jsonLBS status200 (A.encode (map providerInfoJson (adProviders deps))))
+    (m', ["api", "providers"]) | m' == methodGet -> do
+      providers <- adProviders deps
+      respond (jsonLBS status200 (A.encode (map providerInfoJson providers)))
     -- T11: GET /api/providers/:p/models -> a STATIC list of models for the
     -- provider (the real /v1/models upstream call needs vault credentials +
     -- a live HTTP request and is out of scope). Context windows come from
@@ -427,46 +444,47 @@ handleTranscript deps sidTxt =
         else if convExists
           then do
             raw <- TIO.readFile convPath
-            let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
-                                (filter (not . T.null) (T.lines raw))
+            let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                                   (filter (not . T.null) (T.lines raw)) :: [A.Value]
+                msgs    = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                                   (filter (not . T.null) (T.lines raw)) :: [Message]
             -- Load session.json for the model + createdAt fallback.
             active <- readIORef (srActive (adSessionRuntime deps))
             let model = smModel active
                 fallbackTs = showIso (smCreatedAt active)
-            -- Per-entry timestamps live in entries.jsonl. Each request/response
-            -- entry corresponds positionally to one conversation.jsonl line
-            -- (request↔User, response↔Assistant); harness/compaction entries
-            -- carry no conv line and are filtered out. When entries.jsonl is
-            -- absent or a conv line has no matching entry, fall back to the
-            -- session's smCreatedAt so the transcript still renders.
             entriesExist <- doesFileExist (sessionEntriesPath paths sid)
-            entryTimestamps <- if not entriesExist
-              then pure []
-              else do
+            if entriesExist
+              then do
                 eraw <- TIO.readFile (sessionEntriesPath paths sid)
                 let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
-                                   (filter (not . T.null) (T.lines eraw))
-                    -- Keep only request/response kinds, in order; pull the @ts@
-                    -- field (aeson's default UTCTime encoding, ISO-8601 with
-                    -- microseconds + Z). The frontend parses ISO-8601 via
-                    -- @new Date(...)@, so this matches the legacy
-                    -- @teLineToFrontend@ path's timestamp shape.
-                    isConvKind v = case KeyMap.lookup (Key.fromText "kind") (objOf v) of
-                      Just (A.String t) -> t == "request" || t == "response"
-                      _                 -> False
-                    tsOf v = case KeyMap.lookup (Key.fromText "ts") (objOf v) of
-                      Just (A.String t) -> Just (T.unpack t)
-                      _                 -> Nothing
-                    objOf v = case v of
-                      A.Object m -> m
-                      _          -> KeyMap.empty
-                pure (mapMaybe tsOf (filter isConvKind evs))
-            -- conversation.jsonl carries no per-entry id; the line index is
-            -- the stable identifier within the file. Thread it through so the
-            -- frontend's dedup-by-id (reconcileEntries) doesn't collapse every
-            -- entry onto the first (all-empty id) and render duplicates.
-            pure (jsonLBS status200
-                  (A.encode (zipWith (convLineToFrontend model entryTimestamps fallbackTs) [0..] msgs)))
+                                   (filter (not . T.null) (T.lines eraw)) :: [EntryRecord]
+                    -- Reconstruct the full TranscriptEntry stream from the
+                    -- conversation + entry records. This folds the envelope
+                    -- deltas so each Request entry's payload carries the
+                    -- effective `system` prompt (alongside model / tools /
+                    -- messages), which the frontend extracts into a collapsed
+                    -- "System" row at the top of the session. Without this,
+                    -- the system prompt is invisible in the session view.
+                    reconstructed = reconstruct msgs evs
+                    -- The reconstructed entries carry their own ids /
+                    -- timestamps / payloads; map them to the frontend's
+                    -- TranscriptEntry shape. Filter out compaction entries
+                    -- (Null payload, direction Request) — they are boundary
+                    -- markers with no conversation line and would render as
+                    -- empty "You" rows. The writer currently stores erId =
+                    -- "" (ids are not yet assigned at write time), so we
+                    -- synthesize a stable id from the entry's position in
+                    -- the reconstructed stream — matching the
+                    -- convLineToFrontend path's line-index id scheme — so
+                    -- the frontend's dedup-by-id works and the HTTP seed +
+                    -- WS seed don't collide on the empty-string id.
+                    frontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
+                pure (jsonLBS status200 (A.encode frontend))
+              else do
+                -- No entries.jsonl: fall back to the synthetic per-conv-line
+                -- path. Timestamps fall back to the session's smCreatedAt.
+                pure (jsonLBS status200
+                      (A.encode (zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals)))
           else pure (jsonLBS status200 (A.encode ([] :: [Value])))
   where
     -- | Map a legacy on-disk transcript line (Haskell TranscriptEntry JSON
@@ -586,7 +604,122 @@ handleTranscript deps sidTxt =
              ]
            _ -> fallback
       where
-        fallback = object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
+         fallback = object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
+
+    -- | Map a reconstructed 'TranscriptEntry' (from 'reconstruct') to the
+    -- frontend's TranscriptEntry JSON shape. The reconstructed payload is a
+    -- 'CompletionRequest'-shaped 'Value' with GHC-Generics field names
+    -- (@msgRole@/@msgContent@/@uInput@/@uOutput@) and 'TaggedObject'
+    -- content-block encoding (@{tag, contents}@). The frontend expects
+    -- Anthropic-style blocks (@{type, text}@) and snake_case usage
+    -- (@input_tokens@/@output_tokens@), so the payload is rewritten before
+    -- being serialized to a JSON string. Compaction entries (Null payload)
+    -- and harness entries (payload carries a @harness@ key) are filtered out
+    -- — they are opcode-invocation / boundary markers with no conversation
+    -- line and would render as empty rows in the session view.
+    reconEntryToFrontend :: Int -> TranscriptEntry -> Maybe A.Value
+    reconEntryToFrontend idx te =
+      case tePayload te of
+        A.Null -> Nothing
+        A.Object o | KeyMap.member (Key.fromText "harness") o -> Nothing
+        payloadVal -> Just $
+          let dirStr = case teDirection te of
+                Request  -> "request" :: Text
+                Response -> "response"
+              payloadJson = rewritePayload payloadVal (teDirection te)
+              -- The writer stores erId = "" (ids are not yet assigned at
+              -- write time). Fall back to the entry's position in the
+              -- reconstructed stream — stable across reads of the same
+              -- files and distinct per entry, so the frontend's
+              -- dedup-by-id doesn't collide on the empty-string id.
+              entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw
+          in object
+             [ "id"        .= entryId
+             , "timestamp" .= T.pack (showIso (teTimestamp te))
+             , "direction" .= dirStr
+             , "payload"   .= TE.decodeUtf8 (BL.toStrict (A.encode payloadJson))
+             , "harness"   .= (Nothing :: Maybe Text)
+             , "model"     .= (Nothing :: Maybe Text)
+             , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode payloadVal))
+             ]
+
+    -- | Rewrite a reconstructed payload 'Value' from GHC-Generics
+    -- 'TaggedObject' encoding to the Anthropic-style JSON the frontend
+    -- parses. For requests: rewrites @messages@ content blocks and preserves
+    -- @system@/@model@/@tools@/@toolChoice@/@maxTokens@. For responses:
+    -- rewrites @content@ blocks and translates @usage@ field names.
+    rewritePayload :: A.Value -> Direction -> A.Value
+    rewritePayload val dir =
+      case val of
+        A.Object o ->
+          let k = Key.fromText
+              rewriteMsgs = case KeyMap.lookup (k "messages") o of
+                Just (A.Array arr) ->
+                  let msgs = map rewriteMessage (V.toList arr)
+                  in ["messages" .= A.Array (V.fromList msgs)]
+                _ -> []
+              rewriteContent = case KeyMap.lookup (k "content") o of
+                Just (A.Array arr) ->
+                  let blocks = map cbToFrontend (V.toList arr)
+                  in ["content" .= A.Array (V.fromList blocks)]
+                _ -> []
+              passthrough key = case KeyMap.lookup key o of
+                Just v  -> [key .= v]
+                Nothing -> []
+              usageFields = case KeyMap.lookup (k "usage") o of
+                Just (A.Object uo) ->
+                  let uIn  = case KeyMap.lookup (k "uInput")  uo of
+                        Just n -> Just n; _ -> Nothing
+                      uOut = case KeyMap.lookup (k "uOutput") uo of
+                        Just n -> Just n; _ -> Nothing
+                  in case (uIn, uOut) of
+                       (Just _, Just _) ->
+                         [ "usage" .= object
+                           [ "input_tokens"  .= uIn
+                           , "output_tokens" .= uOut
+                           ]
+                         ]
+                       _ -> []
+                _ -> []
+              fields = case dir of
+                Request ->
+                  passthrough (k "system")
+                  <> passthrough (k "model")
+                  <> passthrough (k "tools")
+                  <> passthrough (k "toolChoice")
+                  <> passthrough (k "maxTokens")
+                  <> rewriteMsgs
+                Response ->
+                  passthrough (k "model")
+                  <> rewriteContent
+                  <> usageFields
+                  <> passthrough (k "stop")
+                  <> passthrough (k "durationMs")
+          in A.object fields
+        _ -> val
+
+    -- | Rewrite one GHC-Generics 'Message' (@{msgRole, msgContent: [...]}@)
+    -- to the Anthropic-style shape (@{role, content: [...]}@) the frontend
+    -- parses, with content blocks rewritten by 'cbToFrontend'. The role is
+    -- lowercased because GHC-Generics encodes 'User'/'Assistant' as
+    -- @"User"@/@"Assistant"@ but the frontend checks @msg.role === "user"@.
+    rewriteMessage :: A.Value -> A.Value
+    rewriteMessage msg =
+      case msg of
+        A.Object mo ->
+          let k = Key.fromText
+              role = case KeyMap.lookup (k "msgRole") mo of
+                Just (A.String t) -> T.toLower t
+                _                 -> "user" :: Text
+              rawContent = case KeyMap.lookup (k "msgContent") mo of
+                Just (A.Array arr) -> arr
+                _                  -> mempty
+              blocks = map cbToFrontend (V.toList rawContent)
+          in A.object
+             [ "role"    .= role
+             , "content" .= A.Array (V.fromList blocks)
+             ]
+        _ -> msg
 
 -- | Map an 'AgentDef' to the frontend's 'AgentInfo' JSON shape. @isDefault@
 -- is a UI convenience; T11 returns @false@ for all (the configured default

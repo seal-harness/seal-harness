@@ -39,7 +39,7 @@ import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Core.Types (ToolCallId (..), OpName (..))
-import Seal.Providers.Registry (knownProviders)
+import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
@@ -71,6 +71,11 @@ fakeMeta =
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
 lookupK key = KeyMap.lookup (Key.fromText key)
+
+-- | Predicate: the 'Value' is a JSON array.
+isJustArray :: Maybe A.Value -> Bool
+isJustArray (Just (A.Array _)) = True
+isJustArray _                  = False
 
 -- | Build a test request with a given method + path.
 testRequest :: BC.ByteString -> [T.Text] -> Request
@@ -149,7 +154,7 @@ spec = describe "Seal.Gateway.API" $ do
               , adHarnessRegistry = reg
               , adAdoptConsent    = Just CcWeb
               , adAgentDefs       = adb
-              , adProviders       = knownProviders
+              , adProviders       = pure knownProviders
               , adSend            = Nothing
               }
         pure (apiApp deps)
@@ -308,7 +313,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Nothing
             }
           app = apiApp deps
@@ -390,7 +395,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Nothing
             }
           app = apiApp deps
@@ -482,7 +487,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Nothing
             }
           app = apiApp deps
@@ -505,6 +510,125 @@ spec = describe "Seal.Gateway.API" $ do
             []    -> error "expected at least one entry"
       tsOf firstEntry `shouldBe` Just (A.String "2026-07-01T12:00:00.100Z")
       tsOf (arr !! 1) `shouldBe` Just (A.String "2026-07-01T12:00:01.234Z")
+
+  it "GET /api/sessions/<sid>/transcript includes the system prompt in request payloads (two-file format)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "hello"] ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      -- entries.jsonl: one request entry carrying an envelope delta with
+      -- system = "You are a helpful assistant." The reconstruct path folds
+      -- this delta and the frontend's transcriptToMessages extracts the
+      -- `system` field into a collapsed "System" row at the top of the
+      -- session. Without the system field in the payload, the row is absent.
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        ]
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 1
+      -- The request entry's payload must carry a `system` field with the
+      -- system prompt text. The frontend reads `parsed.system` to synthesize
+      -- the collapsed "System" row.
+      let reqEntry = case arr of
+            (x:_) -> x
+            []    -> error "expected at least one entry"
+          ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _                 -> error "no req payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          systemField = case rparsed of
+            A.Object m -> lookupK "system" m
+            _          -> Nothing
+      systemField `shouldBe` Just (A.String "You are a helpful assistant.")
+
+  it "GET /api/sessions/<sid>/transcript lowercases message roles for the frontend (two-file format)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "hello world"] ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
+        ]
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      activeRef <- newIORef fakeMeta
+      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adProviders       = pure knownProviders
+            , adSend            = Nothing
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode transcript body: " ++ show body)
+      length arr `shouldBe` 1
+      let reqEntry = case arr of
+            (x:_) -> x
+            []    -> error "expected at least one entry"
+          ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
+          rpayload = case lookupK "payload" ro of
+            Just (A.String t) -> t
+            _                 -> error "no req payload"
+          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+            Just v -> v
+            Nothing -> error "req payload not JSON"
+          msgs = case rparsed of
+            A.Object m -> case lookupK "messages" m of
+              Just (A.Array a) -> a
+              _                -> error "no messages array"
+            _ -> error "payload not object"
+          firstMsg = case msgs V.! 0 of
+            A.Object m -> m
+            _          -> error "msg not object"
+      -- GHC-Generics encodes Role as "User"/"Assistant" (capitalized); the
+      -- frontend checks `msg.role === "user"` (lowercase). The rewrite must
+      -- lowercase the role or the user's first message won't render.
+      lookupK "role" firstMsg `shouldBe` Just (A.String "user")
+      lookupK "content" firstMsg `shouldSatisfy` isJustArray
 
   it "GET /api/sessions/<sid>/transcript falls back to smCreatedAt when entries.jsonl is absent" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
@@ -534,7 +658,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Nothing
             }
           app = apiApp deps
@@ -593,6 +717,38 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
     status `shouldBe` 200
 
+  it "GET /api/providers returns only the configured providers" $ do
+    -- adProviders is an IO action; a filtered list means only the configured
+    -- providers appear (here: ollama only, since no vault/credentials).
+    let mkAppFiltered = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          activeRef <- newIORef fakeMeta
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adProviders       = pure [OllamaProvider]
+                , adSend            = Nothing
+                }
+          pure (apiApp deps)
+    app <- mkAppFiltered
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode providers body: " ++ show body)
+    length arr `shouldBe` 1
+    let nm = case arr of
+          (A.Object o : _) -> case lookupK "name" o of
+            Just (A.String n) -> n
+            _ -> error "no name field"
+          _ -> error "not an object"
+    nm `shouldBe` "ollama"
+
   it "GET /api/providers/anthropic/models returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "anthropic", "models"])
@@ -637,7 +793,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Just sendDeps
             }
           app = apiApp deps
@@ -701,7 +857,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
-            , adProviders       = knownProviders
+            , adProviders       = pure knownProviders
             , adSend            = Just sendDeps
             }
           app = apiApp deps

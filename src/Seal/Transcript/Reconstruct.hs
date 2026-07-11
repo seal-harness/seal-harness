@@ -60,22 +60,28 @@ reconstruct conv = go 0 Nothing
         EKRequest ->
           let env = effectiveAt e mEnv
               end = erConvLen e
-              msgs = take end (drop start conv)
+              -- erConvLen is ABSOLUTE (the total conversation length at this
+              -- point), so the slice is conv[start:end], not take end (drop start).
+              msgs = take (end - start) (drop start conv)
               payload = requestPayload env msgs
               entry = toEntry e Request payload
           in entry : go end (Just env) es
         EKResponse ->
           let end = erConvLen e
-              msgs = take end (drop start conv)
+              msgs = take (end - start) (drop start conv)
               payload = responsePayload mEnv msgs e
               entry = toEntry e Response payload
           in entry : go end mEnv es
         EKHarness ->
-          let end = erConvLen e
-              msgs = take end (drop start conv)
-              payload = harnessPayload msgs e
+          -- A harness entry (opcode invocation) adds no conversation lines
+          -- (erConvLen = 0), so the conversation cursor is preserved — the
+          -- next response entry must slice from the same @start@, not from 0.
+          -- Resetting the cursor here would make the next response's
+          -- @take end (drop 0 conv)@ return the ENTIRE conversation, which
+          -- the frontend renders as one giant duplicate response row.
+          let payload = harnessPayload (take (erConvLen e) (drop start conv)) e
               entry = toEntry e Request payload
-          in entry : go end mEnv es
+          in entry : go start mEnv es
         EKCompaction ->
           let entry = toEntry e Request Null
           in entry : go (erConvLen e) mEnv es

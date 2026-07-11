@@ -54,7 +54,7 @@ function threeEntryTranscript(): TranscriptEntry[] {
       direction: 'request',
       payload: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        system_prompt: 'You are a helpful assistant.',
+        system: 'You are a helpful assistant.',
         messages: [
           { role: 'user', content: [{ type: 'text', text: 'Hello, please list files.' }] },
         ],
@@ -132,6 +132,119 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.name).toBe('shell')
     expect(tcBlock!.toolCall!.result).toBe('file_a.txt\nfile_b.txt')
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+  })
+
+  it('emits a Tools row from parsed.tools with names + count + full JSON', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 't1',
+        direction: 'request',
+        payload: JSON.stringify({
+          system: 'sys',
+          tools: [
+            { tdName: 'shell', tdDescription: 'run a shell command', tdInputSchema: { type: 'object' } },
+            { tdName: 'read', tdDescription: 'read a file', tdInputSchema: { type: 'object' } },
+          ],
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    expect(block).toBeTruthy()
+    expect(block.toolDefs!.count).toBe(2)
+    expect(block.toolDefs!.names).toEqual(['shell', 'read'])
+    // Full JSON carries both tool definitions.
+    const parsed = JSON.parse(block.toolDefs!.json)
+    expect(Array.isArray(parsed)).toBe(true)
+    expect(parsed).toHaveLength(2)
+    expect(parsed[0]!.tdName).toBe('shell')
+  })
+
+  it('emits a Tools row from Anthropic wire shape ({name, input_schema})', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'a1',
+        direction: 'request',
+        payload: JSON.stringify({
+          tools: [
+            { name: 'shell', description: 'sh', input_schema: { type: 'object' } },
+          ],
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    expect(block.toolDefs!.names).toEqual(['shell'])
+  })
+
+  it('emits a Tools row from Ollama-style function wrappers', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'o1',
+        direction: 'request',
+        payload: JSON.stringify({
+          tools: [
+            { type: 'function', function: { name: 'web_search', description: 'search the web', parameters: { type: 'object' } } },
+          ],
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    expect(block.toolDefs!.names).toEqual(['web_search'])
+  })
+
+  it('emits a Tools row only once per unique tool set', () => {
+    const tools = [{ tdName: 'shell', tdDescription: 'sh', tdInputSchema: {} }]
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'd1',
+        direction: 'request',
+        payload: JSON.stringify({ tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'd2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'd3',
+        direction: 'request',
+        payload: JSON.stringify({ tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const toolsRows = msgs.filter((m) => m.agentName === 'Tools')
+    expect(toolsRows).toHaveLength(1)
+  })
+
+  it('omits a Tools row when tools array is empty or absent', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'e1',
+        direction: 'request',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.find((m) => m.agentName === 'Tools')).toBeUndefined()
   })
 
   it('emits a text block for a plain user message', () => {
@@ -420,6 +533,45 @@ describe('ChatArea', () => {
     // BottomBar shows the token count and the percentage.
     expect(screen.getByText(/5k/)).toBeTruthy()
     expect(screen.getByText(/200k/)).toBeTruthy()
+  })
+
+  it('renders a collapsed Tools row showing count + names, expandable to full JSON', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'Tools',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolDefs: {
+            count: 2,
+            names: ['shell', 'read'],
+            json: JSON.stringify([
+              { name: 'shell', description: 'sh', input_schema: {} },
+              { name: 'read', description: 'rd', input_schema: {} },
+            ], null, 2),
+          },
+        }],
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // Collapsed header shows count + names.
+    expect(screen.getByText(/2 tools:.*shell.*read/)).toBeTruthy()
+    // The full JSON is NOT visible while collapsed.
+    expect(screen.queryByText('"input_schema"')).toBeNull()
+    // Click to expand.
+    fireEvent.click(screen.getByText(/2 tools:/))
+    // Now the full JSON renders inside a <pre>.
+    const pre = document.querySelector('pre')
+    expect(pre).toBeTruthy()
+    expect(pre!.textContent).toContain('"input_schema"')
+    expect(pre!.textContent).toContain('"shell"')
   })
 
   it('renders the empty-state message when there are no messages and no setup props', () => {
