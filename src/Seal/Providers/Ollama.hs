@@ -22,14 +22,18 @@ module Seal.Providers.Ollama
 
 import Control.Exception (try)
 import Data.Aeson
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser, parseEither)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
+import Data.Vector qualified as V
 import Network.HTTP.Client
 import Network.HTTP.Types (statusCode)
 import Network.HTTP.Types.Header (RequestHeaders)
@@ -45,10 +49,13 @@ data Ollama = Ollama
   , olManager :: Manager
   , olBaseUrl :: Text          -- e.g. "http://localhost:11434" | "https://ollama.com"
   , olApiKey  :: Maybe ApiKey  -- Nothing = local (no auth); Just = cloud (Bearer)
+  , olCallCounter :: IORef Int -- ^ monotonic counter for globally-unique tool-call ids
   }
 
-mkOllama :: Manager -> Text -> Maybe ApiKey -> ModelId -> Ollama
-mkOllama mgr base mKey model = Ollama model mgr base mKey
+mkOllama :: Manager -> Text -> Maybe ApiKey -> ModelId -> IO Ollama
+mkOllama mgr base mKey model = do
+  counter <- newIORef 0
+  pure (Ollama model mgr base mKey counter)
 
 -- URL + headers ------------------------------------------------------------
 
@@ -132,15 +139,21 @@ encTool (ToolDefinition (OpName n) d sch) =
 -- Pure response mapping ----------------------------------------------------
 
 decodeResponse :: Value -> Either Text CompletionResponse
-decodeResponse = mapLeft T.pack . parseEither parseResp
+decodeResponse = decodeResponseFrom 0
+
+-- | Like 'decodeResponse' but starts tool-call ids at the given index so
+-- multiple responses in the same conversation get globally unique ids
+-- (Ollama tool calls carry no id).
+decodeResponseFrom :: Int -> Value -> Either Text CompletionResponse
+decodeResponseFrom start = mapLeft T.pack . parseEither (parseRespFrom start)
   where mapLeft f = either (Left . f) Right
 
-parseResp :: Value -> Parser CompletionResponse
-parseResp = withObject "ollama response" $ \o -> do
+parseRespFrom :: Int -> Value -> Parser CompletionResponse
+parseRespFrom start = withObject "ollama response" $ \o -> do
   msg        <- o .: "message"
   content    <- msg .:? "content" .!= ""
   rawCalls   <- msg .:? "tool_calls" .!= ([] :: [Value])
-  toolBlocks <- traverse parseToolCall (zip [0 :: Int ..] rawCalls)
+  toolBlocks <- traverse parseToolCall (zip [start ..] rawCalls)
   doneReason <- o .:? "done_reason"
   promptTok  <- o .:? "prompt_eval_count" .!= 0
   evalTok    <- o .:? "eval_count" .!= 0
@@ -184,26 +197,41 @@ unreachableMsg base =
 -- | POST {base}/api/chat with the given headers; decode, or return a key-safe
 -- transport / HTTP-status error.
 sendChat
-  :: Manager -> Text -> RequestHeaders -> CompletionRequest
+  :: Ollama -> RequestHeaders -> CompletionRequest
   -> IO (Either Text CompletionResponse)
-sendChat mgr base hdrs cr = do
+sendChat o hdrs cr = do
   result <- try $ do
-    initReq <- parseRequest (T.unpack ("POST " <> chatUrl base))
+    initReq <- parseRequest (T.unpack ("POST " <> chatUrl (olBaseUrl o)))
     let req = initReq
           { requestBody     = RequestBodyLBS (encode (encodeRequest cr))
           , requestHeaders  = hdrs
           }
-    httpLbs req mgr
+    httpLbs req (olManager o)
   case result of
-    Left (_ :: HttpException) -> pure (Left (unreachableMsg base))
+    Left (_ :: HttpException) -> pure (Left (unreachableMsg (olBaseUrl o)))
     Right resp -> do
       let code = statusCode (responseStatus resp)
       if code >= 200 && code <= 299
-        then pure $ case eitherDecode (responseBody resp) of
-          Left e  -> Left (T.pack e)
-          Right v -> decodeResponse v
+        then case eitherDecode (responseBody resp) of
+          Left e  -> pure (Left (T.pack e))
+          Right v -> do
+            startIdx <- atomicModifyIORef' (olCallCounter o) (\i -> (i, i))
+            let toolCount = countToolCalls v
+                nextIdx = startIdx + toolCount
+            _ <- atomicModifyIORef' (olCallCounter o) (\_ -> (nextIdx, ()))
+            pure (decodeResponseFrom startIdx v)
         else pure $ Left $ ollamaErrorText code
           (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))
+
+-- | Count how many tool_calls appear in the response (to advance the counter).
+countToolCalls :: Value -> Int
+countToolCalls v = case v of
+  Object o -> case KeyMap.lookup (Key.fromString "message") o of
+    Just (Object msg) -> case KeyMap.lookup (Key.fromString "tool_calls") msg of
+      Just (Array arr) -> V.length arr
+      _ -> 0
+    _ -> 0
+  _ -> 0
 
 -- | GET {base}/api/tags → the installed model names.
 listTags :: Manager -> Text -> RequestHeaders -> IO (Either Text [ModelId])
@@ -235,7 +263,7 @@ parseTags = mapLeft T.pack . parseEither p
 instance Provider Ollama where
   listModels o = withHeaders o (listTags (olManager o) (olBaseUrl o))
   complete o cr =
-    withHeaders o (\hdrs -> sendChat (olManager o) (olBaseUrl o) hdrs cr)
+    withHeaders o (\hdrs -> sendChat o hdrs cr)
 
 -- | Run @k@ with request headers built from the optional key; the key bytes
 -- live only inside the 'withApiKey' continuation.

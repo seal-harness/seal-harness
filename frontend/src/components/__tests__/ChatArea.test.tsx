@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
-import type { Agent, Message, SessionInfo, TranscriptEntry } from '../../types'
+import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -299,6 +299,164 @@ describe('transcriptToMessages', () => {
     const msgs = transcriptToMessages(entries)
     expect(msgs[0]!.streaming).toBe(true)
   })
+
+  it('matches tool calls with tool_results that appear in response entries (two-file reconstruct path)', () => {
+    // In the two-file format, tool_results appear in the NEXT response entry's
+    // reconstructed content (concatMap of assistant + result messages), not in
+    // a separate request entry. This test verifies buildToolResultIndex scans
+    // response entries too.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'e1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'list files' }] }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e2',
+        direction: 'response',
+        model: 'claude-sonnet-4-20250514',
+        payload: JSON.stringify({
+          content: [{ type: 'tool_use', id: 'tool-1', name: 'shell', input: { command: 'ls' } }],
+        }),
+        raw: '{}',
+      }),
+      // The next response entry's reconstructed content includes BOTH the
+      // prior assistant's tool_use AND the user's tool_result (concatMap).
+      makeEntry({
+        id: 'e3',
+        direction: 'response',
+        model: 'claude-sonnet-4-20250514',
+        payload: JSON.stringify({
+          content: [
+            { type: 'tool_use', id: 'tool-1', name: 'shell', input: { command: 'ls' } },
+            { type: 'tool_result', tool_use_id: 'tool-1', content: [{ type: 'text', text: 'file_a.txt' }], is_error: false },
+          ],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // The assistant row from e2 should have its tool call matched with the
+    // tool_result from e3.
+    const asst = msgs.find((m) => m.agentName === 'claude-sonnet-4-20250514')!
+    expect(asst).toBeTruthy()
+    const tcBlock = asst.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.result).toBe('file_a.txt')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+  })
+
+  it('parses exit code from tool result text and sets exitCode on ToolCallInfo', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'e1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'run cmd' }] }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e2',
+        direction: 'response',
+        model: 'claude-sonnet-4-20250514',
+        payload: JSON.stringify({
+          content: [{ type: 'tool_use', id: 'tool-1', name: 'shell', input: { command: 'false' } }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e3',
+        direction: 'response',
+        model: 'claude-sonnet-4-20250514',
+        payload: JSON.stringify({
+          content: [
+            { type: 'tool_use', id: 'tool-1', name: 'shell', input: { command: 'false' } },
+            { type: 'tool_result', tool_use_id: 'tool-1', content: [{ type: 'text', text: 'error output\n[exit code: 1]' }], is_error: false },
+          ],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const asst = msgs.find((m) => m.agentName === 'claude-sonnet-4-20250514')!
+    const tcBlock = asst.blocks.find((b) => b.toolCall !== undefined)!
+    expect(tcBlock.toolCall!.exitCode).toBe(1)
+    expect(tcBlock.toolCall!.result).toContain('[exit code: 1]')
+  })
+
+  it('matches tool calls with unique ids across multiple responses (no id collision)', () => {
+    // Simulates the Ollama fix: each response gets globally unique tool_call
+    // ids (call_0, call_1, ...) instead of restarting at call_0 each turn.
+    // Without unique ids, the tool_result for call_0 in turn 2 would
+    // overwrite the tool_result for call_0 in turn 1.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'e1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'list files' }] }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e2',
+        direction: 'response',
+        model: 'ollama',
+        payload: JSON.stringify({
+          content: [{ type: 'tool_use', id: 'call_0', name: 'shell', input: { command: 'ls' } }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e3',
+        direction: 'response',
+        model: 'ollama',
+        payload: JSON.stringify({
+          content: [
+            { type: 'tool_use', id: 'call_0', name: 'shell', input: { command: 'ls' } },
+            { type: 'tool_result', tool_use_id: 'call_0', content: [{ type: 'text', text: 'file_a.txt' }], is_error: false },
+          ],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e4',
+        direction: 'response',
+        model: 'ollama',
+        payload: JSON.stringify({
+          content: [{ type: 'tool_use', id: 'call_1', name: 'shell', input: { command: 'uname' } }],
+        }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'e5',
+        direction: 'response',
+        model: 'ollama',
+        payload: JSON.stringify({
+          content: [
+            { type: 'tool_use', id: 'call_1', name: 'shell', input: { command: 'uname' } },
+            { type: 'tool_result', tool_use_id: 'call_1', content: [{ type: 'text', text: 'Linux' }], is_error: false },
+          ],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // Find the tool call blocks for call_0 and call_1 across all messages.
+    // With unique ids, call_0's result should be 'file_a.txt' and call_1's
+    // result should be 'Linux' — no collision.
+    const allToolCalls = msgs.flatMap((m) => m.blocks).filter((b) => b.toolCall !== undefined) as Array<{ toolCall: ToolCallInfo }>
+    const call0 = allToolCalls.find((b) => b.toolCall.id === 'call_0')!
+    const call1 = allToolCalls.find((b) => b.toolCall.id === 'call_1')!
+    expect(call0).toBeTruthy()
+    expect(call1).toBeTruthy()
+    expect(call0.toolCall.result).toBe('file_a.txt')
+    expect(call1.toolCall.result).toBe('Linux')
+  })
 })
 
 // ── ChatArea rendering ──────────────────────────────────────────────────────
@@ -356,6 +514,58 @@ describe('ChatArea', () => {
     expect(screen.getByText('shell')).toBeTruthy()
     // System row collapses by default but is present in the DOM.
     expect(document.querySelector('.addressable-block')).toBeTruthy()
+  })
+
+  it('shows an "exit 0" pill for a tool call with exit code 0', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'tool-1',
+            name: 'shell',
+            input: { command: 'ls' },
+            result: 'file_a.txt\n[exit code: 0]',
+            resultIsError: false,
+            exitCode: 0,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    expect(screen.getByText('exit 0')).toBeTruthy()
+  })
+
+  it('shows an "exit N" error pill for a tool call with non-zero exit code', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b1',
+          toolCall: {
+            id: 'tool-1',
+            name: 'shell',
+            input: { command: 'false' },
+            result: 'error output\n[exit code: 1]',
+            resultIsError: false,
+            exitCode: 1,
+          },
+        }],
+        rawJson: '{}',
+      },
+    ]
+    render(<ChatArea selectedAgent={makeAgent()} messages={messages} />)
+    expect(screen.getByText('exit 1')).toBeTruthy()
   })
 
   it('branch-from-here on a user row triggers the composer callback with the entry id', () => {

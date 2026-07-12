@@ -34,6 +34,7 @@ import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Tabs (newTabsHandle)
@@ -43,8 +44,8 @@ import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: IO ()
-runServeMain = do
+runServeMain :: AutonomyLevel -> IO ()
+runServeMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
@@ -79,6 +80,7 @@ runServeMain = do
   -- polluting the sessions list with an empty session on every `seal serve`.
   sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
+  broker <- newStreamBroker 1024
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -108,6 +110,8 @@ runServeMain = do
         , sdPreprocess = emptyChain
         , sdRegistry   = registry
         , sdResolve    = resolveSessionProvider pr
+        , sdAutonomy   = autonomy
+        , sdBroker     = Just broker
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)
@@ -133,7 +137,6 @@ runServeMain = do
   -- empty allowlist to the WS guard, which triggers wildcard mode (accept
   -- any Origin) — overriding even the default loopback origin. For a specific
   -- host, derive the origin + prepend it to the configured list.
-  broker <- newStreamBroker 1024
   let isWildcard = gcHost gwCfg == "0.0.0.0" || gcHost gwCfg == "::"
       httpOrigins = [ "http://" <> gcHost gwCfg <> ":" <> T.pack (show (gcPort gwCfg))
                     | not isWildcard ]

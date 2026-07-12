@@ -117,15 +117,15 @@ resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model = do
 resolveProvider mvh mgr baseUrl OllamaProvider model
   | not (ollamaNeedsKey baseUrl) =
       -- local/custom host: keyless, never touch the vault
-      pure (Right (SomeProvider (mkOllama mgr baseUrl Nothing model)))
+      Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model
   | otherwise = case mvh of
       Nothing ->
         pure (Left "Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama")
       Just vh -> do
         eKey <- vhGet vh (vaultKeyName OllamaProvider)
-        pure $ case eKey of
-          Right kb -> Right (SomeProvider (mkOllama mgr baseUrl (Just (mkApiKey kb)) model))
-          Left e   -> Left (vaultErrText e)
+        case eKey of
+          Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model
+          Left e   -> pure (Left (vaultErrText e))
 
 -- | Run a completion through an existentially-wrapped provider.
 completeSome :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)

@@ -47,7 +47,7 @@ import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
-import Seal.Handles.Transcript (withTwoFileTranscript)
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
@@ -224,6 +224,7 @@ plainTurn paths rt pr sr backends h mSrc t = do
               }
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
+        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         let env = (mkSessionAgentEnv
                      handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
                      (debugRequestsPath paths sid eCfg))

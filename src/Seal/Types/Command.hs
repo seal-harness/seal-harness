@@ -5,15 +5,19 @@ module Seal.Types.Command
 
 import Options.Applicative
 
+import Seal.Security.Policy (AutonomyLevel (..))
+
 -- | The subcommand selected on the command line. 'CommandNoOp' is the
 -- harmless placeholder carried by 'defaultConfig'; it is not exposed as a
 -- subcommand (the subcommands are @tui@, @signal@, and @serve@) and is
 -- excluded from the config-file 'FromJSON'/'ToJSON' instances.
+-- 'CommandServe' carries the autonomy level selected via @--yolo@
+-- ('Full' — bypass the approval gate) vs the default ('Supervised').
 data Command
   = CommandNoOp
   | CommandTui
   | CommandSignal
-  | CommandServe
+  | CommandServe AutonomyLevel
   deriving (Eq, Show)
 
 pCommand :: Parser Command
@@ -22,5 +26,13 @@ pCommand = hsubparser
                          (progDesc "Start the interactive terminal UI (TUI)"))
   <> command "signal" (info (pure CommandSignal)
                             (progDesc "Run the agent over the Signal channel"))
-  <> command "serve" (info (pure CommandServe)
+  <> command "serve" (info (CommandServe <$> pAutonomy)
                            (progDesc "Run the web gateway server"))
+
+-- | @--yolo@ sets 'Full' autonomy (bypass the untrusted-opcode approval
+-- gate); absent defaults to 'Supervised'.
+pAutonomy :: Parser AutonomyLevel
+pAutonomy = flag Supervised Full
+  ( long "yolo"
+  <> help "Bypass the approval gate so untrusted opcodes run without prompting (ACK audit still recorded)"
+  )

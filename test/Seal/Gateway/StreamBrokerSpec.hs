@@ -18,8 +18,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
     let entry = object ["id" .= ("e1" :: T.Text)]
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
     a <- readIORef refA
@@ -31,8 +31,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
     let snap = object ["tabs" .= ([] :: [T.Text])]
     broadcastLists broker snap
     a <- readIORef refA
@@ -44,8 +44,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 1
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))  -- over cap
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))  -- over cap
     -- the first subscriber still works
     let entry = object ["id" .= ("e1" :: T.Text)]
     broadcast broker (BeEntryRecorded (mkSid "a") entry)

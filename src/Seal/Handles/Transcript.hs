@@ -39,8 +39,10 @@ import Data.Aeson (decode)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Unsafe qualified as BSU
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Text (Text)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
@@ -52,6 +54,7 @@ import System.Posix.IO
 import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
 
+import Seal.Core.Types (OpName, ToolCallId)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), ToolResultPart (..) )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
@@ -188,6 +191,11 @@ data TwoFileHandle = TwoFileHandle
   -- ^ Read back the on-disk conversation (for tests / replay).
   , tfwReadEntries     :: IO [EntryRecord]
   -- ^ Read back the on-disk entry log.
+  , tfwSetSecretOps    :: Set OpName -> IO ()
+  -- ^ Set the set of opcode names whose tool results should be redacted from
+  -- the on-disk conversation file. Call this after building the ISA registry
+  -- so the writer knows which 'CbToolResult's may carry secrets. Results from
+  -- opcodes NOT in this set (e.g. SHELL_EXEC, FILE_READ) pass through verbatim.
   , tfwCloseTranscript :: IO ()
   }
 
@@ -200,6 +208,12 @@ data TwoFileState = TwoFileState
   , tfsWritten :: [Message]
   -- ^ The conversation as it exists on disk, in order. Grown by each write
   -- so the next diff can be computed in-memory.
+  , tfsSecretOpsRef :: IORef (Set OpName)
+  -- ^ The set of opcode names whose tool results may carry secrets and must
+  -- be redacted from the on-disk conversation file. An IORef so the caller
+  -- can set it after building the registry (the registry construction may
+  -- depend on values only available inside the 'withTwoFileTranscript'
+  -- callback, e.g. session id or worker functions).
   }
 
 -- | A work item for the two-file daemon.
@@ -225,8 +239,9 @@ withTwoFileTranscript dir action = do
         }
       ack = maybe (pure ()) (\tv -> atomically (putTMVar tv ()))
       writeOne st (TwoFileWrite msgs entry) = do
+        secretOps <- readIORef (tfsSecretOpsRef st)
         let new = diffMessages msgs (tfsWritten st)
-            redacted = map redactMessage new
+            redacted = redactMessages secretOps msgs new
         -- 1. Append new conversation lines, fsync.
         mapM_ (\m -> writeFd (tfsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) redacted
         fileSynchronise (tfsConvFd st)
@@ -276,7 +291,8 @@ withTwoFileTranscript dir action = do
         done <- newEmptyTMVarIO
         shutdown convFd entriesFd done)
     $ \(convFd, entriesFd) -> do
-        let st0 = TwoFileState convFd entriesFd existingConv
+        secretOpsRef <- newIORef Set.empty
+        let st0 = TwoFileState convFd entriesFd existingConv secretOpsRef
         void $ forkIO (void (daemon st0))
         let enqueue w = atomically (writeTQueue q (TFWWrite w Nothing))
             ackWrite w = do
@@ -288,6 +304,7 @@ withTwoFileTranscript dir action = do
           , tfwRecordAsync  = enqueue
           , tfwReadConversation = readConversation <$> BS.readFile convPath
           , tfwReadEntries     = readEntries entriesPath
+          , tfwSetSecretOps    = writeIORef secretOpsRef
           , tfwCloseTranscript = pure ()
           }
 
@@ -307,12 +324,14 @@ fakeTwoFileTranscript :: IO (TwoFileHandle, IO ([Message], [EntryRecord]))
 fakeTwoFileTranscript = do
   convRef    <- newMVar ([] :: [Message])
   entriesRef <- newMVar ([] :: [EntryRecord])
+  secretOpsRef <- newIORef Set.empty
   let pushConv m = modifyMVar_ convRef (pure . (++ [m]))
       pushEntry e = modifyMVar_ entriesRef (pure . (++ [e]))
       handle w = do
+        secretOps <- readIORef secretOpsRef
         written <- readMVar convRef
         let new = diffMessages (tfwMessages w) written
-            redacted = map redactMessage new
+            redacted = redactMessages secretOps (tfwMessages w) new
         mapM_ pushConv redacted
         pushEntry (tfwEntry w)
   pure
@@ -321,6 +340,7 @@ fakeTwoFileTranscript = do
         , tfwRecordAsync  = handle
         , tfwReadConversation = readMVar convRef
         , tfwReadEntries     = readMVar entriesRef
+        , tfwSetSecretOps    = writeIORef secretOpsRef
         , tfwCloseTranscript = pure ()
         }
     , do cs <- readMVar convRef
@@ -339,28 +359,39 @@ diffMessages incoming written = fromMaybe incoming (stripPrefixMsg written incom
       | w == i    = stripPrefixMsg ws is
       | otherwise = Nothing
 
--- | Redact a message's content blocks: 'CbToolResult' parts (which may carry
--- secret values returned by opcodes like SECRET_GET) are replaced with a
--- '<redacted:secret>' placeholder, so the conversation file never serializes a
--- secret. 'CbText' and 'CbToolUse' pass through unchanged (the latter carries
--- only tool-call INPUTS, never tool results).
-redactMessage :: Message -> Message
-redactMessage (Message role blocks) = Message role (map redactBlock blocks)
+-- | Redact tool-result parts that may carry secret values. Only results from
+-- secret-producing opcodes (those whose name is in the provided set) are
+-- redacted — Untrusted opcodes (SHELL_EXEC, FILE_READ, etc.) produce non-secret
+-- output that passes through verbatim so the frontend can display it.
+--
+-- The @allMsgs@ list (the full conversation) is scanned for 'CbToolUse' blocks
+-- whose 'cbName' is in the secret-opcode-name set; their 'cbId's form the set
+-- of tool-call ids whose results should be redacted. Only the @newMsgs@ are
+-- returned (after redaction); @allMsgs@ is only used for the scan.
+redactMessages :: Set OpName -> [Message] -> [Message] -> [Message]
+redactMessages secretOps allMsgs newMsgs =
+  let secretIds = buildSecretIds secretOps allMsgs
+  in map (redactMessage secretIds) newMsgs
   where
-    redactBlock (CbToolResult tcid parts isErr) =
-      CbToolResult tcid (map redactPart parts) isErr
-    redactBlock other = other
+    buildSecretIds :: Set OpName -> [Message] -> Set ToolCallId
+    buildSecretIds ops = foldr go mempty
+      where
+        go (Message _ blocks) acc = acc <> foldr goBlock mempty blocks
+          where
+            goBlock (CbToolUse tcid name _) a
+              | name `Set.member` ops = tcid `Set.insert` a
+              | otherwise             = a
+            goBlock _ a = a
 
-    redactPart (TrpText t)
-      | looksSecrety t = TrpText "<redacted:secret>"
-      | otherwise      = TrpText t
+    redactMessage :: Set ToolCallId -> Message -> Message
+    redactMessage secretIds (Message role blocks) =
+      Message role (map (redactBlock secretIds) blocks)
+      where
+        redactBlock ids (CbToolResult tcid parts isErr)
+          | tcid `Set.member` ids = CbToolResult tcid (map redactPart parts) isErr
+          | otherwise             = CbToolResult tcid parts isErr
+        redactBlock _ other = other
 
-    -- Heuristic: a part is considered potentially secret if it is non-empty
-    -- AND the message came in as a CbToolResult (which we know by virtue of
-    -- being here). To be conservative, redact ALL CbToolResult parts whose
-    -- content is non-empty. This over-redacts (some tool results are harmless
-    -- shell output), but errs on the side of never leaking a secret to disk.
-    -- The agent still sees the real value in-memory (the redaction is only
-    -- for the on-disk conversation file).
-    looksSecrety :: Text -> Bool
-    looksSecrety t = not (T.null t)
+        redactPart (TrpText t)
+          | not (T.null t) = TrpText "<redacted:secret>"
+          | otherwise      = TrpText t

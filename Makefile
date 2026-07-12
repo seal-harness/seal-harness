@@ -32,9 +32,9 @@ check: build test lint ## Build, test, and lint — the full local gate (what CI
 run: ## Run the seal executable; pass flags via ARGS="..." (e.g. make run ARGS="--help")
 	$(NIX) cabal run -v0 seal -- $(ARGS)
 
-serve: ## Rebuild the frontend, then launch the seal gateway and web server
+serve: ## Rebuild the frontend, then launch the seal gateway and web server (pass flags via ARGS, e.g. make serve ARGS="--yolo")
 	@cd frontend && npm run build
-	$(NIX) cabal run -v0 seal -- serve
+	$(NIX) cabal run -v0 seal -- serve $(ARGS)
 
 tui: ## Launch the interactive terminal UI (equivalent to `seal tui`)
 	$(NIX) cabal run -v0 seal -- tui

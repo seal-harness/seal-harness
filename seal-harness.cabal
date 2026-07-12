@@ -114,12 +114,13 @@ library
         Seal.Web.Browser
         Seal.Media.Image
         Seal.Media.Tts
-        Seal.Gateway.Config
-         Seal.Gateway.API
-         Seal.Gateway.Send
-         Seal.Gateway.Server
-        Seal.Gateway.Stream
-        Seal.Gateway.StreamBroker
+         Seal.Gateway.Config
+          Seal.Gateway.API
+          Seal.Gateway.Send
+          Seal.Gateway.Server
+         Seal.Gateway.Stream
+         Seal.Gateway.StreamBroker
+         Seal.Gateway.Transcript
         Seal.Tui
         Seal.Types.App
         Seal.Types.Command
@@ -315,6 +316,7 @@ test-suite tests
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
+        Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec

@@ -4,6 +4,7 @@ module Seal.Handles.TranscriptSpec (spec) where
 import Data.Aeson (object, (.=))
 import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Time (getCurrentTime)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -11,7 +12,7 @@ import Test.Hspec
 
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..) )
-import Seal.Core.Types (ToolCallId (..))
+import Seal.Core.Types (OpName (..), ToolCallId (..))
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), emptyEnvelopeDelta )
 import Seal.Transcript.Types
@@ -103,16 +104,32 @@ spec = describe "Seal.Handles.Transcript" $ do
         -- turn1 writes 1 line ("a"); turn2 diffs and writes only "b".
         length (BS8.lines convContents) `shouldBe` 2
 
-    it "redacts CbToolResult parts so secret values never reach disk" $
+    it "redacts CbToolResult parts from secret-producing opcodes so secret values never reach disk" $
       withSystemTempDirectory "seal-twofile" $ \dir -> do
         e <- mkEntryRecord
         let secret = TrpText "super-secret-api-key"
-            msg = Message User [CbToolResult (ToolCallId "tc1") [secret] False]
+            toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SECRET_GET") (object [])]
+            resultMsg = Message User [CbToolResult (ToolCallId "tc1") [secret] False]
         withTwoFileTranscript dir $ \h -> do
-          tfwRecordAndAck h (TwoFileWrite [msg] e)
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
         convContents <- BS8.readFile (dir </> "conversation.jsonl")
         BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
         BS8.unpack convContents `shouldContain` "<redacted:secret>"
+
+    it "does NOT redact CbToolResult parts from non-secret opcodes (e.g. SHELL_EXEC)" $
+      withSystemTempDirectory "seal-twofile" $ \dir -> do
+        e <- mkEntryRecord
+        let output = TrpText "total used free\n4096 2048 2048"
+            toolUse = Message Assistant [CbToolUse (ToolCallId "tc1") (OpName "SHELL_EXEC") (object ["command" .= ("free -h" :: String)])]
+            resultMsg = Message User [CbToolResult (ToolCallId "tc1") [output] False]
+        withTwoFileTranscript dir $ \h -> do
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwRecordAndAck h (TwoFileWrite [toolUse, resultMsg] e)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        -- Shell output passes through verbatim — NOT redacted.
+        BS8.unpack convContents `shouldContain` "total used free"
+        BS8.unpack convContents `shouldNotContain` "<redacted:secret>"
 
     it "readConversation / readEntries round-trip the written data" $
       withSystemTempDirectory "seal-twofile" $ \dir -> do

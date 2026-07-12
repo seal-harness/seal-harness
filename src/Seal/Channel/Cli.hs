@@ -18,6 +18,8 @@ module Seal.Channel.Cli
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
+import qualified Data.Set as Set
+import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (getCurrentTime)
@@ -54,7 +56,7 @@ import Seal.Tools.Exec.Local (mkLocalExecHandle)
 #endif
 import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
-import Seal.ISA.Ops.File (fileReadOp)
+import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
@@ -65,6 +67,10 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Ops.Agent
   ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
   , agentListOp, agentStartOp, agentStatusOp, agentStopOp )
+import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Code (codeExecOp)
+import Seal.ISA.Ops.Process (processManageOp)
+import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
@@ -75,6 +81,7 @@ import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
@@ -321,8 +328,15 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
           , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
           , agentStatusOp agentRuntime
           , agentStopOp agentRuntime
+          , shellExecOp wsRoot cliSecurityPolicy execBackend
+          , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+          , processManageOp wsRoot cliSecurityPolicy execBackend
+          , fileWriteOp wsRoot operatorCeiling
+          , filePatchOp wsRoot
+          , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
           ]
-        plainHandler t = do
+    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    let plainHandler t = do
           meta  <- readIORef (srActive sr)
           eprov <- resolveSessionProvider pr meta
           case eprov of
@@ -425,3 +439,14 @@ execBackendFromFile _wsRoot cfg =
     defaultBackend = failClosedBackend  -- local executor absent; fail-closed
 #endif
     failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed
+
+-- | The CLI security policy: allow all commands, full autonomy. The TUI has
+-- no web approval gate, so untrusted opcodes run without prompting (ACK
+-- audit still recorded).
+cliSecurityPolicy :: SecurityPolicy
+cliSecurityPolicy = SecurityPolicy AllowAll Full
+
+-- | The set of interpreters CODE_EXEC may run. Conservative default; can be
+-- tightened via config in a later phase.
+codeAllowList :: Set Text
+codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]

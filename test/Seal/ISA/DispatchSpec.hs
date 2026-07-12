@@ -28,6 +28,7 @@ probe ref tl =
       , tfwRecordAsync  = \_ -> modifyIORef' ref (++ ["async"])
       , tfwReadConversation = pure []
       , tfwReadEntries     = pure []
+      , tfwSetSecretOps    = \_ -> pure ()
       , tfwCloseTranscript = pure ()
       }
   , mkProbeOpcode ref tl

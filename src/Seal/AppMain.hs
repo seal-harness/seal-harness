@@ -29,7 +29,7 @@ dispatch cfg = do
     CommandNoOp   -> pure ()
     CommandTui   -> liftIO Seal.Tui.runTui
     CommandSignal -> liftIO Seal.Channels.Signal.Run.runSignalMain
-    CommandServe  -> liftIO Seal.Command.Serve.runServeMain
+    CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy)
 
 -- | Map the process arguments so that an empty argument list behaves as if
 -- @--help@ was passed. Running @seal@ with no arguments should print usage
