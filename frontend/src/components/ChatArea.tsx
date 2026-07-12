@@ -713,7 +713,7 @@ function ToolDefsCollapsed({ block, anchorId }: { block: ToolDefsBlock; anchorId
             {block.json}
           </pre>
         ) : (
-          <span className="flex-1 truncate">{collapsed}</span>
+          <span className="flex-1 break-words whitespace-normal">{collapsed}</span>
         )}
       </div>
     </div>
