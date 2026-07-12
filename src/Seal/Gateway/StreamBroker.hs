@@ -7,6 +7,7 @@ module Seal.Gateway.StreamBroker
   , StreamBroker (..)
   , newStreamBroker
   , subscribe
+  , updateSubscriberSession
   , broadcast
   , broadcastLists
   , subscriberCount
@@ -25,9 +26,11 @@ data BrokerEvent
   | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
   deriving stock (Eq, Show)
 
--- | The per-subscriber state: the focused session + a send action.
+-- | The per-subscriber state: the focused session (via an 'IORef' so the
+-- connection thread can update it on focus without re-subscribing) + a
+-- send action.
 data Subscriber = Subscriber
-  { subSession :: SessionId
+  { subSessionRef :: TVar SessionId
   , subSend    :: BrokerEvent -> IO ()
   }
 
@@ -43,11 +46,22 @@ newStreamBroker cap = StreamBroker <$> newTVarIO [] <*> pure cap
 
 -- | Subscribe a new connection. If the global cap is exceeded, the subscribe
 -- is a no-op (the over-cap subscriber is never added — it should close).
-subscribe :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO ()
-subscribe broker session sendfn = atomically $ do
-  subs <- readTVar (sbSubs broker)
-  when (length subs < sbCap broker) $
-    writeTVar (sbSubs broker) (subs <> [Subscriber session sendfn])
+-- Returns the session 'TVar' so the caller can update the focused session
+-- via 'updateSubscriberSession' when the client sends a @focus@ op.
+subscribe :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO (TVar SessionId)
+subscribe broker session sendfn = do
+  ref <- newTVarIO session
+  atomically $ do
+    subs <- readTVar (sbSubs broker)
+    when (length subs < sbCap broker) $
+      writeTVar (sbSubs broker) (subs <> [Subscriber ref sendfn])
+  pure ref
+
+-- | Update a subscriber's focused session. Called when the client sends a
+-- @focus@ op so subsequent 'BeEntryRecorded' events for the new session are
+-- delivered.
+updateSubscriberSession :: TVar SessionId -> SessionId -> IO ()
+updateSubscriberSession ref sid = atomically (writeTVar ref sid)
 
 -- | Fan one event to every subscriber whose focused session matches. For
 -- 'BeListsSnapshot' (a broadcast to all), every subscriber receives it
@@ -57,7 +71,9 @@ broadcast broker event = do
   subs <- readTVarIO (sbSubs broker)
   case event of
     BeListsSnapshot _ -> mapM_ (`subSend` event) subs
-    BeEntryRecorded sid _ -> mapM_ (\s -> when (subSession s == sid) (subSend s event)) subs
+    BeEntryRecorded sid _ -> mapM_ (\s -> do
+      subSid <- readTVarIO (subSessionRef s)
+      when (subSid == sid) (subSend s event)) subs
     BeHarnessStatus _ -> mapM_ (`subSend` event) subs  -- harness status → all (the frontend's sidebar shows all harnesses)
 
 -- | Push a refreshed tab/session snapshot to every connection.

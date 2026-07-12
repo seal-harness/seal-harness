@@ -16,7 +16,6 @@ import Control.Monad (forever)
 import Data.Aeson (object, (.=), (.:))
 import Data.Aeson qualified as A
 import Data.CaseInsensitive qualified as CI
-import Data.IORef (newIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -26,9 +25,9 @@ import Network.WebSockets
 import Network.WebSockets qualified as WS
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Core.Types (mkSessionId)
+import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Gateway.StreamBroker
-  ( BrokerEvent (..), StreamBroker, subscribe )
+  ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 data StreamGuard = StreamGuard
@@ -58,19 +57,23 @@ streamApp guard broker pending = do
     acceptConn = do
       conn <- acceptRequest pending
       sendTextData conn (A.encode (object ["type" .= ("hello" :: Text)]))
-      let sendEvent (BeEntryRecorded _ v)   = sendTextData conn (A.encode v)
+      let sendEvent (BeEntryRecorded sid v) =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("entry" :: Text)
+              , "sessionId" .= sessionIdText sid
+              , "entry" .= v
+              ]))
           sendEvent (BeHarnessStatus v)    = sendTextData conn (A.encode v)
           sendEvent (BeListsSnapshot v)    = sendTextData conn (A.encode v)
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
-      subscribe broker defaultSid sendEvent
-      sessionRef <- newIORef defaultSid
+      subSessionRef <- subscribe broker defaultSid sendEvent
       withPingThread conn 30 (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
               case A.decode msg of
                 Just (focusOp :: FocusOp) ->
                   case mkSessionId (foSession focusOp) of
-                    Right s  -> writeIORef sessionRef s
+                    Right s  -> updateSubscriberSession subSessionRef s
                     Left _e  -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("invalid session id" :: Text)]))
                 Nothing -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("expected a focus op" :: Text)]))
         readerLoop `catch` \(_e :: SomeException) -> pure ()

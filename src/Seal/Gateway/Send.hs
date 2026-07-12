@@ -19,8 +19,10 @@ import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.FilePath ((</>))
 
@@ -37,11 +39,11 @@ import Seal.Config.File
   , fcDebugSessionTranscript )
 import Seal.Config.Paths (SealPaths, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId, SessionId)
+import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Ops.File (fileReadOp)
+import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
@@ -51,10 +53,17 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Ops.Agent
   ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
   , agentListOp, agentStatusOp, agentStopOp )
+import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Code (codeExecOp)
+import Seal.ISA.Ops.Process (processManageOp)
+import Seal.ISA.Ops.Search (searchFilesOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
+import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
+import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
+import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
@@ -83,6 +92,11 @@ data SendDeps = SendDeps
     -- ^ The CLI autonomy level (--yolo / --locked / default Supervised).
     -- When 'Full', the approval gate bypasses prompting so untrusted
     -- opcodes run without asking (ACK audit still recorded).
+  , sdBroker     :: Maybe StreamBroker
+    -- ^ The WS broker for pushing live transcript entries to the frontend.
+    -- 'Nothing' in tests; in production, set by 'runServeMain'. After each
+    -- turn, new entries are read from disk and broadcast as 'BeEntryRecorded'
+    -- so the frontend's WS stream updates without a page refresh.
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -163,12 +177,6 @@ plainTurn deps meta t = do
         wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
-        -- The web gate respects the CLI autonomy level. --yolo (Full) bypasses
-        -- prompting so untrusted opcodes run without asking. The default
-        -- (Supervised) uses a fail-closed prompt (web can't prompt inline
-        -- yet — a real approval card is Phase 7b).
-        gate <- mkApprovalGate (Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps))
-                               (\_ -> pure Deny) Nothing
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
@@ -178,6 +186,7 @@ plainTurn deps meta t = do
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
         let isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              execBackend (sdAutonomy deps)
             caps = ChannelCaps
               { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
               , ccPrompt = \_ -> pure ""  -- web can't prompt inline (deferral is a later phase)
@@ -187,14 +196,21 @@ plainTurn deps meta t = do
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        runApp appEnv (runTurn env t))
+        result <- runApp appEnv (runTurn env t)
+        broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+        pure result)
 
 -- | Build the ISA registry for a web turn. Mirrors
 -- 'Seal.Channels.Signal.Run.buildRegistry' (no AGENT_START worker over the
--- web; sub-agents over the web is a later phase).
+-- web; sub-agents over the web is a later phase). Includes the Untrusted
+-- execution opcodes (SHELL_EXEC, CODE_EXEC, PROCESS_MANAGE, FILE_WRITE,
+-- FILE_PATCH, SEARCH_FILES) wired to the per-session 'ExecBackend' and a
+-- 'SecurityPolicy' derived from the CLI autonomy level. HARNESS_* opcodes
+-- are omitted (they need tmux infrastructure not available over the web).
 buildWebRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling =
+  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  -> ExecBackend -> Policy.AutonomyLevel -> ISA.Registry
+buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy =
   ISA.mkRegistry
     [ showHumanOp simpleCaps
     , askHumanOp simpleCaps
@@ -214,8 +230,16 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling =
     , agentListOp (bRuntime backends)
     , agentStatusOp (bRuntime backends)
     , agentStopOp (bRuntime backends)
+    , shellExecOp wsRoot securityPolicy execBackend
+    , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+    , processManageOp wsRoot securityPolicy execBackend
+    , fileWriteOp wsRoot operatorCeiling
+    , filePatchOp wsRoot
+    , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
     ]
   where
+    securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
+    codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
     simpleCaps = ChannelCaps
       { ccSend = \_ -> pure ()
       , ccPrompt = \_ -> pure ""
@@ -265,8 +289,6 @@ plainTurnWithCaps deps meta caps t = do
         wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
-        gate <- mkApprovalGate (Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps))
-                               (\_ -> pure Deny) Nothing
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
@@ -275,8 +297,28 @@ plainTurnWithCaps deps meta caps t = do
           Nothing -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
         let isaReg = buildWebRegistry (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              execBackend (sdAutonomy deps)
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        runApp appEnv (runTurn env t))
+        result <- runApp appEnv (runTurn env t)
+        broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+        pure result)
+
+-- | Extract the 'Text' from a 'ModelId'.
+modelText :: ModelId -> Text
+modelText (ModelId t) = t
+
+-- | Broadcast new transcript entries over the WS broker so the frontend
+-- updates live without a page refresh. Reads the full transcript from disk
+-- and broadcasts every entry — the frontend dedupes by id, so already-seen
+-- entries are no-ops. 'Nothing' broker (tests) is a no-op.
+broadcastNewEntries
+  :: Maybe StreamBroker -> SealPaths -> SessionId -> Text -> UTCTime -> IO ()
+broadcastNewEntries mBroker paths sid model createdAt =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> do
+      entries <- readTranscriptEntries paths model (showIso createdAt) sid
+      mapM_ (broadcast broker . BeEntryRecorded sid) entries

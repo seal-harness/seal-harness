@@ -29,7 +29,7 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Core.Types (ModelId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -38,7 +38,6 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
-import Seal.Core.Types (ToolCallId (..), OpName (..))
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -800,6 +799,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdRegistry   = error "sdRegistry: unused on the 404 path"
             , sdResolve    = error "sdResolve: unused on the 404 path"
             , sdAutonomy   = error "sdAutonomy: unused on the 404 path"
+            , sdBroker     = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -865,6 +865,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdRegistry   = mkRegistry []
             , sdResolve    = resolveStub
             , sdAutonomy   = Policy.Full
+            , sdBroker     = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

@@ -225,11 +225,6 @@ plainTurn paths rt pr sr backends h mSrc t = do
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        -- Construct the approval gate. Task D wires the real --yolo/--locked
-        -- flags + on-disk store; for now a Full-autonomy gate (bypasses
-        -- prompting) preserves existing behavior.
-        gate <- mkApprovalGate (Policy.SecurityPolicy Policy.AllowAll Policy.Full)
-                               (\_ -> pure Deny) Nothing
         let env = (mkSessionAgentEnv
                      handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
                      (debugRequestsPath paths sid eCfg))
