@@ -31,6 +31,7 @@ import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -74,6 +75,7 @@ runServeMain autonomy = do
   backends <- newBackends cfgRoot repo
   tabsH   <- newTabsHandle
   reg     <- newHarnessRegistry
+  tmuxR   <- mkRealTmuxRunner
   uiState <- newUiStateHandle paths
   -- Build an in-memory active session (NOT persisted to disk) so the
   -- active-session ref has valid provider/model fallbacks. The session
@@ -114,6 +116,9 @@ runServeMain autonomy = do
         , sdResolve    = resolveSessionProvider pr
         , sdAutonomy   = autonomy
         , sdBroker     = Just broker
+        , sdHarnessRegistry = reg
+        , sdTmuxRunner  = tmuxR
+        , sdHttpManager = Just mgr
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)

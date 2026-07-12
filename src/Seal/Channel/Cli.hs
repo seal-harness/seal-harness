@@ -8,6 +8,7 @@ module Seal.Channel.Cli
   , interpretDisposition
   , handlePlain
   , resolveSessionProvider
+  , resolveDefProvider
   , mkSessionAgentEnv
   , debugRequestsPath
   , execBackendFromFile

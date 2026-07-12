@@ -34,6 +34,7 @@ import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
@@ -898,6 +899,9 @@ spec = describe "Seal.Gateway.API" $ do
             , sdResolve    = error "sdResolve: unused on the 404 path"
             , sdAutonomy   = error "sdAutonomy: unused on the 404 path"
             , sdBroker     = Nothing
+            , sdHarnessRegistry = error "sdHarnessRegistry: unused on the 404 path"
+            , sdTmuxRunner  = error "sdTmuxRunner: unused on the 404 path"
+            , sdHttpManager = error "sdHttpManager: unused on the 404 path"
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -934,6 +938,7 @@ spec = describe "Seal.Gateway.API" $ do
       backends <- newBackends configRoot repo
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
+      tmuxR <- mkRealTmuxRunner
       let adb = bAgentDefs backends
       -- A fake provider that returns one canned assistant reply.
       providerRef <- newIORef
@@ -966,6 +971,9 @@ spec = describe "Seal.Gateway.API" $ do
             , sdResolve    = resolveStub
             , sdAutonomy   = Policy.Full
             , sdBroker     = Nothing
+            , sdHarnessRegistry = reg
+            , sdTmuxRunner  = tmuxR
+            , sdHttpManager = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

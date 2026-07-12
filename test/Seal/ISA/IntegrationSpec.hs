@@ -91,7 +91,7 @@ import Seal.Types.Env (mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Browser (browserClickOp, browserOpenOp, browserReadOp,
                          noBrowserDriver)
-import Seal.Web.Extract (WebExtractConfig (..), webExtractOp)
+import Seal.Web.Fetch (WebFetchConfig (..), webFetchOp)
 import Seal.Web.Search (WebSearchConfig (..), webSearchOp)
 
 -- ---------------------------------------------------------------------------
@@ -908,9 +908,10 @@ spec = describe "Seal.ISA.Integration" $ do
   -- WEB_SEARCH
   -- ----------------------------------------------------------------------
   describe "WEB_SEARCH" $ do
-    it "\"Search the web for 'Haskell runtime'.\" -> WEB_SEARCH -> query accepted, fail-closed result (no provider wired)" $ do
+    it "\"Search the web for 'Haskell runtime'.\" -> WEB_SEARCH -> query accepted, fail-closed result (no HTTP manager)" $ do
       let cfg = WebSearchConfig
-            { wscEndpoint = "https://search.example.com/api"
+            { wscManager = Nothing
+            , wscEndpoint = "https://search.example.com/api"
             , wscAllowList = ["example.com"]
             , wscAuthKey = Nothing
             }
@@ -920,12 +921,10 @@ spec = describe "Seal.ISA.Integration" $ do
                         (object ["query" .= ("Haskell runtime" :: Text)]))
       case r of
         Right res -> do
-          -- Authorize passed; the run fail-closes (no real HTTP provider).
           orIsError res `shouldBe` True
           case orParts res of
-            [TrpText t] -> "no search provider" `T.isInfixOf` t `shouldBe` True
+            [TrpText t] -> "no HTTP manager" `T.isInfixOf` t `shouldBe` True
             _          -> expectationFailure "expected text part"
-          -- orRecorded carries the query (secret-free metadata).
           orRecorded res `shouldBe` object
             [ "query" .= ("Haskell runtime" :: Text)
             , "result_count" .= (0 :: Int)
@@ -933,7 +932,7 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Search for ''.\" -> WEB_SEARCH with empty query -> Denied at the gate" $ do
-      let cfg = WebSearchConfig "https://x" [] Nothing
+      let cfg = WebSearchConfig Nothing "https://x" [] Nothing
           op = webSearchOp cfg
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "WEB_SEARCH")
@@ -941,24 +940,25 @@ spec = describe "Seal.ISA.Integration" $ do
       r `shouldBe` Left (Denied "WEB_SEARCH: query is empty")
 
   -- ----------------------------------------------------------------------
-  -- WEB_EXTRACT
+  -- WEB_FETCH
   -- ----------------------------------------------------------------------
-  describe "WEB_EXTRACT" $ do
-    it "\"Fetch the page at https://example.com.\" -> WEB_EXTRACT -> URL accepted, fail-closed result (no HTTP provider)" $ do
-      let cfg = WebExtractConfig
-            { wecAllowList = ["example.com"]
-            , wecMaxBytes = 65536
-            , wecAuthKey = Nothing
+  describe "WEB_FETCH" $ do
+    it "\"Fetch the page at https://example.com.\" -> WEB_FETCH -> URL accepted, fail-closed result (no HTTP manager)" $ do
+      let cfg = WebFetchConfig
+            { wfcManager = Nothing
+            , wfcAllowList = ["example.com"]
+            , wfcMaxBytes = 65536
+            , wfcAuthKey = Nothing
             }
-          op = webExtractOp cfg
+          op = webFetchOp cfg
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "WEB_EXTRACT")
+      r <- runTestApp (dispatchOne reg (OpName "WEB_FETCH")
                         (object ["url" .= ("https://example.com" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` True
           case orParts res of
-            [TrpText t] -> "no HTTP provider" `T.isInfixOf` t `shouldBe` True
+            [TrpText t] -> "no HTTP manager" `T.isInfixOf` t `shouldBe` True
             _          -> expectationFailure "expected text part"
           -- orRecorded captures the URL + placeholder status/bytes (secret-free).
           orRecorded res `shouldBe` object
@@ -968,13 +968,13 @@ spec = describe "Seal.ISA.Integration" $ do
             ]
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-    it "\"Fetch ''.\" -> WEB_EXTRACT with empty url -> Denied at the gate" $ do
-      let cfg = WebExtractConfig [] 65536 Nothing
-          op = webExtractOp cfg
+    it "\"Fetch ''.\" -> WEB_FETCH with empty url -> Denied at the gate" $ do
+      let cfg = WebFetchConfig Nothing [] 65536 Nothing
+          op = webFetchOp cfg
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "WEB_EXTRACT")
+      r <- runTestApp (dispatchOne reg (OpName "WEB_FETCH")
                         (object ["url" .= ("" :: Text)]))
-      r `shouldBe` Left (Denied "WEB_EXTRACT: url is empty")
+      r `shouldBe` Left (Denied "WEB_FETCH: url is empty")
 
   -- ----------------------------------------------------------------------
   -- BROWSER_OPEN / CLICK / READ

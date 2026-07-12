@@ -19,27 +19,29 @@ import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
+import Data.IORef (readIORef)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (UTCTime)
+import Data.Time (UTCTime, getCurrentTime)
+import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.FilePath ((</>))
 
 import Seal.Agent.Def.Backend (adbRead)
-import Seal.Agent.Def.Types (adSystem)
+import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), execBackendFromFile, mkSessionAgentEnv )
+  ( Backends (..), execBackendFromFile, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
   , fcDebugSessionTranscript )
-import Seal.Config.Paths (SealPaths, sessionDir, sessionRequestsPath)
+import Seal.Config.Paths (SealPaths, agentSessionDir, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
@@ -52,11 +54,21 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStatusOp, agentStopOp )
+  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
+  , AgentWorkerBuilder
+  )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
+import Seal.ISA.Ops.Harness
+  ( harnessListOp, harnessStartOp, harnessStopOp )
+import Seal.Harness.Id (newHarnessId)
+import Seal.Harness.Registry (HarnessRegistry)
+import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
+import Seal.Session.Kind (HarnessFlavour (..))
+import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
+import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
@@ -65,11 +77,11 @@ import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..))
+import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
-import Seal.Types.Env (mkEnv)
+import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | The dependencies the send handler needs (the agent-loop plumbing). Built
@@ -97,6 +109,17 @@ data SendDeps = SendDeps
     -- 'Nothing' in tests; in production, set by 'runServeMain'. After each
     -- turn, new entries are read from disk and broadcast as 'BeEntryRecorded'
     -- so the frontend's WS stream updates without a page refresh.
+  , sdHarnessRegistry :: HarnessRegistry
+    -- ^ The live harness registry (shared with the gateway's
+    -- @adHarnessRegistry@). Backs HARNESS_LIST/START/STOP.
+  , sdTmuxRunner  :: TmuxRunner
+    -- ^ The tmux runner (real via 'mkRealTmuxRunner' in production;
+    -- fail-closes to 'HeTmuxMissing' when tmux is absent). Backs
+    -- HARNESS_START/STOP.
+  , sdHttpManager :: Maybe Manager
+    -- ^ The shared HTTP manager (TLS-configured) for WEB_FETCH and
+    -- WEB_SEARCH. 'Nothing' fail-closes those opcodes (they return a
+    -- structured error). Set by 'runServeMain'; tests use 'Nothing'.
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -181,17 +204,20 @@ plainTurn deps meta t = do
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
             agentDefBackend = bAgentDefs (sdBackends deps)
-        mSystem <- case smAgent meta of
-          Nothing -> pure Nothing
-          Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-        let isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              execBackend (sdAutonomy deps)
             caps = ChannelCaps
               { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
               , ccPrompt = \_ -> pure ""  -- web can't prompt inline (deferral is a later phase)
               , ccPromptSecret = \_ -> pure ""
               }
+        mSystem <- case smAgent meta of
+          Nothing -> pure Nothing
+          Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+        let mintSession = webMintSession sid
+            isaReg = buildWebRegistry
+              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              execBackend (sdAutonomy deps) mintSession
+              (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
+              (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
@@ -201,20 +227,34 @@ plainTurn deps meta t = do
         pure result)
 
 -- | Build the ISA registry for a web turn. Mirrors
--- 'Seal.Channels.Signal.Run.buildRegistry' (no AGENT_START worker over the
--- web; sub-agents over the web is a later phase). Includes the Untrusted
--- execution opcodes (SHELL_EXEC, CODE_EXEC, PROCESS_MANAGE, FILE_WRITE,
--- FILE_PATCH, SEARCH_FILES) wired to the per-session 'ExecBackend' and a
--- 'SecurityPolicy' derived from the CLI autonomy level. HARNESS_* opcodes
--- are omitted (they need tmux infrastructure not available over the web).
+-- 'Seal.Channels.Signal.Run.buildRegistry' but includes AGENT_START (the
+-- worker-builder is closed over per-turn values by the caller in
+-- 'plainTurn'). Includes the Untrusted execution opcodes (SHELL_EXEC,
+-- CODE_EXEC, PROCESS_MANAGE, FILE_WRITE, FILE_PATCH, SEARCH_FILES) wired
+-- to the per-session 'ExecBackend' and a 'SecurityPolicy' derived from
+-- the CLI autonomy level. The fail-closed provider-pluggable opcodes
+-- (WEB_SEARCH, WEB_FETCH, BROWSER_OPEN/CLICK/READ, IMAGE_GENERATE/
+-- DESCRIBE, TEXT_TO_SPEECH) are registered with their default fail-closed
+-- providers so they surface as available tools to the LLM and return a
+-- structured error until a real provider is configured. The HARNESS_*
+-- opcodes (LIST/START/STOP) are wired to the shared 'HarnessRegistry' +
+-- 'TmuxRunner'; HARNESS_START uses a fixed tmux session/window (\"seal\" /
+-- \"harness\") and 'HfGeneric' flavour — the 6b wiring that resolves
+-- per-call session/window/flavour from the input is a later phase.
 buildWebRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
-  -> ExecBackend -> Policy.AutonomyLevel -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy =
+  -> ExecBackend -> Policy.AutonomyLevel
+  -> IO SessionId            -- ^ mint a fresh SessionId for a forked agent
+  -> AgentWorkerBuilder       -- ^ the AGENT_START worker (closes over per-turn tHandle/caps/execBackend)
+  -> HarnessRegistry          -- ^ the live harness registry (shared with the gateway)
+  -> TmuxRunner               -- ^ the tmux runner (real via mkRealTmuxRunner; fail-closes when tmux absent)
+  -> Maybe Manager            -- ^ shared HTTP manager for WEB_FETCH / WEB_SEARCH (Nothing = fail-closed)
+  -> ISA.Registry
+buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
+                 mintSession mkWorker harnessReg tmuxRunner httpManager =
   ISA.mkRegistry
     [ showHumanOp simpleCaps
     , askHumanOp simpleCaps
-    , fileReadOp wsRoot operatorCeiling
     , secretGetOp rt
     , memoryWriteOp (bMemory backends) sid
     , memoryRecallOp defaultPageParams (bMemory backends)
@@ -228,14 +268,29 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy =
     , agentDefListOp (bAgentDefs backends)
     , agentDefDeleteOp (bAgentDefs backends)
     , agentInstancesOp (bRuntime backends)
+    , agentStartOp (bAgentDefs backends) (bRuntime backends) mintSession mkWorker
     , agentStatusOp (bRuntime backends)
     , agentStopOp (bRuntime backends)
+    , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+    , fileReadOp wsRoot operatorCeiling
+    , fileWriteOp wsRoot operatorCeiling
+    , filePatchOp wsRoot
     , shellExecOp wsRoot securityPolicy execBackend
     , codeExecOp wsRoot securityPolicy codeAllowList execBackend
     , processManageOp wsRoot securityPolicy execBackend
-    , fileWriteOp wsRoot operatorCeiling
-    , filePatchOp wsRoot
-    , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+    , webFetchOp webFetchCfg
+    , webSearchOp webSearchCfg
+    , harnessListOp harnessReg
+    , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
+        HfGeneric newHarnessId
+    , harnessStopOp harnessReg tmuxRunner
+    -- TODO browser, image, and tts ops
+    -- , browserOpenOp noBrowserDriver
+    -- , browserClickOp noBrowserDriver
+    -- , browserReadOp noBrowserDriver
+    -- , imageGenerateOp noImageProvider
+    -- , imageDescribeOp noImageProvider
+    -- , textToSpeechOp noTtsProvider
     ]
   where
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
@@ -245,6 +300,30 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy =
       , ccPrompt = \_ -> pure ""
       , ccPromptSecret = \_ -> pure ""
       }
+    -- Fail-closed defaults for the provider-pluggable opcodes. These surface
+    -- as available tools to the LLM; the opcodes return a structured error
+    -- until a real provider is configured (operator-supplied via config in a
+    -- follow-up). Empty allow-lists mean all domains are permitted at the
+    -- gate; the fail-closed run path is what enforces the boundary today.
+    webSearchCfg = WebSearchConfig
+      { wscManager   = httpManager
+      , wscEndpoint  = ""
+      , wscAllowList = []
+      , wscAuthKey   = Nothing
+      }
+    webFetchCfg = WebFetchConfig
+      { wfcManager   = httpManager
+      , wfcAllowList = []
+      , wfcMaxBytes  = operatorCeiling
+      , wfcAuthKey   = Nothing
+      }
+    -- Fixed tmux session/window idents for HARNESS_START. The 6b wiring that
+    -- resolves per-call session/window/flavour from the opcode input is a
+    -- later phase; for now every HARNESS_START spawns into the same \"seal\"
+    -- session / \"harness\" window. 'mkTmuxIdent' is total on these literals
+    -- (validated idents), so the 'either (error ...) id' is unreachable.
+    harnessSession = either (error "unreachable: seal is a valid TmuxIdent") id (mkTmuxIdent "seal")
+    harnessWindow  = either (error "unreachable: harness is a valid TmuxIdent") id (mkTmuxIdent "harness")
 
 -- | Run a slash command. The output is collected via a 'ChannelCaps' whose
 -- 'ccSend' appends to an MVar-backed list, then returned as the @response@.
@@ -296,8 +375,12 @@ plainTurnWithCaps deps meta caps t = do
         mSystem <- case smAgent meta of
           Nothing -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-        let isaReg = buildWebRegistry (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              execBackend (sdAutonomy deps)
+        let mintSession = webMintSession sid
+            isaReg = buildWebRegistry
+              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              execBackend (sdAutonomy deps) mintSession
+              (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
+              (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg)
@@ -305,6 +388,51 @@ plainTurnWithCaps deps meta caps t = do
         result <- runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
         pure result)
+
+-- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the CLI's
+-- 'mintAgentSession'). Each start gets its own timestamped id.
+webMintSession :: SessionId -> IO SessionId
+webMintSession fallback = do
+  now <- getCurrentTime
+  case mkSessionId (formatSessionId now) of
+    Right s  -> pure s
+    -- unreachable: formatSessionId only emits digits and dashes
+    Left _e  -> pure fallback
+
+-- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
+-- 'mkWorker': resolve the def's provider+model, open a fresh two-file
+-- transcript under the parent session's agents dir, build a fresh 'AgentEnv'
+-- bound to the child session + transcript, and run the turn loop. The child
+-- shares the parent's 'isaReg' (same tool set) but gets its OWN 'TwoFileHandle'
+-- so its conversation/entries stay separate (the two-file format's
+-- 'erConvLen' and envelope-delta fold are per-session). Web 'ChannelCaps' are
+-- no-op (replies surface via transcript poll), so provider-resolution errors
+-- are swallowed here and surface only in the agent transcript.
+webMkWorker
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
+  -> Either a FileConfig -> ISA.Registry -> AgentWorkerBuilder
+webMkWorker deps paths parentSid caps execBackend appEnv eCfg isaReg def childSid = do
+  let childDir = agentSessionDir paths parentSid childSid
+  createDirectoryIfMissing True childDir
+  -- Resolve the def's provider+model. Empty fields fall back to the parent
+  -- session's provider+model (symmetric with the CLI). A non-empty-but-unknown
+  -- provider fails; the error surfaces in the agent transcript (web caps are
+  -- no-op so we can't ccSend it).
+  active <- readIORef (srActive (sdSession deps))
+  let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+      fallBackModel = case adModel def of
+        ModelId m | T.null m -> smModel active
+                  | otherwise -> m
+  eChildProv <- resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
+  case eChildProv of
+    Left _err             -> pure ()  -- web caps are no-op; error logged via transcript
+    Right (childProv, childModel) ->
+      withTwoFileTranscript childDir $ \childTHandle -> do
+        let childEnv = mkSessionAgentEnv
+              caps childProv fallBackProvider childModel childSid
+              (adSystem def) isaReg childTHandle execBackend
+              (debugPath paths childSid eCfg)
+        runApp appEnv (runTurn childEnv "")
 
 -- | Extract the 'Text' from a 'ModelId'.
 modelText :: ModelId -> Text

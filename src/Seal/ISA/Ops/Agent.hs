@@ -31,6 +31,7 @@ module Seal.ISA.Ops.Agent
   , agentStartOp
   , agentStatusOp
   , agentStopOp
+  , AgentWorkerBuilder
   ) where
 
 import Control.Monad.IO.Class (liftIO)

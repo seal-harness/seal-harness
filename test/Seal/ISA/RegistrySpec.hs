@@ -30,3 +30,10 @@ spec = describe "Seal.ISA.Registry" $ do
     fmap opName (lookupOp reg (OpName "Z")) `shouldBe` Nothing
   it "derives one ToolDefinition per opcode" $
     map tdName (registryToolDefs reg) `shouldMatchList` [OpName "A", OpName "B"]
+  it "emits tool definitions in registration order (not alphabetical)" $ do
+    let regOrdered = mkRegistry
+          [ stubTrustedOp (OpName "Z")
+          , stubTrustedOp (OpName "A")
+          , stubTrustedOp (OpName "M")
+          ]
+    map tdName (registryToolDefs regOrdered) `shouldBe` [OpName "Z", OpName "A", OpName "M"]

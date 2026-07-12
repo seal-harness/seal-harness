@@ -110,7 +110,7 @@ library
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
         Seal.Web.Search
-        Seal.Web.Extract
+        Seal.Web.Fetch
         Seal.Web.Browser
         Seal.Web.UiState
         Seal.Media.Image
@@ -322,7 +322,7 @@ test-suite tests
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec
         Seal.Web.SearchSpec
-        Seal.Web.ExtractSpec
+        Seal.Web.FetchSpec
         Seal.Web.BrowserSpec
         Seal.Media.ImageSpec
         Seal.Media.TtsSpec
