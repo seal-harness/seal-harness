@@ -343,6 +343,7 @@ test-suite tests
         Seal.Vault.CommandsSpec
         Seal.Agent.LoopSpec
         Seal.ISA.DispatchSpec
+        Seal.ISA.IntegrationSpec
         Seal.ISA.Ops.HumanSpec
         Seal.ISA.Ops.FileSpec
         Seal.ISA.Ops.ShellSpec

@@ -10,10 +10,10 @@
 --    4-phase workflow.
 -- 2. It defines three sub-agent definitions: @architect-agent@ (planning),
 --    @coder-agent@ (implementation), and @code-review-agent@ (adversarial
---    review) via @AGENT_DEF_CREATE@.
+--    review) via @AGENT_DEF_WRITE@.
 -- 3. It starts all three via @AGENT_START@ (they fork as workers).
 -- 4. It verifies all three are @Running@ via @AGENT_STATUS@.
--- 5. It lists them via @AGENT_LIST@.
+-- 5. It lists them via @AGENT_INSTANCES@.
 -- 6. It stops all three via @AGENT_STOP@.
 --
 -- The workers are stub @IO ()@ actions that increment a counter and sleep,
@@ -47,12 +47,12 @@ import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend, OpResult (..))
 import Seal.ISA.Ops.Agent
-  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp, agentListOp
-  , agentStartOp, agentStatusOp, agentStopOp )
+  ( agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp )
 import Seal.ISA.Ops.Skills
-  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+  ( skillWriteOp, skillListOp, skillReadOp, skillDeleteOp )
 import Seal.ISA.Ops.Memory
-  ( memoryStoreOp, memoryRecallOp, memoryUpdateOp, memoryDeleteOp )
+  ( memoryWriteOp, memoryRecallOp, memoryDeleteOp )
 import Seal.ISA.Registry qualified as ISA
 import Seal.Memory.Backend qualified as Mem
 import Seal.Providers.Class
@@ -97,18 +97,18 @@ buildRegistry cfgRoot workerRan sid = do
   defBackend   <- Def.markdownAgentDefBackend (cfgRoot </> "agents") repo
   rt           <- newAgentRuntime
   pure $ ISA.mkRegistry
-    [ memoryStoreOp memBackend sid
+    [ memoryWriteOp memBackend sid
     , memoryRecallOp defaultPageParams memBackend
-    , memoryUpdateOp memBackend
     , memoryDeleteOp memBackend
-    , skillCreateOp skillBackend sid
+    , skillWriteOp skillBackend sid
     , skillReadOp skillBackend
-    , skillUpdateOp skillBackend
+    , skillDeleteOp skillBackend
     , skillListOp skillBackend
-    , agentDefCreateOp defBackend sid
+    , agentDefWriteOp defBackend sid
     , agentDefReadOp defBackend
-    , agentDefUpdateOp defBackend
-    , agentListOp rt
+    , agentDefListOp defBackend
+    , agentDefDeleteOp defBackend
+    , agentInstancesOp rt
     , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
     , agentStatusOp rt
     , agentStopOp rt
@@ -127,32 +127,32 @@ orchestratedExecutionSkill = T.unlines
 -- | The orchestrator's first-turn script: emit tool calls to
 --
 --   1. SKILL_READ the orchestrated-execution skill,
---   2. AGENT_DEF_CREATE for all three sub-agents,
+--   2. AGENT_DEF_WRITE for all three sub-agents,
 --   3. AGENT_START for all three sub-agents,
 --
 --   then a second response with AGENT_STATUS for each, then a third response
---   with AGENT_LIST, then a final text response.
+--   with AGENT_INSTANCES, then a final text response.
 orchestratorScript :: [CompletionResponse]
 orchestratorScript =
   -- Response 1: read skill + define 3 agents
   [ CompletionResponse
       [ CbToolUse (ToolCallId "t1") (OpName "SKILL_READ")
           (object ["id" .= ("orchestrated-execution" :: Text)])
-      , CbToolUse (ToolCallId "t2") (OpName "AGENT_DEF_CREATE")
+      , CbToolUse (ToolCallId "t2") (OpName "AGENT_DEF_WRITE")
           (object
             [ "id" .= ("architect-agent" :: Text)
             , "name" .= ("Architect Agent" :: Text)
             , "provider" .= ("ollama" :: Text)
             , "model" .= ("glm-5.2:cloud" :: Text)
             ])
-      , CbToolUse (ToolCallId "t3") (OpName "AGENT_DEF_CREATE")
+      , CbToolUse (ToolCallId "t3") (OpName "AGENT_DEF_WRITE")
           (object
             [ "id" .= ("coder-agent" :: Text)
             , "name" .= ("Coder Agent" :: Text)
             , "provider" .= ("ollama" :: Text)
             , "model" .= ("glm-5.2:cloud" :: Text)
             ])
-      , CbToolUse (ToolCallId "t4") (OpName "AGENT_DEF_CREATE")
+      , CbToolUse (ToolCallId "t4") (OpName "AGENT_DEF_WRITE")
           (object
             [ "id" .= ("code-review-agent" :: Text)
             , "name" .= ("Code Review Agent" :: Text)
@@ -186,7 +186,7 @@ orchestratorScript =
       (Usage 0 0)
   -- Response 4: list all running agents
   , CompletionResponse
-      [ CbToolUse (ToolCallId "t11") (OpName "AGENT_LIST") (object []) ]
+      [ CbToolUse (ToolCallId "t11") (OpName "AGENT_INSTANCES") (object []) ]
       StopToolUse
       (Usage 0 0)
   -- Response 5: stop all 3 agents
@@ -294,7 +294,7 @@ spec = describe "Metaswarm orchestration integration" $ do
       rt <- newAgentRuntime
       let sid = sampleSession
           reg = ISA.mkRegistry
-            [ agentDefCreateOp defBackend sid
+            [ agentDefWriteOp defBackend sid
             , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
             , agentStatusOp rt
             , agentStopOp rt
@@ -302,7 +302,7 @@ spec = describe "Metaswarm orchestration integration" $ do
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent.
       _ <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder)
-                         (OpName "AGENT_DEF_CREATE")
+                         (OpName "AGENT_DEF_WRITE")
                          (object
                            [ "id" .= ("coder-agent" :: Text)
                            , "name" .= ("Coder Agent" :: Text)

@@ -31,12 +31,12 @@ import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend)
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.ISA.Ops.Agent
-  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp, agentListOp
+  ( agentDefWriteOp, agentDefReadOp, agentInstancesOp
   , agentStartOp, agentStatusOp, agentStopOp )
 import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
+  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Skills
-  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Registry qualified as ISA
 import Seal.Memory.Backend qualified as Mem
 import Seal.Providers.Class
@@ -65,24 +65,24 @@ sampleSession :: SessionId
 sampleSession = SessionId "s1"
 
 -- | The script for the capstone turn: the model emits four tool calls in one
--- response (MEMORY_STORE, MEMORY_RECALL, SKILL_CREATE, AGENT_DEF_CREATE), then
+-- response (MEMORY_WRITE, MEMORY_RECALL, SKILL_WRITE, AGENT_DEF_WRITE), then
 -- a final text response.
 capstoneScript :: [CompletionResponse]
 capstoneScript =
   [ CompletionResponse
-      [ CbToolUse (ToolCallId "t1") (OpName "MEMORY_STORE")
+      [ CbToolUse (ToolCallId "t1") (OpName "MEMORY_WRITE")
           (object
             [ "id" .= ("greeting" :: Text)
             , "content" .= ("hello world" :: Text)
             ])
       , CbToolUse (ToolCallId "t2") (OpName "MEMORY_RECALL") (object [])
-      , CbToolUse (ToolCallId "t3") (OpName "SKILL_CREATE")
+      , CbToolUse (ToolCallId "t3") (OpName "SKILL_WRITE")
           (object
             [ "id" .= ("greet" :: Text)
             , "description" .= ("greeting skill" :: Text)
             , "body" .= ("say hello warmly" :: Text)
             ])
-      , CbToolUse (ToolCallId "t4") (OpName "AGENT_DEF_CREATE")
+      , CbToolUse (ToolCallId "t4") (OpName "AGENT_DEF_WRITE")
           (object
             [ "id" .= ("worker" :: Text)
             , "name" .= ("worker" :: Text)
@@ -104,18 +104,16 @@ buildRegistry cfgRoot workerRan sid = do
   defBackend    <- Def.markdownAgentDefBackend (cfgRoot </> "agents") repo
   rt            <- newAgentRuntime
   pure $ ISA.mkRegistry
-    [ memoryStoreOp memBackend sid
+    [ memoryWriteOp memBackend sid
     , memoryRecallOp defaultPageParams memBackend
-    , memoryUpdateOp memBackend
     , memoryDeleteOp memBackend
-    , skillCreateOp skillBackend sid
+    , skillWriteOp skillBackend sid
     , skillReadOp skillBackend
-    , skillUpdateOp skillBackend
     , skillListOp skillBackend
-    , agentDefCreateOp defBackend sid
+    , skillDeleteOp skillBackend
+    , agentDefWriteOp defBackend sid
     , agentDefReadOp defBackend
-    , agentDefUpdateOp defBackend
-    , agentListOp rt
+    , agentInstancesOp rt
     , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
     , agentStatusOp rt
     , agentStopOp rt
@@ -123,7 +121,7 @@ buildRegistry cfgRoot workerRan sid = do
 
 spec :: Spec
 spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
-  it "one chat turn: MEMORY_STORE + RECALL + SKILL_CREATE + AGENT_DEF_CREATE — files land on disk + git, transcript in two-file format" $
+  it "one chat turn: MEMORY_WRITE + RECALL + SKILL_WRITE + AGENT_DEF_WRITE — files land on disk + git, transcript in two-file format" $
     withSystemTempDirectory "seal-phase5" $ \root -> do
       let cfgRoot = root </> "config"
       ensureConfigRepo cfgRoot
@@ -174,14 +172,14 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       rt <- newAgentRuntime
       let sid = sampleSession
           reg = ISA.mkRegistry
-            [ agentDefCreateOp defBackend sid
+            [ agentDefWriteOp defBackend sid
             , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
             , agentStatusOp rt
             , agentStopOp rt
             ]
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
-      _ <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_DEF_CREATE")
+      _ <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_DEF_WRITE")
                          (object
                            [ "id" .= ("worker" :: Text)
                            , "name" .= ("worker" :: Text)

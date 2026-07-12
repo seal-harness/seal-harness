@@ -46,13 +46,13 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
+  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Skills
-  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
-  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
-  , agentListOp, agentStatusOp, agentStopOp )
+  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
+  , agentInstancesOp, agentStatusOp, agentStopOp )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -216,18 +216,18 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy =
     , askHumanOp simpleCaps
     , fileReadOp wsRoot operatorCeiling
     , secretGetOp rt
-    , memoryStoreOp (bMemory backends) sid
+    , memoryWriteOp (bMemory backends) sid
     , memoryRecallOp defaultPageParams (bMemory backends)
-    , memoryUpdateOp (bMemory backends)
     , memoryDeleteOp (bMemory backends)
-    , skillCreateOp (bSkills backends) sid
+    , skillWriteOp (bSkills backends) sid
     , skillReadOp (bSkills backends)
-    , skillUpdateOp (bSkills backends)
     , skillListOp (bSkills backends)
-    , agentDefCreateOp (bAgentDefs backends) sid
+    , skillDeleteOp (bSkills backends)
+    , agentDefWriteOp (bAgentDefs backends) sid
     , agentDefReadOp (bAgentDefs backends)
-    , agentDefUpdateOp (bAgentDefs backends)
-    , agentListOp (bRuntime backends)
+    , agentDefListOp (bAgentDefs backends)
+    , agentDefDeleteOp (bAgentDefs backends)
+    , agentInstancesOp (bRuntime backends)
     , agentStatusOp (bRuntime backends)
     , agentStopOp (bRuntime backends)
     , shellExecOp wsRoot securityPolicy execBackend
