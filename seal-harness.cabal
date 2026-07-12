@@ -283,6 +283,7 @@ test-suite tests
         Seal.Phase7aSpec
         Seal.Phase5Spec
         Seal.Phase4Spec
+        Seal.MetaswarmOrchestrationSpec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Channel.CliSpec
