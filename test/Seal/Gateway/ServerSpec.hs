@@ -24,6 +24,7 @@ import Seal.Session.Store (SessionRuntime (..))
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "" }
@@ -45,6 +46,7 @@ mkDeps = do
   reg   <- newHarnessRegistry
   adb   <- noneBackend
   activeRef <- newIORef fakeMeta
+  uiState <- newUiStateHandle fakePaths
   let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
   pure (ApiDeps
     { adSessionRuntime = sr
@@ -53,6 +55,7 @@ mkDeps = do
     , adAdoptConsent = Just CcWeb
     , adAgentDefs = adb
     , adProviders = pure knownProviders
+    , adUiState = uiState
     , adSend = Nothing
     })
 

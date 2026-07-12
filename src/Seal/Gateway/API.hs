@@ -44,6 +44,9 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, newSession)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
+import Seal.Web.UiState
+  ( LastOptions (..), UiState (..), UiStateHandle
+  , addCustomModel, getUiState, setLastOptions )
 
 -- | The dependencies the API needs (injected so the test can supply fakes).
 data ApiDeps = ApiDeps
@@ -53,6 +56,7 @@ data ApiDeps = ApiDeps
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11)
   , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
+  , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   }
 
@@ -142,6 +146,28 @@ apiApp deps req respond =
         [ "contextWindow" .= modelContextWindow m
         , "maxOutputTokens" .= modelMaxOutputTokens m
         ]))
+    -- GET /api/ui/state -> the persisted last-chosen "new tab" options and
+    -- the custom-model id history. The frontend loads this on mount so the
+    -- form opens with the last-used selection; the custom-model combobox
+    -- is populated from the history list.
+    (m', ["api", "ui", "state"]) | m' == methodGet -> do
+      st <- getUiState (adUiState deps)
+      respond (jsonLBS status200 (A.encode (uiStateJson st)))
+    -- PUT /api/ui/state -> replace the last-chosen options. The body is the
+    -- `last_options` object (the frontend's NewTabSpec shape). Custom-model
+    -- history is NOT touched here (it's append-only via /api/ui/custom-models).
+    (m', ["api", "ui", "state"]) | m' == methodPut -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleUiStatePut deps v
+        Nothing -> respond (errJson status400 "invalid JSON body")
+    -- POST /api/ui/custom-models -> add a custom model id to the persisted
+    -- history. Body: { "model": "<id>" }. Idempotent + deduped + capped.
+    (m', ["api", "ui", "custom-models"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleUiCustomModelAdd deps v
+        Nothing -> respond (errJson status400 "invalid JSON body")
     (m', ["api", "tabs", "new"]) | m' == methodPost -> do
       body <- collectBody req
       case A.decode body :: Maybe A.Value of
@@ -255,6 +281,45 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | Encode the persisted 'UiState' for GET /api/ui/state. The shape mirrors
+-- the on-disk JSON: an object with @last_options@ (the LastOptions record)
+-- and @custom_models@ (a list of strings, most-recent first).
+uiStateJson :: UiState -> Value
+uiStateJson s = object
+  [ "last_options"  .= usLastOptions s
+  , "custom_models" .= usCustomModels s
+  ]
+
+-- | Handle PUT /api/ui/state. The body is the @last_options@ object (the
+-- frontend's NewTabSpec shape). Decodes the `kind` field defensively (the
+-- frontend always sends it); an invalid body yields a 400.
+handleUiStatePut :: ApiDeps -> A.Value -> IO Response
+handleUiStatePut deps v =
+  case A.fromJSON v :: A.Result LastOptions of
+    A.Success opts -> do
+      setLastOptions (adUiState deps) opts
+      pure (jsonOk (object ["ok" .= True]))
+    A.Error err     -> pure (errJson status400 ("invalid last_options: " <> T.pack err))
+
+-- | Handle POST /api/ui/custom-models. The body is @{"model":"<id>"}@. A
+-- blank/missing model is a no-op success (the frontend shouldn't send one,
+-- but the store is defensive).
+handleUiCustomModelAdd :: ApiDeps -> A.Value -> IO Response
+handleUiCustomModelAdd deps v = do
+  let mModel = parseModelField v
+  case mModel of
+    Nothing -> pure (errJson status400 "missing 'model' field")
+    Just m  -> do
+      addCustomModel (adUiState deps) m
+      pure (jsonOk (object ["ok" .= True]))
+
+-- | Parse the @model@ field from a JSON body.
+parseModelField :: A.Value -> Maybe Text
+parseModelField (A.Object o) = case KeyMap.lookup (Key.fromText "model") o of
+  Just (A.String t) -> Just t
+  _                -> Nothing
+parseModelField _ = Nothing
 
 -- | Parse the @harness_id@ field (the flavour-name or @custom:<binary>@
 -- encoding) into the tab's label.
@@ -477,7 +542,7 @@ errJson st msg = responseLBS st (corsHeaders <> [jsonHeader])
 corsHeaders :: [Header]
 corsHeaders =
   [ (mkHN "Access-Control-Allow-Origin", "*")
-  , (mkHN "Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+  , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
   , (mkHN "Access-Control-Allow-Headers", "Content-Type")
   ]
 

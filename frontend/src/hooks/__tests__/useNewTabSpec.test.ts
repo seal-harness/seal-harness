@@ -2,12 +2,20 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { useNewTabSpec } from '../useNewTabSpec'
 
+// The persisted UI state to return from GET /api/ui/state. Tests can override
+// via `setUiStateResponse`.
+let uiStateResponse: unknown = { last_options: null, custom_models: [] }
+
 beforeEach(() => {
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+  uiStateResponse = { last_options: null, custom_models: [] }
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (url === '/api/agents') return new Response(JSON.stringify([{ name: 'dev', isDefault: true }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/providers') return new Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/providers/anthropic/models') return new Response(JSON.stringify([{ name: 'claude-sonnet-4', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/harnesses/discover') return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/ui/state' && (!init || init.method === 'GET')) return new Response(JSON.stringify(uiStateResponse), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/ui/state' && init?.method === 'PUT') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/ui/custom-models' && init?.method === 'POST') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
     return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
   }))
 })
@@ -71,5 +79,39 @@ describe('useNewTabSpec', () => {
     await waitFor(() => expect(result.current.providersLoaded).toBe(true))
     act(() => result.current.setKind('attach'))
     expect(result.current.validationError).toBe('Pick or enter a session to attach to')
+  })
+
+  it('loads customModels from the persisted UI state', async () => {
+    uiStateResponse = { last_options: null, custom_models: ['claude-3-opus', 'gpt-4o'] }
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.customModels).toEqual(['claude-3-opus', 'gpt-4o']))
+  })
+
+  it('persistOnSubmit PUTs last_options and records the custom model', async () => {
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
+    act(() => {
+      result.current.handleModelSelectChange('__custom__')
+      result.current.setModel('claude-3-opus-20240229')
+    })
+    act(() => result.current.persistOnSubmit())
+    await waitFor(() => {
+      const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+      const put = calls.find(([u, init]) => u === '/api/ui/state' && init?.method === 'PUT')
+      const add = calls.find(([u, init]) => u === '/api/ui/custom-models' && init?.method === 'POST')
+      expect(put).toBeTruthy()
+      expect(add).toBeTruthy()
+      if (put) {
+        const body = JSON.parse((put[1]!.body as string))
+        expect(body.model).toBe('claude-3-opus-20240229')
+        expect(body.useCustomModel).toBe(true)
+      }
+      if (add) {
+        const body = JSON.parse((add[1]!.body as string))
+        expect(body.model).toBe('claude-3-opus-20240229')
+      }
+    })
+    // The custom-model list is updated optimistically.
+    expect(result.current.customModels).toContain('claude-3-opus-20240229')
   })
 })

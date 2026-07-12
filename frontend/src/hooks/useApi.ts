@@ -521,3 +521,66 @@ export async function adoptWindow(
     return { ok: false, sessionId: null }
   }
 }
+
+// ── UI state (persisted "new tab" recall) ───────────────────────────────
+
+/** The last-chosen "new tab" form selection, persisted server-side so it
+ *  survives restarts. Mirrors the backend's `LastOptions` shape (snake_case
+ *  keys match the wire). Only user-selectable fields are stored; the
+ *  transient model list + validation state are NOT. */
+export interface LastOptions {
+  kind: string
+  provider: string
+  model: string
+  useCustomModel: boolean
+  agent: string
+  flavour: string
+  customBinary: string
+  attachSession: string
+  attachWindow: string
+  attachManual: boolean
+}
+
+/** The persisted UI state: the last-chosen options + the custom-model id
+ *  history (most-recent first, deduped, capped server-side). */
+export interface UiState {
+  last_options: LastOptions | null
+  custom_models: string[]
+}
+
+/** Fetch the persisted UI state. Returns null on any failure (the caller
+ *  falls back to defaults). */
+export async function fetchUiState(): Promise<UiState | null> {
+  return fetchJson<UiState>('/api/ui/state')
+}
+
+/** Replace the last-chosen form selection. Best-effort; a failure is
+ *  swallowed (the UI still works within the session, just without
+ *  cross-restart recall). */
+export async function putUiState(opts: LastOptions): Promise<boolean> {
+  try {
+    const res = await fetch('/api/ui/state', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Add a custom model id to the persisted history. Best-effort; the server
+ *  dedupes + caps. */
+export async function addCustomModel(model: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/ui/custom-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}

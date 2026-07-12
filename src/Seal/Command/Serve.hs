@@ -40,6 +40,7 @@ import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
+import Seal.Web.UiState (newUiStateHandle)
 
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
@@ -73,6 +74,7 @@ runServeMain autonomy = do
   backends <- newBackends cfgRoot repo
   tabsH   <- newTabsHandle
   reg     <- newHarnessRegistry
+  uiState <- newUiStateHandle paths
   -- Build an in-memory active session (NOT persisted to disk) so the
   -- active-session ref has valid provider/model fallbacks. The session
   -- only lands on disk when the user sends the first message (the web send
@@ -127,6 +129,7 @@ runServeMain autonomy = do
             -- vault handle is read from the same ref the commands use.
             mh <- readIORef (vrHandleRef rt)
             configuredProviders mh cfg
+        , adUiState         = uiState
         , adSend            = Just sendDeps
         }
   -- Start the WS stream server on the WS port.

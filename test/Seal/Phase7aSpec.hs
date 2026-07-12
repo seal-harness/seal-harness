@@ -32,6 +32,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tabs (newTabsHandle)
+import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "" }
@@ -54,6 +55,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     reg   <- newHarnessRegistry
     adb   <- noneBackend
     activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle fakePaths
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
           { adSessionRuntime = sr
@@ -62,6 +64,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adProviders = pure knownProviders
+          , adUiState = uiState
           , adSend = Nothing
           }
         app = gatewayApp deps Nothing
@@ -93,6 +96,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     reg   <- newHarnessRegistry
     adb   <- noneBackend
     activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle fakePaths
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
           { adSessionRuntime = sr
@@ -101,6 +105,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
           , adProviders = pure knownProviders
+          , adUiState = uiState
           , adSend = Nothing
           }
         app = gatewayApp deps Nothing

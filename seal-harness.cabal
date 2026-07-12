@@ -112,6 +112,7 @@ library
         Seal.Web.Search
         Seal.Web.Extract
         Seal.Web.Browser
+        Seal.Web.UiState
         Seal.Media.Image
         Seal.Media.Tts
          Seal.Gateway.Config

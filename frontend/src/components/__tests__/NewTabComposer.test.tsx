@@ -44,6 +44,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     agent: 'dev',
     agents: [makeAgent()],
     handleAgentChange: vi.fn(),
+    customModels: [],
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
@@ -61,6 +62,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     scanDiscoverable: vi.fn(async () => {}),
     validationError: null,
     buildBody: vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })),
+    persistOnSubmit: vi.fn(),
   }
   return { ...base, ...overrides }
 }
@@ -90,6 +92,38 @@ describe('NewTabComposer — provider kind', () => {
     fireEvent.click(screen.getByLabelText('Submit new tab'))
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
     expect(createTab).toHaveBeenCalled()
+  })
+
+  it('submit calls persistOnSubmit after a successful createTab', async () => {
+    const persistOnSubmit = vi.fn()
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ persistOnSubmit })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() => expect(persistOnSubmit).toHaveBeenCalled())
+    expect(onSubmit).toHaveBeenCalled()
+  })
+
+  it('custom model input renders a combobox (datalist) populated with customModels', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ useCustomModel: true, model: '', customModels: ['claude-3-opus', 'gpt-4o'] })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const input = screen.getByLabelText('Custom Model') as HTMLInputElement
+    expect(input).toBeTruthy()
+    expect(input.getAttribute('list')).toBe('provider-model-custom-list')
+    const list = document.getElementById('provider-model-custom-list') as HTMLDataListElement
+    expect(list).toBeTruthy()
+    const opts = Array.from(list.querySelectorAll('option')).map((o) => o.getAttribute('value'))
+    expect(opts).toEqual(['claude-3-opus', 'gpt-4o'])
   })
 })
 

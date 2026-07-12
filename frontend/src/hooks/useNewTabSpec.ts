@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
-import { useAgents, useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody } from './useApi'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useAgents, useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, type LastOptions } from './useApi'
 import type { AgentInfo, DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
@@ -41,6 +41,11 @@ export interface NewTabSpec {
   agents: AgentInfo[]
   handleAgentChange: (v: string) => void
 
+  /** Custom model ids the user has typed before, most-recent first, deduped.
+   *  Loaded from the persisted UI state on mount; the combobox offers these
+   *  as suggestions. Populated by `recordCustomModel` on submit. */
+  customModels: string[]
+
   // Harness
   flavour: HarnessFlavour
   setFlavour: (v: HarnessFlavour) => void
@@ -64,6 +69,10 @@ export interface NewTabSpec {
   validationError: string | null
   /** Build the flat POST /api/tabs/new body (T10's CreateTabBody shape). */
   buildBody: () => CreateTabBody
+  /** Persist the current form selection as the last-chosen options so the
+   *  next "new tab" opens with the same values. Also records the custom
+   *  model (if any) to the history. Best-effort; failures are swallowed. */
+  persistOnSubmit: () => void
 }
 
 export function useNewTabSpec(): NewTabSpec {
@@ -82,6 +91,15 @@ export function useNewTabSpec(): NewTabSpec {
   const { agents } = useAgents()
   const [agent, setAgent] = useState<string>('')
   const [agentTouched, setAgentTouched] = useState(false)
+
+  // Custom-model history (loaded from persisted UI state). The combobox
+  // offers these as suggestions; `recordCustomModel` appends on submit.
+  const [customModels, setCustomModels] = useState<string[]>([])
+  // When lastOptions restores a provider+model, the model-fetch effect
+  // would normally clobber the restored model with the provider's default.
+  // `pendingRestoreModel` holds the restored model id so the fetch effect
+  // prefers it over the default; it's cleared once consumed.
+  const pendingRestoreModel = useRef<string | null>(null)
 
   // Harness
   const [flavour, setFlavour] = useState<HarnessFlavour>('claude-code')
@@ -107,6 +125,44 @@ export function useNewTabSpec(): NewTabSpec {
     void scanDiscoverable()
   }, [kind, attachScanned, scanDiscoverable])
 
+  // Load the persisted last-options + custom-model history on mount so the
+  // form opens with the last-used selection. The provider+model restore is
+  // staged via `pendingRestoreModel` so the model-fetch effect (which fires
+  // when the provider effect lands) honors the restored id instead of the
+  // provider's configured default. Runs once (the ref guards against
+  // StrictMode double-invoke without cancelling an in-flight fetch).
+  const restoredRef = useRef(false)
+  useEffect(() => {
+    if (restoredRef.current) return
+    restoredRef.current = true
+    void fetchUiState().then((st) => {
+      if (!st) return
+      const models = Array.isArray(st.custom_models) ? st.custom_models : []
+      if (models.length > 0) setCustomModels(models)
+      const opts = st.last_options
+      if (!opts) return
+      setKind(opts.kind as NewTabKind)
+      if (opts.flavour) setFlavour(opts.flavour as HarnessFlavour)
+      if (opts.customBinary) setCustomBinary(opts.customBinary)
+      if (opts.attachSession) setAttachSession(opts.attachSession)
+      if (opts.attachWindow) setAttachWindow(opts.attachWindow)
+      if (opts.attachManual) setAttachManual(true)
+      if (opts.agent) {
+        setAgent(opts.agent)
+        setAgentTouched(true)
+      }
+      // Provider + model: stage the model so the model-fetch effect (which
+      // fires when the restored provider lands) honors it instead of the
+      // configured default. The fetch effect clears the ref once consumed.
+      if (opts.provider) setProvider(opts.provider)
+      if (opts.model) {
+        pendingRestoreModel.current = opts.model
+        if (opts.useCustomModel) setUseCustomModel(true)
+      }
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Default the provider to whatever Seal is configured to use (the entry
   // marked isDefault by the backend), or — failing that — the first one.
   useEffect(() => {
@@ -120,7 +176,9 @@ export function useNewTabSpec(): NewTabSpec {
 
   // Fetch the model list when the provider changes (and we're in provider
   // mode). Pre-select the configured default if it appears in the list,
-  // otherwise fall back to the first entry.
+  // otherwise fall back to the first entry. When a `pendingRestoreModel`
+  // is set (from the persisted last-options), prefer it over the default
+  // and clear the pending ref once consumed.
   useEffect(() => {
     if (kind !== 'provider' || !provider) return
     let cancelled = false
@@ -131,9 +189,23 @@ export function useNewTabSpec(): NewTabSpec {
       if (cancelled) return
       setModels(rows)
       setModelsLoading(false)
+      const names = rows.map((r) => r.name)
+      const restored = pendingRestoreModel.current
+      pendingRestoreModel.current = null
+      if (restored && names.includes(restored)) {
+        setUseCustomModel(false)
+        setModel(restored)
+        return
+      }
+      // A restored custom model (useCustomModel=true) isn't in the provider's
+      // static list — keep the custom flag + the restored id.
+      if (restored) {
+        setUseCustomModel(true)
+        setModel(restored)
+        return
+      }
       setUseCustomModel(false)
       const dflt = info?.defaultModel
-      const names = rows.map((r) => r.name)
       if (dflt && names.includes(dflt)) {
         setModel(dflt)
       } else {
@@ -205,12 +277,40 @@ export function useNewTabSpec(): NewTabSpec {
     return { kind: 'attach', harness_id: attachSession }
   }, [kind, provider, model, agent, flavour, customBinary, attachSession])
 
+  // Persist the current form selection + record the custom model (if any).
+  // Best-effort; failures are swallowed (the UI still works within the
+  // session, just without cross-restart recall). Fires after a successful
+  // submit so the next "new tab" opens with the same values.
+  const persistOnSubmit = useCallback(() => {
+    const opts: LastOptions = {
+      kind,
+      provider,
+      model: model.trim(),
+      useCustomModel,
+      agent: agent.trim(),
+      flavour,
+      customBinary: customBinary.trim(),
+      attachSession,
+      attachWindow,
+      attachManual,
+    }
+    void putUiState(opts)
+    if (useCustomModel && model.trim()) {
+      void addCustomModel(model.trim())
+      setCustomModels((prev) => {
+        const next = [model.trim(), ...prev.filter((m) => m !== model.trim())]
+        return next.slice(0, 32)
+      })
+    }
+  }, [kind, provider, model, useCustomModel, agent, flavour, customBinary, attachSession, attachWindow, attachManual])
+
   return {
     kind, setKind,
     configuredProviders, providersLoaded,
     provider, setProvider,
     model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
     agent, agents, handleAgentChange,
+    customModels,
     flavour, setFlavour,
     customBinary, setCustomBinary,
     attachSession, setAttachSession,
@@ -220,5 +320,6 @@ export function useNewTabSpec(): NewTabSpec {
     discoverableWindows, discoveryError, scanDiscoverable,
     validationError,
     buildBody,
+    persistOnSubmit,
   }
 }

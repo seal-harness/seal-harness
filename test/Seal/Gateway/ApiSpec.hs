@@ -46,6 +46,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Web.UiState (newUiStateHandle)
 
 -- | A provider that returns a scripted list of responses, one per call
 -- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
@@ -128,6 +129,27 @@ runAppBody app req = do
     pure ResponseReceived)
   takeMVar mv
 
+-- | Build 'ApiDeps' against the given paths with the common test fakes.
+-- Used by the transcript tests that need a per-test temp dir.
+mkDepsFor :: SealPaths -> IO ApiDeps
+mkDepsFor paths = do
+  tabsH <- newTabsHandle
+  reg   <- newHarnessRegistry
+  adb   <- noneBackend
+  activeRef <- newIORef fakeMeta
+  uiState <- newUiStateHandle paths
+  let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+  pure ApiDeps
+    { adSessionRuntime  = sr
+    , adTabsHandle      = tabsH
+    , adHarnessRegistry = reg
+    , adAdoptConsent    = Just CcWeb
+    , adAgentDefs       = adb
+    , adProviders       = pure knownProviders
+    , adUiState         = uiState
+    , adSend            = Nothing
+    }
+
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
   -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
@@ -142,22 +164,7 @@ spec = describe "Seal.Gateway.API" $ do
     pure dir
 
   let mkPaths = fakePaths { spState = sharedStateDir }
-      mkApp = do
-        tabsH <- newTabsHandle
-        reg   <- newHarnessRegistry
-        adb   <- noneBackend
-        activeRef <- newIORef fakeMeta
-        let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
-            deps = ApiDeps
-              { adSessionRuntime  = sr
-              , adTabsHandle      = tabsH
-              , adHarnessRegistry = reg
-              , adAdoptConsent    = Just CcWeb
-              , adAgentDefs       = adb
-              , adProviders       = pure knownProviders
-              , adSend            = Nothing
-              }
-        pure (apiApp deps)
+      mkApp = apiApp <$> mkDepsFor mkPaths
 
   it "GET /api/health returns 200" $ do
     app <- mkApp
@@ -302,21 +309,8 @@ spec = describe "Seal.Gateway.API" $ do
       BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
       -- No session.json -> smModel fallback is fine for this test; the
       -- active IORef holds fakeMeta so the model comes from there.
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -384,21 +378,8 @@ spec = describe "Seal.Gateway.API" $ do
                   , Message Assistant [CbText "done"]
                   ]
       BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -488,21 +469,8 @@ spec = describe "Seal.Gateway.API" $ do
         , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.500Z\",\"kind\":\"harness\",\"convLen\":0,\"meta\":{\"op\":{\"name\":\"MEMORY_RECALL\"}}}"
         , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:01.234Z\",\"kind\":\"response\",\"convLen\":2}"
         ]
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -542,21 +510,8 @@ spec = describe "Seal.Gateway.API" $ do
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
         [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are a helpful assistant.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
         ]
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -596,21 +551,8 @@ spec = describe "Seal.Gateway.API" $ do
       BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
         [ "{\"id\":\"e1\",\"ts\":\"2026-07-01T12:00:00.000Z\",\"kind\":\"request\",\"convLen\":1,\"envelope\":{\"model\":\"claude-sonnet-4-20250514\",\"system\":\"You are helpful.\",\"tools\":[],\"toolChoice\":\"ToolAuto\",\"maxTokens\":8192}}"
         ]
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -659,21 +601,8 @@ spec = describe "Seal.Gateway.API" $ do
       -- fakeMeta's createdAt is 2026-01-01T00:00:00Z). They'll share the
       -- fallback timestamp, matching the pre-fix behavior for sessions
       -- without entries.jsonl.
-      tabsH <- newTabsHandle
-      reg   <- newHarnessRegistry
-      adb   <- noneBackend
-      activeRef <- newIORef fakeMeta
-      let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
-          deps = ApiDeps
-            { adSessionRuntime  = sr
-            , adTabsHandle      = tabsH
-            , adHarnessRegistry = reg
-            , adAdoptConsent    = Just CcWeb
-            , adAgentDefs       = adb
-            , adProviders       = pure knownProviders
-            , adSend            = Nothing
-            }
-          app = apiApp deps
+      deps <- mkDepsFor paths
+      let app = apiApp deps
       (status, body) <- runAppBody app
         (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
       status `shouldBe` 200
@@ -737,6 +666,7 @@ spec = describe "Seal.Gateway.API" $ do
           reg   <- newHarnessRegistry
           adb   <- noneBackend
           activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
           let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
               deps = ApiDeps
                 { adSessionRuntime  = sr
@@ -745,6 +675,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
                 , adProviders       = pure [OllamaProvider]
+                , adUiState         = uiState
                 , adSend            = Nothing
                 }
           pure (apiApp deps)
@@ -777,6 +708,88 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
     status `shouldBe` 200
 
+  -- ── UI state (persisted "new tab" recall) ─────────────────────────────
+  -- GET /api/ui/state returns the empty state by default (no file). PUT
+  -- /api/ui/state persists the last-chosen options; a follow-up GET
+  -- round-trips them. POST /api/ui/custom-models appends to the history;
+  -- a follow-up GET lists it.
+  it "GET /api/ui/state returns 200 with empty state by default" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app (testRequest methodGet ["api", "ui", "state"])
+    status `shouldBe` 200
+    let obj = case A.decode body :: Maybe A.Value of
+          Just o -> o
+          Nothing -> error ("could not decode ui state: " ++ show body)
+        lo = case obj of { A.Object o -> lookupK "last_options" o; _ -> Nothing }
+        cms = case obj of { A.Object o -> lookupK "custom_models" o; _ -> Nothing }
+    -- last_options is null (Nothing encoded as JSON null); custom_models
+    -- is an empty array.
+    lo `shouldBe` Just A.Null
+    cms `shouldBe` Just (A.Array V.empty)
+
+  it "PUT /api/ui/state persists last_options and round-trips via GET" $
+    withSystemTempDirectory "seal-ui-state" $ \tmp -> do
+      let paths = fakePaths { spState = tmp }
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      let opts = A.object
+            [ "kind"           .= ("provider" :: T.Text)
+            , "provider"       .= ("ollama" :: T.Text)
+            , "model"          .= ("llama3.2" :: T.Text)
+            , "useCustomModel" .= False
+            , "agent"          .= ("" :: T.Text)
+            , "flavour"        .= ("claude-code" :: T.Text)
+            , "customBinary"   .= ("" :: T.Text)
+            , "attachSession"  .= ("" :: T.Text)
+            , "attachWindow"   .= ("" :: T.Text)
+            , "attachManual"   .= False
+            ]
+      putReq <- testPut ["api", "ui", "state"] (A.encode opts)
+      putStatus <- runAppStatus app putReq
+      putStatus `shouldBe` 200
+      -- Reload the handle from disk to prove the write persisted.
+      deps2 <- mkDepsFor paths
+      let app2 = apiApp deps2
+      (getStatus, getBody) <- runAppBody app2 (testRequest methodGet ["api", "ui", "state"])
+      getStatus `shouldBe` 200
+      let lo = case A.decode getBody :: Maybe A.Value of
+            Just (A.Object o) -> lookupK "last_options" o
+            _                 -> error ("could not decode GET body: " ++ show getBody)
+      lo `shouldSatisfy` \case
+        Just (A.Object o) -> case lookupK "model" o of
+          Just (A.String m) -> m == "llama3.2"
+          _                 -> False
+        _ -> False
+
+  it "POST /api/ui/custom-models appends and lists via GET" $
+    withSystemTempDirectory "seal-ui-models" $ \tmp -> do
+      let paths = fakePaths { spState = tmp }
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      addReq <- testPost ["api", "ui", "custom-models"]
+        (A.encode (A.object [ "model" .= ("claude-3-opus" :: T.Text) ]))
+      addStatus <- runAppStatus app addReq
+      addStatus `shouldBe` 200
+      -- Adding a second model keeps both, most-recent first.
+      addReq2 <- testPost ["api", "ui", "custom-models"]
+        (A.encode (A.object [ "model" .= ("gpt-4o" :: T.Text) ]))
+      _ <- runAppStatus app addReq2
+      -- Adding a duplicate dedupes (moves to front).
+      addReq3 <- testPost ["api", "ui", "custom-models"]
+        (A.encode (A.object [ "model" .= ("claude-3-opus" :: T.Text) ]))
+      _ <- runAppStatus app addReq3
+      -- Reload from disk to prove persistence.
+      deps2 <- mkDepsFor paths
+      let app2 = apiApp deps2
+      (_, getBody) <- runAppBody app2 (testRequest methodGet ["api", "ui", "state"])
+      let cms = case A.decode getBody :: Maybe A.Value of
+            Just (A.Object o) -> case lookupK "custom_models" o of
+              Just (A.Array a) -> V.toList a
+              _               -> error "no custom_models array"
+            _ -> error "could not decode GET body"
+      let toText v = case v of { A.String t -> t; _ -> "" }
+      map toText cms `shouldBe` ["claude-3-opus", "gpt-4o"]
+
   -- ── Wired send path (adSend = Just SendDeps) ──────────────────────────
   -- A session that doesn't exist on disk returns 404. This exercises the
   -- handleSend -> loadSessionMeta -> Nothing path without needing a real
@@ -787,6 +800,7 @@ spec = describe "Seal.Gateway.API" $ do
       reg   <- newHarnessRegistry
       adb   <- noneBackend
       activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle (fakePaths { spState = tmp })
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
@@ -808,6 +822,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adProviders       = pure knownProviders
+            , adUiState         = uiState
             , adSend            = Just sendDeps
             }
           app = apiApp deps
@@ -851,6 +866,7 @@ spec = describe "Seal.Gateway.API" $ do
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
       activeRef' <- newIORef meta0
+      uiState <- newUiStateHandle paths
       let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
@@ -874,6 +890,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
             , adProviders       = pure knownProviders
+            , adUiState         = uiState
             , adSend            = Just sendDeps
             }
           app = apiApp deps

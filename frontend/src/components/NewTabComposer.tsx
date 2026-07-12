@@ -58,13 +58,19 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     if (spec.validationError) return
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
-      if (res.ok) onSubmit(null)
+      if (res.ok) {
+        spec.persistOnSubmit()
+        onSubmit(null)
+      }
       return
     }
     const body = spec.buildBody()
     if (branchFrom) body.branch_from = branchFrom
     const res = await createTab(body)
-    if (res) onSubmit(res)
+    if (res) {
+      spec.persistOnSubmit()
+      onSubmit(res)
+    }
   }
 
   return (
@@ -155,11 +161,18 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               <input
                 id="provider-model-custom"
                 type="text"
+                list="provider-model-custom-list"
                 value={spec.model}
                 onChange={(e) => spec.setModel(e.target.value)}
                 style={inputStyle}
                 placeholder="model id (e.g. claude-3-opus-20240229)"
+                autoComplete="off"
               />
+              <datalist id="provider-model-custom-list">
+                {spec.customModels.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
             </Row>
           )}
 
