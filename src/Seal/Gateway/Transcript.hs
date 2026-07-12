@@ -10,6 +10,7 @@
 -- reader for broadcasting).
 module Seal.Gateway.Transcript
   ( readTranscriptEntries
+  , firstUserMessageSnippet
   , showIso
   ) where
 
@@ -30,7 +31,7 @@ import System.Directory (doesFileExist)
 import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
-import Seal.Providers.Class (Message)
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
@@ -79,6 +80,69 @@ readTranscriptEntries paths model fallbackTs sid = do
           else do
             pure (zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals)
       else pure []
+
+-- | Extract a short snippet of the first user message in a session's
+-- transcript, for use as the default session title when the user has not
+-- set an explicit description. Reads the two-file format
+-- (@conversation.jsonl@) first, falling back to the legacy
+-- @transcript.jsonl@. Returns 'Nothing' when the session has no transcript
+-- or no user message with text content. The snippet is truncated to 80
+-- characters (on a codepoint boundary) to keep the sessions list compact.
+firstUserMessageSnippet :: SealPaths -> SessionId -> IO (Maybe Text)
+firstUserMessageSnippet paths sid = do
+  let legacyPath = sessionTranscriptPath paths sid
+      convPath   = sessionConversationPath paths sid
+  legacyExists <- doesFileExist legacyPath
+  convExists   <- doesFileExist convPath
+  if convExists
+    then do
+      raw <- TIO.readFile convPath
+      let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                          (filter (not . T.null) (T.lines raw)) :: [Message]
+      pure (snippetFromMessages msgs)
+    else if legacyExists
+      then do
+        raw <- TIO.readFile legacyPath
+        let entries = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
+                               (filter (not . T.null) (T.lines raw)) :: [TranscriptEntry]
+        pure (snippetFromMessages (legacyRequestMessages entries))
+      else pure Nothing
+
+-- | Extract the first user message's text from a list of messages, truncated
+-- to 80 characters. Tool-use and tool-result blocks are skipped (only the
+-- first 'CbText' block of the first 'User' message is used).
+snippetFromMessages :: [Message] -> Maybe Text
+snippetFromMessages msgs =
+  case filter (\m -> msgRole m == User) msgs of
+    (m : _) -> case [t | CbText t <- msgContent m] of
+      (t : _) -> Just (truncateSnippet 80 t)
+      []      -> Nothing
+    [] -> Nothing
+
+-- | Truncate a snippet to at most @n@ characters, appending an ellipsis when
+-- truncation occurs. 'T.take' is codepoint-safe for UTF-8 'Text'.
+truncateSnippet :: Int -> Text -> Text
+truncateSnippet n t
+  | T.length t <= n = t
+  | otherwise       = T.take n t <> "…"
+
+-- | Extract the request messages from legacy @transcript.jsonl@ entries.
+-- Only 'Request'-direction entries carry a payload with a @messages@ array;
+-- we collect messages from every request entry (the first user message is
+-- always in the first request).
+legacyRequestMessages :: [TranscriptEntry] -> [Message]
+legacyRequestMessages = concatMap go
+  where
+    go te
+      | teDirection te /= Request = []
+      | otherwise = case tePayload te of
+          A.Object o -> case KeyMap.lookup (Key.fromText "messages") o of
+            Just (A.Array arr) -> mapMaybe decodeMsg (V.toList arr)
+            _ -> []
+          _ -> []
+    decodeMsg v = case A.fromJSON v :: A.Result Message of
+      A.Success m -> Just m
+      A.Error _   -> Nothing
 
 -- | Map a legacy on-disk transcript line (Haskell TranscriptEntry JSON
 -- with @te*@-prefixed fields) to the frontend's TranscriptEntry shape.

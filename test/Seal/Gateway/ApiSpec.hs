@@ -43,7 +43,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..))
+import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
@@ -281,6 +281,90 @@ spec = describe "Seal.Gateway.API" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "sessions"])
     status `shouldBe` 200
+
+  it "GET /api/sessions includes firstMessageSnippet from conversation.jsonl" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "Fix the login bug please"]
+                  , Message Assistant [CbText "Sure, let me look"]
+                  ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      length arr `shouldBe` 1
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "firstMessageSnippet" o `shouldBe` Just (A.String "Fix the login bug please")
+
+  it "GET /api/sessions truncates long firstMessageSnippet to 80 chars + ellipsis" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      let longMsg = T.replicate 100 "x"
+          convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (convLine (Message User [CbText longMsg])))
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      case lookupK "firstMessageSnippet" o of
+        Just (A.String snippet) -> do
+          T.length snippet `shouldBe` 81
+          T.drop 80 snippet `shouldBe` "…"
+        other -> error ("unexpected snippet: " ++ show other)
+
+  it "GET /api/sessions returns null firstMessageSnippet when no conversation exists" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "firstMessageSnippet" o `shouldBe` Just A.Null
 
   it "GET /api/sessions/archived returns 200 with []" $ do
     app <- mkApp

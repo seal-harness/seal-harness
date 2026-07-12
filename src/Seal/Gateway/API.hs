@@ -28,10 +28,11 @@ import Network.Wai
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
+import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Gateway.Send
   ( SendDeps (..), handleSend, sendOutcomeJson )
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Gateway.Transcript (firstUserMessageSnippet, readTranscriptEntries, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -76,7 +77,8 @@ apiApp deps req respond =
     -- archive flag is a UI hint the backend doesn't track yet).
     (m', ["api", "sessions"]) | m' == methodGet -> do
       metas <- listSessions (srPaths (adSessionRuntime deps))
-      respond (jsonLBS status200 (A.encode (map sessionInfoJson metas)))
+      infos <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) metas
+      respond (jsonLBS status200 (A.encode infos))
     -- T11: archived sessions — the backend doesn't persist an archive flag,
     -- so this is always @[]@ for now.
     (m', ["api", "sessions", "archived"]) | m' == methodGet ->
@@ -440,9 +442,11 @@ sessionWire (BoundHarness _)   = Nothing
 -- (camelCase). The on-disk 'SessionMeta' uses snake_case; the gateway maps
 -- to the frontend's shape without changing 'SessionMeta's instance.
 -- Fields the backend doesn't track yet (@description@, @autoSummary@,
--- @firstMessageSnippet@, @channelUserId@) are returned as @null@.
-sessionInfoJson :: SessionMeta -> Value
-sessionInfoJson m = object
+-- @channelUserId@) are returned as @null@. @firstMessageSnippet@ is derived
+-- from the session's transcript (the first user message), so a session
+-- has a readable title before the user sets an explicit description.
+sessionInfoJson :: Maybe Text -> SessionMeta -> Value
+sessionInfoJson mSnippet m = object
   [ "id" .= sessionIdText (smId m)
   , "agent" .= (agentDefIdText <$> smAgent m)
   , "runtime" .= ("session:" <> smProvider m)
@@ -451,10 +455,18 @@ sessionInfoJson m = object
   , "createdAt" .= smCreatedAt m
   , "description" .= (Nothing :: Maybe Text)
   , "autoSummary" .= (Nothing :: Maybe Text)
-  , "firstMessageSnippet" .= (Nothing :: Maybe Text)
+  , "firstMessageSnippet" .= mSnippet
   , "channel" .= smChannel m
   , "channelUserId" .= (Nothing :: Maybe Text)
   ]
+
+-- | Build the 'SessionInfo' JSON for a session, reading the first user
+-- message snippet from the transcript so the session has a default title
+-- before the user sets an explicit description.
+sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
+sessionInfoJsonWithSnippet paths m = do
+  mSnippet <- firstUserMessageSnippet paths (smId m)
+  pure (sessionInfoJson mSnippet m)
 
 -- | T11: handle GET /api/sessions/:id/transcript. Returns the session's
 -- transcript as the frontend's @TranscriptEntry@ shape
