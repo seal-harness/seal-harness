@@ -1,26 +1,33 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Agent opcode group: three Audited definition opcodes
--- (@AGENT_DEF_CREATE@, @AGENT_DEF_READ@, @AGENT_DEF_UPDATE@) and four Trusted
--- lifecycle opcodes (@AGENT_LIST@, @AGENT_START@, @AGENT_STATUS@,
--- @AGENT_STOP@). Only the *definition* mutations are Audited — running an
--- instance is harness-internal, not an evolutionary mutation, so the lifecycle
--- ops are Trusted.
+-- (@AGENT_DEF_WRITE@, @AGENT_DEF_READ@, @AGENT_DEF_LIST@, @AGENT_DEF_DELETE@)
+-- and four Trusted lifecycle opcodes (@AGENT_INSTANCES@, @AGENT_START@,
+-- @AGENT_STATUS@, @AGENT_STOP@). Only the *definition* mutations are Audited —
+-- running an instance is harness-internal, not an evolutionary mutation, so
+-- the lifecycle ops are Trusted.
 --
--- The Audited def ops write to both the session transcript and the Audited log
--- via the dispatcher's Audited branch; the opcodes mutate the in-memory/Markdown
--- def backend (the materialized view). 'orRecorded' carries the secret-free
--- 'AgentDefId' + op name; the system prompt and tool list are agent-visible
--- data (not vault secrets) and are recorded in full in both logs.
+-- @AGENT_DEF_WRITE@ is an upsert: if the def already exists, its name/system/
+-- tools are updated (the original 'adSession' provenance and 'adCreatedAt' are
+-- preserved; only 'adUpdatedAt' is bumped); if not, a fresh def is created.
+-- This merges the former AGENT_DEF_CREATE + AGENT_DEF_UPDATE into a single
+-- opcode. @orRecorded@ carries a @was_new@ flag so the audit log still
+-- distinguishes create vs update.
+--
+-- @AGENT_INSTANCES@ (renamed from @AGENT_LIST@) snapshots the in-process agent
+-- runtime (running instances), NOT the definitions. @AGENT_DEF_LIST@ lists the
+-- definitions. The rename stops the confusion between "list definitions" and
+-- "list running instances".
 --
 -- @AGENT_START@ forks a worker via the wiring layer's worker-builder: the
 -- opcode is decoupled from 'Seal.Agent.Loop' / 'Seal.Types.Env' so it stays
 -- testable. The worker-builder resolves the def's provider+model, builds a
 -- fresh 'AgentEnv' bound to a fresh session, and runs the loop.
 module Seal.ISA.Ops.Agent
-  ( agentDefCreateOp
+  ( agentDefWriteOp
   , agentDefReadOp
-  , agentDefUpdateOp
-  , agentListOp
+  , agentDefListOp
+  , agentDefDeleteOp
+  , agentInstancesOp
   , agentStartOp
   , agentStatusOp
   , agentStopOp
@@ -80,14 +87,17 @@ toolsField v =
     Just (Just (Array xs))     -> AllowOnly (Set.fromList [ OpName t | String t <- V.toList xs ])
     _                          -> AllowAll
 
--- | AGENT_DEF_CREATE: insert or replace an agent definition by id. The name,
--- provider, model, system prompt, and tool list are recorded in full
--- (agent-visible data); 'orRecorded' carries the id + op name + fields.
-agentDefCreateOp :: AgentDefBackend -> SessionId -> Opcode
-agentDefCreateOp backend session = TrustedOpcode
-  { toName = OpName "AGENT_DEF_CREATE"
+-- | AGENT_DEF_WRITE: upsert an agent definition by id. If the def already
+-- exists, its name/system/tools are updated (the original 'adSession'
+-- provenance and 'adCreatedAt' are preserved; only 'adUpdatedAt' is bumped);
+-- if not, a fresh def is created. The name, provider, model, system prompt,
+-- and tool list are recorded in full (agent-visible data); 'orRecorded'
+-- carries the id + op name + fields + @was_new@.
+agentDefWriteOp :: AgentDefBackend -> SessionId -> Opcode
+agentDefWriteOp backend session = TrustedOpcode
+  { toName = OpName "AGENT_DEF_WRITE"
   , toTrust = Trusted
-  , toDesc = "Define an agent by id (insert or replace)."
+  , toDesc = "Create or update an agent definition by id (upsert; preserves provenance on update)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -119,27 +129,41 @@ agentDefCreateOp backend session = TrustedOpcode
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_CREATE requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "AGENT_DEF_WRITE requires {id:string}") checkId . idField
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
         Just aid -> do
+          mExisting <- liftIO (adbRead backend aid)
           now <- liftIO getCurrentTime
-          let def = AgentDef
-                { adId = aid
-                , adName = textField "name" v
-                , adProvider = textField "provider" v
-                , adModel = ModelId (textField "model" v)
-                , adSystem = textFieldMaybe "system" v
-                , adTools = toolsField v
-                , adCreatedAt = now
-                , adUpdatedAt = now
-                , adSession = session
-                }
+          let (def, wasNew) = case mExisting of
+                Just existing ->
+                  ( existing
+                      { adName = textField "name" v
+                      , adSystem = textFieldMaybe "system" v
+                      , adTools = toolsField v
+                      , adUpdatedAt = now
+                      }
+                  , False
+                  )
+                Nothing ->
+                  ( AgentDef
+                      { adId = aid
+                      , adName = textField "name" v
+                      , adProvider = textField "provider" v
+                      , adModel = ModelId (textField "model" v)
+                      , adSystem = textFieldMaybe "system" v
+                      , adTools = toolsField v
+                      , adCreatedAt = now
+                      , adUpdatedAt = now
+                      , adSession = session
+                      }
+                  , True
+                  )
           liftIO (adbUpdate backend def)
-          let recorded = encodeDefRecorded def
-          pure (OpResult [TrpText "defined"] False recorded)
+          let recorded = encodeDefRecorded def wasNew
+          pure (OpResult [TrpText (if wasNew then "defined" else "updated")] False recorded)
   }
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
@@ -166,83 +190,77 @@ agentDefReadOp backend = TrustedOpcode
             Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
             Just d  -> do
               let rendered = renderDef d
-                  recorded = encodeDefRecorded d
+                  recorded = encodeDefRecorded d False
               pure (OpResult [TrpText rendered] False recorded)
   }
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- | AGENT_DEF_UPDATE: update an existing agent definition's name/system/tools.
--- The updated_at timestamp is bumped. If the def does not exist, returns an
--- error result (the model should use AGENT_DEF_CREATE to define). The original
--- 'adSession' (provenance) and 'adCreatedAt' are preserved.
-agentDefUpdateOp :: AgentDefBackend -> Opcode
-agentDefUpdateOp backend = TrustedOpcode
-  { toName = OpName "AGENT_DEF_UPDATE"
+-- | AGENT_DEF_LIST: list all agent definitions (id + name + provider/model).
+-- Mirrors the @/agent list@ slash command which already calls 'adbList'.
+-- Trusted — listing definitions is an evolutionary event worth logging, with
+-- secret-free metadata (no system prompts in the recorded payload; the model
+-- sees only the id+name+provider+model summary).
+agentDefListOp :: AgentDefBackend -> Opcode
+agentDefListOp backend = TrustedOpcode
+  { toName = OpName "AGENT_DEF_LIST"
   , toTrust = Trusted
-  , toDesc = "Update an existing agent definition's name/system/tools."
+  , toDesc = "List all agent definitions (id + name + provider/model)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
-      , "properties" .= object
-          [ fromText "id" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("The agent def id to update." :: Text)
-              ]
-          , fromText "name" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("New name (optional)." :: Text)
-              ]
-          , fromText "system" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("New system prompt (optional)." :: Text)
-              ]
-          , fromText "tools" .= object
-              [ "type" .= ("array" :: Text)
-              , "description" .= ("New allowed opcode names, or \"all\" (optional)." :: Text)
-              ]
-          ]
-      , "required" .= (["id"] :: [Text])
+      , "properties" .= object []
       ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_UPDATE requires {id:string}") checkId . idField
+  , toAuthorize = const (Right ())
+  , toRun = \_ _ -> do
+      defs <- liftIO (adbList backend)
+      let rendered = case defs of
+            [] -> "(no agent definitions)"
+            _  -> T.intercalate "\n"
+                    [ agentDefIdText (adId d) <> ": " <> adName d
+                        <> " (" <> adProvider d <> "/" <> modelName <> ")"
+                    | d <- defs, let ModelId modelName = adModel d ]
+          recorded = object
+            [ "count" .= length defs
+            , "ids" .= fmap (agentDefIdText . adId) defs
+            ]
+      pure (OpResult [TrpText rendered] False recorded)
+  }
+
+-- | AGENT_DEF_DELETE: remove an agent definition by id. Idempotent (deleting
+-- a missing id is a success with a "not present" message, not an error).
+-- Mirrors 'Seal.ISA.Ops.Memory.memoryDeleteOp'.
+agentDefDeleteOp :: AgentDefBackend -> Opcode
+agentDefDeleteOp backend = TrustedOpcode
+  { toName = OpName "AGENT_DEF_DELETE"
+  , toTrust = Trusted
+  , toDesc = "Delete an agent definition by id (idempotent)."
+  , toInSchema = singleStringSchema "id" "The agent def id to delete."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_DEF_DELETE requires {id:string}") checkId . idField
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
         Just aid -> do
           mExisting <- liftIO (adbRead backend aid)
-          case mExisting of
-            Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
-            Just existing -> do
-              now <- liftIO getCurrentTime
-              let newName   = case textFieldMaybe "name" v of
-                    Just n  -> n
-                    Nothing -> adName existing
-                  newSystem = case textFieldMaybe "system" v of
-                    Just s  -> Just s
-                    Nothing -> adSystem existing
-                  newTools  = case parseMaybe (withObject "in" (.:? "tools")) v :: Maybe (Maybe Value) of
-                    Just (Just _) -> toolsField v
-                    _             -> adTools existing
-                  updated = existing
-                    { adName = newName
-                    , adSystem = newSystem
-                    , adTools = newTools
-                    , adUpdatedAt = now
-                    }
-              liftIO (adbUpdate backend updated)
-              let recorded = encodeDefRecorded updated
-              pure (OpResult [TrpText "updated"] False recorded)
+          liftIO (adbDelete backend aid)
+          let msg = case mExisting of
+                Nothing -> "deleted (was not present)"
+                Just _  -> "deleted"
+              recorded = object ["id" .= agentDefIdText aid]
+          pure (OpResult [TrpText msg] False recorded)
   }
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- | AGENT_LIST: snapshot the in-process agent runtime (running instances).
--- Trusted — listing running instances is harness-internal, not an evolutionary
--- mutation.
-agentListOp :: AgentRuntime -> Opcode
-agentListOp runtime = TrustedOpcode
-  { toName = OpName "AGENT_LIST"
+-- | AGENT_INSTANCES: snapshot the in-process agent runtime (running
+-- instances). Trusted — listing running instances is harness-internal, not an
+-- evolutionary mutation. Renamed from AGENT_LIST to stop the confusion with
+-- AGENT_DEF_LIST (which lists definitions, not running instances).
+agentInstancesOp :: AgentRuntime -> Opcode
+agentInstancesOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_INSTANCES"
   , toTrust = Trusted
   , toDesc = "List running agent instances (id + status)."
   , toInSchema = object
@@ -358,8 +376,9 @@ singleStringSchema fieldName fieldDesc =
     ]
 
 -- | Encode the secret-free 'AgentDef' fields into the 'orRecorded' payload.
-encodeDefRecorded :: AgentDef -> Value
-encodeDefRecorded d = object
+-- The @was_new@ flag distinguishes create vs update in the audit log.
+encodeDefRecorded :: AgentDef -> Bool -> Value
+encodeDefRecorded d wasNew = object
   [ "id"         .= agentDefIdText (adId d)
   , "name"       .= adName d
   , "provider"   .= adProvider d
@@ -369,6 +388,7 @@ encodeDefRecorded d = object
   , "created_at" .= adCreatedAt d
   , "updated_at" .= adUpdatedAt d
   , "session"    .= adSession d
+  , "was_new"    .= wasNew
   ]
 
 -- | Encode an 'AllowList OpName' for the recorded payload: @\"all\"@ for

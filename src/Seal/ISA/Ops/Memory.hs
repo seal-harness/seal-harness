@@ -1,18 +1,24 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The Memory opcode group: MEMORY_STORE, MEMORY_RECALL, MEMORY_UPDATE,
--- MEMORY_DELETE. All Audited — the dispatcher writes both the session
--- transcript and the Audited log; the opcodes mutate the in-memory/SQLite/
--- Markdown backend (the materialized view). 'orRecorded' carries the
--- secret-free 'MemoryId' + op name; the memory CONTENT is agent-visible data
--- (not a vault secret) and is recorded in full in both logs.
+-- | The Memory opcode group: MEMORY_WRITE, MEMORY_RECALL, MEMORY_DELETE.
+-- All Audited — the dispatcher writes both the session transcript and the
+-- Audited log; the opcodes mutate the in-memory/SQLite/Markdown backend
+-- (the materialized view). 'orRecorded' carries the secret-free 'MemoryId'
+-- + op name + @was_new@ flag (so the audit log distinguishes create vs
+-- update); the memory CONTENT is agent-visible data (not a vault secret)
+-- and is recorded in full in both logs.
+--
+-- 'MEMORY_WRITE' is an upsert: if the memory already exists, its content
+-- and/or tags are updated (the original 'meSession' provenance and
+-- 'meCreatedAt' are preserved; only 'meUpdatedAt' is bumped); if not, a
+-- fresh entry is created. This merges the former MEMORY_STORE +
+-- MEMORY_UPDATE into a single opcode, eliminating one failure path.
 --
 -- 'MEMORY_RECALL' uses the dynamic-retrieval pager ('Seal.Core.Paging'):
 -- @page_size = clamp floor ceiling (round (coeff * sqrt total))@, where total
 -- is the number of matching memories.
 module Seal.ISA.Ops.Memory
-  ( memoryStoreOp
+  ( memoryWriteOp
   , memoryRecallOp
-  , memoryUpdateOp
   , memoryDeleteOp
   ) where
 
@@ -82,14 +88,17 @@ offsetField v =
     Just (Just n) | n >= 0 -> n
     _                      -> 0
 
--- | MEMORY_STORE: insert or replace a memory by id. The content and tags are
--- recorded in full (agent-visible data); 'orRecorded' carries the id + op
--- name + content + tags (secret-free).
-memoryStoreOp :: MemoryBackend -> SessionId -> Opcode
-memoryStoreOp backend session = TrustedOpcode
-  { toName = OpName "MEMORY_STORE"
+-- | MEMORY_WRITE: upsert a memory by id. If the memory already exists, its
+-- content and/or tags are updated (the original 'meSession' provenance and
+-- 'meCreatedAt' are preserved; only 'meUpdatedAt' is bumped); if not, a
+-- fresh entry is created with the current session as provenance. The
+-- content and tags are recorded in full (agent-visible data); 'orRecorded'
+-- carries the id + op name + content + tags + @was_new@ (secret-free).
+memoryWriteOp :: MemoryBackend -> SessionId -> Opcode
+memoryWriteOp backend session = TrustedOpcode
+  { toName = OpName "MEMORY_WRITE"
   , toTrust = Trusted
-  , toDesc = "Store an agent memory by id (insert or replace)."
+  , toDesc = "Create or update an agent memory by id (upsert; preserves provenance on update)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object
@@ -109,21 +118,34 @@ memoryStoreOp backend session = TrustedOpcode
       , "required" .= (["id", "content"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "MEMORY_STORE requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "MEMORY_WRITE requires {id:string}") checkId . idField
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid memory id"] True (object []))
         Just mid -> do
+          mExisting <- liftIO (mbRecall backend mid)
           now <- liftIO getCurrentTime
-          let entry = MemoryEntry
-                { meId = mid
-                , meContent = contentField v
-                , meTags = tagsField v
-                , meCreatedAt = now
-                , meUpdatedAt = now
-                , meSession = session
-                }
+          let (entry, wasNew) = case mExisting of
+                Just existing ->
+                  ( existing
+                      { meContent = contentField v
+                      , meTags = tagsField v
+                      , meUpdatedAt = now
+                      }
+                  , False
+                  )
+                Nothing ->
+                  ( MemoryEntry
+                      { meId = mid
+                      , meContent = contentField v
+                      , meTags = tagsField v
+                      , meCreatedAt = now
+                      , meUpdatedAt = now
+                      , meSession = session
+                      }
+                  , True
+                  )
           liftIO (mbStore backend entry)
           let recorded = object
                 [ "id" .= memoryIdText mid
@@ -132,8 +154,9 @@ memoryStoreOp backend session = TrustedOpcode
                 , "created_at" .= meCreatedAt entry
                 , "updated_at" .= meUpdatedAt entry
                 , "session" .= meSession entry
+                , "was_new" .= wasNew
                 ]
-          pure (OpResult [TrpText "stored"] False recorded)
+          pure (OpResult [TrpText (if wasNew then "stored" else "updated")] False recorded)
   }
   where
     checkId t = either (Left . ("invalid memory id: " <>)) (const (Right ())) (mkMemoryId t)
@@ -190,70 +213,6 @@ memoryRecallOp params backend = TrustedOpcode
         Just q  -> q `T.isInfixOf` meContent e || any (q `T.isInfixOf`) (meTags e)
     renderEntry e =
       memoryIdText (meId e) <> ": " <> meContent e
-
--- | MEMORY_UPDATE: update an existing memory's content and/or tags. The
--- updated_at timestamp is bumped. If the memory does not exist, returns an
--- error result (the model should use MEMORY_STORE to create). The original
--- 'meSession' is preserved (the update is attributed to the session that
--- created the memory, not the session that updated it).
-memoryUpdateOp :: MemoryBackend -> Opcode
-memoryUpdateOp backend = TrustedOpcode
-  { toName = OpName "MEMORY_UPDATE"
-  , toTrust = Trusted
-  , toDesc = "Update an existing memory's content and/or tags."
-  , toInSchema = object
-      [ "type" .= ("object" :: Text)
-      , "properties" .= object
-          [ fromText "id" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("The memory id to update." :: Text)
-              ]
-          , fromText "content" .= object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("New content (optional)." :: Text)
-              ]
-          , fromText "tags" .= object
-              [ "type" .= ("array" :: Text)
-              , "description" .= ("New tags (optional)." :: Text)
-              ]
-          ]
-      , "required" .= (["id"] :: [Text])
-      ]
-  , toOutSchema = object []
-  , toAuthorize = maybe (Left "MEMORY_UPDATE requires {id:string}") checkId . idField
-  , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkMemoryId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid memory id"] True (object []))
-        Just mid -> do
-          mExisting <- liftIO (mbRecall backend mid)
-          case mExisting of
-            Nothing -> pure (OpResult [TrpText "memory not found"] True (object ["id" .= memoryIdText mid]))
-            Just existing -> do
-              now <- liftIO getCurrentTime
-              let newContent = case parseMaybe (withObject "in" (.:? "content")) v :: Maybe (Maybe Text) of
-                    Just (Just c) -> c
-                    _             -> meContent existing
-                  newTags = case parseMaybe (withObject "in" (.:? "tags")) v :: Maybe (Maybe [Text]) of
-                    Just (Just ts) -> ts
-                    _              -> meTags existing
-                  updated = existing
-                    { meContent = newContent
-                    , meTags = newTags
-                    , meUpdatedAt = now
-                    }
-              liftIO (mbUpdate backend updated)
-              let recorded = object
-                    [ "id" .= memoryIdText mid
-                    , "content" .= meContent updated
-                    , "tags" .= meTags updated
-                    , "updated_at" .= meUpdatedAt updated
-                    , "session" .= meSession updated
-                    ]
-              pure (OpResult [TrpText "updated"] False recorded)
-  }
-  where
-    checkId t = either (Left . ("invalid memory id: " <>)) (const (Right ())) (mkMemoryId t)
 
 -- | MEMORY_DELETE: remove a memory by id. Idempotent (deleting a missing id is
 -- a success with a "not present" message, not an error).

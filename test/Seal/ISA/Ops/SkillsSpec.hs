@@ -31,10 +31,10 @@ sampleSkillId = case mkSkillId "s1" of
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Skills" $ do
-  describe "SKILL_CREATE" $ do
-    it "creates a skill and returns 'created'" $ do
+  describe "SKILL_WRITE" $ do
+    it "creates a new skill and returns 'created' with was_new=true" $ do
       backend <- noneBackend
-      let op = skillCreateOp backend sampleSession
+      let op = skillWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("say hi" :: Text)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "created"]
@@ -45,14 +45,31 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
 
     it "rejects an invalid id" $ do
       backend <- noneBackend
-      let op = skillCreateOp backend sampleSession
+      let op = skillWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("bad/id" :: Text), "description" .= ("x" :: Text), "body" .= ("y" :: Text)]))
       orIsError r `shouldBe` True
+
+    it "updates an existing skill and returns 'updated' with was_new=false (preserves provenance)" $ do
+      backend <- noneBackend
+      _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("old" :: Text)]))
+      let op = skillWriteOp backend (SessionId "s2")
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("s1" :: Text), "description" .= ("greet2" :: Text), "body" .= ("new" :: Text)]))
+      orIsError r `shouldBe` False
+      orParts r `shouldBe` [TrpText "updated"]
+      m <- sbRead backend sampleSkillId
+      case m of
+        Just s  -> do
+          skBody s `shouldBe` "new"
+          skDescription s `shouldBe` "greet2"
+          -- provenance (original session) is preserved on update
+          skSession s `shouldBe` sampleSession
+        Nothing -> expectationFailure "skill not found after update"
 
   describe "SKILL_READ" $ do
     it "returns the skill body" $ do
       backend <- noneBackend
-      _ <- runTestApp (opRun (skillCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("say hi" :: Text)]))
       let read' = skillReadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("s1" :: Text)]))
@@ -73,35 +90,6 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("bad/id" :: Text)]))
       orIsError r `shouldBe` True
 
-  describe "SKILL_UPDATE" $ do
-    it "updates an existing skill's body" $ do
-      backend <- noneBackend
-      _ <- runTestApp (opRun (skillCreateOp backend sampleSession) localBackend
-                             (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("old" :: Text)]))
-      let update = skillUpdateOp backend
-      r <- runTestApp (opRun update localBackend (object ["id" .= ("s1" :: Text), "body" .= ("new" :: Text)]))
-      orIsError r `shouldBe` False
-      m <- sbRead backend sampleSkillId
-      case m of
-        Just s  -> skBody s `shouldBe` "new"
-        Nothing -> expectationFailure "skill not found after update"
-
-    it "preserves the description when only body is updated" $ do
-      backend <- noneBackend
-      _ <- runTestApp (opRun (skillCreateOp backend sampleSession) localBackend
-                             (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("old" :: Text)]))
-      _ <- runTestApp (opRun (skillUpdateOp backend) localBackend (object ["id" .= ("s1" :: Text), "body" .= ("new" :: Text)]))
-      m <- sbRead backend sampleSkillId
-      case m of
-        Just s  -> skDescription s `shouldBe` "greet"
-        Nothing -> expectationFailure "skill not found"
-
-    it "errors when the skill does not exist" $ do
-      backend <- noneBackend
-      let update = skillUpdateOp backend
-      r <- runTestApp (opRun update localBackend (object ["id" .= ("nope" :: Text), "body" .= ("x" :: Text)]))
-      orIsError r `shouldBe` True
-
   describe "SKILL_LIST" $ do
     it "returns an empty message when no skills" $ do
       backend <- noneBackend
@@ -114,9 +102,9 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
 
     it "lists defined skills as id: description lines" $ do
       backend <- noneBackend
-      _ <- runTestApp (opRun (skillCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("b" :: Text)]))
-      _ <- runTestApp (opRun (skillCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("s2" :: Text), "description" .= ("farewell" :: Text), "body" .= ("b2" :: Text)]))
       let list' = skillListOp backend
       r <- runTestApp (opRun list' localBackend (object []))
@@ -126,10 +114,29 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
           T.isInfixOf "s2: farewell" t `shouldBe` True
         _ -> expectationFailure "expected a single text part"
 
+  describe "SKILL_DELETE" $ do
+    it "deletes an existing skill" $ do
+      backend <- noneBackend
+      _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("s1" :: Text), "description" .= ("g" :: Text), "body" .= ("b" :: Text)]))
+      let delete = skillDeleteOp backend
+      r <- runTestApp (opRun delete localBackend (object ["id" .= ("s1" :: Text)]))
+      orIsError r `shouldBe` False
+      sbRead backend sampleSkillId `shouldReturn` Nothing
+
+    it "is idempotent on a missing id" $ do
+      backend <- noneBackend
+      let delete = skillDeleteOp backend
+      r <- runTestApp (opRun delete localBackend (object ["id" .= ("nope" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "not present" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+
   describe "secret discipline" $
     it "orRecorded carries the skill body (agent-visible data, recorded in full, not a vault secret)" $ do
       backend <- noneBackend
-      let op = skillCreateOp backend sampleSession
+      let op = skillWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("s1" :: Text), "description" .= ("d" :: Text), "body" .= ("not-a-secret" :: Text)]))
       let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
       T.isInfixOf "not-a-secret" recorded `shouldBe` True

@@ -69,7 +69,7 @@ import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import Data.Vector qualified as V
-import System.Directory (doesDirectoryExist, doesFileExist, getFileSize, getModificationTime, listDirectory, renameFile)
+import System.Directory (doesDirectoryExist, doesFileExist, getFileSize, getModificationTime, listDirectory, removeFile, renameFile)
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
@@ -88,6 +88,8 @@ data AgentDefBackend = AgentDefBackend
   { adbRead   :: AgentDefId -> IO (Maybe AgentDef)
   , adbUpdate :: AgentDef -> IO ()
   , adbList   :: IO [AgentDef]
+  , adbDelete :: AgentDefId -> IO ()
+  -- ^ Remove a def by id (delete the file + auto-commit; idempotent).
   }
 
 -- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
@@ -98,6 +100,7 @@ noneBackend = do
     { adbRead   = \aid -> Map.lookup aid <$> readIORef ref
     , adbUpdate = \d -> modifyIORef' ref (Map.insert (adId d) d)
     , adbList   = Map.elems <$> readIORef ref
+    , adbDelete = modifyIORef' ref . Map.delete
     }
 
 -- | The Markdown backend. Discovers both flat @agents\/\<id\>.md@ files and
@@ -109,6 +112,7 @@ markdownAgentDefBackend dir repo = pure AgentDefBackend
   { adbRead   = readAgentDef dir
   , adbUpdate = writeAgentDef dir repo
   , adbList   = listAgentDefs dir
+  , adbDelete = deleteAgentDef dir repo
   }
 
 -- ---------------------------------------------------------------------------
@@ -169,6 +173,21 @@ writeAgentDef dir repo d = do
   let rel = "agents" </> (T.unpack (agentDefIdText (adId d)) <.> "md")
   _ <- gitCommitAll repo rel ("seal: AGENT_DEF write " <> agentDefIdText (adId d))
   pure ()
+
+-- | Delete one def file and auto-commit. Idempotent (no-op if the file is
+-- absent). Does NOT remove PureClaw-style subdirectories (a directory is a
+-- human-authored import path; the model does not delete those).
+deleteAgentDef :: FilePath -> ConfigRepo -> AgentDefId -> IO ()
+deleteAgentDef dir repo aid = do
+  let path = defFile dir aid
+  exists <- doesFileExist path
+  if not exists
+    then pure ()
+    else do
+      removeFile path
+      let rel = "agents" </> (T.unpack (agentDefIdText aid) <.> "md")
+      _ <- gitCommitAll repo rel ("seal: AGENT_DEF delete " <> agentDefIdText aid)
+      pure ()
 
 -- ---------------------------------------------------------------------------
 -- DirScheme (PureClaw-compatible)
