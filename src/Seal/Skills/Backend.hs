@@ -29,7 +29,7 @@ import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
-import System.Directory (doesFileExist, listDirectory, renameFile)
+import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
@@ -49,6 +49,8 @@ data SkillBackend = SkillBackend
   -- ^ All skills, sorted by id (deterministic for tests + git diffs).
   , sbUpdate :: Skill -> IO ()
   -- ^ Update an existing skill (same as 'sbCreate' for both backends).
+  , sbDelete :: SkillId -> IO ()
+  -- ^ Remove a skill by id (delete the file + auto-commit; idempotent).
   }
 
 -- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
@@ -61,6 +63,7 @@ noneBackend = do
     , sbRead   = \sid -> Map.lookup sid <$> readIORef ref
     , sbList   = Map.elems <$> readIORef ref
     , sbUpdate = \s -> modifyIORef' ref (Map.insert (skId s) s)
+    , sbDelete = modifyIORef' ref . Map.delete
     }
 
 -- | The Markdown backend. One file per skill under @dir@ (the @config/skills@
@@ -69,11 +72,12 @@ noneBackend = do
 -- skipped (a partial write never breaks the list).
 markdownSkillBackend :: FilePath -> ConfigRepo -> IO SkillBackend
 markdownSkillBackend dir repo = pure SkillBackend
-  { sbCreate = writeSkill dir repo
-  , sbRead   = readSkill dir
-  , sbList   = listSkills dir
-  , sbUpdate = writeSkill dir repo
-  }
+    { sbCreate = writeSkill dir repo
+    , sbRead   = readSkill dir
+    , sbList   = listSkills dir
+    , sbUpdate = writeSkill dir repo
+    , sbDelete = deleteSkill dir repo
+    }
 
 -- | The filename for a skill: @\<id\>.md@.
 skillFile :: FilePath -> SkillId -> FilePath
@@ -143,6 +147,20 @@ listSkills dir = do
     content <- TIO.readFile (dir </> e)
     pure (decodeSkill content)
   pure (sortOn (skillIdText . skId) (catMaybes skills))
+
+-- | Delete one skill file and auto-commit. Idempotent (no-op if the file is
+-- absent).
+deleteSkill :: FilePath -> ConfigRepo -> SkillId -> IO ()
+deleteSkill dir repo sid = do
+  let path = skillFile dir sid
+  exists <- doesFileExist path
+  if not exists
+    then pure ()
+    else do
+      removeFile path
+      let rel = "skills" </> (T.unpack (skillIdText sid) <.> "md")
+      _ <- gitCommitAll repo rel ("seal: SKILL delete " <> skillIdText sid)
+      pure ()
 
 -- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
 isoTime :: UTCTime -> Text

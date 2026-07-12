@@ -59,14 +59,14 @@ import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
+  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Skills
-  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
-  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
-  , agentListOp, agentStartOp, agentStatusOp, agentStopOp )
+  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
+  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -313,18 +313,18 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
           , askHumanOp caps
           , fileReadOp wsRoot operatorCeiling
           , secretGetOp rt
-          , memoryStoreOp memoryBackend sid0
+          , memoryWriteOp memoryBackend sid0
           , memoryRecallOp defaultPageParams memoryBackend
-          , memoryUpdateOp memoryBackend
           , memoryDeleteOp memoryBackend
-          , skillCreateOp skillBackend sid0
+          , skillWriteOp skillBackend sid0
           , skillReadOp skillBackend
-          , skillUpdateOp skillBackend
           , skillListOp skillBackend
-          , agentDefCreateOp agentDefBackend sid0
+          , skillDeleteOp skillBackend
+          , agentDefWriteOp agentDefBackend sid0
           , agentDefReadOp agentDefBackend
-          , agentDefUpdateOp agentDefBackend
-          , agentListOp agentRuntime
+          , agentDefListOp agentDefBackend
+          , agentDefDeleteOp agentDefBackend
+          , agentInstancesOp agentRuntime
           , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
           , agentStatusOp agentRuntime
           , agentStopOp agentRuntime

@@ -41,10 +41,10 @@ blockingWorker ref _ _ = do
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Agent" $ do
-  describe "AGENT_DEF_CREATE" $ do
+  describe "AGENT_DEF_WRITE" $ do
     it "creates a def and returns 'defined'" $ do
       backend <- noneBackend
-      let op = agentDefCreateOp backend sampleSession
+      let op = agentDefWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("greeter" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "defined"]
@@ -55,13 +55,13 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
 
     it "rejects an invalid id" $ do
       backend <- noneBackend
-      let op = agentDefCreateOp backend sampleSession
+      let op = agentDefWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("bad/id" :: Text), "name" .= ("x" :: Text), "provider" .= ("p" :: Text), "model" .= ("m" :: Text)]))
       orIsError r `shouldBe` True
 
     it "accepts an optional system prompt and tools=all" $ do
       backend <- noneBackend
-      let op = agentDefCreateOp backend sampleSession
+      let op = agentDefWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text), "system" .= ("be nice" :: Text), "tools" .= ("all" :: Text)]))
       orIsError r `shouldBe` False
       m <- adbRead backend sampleDefId
@@ -69,10 +69,26 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         Just d  -> adSystem d `shouldBe` Just "be nice"
         Nothing -> expectationFailure "def not stored"
 
+    it "updates an existing def and returns 'updated' with was_new=false (preserves provenance)" $ do
+      backend <- noneBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("old" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let op = agentDefWriteOp backend (SessionId "s2")
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("new" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      orIsError r `shouldBe` False
+      orParts r `shouldBe` [TrpText "updated"]
+      m <- adbRead backend sampleDefId
+      case m of
+        Just d  -> do
+          adName d `shouldBe` "new"
+          -- provenance (original session) is preserved on update
+          adSession d `shouldBe` sampleSession
+        Nothing -> expectationFailure "def not found after update"
+
   describe "AGENT_DEF_READ" $ do
     it "returns the def fields" $ do
       backend <- noneBackend
-      _ <- runTestApp (opRun (agentDefCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("greeter" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       let read' = agentDefReadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("a1" :: Text)]))
@@ -87,41 +103,53 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("nope" :: Text)]))
       orIsError r `shouldBe` True
 
-  describe "AGENT_DEF_UPDATE" $ do
-    it "updates an existing def's name" $ do
+  describe "AGENT_DEF_LIST" $ do
+    it "returns an empty message when no defs" $ do
       backend <- noneBackend
-      _ <- runTestApp (opRun (agentDefCreateOp backend sampleSession) localBackend
-                             (object ["id" .= ("a1" :: Text), "name" .= ("old" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
-      let update = agentDefUpdateOp backend
-      r <- runTestApp (opRun update localBackend (object ["id" .= ("a1" :: Text), "name" .= ("new" :: Text)]))
+      let list' = agentDefListOp backend
+      r <- runTestApp (opRun list' localBackend (object []))
       orIsError r `shouldBe` False
-      m <- adbRead backend sampleDefId
-      case m of
-        Just d  -> adName d `shouldBe` "new"
-        Nothing -> expectationFailure "def not found after update"
+      case orParts r of
+        [TrpText t] -> t `shouldBe` "(no agent definitions)"
+        _           -> expectationFailure "expected a single text part"
 
-    it "preserves the provider when only name is updated" $ do
+    it "lists defined defs with id, name, and provider/model" $ do
       backend <- noneBackend
-      _ <- runTestApp (opRun (agentDefCreateOp backend sampleSession) localBackend
-                             (object ["id" .= ("a1" :: Text), "name" .= ("old" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
-      _ <- runTestApp (opRun (agentDefUpdateOp backend) localBackend (object ["id" .= ("a1" :: Text), "name" .= ("new" :: Text)]))
-      m <- adbRead backend sampleDefId
-      case m of
-        Just d  -> adProvider d `shouldBe` "ollama"
-        Nothing -> expectationFailure "def not found"
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("greeter" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let list' = agentDefListOp backend
+      r <- runTestApp (opRun list' localBackend (object []))
+      case orParts r of
+        [TrpText t] -> do
+          T.isInfixOf "a1: greeter" t `shouldBe` True
+          T.isInfixOf "ollama/llama3" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
 
-    it "errors when the def does not exist" $ do
+  describe "AGENT_DEF_DELETE" $ do
+    it "deletes an existing def" $ do
       backend <- noneBackend
-      let update = agentDefUpdateOp backend
-      r <- runTestApp (opRun update localBackend (object ["id" .= ("nope" :: Text), "name" .= ("x" :: Text)]))
-      orIsError r `shouldBe` True
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("p" :: Text), "model" .= ("m" :: Text)]))
+      let delete = agentDefDeleteOp backend
+      r <- runTestApp (opRun delete localBackend (object ["id" .= ("a1" :: Text)]))
+      orIsError r `shouldBe` False
+      adbRead backend sampleDefId `shouldReturn` Nothing
 
-  describe "AGENT_START / STATUS / STOP / LIST" $ do
+    it "is idempotent on a missing id" $ do
+      backend <- noneBackend
+      let delete = agentDefDeleteOp backend
+      r <- runTestApp (opRun delete localBackend (object ["id" .= ("nope" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "not present" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+
+  describe "AGENT_START / STATUS / INSTANCES / STOP" $ do
     it "starts an agent, status Running, then stops it" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
       ran <- newIORef (0 :: Int)
-      _ <- runTestApp (opRun (agentDefCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       let start = agentStartOp backend rt (pure (SessionId "fresh")) (blockingWorker ran)
       rStart <- runTestApp (opRun start localBackend (object ["id" .= ("a1" :: Text)]))
@@ -142,16 +170,16 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       r <- runTestApp (opRun start localBackend (object ["id" .= ("nope" :: Text)]))
       orIsError r `shouldBe` True
 
-    it "AGENT_LIST reports running instances" $ do
+    it "AGENT_INSTANCES reports running instances" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
-      _ <- runTestApp (opRun (agentDefCreateOp backend sampleSession) localBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       let worker _ _ = threadDelay 1000000
           start = agentStartOp backend rt (pure (SessionId "fresh")) worker
       _ <- runTestApp (opRun start localBackend (object ["id" .= ("a1" :: Text)]))
       threadDelay 50000
-      r <- runTestApp (opRun (agentListOp rt) localBackend (object []))
+      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
       case orParts r of
         [TrpText t] -> T.isInfixOf "a1:" t `shouldBe` True
         _           -> expectationFailure "expected a single text part"
@@ -177,7 +205,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
   describe "secret discipline" $
     it "orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret)" $ do
       backend <- noneBackend
-      let op = agentDefCreateOp backend sampleSession
+      let op = agentDefWriteOp backend sampleSession
       r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("p" :: Text), "model" .= ("m" :: Text), "system" .= ("not-a-secret" :: Text)]))
       let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
       T.isInfixOf "not-a-secret" recorded `shouldBe` True

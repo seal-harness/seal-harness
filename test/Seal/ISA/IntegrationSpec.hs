@@ -375,14 +375,14 @@ spec = describe "Seal.ISA.Integration" $ do
       r `shouldBe` Left (Denied "SEARCH_FILES: pattern must not start with '-' (option injection)")
 
   -- ----------------------------------------------------------------------
-  -- MEMORY_STORE / RECALL / UPDATE / DELETE
+  -- MEMORY_WRITE / RECALL / DELETE
   -- ----------------------------------------------------------------------
-  describe "MEMORY_STORE" $ do
-    it "\"Remember that the user prefers concise answers.\" -> MEMORY_STORE -> memory in the store" $ do
+  describe "MEMORY_WRITE" $ do
+    it "\"Remember that the user prefers concise answers.\" -> MEMORY_WRITE (create) -> memory in the store" $ do
       backend <- MemoryBackend.noneBackend
-      let op = memoryStoreOp backend sid
+      let op = memoryWriteOp backend sid
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_STORE")
+      r <- runTestApp (dispatchOne reg (OpName "MEMORY_WRITE")
                         (object [ "id" .= ("user-pref" :: Text)
                                 , "content" .= ("prefer concise answers" :: Text) ]))
       case r of
@@ -395,11 +395,32 @@ spec = describe "Seal.ISA.Integration" $ do
             []     -> expectationFailure "expected at least one memory"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
+    it "\"Update the 'pref' memory to say 'very concise'.\" -> MEMORY_WRITE (update) -> content changed, provenance preserved" $ do
+      backend <- MemoryBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
+                          (OpName "MEMORY_WRITE")
+                          (object [ "id" .= ("pref" :: Text)
+                                  , "content" .= ("concise" :: Text) ]))
+      let op = memoryWriteOp backend sid
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "MEMORY_WRITE")
+                        (object [ "id" .= ("pref" :: Text)
+                                , "content" .= ("very concise" :: Text) ]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          orParts res `shouldBe` [TrpText "updated"]
+          entries <- MemoryBackend.mbList backend
+          case entries of
+            (e : _) -> meContent e `shouldBe` "very concise"
+            []     -> expectationFailure "expected at least one memory"
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
   describe "MEMORY_RECALL" $ do
     it "\"What do you remember about the user?\" -> MEMORY_RECALL -> returns stored memories" $ do
       backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryStoreOp backend sid])
-                          (OpName "MEMORY_STORE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
+                          (OpName "MEMORY_WRITE")
                           (object [ "id" .= ("pref" :: Text)
                                   , "content" .= ("concise" :: Text) ]))
       let op = memoryRecallOp defaultPageParams backend
@@ -413,33 +434,11 @@ spec = describe "Seal.ISA.Integration" $ do
             _          -> expectationFailure "expected text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "MEMORY_UPDATE" $ do
-    it "\"Update the 'pref' memory to say 'very concise'.\" -> MEMORY_UPDATE -> content changed" $ do
-      backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryStoreOp backend sid])
-                          (OpName "MEMORY_STORE")
-                          (object [ "id" .= ("pref" :: Text)
-                                  , "content" .= ("concise" :: Text) ]))
-      let op = memoryUpdateOp backend
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "MEMORY_UPDATE")
-                        (object [ "id" .= ("pref" :: Text)
-                                , "content" .= ("very concise" :: Text) ]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "updated"]
-          entries <- MemoryBackend.mbList backend
-          case entries of
-            (e : _) -> meContent e `shouldBe` "very concise"
-            []     -> expectationFailure "expected at least one memory"
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
-
   describe "MEMORY_DELETE" $ do
     it "\"Forget the 'pref' memory.\" -> MEMORY_DELETE -> memory removed" $ do
       backend <- MemoryBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryStoreOp backend sid])
-                          (OpName "MEMORY_STORE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [memoryWriteOp backend sid])
+                          (OpName "MEMORY_WRITE")
                           (object [ "id" .= ("pref" :: Text)
                                   , "content" .= ("concise" :: Text) ]))
       let op = memoryDeleteOp backend
@@ -454,14 +453,14 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------
-  -- SKILL_CREATE / READ / UPDATE / LIST
+  -- SKILL_WRITE / READ / LIST / DELETE
   -- ----------------------------------------------------------------------
-  describe "SKILL_CREATE" $ do
-    it "\"Define a 'greeting' skill that says hello.\" -> SKILL_CREATE -> skill in the store" $ do
+  describe "SKILL_WRITE" $ do
+    it "\"Define a 'greeting' skill that says hello.\" -> SKILL_WRITE (create) -> skill in the store" $ do
       backend <- SkillBackend.noneBackend
-      let op = skillCreateOp backend sid
+      let op = skillWriteOp backend sid
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "SKILL_CREATE")
+      r <- runTestApp (dispatchOne reg (OpName "SKILL_WRITE")
                         (object [ "id" .= ("greeting" :: Text)
                                 , "description" .= ("say hello" :: Text)
                                 , "body" .= ("say hello warmly" :: Text) ]))
@@ -475,11 +474,34 @@ spec = describe "Seal.ISA.Integration" $ do
             []     -> expectationFailure "expected at least one skill"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
+    it "\"Change the 'greeting' skill body to be more formal.\" -> SKILL_WRITE (update) -> body changed" $ do
+      backend <- SkillBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillWriteOp backend sid])
+                          (OpName "SKILL_WRITE")
+                          (object [ "id" .= ("greeting" :: Text)
+                                  , "description" .= ("say hello" :: Text)
+                                  , "body" .= ("hi" :: Text) ]))
+      let op = skillWriteOp backend sid
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "SKILL_WRITE")
+                        (object [ "id" .= ("greeting" :: Text)
+                                , "description" .= ("say hello" :: Text)
+                                , "body" .= ("greetings, formally" :: Text) ]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          orParts res `shouldBe` [TrpText "updated"]
+          skills <- SkillBackend.sbList backend
+          case skills of
+            (s : _) -> skBody s `shouldBe` "greetings, formally"
+            []     -> expectationFailure "expected at least one skill"
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
   describe "SKILL_READ" $ do
     it "\"Show me the 'greeting' skill.\" -> SKILL_READ -> skill body returned" $ do
       backend <- SkillBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillCreateOp backend sid])
-                          (OpName "SKILL_CREATE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillWriteOp backend sid])
+                          (OpName "SKILL_WRITE")
                           (object [ "id" .= ("greeting" :: Text)
                                   , "description" .= ("say hello" :: Text)
                                   , "body" .= ("say hello warmly" :: Text) ]))
@@ -495,34 +517,11 @@ spec = describe "Seal.ISA.Integration" $ do
             _          -> expectationFailure "expected text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "SKILL_UPDATE" $ do
-    it "\"Change the 'greeting' skill body to be more formal.\" -> SKILL_UPDATE -> body changed" $ do
-      backend <- SkillBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillCreateOp backend sid])
-                          (OpName "SKILL_CREATE")
-                          (object [ "id" .= ("greeting" :: Text)
-                                  , "description" .= ("say hello" :: Text)
-                                  , "body" .= ("hi" :: Text) ]))
-      let op = skillUpdateOp backend
-          reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "SKILL_UPDATE")
-                        (object [ "id" .= ("greeting" :: Text)
-                                , "body" .= ("greetings, formally" :: Text) ]))
-      case r of
-        Right res -> do
-          orIsError res `shouldBe` False
-          orParts res `shouldBe` [TrpText "updated"]
-          skills <- SkillBackend.sbList backend
-          case skills of
-            (s : _) -> skBody s `shouldBe` "greetings, formally"
-            []     -> expectationFailure "expected at least one skill"
-        Left e -> expectationFailure ("dispatch failed: " <> show e)
-
   describe "SKILL_LIST" $ do
     it "\"List all my skills.\" -> SKILL_LIST -> ids + descriptions returned" $ do
       backend <- SkillBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillCreateOp backend sid])
-                          (OpName "SKILL_CREATE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillWriteOp backend sid])
+                          (OpName "SKILL_WRITE")
                           (object [ "id" .= ("a" :: Text)
                                   , "description" .= ("alpha" :: Text)
                                   , "body" .= ("x" :: Text) ]))
@@ -537,17 +536,69 @@ spec = describe "Seal.ISA.Integration" $ do
             _          -> expectationFailure "expected text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  -- ----------------------------------------------------------------------
-  -- AGENT_DEF_CREATE / READ / UPDATE
-  -- ----------------------------------------------------------------------
-  describe "AGENT_DEF_CREATE" $ do
-    it "\"Define a 'greeter' agent on ollama/llama3.\" -> AGENT_DEF_CREATE -> def stored" $ do
-      backend <- AgentDefBackend.noneBackend
-      let op = agentDefCreateOp backend sid
+  describe "SKILL_DELETE" $ do
+    it "\"Delete the 'greeting' skill.\" -> SKILL_DELETE -> skill removed" $ do
+      backend <- SkillBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillWriteOp backend sid])
+                          (OpName "SKILL_WRITE")
+                          (object [ "id" .= ("greeting" :: Text)
+                                  , "description" .= ("say hello" :: Text)
+                                  , "body" .= ("hi" :: Text) ]))
+      let op = skillDeleteOp backend
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_CREATE")
+      r <- runTestApp (dispatchOne reg (OpName "SKILL_DELETE")
+                        (object ["id" .= ("greeting" :: Text)]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          skills <- SkillBackend.sbList backend
+          skills `shouldBe` []
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
+    it "\"Delete a skill that doesn't exist.\" -> SKILL_DELETE -> idempotent" $ do
+      backend <- SkillBackend.noneBackend
+      let op = skillDeleteOp backend
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "SKILL_DELETE")
+                        (object ["id" .= ("nope" :: Text)]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          case orParts res of
+            [TrpText t] -> "not present" `T.isInfixOf` t `shouldBe` True
+            _          -> expectationFailure "expected text part"
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
+  -- ----------------------------------------------------------------------
+  -- AGENT_DEF_WRITE / READ / LIST / DELETE
+  -- ----------------------------------------------------------------------
+  describe "AGENT_DEF_WRITE" $ do
+    it "\"Define a 'greeter' agent on ollama/llama3.\" -> AGENT_DEF_WRITE (create) -> def stored" $ do
+      backend <- AgentDefBackend.noneBackend
+      let op = agentDefWriteOp backend sid
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_WRITE")
                         (object [ "id" .= ("greeter" :: Text)
                                 , "name" .= ("Greeter" :: Text)
+                                , "provider" .= ("ollama" :: Text)
+                                , "model" .= ("llama3" :: Text) ]))
+      case r of
+        Right res -> orIsError res `shouldBe` False
+        Left e    -> expectationFailure ("dispatch failed: " <> show e)
+
+    it "\"Rename the 'greeter' agent to 'Polite Greeter'.\" -> AGENT_DEF_WRITE (update) -> name changed" $ do
+      backend <- AgentDefBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
+                          (OpName "AGENT_DEF_WRITE")
+                          (object [ "id" .= ("greeter" :: Text)
+                                  , "name" .= ("old" :: Text)
+                                  , "provider" .= ("ollama" :: Text)
+                                  , "model" .= ("llama3" :: Text) ]))
+      let op = agentDefWriteOp backend sid
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_WRITE")
+                        (object [ "id" .= ("greeter" :: Text)
+                                , "name" .= ("Polite Greeter" :: Text)
                                 , "provider" .= ("ollama" :: Text)
                                 , "model" .= ("llama3" :: Text) ]))
       case r of
@@ -557,8 +608,8 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "AGENT_DEF_READ" $ do
     it "\"Show me the 'greeter' agent definition.\" -> AGENT_DEF_READ -> def returned" $ do
       backend <- AgentDefBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefCreateOp backend sid])
-                          (OpName "AGENT_DEF_CREATE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
+                          (OpName "AGENT_DEF_WRITE")
                           (object [ "id" .= ("greeter" :: Text)
                                   , "name" .= ("Greeter" :: Text)
                                   , "provider" .= ("ollama" :: Text)
@@ -575,34 +626,83 @@ spec = describe "Seal.ISA.Integration" $ do
             _          -> expectationFailure "expected text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "AGENT_DEF_UPDATE" $ do
-    it "\"Rename the 'greeter' agent to 'Polite Greeter'.\" -> AGENT_DEF_UPDATE -> name changed" $ do
+  describe "AGENT_DEF_LIST" $ do
+    it "\"List all agent definitions.\" -> AGENT_DEF_LIST -> empty when none defined" $ do
       backend <- AgentDefBackend.noneBackend
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefCreateOp backend sid])
-                          (OpName "AGENT_DEF_CREATE")
+      let op = agentDefListOp backend
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_LIST") (object []))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          orParts res `shouldBe` [TrpText "(no agent definitions)"]
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
+    it "\"List all agent definitions.\" -> AGENT_DEF_LIST -> defs with id, name, provider/model" $ do
+      backend <- AgentDefBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
+                          (OpName "AGENT_DEF_WRITE")
                           (object [ "id" .= ("greeter" :: Text)
-                                  , "name" .= ("old" :: Text)
+                                  , "name" .= ("Greeter" :: Text)
                                   , "provider" .= ("ollama" :: Text)
                                   , "model" .= ("llama3" :: Text) ]))
-      let op = agentDefUpdateOp backend
+      let op = agentDefListOp backend
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_UPDATE")
-                        (object [ "id" .= ("greeter" :: Text)
-                                , "name" .= ("Polite Greeter" :: Text) ]))
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_LIST") (object []))
       case r of
-        Right res -> orIsError res `shouldBe` False
-        Left e    -> expectationFailure ("dispatch failed: " <> show e)
+        Right res -> do
+          orIsError res `shouldBe` False
+          case orParts res of
+            [TrpText t] -> do
+              "greeter: Greeter" `T.isInfixOf` t `shouldBe` True
+              "ollama/llama3" `T.isInfixOf` t `shouldBe` True
+            _          -> expectationFailure "expected text part"
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
+  describe "AGENT_DEF_DELETE" $ do
+    it "\"Delete the 'greeter' agent definition.\" -> AGENT_DEF_DELETE -> def removed" $ do
+      backend <- AgentDefBackend.noneBackend
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
+                          (OpName "AGENT_DEF_WRITE")
+                          (object [ "id" .= ("greeter" :: Text)
+                                  , "name" .= ("Greeter" :: Text)
+                                  , "provider" .= ("ollama" :: Text)
+                                  , "model" .= ("llama3" :: Text) ]))
+      let op = agentDefDeleteOp backend
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_DELETE")
+                        (object ["id" .= ("greeter" :: Text)]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          defs <- AgentDefBackend.adbList backend
+          defs `shouldBe` []
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
+
+    it "\"Delete a def that doesn't exist.\" -> AGENT_DEF_DELETE -> idempotent" $ do
+      backend <- AgentDefBackend.noneBackend
+      let op = agentDefDeleteOp backend
+          reg = Registry.mkRegistry [op]
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_DEF_DELETE")
+                        (object ["id" .= ("nope" :: Text)]))
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          case orParts res of
+            [TrpText t] -> "not present" `T.isInfixOf` t `shouldBe` True
+            _          -> expectationFailure "expected text part"
+        Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   -- ----------------------------------------------------------------------
-  -- AGENT_START / STATUS / LIST / STOP
+  -- AGENT_START / STATUS / INSTANCES / STOP
   -- ----------------------------------------------------------------------
   describe "AGENT_START" $ do
     it "\"Start the 'greeter' agent.\" -> AGENT_START -> instance Running in the runtime" $ do
       backend <- AgentDefBackend.noneBackend
       rt <- newAgentRuntime
       ran <- newIORef (0 :: Int)
-      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefCreateOp backend sid])
-                          (OpName "AGENT_DEF_CREATE")
+      _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
+                          (OpName "AGENT_DEF_WRITE")
                           (object [ "id" .= ("greeter" :: Text)
                                   , "name" .= ("g" :: Text)
                                   , "provider" .= ("ollama" :: Text)
@@ -636,12 +736,12 @@ spec = describe "Seal.ISA.Integration" $ do
           orParts res `shouldBe` [TrpText "not running"]
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "AGENT_LIST" $ do
-    it "\"List the running agents.\" -> AGENT_LIST -> empty when none running" $ do
+  describe "AGENT_INSTANCES" $ do
+    it "\"List the running agents.\" -> AGENT_INSTANCES -> empty when none running" $ do
       rt <- newAgentRuntime
-      let op = agentListOp rt
+      let op = agentInstancesOp rt
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "AGENT_LIST") (object []))
+      r <- runTestApp (dispatchOne reg (OpName "AGENT_INSTANCES") (object []))
       case r of
         Right res -> do
           orIsError res `shouldBe` False

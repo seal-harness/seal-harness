@@ -56,12 +56,12 @@ import Seal.ISA.Ops.File (fileReadOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryStoreOp, memoryUpdateOp )
+  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Skills
-  ( skillCreateOp, skillListOp, skillReadOp, skillUpdateOp )
+  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
-  ( agentDefCreateOp, agentDefReadOp, agentDefUpdateOp
-  , agentListOp, agentStatusOp, agentStopOp )
+  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
+  , agentInstancesOp, agentStatusOp, agentStopOp )
 import qualified Seal.ISA.Registry as ISA
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Vault qualified as Vault
@@ -244,18 +244,18 @@ buildRegistry _paths rt backends wsRoot sid _eCfg =
     , askHumanOp simpleCaps
     , fileReadOp wsRoot 131072
     , secretGetOp rt
-    , memoryStoreOp (bMemory backends) sid
+    , memoryWriteOp (bMemory backends) sid
     , memoryRecallOp defaultPageParams (bMemory backends)
-    , memoryUpdateOp (bMemory backends)
     , memoryDeleteOp (bMemory backends)
-    , skillCreateOp (bSkills backends) sid
+    , skillWriteOp (bSkills backends) sid
     , skillReadOp (bSkills backends)
-    , skillUpdateOp (bSkills backends)
     , skillListOp (bSkills backends)
-    , agentDefCreateOp (bAgentDefs backends) sid
+    , skillDeleteOp (bSkills backends)
+    , agentDefWriteOp (bAgentDefs backends) sid
     , agentDefReadOp (bAgentDefs backends)
-    , agentDefUpdateOp (bAgentDefs backends)
-    , agentListOp (bRuntime backends)
+    , agentDefListOp (bAgentDefs backends)
+    , agentDefDeleteOp (bAgentDefs backends)
+    , agentInstancesOp (bRuntime backends)
     , agentStatusOp (bRuntime backends)
     , agentStopOp (bRuntime backends)
     ]
