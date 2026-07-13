@@ -2,11 +2,13 @@
 module Seal.Channels.Signal.RunSpec (spec) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime(..), fromGregorian)
 import Options.Applicative
   ( defaultPrefs, execParserPure, renderFailure, ParserResult (..), info, progDesc )
 import Test.Hspec
@@ -23,6 +25,8 @@ import Seal.Command.Spec
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.MessageSource (mkUserId)
 import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Config.Paths (SealPaths (..))
+import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.ISA.Opcode (localBackend)
@@ -30,9 +34,12 @@ import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Provider (..), SomeProvider (..)
   , StopReason (..), Usage (..) )
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (SessionRuntime (..))
 import Seal.Signal.Config (SignalAccount (..), mkSignalAccount)
 import Seal.Tabs (newTabsHandle)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Types.App (runApp)
 import Seal.Types.Command (Command (..), pCommand)
 import Seal.Types.Config (defaultConfig)
@@ -82,10 +89,10 @@ spec :: Spec
 spec = do
   describe "Seal.Types.Command.pCommand" $ do
     let cmdInfo = info pCommand (progDesc "seal subcommand")
-    it "parses 'signal' as CommandSignal" $
+    it "parses 'signal' as CommandSignal Supervised" $
       case execParserPure defaultPrefs cmdInfo ["signal"] of
-        Success cmd -> cmd `shouldBe` CommandSignal
-        other       -> expectationFailure ("expected CommandSignal, got: " <> show other)
+        Success cmd -> cmd `shouldBe` CommandSignal Supervised
+        other       -> expectationFailure ("expected CommandSignal Supervised, got: " <> show other)
 
     it "renders --help for the signal subcommand" $
       case execParserPure defaultPrefs cmdInfo ["signal", "--help"] of
@@ -106,6 +113,7 @@ spec = do
           isaReg   = ISA.mkRegistry []
           allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
       appEnv <- mkEnv defaultConfig
+      approvals <- newApprovalCache
       let runOneTurn h ms body =
             let handleCaps = ChannelCaps
                   { ccSend = chSend h
@@ -125,14 +133,32 @@ spec = do
                   , aeSession = sid
                   , aeMaxTurns = 4
                   , aeMessageSource = Just ms
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
                   }
             in runApp appEnv (runTurn agentEnv body)
           plainHandler h mSrc body = case mSrc of
             Just ms -> runOneTurn h ms body
             Nothing -> pure ()
       tabsH <- newTabsHandle
-      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH plainHandler
+      askReply <- newAskReplyStore 0
+      let meta = SessionMeta sid "ollama" "test" "signal" Nothing
+                   (UTCTime (fromGregorian 2026 1 1) 0)
+                   (UTCTime (fromGregorian 2026 1 1) 0)
+      activeRef <- newIORef meta
+      let sr = SessionRuntime
+            { srPaths = SealPaths
+                { spHome = "", spState = "", spConfig = "", spKeys = "" }
+            , srConfigPath = ""
+            , srActive = activeRef
+            }
+      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+      -- The plain turn is forked so the loop can keep receiving; give the
+      -- forked thread a moment to finish its runTurn + chSend before reading
+      -- the captured sends.
+      threadDelay 100000  -- 100ms
       -- /ping dispatched → pong sent via the handle
       -- hello routed → "hi from model" sent via the handle
       cap <- getCaptured

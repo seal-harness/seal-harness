@@ -9,10 +9,12 @@ import Data.Text (Text)
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Types (ModelId, SessionId)
+import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
+import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tools.Exec.Types (ExecBackend)
 
 data AgentEnv = AgentEnv
@@ -45,6 +47,19 @@ data AgentEnv = AgentEnv
     -- @erMeta@ @channel@ field and the 'msConversationId' into
     -- @conversationId@, so the transcript records which channel + conversation
     -- each turn served.
+  , aeAutonomy :: AutonomyLevel
+    -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
+    -- human-confirmation gate for Untrusted opcodes (they run immediately after
+    -- the ACK-before-execute audit). 'Supervised' (the default) prompts the
+    -- human via 'ccPrompt' before executing any Untrusted opcode; a non-"yes"
+    -- reply cancels the call (the model sees a denied result). 'Deny' is
+    -- enforced by the opcode's own authorize gate (rejected before the
+    -- dispatcher runs).
+  , aeApprovals :: ApprovalCache
+    -- ^ The approval cache for Untrusted opcodes under 'Supervised' autonomy.
+    -- Records "for this session" and "always" approvals so subsequent calls
+    -- to the same opcode skip the prompt. 'ScopeRejected' entries short-
+    -- circuit to denied. Threaded from the channel wiring (web, CLI, Signal).
   , aeDebugRequestsPath :: Maybe FilePath
     -- ^ When 'Just', every 'CompletionRequest' sent to the LLM is appended
     -- (redundantly, in full) to this file as one JSONL line per request.
@@ -53,4 +68,11 @@ data AgentEnv = AgentEnv
     -- we can debug whether the two-file storage format is correctly feeding
     -- the session history to the LLM. 'Nothing' (the default) means no
     -- debug file is written.
+  , aeOnEntry :: IO ()
+    -- ^ A hook called by the loop after each transcript entry is recorded
+    -- (response entries, tool-result entries, approval-evidence entries).
+    -- The web channel wires this to 'broadcastNewEntries' so the frontend
+    -- sees new entries live — including tool calls that are pending
+    -- confirmation — rather than only at the end of the turn. The CLI and
+    -- Signal channels set this to @pure ()@ (no live broadcast needed).
   }

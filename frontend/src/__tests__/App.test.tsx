@@ -17,6 +17,8 @@ vi.mock('../lib/streamClient', () => {
     onActivity: () => unsub,
     onLists: () => unsub,
     onStatusChange: () => unsub,
+    onAsk: () => unsub,
+    onAskResolved: () => unsub,
     lastError: () => null,
   }
   return { streamClient: () => client }
@@ -102,6 +104,8 @@ function defaultFetchDispatch(): void {
     else if (url === '/api/tabs') body = []
     else if (url === '/api/harnesses') body = []
     else if (url === '/api/harnesses/discover') body = []
+    else if (url.includes('/questions')) body = []
+    else if (url.includes('/transcript')) body = []
     return new globalThis.Response(JSON.stringify(body), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },

@@ -26,6 +26,7 @@ import Seal.Config.Paths
   )
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Ingest (emptyChain)
+import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle)
@@ -56,9 +57,10 @@ tryOpenVault paths cfg =
           Just <$> openVault vcfg enc
     _ -> pure Nothing
 
--- | Full TUI wiring.
-runTui :: IO ()
-runTui = do
+-- | Full TUI wiring. The autonomy level threads through to 'mkSessionAgentEnv'
+-- so 'Supervised' (the default) prompts before running Untrusted opcodes.
+runTui :: AutonomyLevel -> IO ()
+runTui autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
@@ -116,4 +118,4 @@ runTui = do
         , tabsCommandSpec tabsH
         , terseGrammarSpec
         ]
-  runCliTui paths rt pr sr registry emptyChain backends tabsH
+  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy

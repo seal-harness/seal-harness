@@ -30,8 +30,10 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
+import Seal.Handles.AskReply
+  ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
-  ( SendDeps (..), handleSend, sendOutcomeJson )
+  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
 import Seal.Gateway.Transcript (firstUserMessageSnippet, readTranscriptEntries, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
@@ -118,6 +120,52 @@ apiApp deps req respond =
     (m', ["api", "sessions", _sid, "prompt"]) | m' == methodPut -> do
       _body <- collectBody req
       respond noContent
+    -- GET /api/sessions/:id/questions -> the session's pending ASK_HUMAN
+    -- questions (oldest-first). The frontend renders these as dismissible
+    -- prompts; the operator answers via POST .../questions/:qid/answer or
+    -- cancels via POST .../questions/:qid/cancel. Requires 'adSend' (the
+    -- 'AskReplyStore' lives on the 'SendDeps'); returns [] when unwired.
+    (m', ["api", "sessions", sid, "questions"]) | m' == methodGet ->
+      case adSend deps of
+        Nothing -> respond (jsonLBS status200 (A.encode ([] :: [Value])))
+        Just _sendDeps -> respond =<< handleListQuestions deps sid
+    -- POST /api/sessions/:id/questions/:qid/answer -> deliver the operator's
+    -- approval scope to a pending confirmation question, unblocking the
+    -- agent-loop thread. Body: {"scope":"once|for_session|always|rejected"}.
+    -- Returns 200 {ok:true, accepted:true} when the answer was accepted (the
+    -- question was pending), or 200 {ok:true, accepted:false} when the
+    -- question was already answered, cancelled, or unknown. A malformed ask
+    -- id or scope yields 400.
+    (m', ["api", "sessions", sid, "questions", qid, "answer"]) | m' == methodPost -> do
+      body <- collectBody req
+      case adSend deps of
+        Nothing -> respond (errJson status501 "ask/reply not wired")
+        Just sendDeps -> case mkSessionId sid of
+          Left e -> respond (errJson status400 ("invalid session id: " <> e))
+          Right sId -> case parseScopeBody body of
+            Nothing -> respond (errJson status400 "missing or invalid 'scope' field")
+            Just scopeTxt -> case parseApprovalScope scopeTxt of
+              Left e -> respond (errJson status400 e)
+              Right scope -> do
+                eRes <- handleAnswerDelivery sendDeps sId qid scope
+                case eRes of
+                  Left e     -> respond (errJson status400 e)
+                  Right acc -> respond (jsonOk (object ["ok" .= True, "accepted" .= acc]))
+    -- POST /api/sessions/:id/questions/:qid/cancel -> cancel a pending
+    -- ASK_HUMAN question (the operator dismissed it). Returns 200
+    -- {ok:true, cancelled:true} when the question was pending and is now
+    -- cancelled, or 200 {ok:true, cancelled:false} when it was already
+    -- resolved or unknown. A malformed ask id yields 400.
+    (m', ["api", "sessions", sid, "questions", qid, "cancel"]) | m' == methodPost ->
+      case adSend deps of
+        Nothing -> respond (errJson status501 "ask/reply not wired")
+        Just sendDeps -> case mkSessionId sid of
+          Left e -> respond (errJson status400 ("invalid session id: " <> e))
+          Right sId -> do
+            eRes <- handleAskCancel sendDeps sId qid
+            case eRes of
+              Left e -> respond (errJson status400 e)
+              Right cnl -> respond (jsonOk (object ["ok" .= True, "cancelled" .= cnl]))
     (m', ["api", "harnesses"]) | m' == methodGet -> do
       entries <- snapshot (adHarnessRegistry deps)
       respond (jsonLBS status200 (A.encode entries))
@@ -491,6 +539,44 @@ handleTranscript deps sidTxt =
       active <- readIORef (srActive (adSessionRuntime deps))
       entries <- readTranscriptEntries paths (smModel active) (showIso (smCreatedAt active)) sid
       pure (jsonLBS status200 (A.encode entries))
+
+-- | Handle GET /api/sessions/:id/questions. Returns the session's pending
+-- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@), oldest
+-- first. Requires 'adSend' (the 'AskReplyStore' lives on 'SendDeps'); returns
+-- @[]@ when unwired or the session id is invalid.
+handleListQuestions :: ApiDeps -> Text -> IO Response
+handleListQuestions deps sidTxt =
+  case mkSessionId sidTxt of
+    Left _ -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
+    Right sid -> case adSend deps of
+      Nothing -> pure (jsonLBS status200 (A.encode ([] :: [Value])))
+      Just sendDeps -> do
+        pending <- pendingForSession (sdAskReply sendDeps) sid
+        let vals = map questionJson pending
+        pure (jsonLBS status200 (A.encode vals))
+  where
+    questionJson (qid, question, createdAt, mMeta) = case mMeta of
+      Nothing -> object
+        [ "id" .= askIdText qid
+        , "question" .= question
+        , "createdAt" .= createdAt
+        ]
+      Just meta -> object
+        [ "id" .= askIdText qid
+        , "question" .= question
+        , "createdAt" .= createdAt
+        , "meta" .= meta
+        ]
+
+-- | Parse the @scope@ field from a POST .../questions/:qid/answer body.
+-- Returns 'Nothing' when the body is missing/invalid or the field is absent.
+parseScopeBody :: BL.ByteString -> Maybe Text
+parseScopeBody body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "scope") o of
+      Just (A.String t) -> Just t
+      _                 -> Nothing
+    _ -> Nothing
 
 -- | Map an 'AgentDef' to the frontend's 'AgentInfo' JSON shape. @isDefault@
 -- is a UI convenience; T11 returns @false@ for all (the configured default

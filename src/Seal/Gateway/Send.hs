@@ -13,9 +13,12 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , handleAnswerDelivery
+  , handleAskCancel
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
+import Control.Monad (when)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
@@ -43,6 +46,10 @@ import Seal.Config.Paths (SealPaths, agentSessionDir, sessionDir, sessionRequest
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo)
+import Seal.Handles.AskReply
+  ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
+  , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
+  , approvalScopeText )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
@@ -120,6 +127,17 @@ data SendDeps = SendDeps
     -- ^ The shared HTTP manager (TLS-configured) for WEB_FETCH and
     -- WEB_SEARCH. 'Nothing' fail-closes those opcodes (they return a
     -- structured error). Set by 'runServeMain'; tests use 'Nothing'.
+  , sdAskReply :: AskReplyStore
+    -- ^ The shared, medium-agnostic ask/reply store backing ASK_HUMAN on
+    -- async channels (web, Signal, Telegram). The agent loop blocks on the
+    -- store until the medium delivers an answer (web: POST
+    -- /api/sessions/:id/questions/:qid/answer; Signal/Telegram: the next
+    -- inbound message). Set by 'runServeMain'; tests use a fresh store.
+  , sdApprovals :: ApprovalCache
+    -- ^ The approval cache for Untrusted opcodes under 'Supervised' autonomy.
+    -- Records "for this session" and "always" approvals so subsequent calls
+    -- to the same opcode skip the prompt. Shared across all sessions (the
+    -- "always" scope is global; "for this session" is keyed by session id).
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -184,8 +202,10 @@ loadSessionMeta paths sid = do
 
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
--- and uses a no-op 'ChannelCaps' (the web frontend reads replies from the
--- transcript poll, not from ccSend).
+-- and uses the ask/reply-backed 'ChannelCaps' ('webAskCaps') so ASK_HUMAN
+-- surfaces the question to the frontend and blocks until the human answers
+-- (the web frontend reads replies + questions from the WS stream, not from
+-- ccSend).
 plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
 plainTurn deps meta t = do
   eprov <- sdResolve deps meta
@@ -197,30 +217,28 @@ plainTurn deps meta t = do
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
       Right <$> withTwoFileTranscript sessionDirPath (\tHandle -> do
-        wsRoot <- WorkspaceRoot <$> getCurrentDirectory
+        wsroot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+            execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
             agentDefBackend = bAgentDefs (sdBackends deps)
-            caps = ChannelCaps
-              { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
-              , ccPrompt = \_ -> pure ""  -- web can't prompt inline (deferral is a later phase)
-              , ccPromptSecret = \_ -> pure ""
-              }
+            caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
         mSystem <- case smAgent meta of
           Nothing -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
         let mintSession = webMintSession sid
             isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
               execBackend (sdAutonomy deps) mintSession
               (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+              caps
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
-              (debugPath (sdPaths deps) sid eCfg)
+              (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
+              (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
@@ -249,12 +267,13 @@ buildWebRegistry
   -> HarnessRegistry          -- ^ the live harness registry (shared with the gateway)
   -> TmuxRunner               -- ^ the tmux runner (real via mkRealTmuxRunner; fail-closes when tmux absent)
   -> Maybe Manager            -- ^ shared HTTP manager for WEB_FETCH / WEB_SEARCH (Nothing = fail-closed)
+  -> ChannelCaps              -- ^ the per-turn caps (ASK_HUMAN/SHOW_HUMAN use these; built by 'webAskCaps')
   -> ISA.Registry
 buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
-                 mintSession mkWorker harnessReg tmuxRunner httpManager =
+                 mintSession mkWorker harnessReg tmuxRunner httpManager caps =
   ISA.mkRegistry
-    [ showHumanOp simpleCaps
-    , askHumanOp simpleCaps
+    [ showHumanOp caps
+    , askHumanOp caps
     , secretGetOp rt
     , memoryWriteOp (bMemory backends) sid
     , memoryRecallOp defaultPageParams (bMemory backends)
@@ -295,11 +314,6 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
   where
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
-    simpleCaps = ChannelCaps
-      { ccSend = \_ -> pure ()
-      , ccPrompt = \_ -> pure ""
-      , ccPromptSecret = \_ -> pure ""
-      }
     -- Fail-closed defaults for the provider-pluggable opcodes. These surface
     -- as available tools to the LLM; the opcodes return a structured error
     -- until a real provider is configured (operator-supplied via config in a
@@ -327,14 +341,13 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
 
 -- | Run a slash command. The output is collected via a 'ChannelCaps' whose
 -- 'ccSend' appends to an MVar-backed list, then returned as the @response@.
+-- 'ccPrompt' routes through the ask/reply store so ASK_HUMAN (e.g. from a
+-- slash command that delegates to the agent) surfaces to the frontend.
 runSlash :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
 runSlash deps meta fullLine = do
   outVar <- newMVar ([] :: [Text])
-  let caps = ChannelCaps
-        { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t']))
-        , ccPrompt = \_ -> pure ""
-        , ccPromptSecret = \_ -> pure ""
-        }
+  let askCaps = webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
+      caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
   d <- ingest (sdRegistry deps) (sdPreprocess deps) (RawInbound fullLine)
   case d of
     DispatchAction (CommandAction act) -> do
@@ -381,9 +394,11 @@ plainTurnWithCaps deps meta caps t = do
               execBackend (sdAutonomy deps) mintSession
               (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+              caps
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
-              (debugPath (sdPaths deps) sid eCfg)
+              (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
+              (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
@@ -431,7 +446,8 @@ webMkWorker deps paths parentSid caps execBackend appEnv eCfg isaReg def childSi
         let childEnv = mkSessionAgentEnv
               caps childProv fallBackProvider childModel childSid
               (adSystem def) isaReg childTHandle execBackend
-              (debugPath paths childSid eCfg)
+              (debugPath paths childSid eCfg) (sdAutonomy deps) (sdApprovals deps)
+              (broadcastNewEntries (sdBroker deps) paths childSid (modelText childModel) (smCreatedAt active))
         runApp appEnv (runTurn childEnv "")
 
 -- | Extract the 'Text' from a 'ModelId'.
@@ -450,3 +466,77 @@ broadcastNewEntries mBroker paths sid model createdAt =
     Just broker -> do
       entries <- readTranscriptEntries paths model (showIso createdAt) sid
       mapM_ (broadcast broker . BeEntryRecorded sid) entries
+
+-- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend' is a
+-- no-op (web replies surface via the transcript poll); 'ccPrompt' drives the
+-- full ask/reply primitive: it mints a pending question (carrying the opcode
+-- metadata when provided), broadcasts a 'BeAsk' event so the frontend renders
+-- it, and blocks on the store until the human answers via POST
+-- /api/sessions/:id/questions/:qid/answer (or the question is
+-- cancelled/timed out). The returned 'Text' is the approval scope's wire form
+-- (e.g. @"once"@, @for_session@, @always@, @rejected@) for the confirmation
+-- gate, or the human's typed reply for @ASK_HUMAN@. 'ccPromptSecret' is
+-- fail-closed.
+webAskCaps
+  :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
+webAskCaps mBroker store sid = ChannelCaps
+  { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
+  , ccPrompt = \q -> do
+      outcome <- askHuman store sid q (\qid ->
+        case mBroker of
+          Nothing -> pure ()
+          Just broker ->
+            broadcast broker (BeAsk sid (object
+              [ "id" .= askIdText qid
+              , "question" .= q
+              ])))
+      pure (case outcome of
+        Left _  -> "rejected"
+        Right t -> t)
+  , ccPromptSecret = \_ -> pure ""  -- web: hidden prompts are a later phase
+  }
+
+-- | Notify the broker that a pending question was resolved (answered or
+-- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a
+-- no-op.
+broadcastAskResolved
+  :: Maybe StreamBroker -> SessionId -> AskId -> Text -> IO ()
+broadcastAskResolved mBroker sid qid resolution =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker ->
+      broadcast broker (BeAskResolved sid (object
+        [ "id" .= askIdText qid
+        , "resolution" .= resolution
+        ]))
+
+-- | Deliver an answer to a pending question for a session. Returns 'True'
+-- if the answer was accepted (the question was pending and not yet
+-- answered). Also broadcasts 'BeAskResolved' so the frontend dismisses the
+-- question. A 'Left' parse error is returned for a malformed ask id or
+-- approval scope.
+handleAnswerDelivery
+  :: SendDeps -> SessionId -> Text -> ApprovalScope -> IO (Either Text Bool)
+handleAnswerDelivery deps sid qidTxt scope =
+  case parseAskId qidTxt of
+    Left e -> pure (Left e)
+    Right qid -> do
+      let reply = AskReply scope (approvalScopeText scope)
+      accepted <- deliverAnswer (sdAskReply deps) qid reply
+      when accepted $
+        broadcastAskResolved (sdBroker deps) sid qid "answered"
+      pure (Right accepted)
+
+-- | Cancel a pending question for a session. Returns 'True' if the question
+-- was pending and is now cancelled. Broadcasts 'BeAskResolved' so the
+-- frontend dismisses it.
+handleAskCancel
+  :: SendDeps -> SessionId -> Text -> IO (Either Text Bool)
+handleAskCancel deps sid qidTxt =
+  case parseAskId qidTxt of
+    Left e -> pure (Left e)
+    Right qid -> do
+      cancelled <- cancelAsk (sdAskReply deps) qid
+      when cancelled $
+        broadcastAskResolved (sdBroker deps) sid qid "cancelled"
+      pure (Right cancelled)

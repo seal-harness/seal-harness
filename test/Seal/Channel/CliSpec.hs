@@ -18,8 +18,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.Ingest (Disposition (..))
+import Seal.Security.Policy (AutonomyLevel (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (Provider (..), SomeProvider (..))
 import Seal.Security.Vault (VaultHandle)
@@ -118,13 +120,14 @@ spec = do
 
   describe "mkSessionAgentEnv" $
     it "carries the session's model and id into the AgentEnv" $ do
+      approvals <- newApprovalCache
       (_, caps) <- makeFakeCaps []
       (th, _)   <- fakeTwoFileTranscript
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (EbLocal mkLocalExecHandlePlaceholder)
-                  Nothing
+                  Nothing Full approvals (pure ())
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing

@@ -44,6 +44,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..),
                         mkSessionId)
+import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.Handles.Harness (HarnessError (..))
 import Seal.Harness.Id (harnessIdToText, newHarnessId)
@@ -207,6 +208,7 @@ spec = describe "Seal.ISA.Integration" $ do
 
     it "\"end-to-end: read notes.txt\" -> runTurn -> final text contains the file contents" $
       withSystemTempDirectory "seal-int-e2e" $ \root -> do
+        approvals <- newApprovalCache
         BS.writeFile (root </> "notes.txt") "hello world"
         sent <- newIORef []
         let caps = recordCaps sent
@@ -224,7 +226,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    (EbLocal mkLocalExecHandlePlaceholder) caps sid 8 Nothing Nothing
+                    (EbLocal mkLocalExecHandlePlaceholder) caps sid 8 Nothing Full approvals Nothing (pure ())
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

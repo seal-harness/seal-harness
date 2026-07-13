@@ -35,6 +35,7 @@ import Seal.Gateway.Send (SendDeps (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
+import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
@@ -902,6 +903,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdHarnessRegistry = error "sdHarnessRegistry: unused on the 404 path"
             , sdTmuxRunner  = error "sdTmuxRunner: unused on the 404 path"
             , sdHttpManager = error "sdHttpManager: unused on the 404 path"
+            , sdAskReply    = error "sdAskReply: unused on the 404 path"
+            , sdApprovals   = error "sdApprovals: unused on the 404 path"
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -939,6 +942,8 @@ spec = describe "Seal.Gateway.API" $ do
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       tmuxR <- mkRealTmuxRunner
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
       let adb = bAgentDefs backends
       -- A fake provider that returns one canned assistant reply.
       providerRef <- newIORef
@@ -974,6 +979,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdHarnessRegistry = reg
             , sdTmuxRunner  = tmuxR
             , sdHttpManager = Nothing
+            , sdAskReply    = askReply
+            , sdApprovals   = approvals
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

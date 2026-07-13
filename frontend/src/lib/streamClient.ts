@@ -49,6 +49,8 @@ class StreamClientImpl implements StreamClient {
   private entryListeners = new Set<(e: TranscriptEntry) => void>()
   private activityListeners = new Set<(sid: string, a: ActivityEvent) => void>()
   private listsListeners = new Set<(snapshot: ListsSnapshot) => void>()
+  private askListeners = new Set<(sid: string, ask: { id: string; question: string }) => void>()
+  private askResolvedListeners = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
 
   constructor(url: string) {
     this.url = url
@@ -104,6 +106,20 @@ class StreamClientImpl implements StreamClient {
     this.statusListeners.add(cb)
     return () => {
       this.statusListeners.delete(cb)
+    }
+  }
+
+  onAsk(cb: (sid: string, ask: { id: string; question: string }) => void): () => void {
+    this.askListeners.add(cb)
+    return () => {
+      this.askListeners.delete(cb)
+    }
+  }
+
+  onAskResolved(cb: (sid: string, ask: { id: string; resolution: string }) => void): () => void {
+    this.askResolvedListeners.add(cb)
+    return () => {
+      this.askResolvedListeners.delete(cb)
     }
   }
 
@@ -228,6 +244,22 @@ class StreamClientImpl implements StreamClient {
         break
       case 'lists':
         for (const cb of this.listsListeners) cb(event)
+        break
+      case 'ask':
+        if (
+          this.focusState.kind === 'focused' &&
+          this.focusState.sessionId === event.sessionId
+        ) {
+          for (const cb of this.askListeners) cb(event.sessionId, event.ask)
+        }
+        break
+      case 'ask_resolved':
+        if (
+          this.focusState.kind === 'focused' &&
+          this.focusState.sessionId === event.sessionId
+        ) {
+          for (const cb of this.askResolvedListeners) cb(event.sessionId, event.ask)
+        }
         break
       case 'replay-end':
         if (

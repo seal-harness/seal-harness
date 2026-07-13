@@ -28,6 +28,7 @@ module Seal.Transcript.Reconstruct
   ) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 
 import Seal.Core.Types (ModelId (..))
@@ -139,11 +140,22 @@ responsePayload mEnv msgs e = object
 
 -- | A harness turn's payload: the conversation lines added since the prior
 -- turn (the harness's input/output as messages), plus the harness name.
+-- When the entry carries approval metadata (erMeta has an "approval" key),
+-- the payload includes the approval info so the frontend can render it.
 harnessPayload :: [Message] -> EntryRecord -> Value
-harnessPayload msgs e = object
-  [ "messages" .= msgs
-  , "harness"  .= erHarness e
-  ]
+harnessPayload msgs e =
+  let base = object
+        [ "messages" .= msgs
+        , "harness"  .= erHarness e
+        ]
+  in case Map.lookup "approval" (erMeta e) of
+       Nothing -> base
+       Just approvalVal -> object
+         [ "messages" .= msgs
+         , "harness"  .= erHarness e
+         , "approval" .= approvalVal
+         , "op" .= (Map.lookup "op" (erMeta e) :: Maybe Value)
+         ]
 
 -- | Lift an 'EntryRecord' into a 'TranscriptEntry' with the given direction
 -- and payload. The id, timestamp, duration, correlation, and meta are
