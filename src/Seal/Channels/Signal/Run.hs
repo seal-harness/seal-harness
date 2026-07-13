@@ -31,6 +31,7 @@ import Seal.Tools.Exec.Types (ExecBackend (..))
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (SignalTransport, mkRealSignalTransport)
+import Seal.Command.Channel (ChannelRuntime (..), channelCommandSpec, mkRealSignalCli)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
@@ -312,11 +313,14 @@ runSignalMain = do
              , srActive     = activeRef
              }
   tabsH <- newTabsHandle
+  cli <- mkRealSignalCli
+  let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli }
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
+        , channelCommandSpec channelRt
         , tabCommandSpec tabsH
         , tabsCommandSpec tabsH
         , terseGrammarSpec
