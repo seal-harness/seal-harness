@@ -55,6 +55,7 @@ library
         Seal.Transcript.Entries
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
+        Seal.Handles.AskReply
         Seal.Handles.Harness
         Seal.Handles.Tab
         Seal.Handles.Transcript
@@ -263,6 +264,7 @@ test-suite tests
         Seal.Transcript.EntriesSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
+        Seal.Handles.AskReplySpec
         Seal.Handles.HarnessSpec
         Seal.Handles.TabSpec
         Seal.Handles.TranscriptSpec

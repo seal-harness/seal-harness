@@ -5,11 +5,13 @@
 module Seal.Phase2bSpec (spec) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime(..), fromGregorian)
 import Options.Applicative (info, progDesc)
 import Test.Hspec
 
@@ -18,6 +20,7 @@ import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channels.Signal.Run (runSignalLoop)
+import Seal.Config.Paths (SealPaths (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Channels.Signal.Transport (mkMockSignalTransport)
 import Seal.Command.Spec
@@ -26,6 +29,7 @@ import Seal.Command.Spec
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.MessageSource (mkUserId)
 import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Opcode (localBackend)
@@ -33,6 +37,9 @@ import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Provider (..), SomeProvider (..)
   , StopReason (..), Usage (..) )
+import Seal.Security.Policy (AutonomyLevel (..))
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (SessionRuntime (..))
 import Seal.Signal.Config (SignalAccount (..), mkSignalAccount)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App (runApp)
@@ -82,6 +89,7 @@ acct = case mkSignalAccount "+12025551234" of
 spec :: Spec
 spec = describe "Seal.Phase2bSpec" $ do
   it "Signal over mock transport: /ping dispatches, plain routes to runTurn, non-allow-listed dropped, replies chunked, MessageSource threaded into erMeta" $ do
+    approvals <- newApprovalCache
     let envPing  = signalEnvelope "+15551234567" (Just "abc") "/ping"
         envHello = signalEnvelope "+15551234567" (Just "abc") "hello"
         envDrop  = signalEnvelope "+19999999999" Nothing "ignored"  -- non-allow-listed
@@ -113,14 +121,32 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeSession = sid
                 , aeMaxTurns = 4
                 , aeMessageSource = Just ms
+                , aeAutonomy = Full
+                , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
                 }
           in runApp appEnv (runTurn agentEnv body)
         plainHandler h mSrc body = case mSrc of
           Just ms -> runOneTurn h ms body
           Nothing -> pure ()
     tabsH <- newTabsHandle
-    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH plainHandler
+    askReply <- newAskReplyStore 0
+    let meta = SessionMeta sid "ollama" "test" "signal" Nothing
+                 (UTCTime (fromGregorian 2026 1 1) 0)
+                 (UTCTime (fromGregorian 2026 1 1) 0)
+    activeRef <- newIORef meta
+    let sr = SessionRuntime
+          { srPaths = SealPaths
+              { spHome = "", spState = "", spConfig = "", spKeys = "" }
+          , srConfigPath = ""
+          , srActive = activeRef
+          }
+    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+    -- The plain turn is forked so the loop can keep receiving; give the
+    -- forked thread a moment to finish its runTurn + chSend before reading
+    -- the captured sends.
+    threadDelay 100000  -- 100ms
     cap <- getCaptured
     -- /ping dispatched → pong sent via the handle
     map snd cap `shouldContain` ["pong"]

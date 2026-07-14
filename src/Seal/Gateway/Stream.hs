@@ -11,6 +11,7 @@ module Seal.Gateway.Stream
   , StreamGuard (..)
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (SomeException, catch)
 import Control.Monad (forever)
 import Data.Aeson (object, (.=), (.:))
@@ -65,6 +66,18 @@ streamApp guard broker pending = do
               ]))
           sendEvent (BeHarnessStatus v)    = sendTextData conn (A.encode v)
           sendEvent (BeListsSnapshot v)    = sendTextData conn (A.encode v)
+          sendEvent (BeAsk sid v)          =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("ask" :: Text)
+              , "sessionId" .= sessionIdText sid
+              , "ask" .= v
+              ]))
+          sendEvent (BeAskResolved sid v)  =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("ask_resolved" :: Text)
+              , "sessionId" .= sessionIdText sid
+              , "ask" .= v
+              ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
       withPingThread conn 30 (pure ()) $ do
@@ -78,12 +91,15 @@ streamApp guard broker pending = do
                 Nothing -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("expected a focus op" :: Text)]))
         readerLoop `catch` \(_e :: SomeException) -> pure ()
 
--- | The focus op the client sends to change its focused session.
+-- | The focus op the client sends to change its focused session. Accepts
+-- both the frontend's shape (@{"op":"focus","sessionId":"..."}@) and the
+-- legacy shape (@{"session":"..."}@) for robustness.
 newtype FocusOp = FocusOp { foSession :: Text }
   deriving stock (Eq, Show)
 
 instance A.FromJSON FocusOp where
-  parseJSON = A.withObject "focus" $ \o -> FocusOp <$> o .: "session"
+  parseJSON = A.withObject "focus" $ \o ->
+    FocusOp <$> (o .: "sessionId" <|> o .: "session")
 
 -- | Look up a header value from the pending request headers (case-insensitive).
 lookupHeader :: Text -> WS.RequestHead -> Maybe String

@@ -27,8 +27,8 @@ dispatch cfg = do
   env <- mkEnv cfg
   runApp env $ case _config_command cfg of
     CommandNoOp   -> pure ()
-    CommandTui   -> liftIO Seal.Tui.runTui
-    CommandSignal -> liftIO Seal.Channels.Signal.Run.runSignalMain
+    CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy)
+    CommandSignal autonomy -> liftIO (Seal.Channels.Signal.Run.runSignalMain autonomy)
     CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy)
 
 -- | Map the process arguments so that an empty argument list behaves as if

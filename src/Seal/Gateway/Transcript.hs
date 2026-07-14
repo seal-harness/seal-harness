@@ -275,7 +275,14 @@ reconEntryToFrontend :: Int -> TranscriptEntry -> Maybe A.Value
 reconEntryToFrontend idx te =
   case tePayload te of
     A.Null -> Nothing
-    A.Object o | KeyMap.member (Key.fromText "harness") o -> Nothing
+    -- Drop harness entries (opcode invocations from the dispatcher) that
+    -- carry a "harness" key in the payload — UNLESS they also carry an
+    -- "approval" key, which marks them as approval-evidence entries that
+    -- should surface so the user sees the confirmation decision in the
+    -- transcript.
+    A.Object o
+      | KeyMap.member (Key.fromText "harness") o,
+        not (KeyMap.member (Key.fromText "approval") o) -> Nothing
     payloadVal -> Just $
       let dirStr = case teDirection te of
             Request  -> "request" :: Text
@@ -334,6 +341,8 @@ rewritePayload val dir =
               <> passthrough (k "tools")
               <> passthrough (k "toolChoice")
               <> passthrough (k "maxTokens")
+              <> passthrough (k "approval")
+              <> passthrough (k "op")
               <> rewriteMsgs
             Response ->
               passthrough (k "model")

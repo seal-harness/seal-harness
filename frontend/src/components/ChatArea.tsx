@@ -5,7 +5,7 @@ import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
-import { fetchModelContext } from '../hooks/useApi'
+import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -587,25 +587,41 @@ function ResultPreview({ text, isError }: { text: string; isError?: boolean }) {
   )
 }
 
-function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string }) {
+function ToolCallBlock({
+  tc,
+  anchorId,
+  pendingQuestion,
+  onAnswer,
+  onCancel,
+}: {
+  tc: ToolCallInfo
+  anchorId: string
+  pendingQuestion?: PendingQuestion
+  onAnswer?: (qid: string, scope: string) => void
+  onCancel?: (qid: string) => void
+}) {
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
-  const [expanded, setExpanded] = useState(targeted)
+  const [expanded, setExpanded] = useState(targeted || pendingQuestion !== undefined)
 
-  useEffect(() => { if (targeted) setExpanded(true) }, [targeted])
+  useEffect(() => { if (targeted || pendingQuestion) setExpanded(true) }, [targeted, pendingQuestion])
 
   const summary = toolCallSummary(tc.input)
   const inputJson = (() => {
     try { return JSON.stringify(tc.input, null, 2) } catch { return String(tc.input) }
   })()
 
-  // Determine success/failure. When an exit code is available (shell commands),
-  // it takes precedence: 0 = success, non-zero = failure. Otherwise fall back
-  // to the is_error flag from the tool_result.
   const hasResult = tc.result !== undefined
   const failed = tc.exitCode !== undefined && tc.exitCode !== null
     ? tc.exitCode !== 0
     : tc.resultIsError ?? false
+  const isPending = pendingQuestion !== undefined
+
+  const btnStyle = (color: string): React.CSSProperties => ({
+    background: 'var(--bg-sunken)',
+    border: `1px solid ${color}`,
+    color: color,
+  })
 
   return (
     <div
@@ -614,7 +630,7 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
       className="addressable-block tool-call mb-2"
       style={{
         background: 'var(--bg-sunken)',
-        border: `1px solid ${targeted ? 'var(--accent-primary)' : 'var(--border)'}`,
+        border: `1px solid ${isPending ? 'var(--needs-input)' : targeted ? 'var(--accent-primary)' : 'var(--border)'}`,
         borderRadius: 'var(--radius-md)',
         overflow: 'hidden',
       }}
@@ -626,7 +642,7 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
         <span style={{ fontSize: 10, opacity: 0.6 }}>{expanded ? '\u25BC' : '\u25B6'}</span>
         <span
           className="text-xs font-semibold"
-          style={{ color: failed ? 'var(--needs-input)' : 'var(--accent-secondary)' }}
+          style={{ color: isPending ? 'var(--needs-input)' : failed ? 'var(--needs-input)' : 'var(--accent-secondary)' }}
         >
           {tc.name}
         </span>
@@ -636,6 +652,11 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
         >
           {summary}
         </span>
+        {isPending && (
+          <span className="pill" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--needs-input)' }}>
+            {'\u26A0'} needs approval
+          </span>
+        )}
         {hasResult && failed && (
           <span className="pill" style={{ background: 'rgba(255,107,107,0.12)', color: 'var(--needs-input)' }}>
             {tc.exitCode !== undefined && tc.exitCode !== null ? `exit ${tc.exitCode}` : 'error'}
@@ -658,7 +679,28 @@ function ToolCallBlock({ tc, anchorId }: { tc: ToolCallInfo; anchorId: string })
           {hasResult && tc.result !== undefined && (
             <ResultPreview text={tc.result} isError={failed} />
           )}
-          {!hasResult && (
+          {isPending && pendingQuestion && onAnswer && onCancel && (
+            <div data-testid="inline-approval" className="rounded-md p-3" style={{ background: 'rgba(255,193,7,0.06)', border: '1px solid var(--needs-input)' }}>
+              <div className="text-xs font-semibold mb-2" style={{ color: 'var(--needs-input)' }}>
+                {'\u26A0'} Confirmation required
+              </div>
+              <div className="flex items-center flex-wrap gap-2">
+                <button className="px-3 py-1.5 rounded-lg text-xs font-medium" style={btnStyle('var(--success)')} onClick={() => onAnswer(pendingQuestion.id, 'once')}>
+                  Yes, once
+                </button>
+                <button className="px-3 py-1.5 rounded-lg text-xs font-medium" style={btnStyle('var(--success)')} onClick={() => onAnswer(pendingQuestion.id, 'for_session')}>
+                  Yes, for this session
+                </button>
+                <button className="px-3 py-1.5 rounded-lg text-xs font-medium" style={btnStyle('var(--success)')} onClick={() => onAnswer(pendingQuestion.id, 'always')}>
+                  Yes, always
+                </button>
+                <button className="px-3 py-1.5 rounded-lg text-xs font-medium" style={btnStyle('var(--needs-input)')} onClick={() => onCancel(pendingQuestion.id)}>
+                  Reject
+                </button>
+              </div>
+            </div>
+          )}
+          {!hasResult && !isPending && (
             <div className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
               Awaiting result\u2026
             </div>
@@ -720,9 +762,49 @@ function ToolDefsCollapsed({ block, anchorId }: { block: ToolDefsBlock; anchorId
   )
 }
 
-function MessageBlock({ block }: { block: MessageContent }) {
+/** Check whether a pending question matches a tool call. The pending
+ *  question's text has the format "Allow <NAME> <JSON>? [y/N] " — parse
+ *  the name + input JSON and compare against the tool call's name + input. */
+function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
+  const m = pq.question.match(/^Allow\s+(\S+)\s+(\{.*\})\?/)
+  if (!m) return false
+  const opName = m[1]!
+  if (opName !== tc.name) return false
+  try {
+    const input = JSON.parse(m[2]!) as Record<string, unknown>
+    const tcInput = tc.input as Record<string, unknown>
+    // Compare by JSON string equality (handles key ordering)
+    return JSON.stringify(input) === JSON.stringify(tcInput)
+  } catch {
+    return false
+  }
+}
+
+function MessageBlock({
+  block,
+  pendingQuestions,
+  onAnswer,
+  onCancel,
+}: {
+  block: MessageContent
+  pendingQuestions?: PendingQuestion[]
+  onAnswer?: (qid: string, scope: string) => void
+  onCancel?: (qid: string) => void
+}) {
   if (block.toolCall) {
-    return <ToolCallBlock tc={block.toolCall} anchorId={block.id ?? `tc-${block.toolCall.id}`} />
+    // Match this tool call to a pending question (if any). The pending
+    // question's text has the format "Allow <NAME> <JSON>? [y/N] " — parse
+    // the name + input and match against the tool call.
+    const pq = pendingQuestions?.find((q) => matchesToolCall(q, block.toolCall!))
+    return (
+      <ToolCallBlock
+        tc={block.toolCall}
+        anchorId={block.id ?? `tc-${block.toolCall.id}`}
+        pendingQuestion={pq}
+        onAnswer={onAnswer}
+        onCancel={onCancel}
+      />
+    )
   }
   if (block.toolDefs) {
     return <ToolDefsCollapsed block={block.toolDefs} anchorId={block.id} />
@@ -774,10 +856,16 @@ function ChatMessage({
   message,
   onBranch,
   sending,
+  pendingQuestions,
+  onAnswer,
+  onCancel,
 }: {
   message: Message
   onBranch?: (entryId: string) => void
   sending?: boolean
+  pendingQuestions?: PendingQuestion[]
+  onAnswer?: (qid: string, scope: string) => void
+  onCancel?: (qid: string) => void
 }) {
   const anchorId = `msg-${message.id}`
   const ref = useRef<HTMLDivElement>(null)
@@ -873,7 +961,13 @@ function ChatMessage({
       </div>
       <div className="text-sm" style={{ lineHeight: 'var(--leading-relaxed)' }}>
         {message.blocks.map((block, i) => (
-          <MessageBlock key={block.id ?? i} block={block} />
+          <MessageBlock
+            key={block.id ?? i}
+            block={block}
+            pendingQuestions={pendingQuestions}
+            onAnswer={onAnswer}
+            onCancel={onCancel}
+          />
         ))}
       </div>
       {jsonOpen && message.rawJson !== undefined && (
@@ -1209,6 +1303,26 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     if (e.direction === 'request') {
       const parsed = tryParseJson(e.payload)
       if (parsed) {
+        // Approval-evidence entries (EKHarness with an "approval" key in
+        // the payload). Render as a distinct "approval" row so the user
+        // sees the confirmation decision in the transcript.
+        if (parsed.approval) {
+          const opName = (parsed.op as { name?: string } | undefined)?.name ?? 'Unknown'
+          const scope = (parsed.approval as { scope?: string }).scope ?? 'unknown'
+          const isReject = scope === 'rejected'
+          const label = isReject
+            ? `Rejected: ${opName}`
+            : `Approved: ${opName} (${scope})`
+          messages.push({
+            id: e.id + '-approval',
+            agentName: 'Approval',
+            agentStatus: 'completed',
+            timestamp: ts,
+            blocks: [{ id: 'appr-' + e.id, text: label }],
+            rawJson,
+          })
+          continue
+        }
         // Extract system prompt as a separate collapsed message (only first
         // occurrence). The synthesized row deliberately omits rawJson: the
         // user message that follows from the same entry carries the same
@@ -1436,6 +1550,9 @@ export function ChatArea({
   currentModel,
   availableModels,
   onModelChange,
+  pendingQuestions,
+  onAnswerQuestion,
+  onCancelQuestion,
 }: {
   selectedAgent: Agent
   selectedSession?: SessionInfo | null
@@ -1500,6 +1617,15 @@ export function ChatArea({
   /** Called with the newly-picked model id when the user changes the
    *  input-row model dropdown. */
   onModelChange?: (model: string) => void
+  /** Pending human-confirmation questions (Untrusted opcode gate or
+   *  ASK_HUMAN). The agent loop is blocked until each is answered or
+   *  cancelled. */
+  pendingQuestions?: PendingQuestion[]
+  /** Called when the human submits an approval scope for a pending
+   *  question. The scope is "once", "for_session", "always", or "rejected". */
+  onAnswerQuestion?: (qid: string, scope: string) => void
+  /** Called when the human dismisses a pending question. */
+  onCancelQuestion?: (qid: string) => void
 }) {
   const [input, setInput] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -1707,7 +1833,15 @@ export function ChatArea({
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>
           ) : (
             messages.map((msg) => (
-              <ChatMessage key={msg.id} message={msg} onBranch={onBranch} sending={sending} />
+              <ChatMessage
+                key={msg.id}
+                message={msg}
+                onBranch={onBranch}
+                sending={sending}
+                pendingQuestions={pendingQuestions}
+                onAnswer={onAnswerQuestion}
+                onCancel={onCancelQuestion}
+              />
             ))
           )}
           <div ref={messagesEndRef} />

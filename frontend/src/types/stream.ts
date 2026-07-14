@@ -89,6 +89,24 @@ export interface ListsEvent {
   tabSessions: SessionInfo[]
 }
 
+/** A pending human-confirmation question from an Untrusted opcode (SHELL_EXEC,
+ *  CODE_EXEC, etc.) under Supervised autonomy, or from ASK_HUMAN. The agent
+ *  loop is blocked until the human answers via POST .../questions/:qid/answer
+ *  or cancels via POST .../questions/:qid/cancel. */
+export interface AskEvent {
+  type: 'ask'
+  sessionId: string
+  ask: { id: string; question: string }
+}
+
+/** A pending question was answered or cancelled; the frontend should dismiss
+ *  its prompt UI. `resolution` is "answered" or "cancelled". */
+export interface AskResolvedEvent {
+  type: 'ask_resolved'
+  sessionId: string
+  ask: { id: string; resolution: string }
+}
+
 export type ServerEvent =
   | HelloEvent
   | EntryEvent
@@ -98,6 +116,8 @@ export type ServerEvent =
   | OverflowEvent
   | ErrorEvent
   | ListsEvent
+  | AskEvent
+  | AskResolvedEvent
 
 // ── Client → Server ────────────────────────────────────────────────────
 
@@ -134,6 +154,10 @@ export interface StreamClient {
   onLists(cb: (snapshot: ListsSnapshot) => void): () => void
   /** Subscribe to status changes. */
   onStatusChange(cb: (s: StreamStatus) => void): () => void
+  /** Subscribe to pending human-confirmation questions (ASK_HUMAN / Untrusted opcode gate). */
+  onAsk(cb: (sessionId: string, ask: { id: string; question: string }) => void): () => void
+  /** Subscribe to question-resolved events (answer delivered or cancelled). */
+  onAskResolved(cb: (sessionId: string, ask: { id: string; resolution: string }) => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
 }
@@ -150,6 +174,8 @@ export interface UseTranscriptStream {
   entries: TranscriptEntry[]
   status: StreamStatus
   lastError: string | null
+  /** Pending human-confirmation questions (Untrusted opcode gate or ASK_HUMAN). */
+  pendingQuestions: import('../hooks/useApi').PendingQuestion[]
 }
 
 export interface UseSessionActivityStream {
