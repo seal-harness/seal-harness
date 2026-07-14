@@ -90,6 +90,7 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Spec
+        Seal.Command.Channel
         Seal.Config.File
         Seal.Config.Paths
         Seal.Git.Repo
@@ -302,6 +303,7 @@ test-suite tests
         Seal.Command.ServeSpec
         Seal.Command.SkillSpec
         Seal.Command.AgentSpec
+        Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
         Seal.Config.FileSpec
