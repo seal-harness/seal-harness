@@ -8,10 +8,12 @@ import Seal.Agent.Env
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Channel.Cli
 import Seal.Core.Types
+import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript
 import Seal.ISA.Opcode
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class
+import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.TestHelpers.FakeCaps
 import Seal.Types.Config
 import Seal.Types.Env
@@ -31,6 +33,7 @@ instance Provider ScriptProvider where
 spec :: Spec
 spec = describe "Seal.Channel.Cli.handlePlain" $
   it "routes a scripted provider response through runTurn to ccSend" $ do
+    approvals <- newApprovalCache
     (fc, caps) <- makeFakeCaps []
     ref <- newIORef
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
@@ -48,7 +51,10 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           (either (error "sid") id (mkSessionId "cli"))
           4
           Nothing
+          Full
+          approvals
           Nothing
+          (pure ())
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc

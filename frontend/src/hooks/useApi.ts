@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type {
   AgentInfo,
   DiscoverableWindow,
@@ -206,6 +206,14 @@ export function useTranscript(sessionId: string | null) {
   const [entries, setEntries] = useState<TranscriptEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [refreshCount, setRefreshCount] = useState(0)
+  // Track whether we've already loaded entries for the current session.
+  // Only show "Loading transcript..." on the FIRST load for a session —
+  // NOT on refresh-after-send (which fires `refresh` via `useSendMessage`'s
+  // `onComplete`). At refresh time the WS stream has already delivered the
+  // new entries live, so the HTTP re-seed is a consistency check; setting
+  // `loading=true` would flash "Loading transcript..." and clear the
+  // visible entries for the round-trip duration.
+  const loadedSessionRef = useRef<string | null>(null)
 
   const refresh = useCallback(() => {
     setRefreshCount((c) => c + 1)
@@ -214,17 +222,22 @@ export function useTranscript(sessionId: string | null) {
   useEffect(() => {
     if (!sessionId) {
       setEntries([])
+      loadedSessionRef.current = null
       return
     }
 
     let cancelled = false
-    setLoading(true)
+    const isFirstLoad = loadedSessionRef.current !== sessionId
+    if (isFirstLoad) {
+      setLoading(true)
+    }
 
     fetchJson<TranscriptEntry[]>(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
       .then((data) => {
         if (cancelled) return
         setEntries(data ?? [])
         setLoading(false)
+        loadedSessionRef.current = sessionId
       })
 
     return () => { cancelled = true }
@@ -326,6 +339,68 @@ export async function setSessionPrompt(sessionId: string, prompt: string, name?:
       body: JSON.stringify(body),
     })
     return res.ok
+  } catch {
+    return false
+  }
+}
+
+// ── Pending questions (human-confirmation gate / ASK_HUMAN) ────────────
+
+/** One pending human-confirmation question (Untrusted opcode gate or
+ *  ASK_HUMAN). The agent loop is blocked until the human answers or
+ *  cancels. */
+export interface PendingQuestion {
+  id: string
+  question: string
+  createdAt: string
+}
+
+/** Fetch the session's pending questions (the frontend polls this on
+ *  connect/reconnect so questions that arrived during a WS gap are
+ *  recovered). */
+export async function fetchPendingQuestions(sessionId: string): Promise<PendingQuestion[]> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/questions`)
+    if (!res.ok) return []
+    return (await res.json()) as PendingQuestion[]
+  } catch {
+    return []
+  }
+}
+
+/** Deliver the human's approval scope to a pending confirmation question,
+ *  unblocking the agent loop. Returns true when the answer was accepted
+ *  (the question was pending and not yet answered).
+ *  The scope is one of: "once", "for_session", "always", "rejected". */
+export async function answerQuestion(sessionId: string, askId: string, scope: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(askId)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      },
+    )
+    if (!res.ok) return false
+    const data = (await res.json().catch(() => ({}))) as { accepted?: boolean }
+    return data.accepted === true
+  } catch {
+    return false
+  }
+}
+
+/** Cancel a pending question (the human dismissed it). Returns true when
+ *  the question was pending and is now cancelled. */
+export async function cancelQuestion(sessionId: string, askId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(askId)}/cancel`,
+      { method: 'POST' },
+    )
+    if (!res.ok) return false
+    const data = (await res.json().catch(() => ({}))) as { cancelled?: boolean }
+    return data.cancelled === true
   } catch {
     return false
   }

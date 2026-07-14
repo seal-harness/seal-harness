@@ -26,6 +26,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
+import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend)
@@ -43,6 +44,7 @@ import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Provider (..)
   , StopReason (..), Usage (..), SomeProvider (..) )
 import Seal.Skills.Backend qualified as Skill
+import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -123,6 +125,7 @@ spec :: Spec
 spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
   it "one chat turn: MEMORY_WRITE + RECALL + SKILL_WRITE + AGENT_DEF_WRITE — files land on disk + git, transcript in two-file format" $
     withSystemTempDirectory "seal-phase5" $ \root -> do
+      approvals <- newApprovalCache
       let cfgRoot = root </> "config"
       ensureConfigRepo cfgRoot
       sent <- newIORef ([] :: [Text])
@@ -147,7 +150,10 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
                   , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
                   }
       runTestApp (runTurn env "run the capstone")
       -- 1. Each mutation landed as a Markdown file under config/.

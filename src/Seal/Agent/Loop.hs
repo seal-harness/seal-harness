@@ -8,10 +8,11 @@ module Seal.Agent.Loop
 
 import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value (..))
+import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
+import Data.ByteString.Lazy.Char8 qualified as BLC
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -22,13 +23,16 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
-import Seal.Core.Types (ModelId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
 import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Handles.AskReply
+  ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
-import Seal.ISA.Dispatch (dispatch)
-import Seal.ISA.Opcode (OpResult (..))
-import Seal.ISA.Registry (registryToolDefs)
+import Seal.ISA.Dispatch (DispatchError (..), dispatch)
+import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
+import Seal.ISA.Registry (registryToolDefs, lookupOp)
 import Seal.Providers.Class
+import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
@@ -128,7 +132,8 @@ runTurn env userText = do
                   , erCorrelation = Nothing
                   , erMeta = Map.empty
                   }
-            tfwRecordAsync (aeTranscript env) (TwoFileWrite conv entry)
+            tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+            aeOnEntry env
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
             then liftIO $
@@ -140,14 +145,130 @@ runTurn env userText = do
               results <- mapM dispatchOne toolUses
               let assistantMsg = Message Assistant (rsContent resp)
                   resultMsg = Message User results
+              -- Record the tool results to the transcript immediately so
+              -- the frontend sees them as soon as each tool call completes
+              -- (the dispatchOne calls above already recorded any approval
+              -- evidence + the dispatcher's own opcode-invocation entries).
+              liftIO $ do
+                now2 <- getCurrentTime
+                let conv2 = msgs <> [assistantMsg, resultMsg]
+                    entry2 = EntryRecord
+                      { erId = ""
+                      , erTimestamp = now2
+                      , erKind = EKRequest
+                      , erConvLen = length conv2
+                      , erEnvelope = Nothing
+                      , erUsage = Nothing
+                      , erStop = Nothing
+                      , erDurationMs = Nothing
+                      , erHarness = Nothing
+                      , erCorrelation = Nothing
+                      , erMeta = Map.empty
+                      }
+                tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv2 entry2)
+                aeOnEntry env
               go (n - 1) (msgs <> [assistantMsg, resultMsg])
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
-      res <- dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeExecBackend env) name input
+      let mOp = lookupOp (aeRegistry env) name
+      mConfirmed <- checkConfirmation name mOp input
+      res <- case mConfirmed of
+        Left denyMsg -> pure (Left (Denied denyMsg))
+        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeExecBackend env) name input
       pure $ case res of
         Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
         Right r -> CbToolResult tcid (orParts r) (orIsError r)
+      where
+        -- | The human-confirmation gate. 'Full' autonomy (@--yolo@) bypasses
+        -- the gate. 'Supervised' checks the approval cache first; on a miss,
+        -- prompts the human via 'ccPrompt' (the reply text is the approval
+        -- scope's wire form: @"once"@, @"for_session"@, @"always"@, or
+        -- @"rejected"@ on the web; on the CLI, @"y"/@"yes"@ → 'ScopeOnce',
+        -- anything else → 'ScopeRejected'). On a hit, records the approval
+        -- scope in the transcript, then proceeds (or denies for 'ScopeRejected').
+        -- Trusted opcodes skip the gate.
+        checkConfirmation :: OpName -> Maybe Opcode -> Value -> App (Either Text ())
+        checkConfirmation opName' mOp input' =
+          case aeAutonomy env of
+            Full -> pure (Right ())
+            _ ->
+              case mOp of
+                Nothing -> pure (Right ())
+                Just op ->
+                  case opTrust op of
+                    Untrusted -> do
+                      mCached <- liftIO (checkApproval (aeApprovals env) (aeSession env) opName')
+                      case mCached of
+                        Just ScopeRejected -> do
+                          recordApprovalEvidence opName' input' ScopeRejected
+                          pure (Left ("SHELL_EXEC denied by human" <> suffixFor opName'))
+                        Just ScopeForSession -> do
+                          recordApprovalEvidence opName' input' ScopeForSession
+                          pure (Right ())
+                        Just ScopeAlways -> do
+                          recordApprovalEvidence opName' input' ScopeAlways
+                          pure (Right ())
+                        Just ScopeOnce -> do
+                          -- ScopeOnce is never cached (recordApproval is a
+                          -- no-op for it), so this branch is unreachable.
+                          -- If it somehow appears, treat it as a cache miss.
+                          recordApprovalEvidence opName' input' ScopeOnce
+                          pure (Right ())
+                        Nothing -> do
+                          let prompt = buildConfirmationPrompt opName' input'
+                          reply <- liftIO (ccPrompt (aeCaps env) prompt)
+                          let scope = parseScopeReply reply
+                          liftIO (recordApproval (aeApprovals env) (aeSession env) opName' scope)
+                          recordApprovalEvidence opName' input' scope
+                          case scope of
+                            ScopeRejected -> pure (Left ("SHELL_EXEC denied by human" <> suffixFor opName'))
+                            _ -> pure (Right ())
+                    _ -> pure (Right ())
+        -- | Parse the 'ccPrompt' reply into an 'ApprovalScope'. The web
+        -- returns the scope's wire form (@once@, @for_session@, @always@,
+        -- @rejected@). The CLI returns free text (@y@/@yes@ → 'ScopeOnce',
+        -- anything else → 'ScopeRejected').
+        parseScopeReply :: Text -> ApprovalScope
+        parseScopeReply reply =
+          case parseApprovalScope reply of
+            Right scope -> scope
+            Left _ ->
+              let lower = T.toLower (T.strip reply) in
+              if lower == "y" || lower == "yes"
+                then ScopeOnce
+                else ScopeRejected
+        buildConfirmationPrompt :: OpName -> Value -> Text
+        buildConfirmationPrompt (OpName n) inp =
+          "Allow " <> n <> " " <> T.pack (BLC.unpack (A.encode inp)) <> "? [y/N] "
+        suffixFor :: OpName -> Text
+        suffixFor (OpName n) = " (" <> n <> ")"
+        -- | Record an EKHarness entry in the transcript carrying the opcode
+        -- name, input, and approval scope as evidence of the human's
+        -- decision. This is separate from the dispatcher's own entry (which
+        -- records the invocation, not the approval).
+        recordApprovalEvidence :: OpName -> Value -> ApprovalScope -> App ()
+        recordApprovalEvidence opName' input' scope = liftIO $ do
+          now <- getCurrentTime
+          let entry = EntryRecord
+                { erId = ""
+                , erTimestamp = now
+                , erKind = EKHarness
+                , erConvLen = 0
+                , erEnvelope = Nothing
+                , erUsage = Nothing
+                , erStop = Nothing
+                , erDurationMs = Nothing
+                , erHarness = Nothing
+                , erCorrelation = Nothing
+                , erMeta = Map.fromList
+                    [ ("op", object ["name" .= opName'])
+                    , ("input", input')
+                    , ("approval", object ["scope" .= scope])
+                    ]
+                }
+          tfwRecordAndAck (aeTranscript env) (TwoFileWrite [] entry)
+          aeOnEntry env
     dispatchOne other = pure other  -- non-tool blocks never reach dispatchOne
 
 providerComplete :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)

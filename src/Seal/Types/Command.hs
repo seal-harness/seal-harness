@@ -11,20 +11,21 @@ import Seal.Security.Policy (AutonomyLevel (..))
 -- harmless placeholder carried by 'defaultConfig'; it is not exposed as a
 -- subcommand (the subcommands are @tui@, @signal@, and @serve@) and is
 -- excluded from the config-file 'FromJSON'/'ToJSON' instances.
--- 'CommandServe' carries the autonomy level selected via @--yolo@
--- ('Full' — bypass the approval gate) vs the default ('Supervised').
+-- Each subcommand carries the autonomy level selected via @--yolo@
+-- ('Full' — bypass the human-confirmation gate) vs the default
+-- ('Supervised' — prompt before running any Untrusted opcode).
 data Command
   = CommandNoOp
-  | CommandTui
-  | CommandSignal
+  | CommandTui AutonomyLevel
+  | CommandSignal AutonomyLevel
   | CommandServe AutonomyLevel
   deriving (Eq, Show)
 
 pCommand :: Parser Command
 pCommand = hsubparser
-  $  command "tui" (info (pure CommandTui)
+  $  command "tui" (info (CommandTui <$> pAutonomy)
                          (progDesc "Start the interactive terminal UI (TUI)"))
-  <> command "signal" (info (pure CommandSignal)
+  <> command "signal" (info (CommandSignal <$> pAutonomy)
                             (progDesc "Run the agent over the Signal channel"))
   <> command "serve" (info (CommandServe <$> pAutonomy)
                            (progDesc "Run the web gateway server"))

@@ -11,6 +11,7 @@ import { useEffect, useState } from 'react'
 import type { TranscriptEntry } from '../types'
 import type { StreamClient, StreamStatus, UseTranscriptStream } from '../types/stream'
 import { streamClient } from '../lib/streamClient'
+import { fetchPendingQuestions, type PendingQuestion } from './useApi'
 
 async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]> {
   try {
@@ -62,13 +63,17 @@ export function useTranscriptStream(
   const [entries, setEntries] = useState<TranscriptEntry[]>([])
   const [status, setStatus] = useState<StreamStatus>(sc.status)
   const [lastError, setLastError] = useState<string | null>(sc.lastError())
+  const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([])
 
   // Initial HTTP GET seed + focus the session. Set live focus eagerly BEFORE
   // the seed fetch (so live events during the GET round-trip aren't dropped),
-  // then upgrade to a `since`-replay focus once the seed lands.
+  // then upgrade to a `since`-replay focus once the seed lands. Also fetch
+  // any pending questions (recovered on reconnect) so the user can answer
+  // a question that arrived during a WS gap.
   useEffect(() => {
     if (sessionId === null) {
       setEntries([])
+      setPendingQuestions([])
       return
     }
     sc.focus(sessionId)
@@ -80,6 +85,10 @@ export function useTranscriptStream(
       if (lastId !== undefined) {
         sc.focus(sessionId, lastId)
       }
+    })
+    fetchPendingQuestions(sessionId).then((qs) => {
+      if (cancelled) return
+      setPendingQuestions(qs)
     })
     return () => {
       cancelled = true
@@ -95,6 +104,27 @@ export function useTranscriptStream(
     return unsub
   }, [sessionId, sc])
 
+  // WS ask subscription (focused session only).
+  useEffect(() => {
+    if (sessionId === null) return
+    const unsub = sc.onAsk((_sid, ask) => {
+      setPendingQuestions((prev) => {
+        if (prev.some((q) => q.id === ask.id)) return prev
+        return [...prev, { id: ask.id, question: ask.question, createdAt: new Date().toISOString() }]
+      })
+    })
+    return unsub
+  }, [sessionId, sc])
+
+  // WS ask_resolved subscription (focused session only).
+  useEffect(() => {
+    if (sessionId === null) return
+    const unsub = sc.onAskResolved((_sid, ask) => {
+      setPendingQuestions((prev) => prev.filter((q) => q.id !== ask.id))
+    })
+    return unsub
+  }, [sessionId, sc])
+
   // Status + lastError subscriptions.
   useEffect(() => {
     const unsub = sc.onStatusChange((s) => {
@@ -104,5 +134,5 @@ export function useTranscriptStream(
     return unsub
   }, [sc])
 
-  return { entries, status, lastError }
+  return { entries, status, lastError, pendingQuestions }
 }

@@ -32,6 +32,7 @@ import Seal.Gateway.StreamBroker (newStreamBroker)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
+import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -77,6 +78,10 @@ runServeMain autonomy = do
   reg     <- newHarnessRegistry
   tmuxR   <- mkRealTmuxRunner
   uiState <- newUiStateHandle paths
+  askReply <- newAskReplyStore 0  -- 0 = block indefinitely (no timeout); a
+                                 -- future phase may surface a configurable
+                                 -- per-session timeout.
+  approvals <- newApprovalCache
   -- Build an in-memory active session (NOT persisted to disk) so the
   -- active-session ref has valid provider/model fallbacks. The session
   -- only lands on disk when the user sends the first message (the web send
@@ -119,6 +124,8 @@ runServeMain autonomy = do
         , sdHarnessRegistry = reg
         , sdTmuxRunner  = tmuxR
         , sdHttpManager = Just mgr
+        , sdAskReply    = askReply
+        , sdApprovals   = approvals
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)

@@ -24,6 +24,8 @@ data BrokerEvent
   = BeEntryRecorded SessionId Value   -- ^ a transcript entry (the JSON the WS peer receives)
   | BeHarnessStatus Value             -- ^ a harness liveness change
   | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
+  | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
+  | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
   deriving stock (Eq, Show)
 
 -- | The per-subscriber state: the focused session (via an 'IORef' so the
@@ -75,6 +77,12 @@ broadcast broker event = do
       subSid <- readTVarIO (subSessionRef s)
       when (subSid == sid) (subSend s event)) subs
     BeHarnessStatus _ -> mapM_ (`subSend` event) subs  -- harness status → all (the frontend's sidebar shows all harnesses)
+    BeAsk sid _ -> mapM_ (\s -> do
+      subSid <- readTVarIO (subSessionRef s)
+      when (subSid == sid) (subSend s event)) subs
+    BeAskResolved sid _ -> mapM_ (\s -> do
+      subSid <- readTVarIO (subSessionRef s)
+      when (subSid == sid) (subSend s event)) subs
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()

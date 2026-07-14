@@ -63,6 +63,7 @@ import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.ReconstructSpec
+import qualified Seal.Handles.AskReplySpec
 import qualified Seal.Handles.ChannelSpec
 import qualified Seal.Handles.HarnessSpec
 import qualified Seal.Handles.TabSpec
@@ -177,6 +178,7 @@ main = hspec $ do
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.ReconstructSpec.spec
+  Seal.Handles.AskReplySpec.spec
   Seal.Handles.ChannelSpec.spec
   Seal.Handles.HarnessSpec.spec
   Seal.Handles.TabSpec.spec

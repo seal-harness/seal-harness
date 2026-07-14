@@ -85,6 +85,7 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..))
+import Seal.Handles.AskReply (ApprovalCache, newApprovalCache)
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
@@ -168,8 +169,8 @@ resolveDefProvider pr providerLabel model =
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
-  -> Maybe FilePath -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath = AgentEnv
+  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath autonomy approvals onEntry = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -178,15 +179,14 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
   , aeTranscript = tHandle
   , aeBackend    = localBackend
   , aeExecBackend = execBackend
-    -- ^ The untrusted-execution backend (Local vs Remote SSH) from the
-    -- runtime 'UntrustedExecConfig' (4b-T3). Trusted/Audited opcodes
-    -- ignore it (the GADT 'Opcode' has no 'ExecBackend' field for them —
-    -- type-level capability scoping, spec §4/§8).
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
   , aeMessageSource = Nothing
+  , aeAutonomy   = autonomy
+  , aeApprovals  = approvals
   , aeDebugRequestsPath = debugReqPath
+  , aeOnEntry    = onEntry
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -211,8 +211,9 @@ debugRequestsPath paths sid eCfg =
 -- immediately.
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends -> TabsHandle -> IO ()
-runCliTui paths rt pr sr registry chain backends tabsH = do
+  -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel -> IO ()
+runCliTui paths rt pr sr registry chain backends tabsH autonomy = do
+  approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
       sessionDirPath = sessionDir paths (smId active0)
@@ -307,7 +308,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
                 let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
-                      (debugRequestsPath paths sid eCfg)
+                      (debugRequestsPath paths sid eCfg) autonomy approvals (pure ())
                 runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
           [ showHumanOp caps
@@ -351,7 +352,7 @@ runCliTui paths rt pr sr registry chain backends tabsH = do
                 Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
                 (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
-                   (debugRequestsPath paths (smId meta) eCfg))
+                   (debugRequestsPath paths (smId meta) eCfg) autonomy approvals (pure ()))
                 appEnv t
     runInputT hlSettings (loop caps plainHandler tabsH)
   where
@@ -441,11 +442,12 @@ execBackendFromFile _wsRoot cfg =
 #endif
     failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed
 
--- | The CLI security policy: allow all commands, full autonomy. The TUI has
--- no web approval gate, so untrusted opcodes run without prompting (ACK
--- audit still recorded).
+-- | The CLI security policy: allow all commands. The autonomy level is
+-- threaded separately via 'aeAutonomy' (the operator-selected @--yolo@ vs
+-- default 'Supervised'); the policy here gates command-name allow-listing
+-- (orthogonal to the human-confirmation gate).
 cliSecurityPolicy :: SecurityPolicy
-cliSecurityPolicy = SecurityPolicy AllowAll Full
+cliSecurityPolicy = SecurityPolicy AllowAll Supervised
 
 -- | The set of interpreters CODE_EXEC may run. Conservative default; can be
 -- tightened via config in a later phase.

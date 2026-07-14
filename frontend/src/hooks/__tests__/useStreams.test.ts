@@ -11,6 +11,8 @@ function fakeClient(): StreamClient & {
   pushLists(s: ListsSnapshot): void
   pushEntry(e: TranscriptEntry): void
   pushActivity(sid: string, a: ActivityEvent): void
+  pushAsk(sid: string, ask: { id: string; question: string }): void
+  pushAskResolved(sid: string, ask: { id: string; resolution: string }): void
   setStatus(s: StreamClient['status']): void
   setError(e: string | null): void
 } {
@@ -18,6 +20,8 @@ function fakeClient(): StreamClient & {
   const entryCbs = new Set<(e: TranscriptEntry) => void>()
   const activityCbs = new Set<(sid: string, a: ActivityEvent) => void>()
   const statusCbs = new Set<(s: StreamClient['status']) => void>()
+  const askCbs = new Set<(sid: string, ask: { id: string; question: string }) => void>()
+  const askResolvedCbs = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
   let lastError: string | null = null
   return {
     status: 'live' as StreamClient['status'],
@@ -26,14 +30,26 @@ function fakeClient(): StreamClient & {
     onActivity: (cb) => { activityCbs.add(cb); return () => { activityCbs.delete(cb) } },
     onLists: (cb) => { listsCbs.add(cb); return () => { listsCbs.delete(cb) } },
     onStatusChange: (cb) => { statusCbs.add(cb); return () => { statusCbs.delete(cb) } },
+    onAsk: (cb) => { askCbs.add(cb); return () => { askCbs.delete(cb) } },
+    onAskResolved: (cb) => { askResolvedCbs.add(cb); return () => { askResolvedCbs.delete(cb) } },
     lastError: () => lastError,
     // test drivers:
     pushLists: (s) => { for (const cb of listsCbs) cb(s) },
     pushEntry: (e) => { for (const cb of entryCbs) cb(e) },
     pushActivity: (sid, a) => { for (const cb of activityCbs) cb(sid, a) },
+    pushAsk: (sid, ask) => { for (const cb of askCbs) cb(sid, ask) },
+    pushAskResolved: (sid, ask) => { for (const cb of askResolvedCbs) cb(sid, ask) },
     setStatus: (s) => { for (const cb of statusCbs) cb(s); },
     setError: (e) => { lastError = e },
-  } as StreamClient & { pushLists: (s: ListsSnapshot) => void; pushEntry: (e: TranscriptEntry) => void; pushActivity: (sid: string, a: ActivityEvent) => void; setStatus: (s: StreamClient['status']) => void; setError: (e: string | null) => void }
+  } as StreamClient & {
+    pushLists: (s: ListsSnapshot) => void
+    pushEntry: (e: TranscriptEntry) => void
+    pushActivity: (sid: string, a: ActivityEvent) => void
+    pushAsk: (sid: string, ask: { id: string; question: string }) => void
+    pushAskResolved: (sid: string, ask: { id: string; resolution: string }) => void
+    setStatus: (s: StreamClient['status']) => void
+    setError: (e: string | null) => void
+  }
 }
 
 function makeEntry(id: string, ts: string, payload = 'hi'): TranscriptEntry {

@@ -11,6 +11,8 @@ module Seal.Channels.Signal.Run
   , runSignalMain
   ) where
 
+import Control.Concurrent (forkIO)
+import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
@@ -46,11 +48,15 @@ import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Handles.AskReply
+  ( ApprovalCache, AskReplyStore, askHuman, deliverNextAnswer, newApprovalCache
+  , newAskReplyStore )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
+import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs)
 import Seal.ISA.Ops.File (fileReadOp)
@@ -83,15 +89,18 @@ runSignal
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle
   -> (SignalAccount, Int, AllowList UserId)
+  -> AskReplyStore
+  -> AutonomyLevel
+  -> ApprovalCache
   -> IO ()
-runSignal paths rt pr sr registry chain backends tabsH (account, chunkLimit, allow) = do
+runSignal paths rt pr sr registry chain backends tabsH (account, chunkLimit, allow) askReply autonomy approvals = do
   let accountLabel = signalAccountText account
   eTransport <- mkRealSignalTransport accountLabel
   case eTransport of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
     Right transport ->
-      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH $
-        \h -> plainTurn paths rt pr sr backends h
+      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr $
+        \h -> plainTurn paths rt pr sr backends h askReply autonomy approvals
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
 -- pulls @(MessageSource, body)@ from 'chReceive', classifies via
@@ -109,14 +118,23 @@ runSignalLoop
   -> SignalAccount
   -> SignalTransport
   -> TabsHandle
+  -> AskReplyStore
+  -> SessionRuntime
   -> (ChannelHandle -> Maybe MessageSource -> Text -> IO ())
   -> IO ()
-runSignalLoop registry chain (allow, chunkLimit) account transport tabsH plainHandler =
+runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr plainHandler =
   withSignalChannel (allow, chunkLimit) account transport $ \ch -> do
     let h = toHandle ch
         handleCaps = ChannelCaps
           { ccSend         = chSend h
-          , ccPrompt       = fmap (fromRight "") . chPrompt h
+          , ccPrompt       = \q -> do
+              -- Bind the pending question to the active session so the
+              -- next inbound message from the peer (delivered via
+              -- 'deliverNextAnswer' in the loop below) unblocks this thread.
+              meta <- readIORef (srActive sr)
+              let sid = smId meta
+              outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+              pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
           }
     loop h handleCaps
@@ -126,33 +144,46 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH plainHa
       case mSrc of
         Nothing -> pure ()  -- EOF: reader exited + inbox drained
         Just _ms -> do
-          -- Layer-1 routing: check the terse /N grammar + /tab commands
-          -- BEFORE the /-command registry.
-          case Seal.Routing.Route.route body of
-            Right (Seal.Routing.Route.Focus idx) -> do
-              _ <- focusTabH tabsH idx
-              chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
-              loop h handleCaps
-            Right (Seal.Routing.Route.Inject idx payload) -> do
-              _ <- focusTabH tabsH idx
-              plainHandler h mSrc payload
-              loop h handleCaps
-            Right (Seal.Routing.Route.TabCommand tsc) -> do
-              _ <- handleTabCommand' h tabsH tsc
-              loop h handleCaps
-            Right (Seal.Routing.Route.SlashCommand _) -> do
-              d <- ingest registry chain (RawInbound body)
-              case d of
-                DispatchAction a -> runCommandAction a handleCaps >> loop h handleCaps
-                ShowText t       -> chSend h t >> loop h handleCaps
-                PlainMessage t   -> plainHandler h mSrc t >> loop h handleCaps
-                Rejected msg     -> chSend h msg >> loop h handleCaps
-            Right (Seal.Routing.Route.Plain t) -> do
-              plainHandler h mSrc t
-              loop h handleCaps
-            Left (Seal.Routing.Route.ParseError e) -> do
-              chSend h e
-              loop h handleCaps
+          -- First, try to deliver the inbound message as the answer to the
+          -- oldest pending ASK_HUMAN question for the active session. If it
+          -- matches, the waiting agent-loop thread unblocks and the message
+          -- is consumed as the answer (NOT routed as a plain turn). If no
+          -- question is pending, the message is a normal inbound turn.
+          meta <- readIORef (srActive sr)
+          let sid = smId meta
+          delivered <- deliverNextAnswer askReply sid body
+          if delivered
+            then loop h handleCaps
+            else do
+              -- Layer-1 routing: check the terse /N grammar + /tab commands
+              -- BEFORE the /-command registry. Plain turns are forked so the
+              -- main loop keeps receiving + delivering answers while the
+              -- agent loop blocks on ASK_HUMAN.
+              case Seal.Routing.Route.route body of
+                Right (Seal.Routing.Route.Focus idx) -> do
+                  _ <- focusTabH tabsH idx
+                  chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
+                  loop h handleCaps
+                Right (Seal.Routing.Route.Inject idx payload) -> do
+                  _ <- focusTabH tabsH idx
+                  void (forkIO (plainHandler h mSrc payload))
+                  loop h handleCaps
+                Right (Seal.Routing.Route.TabCommand tsc) -> do
+                  _ <- handleTabCommand' h tabsH tsc
+                  loop h handleCaps
+                Right (Seal.Routing.Route.SlashCommand _) -> do
+                  d <- ingest registry chain (RawInbound body)
+                  case d of
+                    DispatchAction a -> runCommandAction a handleCaps >> loop h handleCaps
+                    ShowText t       -> chSend h t >> loop h handleCaps
+                    PlainMessage t   -> void (forkIO (plainHandler h mSrc t)) >> loop h handleCaps
+                    Rejected msg     -> chSend h msg >> loop h handleCaps
+                Right (Seal.Routing.Route.Plain t) -> do
+                  void (forkIO (plainHandler h mSrc t))
+                  loop h handleCaps
+                Left (Seal.Routing.Route.ParseError e) -> do
+                  chSend h e
+                  loop h handleCaps
 
 -- | Handle a parsed 'TabSlashCommand' over the Signal channel (mutates the
 -- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.
@@ -201,11 +232,17 @@ handleTabCommand' h tabsH = \case
 -- 'plainHandler' but pulls the active session's provider+model the same
 -- way and builds the 'AgentEnv' with @aeMessageSource = Just ms@. The
 -- 'ChannelHandle' supplies the 'ChannelCaps' (forwarded) so the agent's
--- replies go out via the Signal channel.
+-- replies go out via the Signal channel. The ask/reply store backs
+-- ASK_HUMAN: 'ccPrompt' blocks the agent-loop thread on the store until the
+-- next inbound message from the peer is delivered as the answer (by
+-- 'deliverNextAnswer' in 'runSignalLoop'). The turn runs in a forked thread
+-- so the main loop keeps receiving + delivering answers while the agent
+-- blocks.
 plainTurn
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime -> Backends
-  -> ChannelHandle -> Maybe MessageSource -> Text -> IO ()
-plainTurn paths rt pr sr backends h mSrc t = do
+  -> ChannelHandle -> AskReplyStore -> AutonomyLevel -> ApprovalCache
+  -> Maybe MessageSource -> Text -> IO ()
+plainTurn paths rt pr sr backends h askReply autonomy approvals mSrc t = do
   meta <- readIORef (srActive sr)
   eprov <- resolveSessionProvider pr meta
   case eprov of
@@ -214,35 +251,40 @@ plainTurn paths rt pr sr backends h mSrc t = do
       let sid = smId meta
           sessionDirPath = sessionDir paths sid
       withTwoFileTranscript sessionDirPath $ \tHandle -> do
-        wsRoot <- WorkspaceRoot <$> getCurrentDirectory
+        wsroot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
         eCfg <- loadFileConfig (prConfigPath pr)
-        let isaReg = buildRegistry paths rt backends wsRoot (smId meta) eCfg
+        let isaReg = buildRegistry paths rt backends wsroot (smId meta) eCfg askReply h sid
             handleCaps = ChannelCaps
               { ccSend         = chSend h
-              , ccPrompt       = fmap (fromRight "") . chPrompt h
+              , ccPrompt       = \q -> do
+                  outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+                  pure (fromRight "" outcome)
               , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
               }
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-            defaultExecBackend = EbLocal (mkLocalExecHandle wsRoot)
+            execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
+            defaultExecBackend = EbLocal (mkLocalExecHandle wsroot)
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         let env = (mkSessionAgentEnv
                      handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
-                     (debugRequestsPath paths sid eCfg))
+                     (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()))
                     { aeMessageSource = mSrc }
         runApp appEnv (runTurn env t)
 
 -- | Build the ISA registry for a Signal turn. Mirrors 'runCliTui's registry
 -- assembly but without the AGENT_START worker (sub-agents over Signal is a
--- later phase). Kept minimal: the human-interaction, file-read, secret,
--- memory, skills, and agent-def opcodes.
+-- later phase). The human-interaction opcodes are wired to the ask/reply
+-- store via the per-turn 'ChannelCaps' so ASK_HUMAN surfaces the question to
+-- the peer and blocks until the next inbound message delivers the answer.
 buildRegistry
   :: SealPaths -> VaultRuntime -> Backends -> WorkspaceRoot -> Seal.Core.Types.SessionId
-  -> Either a Seal.Config.File.FileConfig -> ISA.Registry
-buildRegistry _paths rt backends wsRoot sid _eCfg =
+  -> Either a Seal.Config.File.FileConfig -> AskReplyStore -> ChannelHandle
+  -> Seal.Core.Types.SessionId
+  -> ISA.Registry
+buildRegistry _paths rt backends wsRoot sid _eCfg askReply h _activeSid =
   ISA.mkRegistry
-    [ showHumanOp simpleCaps
-    , askHumanOp simpleCaps
+    [ showHumanOp caps
+    , askHumanOp caps
     , fileReadOp wsRoot 131072
     , secretGetOp rt
     , memoryWriteOp (bMemory backends) sid
@@ -261,13 +303,16 @@ buildRegistry _paths rt backends wsRoot sid _eCfg =
     , agentStopOp (bRuntime backends)
     ]
   where
-    -- A minimal ChannelCaps for the human-interaction opcodes (Signal can't
-    -- answer inline, so askHuman returns a deferral; this is a placeholder
-    -- until the opcode is widened to ChannelHandle).
-    simpleCaps = ChannelCaps
-      { ccSend = \_ -> pure ()
-      , ccPrompt = \_ -> pure ""
-      , ccPromptSecret = \_ -> pure ""
+    -- The per-turn caps for the human-interaction opcodes. ASK_HUMAN mints
+    -- a pending question in the store, sends the question to the peer via
+    -- chSend, and blocks until the next inbound message is delivered as the
+    -- answer (by 'deliverNextAnswer' in 'runSignalLoop').
+    caps = ChannelCaps
+      { ccSend         = chSend h
+      , ccPrompt       = \q -> do
+          outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+          pure (fromRight "" outcome)
+      , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
       }
 
 -- | Full @seal signal@ startup wiring: paths -> config -> vault -> session
@@ -275,9 +320,12 @@ buildRegistry _paths rt backends wsRoot sid _eCfg =
 -- Mirrors 'Seal.Tui.runTui' but drives the Signal channel instead of the
 -- Haskeline TUI. Resolves the @[signal]@ config section + an optional
 -- vault-supplied account label; fails fast with a stderr diagnostic if
--- the account is unresolved or signal-cli is absent.
-runSignalMain :: IO ()
-runSignalMain = do
+-- the account is unresolved or signal-cli is absent. The autonomy level
+-- threads through to 'mkSessionAgentEnv' so 'Supervised' (the default)
+-- prompts before running Untrusted opcodes (the next inbound message from
+-- the peer delivers the answer via the ask/reply store).
+runSignalMain :: Seal.Security.Policy.AutonomyLevel -> IO ()
+runSignalMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
@@ -328,9 +376,11 @@ runSignalMain = do
   -- Resolve the [signal] section + an optional vault-supplied account.
   -- For now the vault-supplied account is Nothing (the account comes from
   -- config); a future phase may pull it from the vault via CPS.
+  askReply <- newAskReplyStore 0  -- 0 = block indefinitely (no timeout)
+  approvals <- newApprovalCache
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
-    Right resolved -> runSignal paths rt pr sr registry emptyChain backends tabsH resolved
+    Right resolved -> runSignal paths rt pr sr registry emptyChain backends tabsH resolved askReply autonomy approvals
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone

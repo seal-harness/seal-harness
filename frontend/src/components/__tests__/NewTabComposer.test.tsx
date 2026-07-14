@@ -109,7 +109,7 @@ describe('NewTabComposer — provider kind', () => {
     expect(onSubmit).toHaveBeenCalled()
   })
 
-  it('custom model input renders a combobox (datalist) populated with customModels', () => {
+  it('custom model input renders a combobox populated with customModels', () => {
     render(
       <NewTabComposer
         spec={makeSpec({ useCustomModel: true, model: '', customModels: ['claude-3-opus', 'gpt-4o'] })}
@@ -119,10 +119,11 @@ describe('NewTabComposer — provider kind', () => {
     )
     const input = screen.getByLabelText('Custom Model') as HTMLInputElement
     expect(input).toBeTruthy()
-    expect(input.getAttribute('list')).toBe('provider-model-custom-list')
-    const list = document.getElementById('provider-model-custom-list') as HTMLDataListElement
+    // The custom combobox popup renders on focus with the customModel options.
+    fireEvent.focus(input)
+    const list = screen.getByTestId('provider-model-custom-list')
     expect(list).toBeTruthy()
-    const opts = Array.from(list.querySelectorAll('option')).map((o) => o.getAttribute('value'))
+    const opts = Array.from(list.querySelectorAll('[role="option"]')).map((o) => o.textContent)
     expect(opts).toEqual(['claude-3-opus', 'gpt-4o'])
   })
 })

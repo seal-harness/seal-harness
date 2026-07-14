@@ -18,6 +18,8 @@ import {
   acknowledgeTab,
   releaseHarness,
   destroyHarness,
+  answerQuestion,
+  cancelQuestion,
   type SendResult,
   type NewTabResponse,
 } from './hooks/useApi'
@@ -173,7 +175,7 @@ export default function App() {
 
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   const { entries: httpEntries, loading, refresh } = useTranscript(currentSessionId)
-  const { entries: streamEntries } = useTranscriptStream(currentSessionId)
+  const { entries: streamEntries, pendingQuestions } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId)
   const entries = useMemo(() => {
     if (streamEntries.length === 0) return httpEntries
@@ -247,8 +249,15 @@ export default function App() {
   // Is the focused session currently processing a request? Sourced from the
   // live activity stream. Drives the chat-area thinking indicator + sidebar
   // spinner.
+  // The spinner shows when the agent is actively thinking (not blocked on
+  // a pending approval). `sending` is true for the entire POST /send
+  // round-trip (including confirmation prompts); `pendingQuestions` is
+  // non-empty when the agent is blocked waiting for approval. So the
+  // spinner shows when sending AND no pending questions, or when the
+  // session activity stream reports 'thinking' (e.g. a harness turn).
   const sessionIsThinking = currentSessionId !== null
-    && sessionActivity?.[currentSessionId]?.harness === 'thinking'
+    && (sessionActivity?.[currentSessionId]?.harness === 'thinking'
+        || (sending && pendingQuestions.length === 0))
 
   // Model id to display on the thinking indicator. Prefer the explicit
   // pending-thinking model captured at send-time; fall back to the most
@@ -594,6 +603,13 @@ export default function App() {
             currentModel={modelDropdownValue}
             availableModels={[...transcriptModels]}
             onModelChange={modelDropdownValue !== null ? setModelOverride : undefined}
+            pendingQuestions={pendingQuestions}
+            onAnswerQuestion={(qid, ans) => {
+              if (currentSessionId) void answerQuestion(currentSessionId, qid, ans)
+            }}
+            onCancelQuestion={(qid) => {
+              if (currentSessionId) void cancelQuestion(currentSessionId, qid)
+            }}
           />
         )}
       </div>

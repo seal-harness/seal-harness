@@ -3,7 +3,7 @@ module Seal.Agent.LoopSpec (spec) where
 
 import Control.Monad (zipWithM_)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value (..), object)
+import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -19,10 +19,14 @@ import qualified Data.Vector as V
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Types
+import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript, withTwoFileTranscript)
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
+import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.Providers.Class
+import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
@@ -31,7 +35,7 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Agent.Env
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.Types (ExecBackend (..), LocalExecHandle (..), mkLocalExecHandlePlaceholder)
 import Seal.Agent.Loop
 
 -- | A provider that returns a scripted list of responses, one per call.
@@ -53,6 +57,7 @@ runTestApp act = do
 spec :: Spec
 spec = describe "Seal.Agent.Loop" $ do
   it "dispatches a tool call then emits the final text" $ do
+    approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     ran <- newIORef (0 :: Int)
     let caps = ChannelCaps
@@ -86,12 +91,16 @@ spec = describe "Seal.Agent.Loop" $ do
                 (either (error "sid") id (mkSessionId "s1"))
                 8
                 Nothing
+                Full
+                approvals
                 Nothing
+                (pure ())
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
 
   it "writes the conversation + entries to the two-file transcript" $ do
+    approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
@@ -114,7 +123,10 @@ spec = describe "Seal.Agent.Loop" $ do
                 (either (error "sid") id (mkSessionId "s1"))
                 8
                 Nothing
+                Full
+                approvals
                 Nothing
+                (pure ())
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
     -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)
@@ -137,6 +149,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- duplicate user + assistant lines.
   it "a second turn loads the prior conversation, no duplication" $
     withSystemTempDirectory "seal-loop" $ \dir -> do
+      approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
@@ -161,7 +174,10 @@ spec = describe "Seal.Agent.Loop" $ do
                       (either (error "sid") id (mkSessionId "s1"))
                       8
                       Nothing
+                      Full
+                      approvals
                       Nothing
+                      (pure ())
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- The on-disk conversation.jsonl must contain exactly 4 lines:
@@ -183,6 +199,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- reconstruction was only surfacing the latest message, not the history).
   it "writes the full CompletionRequest to requests.jsonl when aeDebugRequestsPath is set" $
     withSystemTempDirectory "seal-loop-debug" $ \dir -> do
+      approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
@@ -206,7 +223,10 @@ spec = describe "Seal.Agent.Loop" $ do
                       (either (error "sid") id (mkSessionId "s1"))
                       8
                       Nothing
+                      Full
+                      approvals
                       (Just reqPath)
+                      (pure ())
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- requests.jsonl has one line per provider call. Each line is the full
@@ -238,6 +258,7 @@ spec = describe "Seal.Agent.Loop" $ do
   -- received — the full conversation history, not just the latest message.
   it "reconstructed request payloads match the requests.jsonl debug file" $
     withSystemTempDirectory "seal-loop-recon" $ \dir -> do
+      approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
@@ -261,7 +282,10 @@ spec = describe "Seal.Agent.Loop" $ do
                       (either (error "sid") id (mkSessionId "s1"))
                       8
                       Nothing
+                      Full
+                      approvals
                       (Just reqPath)
+                      (pure ())
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- Read back the two-file format + the debug requests file.
@@ -295,3 +319,126 @@ spec = describe "Seal.Agent.Loop" $ do
       -- corresponding debug request's message count — the full conversation
       -- history, not just the latest message.
       zipWithM_ shouldBe reconMsgCounts debugMsgCounts
+
+  -- -----------------------------------------------------------------------
+  -- Human-confirmation gate (Supervised autonomy)
+  -- -----------------------------------------------------------------------
+
+  describe "human-confirmation gate" $ do
+    let mkRecordBackend :: IO (IORef Bool, ExecBackend)
+        mkRecordBackend = do
+          ran <- newIORef False
+          let handle = LocalExecHandle
+                { lehExecShell = \_ _ -> do
+                    writeIORef ran True
+                    pure (Right "executed")
+                , lehExecProgram = \_ _ -> do
+                    writeIORef ran True
+                    pure (Right "executed")
+                }
+          pure (ran, EbLocal handle)
+        shellScript :: [CompletionResponse]
+        shellScript =
+          [ CompletionResponse
+              [CbToolUse (ToolCallId "t1") (OpName "SHELL_EXEC") (object ["command" .= ("echo hi" :: Text)])]
+              StopToolUse
+              (Usage 0 0)
+          , CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+          ]
+
+    it "Supervised + 'once' reply → the opcode executes, not cached" $ do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      prompts <- newIORef ([] :: [Text])
+      (ran, backend) <- mkRecordBackend
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\q -> modifyIORef' prompts (++ [q]) >> pure "once")
+                   (\_ -> pure "")
+          wsRoot = WorkspaceRoot "/ws"
+          policy = SecurityPolicy AllowAll Supervised
+          reg = mkRegistry [shellExecOp wsRoot policy backend]
+      ref <- newIORef shellScript
+      (h, _) <- fakeTwoFileTranscript
+      let env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing reg h localBackend
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+      runTestApp (runTurn env "run echo hi")
+      readIORef ran `shouldReturn` True
+
+    it "Supervised + 'rejected' reply → the opcode is denied, not executed" $ do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      prompts <- newIORef ([] :: [Text])
+      (ran, backend) <- mkRecordBackend
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
+                   (\_ -> pure "")
+          wsRoot = WorkspaceRoot "/ws"
+          policy = SecurityPolicy AllowAll Supervised
+          reg = mkRegistry [shellExecOp wsRoot policy backend]
+      ref <- newIORef shellScript
+      (h, _) <- fakeTwoFileTranscript
+      let env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing reg h localBackend
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+      runTestApp (runTurn env "run echo hi")
+      readIORef ran `shouldReturn` False
+
+    it "Full autonomy → no prompt, the opcode executes" $ do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      prompts <- newIORef ([] :: [Text])
+      (ran, backend) <- mkRecordBackend
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant")
+                   (\_ -> pure "")
+          wsRoot = WorkspaceRoot "/ws"
+          policy = SecurityPolicy AllowAll Full
+          reg = mkRegistry [shellExecOp wsRoot policy backend]
+      ref <- newIORef shellScript
+      (h, _) <- fakeTwoFileTranscript
+      let env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing reg h localBackend
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ())
+      runTestApp (runTurn env "run echo hi")
+      readIORef ran `shouldReturn` True
+      readIORef prompts `shouldReturn` ([] :: [Text])
+
+    it "Supervised + Trusted opcode → no prompt, the opcode executes" $ do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      prompts <- newIORef ([] :: [Text])
+      ran <- newIORef (0 :: Int)
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
+                   (\_ -> pure "")
+          stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                     (const (Right ()))
+                     (\_ _ -> do
+                       liftIO (modifyIORef' ran (+ 1))
+                       pure (OpResult [TrpText "pong"] False Null))
+          script =
+            [ CompletionResponse
+                [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+                StopToolUse
+                (Usage 0 0)
+            , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
+            ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      let reg = mkRegistry [stubOp]
+          env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing reg h localBackend
+                  (EbLocal mkLocalExecHandlePlaceholder) caps
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+      runTestApp (runTurn env "ping")
+      readIORef ran `shouldReturn` 1
+      readIORef prompts `shouldReturn` ([] :: [Text])
