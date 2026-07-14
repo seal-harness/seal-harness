@@ -228,6 +228,58 @@ body {
 .chat-scroll::-webkit-scrollbar-track { background: transparent; }
 .chat-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
+/* ── Composer dropdown controls ─────────────────────────────────────────── */
+/* Native <select> arrows and native <datalist> indicators differ between
+   controls and between browsers. Strip native chrome and paint one shared
+   SVG chevron (thin stroked, --text-muted) so every dropdown-style control in
+   the composer shares the same indicator and identical 10px left text inset.
+   Two classes because the controls differ: <select> is a true dropdown;
+   <input list="…"> is a combobox (free text + suggestions) — the distinction
+   is preserved, only the indicator style is unified. */
+.composer-select,
+.composer-datalist {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  /* inputStyle uses 6px 10px; reserve 28px on the right for the chevron so the
+     text inset on the left (10px) matches every other control and the chevron
+     never sits on top of the value. */
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239598B8' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+/* Suppress the native datalist indicator on the combobox. Chrome/WebKit
+   draws a filled ▾ triangle that reappears on :hover and :focus unless the
+   rule carries !important and covers those states explicitly. Harmless on
+   <select> (no calendar indicator to suppress). */
+.composer-datalist::-webkit-calendar-picker-indicator,
+.composer-datalist:hover::-webkit-calendar-picker-indicator,
+.composer-datalist:focus::-webkit-calendar-picker-indicator,
+.composer-select::-webkit-calendar-picker-indicator {
+  display: none !important;
+  opacity: 0 !important;
+  -webkit-appearance: none !important;
+}
+
+/* ── Custom Model combobox popup ────────────────────────────────────────── */
+/* Replaces the native <datalist> popup (whose position is browser-controlled
+   and centers under the input). Positioned with left:0 in the component so it
+   left-aligns to the input box like the <select> dropdowns. */
+.composer-combobox-popup {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.composer-combobox-option {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Misc ─────────────────────────────────────────────────────────────── */
 
 .progress-fill {
