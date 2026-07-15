@@ -94,6 +94,11 @@ spec = do
         Success cmd -> cmd `shouldBe` CommandSignal Supervised
         other       -> expectationFailure ("expected CommandSignal Supervised, got: " <> show other)
 
+    it "parses 'telegram' as CommandTelegram Supervised" $
+      case execParserPure defaultPrefs cmdInfo ["telegram"] of
+        Success cmd -> cmd `shouldBe` CommandTelegram Supervised
+        other       -> expectationFailure ("expected CommandTelegram Supervised, got: " <> show other)
+
     it "renders --help for the signal subcommand" $
       case execParserPure defaultPrefs cmdInfo ["signal", "--help"] of
         Failure f -> T.unpack (T.pack (fst (renderFailure f "seal"))) `shouldContain` "signal"

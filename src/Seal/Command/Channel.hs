@@ -1,31 +1,41 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The @\/channel@ command: interactive setup for chat channels. Currently
--- only Signal is supported. The wizard checks for @signal-cli@, offers a
--- @link@ (secondary device) or @register@ (primary device) flow, walks the
--- user through it via 'ChannelCaps' prompts, and writes the resolved
--- account into the @[signal]@ section of @config.toml@. Mirrors PureClaw's
--- @\/channel signal@ wizard; adapted to Seal's 'ChannelCaps' + 'FileConfig'
--- + 'SealPaths' shape.
+-- Signal and Telegram are supported. The Signal wizard checks for
+-- @signal-cli@, offers a @link@ (secondary device) or @register@ (primary
+-- device) flow, walks the user through it via 'ChannelCaps' prompts, and
+-- writes the resolved account into the @[signal]@ section of @config.toml@.
+-- The Telegram wizard prompts for a BotFather token, validates it via the
+-- Bot API @getMe@ endpoint, and writes the @[telegram]@ section. Mirrors
+-- PureClaw's @\/channel signal@ wizard; adapted to Seal's 'ChannelCaps' +
+-- 'FileConfig' + 'SealPaths' shape.
 module Seal.Command.Channel
   ( channelCommandSpec
   , ChannelRuntime (..)
   , SignalCli (..)
   , mkRealSignalCli
+  , TelegramBotApi (..)
+  , mkRealTelegramBotApi
+  , GetMeOutcome (..)
   , LinkOutcome (..)
   , RegisterOutcome (..)
   , VerifyOutcome (..)
   , AccountsOutcome (..)
   ) where
 
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, SomeException, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8With)
 import Data.Text.Encoding.Error (lenientDecode)
+import Network.HTTP.Client (Manager, httpLbs, parseRequest, responseBody,
+                            responseStatus)
+import Network.HTTP.Client.TLS (newTlsManager)
+import Network.HTTP.Types (statusCode)
 import Options.Applicative
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (ExitCode (..))
@@ -43,18 +53,23 @@ import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig,
                          saveFileConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
+import Seal.Telegram.Config
+  ( TelegramConfig (..), defaultTelegramChunkLimit, mkTelegramToken
+  , telegramTokenText )
 
 -- ---------------------------------------------------------------------------
 -- Runtime + testability seam
 -- ---------------------------------------------------------------------------
 
 -- | The runtime the @\/channel@ command closes over: where to find the
--- config file (so the wizard can read-modify-write @config.toml@) and a
--- 'SignalCli' seam for shelling out to @signal-cli@. Tests inject a mock
--- 'SignalCli' so @cabal test@ never needs the binary.
+-- config file (so the wizard can read-modify-write @config.toml@), a
+-- 'SignalCli' seam for shelling out to @signal-cli@, and a
+-- 'TelegramBotApi' seam for the Telegram Bot API. Tests inject mock seams
+-- so @cabal test@ never needs the binary or network.
 data ChannelRuntime = ChannelRuntime
-  { crConfigPath :: FilePath
-  , crSignalCli  :: SignalCli
+  { crConfigPath    :: FilePath
+  , crSignalCli     :: SignalCli
+  , crTelegramBotApi :: TelegramBotApi
   }
 
 -- | A small seam over the @signal-cli@ binary. Each field is one subprocess
@@ -102,19 +117,41 @@ data AccountsOutcome
     -- ^ The detected @+…@ phone numbers (E.164).
 
 -- ---------------------------------------------------------------------------
+-- TelegramBotApi — seam over the Telegram Bot API
+-- ---------------------------------------------------------------------------
+
+-- | A small seam over the Telegram Bot API. The wizard needs only one
+-- operation: validate a bot token via @getMe@. 'mkRealTelegramBotApi'
+-- performs an HTTPS request to the Bot API; tests supply an in-memory
+-- 'TelegramBotApi'. The seam keeps the wizard logic pure with respect to
+-- the network and makes the interactive flow unit-testable.
+newtype TelegramBotApi = TelegramBotApi
+  { tbaGetMe :: Text -> IO GetMeOutcome
+    -- ^ Call @GET \/bot<token>\/getMe@. 'Right' username on success; 'Left'
+    -- diagnostic if the token is invalid or the request fails.
+  }
+
+-- | Outcome of the Bot API @getMe@ call.
+data GetMeOutcome
+  = GetMeOk Text
+    -- ^ The bot's username (without the leading @).
+  | GetMeFailed Text
+
+-- ---------------------------------------------------------------------------
 -- CommandSpec
 -- ---------------------------------------------------------------------------
 
--- | The @\/channel@ command spec. Subcommand: @signal@. Interactive only
--- (the wizard prompts the user; non-interactive channels defer prompts, so
--- the wizard is meaningful on the CLI TUI and equivalent interactive
--- surfaces). The 'ChannelRuntime' carries the config path + 'SignalCli' seam.
+-- | The @\/channel@ command spec. Subcommands: @signal@, @telegram@.
+-- Interactive only (the wizard prompts the user; non-interactive channels
+-- defer prompts, so the wizard is meaningful on the CLI TUI and equivalent
+-- interactive surfaces). The 'ChannelRuntime' carries the config path +
+-- 'SignalCli' + 'TelegramBotApi' seams.
 channelCommandSpec :: ChannelRuntime -> CommandSpec
 channelCommandSpec rt = CommandSpec
   { csName         = CommandName "channel"
   , csAliases      = []
   , csGroup        = GroupGeneral
-  , csSynopsis     = "Set up a chat channel (signal)"
+  , csSynopsis     = "Set up a chat channel (signal, telegram)"
   , csParserInfo   = channelParserInfo rt
   , csAvailability = InteractiveOnly
   }
@@ -123,13 +160,15 @@ channelParserInfo :: ChannelRuntime -> ParserInfo CommandAction
 channelParserInfo rt =
   info (channelParser rt <**> helper)
     (  progDesc "Set up a chat channel"
-    <> header   "channel — interactive channel setup (signal)"
+    <> header   "channel — interactive channel setup (signal, telegram)"
     )
 
 channelParser :: ChannelRuntime -> Parser CommandAction
 channelParser rt = hsubparser
   $  command "signal"
        (info (pure (signalSetupCmd rt)) (progDesc "Set up the Signal channel"))
+  <> command "telegram"
+       (info (pure (telegramSetupCmd rt)) (progDesc "Set up the Telegram channel"))
   <> metavar "CHANNEL"
 
 -- ---------------------------------------------------------------------------
@@ -294,6 +333,71 @@ writeSignalConfig rt caps phoneNumber = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Telegram wizard
+-- ---------------------------------------------------------------------------
+
+-- | Run the Telegram setup wizard. Prompts for a BotFather token, validates
+-- it via the Bot API @getMe@ (so a typo is caught here, not at runtime),
+-- then writes the @[telegram]@ config section. All interaction goes through
+-- 'ChannelCaps' (sends + prompts) so the wizard works on the CLI TUI and
+-- any interactive channel.
+telegramSetupCmd :: ChannelRuntime -> CommandAction
+telegramSetupCmd rt = CommandAction $ \caps -> do
+  ccSend caps $ T.intercalate "\n"
+    [ "Setting up the Telegram channel."
+    , ""
+    , "You need a bot token from BotFather (@BotFather on Telegram):"
+    , "  1. Open a chat with @BotFather"
+    , "  2. Send /newbot and follow the prompts"
+    , "  3. Copy the token it gives you (looks like 123456:ABC-DEF...)"
+    ]
+  tokenInput <- T.strip <$> ccPrompt caps "Bot token: "
+  case mkTelegramToken tokenInput of
+    Left err -> ccSend caps ("Invalid token: " <> err)
+    Right token -> do
+      ccSend caps "Validating token with Telegram..."
+      result <- tbaGetMe (crTelegramBotApi rt) (telegramTokenText token)
+      case result of
+        GetMeFailed err -> ccSend caps ("Token validation failed: " <> err)
+        GetMeOk username -> do
+          ccSend caps ("Connected! Bot username: @" <> username)
+          writeTelegramConfig rt caps (telegramTokenText token) username
+
+-- | Write the @[telegram]@ section into @config.toml@ and confirm. Preserves
+-- all other config; sets the token and a permissive default DM policy
+-- (@AllowAll@), which the user can tighten later by editing @allow_from@.
+writeTelegramConfig :: ChannelRuntime -> ChannelCaps -> Text -> Text -> IO ()
+writeTelegramConfig rt caps token username = do
+  let cfgPath = crConfigPath rt
+  createDirectoryIfMissing True (takeDirectory cfgPath)
+  existing <- loadFileConfig cfgPath
+  let baseCfg = fromRight defaultFileConfig existing
+      updated = baseCfg
+        { fcTelegram = Just TelegramConfig
+            { tcToken         = Just token
+            , tcTextChunkLimit = Just defaultTelegramChunkLimit
+            , tcAllowFrom      = AllowAll
+            }
+        }
+  saveFileConfig cfgPath updated
+  ccSend caps $ T.intercalate "\n"
+    [ ""
+    , "Telegram configured!"
+    , "  Bot: @" <> username
+    , "  DM policy: open (accepts messages from anyone)"
+    , ""
+    , "To start chatting:"
+    , "  1. Restart Seal (or run: seal telegram)"
+    , "  2. Open Telegram and DM @" <> username
+    , ""
+    , "To restrict access later, edit " <> T.pack cfgPath <> ":"
+    , "  [telegram]"
+    , "  allow_from = [\"<your-telegram-user-id>\"]"
+    , ""
+    , "Your Telegram user id will appear in the logs on first message."
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Real SignalCli — shells out to signal-cli
 -- ---------------------------------------------------------------------------
 
@@ -337,11 +441,66 @@ mkRealSignalCli = pure SignalCli
         _ -> AccountsFailed "signal-cli listAccounts failed"
   }
 
--- | Run @signal-cli link -n Seal@. signal-cli emits the @sgnl:\/\/@ URI to
--- stderr, then blocks until the user scans it. We read stderr lines until
--- we find the URI, show it via the caller, then wait for the process to
--- exit. Returns 'LinkSucceeded' with the URI on @ExitSuccess@,
--- 'LinkFailed' otherwise.
+-- ---------------------------------------------------------------------------
+-- Real TelegramBotApi — calls the Telegram Bot API over HTTPS
+-- ---------------------------------------------------------------------------
+
+-- | The real 'TelegramBotApi': validates a bot token via a GET request to
+-- @https:\/\/api.telegram.org\/bot<token>\/getMe@. Uses a shared TLS manager.
+-- On a non-200 response or a network error the wizard surfaces a clear
+-- 'GetMeFailed'. The bot's username is extracted from the JSON response body
+-- (the @\"result\": {\"username\": \"...\"}@ field). We avoid pulling in a
+-- full JSON parser dependency by extracting the username via a lightweight
+-- text scan — the Bot API response shape for getMe is stable.
+mkRealTelegramBotApi :: IO TelegramBotApi
+mkRealTelegramBotApi = do
+  mgr <- newTlsManager
+  pure TelegramBotApi
+    { tbaGetMe = validateToken mgr
+    }
+
+-- | Perform the @getMe@ request and extract the bot username. Returns
+-- 'GetMeOk' with the username (without the leading @) on success,
+-- 'GetMeFailed' with a diagnostic otherwise.
+validateToken :: Manager -> Text -> IO GetMeOutcome
+validateToken mgr token = do
+  let url = "https://api.telegram.org/bot" <> T.unpack token <> "/getMe"
+  eReq <- try @SomeException (parseRequest url)
+  case eReq of
+    Left ex -> pure (GetMeFailed ("request error: " <> T.pack (show ex)))
+    Right req -> do
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left ex -> pure (GetMeFailed ("network error: " <> T.pack (show ex)))
+        Right resp ->
+          let code = statusCode (responseStatus resp)
+              body = decodeUtf8 (BL.toStrict (responseBody resp))
+          in if code == 200
+               then case extractUsername body of
+                 Just u  -> pure (GetMeOk u)
+                 Nothing -> pure (GetMeFailed "could not parse username from getMe response")
+               else pure (GetMeFailed ("getMe returned HTTP " <> T.pack (show code) <> ": " <> body))
+
+-- | Extract the @\"username\"@ field value from a getMe JSON response body
+-- via a lightweight text scan: find @\"username\"@ then the next quoted
+-- string. The Bot API response shape is stable: @{"ok":true,"result":{"id":...,"is_bot":true,"first_name":"...","username":"..."}}@.
+-- Returns the username without the leading @.
+extractUsername :: Text -> Maybe Text
+extractUsername body = do
+  let key = "\"username\""
+      afterKey = T.dropWhile (`notElem` ("\"" :: String))
+                   (T.drop (T.length key)
+                           (snd (T.breakOn key body)))
+  -- afterKey starts with "username-value"..., drop the leading quote
+  case T.uncons (T.drop 1 afterKey) of
+    Just (_, rest) ->
+      let val = T.takeWhile (/= '"') rest
+      in if T.null val then Nothing else Just val
+    Nothing -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- runLink — signal-cli link subprocess
+-- ---------------------------------------------------------------------------
 runLink :: IO LinkOutcome
 runLink =
   withCreateProcess

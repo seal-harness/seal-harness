@@ -18,6 +18,7 @@ data Command
   = CommandNoOp
   | CommandTui AutonomyLevel
   | CommandSignal AutonomyLevel
+  | CommandTelegram AutonomyLevel
   | CommandServe AutonomyLevel
   deriving (Eq, Show)
 
@@ -27,6 +28,8 @@ pCommand = hsubparser
                          (progDesc "Start the interactive terminal UI (TUI)"))
   <> command "signal" (info (CommandSignal <$> pAutonomy)
                             (progDesc "Run the agent over the Signal channel"))
+  <> command "telegram" (info (CommandTelegram <$> pAutonomy)
+                              (progDesc "Run the agent over the Telegram channel"))
   <> command "serve" (info (CommandServe <$> pAutonomy)
                            (progDesc "Run the web gateway server"))
 

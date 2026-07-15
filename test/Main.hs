@@ -59,6 +59,8 @@ import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
+import qualified Seal.Channels.TelegramSpec
+import qualified Seal.Channels.Telegram.TransportSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.EntriesSpec
@@ -97,6 +99,7 @@ import qualified Seal.Phase7aSpec
 import qualified Seal.Phase5Spec
 import qualified Seal.Phase4Spec
 import qualified Seal.Signal.ConfigSpec
+import qualified Seal.Telegram.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
@@ -171,6 +174,8 @@ main = hspec $ do
   Seal.Channel.WiringSpec.spec
   Seal.Channels.ClassSpec.spec
   Seal.Channels.SignalSpec.spec
+  Seal.Channels.TelegramSpec.spec
+  Seal.Channels.Telegram.TransportSpec.spec
   Seal.Channels.Signal.EnvelopeSpec.spec
   Seal.Channels.Signal.RunSpec.spec
   Seal.Channels.Signal.TransportSpec.spec
@@ -212,6 +217,7 @@ main = hspec $ do
   Seal.Phase5Spec.spec
   Seal.Phase4Spec.spec
   Seal.Signal.ConfigSpec.spec
+  Seal.Telegram.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec

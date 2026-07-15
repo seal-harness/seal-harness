@@ -13,6 +13,7 @@ import Seal.Types.Env
 import Seal.Types.App
 import qualified Seal.Tui
 import qualified Seal.Channels.Signal.Run
+import qualified Seal.Channels.Telegram.Run
 import qualified Seal.Command.Serve
 
 -- | Program information for 'runWithConfiguration'. Provides @--config-file@,
@@ -29,6 +30,7 @@ dispatch cfg = do
     CommandNoOp   -> pure ()
     CommandTui autonomy -> liftIO (Seal.Tui.runTui autonomy)
     CommandSignal autonomy -> liftIO (Seal.Channels.Signal.Run.runSignalMain autonomy)
+    CommandTelegram autonomy -> liftIO (Seal.Channels.Telegram.Run.runTelegramMain autonomy)
     CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy)
 
 -- | Map the process arguments so that an empty argument list behaves as if

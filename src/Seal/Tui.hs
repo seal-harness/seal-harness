@@ -10,7 +10,9 @@ import Network.HTTP.Client.TLS (newTlsManager)
 
 import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
 import Seal.Command.Agent (agentCommandSpec)
-import Seal.Command.Channel (ChannelRuntime (..), channelCommandSpec, mkRealSignalCli)
+import Seal.Command.Channel
+  ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
+  , mkRealTelegramBotApi )
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
@@ -99,7 +101,9 @@ runTui autonomy = do
   backends <- newBackends cfgRoot repo
   tabsH   <- newTabsHandle
   cli <- mkRealSignalCli
-  let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli }
+  tgApi <- mkRealTelegramBotApi
+  let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
+                                 , crTelegramBotApi = tgApi }
   -- Every launch starts a fresh session (resume is a follow-on milestone).
   -- The default agent (if set in config) is bound here: its id persists in
   -- smAgent and its non-empty provider/model override the config defaults.

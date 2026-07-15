@@ -77,9 +77,13 @@ library
         Seal.Channel.Caps
         Seal.Channel.Cli
         Seal.Channels.Class
+        Seal.Channels.Loop
         Seal.Channels.Signal
         Seal.Channels.Signal.Run
         Seal.Channels.Signal.Transport
+        Seal.Channels.Telegram
+        Seal.Channels.Telegram.Run
+        Seal.Channels.Telegram.Transport
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
@@ -99,6 +103,7 @@ library
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Signal.Config
+        Seal.Telegram.Config
         Seal.Security.Command
         Seal.Security.Crypto
         Seal.Security.Path
@@ -288,6 +293,7 @@ test-suite tests
         Seal.Phase4Spec
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
+        Seal.Telegram.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.ClassSpec
@@ -295,6 +301,8 @@ test-suite tests
         Seal.Channels.Signal.EnvelopeSpec
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
+        Seal.Channels.TelegramSpec
+        Seal.Channels.Telegram.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec
         Seal.Command.ParseSpec

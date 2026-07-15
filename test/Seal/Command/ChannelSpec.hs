@@ -12,15 +12,17 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Command.Channel
-  ( AccountsOutcome (..), ChannelRuntime (..), LinkOutcome (..)
-  , RegisterOutcome (..), SignalCli (..), VerifyOutcome (..)
-  , channelCommandSpec )
+  ( AccountsOutcome (..), ChannelRuntime (..), GetMeOutcome (..)
+  , LinkOutcome (..), RegisterOutcome (..), SignalCli (..)
+  , TelegramBotApi (..), VerifyOutcome (..), channelCommandSpec )
 import Seal.Command.Spec
   ( Availability (..), CommandName (..), CommandSpec (..), runCommandAction )
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig,
                           saveFileConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
+import Seal.Telegram.Config
+  ( TelegramConfig (..), defaultTelegramChunkLimit )
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 
 -- ---------------------------------------------------------------------------
@@ -65,15 +67,35 @@ mkMockCli check link register verify accounts = do
     }
 
 -- ---------------------------------------------------------------------------
+-- Mock TelegramBotApi
+-- ---------------------------------------------------------------------------
+
+-- | A mock 'TelegramBotApi' that returns a scripted 'GetMeOutcome' for every
+-- call. Tests script the outcome to exercise the valid-token and
+-- invalid-token branches of the wizard.
+mkMockTgApi :: GetMeOutcome -> IO TelegramBotApi
+mkMockTgApi outcome = do
+  ref <- newIORef outcome
+  pure TelegramBotApi
+    { tbaGetMe = \_token -> readIORef ref
+    }
+
+-- | A 'TelegramBotApi' whose 'tbaGetMe' always fails. Used for Signal-only
+-- tests where the Telegram seam is never exercised.
+dummyTgApi :: TelegramBotApi
+dummyTgApi = TelegramBotApi { tbaGetMe = \_ -> pure (GetMeFailed "unused") }
+
+-- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
 -- | Run /channel <args> against a mock runtime in a temp config dir.
 -- Returns the messages sent via the channel, in order.
-runChannel :: SignalCli -> [String] -> [Text] -> FilePath -> IO [Text]
-runChannel cli argv inputs cfgPath = do
+runChannel :: SignalCli -> TelegramBotApi -> [String] -> [Text] -> FilePath -> IO [Text]
+runChannel cli tgApi argv inputs cfgPath = do
   (fc, caps) <- makeFakeCaps inputs
-  let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli }
+  let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
+                          , crTelegramBotApi = tgApi }
   case execParserPure defaultPrefs (csParserInfo (channelCommandSpec rt)) argv of
     Success act -> runCommandAction act caps
     _           -> expectationFailure ("parse failed: " <> show argv)
@@ -98,6 +120,20 @@ unsafeSig :: Maybe SignalConfig -> SignalConfig
 unsafeSig (Just s) = s
 unsafeSig Nothing  = error "signalSection was Nothing despite isJust check"
 
+-- | Load the telegram section from a config file, failing the test if absent.
+telegramSection :: FilePath -> IO (Maybe TelegramConfig)
+telegramSection cfgPath = do
+  eCfg <- loadFileConfig cfgPath
+  case eCfg of
+    Right cfg -> pure (fcTelegram cfg)
+    Left _    -> expectationFailure "config failed to load" >> pure Nothing
+
+-- | Unwrap a 'Just' produced by 'telegramSection' after an 'isJust'
+-- assertion. The prior 'shouldSatisfy' isJust' guards the partial match.
+unsafeTg :: Maybe TelegramConfig -> TelegramConfig
+unsafeTg (Just t) = t
+unsafeTg Nothing  = error "telegramSection was Nothing despite isJust check"
+
 -- ---------------------------------------------------------------------------
 -- Spec
 -- ---------------------------------------------------------------------------
@@ -108,10 +144,12 @@ spec = describe "Seal.Command.Channel" $ do
   describe "command spec metadata" $ do
     cli <- runIO (mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x"))
-    let rt = ChannelRuntime { crConfigPath = "/tmp/x.toml", crSignalCli = cli }
+    let rt = ChannelRuntime { crConfigPath = "/tmp/x.toml", crSignalCli = cli
+                            , crTelegramBotApi = dummyTgApi }
         cs = channelCommandSpec rt
     it "name is /channel" $ csName cs `shouldBe` CommandName "channel"
     it "synopsis mentions signal" $ csSynopsis cs `shouldSatisfy` ("signal" `T.isInfixOf`)
+    it "synopsis mentions telegram" $ csSynopsis cs `shouldSatisfy` ("telegram" `T.isInfixOf`)
     it "is InteractiveOnly" $ csAvailability cs `shouldBe` InteractiveOnly
 
   describe "/channel signal — signal-cli absent" $
@@ -120,7 +158,7 @@ spec = describe "Seal.Command.Channel" $ do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Left "not found") (LinkFailed "x") [] []
                         (AccountsFailed "x")
-        sent <- runChannel cli ["signal"] [] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] [] cfgPath
         sentBlock sent `shouldSatisfy` ("signal-cli is not installed" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("github.com/AsamK/signal-cli" `T.isInfixOf`)
 
@@ -134,7 +172,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+15551234567"])
-        sent <- runChannel cli ["signal"] ["1"] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] ["1"] cfgPath
         sentBlock sent `shouldSatisfy` ("sgnl://link?enc=xyz" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Detected account: +15551234567" `T.isInfixOf`)
         mSig <- signalSection cfgPath
@@ -154,10 +192,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound [])
-        _sent <- runChannel cli ["signal"] ["1", "+18005551234"] cfgPath
-        -- listAccounts found nothing, so the wizard prompts for the phone
-        -- number (the prompt text goes through ccPrompt, not ccSend, so we
-        -- assert on the written config instead).
+        _sent <- runChannel cli dummyTgApi ["signal"] ["1", "+18005551234"] cfgPath
         mSig <- signalSection cfgPath
         mSig `shouldSatisfy` isJust
         let sig = unsafeSig mSig
@@ -173,7 +208,7 @@ spec = describe "Seal.Command.Channel" $ do
           [("+15557654321", Nothing, RegisterOk)]
           [("+15557654321", "123456", VerifyOk)]
           (AccountsFound ["+15557654321"])
-        sent <- runChannel cli ["signal"] ["2", "+15557654321", "123456"] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] ["2", "+15557654321", "123456"] cfgPath
         sentBlock sent `shouldSatisfy` ("Sending verification SMS to +15557654321" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Phone number verified!" `T.isInfixOf`)
         mSig <- signalSection cfgPath
@@ -193,7 +228,7 @@ spec = describe "Seal.Command.Channel" $ do
           ]
           [ ("+15551112222", "999000", VerifyOk) ]
           (AccountsFound ["+15551112222"])
-        sent <- runChannel cli ["signal"]
+        sent <- runChannel cli dummyTgApi ["signal"]
                    ["2", "+15551112222", "signalcaptcha://tok123", "999000"] cfgPath
         sentBlock sent `shouldSatisfy` ("requires a captcha" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Phone number verified!" `T.isInfixOf`)
@@ -208,7 +243,7 @@ spec = describe "Seal.Command.Channel" $ do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x")
-        sent <- runChannel cli ["signal"] ["9"] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] ["9"] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid choice" `T.isInfixOf`)
 
   describe "/channel signal — invalid phone number" $
@@ -217,7 +252,7 @@ spec = describe "Seal.Command.Channel" $ do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x")
-        sent <- runChannel cli ["signal"] ["2", "5551234"] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] ["2", "5551234"] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid phone number" `T.isInfixOf`)
 
   describe "/channel signal — default choice is link (empty input)" $
@@ -230,7 +265,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+14045551234"])
-        sent <- runChannel cli ["signal"] [""] cfgPath
+        sent <- runChannel cli dummyTgApi ["signal"] [""] cfgPath
         sentBlock sent `shouldSatisfy` ("sgnl://link?enc=dflt" `T.isInfixOf`)
         mSig <- signalSection cfgPath
         mSig `shouldSatisfy` isJust
@@ -241,7 +276,6 @@ spec = describe "Seal.Command.Channel" $ do
     it "keeps unrelated keys (vault_recipient) when adding [signal]" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
-        -- Seed an existing config with a vault recipient.
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
         let seed = defaultFileConfig { fcVaultRecipient = Just "age1xxx" }
         saveFileConfig cfgPath seed
@@ -251,7 +285,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+15550000000"])
-        _sent <- runChannel cli ["signal"] ["1"] cfgPath
+        _sent <- runChannel cli dummyTgApi ["signal"] ["1"] cfgPath
         eCfg <- loadFileConfig cfgPath
         case eCfg of
           Right cfg -> do
@@ -259,28 +293,108 @@ spec = describe "Seal.Command.Channel" $ do
             fcSignal cfg `shouldSatisfy` isJust
           Left _ -> expectationFailure "config failed to load"
 
-  describe "/channel — unknown subcommand" $
-    it "optparse rejects /channel telegram" $
+  -- ---------------------------------------------------------------------
+  -- Telegram wizard tests
+  -- ---------------------------------------------------------------------
+
+  describe "/channel telegram — valid token" $
+    it "validates the token via getMe and writes the [telegram] config" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x")
-        let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli }
+        tgApi <- mkMockTgApi (GetMeOk "MySealBot")
+        sent <- runChannel cli tgApi ["telegram"] ["123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"] cfgPath
+        sentBlock sent `shouldSatisfy` ("Validating token with Telegram" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Connected! Bot username: @MySealBot" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Telegram configured!" `T.isInfixOf`)
+        mTg <- telegramSection cfgPath
+        mTg `shouldSatisfy` isJust
+        let tg = unsafeTg mTg
+        tcToken tg `shouldBe` Just "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+        tcTextChunkLimit tg `shouldBe` Just defaultTelegramChunkLimit
+        tcAllowFrom tg `shouldBe` AllowAll
+
+  describe "/channel telegram — getMe fails" $
+    it "reports the failure and does not write config" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                        (AccountsFailed "x")
+        tgApi <- mkMockTgApi (GetMeFailed "Unauthorized")
+        sent <- runChannel cli tgApi ["telegram"] ["123456:BAD"] cfgPath
+        sentBlock sent `shouldSatisfy` ("Token validation failed: Unauthorized" `T.isInfixOf`)
+        mTg <- telegramSection cfgPath
+        mTg `shouldBe` Nothing
+
+  describe "/channel telegram — empty token" $
+    it "rejects an empty token before calling getMe" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                        (AccountsFailed "x")
+        tgApi <- mkMockTgApi (GetMeOk "never")
+        sent <- runChannel cli tgApi ["telegram"] [""] cfgPath
+        sentBlock sent `shouldSatisfy` ("Invalid token" `T.isInfixOf`)
+        mTg <- telegramSection cfgPath
+        mTg `shouldBe` Nothing
+
+  describe "/channel telegram — leading-dash token" $
+    it "rejects a leading-dash token (option injection)" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                        (AccountsFailed "x")
+        tgApi <- mkMockTgApi (GetMeOk "never")
+        sent <- runChannel cli tgApi ["telegram"] ["--version"] cfgPath
+        sentBlock sent `shouldSatisfy` ("Invalid token" `T.isInfixOf`)
+
+  describe "/channel telegram — preserves existing config" $
+    it "keeps unrelated keys (vault_recipient) when adding [telegram]" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
+        let seed = defaultFileConfig { fcVaultRecipient = Just "age1yyy" }
+        saveFileConfig cfgPath seed
+        cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                        (AccountsFailed "x")
+        tgApi <- mkMockTgApi (GetMeOk "SealBot")
+        _sent <- runChannel cli tgApi ["telegram"] ["123456:ABC-DEF"] cfgPath
+        eCfg <- loadFileConfig cfgPath
+        case eCfg of
+          Right cfg -> do
+            fcVaultRecipient cfg `shouldBe` Just "age1yyy"
+            fcTelegram cfg `shouldSatisfy` isJust
+          Left _ -> expectationFailure "config failed to load"
+
+  -- ---------------------------------------------------------------------
+  -- Parser tests
+  -- ---------------------------------------------------------------------
+
+  describe "/channel — unknown subcommand" $
+    it "optparse rejects /channel discord" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                        (AccountsFailed "x")
+        let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
+                                , crTelegramBotApi = dummyTgApi }
         case execParserPure defaultPrefs (csParserInfo (channelCommandSpec rt))
-                             ["telegram"] of
+                             ["discord"] of
           Failure _       -> pure ()
-          Success _       -> expectationFailure "expected /channel telegram to fail"
+          Success _       -> expectationFailure "expected /channel discord to fail"
           CompletionInvoked _ -> expectationFailure "unexpected completion"
 
-  describe "/channel — --help renders the signal subcommand" $
-    it "the --help text mentions signal" $
+  describe "/channel — --help renders both subcommands" $
+    it "the --help text mentions signal and telegram" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x")
-        let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli }
+        let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
+                                , crTelegramBotApi = dummyTgApi }
         case execParserPure defaultPrefs (csParserInfo (channelCommandSpec rt))
                              ["--help"] of
-          Failure _ -> pure ()  -- optparse emits help as a Failure
-          Success _ -> expectationFailure "expected --help to render, not succeed"
+          Failure _       -> pure ()  -- optparse emits help as a Failure
+          Success _       -> expectationFailure "expected --help to render, not succeed"
           CompletionInvoked _ -> expectationFailure "unexpected completion"

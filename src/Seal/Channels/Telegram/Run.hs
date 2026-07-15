@@ -1,0 +1,148 @@
+{-# LANGUAGE OverloadedStrings #-}
+-- | The @seal telegram@ startup wiring: spawn the Telegram channel + run
+-- the agent loop against it, parallel to @seal signal@. Reuses the shared
+-- 'Seal.Channels.Loop.runChannelLoop' + 'plainTurn' so the agent loop is
+-- identical; the difference is the channel is Telegram (Bot API long-poll)
+-- instead of Signal (signal-cli subprocess). 'aeMessageSource' is
+-- @Just ms@ so the transcript records the channel + conversation id.
+module Seal.Channels.Telegram.Run
+  ( runTelegram
+  , runTelegramMain
+  ) where
+
+import Data.IORef (newIORef)
+import Data.Maybe (fromMaybe)
+import Data.Text qualified as T
+import Network.HTTP.Client.TLS (newTlsManager)
+import System.IO (hPutStrLn, stderr)
+
+import Seal.Channels.Loop (plainTurn, runChannelLoop)
+import Seal.Channels.Telegram (withTelegramChannel)
+import Seal.Channels.Telegram.Transport (mkRealTelegramTransport)
+import Seal.Channel.Cli (Backends (..), newBackends)
+import Seal.Command.Channel
+  ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
+  , mkRealTelegramBotApi )
+import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Spec (Registry, mkRegistry)
+import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Agent (agentCommandSpec)
+import Seal.Command.Session (sessionCommandSpec)
+import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
+import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
+import Seal.Config.Paths
+  ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath )
+import Seal.Core.AllowList (AllowList)
+import Seal.Core.MessageSource (UserId)
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Handles.AskReply (ApprovalCache, AskReplyStore, newApprovalCache, newAskReplyStore)
+import Seal.Ingest (PreprocessChain, emptyChain)
+import Seal.Security.Policy (AutonomyLevel)
+import Seal.Session.Store (SessionRuntime (..), initSession)
+import Seal.Tabs (newTabsHandle)
+import Seal.Telegram.Config
+  ( TelegramToken (..), resolveTelegramConfig, telegramTokenText )
+import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+import Seal.Vault.Commands (VaultRuntime (..))
+import qualified Seal.Security.Vault as Vault
+
+-- | Spawn the real Telegram transport, resolve the token + chunk limit +
+-- allow-list, and run the agent loop against the Telegram channel. Fails
+-- fast with a stderr diagnostic if the token is unresolved or the Bot API
+-- is unreachable.
+runTelegram
+  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
+  -> Registry -> PreprocessChain -> Backends
+  -> (TelegramToken, Int, AllowList UserId)
+  -> AskReplyStore
+  -> AutonomyLevel
+  -> ApprovalCache
+  -> IO ()
+runTelegram paths rt pr sr registry chain backends (token, chunkLimit, allow) askReply autonomy approvals = do
+  mgr <- newTlsManager
+  transport <- mkRealTelegramTransport (telegramTokenText token) mgr
+  let withCh = withTelegramChannel (allow, chunkLimit) transport
+      plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
+  tabsH <- newTabsHandle
+  runChannelLoop withCh plainHandler registry chain askReply sr tabsH
+
+-- | Full @seal telegram@ startup wiring: paths -> config -> vault -> session
+-- -> backends -> registry -> spawn the Telegram channel -> run the loop.
+-- Mirrors 'Seal.Channels.Signal.Run.runSignalMain' but drives the Telegram
+-- channel instead. Resolves the @[telegram]@ config section + an optional
+-- vault-supplied token; fails fast with a stderr diagnostic if the token is
+-- unresolved.
+runTelegramMain :: AutonomyLevel -> IO ()
+runTelegramMain autonomy = do
+  paths <- getSealPaths
+  ensureSealDirs paths
+  let cfgPath = configFilePath paths
+  cfg <- loadFileConfig cfgPath >>= \case
+    Left err -> do
+      hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
+      pure defaultFileConfig
+    Right c  -> pure c
+  mHandle <- tryOpenVault paths cfg
+  ref     <- newIORef mHandle
+  let rt = VaultRuntime
+            { vrPaths      = paths
+            , vrConfigPath = cfgPath
+            , vrHandleRef  = ref
+            }
+  mgr <- newTlsManager
+  let pr = ProviderRuntime
+            { prConfigPath = cfgPath
+            , prVault      = rt
+            , prManager    = mgr
+            }
+  let cfgRoot = spConfig paths
+  ensureConfigRepo cfgRoot
+  let repo = openConfigRepo cfgRoot
+  backends <- newBackends cfgRoot repo
+  sessionMeta <- initSession paths cfg (bAgentDefs backends)
+  activeRef   <- newIORef sessionMeta
+  let sr = SessionRuntime
+             { srPaths      = paths
+             , srConfigPath = cfgPath
+             , srActive     = activeRef
+             }
+  tabsH <- newTabsHandle
+  cli <- mkRealSignalCli
+  tgApi <- mkRealTelegramBotApi
+  let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
+                                 , crTelegramBotApi = tgApi }
+  let registry = mkRegistry
+        [ sessionCommandSpec sr
+        , modelCommandSpec pr sr
+        , skillCommandSpec (bSkills backends)
+        , agentCommandSpec (bAgentDefs backends) cfgPath
+        , channelCommandSpec channelRt
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
+        ]
+  askReply <- newAskReplyStore 0
+  approvals <- newApprovalCache
+  case resolveTelegramConfig (fcTelegram cfg) Nothing of
+    Left err -> hPutStrLn stderr ("seal telegram: " <> T.unpack err)
+    Right resolved -> runTelegram paths rt pr sr registry emptyChain backends resolved askReply autonomy approvals
+
+-- | Open the vault if both recipient and identity are configured. Mirrors
+-- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone.
+tryOpenVault :: SealPaths -> FileConfig -> IO (Maybe Vault.VaultHandle)
+tryOpenVault paths cfg =
+  case (fcVaultRecipient cfg, fcVaultIdentity cfg) of
+    (Just _, Just _) ->
+      resolveEncryptor cfg >>= \case
+        Left err -> do
+          hPutStrLn stderr ("Warning: vault not available: " <> show err)
+          pure Nothing
+        Right enc -> do
+          let vcfg = Vault.VaultConfig
+                { Vault.vcPath    = maybe (vaultFilePath paths) T.unpack (fcVaultPath cfg)
+                , Vault.vcKeyType = fromMaybe "x25519" (fcVaultKeyType cfg)
+                , Vault.vcUnlock  = parseUnlockMode (fcVaultUnlock cfg)
+                }
+          Just <$> Vault.openVault vcfg enc
+    _ -> pure Nothing

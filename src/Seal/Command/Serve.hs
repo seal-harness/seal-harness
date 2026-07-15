@@ -13,7 +13,15 @@ import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
+import qualified Seal.Signal.Config
+import qualified Seal.Telegram.Config
+
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
+import Seal.Channels.Loop (plainTurn, runChannelLoop)
+import Seal.Channels.Signal (withSignalChannel)
+import Seal.Channels.Signal.Transport (mkRealSignalTransport)
+import Seal.Channels.Telegram (withTelegramChannel)
+import Seal.Channels.Telegram.Transport (mkRealTelegramTransport)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
@@ -39,7 +47,9 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
+import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newTabsHandle)
+import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 import Seal.Web.UiState (newUiStateHandle)
@@ -160,6 +170,14 @@ runServeMain autonomy = do
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
+  -- Fork channel listeners for any configured channel. Each channel gets
+  -- its own tabsHandle + askReplyStore (the session + backends + provider
+  -- runtime + vault runtime are shared). The listener runs the shared
+  -- 'runChannelLoop' + 'plainTurn' so the agent loop is identical to the
+  -- TUI / Signal / Telegram standalone modes. A missing config section
+  -- (Left from resolve) means the channel is not configured — skip silently.
+  forkSignalListener paths rt pr sr backends cfg autonomy
+  forkTelegramListener paths rt pr sr backends cfg autonomy
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
 
@@ -182,3 +200,56 @@ tryOpenVault paths fcfg =
                 }
           Just <$> openVault vcfg enc
     _ -> pure Nothing
+
+-- ---------------------------------------------------------------------------
+-- Channel listener forking
+-- ---------------------------------------------------------------------------
+
+-- | Fork the Signal channel listener if @[signal]@ is configured. Resolves
+-- the config section, spawns the signal-cli transport, and runs the shared
+-- inbox-driven loop in a background thread. A missing/unresolved section
+-- is logged to stderr and skipped (not fatal — the gateway still starts).
+forkSignalListener
+  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
+  -> Backends -> FileConfig -> AutonomyLevel -> IO ()
+forkSignalListener paths rt pr sr backends cfg autonomy =
+  case resolveSignalConfig (fcSignal cfg) Nothing of
+    Left _ -> pure ()  -- not configured; skip silently
+    Right (account, chunkLimit, allow) -> do
+      let accountLabel = Seal.Signal.Config.signalAccountText account
+      eTransport <- mkRealSignalTransport accountLabel
+      case eTransport of
+        Left err -> hPutStrLn stderr ("seal serve: signal channel skipped: " <> T.unpack err)
+        Right transport -> do
+          tabsH <- newTabsHandle
+          askReply <- newAskReplyStore 0
+          approvals <- newApprovalCache
+          let withCh = withSignalChannel (allow, chunkLimit) account transport
+              plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
+          _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+          pure ()
+  where
+    registry = Seal.Command.Spec.mkRegistry []
+
+-- | Fork the Telegram channel listener if @[telegram]@ is configured.
+-- Resolves the config section, spawns the Bot API transport, and runs the
+-- shared inbox-driven loop in a background thread. A missing/unresolved
+-- section is logged to stderr and skipped.
+forkTelegramListener
+  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
+  -> Backends -> FileConfig -> AutonomyLevel -> IO ()
+forkTelegramListener paths rt pr sr backends cfg autonomy =
+  case resolveTelegramConfig (fcTelegram cfg) Nothing of
+    Left _ -> pure ()  -- not configured; skip silently
+    Right (token, chunkLimit, allow) -> do
+      mgr <- newTlsManager
+      transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr
+      tabsH <- newTabsHandle
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
+      let withCh = withTelegramChannel (allow, chunkLimit) transport
+          plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
+      _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+      pure ()
+  where
+    registry = Seal.Command.Spec.mkRegistry []
