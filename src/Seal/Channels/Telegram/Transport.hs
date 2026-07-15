@@ -8,6 +8,7 @@
 module Seal.Channels.Telegram.Transport
   ( TelegramTransport (..)
   , TelegramUpdate (..)
+  , BotCommand (..)
   , mkMockTelegramTransport
   , mkRealTelegramTransport
   , parseTelegramUpdate
@@ -22,7 +23,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -40,16 +41,27 @@ import Seal.Core.MessageSource
 
 -- | The testability seam over the Telegram Bot API. The channel layer calls
 -- 'tgReceive' to pull the next parsed update (blocks until one arrives or
--- the transport closes), 'tgSend' to send a message (chat id + body), and
--- 'tgClose' to clean up.
+-- the transport closes), 'tgSend' to send a message (chat id + body),
+-- 'tgSetCommands' to register the bot's slash-command menu with BotFather
+-- (for auto-completion), and 'tgClose' to clean up.
 data TelegramTransport = TelegramTransport
-  { tgReceive :: IO (Either Text TelegramUpdate)
+  { tgReceive     :: IO (Either Text TelegramUpdate)
     -- ^ Next inbound update. 'Right' on success; 'Left' diagnostic on
     -- close/failure (the reader thread stops).
-  , tgSend    :: Text -> Text -> IO ()
+  , tgSend        :: Text -> Text -> IO ()
     -- ^ Send a message: chat id, body. Calls the Bot API @sendMessage@.
-  , tgClose   :: IO ()
+  , tgSetCommands :: [BotCommand] -> IO ()
+    -- ^ Register the bot's command menu via @setMyCommands@ (auto-completion).
+  , tgClose       :: IO ()
   }
+
+-- | A BotFather command menu entry: the command name (without the leading
+-- @/@) and a short description (≤ 256 chars per Telegram's limit). Derived
+-- from the Seal command 'Registry' by 'telegramBotCommands'.
+data BotCommand = BotCommand
+  { bcName        :: Text   -- ^ command name, lowercase, ≤ 32 chars
+  , bcDescription :: Text   -- ^ short description, ≤ 256 chars
+  } deriving stock (Eq, Show)
 
 -- | A parsed inbound Telegram update: the conversation id (from chat.id),
 -- the sender's user id (from from.id), and the message body. The
@@ -71,13 +83,16 @@ data TelegramUpdate = TelegramUpdate
 -- | A mock transport backed by a 'TQueue' of inbound 'TelegramUpdate's and an
 -- 'IORef' of captured sends. 'tgReceive' pops the next inbound (or returns
 -- @Left "inbox empty"@); 'tgSend' appends @(chatId, body)@ to the capture;
--- 'tgClose' is a no-op (idempotent).
+-- 'tgSetCommands' captures the last registered commands; 'tgClose' is a
+-- no-op (idempotent). Returns the transport + an action to read captured
+-- sends + an IORef holding the last set commands (for test assertions).
 mkMockTelegramTransport
-  :: [TelegramUpdate] -> IO (TelegramTransport, IO [(Text, Text)])
+  :: [TelegramUpdate] -> IO (TelegramTransport, IO [(Text, Text)], IO [BotCommand])
 mkMockTelegramTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
+  cmdRef <- newIORef []
   let transport = TelegramTransport
         { tgReceive = do
             m <- atomically (tryReadTQueue q)
@@ -85,10 +100,12 @@ mkMockTelegramTransport scripted = do
               Just u  -> pure (Right u)
               Nothing -> pure (Left "telegram inbox empty")
         , tgSend = \c b -> modifyIORef' capRef ((c, b) :)
+        , tgSetCommands = writeIORef cmdRef
         , tgClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
-  pure (transport, getCaptured)
+      getCommands = readIORef cmdRef
+  pure (transport, getCaptured, getCommands)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS
@@ -102,9 +119,11 @@ telegramApiBase = "https://api.telegram.org/bot"
 -- @sendMessage@. 'tgReceive' blocks on @getUpdates@ (30s long-poll), parses
 -- each update into a 'TelegramUpdate', and advances the @offset@ so
 -- acknowledged updates are not re-delivered. 'tgSend' calls @sendMessage@.
--- 'tgClose' is a no-op (long-polling is stateless; no child process to
--- kill). The transport maintains an internal buffer ('TQueue') of parsed
--- updates from the last @getUpdates@ call, refilling when it drains.
+-- 'tgSetCommands' calls @setMyCommands@ to register the bot's slash-command
+-- menu for auto-completion. 'tgClose' is a no-op (long-polling is stateless;
+-- no child process to kill). The transport maintains an internal buffer
+-- ('TQueue') of parsed updates from the last @getUpdates@ call, refilling
+-- when it drains.
 mkRealTelegramTransport :: Text -> Manager -> IO TelegramTransport
 mkRealTelegramTransport token mgr = do
   buffer <- newTQueueIO
@@ -112,6 +131,7 @@ mkRealTelegramTransport token mgr = do
   pure TelegramTransport
     { tgReceive = fillAndReceive buffer offsetRef
     , tgSend = sendViaApi mgr token
+    , tgSetCommands = setMyCommandsViaApi mgr token
     , tgClose = pure ()
     }
   where
@@ -255,6 +275,30 @@ sendViaApi mgr token chatId body = do
             [ "chat_id" A..= chatId
             , "text"   A..= body
             ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Register the bot's command menu via @setMyCommands@ so Telegram shows
+-- auto-completion for the bot's slash commands. Calls the Bot API with a
+-- JSON array of @{command, description}@ objects. Silent on failure (the
+-- channel logs elsewhere; the bot still works without auto-completion).
+setMyCommandsViaApi :: Manager -> Text -> [BotCommand] -> IO ()
+setMyCommandsViaApi mgr token commands = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/setMyCommands")))
+  case eReq of
+    Left _ -> pure ()
+    Right req0 -> do
+      let cmds = [ A.object [ "command" A..= bcName bc
+                            , "description" A..= bcDescription bc
+                            ]
+                 | bc <- commands
+                 ]
+          payload = A.object [ "commands" A..= cmds ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)
                      , requestHeaders = [("Content-Type", "application/json")]

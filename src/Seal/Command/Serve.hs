@@ -15,19 +15,20 @@ import System.IO (hPutStrLn, stderr)
 
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
+import qualified Seal.Channels.Telegram.Commands
+import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
 import Seal.Channels.Loop (plainTurn, runChannelLoop)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
-import Seal.Channels.Telegram.Transport (mkRealTelegramTransport)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths)
@@ -176,8 +177,8 @@ runServeMain autonomy = do
   -- 'runChannelLoop' + 'plainTurn' so the agent loop is identical to the
   -- TUI / Signal / Telegram standalone modes. A missing config section
   -- (Left from resolve) means the channel is not configured — skip silently.
-  forkSignalListener paths rt pr sr backends cfg autonomy
-  forkTelegramListener paths rt pr sr backends cfg autonomy
+  forkSignalListener paths rt pr sr backends cfg autonomy registry
+  forkTelegramListener paths rt pr sr backends cfg autonomy registry
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
 
@@ -211,8 +212,8 @@ tryOpenVault paths fcfg =
 -- is logged to stderr and skipped (not fatal — the gateway still starts).
 forkSignalListener
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> IO ()
-forkSignalListener paths rt pr sr backends cfg autonomy =
+  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
+forkSignalListener paths rt pr sr backends cfg autonomy registry =
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left _ -> pure ()  -- not configured; skip silently
     Right (account, chunkLimit, allow) -> do
@@ -228,22 +229,23 @@ forkSignalListener paths rt pr sr backends cfg autonomy =
               plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
           _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
           pure ()
-  where
-    registry = Seal.Command.Spec.mkRegistry []
 
 -- | Fork the Telegram channel listener if @[telegram]@ is configured.
--- Resolves the config section, spawns the Bot API transport, and runs the
+-- Resolves the config section, spawns the Bot API transport, registers the
+-- bot's slash-command menu with BotFather for auto-completion, and runs the
 -- shared inbox-driven loop in a background thread. A missing/unresolved
 -- section is logged to stderr and skipped.
 forkTelegramListener
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> IO ()
-forkTelegramListener paths rt pr sr backends cfg autonomy =
+  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
+forkTelegramListener paths rt pr sr backends cfg autonomy registry =
   case resolveTelegramConfig (fcTelegram cfg) Nothing of
     Left _ -> pure ()  -- not configured; skip silently
     Right (token, chunkLimit, allow) -> do
       mgr <- newTlsManager
       transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr
+      -- Register the bot's slash-command menu with BotFather.
+      tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
       tabsH <- newTabsHandle
       askReply <- newAskReplyStore 0
       approvals <- newApprovalCache
@@ -251,5 +253,3 @@ forkTelegramListener paths rt pr sr backends cfg autonomy =
           plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
       _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
       pure ()
-  where
-    registry = Seal.Command.Spec.mkRegistry []

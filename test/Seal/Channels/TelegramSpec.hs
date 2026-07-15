@@ -43,7 +43,7 @@ spec = describe "Seal.Channels.Telegram" $ do
   it "withTelegramChannel + chReceive yields scripted updates with the right MessageSource" $ do
     let upd1 = mkTestUpdate chatId1 senderId1 "hello"
         upd2 = mkTestUpdate chatId1 senderId1 "/ping"
-    (transport, _) <- mkMockTelegramTransport [upd1, upd2]
+    (transport, _, _) <- mkMockTelegramTransport [upd1, upd2]
     withTelegramChannel (AllowAll, 3900) transport $ \ch -> do
       let h = toHandle ch
       (m1, t1) <- chReceive h
@@ -59,7 +59,7 @@ spec = describe "Seal.Channels.Telegram" $ do
   it "chSend chunks a long message to the configured limit and sends to the last chat" $ do
     let longMsg = T.replicate 25 "a"
         upd1 = mkTestUpdate chatId1 senderId1 "x"
-    (transport, getCaptured) <- mkMockTelegramTransport [upd1]
+    (transport, getCaptured, _) <- mkMockTelegramTransport [upd1]
     withTelegramChannel (AllowAll, 10) transport $ \ch -> do
       let h = toHandle ch
       _ <- chReceive h  -- primes the last-chat id
@@ -69,7 +69,7 @@ spec = describe "Seal.Channels.Telegram" $ do
       all (\(_, b) -> T.length b <= 10) sent `shouldBe` True
 
   it "chSend with no last chat is dropped (capture empty)" $ do
-    (transport, getCaptured) <- mkMockTelegramTransport []
+    (transport, getCaptured, _) <- mkMockTelegramTransport []
     withTelegramChannel (AllowAll, 3900) transport $ \ch -> do
       let h = toHandle ch
       chSend h "hello"
@@ -82,7 +82,7 @@ spec = describe "Seal.Channels.Telegram" $ do
           Right u -> u
           Left _  -> error "mkUserId failed"
         allow = AllowOnly (Set.fromList [blockedSender])
-    (transport, _) <- mkMockTelegramTransport [upd1]
+    (transport, _, _) <- mkMockTelegramTransport [upd1]
     withTelegramChannel (allow, 3900) transport $ \ch -> do
       let h = toHandle ch
       -- The reader drops the non-allow-listed update; the mock queue
@@ -91,14 +91,14 @@ spec = describe "Seal.Channels.Telegram" $ do
       mSrc `shouldBe` Nothing
 
   it "chPrompt returns Left Deferred (Telegram can't answer inline)" $ do
-    (transport, _) <- mkMockTelegramTransport []
+    (transport, _, _) <- mkMockTelegramTransport []
     withTelegramChannel (AllowAll, 3900) transport $ \ch -> do
       let h = toHandle ch
       result <- chPrompt h "question?"
       result `shouldBe` Left Deferred
 
   it "chStreaming is True for Telegram" $ do
-    (transport, _) <- mkMockTelegramTransport []
+    (transport, _, _) <- mkMockTelegramTransport []
     withTelegramChannel (AllowAll, 3900) transport $ \ch -> do
       let h = toHandle ch
       chStreaming h `shouldBe` True

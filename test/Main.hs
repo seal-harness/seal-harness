@@ -60,6 +60,7 @@ import qualified Seal.Channels.Signal.EnvelopeSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
 import qualified Seal.Channels.TelegramSpec
+import qualified Seal.Channels.Telegram.CommandsSpec
 import qualified Seal.Channels.Telegram.TransportSpec
 import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
@@ -175,6 +176,7 @@ main = hspec $ do
   Seal.Channels.ClassSpec.spec
   Seal.Channels.SignalSpec.spec
   Seal.Channels.TelegramSpec.spec
+  Seal.Channels.Telegram.CommandsSpec.spec
   Seal.Channels.Telegram.TransportSpec.spec
   Seal.Channels.Signal.EnvelopeSpec.spec
   Seal.Channels.Signal.RunSpec.spec

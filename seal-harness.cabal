@@ -82,6 +82,7 @@ library
         Seal.Channels.Signal.Run
         Seal.Channels.Signal.Transport
         Seal.Channels.Telegram
+        Seal.Channels.Telegram.Commands
         Seal.Channels.Telegram.Run
         Seal.Channels.Telegram.Transport
         Seal.Command.Help
@@ -302,6 +303,7 @@ test-suite tests
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Channels.TelegramSpec
+        Seal.Channels.Telegram.CommandsSpec
         Seal.Channels.Telegram.TransportSpec
         Seal.Command.HelpSpec
         Seal.Command.ModelSpec

@@ -18,7 +18,8 @@ import System.IO (hPutStrLn, stderr)
 
 import Seal.Channels.Loop (plainTurn, runChannelLoop)
 import Seal.Channels.Telegram (withTelegramChannel)
-import Seal.Channels.Telegram.Transport (mkRealTelegramTransport)
+import Seal.Channels.Telegram.Commands (telegramBotCommands)
+import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
@@ -62,6 +63,8 @@ runTelegram
 runTelegram paths rt pr sr registry chain backends (token, chunkLimit, allow) askReply autonomy approvals = do
   mgr <- newTlsManager
   transport <- mkRealTelegramTransport (telegramTokenText token) mgr
+  -- Register the bot's slash-command menu with BotFather for auto-completion.
+  tgSetCommands transport (telegramBotCommands registry)
   let withCh = withTelegramChannel (allow, chunkLimit) transport
       plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
   tabsH <- newTabsHandle
