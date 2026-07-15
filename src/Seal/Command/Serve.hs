@@ -7,6 +7,7 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO)
+import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
@@ -103,6 +104,13 @@ runServeMain autonomy = do
   sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   broker <- newStreamBroker 1024
+  -- Build the shared ChannelDeps early so the reply registry + write locks
+  -- can be shared with the web send handler (SendDeps). The cursor store,
+  -- reply registry, and write locks are created inside newChannelDeps.
+  let loadCfg = fromRight defaultFileConfig <$> loadFileConfig cfgPath
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy (Just broker)
+        reg tmuxR (Just mgr) approvals loadCfg
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -139,6 +147,8 @@ runServeMain autonomy = do
         , sdHttpManager = Just mgr
         , sdAskReply    = askReply
         , sdApprovals   = approvals
+        , sdReplies     = cdReplies chanDeps
+        , sdLocks       = cdLocks chanDeps
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)
@@ -173,19 +183,6 @@ runServeMain autonomy = do
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
-  -- The shared ChannelDeps for forked channel listeners. This gives every
-  -- channel (Signal, Telegram) the SAME transcript logging + tool-call
-  -- infrastructure as the web and CLI paths: the full ISA registry
-  -- (Untrusted execution, web fetch/search, harness, AGENT_START), the WS
-  -- broker for live frontend updates, and the harness + tmux + HTTP deps.
-  -- The per-conversation cursor store + reply registry + write locks are
-  -- created fresh inside newChannelDeps.
-  let loadCfg = do
-        lc <- loadFileConfig cfgPath
-        pure (either (const defaultFileConfig) id lc)
-  chanDeps <- newChannelDeps
-        paths rt pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'

@@ -23,9 +23,12 @@ import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef)
+import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
@@ -42,7 +45,7 @@ import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
   , fcDebugSessionTranscript )
-import Seal.Config.Paths (SealPaths, agentSessionDir, sessionDir, sessionRequestsPath)
+import Seal.Config.Paths (SealPaths, agentSessionDir, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo)
@@ -77,7 +80,7 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
 import qualified Seal.ISA.Registry as ISA
-import Seal.Providers.Class (SomeProvider)
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
@@ -85,6 +88,8 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Lock
+  ( ReplyRegistry, replyFanout, SessionLocks, withSessionLock )
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
@@ -138,6 +143,16 @@ data SendDeps = SendDeps
     -- Records "for this session" and "always" approvals so subsequent calls
     -- to the same opcode skip the prompt. Shared across all sessions (the
     -- "always" scope is global; "for this session" is keyed by session id).
+  , sdReplies :: ReplyRegistry
+    -- ^ The per-session reply fan-out registry. After a web turn, the reply
+    -- is fanned out to every 'ChannelHandle' subscribed to this session,
+    -- so chat channels (Telegram, Signal) focused on the same tab receive
+    -- the reply via 'chSend'. The web frontend already receives entries
+    -- via the WS broker.
+  , sdLocks :: SessionLocks
+    -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
+    -- lock before 'withTwoFileTranscript' so a web send and a channel
+    -- message on the same tab serialize rather than race.
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -206,6 +221,10 @@ loadSessionMeta paths sid = do
 -- surfaces the question to the frontend and blocks until the human answers
 -- (the web frontend reads replies + questions from the WS stream, not from
 -- ccSend).
+--
+-- After the turn, the reply is fanned out to any chat channels (Telegram,
+-- Signal) subscribed to this session via the 'ReplyRegistry', so a web
+-- send on a channel-origin tab also delivers the reply to the channel.
 plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
 plainTurn deps meta t = do
   eprov <- sdResolve deps meta
@@ -216,33 +235,39 @@ plainTurn deps meta t = do
           sid = smId meta
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
-      Right <$> withTwoFileTranscript sessionDirPath (\tHandle -> do
-        wsroot <- WorkspaceRoot <$> getCurrentDirectory
-        appEnv <- mkEnv defaultConfig
-        eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
-        let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
-            defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
-            agentDefBackend = bAgentDefs (sdBackends deps)
-            caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-        mSystem <- case smAgent meta of
-          Nothing -> pure Nothing
-          Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-        let mintSession = webMintSession sid
-            isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
-              execBackend (sdAutonomy deps) mintSession
-              (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
-              (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-              caps
-            env = mkSessionAgentEnv
-              caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
-              (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-              (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        result <- runApp appEnv (runTurn env t)
-        broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-        pure result)
+      turnResult <- withSessionLock (sdLocks deps) sid
+        (withTwoFileTranscript sessionDirPath (\tHandle -> do
+          wsroot <- WorkspaceRoot <$> getCurrentDirectory
+          appEnv <- mkEnv defaultConfig
+          eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+          let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+              execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
+              defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
+              agentDefBackend = bAgentDefs (sdBackends deps)
+              caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+          mSystem <- case smAgent meta of
+            Nothing -> pure Nothing
+            Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+          let mintSession = webMintSession sid
+              isaReg = buildWebRegistry
+                (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
+                execBackend (sdAutonomy deps) mintSession
+                (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
+                (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+                caps
+              env = mkSessionAgentEnv
+                caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+                (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
+                (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
+          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+          result <- runApp appEnv (runTurn env t)
+          broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+          pure result))
+      -- Fan out the reply to chat channels subscribed to this session.
+      -- The web frontend already received entries via the WS broker above;
+      -- only chat channels need the explicit chSend.
+      fanoutLastReply (sdReplies deps) paths sid
+      pure (Right turnResult)
 
 -- | Build the ISA registry for a web turn. Mirrors
 -- 'Seal.Channels.Signal.Run.buildRegistry' but includes AGENT_START (the
@@ -529,7 +554,7 @@ handleAnswerDelivery deps sid qidTxt scope =
 
 -- | Cancel a pending question for a session. Returns 'True' if the question
 -- was pending and is now cancelled. Broadcasts 'BeAskResolved' so the
--- frontend dismisses it.
+-- frontend dismisses the question.
 handleAskCancel
   :: SendDeps -> SessionId -> Text -> IO (Either Text Bool)
 handleAskCancel deps sid qidTxt =
@@ -540,3 +565,32 @@ handleAskCancel deps sid qidTxt =
       when cancelled $
         broadcastAskResolved (sdBroker deps) sid qid "cancelled"
       pure (Right cancelled)
+
+-- | Read the last assistant message from a session's transcript and fan
+-- it out to every chat channel subscribed to the session. The web frontend
+-- already received entries via the WS broker; only chat channels need the
+-- explicit 'chSend'. Reads @conversation.jsonl@ directly (the two-file
+-- format), parsing the last 'Assistant' message's text content blocks.
+fanoutLastReply :: ReplyRegistry -> SealPaths -> SessionId -> IO ()
+fanoutLastReply replies paths sid = do
+  let convPath = sessionConversationPath paths sid
+  exists <- doesFileExist convPath
+  if not exists
+    then pure ()
+    else do
+      raw <- TIO.readFile convPath
+      let lines' = filter (not . T.null) (T.lines raw)
+          msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
+      case lastAssistantText msgs of
+        Just reply -> replyFanout replies sid reply
+        Nothing    -> pure ()
+
+-- | Extract the concatenated text content of the last 'Assistant' message
+-- in a list. Tool-use blocks are skipped (only 'CbText' is extracted).
+lastAssistantText :: [Message] -> Maybe Text
+lastAssistantText msgs =
+  case reverse (filter (\m -> msgRole m == Assistant) msgs) of
+    (m : _) -> case [t | CbText t <- msgContent m] of
+      (t : _) -> Just t
+      []      -> Nothing
+    [] -> Nothing
