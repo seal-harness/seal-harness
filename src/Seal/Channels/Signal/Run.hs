@@ -24,7 +24,7 @@ import System.IO (hPutStrLn, stderr)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
-import Seal.Channels.Loop (ChannelDeps (..), plainTurn)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (SignalTransport, mkRealSignalTransport)
@@ -77,9 +77,10 @@ runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
   eTransport <- mkRealSignalTransport accountLabel
   case eTransport of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
-    Right transport ->
-      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply (cdSession deps) $
-        \h -> plainTurn deps h askReply
+    Right transport -> do
+      let withCh = withSignalChannel (allow, chunkLimit) account transport
+          plainHandler h = plainTurn deps h askReply
+      runChannelLoop deps withCh plainHandler registry chain askReply tabsH
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
 -- pulls @(MessageSource, body)@ from 'chReceive', classifies via
@@ -275,19 +276,12 @@ runSignalMain autonomy = do
   approvals <- newApprovalCache
   harnessReg <- Seal.Harness.Registry.newHarnessRegistry
   tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
-  let chanDeps = ChannelDeps
-        { cdPaths      = paths
-        , cdVault      = rt
-        , cdProvider   = pr
-        , cdSession    = sr
-        , cdBackends   = backends
-        , cdAutonomy   = autonomy
-        , cdBroker     = Nothing  -- standalone mode: no web frontend
-        , cdHarnessRegistry = harnessReg
-        , cdTmuxRunner  = tmuxR
-        , cdHttpManager = Just mgr
-        , cdApprovals   = approvals
-        }
+  let loadCfg = do
+        lc <- loadFileConfig cfgPath
+        pure (either (const defaultFileConfig) id lc)
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy Nothing
+        harnessReg tmuxR (Just mgr) approvals loadCfg
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
     Right resolved -> runSignal chanDeps registry emptyChain tabsH resolved askReply

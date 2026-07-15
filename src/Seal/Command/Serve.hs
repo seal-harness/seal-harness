@@ -21,7 +21,7 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
-import Seal.Channels.Loop (ChannelDeps (..), plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
@@ -178,25 +178,18 @@ runServeMain autonomy = do
   -- infrastructure as the web and CLI paths: the full ISA registry
   -- (Untrusted execution, web fetch/search, harness, AGENT_START), the WS
   -- broker for live frontend updates, and the harness + tmux + HTTP deps.
-  let chanDeps = ChannelDeps
-        { cdPaths      = paths
-        , cdVault      = rt
-        , cdProvider   = pr
-        , cdSession    = sr
-        , cdBackends   = backends
-        , cdAutonomy   = autonomy
-        , cdBroker     = Just broker
-        , cdHarnessRegistry = reg
-        , cdTmuxRunner  = tmuxR
-        , cdHttpManager = Just mgr
-        , cdApprovals   = approvals
-        }
+  -- The per-conversation cursor store + reply registry + write locks are
+  -- created fresh inside newChannelDeps.
+  let loadCfg = do
+        lc <- loadFileConfig cfgPath
+        pure (either (const defaultFileConfig) id lc)
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy (Just broker)
+        reg tmuxR (Just mgr) approvals loadCfg
   -- Fork channel listeners for any configured channel. Each channel gets
-  -- its own tabsHandle + askReplyStore (the session + backends + provider
-  -- runtime + vault runtime are shared). The listener runs the shared
-  -- 'runChannelLoop' + 'plainTurn' so the agent loop is identical to the
-  -- TUI / Signal / Telegram standalone modes. A missing config section
-  -- (Left from resolve) means the channel is not configured — skip silently.
+  -- its own askReply store; the tab list is shared (passed by the
+  -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'
+  -- so the agent loop is identical to the standalone modes.
   forkSignalListener chanDeps cfg registry
   forkTelegramListener chanDeps cfg registry
   -- Run the HTTP gateway (blocks)
@@ -243,7 +236,7 @@ forkSignalListener deps cfg registry =
           askReply <- newAskReplyStore 0
           let withCh = withSignalChannel (allow, chunkLimit) account transport
               plainHandler h = plainTurn deps h askReply
-          _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply (cdSession deps) tabsH)
+          _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
           pure ()
 
 -- | Fork the Telegram channel listener if @[telegram]@ is configured.
@@ -279,5 +272,5 @@ forkTelegramListener deps cfg registry = do
       askReply <- newAskReplyStore 0
       let withCh = withTelegramChannel (allow, chunkLimit) transport
           plainHandler h = plainTurn deps h askReply
-      _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply (cdSession deps) tabsH)
+      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
       pure ()

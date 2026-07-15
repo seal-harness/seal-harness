@@ -17,7 +17,7 @@ import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Channels.Loop (ChannelDeps (..), plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -69,7 +69,7 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
   let withCh = withTelegramChannel (allow, chunkLimit) transport
       plainHandler h = plainTurn deps h askReply
   tabsH <- newTabsHandle
-  runChannelLoop withCh plainHandler registry chain askReply (cdSession deps) tabsH
+  runChannelLoop deps withCh plainHandler registry chain askReply tabsH
 
 -- | Full @seal telegram@ startup wiring: paths -> config -> vault -> session
 -- -> backends -> registry -> spawn the Telegram channel -> run the loop.
@@ -132,19 +132,12 @@ runTelegramMain autonomy = do
   approvals <- newApprovalCache
   harnessReg <- Seal.Harness.Registry.newHarnessRegistry
   tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
-  let chanDeps = ChannelDeps
-        { cdPaths      = paths
-        , cdVault      = rt
-        , cdProvider   = pr
-        , cdSession    = sr
-        , cdBackends   = backends
-        , cdAutonomy   = autonomy
-        , cdBroker     = Nothing  -- standalone mode: no web frontend
-        , cdHarnessRegistry = harnessReg
-        , cdTmuxRunner  = tmuxR
-        , cdHttpManager = Just mgr
-        , cdApprovals   = approvals
-        }
+  let loadCfg = do
+        lc <- loadFileConfig cfgPath
+        pure (either (const defaultFileConfig) id lc)
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy Nothing
+        harnessReg tmuxR (Just mgr) approvals loadCfg
   -- Read the bot token from the vault (the wizard stores it there, not in
   -- config.toml). Falls back to the config token if present (for backward
   -- compat), but the vault token takes precedence.

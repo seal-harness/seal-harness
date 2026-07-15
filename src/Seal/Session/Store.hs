@@ -11,6 +11,7 @@ module Seal.Session.Store
   , saveSessionMeta
   , listSessions
   , defaultSessionSelection
+  , resolveDefaultAgent
   , initSession
   , initSessionMeta
   , SessionRuntime (..)
