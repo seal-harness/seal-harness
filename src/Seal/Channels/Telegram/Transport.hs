@@ -31,6 +31,7 @@ import Network.HTTP.Client
   ( Manager, Request (..), httpLbs, parseRequest, requestBody, responseBody
   , responseStatus, responseTimeoutMicro, RequestBody (RequestBodyLBS) )
 import Network.HTTP.Types (statusCode, methodPost)
+import System.IO (hPutStrLn, stderr)
 
 import Seal.Core.MessageSource
   ( ConversationId, UserId, mkConversationId, mkUserId )
@@ -284,14 +285,14 @@ sendViaApi mgr token chatId body = do
 
 -- | Register the bot's command menu via @setMyCommands@ so Telegram shows
 -- auto-completion for the bot's slash commands. Calls the Bot API with a
--- JSON array of @{command, description}@ objects. Silent on failure (the
--- channel logs elsewhere; the bot still works without auto-completion).
+-- JSON array of @{command, description}@ objects. Logs errors to stderr
+-- (the bot still works without auto-completion).
 setMyCommandsViaApi :: Manager -> Text -> [BotCommand] -> IO ()
 setMyCommandsViaApi mgr token commands = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/setMyCommands")))
   case eReq of
-    Left _ -> pure ()
+    Left ex -> hPutStrLn stderr ("telegram setMyCommands: request error: " <> show ex)
     Right req0 -> do
       let cmds = [ A.object [ "command" A..= bcName bc
                             , "description" A..= bcDescription bc
@@ -303,8 +304,15 @@ setMyCommandsViaApi mgr token commands = do
                      , requestBody = RequestBodyLBS (A.encode payload)
                      , requestHeaders = [("Content-Type", "application/json")]
                      }
-      _ <- try @SomeException (httpLbs req mgr)
-      pure ()
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left ex -> hPutStrLn stderr ("telegram setMyCommands: network error: " <> show ex)
+        Right resp ->
+          let code = statusCode (responseStatus resp)
+          in if code /= 200
+               then hPutStrLn stderr ("telegram setMyCommands: HTTP " <> show code
+                                      <> " — " <> show (responseBody resp))
+               else pure ()
 
 -- ---------------------------------------------------------------------------
 -- chunkMessage — split long messages for Telegram's 4096-char limit

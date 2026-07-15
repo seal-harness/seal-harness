@@ -57,11 +57,11 @@ spec = do
           cmds = telegramBotCommands reg
       map bcName cmds `shouldContain` ["help", "tab"]
 
-    it "excludes InteractiveOnly commands" $ do
+    it "includes InteractiveOnly commands too (they defer or show usage)" $ do
       let spec1 = mkSpec "vault" "Manage vault" InteractiveOnly
           reg = mkRegistry [spec1]
           cmds = telegramBotCommands reg
-      map bcName cmds `shouldNotContain` ["vault"]
+      map bcName cmds `shouldContain` ["vault"]
 
     it "excludes the terse /N grammar" $ do
       let spec1 = mkSpec "N" "Terse tab switching" AlwaysAvailable

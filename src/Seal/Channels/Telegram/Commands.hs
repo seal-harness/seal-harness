@@ -19,7 +19,7 @@ import Data.Text qualified as T
 
 import Seal.Channels.Telegram.Transport (BotCommand (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandName (..), CommandSpec (..)
+  ( CommandName (..), CommandSpec (..)
   , Registry (..), registrySpecs )
 
 -- | Telegram's limits: command names ≤ 32 chars (lowercase @a-z0-9_@),
@@ -30,18 +30,17 @@ maxTelegramCommandNameLen = 32
 maxTelegramDescriptionLen :: Int
 maxTelegramDescriptionLen = 256
 
--- | Derive the BotCommand menu from the Registry. Filters to
--- 'AlwaysAvailable' commands (interactive-only commands like @\/vault setup@
--- can't run on Telegram — they prompt via 'ccPrompt' which defers), skips
--- aliases, sanitizes names for Telegram's charset, and truncates
--- descriptions. The synthetic @\/help@ is always included first.
+-- | Derive the BotCommand menu from the Registry. Includes all commands
+-- (both 'AlwaysAvailable' and 'InteractiveOnly') — interactive commands
+-- still work over Telegram: their handlers respond with usage text or
+-- defer via 'ChannelCaps' when selected. Skips aliases, sanitizes names
+-- for Telegram's charset, and truncates descriptions. The synthetic
+-- @\/help@ is always included first.
 telegramBotCommands :: Registry -> [BotCommand]
 telegramBotCommands reg =
   helpCommand : map specToBotCommand (filter isMenuEligible (registrySpecs reg))
   where
-    isMenuEligible spec =
-      csAvailability spec == AlwaysAvailable
-      && isTelegramSafeName (csName spec)
+    isMenuEligible spec = isTelegramSafeName (csName spec)
     helpCommand = BotCommand
       { bcName = "help"
       , bcDescription = "Show available commands"
