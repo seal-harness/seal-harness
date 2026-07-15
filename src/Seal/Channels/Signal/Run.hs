@@ -19,17 +19,12 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.Directory (getCurrentDirectory)
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Agent.Env (AgentEnv (..))
-import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), mkSessionAgentEnv, newBackends, resolveSessionProvider
-  , execBackendFromFile, debugRequestsPath )
-import Seal.Tools.Exec.Local (mkLocalExecHandle)
-import Seal.Tools.Exec.Types (ExecBackend (..))
+  ( Backends (..), newBackends )
+import Seal.Channels.Loop (ChannelDeps (..), plainTurn)
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (SignalTransport, mkRealSignalTransport)
@@ -44,42 +39,27 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, sessionDir, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
-import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (SessionId, mkSessionId)
+import Seal.Core.Types (mkSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Harness.Registry qualified
+import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, askHuman, deliverNextAnswer, newApprovalCache
+  ( AskReplyStore, askHuman, deliverNextAnswer, newApprovalCache
   , newAskReplyStore )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs)
-import Seal.ISA.Ops.File (fileReadOp)
-import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
-import Seal.ISA.Ops.Secret (secretGetOp)
-import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
-import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
-import Seal.ISA.Ops.Agent
-  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStatusOp, agentStopOp )
-import qualified Seal.ISA.Registry as ISA
-import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Signal.Config (SignalAccount (..), resolveSignalConfig, signalAccountText)
-import Seal.Types.App (runApp)
-import Seal.Types.Config (defaultConfig)
-import Seal.Types.Env (mkEnv)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
 
@@ -88,21 +68,18 @@ import Seal.Vault.Commands (VaultRuntime (..))
 -- fast with a stderr diagnostic if signal-cli is absent or the account is
 -- unresolved.
 runSignal
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends -> TabsHandle
+  :: ChannelDeps -> Registry -> PreprocessChain -> TabsHandle
   -> (SignalAccount, Int, AllowList UserId)
   -> AskReplyStore
-  -> AutonomyLevel
-  -> ApprovalCache
   -> IO ()
-runSignal paths rt pr sr registry chain backends tabsH (account, chunkLimit, allow) askReply autonomy approvals = do
+runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
   let accountLabel = signalAccountText account
   eTransport <- mkRealSignalTransport accountLabel
   case eTransport of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
     Right transport ->
-      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr $
-        \h -> plainTurn paths rt pr sr backends h askReply autonomy approvals
+      runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply (cdSession deps) $
+        \h -> plainTurn deps h askReply
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
 -- pulls @(MessageSource, body)@ from 'chReceive', classifies via
@@ -229,94 +206,6 @@ handleTabCommand' h tabsH = \case
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
 
--- | Run one plain-text turn through the agent loop with the
--- 'MessageSource' threaded into 'aeMessageSource'. Mirrors 'runCliTui's
--- 'plainHandler' but pulls the active session's provider+model the same
--- way and builds the 'AgentEnv' with @aeMessageSource = Just ms@. The
--- 'ChannelHandle' supplies the 'ChannelCaps' (forwarded) so the agent's
--- replies go out via the Signal channel. The ask/reply store backs
--- ASK_HUMAN: 'ccPrompt' blocks the agent-loop thread on the store until the
--- next inbound message from the peer is delivered as the answer (by
--- 'deliverNextAnswer' in 'runSignalLoop'). The turn runs in a forked thread
--- so the main loop keeps receiving + delivering answers while the agent
--- blocks.
-plainTurn
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime -> Backends
-  -> ChannelHandle -> AskReplyStore -> AutonomyLevel -> ApprovalCache
-  -> Maybe MessageSource -> Text -> IO ()
-plainTurn paths rt pr sr backends h askReply autonomy approvals mSrc t = do
-  meta <- readIORef (srActive sr)
-  eprov <- resolveSessionProvider pr meta
-  case eprov of
-    Left err -> hPutStrLn stderr (T.unpack err)
-    Right (prov, model) -> do
-      let sid = smId meta
-          sessionDirPath = sessionDir paths sid
-      withTwoFileTranscript sessionDirPath $ \tHandle -> do
-        wsroot <- WorkspaceRoot <$> getCurrentDirectory
-        appEnv <- mkEnv defaultConfig
-        eCfg <- loadFileConfig (prConfigPath pr)
-        let isaReg = buildRegistry paths rt backends wsroot (smId meta) eCfg askReply h sid
-            handleCaps = ChannelCaps
-              { ccSend         = chSend h
-              , ccPrompt       = \q -> do
-                  outcome <- askHuman askReply sid q (\_qid -> chSend h q)
-                  pure (fromRight "" outcome)
-              , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
-              }
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
-            defaultExecBackend = EbLocal (mkLocalExecHandle wsroot)
-        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        let env = (mkSessionAgentEnv
-                     handleCaps prov (smProvider meta) model sid Nothing isaReg tHandle execBackend
-                     (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()))
-                    { aeMessageSource = mSrc }
-        runApp appEnv (runTurn env t)
-
--- | Build the ISA registry for a Signal turn. Mirrors 'runCliTui's registry
--- assembly but without the AGENT_START worker (sub-agents over Signal is a
--- later phase). The human-interaction opcodes are wired to the ask/reply
--- store via the per-turn 'ChannelCaps' so ASK_HUMAN surfaces the question to
--- the peer and blocks until the next inbound message delivers the answer.
-buildRegistry
-  :: SealPaths -> VaultRuntime -> Backends -> WorkspaceRoot -> Seal.Core.Types.SessionId
-  -> Either a Seal.Config.File.FileConfig -> AskReplyStore -> ChannelHandle
-  -> Seal.Core.Types.SessionId
-  -> ISA.Registry
-buildRegistry _paths rt backends wsRoot sid _eCfg askReply h _activeSid =
-  ISA.mkRegistry
-    [ showHumanOp caps
-    , askHumanOp caps
-    , fileReadOp wsRoot 131072
-    , secretGetOp rt
-    , memoryWriteOp (bMemory backends) sid
-    , memoryRecallOp defaultPageParams (bMemory backends)
-    , memoryDeleteOp (bMemory backends)
-    , skillWriteOp (bSkills backends) sid
-    , skillReadOp (bSkills backends)
-    , skillListOp (bSkills backends)
-    , skillDeleteOp (bSkills backends)
-    , agentDefWriteOp (bAgentDefs backends) sid
-    , agentDefReadOp (bAgentDefs backends)
-    , agentDefListOp (bAgentDefs backends)
-    , agentDefDeleteOp (bAgentDefs backends)
-    , agentInstancesOp (bRuntime backends)
-    , agentStatusOp (bRuntime backends)
-    , agentStopOp (bRuntime backends)
-    ]
-  where
-    -- The per-turn caps for the human-interaction opcodes. ASK_HUMAN mints
-    -- a pending question in the store, sends the question to the peer via
-    -- chSend, and blocks until the next inbound message is delivered as the
-    -- answer (by 'deliverNextAnswer' in 'runSignalLoop').
-    caps = ChannelCaps
-      { ccSend         = chSend h
-      , ccPrompt       = \q -> do
-          outcome <- askHuman askReply sid q (\_qid -> chSend h q)
-          pure (fromRight "" outcome)
-      , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
-      }
-
 -- | Full @seal signal@ startup wiring: paths -> config -> vault -> session
 -- -> backends -> registry -> spawn the Signal channel -> run the loop.
 -- Mirrors 'Seal.Tui.runTui' but drives the Signal channel instead of the
@@ -384,9 +273,24 @@ runSignalMain autonomy = do
   -- config); a future phase may pull it from the vault via CPS.
   askReply <- newAskReplyStore 0  -- 0 = block indefinitely (no timeout)
   approvals <- newApprovalCache
+  harnessReg <- Seal.Harness.Registry.newHarnessRegistry
+  tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
+  let chanDeps = ChannelDeps
+        { cdPaths      = paths
+        , cdVault      = rt
+        , cdProvider   = pr
+        , cdSession    = sr
+        , cdBackends   = backends
+        , cdAutonomy   = autonomy
+        , cdBroker     = Nothing  -- standalone mode: no web frontend
+        , cdHarnessRegistry = harnessReg
+        , cdTmuxRunner  = tmuxR
+        , cdHttpManager = Just mgr
+        , cdApprovals   = approvals
+        }
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
-    Right resolved -> runSignal paths rt pr sr registry emptyChain backends tabsH resolved askReply autonomy approvals
+    Right resolved -> runSignal chanDeps registry emptyChain tabsH resolved askReply
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone

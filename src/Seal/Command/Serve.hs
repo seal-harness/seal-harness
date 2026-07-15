@@ -21,7 +21,7 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
-import Seal.Channels.Loop (plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), plainTurn, runChannelLoop)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
@@ -173,14 +173,32 @@ runServeMain autonomy = do
                   else httpOrigins <> gcAllowedOrigins gwCfg
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
+  -- The shared ChannelDeps for forked channel listeners. This gives every
+  -- channel (Signal, Telegram) the SAME transcript logging + tool-call
+  -- infrastructure as the web and CLI paths: the full ISA registry
+  -- (Untrusted execution, web fetch/search, harness, AGENT_START), the WS
+  -- broker for live frontend updates, and the harness + tmux + HTTP deps.
+  let chanDeps = ChannelDeps
+        { cdPaths      = paths
+        , cdVault      = rt
+        , cdProvider   = pr
+        , cdSession    = sr
+        , cdBackends   = backends
+        , cdAutonomy   = autonomy
+        , cdBroker     = Just broker
+        , cdHarnessRegistry = reg
+        , cdTmuxRunner  = tmuxR
+        , cdHttpManager = Just mgr
+        , cdApprovals   = approvals
+        }
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own tabsHandle + askReplyStore (the session + backends + provider
   -- runtime + vault runtime are shared). The listener runs the shared
   -- 'runChannelLoop' + 'plainTurn' so the agent loop is identical to the
   -- TUI / Signal / Telegram standalone modes. A missing config section
   -- (Left from resolve) means the channel is not configured — skip silently.
-  forkSignalListener paths rt pr sr backends cfg autonomy registry
-  forkTelegramListener paths rt pr sr backends cfg autonomy registry
+  forkSignalListener chanDeps cfg registry
+  forkTelegramListener chanDeps cfg registry
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
 
@@ -211,10 +229,8 @@ tryOpenVault paths fcfg =
 -- the config section, spawns the signal-cli transport, and runs the shared
 -- inbox-driven loop in a background thread. A missing/unresolved section
 -- is logged to stderr and skipped (not fatal — the gateway still starts).
-forkSignalListener
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
-forkSignalListener paths rt pr sr backends cfg autonomy registry =
+forkSignalListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkSignalListener deps cfg registry =
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left _ -> pure ()  -- not configured; skip silently
     Right (account, chunkLimit, allow) -> do
@@ -225,10 +241,9 @@ forkSignalListener paths rt pr sr backends cfg autonomy registry =
         Right transport -> do
           tabsH <- newTabsHandle
           askReply <- newAskReplyStore 0
-          approvals <- newApprovalCache
           let withCh = withSignalChannel (allow, chunkLimit) account transport
-              plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
-          _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+              plainHandler h = plainTurn deps h askReply
+          _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply (cdSession deps) tabsH)
           pure ()
 
 -- | Fork the Telegram channel listener if @[telegram]@ is configured.
@@ -236,12 +251,10 @@ forkSignalListener paths rt pr sr backends cfg autonomy registry =
 -- bot's slash-command menu with BotFather for auto-completion, and runs the
 -- shared inbox-driven loop in a background thread. A missing/unresolved
 -- section is logged to stderr and skipped.
-forkTelegramListener
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
-forkTelegramListener paths rt pr sr backends cfg autonomy registry = do
+forkTelegramListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkTelegramListener deps cfg registry = do
   -- Read the bot token from the vault (the wizard stores it there).
-  mh <- readIORef (vrHandleRef rt)
+  mh <- readIORef (vrHandleRef (cdVault deps))
   mVaultToken <- case mh of
     Nothing -> pure Nothing
     Just vh -> do
@@ -264,8 +277,7 @@ forkTelegramListener paths rt pr sr backends cfg autonomy registry = do
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
       tabsH <- newTabsHandle
       askReply <- newAskReplyStore 0
-      approvals <- newApprovalCache
       let withCh = withTelegramChannel (allow, chunkLimit) transport
-          plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
-      _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+          plainHandler h = plainTurn deps h askReply
+      _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply (cdSession deps) tabsH)
       pure ()
