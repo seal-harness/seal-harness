@@ -15,6 +15,9 @@ module Seal.Command.Channel
   , mkRealSignalCli
   , TelegramBotApi (..)
   , mkRealTelegramBotApi
+  , VaultStore (..)
+  , mkRealVaultStore
+  , noVaultStore
   , GetMeOutcome (..)
   , LinkOutcome (..)
   , RegisterOutcome (..)
@@ -31,6 +34,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8With)
+import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Network.HTTP.Client (Manager, httpLbs, parseRequest, responseBody,
                             responseStatus)
@@ -52,10 +56,11 @@ import Seal.Command.Spec
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig,
                          saveFileConfig)
 import Seal.Core.AllowList (AllowList (..))
+import Seal.Security.Vault qualified as Vault
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
 import Seal.Telegram.Config
   ( TelegramConfig (..), defaultTelegramChunkLimit, mkTelegramToken
-  , telegramTokenText )
+  , telegramTokenText, telegramVaultKey )
 
 -- ---------------------------------------------------------------------------
 -- Runtime + testability seam
@@ -63,13 +68,26 @@ import Seal.Telegram.Config
 
 -- | The runtime the @\/channel@ command closes over: where to find the
 -- config file (so the wizard can read-modify-write @config.toml@), a
--- 'SignalCli' seam for shelling out to @signal-cli@, and a
--- 'TelegramBotApi' seam for the Telegram Bot API. Tests inject mock seams
--- so @cabal test@ never needs the binary or network.
+-- 'SignalCli' seam for shelling out to @signal-cli@, a 'TelegramBotApi'
+-- seam for the Telegram Bot API, and a 'VaultStore' seam for storing
+-- channel secrets in the vault. Tests inject mock seams so @cabal test@
+-- never needs the binary, network, or vault.
 data ChannelRuntime = ChannelRuntime
   { crConfigPath    :: FilePath
   , crSignalCli     :: SignalCli
   , crTelegramBotApi :: TelegramBotApi
+  , crVaultStore    :: VaultStore
+  }
+
+-- | A seam over the vault for storing channel secrets (like the Telegram
+-- bot token). The wizard writes the token to the vault (not @config.toml@)
+-- so it is never stored in cleartext. 'vsStore' stores a key+value;
+-- 'vsAvailable' checks whether the vault is open and ready.
+data VaultStore = VaultStore
+  { vsStore     :: Text -> ByteString -> IO (Either Text ())
+    -- ^ Store a secret under a key. 'Right ()' on success; 'Left' diagnostic.
+  , vsAvailable :: IO Bool
+    -- ^ Is the vault open and ready to accept writes?
   }
 
 -- | A small seam over the @signal-cli@ binary. Each field is one subprocess
@@ -338,9 +356,10 @@ writeSignalConfig rt caps phoneNumber = do
 
 -- | Run the Telegram setup wizard. Prompts for a BotFather token, validates
 -- it via the Bot API @getMe@ (so a typo is caught here, not at runtime),
--- then writes the @[telegram]@ config section. All interaction goes through
--- 'ChannelCaps' (sends + prompts) so the wizard works on the CLI TUI and
--- any interactive channel.
+-- stores the token in the vault (NOT in @config.toml@), and writes the
+-- @[telegram]@ config section with the non-secret fields. All interaction
+-- goes through 'ChannelCaps' (sends + prompts) so the wizard works on the
+-- CLI TUI and any interactive channel.
 telegramSetupCmd :: ChannelRuntime -> CommandAction
 telegramSetupCmd rt = CommandAction $ \caps -> do
   ccSend caps $ T.intercalate "\n"
@@ -361,20 +380,42 @@ telegramSetupCmd rt = CommandAction $ \caps -> do
         GetMeFailed err -> ccSend caps ("Token validation failed: " <> err)
         GetMeOk username -> do
           ccSend caps ("Connected! Bot username: @" <> username)
-          writeTelegramConfig rt caps (telegramTokenText token) username
+          storeTelegramToken rt caps (telegramTokenText token) username
 
--- | Write the @[telegram]@ section into @config.toml@ and confirm. Preserves
--- all other config; sets the token and a permissive default DM policy
+-- | Store the token in the vault and write the @[telegram]@ config section
+-- (without the token — only non-secret fields). If the vault is not
+-- available, warns the user to set up the vault first.
+storeTelegramToken :: ChannelRuntime -> ChannelCaps -> Text -> Text -> IO ()
+storeTelegramToken rt caps token username = do
+  let store = crVaultStore rt
+  available <- vsAvailable store
+  if not available
+    then ccSend caps $ T.intercalate "\n"
+      [ ""
+      , "Vault is not set up or not unlocked."
+      , "The Telegram bot token is a secret and must be stored in the vault."
+      , ""
+      , "Run /vault setup first, then /channel telegram again."
+      ]
+    else do
+      result <- vsStore store telegramVaultKey (TE.encodeUtf8 token)
+      case result of
+        Left err -> ccSend caps ("Failed to store token in vault: " <> err)
+        Right () -> writeTelegramConfig rt caps username
+
+-- | Write the @[telegram]@ section into @config.toml@ (without the token)
+-- and confirm. The token is stored in the vault, not the config file.
+-- Preserves all other config; sets a permissive default DM policy
 -- (@AllowAll@), which the user can tighten later by editing @allow_from@.
-writeTelegramConfig :: ChannelRuntime -> ChannelCaps -> Text -> Text -> IO ()
-writeTelegramConfig rt caps token username = do
+writeTelegramConfig :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
+writeTelegramConfig rt caps username = do
   let cfgPath = crConfigPath rt
   createDirectoryIfMissing True (takeDirectory cfgPath)
   existing <- loadFileConfig cfgPath
   let baseCfg = fromRight defaultFileConfig existing
       updated = baseCfg
         { fcTelegram = Just TelegramConfig
-            { tcToken         = Just token
+            { tcToken         = Nothing  -- token lives in the vault, not config
             , tcTextChunkLimit = Just defaultTelegramChunkLimit
             , tcAllowFrom      = AllowAll
             }
@@ -384,6 +425,7 @@ writeTelegramConfig rt caps token username = do
     [ ""
     , "Telegram configured!"
     , "  Bot: @" <> username
+    , "  Token: stored in vault (key: " <> telegramVaultKey <> ")"
     , "  DM policy: open (accepts messages from anyone)"
     , ""
     , "To start chatting:"
@@ -458,6 +500,35 @@ mkRealTelegramBotApi = do
   pure TelegramBotApi
     { tbaGetMe = validateToken mgr
     }
+
+-- ---------------------------------------------------------------------------
+-- VaultStore — seam over the vault for storing channel secrets
+-- ---------------------------------------------------------------------------
+
+-- | Build a 'VaultStore' from a 'VaultHandle'. 'vsStore' encodes the text
+-- to a ByteString and calls 'vhPut'; 'vsAvailable' checks that the vault
+-- is open (not locked) by calling 'vhStatus'.
+mkRealVaultStore :: Maybe Vault.VaultHandle -> IO VaultStore
+mkRealVaultStore mVh = pure $ case mVh of
+  Nothing -> noVaultStore
+  Just vh -> VaultStore
+    { vsStore = \key val -> do
+        r <- Vault.vhPut vh key val
+        pure $ case r of
+          Right () -> Right ()
+          Left err -> Left (T.pack (show err))
+    , vsAvailable = do
+        st <- Vault.vhStatus vh
+        pure (not (Vault.vsLocked st))
+    }
+
+-- | A 'VaultStore' that is never available (no vault configured). The
+-- wizard shows a "set up the vault first" message when this is used.
+noVaultStore :: VaultStore
+noVaultStore = VaultStore
+  { vsStore = \_ _ -> pure (Left "vault not configured")
+  , vsAvailable = pure False
+  }
 
 -- | Perform the @getMe@ request and extract the bot username. Returns
 -- 'GetMeOk' with the username (without the leading @) on success,

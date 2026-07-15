@@ -8,13 +8,15 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO)
 import Data.IORef (newIORef, readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
+import qualified Seal.Security.Vault
+import qualified Data.Text.Encoding as TE
 import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
@@ -31,7 +33,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Send (SendDeps (..))
@@ -194,8 +196,7 @@ tryOpenVault paths fcfg =
           pure Nothing
         Right enc -> do
           let vcfg = VaultConfig
-                { vcPath    = maybe (configFilePath paths) T.unpack (fcVaultPath fcfg)
-                    -- the vault file is under config/
+                { vcPath    = maybe (vaultFilePath paths) T.unpack (fcVaultPath fcfg)
                 , vcKeyType = fromMaybe "x25519" (fcVaultKeyType fcfg)
                 , vcUnlock  = parseUnlockMode (fcVaultUnlock fcfg)
                 }
@@ -238,9 +239,24 @@ forkSignalListener paths rt pr sr backends cfg autonomy registry =
 forkTelegramListener
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
   -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
-forkTelegramListener paths rt pr sr backends cfg autonomy registry =
-  case resolveTelegramConfig (fcTelegram cfg) Nothing of
-    Left _ -> pure ()  -- not configured; skip silently
+forkTelegramListener paths rt pr sr backends cfg autonomy registry = do
+  -- Read the bot token from the vault (the wizard stores it there).
+  mh <- readIORef (vrHandleRef rt)
+  mVaultToken <- case mh of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- Seal.Security.Vault.vhGet vh Seal.Telegram.Config.telegramVaultKey
+      pure $ case r of
+        Right bs -> Just (TE.decodeUtf8 bs)
+        Left _   -> Nothing
+  case resolveTelegramConfig (fcTelegram cfg) mVaultToken of
+    Left err
+      | isJust (fcTelegram cfg) ->
+          -- The [telegram] section is present but unresolved (e.g. the vault
+          -- is locked / missing the token). Surface it so the channel isn't
+          -- silently dropped on startup.
+          hPutStrLn stderr ("seal serve: telegram channel skipped: " <> T.unpack err)
+      | otherwise -> pure ()  -- not configured; skip silently
     Right (token, chunkLimit, allow) -> do
       mgr <- newTlsManager
       transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr

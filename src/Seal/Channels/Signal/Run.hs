@@ -35,7 +35,7 @@ import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (SignalTransport, mkRealSignalTransport)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
-  , mkRealTelegramBotApi )
+  , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
@@ -365,8 +365,10 @@ runSignalMain autonomy = do
   tabsH <- newTabsHandle
   cli <- mkRealSignalCli
   tgApi <- mkRealTelegramBotApi
+  vaultStore <- mkRealVaultStore mHandle
   let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
-                                 , crTelegramBotApi = tgApi }
+                                 , crTelegramBotApi = tgApi
+                                 , crVaultStore = vaultStore }
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr

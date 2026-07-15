@@ -15,6 +15,7 @@ module Seal.Telegram.Config
   , defaultTelegramChunkLimit
   , resolveTelegramConfig
   , telegramConfigCodec
+  , telegramVaultKey
   ) where
 
 import Control.Applicative ((<|>))
@@ -28,6 +29,13 @@ import Toml qualified
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.MessageSource (UserId, mkUserId)
+
+-- | The vault key under which the Telegram bot token is stored. The token
+-- is NOT stored in @config.toml@ (cleartext) — the setup wizard writes it
+-- to the vault, and channel startup reads it from the vault. The config
+-- section carries only non-secret fields (chunk limit, allow_from).
+telegramVaultKey :: Text
+telegramVaultKey = "TELEGRAM_BOT_TOKEN"
 
 -- ---------------------------------------------------------------------------
 -- TelegramToken — the validated bot token for the Telegram Bot API

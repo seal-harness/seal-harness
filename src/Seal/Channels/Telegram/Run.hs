@@ -13,6 +13,7 @@ module Seal.Channels.Telegram.Run
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
@@ -23,7 +24,7 @@ import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
-  , mkRealTelegramBotApi )
+  , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (Registry, mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
@@ -40,13 +41,14 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (ApprovalCache, AskReplyStore, newApprovalCache, newAskReplyStore)
 import Seal.Ingest (PreprocessChain, emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.Security.Vault qualified as Vault
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle)
 import Seal.Telegram.Config
-  ( TelegramToken (..), resolveTelegramConfig, telegramTokenText )
+  ( TelegramToken (..), resolveTelegramConfig, telegramTokenText
+  , telegramVaultKey )
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..))
-import qualified Seal.Security.Vault as Vault
 
 -- | Spawn the real Telegram transport, resolve the token + chunk limit +
 -- allow-list, and run the agent loop against the Telegram channel. Fails
@@ -113,8 +115,10 @@ runTelegramMain autonomy = do
   tabsH <- newTabsHandle
   cli <- mkRealSignalCli
   tgApi <- mkRealTelegramBotApi
+  vaultStore <- mkRealVaultStore mHandle
   let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
-                                 , crTelegramBotApi = tgApi }
+                                 , crTelegramBotApi = tgApi
+                                 , crVaultStore = vaultStore }
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
@@ -127,7 +131,17 @@ runTelegramMain autonomy = do
         ]
   askReply <- newAskReplyStore 0
   approvals <- newApprovalCache
-  case resolveTelegramConfig (fcTelegram cfg) Nothing of
+  -- Read the bot token from the vault (the wizard stores it there, not in
+  -- config.toml). Falls back to the config token if present (for backward
+  -- compat), but the vault token takes precedence.
+  mVaultToken <- case mHandle of
+    Nothing -> pure Nothing
+    Just vh -> do
+      r <- Vault.vhGet vh telegramVaultKey
+      pure $ case r of
+        Right bs -> Just (TE.decodeUtf8 bs)
+        Left _   -> Nothing
+  case resolveTelegramConfig (fcTelegram cfg) mVaultToken of
     Left err -> hPutStrLn stderr ("seal telegram: " <> T.unpack err)
     Right resolved -> runTelegram paths rt pr sr registry emptyChain backends resolved askReply autonomy approvals
 

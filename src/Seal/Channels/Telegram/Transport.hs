@@ -18,6 +18,7 @@ module Seal.Channels.Telegram.Transport
 import Control.Concurrent.STM
   ( atomically, newTQueueIO, tryReadTQueue, writeTQueue )
 import Control.Exception (SomeException, try)
+import Control.Monad (when)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -307,12 +308,11 @@ setMyCommandsViaApi mgr token commands = do
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
         Left ex -> hPutStrLn stderr ("telegram setMyCommands: network error: " <> show ex)
-        Right resp ->
+        Right resp -> do
           let code = statusCode (responseStatus resp)
-          in if code /= 200
-               then hPutStrLn stderr ("telegram setMyCommands: HTTP " <> show code
-                                      <> " — " <> show (responseBody resp))
-               else pure ()
+          when (code /= 200) $
+            hPutStrLn stderr ("telegram setMyCommands: HTTP " <> show code
+                               <> " — " <> show (responseBody resp))
 
 -- ---------------------------------------------------------------------------
 -- chunkMessage — split long messages for Telegram's 4096-char limit

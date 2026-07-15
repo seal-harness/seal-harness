@@ -12,7 +12,7 @@ import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
-  , mkRealTelegramBotApi )
+  , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
@@ -102,8 +102,10 @@ runTui autonomy = do
   tabsH   <- newTabsHandle
   cli <- mkRealSignalCli
   tgApi <- mkRealTelegramBotApi
+  vaultStore <- mkRealVaultStore mHandle
   let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
-                                 , crTelegramBotApi = tgApi }
+                                 , crTelegramBotApi = tgApi
+                                 , crVaultStore = vaultStore }
   -- Every launch starts a fresh session (resume is a follow-on milestone).
   -- The default agent (if set in config) is bound here: its id persists in
   -- smAgent and its non-empty provider/model override the config defaults.
