@@ -17,7 +17,7 @@ import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Channels.Loop (plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -38,7 +38,9 @@ import Seal.Config.Paths
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (UserId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
-import Seal.Handles.AskReply (ApprovalCache, AskReplyStore, newApprovalCache, newAskReplyStore)
+import Seal.Harness.Registry qualified
+import Seal.Harness.Tmux qualified
+import Seal.Handles.AskReply (AskReplyStore, newApprovalCache, newAskReplyStore)
 import Seal.Ingest (PreprocessChain, emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault qualified as Vault
@@ -55,22 +57,19 @@ import Seal.Vault.Commands (VaultRuntime (..))
 -- fast with a stderr diagnostic if the token is unresolved or the Bot API
 -- is unreachable.
 runTelegram
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends
+  :: ChannelDeps -> Registry -> PreprocessChain
   -> (TelegramToken, Int, AllowList UserId)
   -> AskReplyStore
-  -> AutonomyLevel
-  -> ApprovalCache
   -> IO ()
-runTelegram paths rt pr sr registry chain backends (token, chunkLimit, allow) askReply autonomy approvals = do
-  mgr <- newTlsManager
+runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
+  let mgr = prManager (cdProvider deps)
   transport <- mkRealTelegramTransport (telegramTokenText token) mgr
   -- Register the bot's slash-command menu with BotFather for auto-completion.
   tgSetCommands transport (telegramBotCommands registry)
   let withCh = withTelegramChannel (allow, chunkLimit) transport
-      plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
+      plainHandler h = plainTurn deps h askReply
   tabsH <- newTabsHandle
-  runChannelLoop withCh plainHandler registry chain askReply sr tabsH
+  runChannelLoop deps withCh plainHandler registry chain askReply tabsH
 
 -- | Full @seal telegram@ startup wiring: paths -> config -> vault -> session
 -- -> backends -> registry -> spawn the Telegram channel -> run the loop.
@@ -131,6 +130,14 @@ runTelegramMain autonomy = do
         ]
   askReply <- newAskReplyStore 0
   approvals <- newApprovalCache
+  harnessReg <- Seal.Harness.Registry.newHarnessRegistry
+  tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
+  let loadCfg = do
+        lc <- loadFileConfig cfgPath
+        pure (either (const defaultFileConfig) id lc)
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy Nothing
+        harnessReg tmuxR (Just mgr) approvals loadCfg
   -- Read the bot token from the vault (the wizard stores it there, not in
   -- config.toml). Falls back to the config token if present (for backward
   -- compat), but the vault token takes precedence.
@@ -143,7 +150,7 @@ runTelegramMain autonomy = do
         Left _   -> Nothing
   case resolveTelegramConfig (fcTelegram cfg) mVaultToken of
     Left err -> hPutStrLn stderr ("seal telegram: " <> T.unpack err)
-    Right resolved -> runTelegram paths rt pr sr registry emptyChain backends resolved askReply autonomy approvals
+    Right resolved -> runTelegram chanDeps registry emptyChain resolved askReply
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone.

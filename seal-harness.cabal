@@ -67,6 +67,7 @@ library
         Seal.Harness.Discovery
         Seal.Security.Adoption
         Seal.Session.Kind
+        Seal.Session.Lock
         Seal.Tabs
         Seal.Tabs.Persist
         Seal.Tabs.Relay
@@ -77,6 +78,7 @@ library
         Seal.Channel.Caps
         Seal.Channel.Cli
         Seal.Channels.Class
+        Seal.Channels.Cursor
         Seal.Channels.Loop
         Seal.Channels.Signal
         Seal.Channels.Signal.Run

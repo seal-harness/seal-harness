@@ -46,6 +46,7 @@ import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
+import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
@@ -905,6 +906,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdHttpManager = error "sdHttpManager: unused on the 404 path"
             , sdAskReply    = error "sdAskReply: unused on the 404 path"
             , sdApprovals   = error "sdApprovals: unused on the 404 path"
+            , sdReplies     = error "sdReplies: unused on the 404 path"
+            , sdLocks       = error "sdLocks: unused on the 404 path"
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -961,6 +964,8 @@ spec = describe "Seal.Gateway.API" $ do
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
+      testReplies <- newReplyRegistry
+      testLocks <- newSessionLocks
       let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
@@ -981,6 +986,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdHttpManager = Nothing
             , sdAskReply    = askReply
             , sdApprovals   = approvals
+            , sdReplies     = testReplies
+            , sdLocks       = testLocks
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

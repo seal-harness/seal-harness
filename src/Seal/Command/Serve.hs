@@ -7,6 +7,7 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO)
+import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
@@ -21,7 +22,7 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
-import Seal.Channels.Loop (plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
@@ -103,6 +104,13 @@ runServeMain autonomy = do
   sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
   activeRef   <- newIORef sessionMeta
   broker <- newStreamBroker 1024
+  -- Build the shared ChannelDeps early so the reply registry + write locks
+  -- can be shared with the web send handler (SendDeps). The cursor store,
+  -- reply registry, and write locks are created inside newChannelDeps.
+  let loadCfg = fromRight defaultFileConfig <$> loadFileConfig cfgPath
+  chanDeps <- newChannelDeps
+        paths rt pr backends autonomy (Just broker)
+        reg tmuxR (Just mgr) approvals loadCfg
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -139,6 +147,8 @@ runServeMain autonomy = do
         , sdHttpManager = Just mgr
         , sdAskReply    = askReply
         , sdApprovals   = approvals
+        , sdReplies     = cdReplies chanDeps
+        , sdLocks       = cdLocks chanDeps
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)
@@ -174,13 +184,11 @@ runServeMain autonomy = do
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
   -- Fork channel listeners for any configured channel. Each channel gets
-  -- its own tabsHandle + askReplyStore (the session + backends + provider
-  -- runtime + vault runtime are shared). The listener runs the shared
-  -- 'runChannelLoop' + 'plainTurn' so the agent loop is identical to the
-  -- TUI / Signal / Telegram standalone modes. A missing config section
-  -- (Left from resolve) means the channel is not configured — skip silently.
-  forkSignalListener paths rt pr sr backends cfg autonomy registry
-  forkTelegramListener paths rt pr sr backends cfg autonomy registry
+  -- its own askReply store; the tab list is shared (passed by the
+  -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'
+  -- so the agent loop is identical to the standalone modes.
+  forkSignalListener chanDeps cfg registry
+  forkTelegramListener chanDeps cfg registry
   -- Run the HTTP gateway (blocks)
   runGateway gwCfg deps
 
@@ -211,10 +219,8 @@ tryOpenVault paths fcfg =
 -- the config section, spawns the signal-cli transport, and runs the shared
 -- inbox-driven loop in a background thread. A missing/unresolved section
 -- is logged to stderr and skipped (not fatal — the gateway still starts).
-forkSignalListener
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
-forkSignalListener paths rt pr sr backends cfg autonomy registry =
+forkSignalListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkSignalListener deps cfg registry =
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left _ -> pure ()  -- not configured; skip silently
     Right (account, chunkLimit, allow) -> do
@@ -225,10 +231,9 @@ forkSignalListener paths rt pr sr backends cfg autonomy registry =
         Right transport -> do
           tabsH <- newTabsHandle
           askReply <- newAskReplyStore 0
-          approvals <- newApprovalCache
           let withCh = withSignalChannel (allow, chunkLimit) account transport
-              plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
-          _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+              plainHandler h = plainTurn deps h askReply
+          _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
           pure ()
 
 -- | Fork the Telegram channel listener if @[telegram]@ is configured.
@@ -236,12 +241,10 @@ forkSignalListener paths rt pr sr backends cfg autonomy registry =
 -- bot's slash-command menu with BotFather for auto-completion, and runs the
 -- shared inbox-driven loop in a background thread. A missing/unresolved
 -- section is logged to stderr and skipped.
-forkTelegramListener
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Backends -> FileConfig -> AutonomyLevel -> Registry -> IO ()
-forkTelegramListener paths rt pr sr backends cfg autonomy registry = do
+forkTelegramListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkTelegramListener deps cfg registry = do
   -- Read the bot token from the vault (the wizard stores it there).
-  mh <- readIORef (vrHandleRef rt)
+  mh <- readIORef (vrHandleRef (cdVault deps))
   mVaultToken <- case mh of
     Nothing -> pure Nothing
     Just vh -> do
@@ -264,8 +267,7 @@ forkTelegramListener paths rt pr sr backends cfg autonomy registry = do
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
       tabsH <- newTabsHandle
       askReply <- newAskReplyStore 0
-      approvals <- newApprovalCache
       let withCh = withTelegramChannel (allow, chunkLimit) transport
-          plainHandler h = plainTurn paths rt pr sr backends h askReply autonomy approvals
-      _ <- forkIO (runChannelLoop withCh plainHandler registry emptyChain askReply sr tabsH)
+          plainHandler h = plainTurn deps h askReply
+      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
       pure ()
