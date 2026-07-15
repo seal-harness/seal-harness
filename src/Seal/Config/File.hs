@@ -38,6 +38,7 @@ import Toml qualified
 import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
+import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
 import Seal.Tools.Exec.Types
   ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
@@ -72,6 +73,9 @@ data FileConfig = FileConfig
   , fcSignal :: Maybe SignalConfig
     -- ^ Optional @[signal]@ section (Signal channel config). Absent means
     -- the Signal channel is not configured.
+  , fcTelegram :: Maybe TelegramConfig
+    -- ^ Optional @[telegram]@ section (Telegram channel config). Absent
+    -- means the Telegram channel is not configured.
   , fcGateway :: Maybe PartialGatewayConfig
     -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
     -- gateway is not configured. Each field inside is optional too; the
@@ -150,6 +154,7 @@ defaultFileConfig = FileConfig
   , fcProviders       = Map.empty
   , fcRetrieval       = Nothing
   , fcSignal          = Nothing
+  , fcTelegram        = Nothing
   , fcGateway         = Nothing
   , fcUntrustedExec   = Nothing
   , fcDebugSessionTranscript = Nothing
@@ -185,6 +190,7 @@ fileConfigCodec = FileConfig
   <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
+  <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= fcTelegram
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= fcDebugSessionTranscript
