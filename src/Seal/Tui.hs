@@ -28,6 +28,7 @@ import Seal.Config.Paths
   , vaultFilePath
   )
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
@@ -116,6 +117,12 @@ runTui autonomy = do
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
+  -- The /bg command is wired inside runCliTui (it needs the ISA registry +
+  -- transcript handle that are constructed there). The AskReplyStore is the
+  -- async bridge for /bg confirmation prompts: a forked /bg turn's ccPrompt
+  -- routes through askHuman, and the CLI loop delivers the next input line
+  -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
+  askReply <- newAskReplyStore 0
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
@@ -128,4 +135,4 @@ runTui autonomy = do
         , tabsCommandSpec tabsH
         , terseGrammarSpec
         ]
-  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy
+  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply

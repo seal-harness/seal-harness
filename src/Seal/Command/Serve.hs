@@ -126,10 +126,10 @@ runServeMain autonomy = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
-        , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
-        , terseGrammarSpec
-        ]
+         , tabCommandSpec tabsH
+         , tabsCommandSpec tabsH
+         , terseGrammarSpec
+         ]
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt

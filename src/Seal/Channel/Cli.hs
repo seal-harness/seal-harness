@@ -16,7 +16,10 @@ module Seal.Channel.Cli
   , newBackends
   ) where
 
+import Control.Concurrent (forkIO)
+import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
+import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
@@ -39,9 +42,11 @@ import System.FilePath ((</>))
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Spec (CommandAction (..), Registry)
-import Seal.Config.File (FileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
+import Seal.Command.Spec
+  ( CommandAction (..), Registry, mkRegistry, registrySpecs )
+import Seal.Config.File (FileConfig, defaultFileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile,
                           fcDebugSessionTranscript)
 import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionRequestsPath)
@@ -85,10 +90,14 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..))
-import Seal.Handles.AskReply (ApprovalCache, newApprovalCache)
+import Seal.Handles.AskReply
+  ( ApprovalCache, AskReplyStore, deliverNextAnswerAny, askHuman
+  , newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Store
+  ( SessionRuntime (..), defaultSessionSelection, formatSessionId
+  , newSession, resolveDefaultAgent )
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -211,8 +220,9 @@ debugRequestsPath paths sid eCfg =
 -- immediately.
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
-  -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel -> IO ()
-runCliTui paths rt pr sr registry chain backends tabsH autonomy = do
+  -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
+  -> AskReplyStore -> IO ()
+runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
@@ -338,6 +348,92 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy = do
           , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
           ]
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    -- The /bg runner: mint a fresh persisted session from the config
+    -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
+    -- (notify = print the question via ccSend, so the confirmation appears
+    -- at the > prompt), and fork a turn against a bg-session-scoped ISA
+    -- registry. The fork lets the CLI loop keep reading input; the loop's
+    -- deliverNextAnswerAny routes the next line as the confirmation answer.
+    -- The assistant reply is delivered via the bg caps' ccSend (println).
+    -- No tab/cursor state is touched.
+    let bgRunner = BgRunner $ \prompt -> do
+          cfg <- fromRight defaultFileConfig <$> loadFileConfig (prConfigPath pr)
+          (mAgent, mProv, mModel) <- resolveDefaultAgent agentDefBackend cfg
+          let (cfgProv, cfgModel) = defaultSessionSelection cfg
+              provider = fromMaybe cfgProv mProv
+              model    = fromMaybe cfgModel mModel
+          meta <- newSession paths provider model "bg" mAgent
+          let bgSid = smId meta
+              sessionDirPath' = sessionDir paths bgSid
+          createDirectoryIfMissing True sessionDirPath'
+          void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
+            let bgCaps = ChannelCaps
+                  { ccSend = ccSend caps
+                  , ccPrompt = \q -> do
+                      outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
+                      pure (fromRight "" outcome)
+                  , ccPromptSecret = ccPromptSecret caps
+                  }
+                bgMintSession = do
+                  now <- getCurrentTime
+                  case mkSessionId (formatSessionId now) of
+                    Right s  -> pure s
+                    Left _e  -> pure bgSid
+                bgMkWorker def childSid = do
+                  let childDir = agentSessionDir paths bgSid childSid
+                  createDirectoryIfMissing True childDir
+                  active <- readIORef (srActive sr)
+                  let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+                      fallBackModel = case adModel def of
+                        ModelId m | T.null m -> smModel active
+                                  | otherwise -> m
+                  eprov <- resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
+                  case eprov of
+                    Left err -> ccSend bgCaps ("agent start failed: " <> err)
+                    Right (prov, mdl) ->
+                      withTwoFileTranscript childDir $ \childTHandle -> do
+                        let childEnv = mkSessionAgentEnv bgCaps prov fallBackProvider mdl childSid (adSystem def) bgIsaReg childTHandle execBackend
+                              (debugRequestsPath paths childSid eCfg) autonomy approvals (pure ())
+                        runApp appEnv (runTurn childEnv "")
+                bgIsaReg = ISA.mkRegistry
+                  [ showHumanOp bgCaps
+                  , askHumanOp bgCaps
+                  , fileReadOp wsRoot operatorCeiling
+                  , secretGetOp rt
+                  , memoryWriteOp memoryBackend bgSid
+                  , memoryRecallOp defaultPageParams memoryBackend
+                  , memoryDeleteOp memoryBackend
+                  , skillWriteOp skillBackend bgSid
+                  , skillReadOp skillBackend
+                  , skillListOp skillBackend
+                  , skillDeleteOp skillBackend
+                  , agentDefWriteOp agentDefBackend bgSid
+                  , agentDefReadOp agentDefBackend
+                  , agentDefListOp agentDefBackend
+                  , agentDefDeleteOp agentDefBackend
+                  , agentInstancesOp agentRuntime
+                  , agentStartOp agentDefBackend agentRuntime bgMintSession bgMkWorker
+                  , agentStatusOp agentRuntime
+                  , agentStopOp agentRuntime
+                  , shellExecOp wsRoot cliSecurityPolicy execBackend
+                  , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                  , processManageOp wsRoot cliSecurityPolicy execBackend
+                  , fileWriteOp wsRoot operatorCeiling
+                  , filePatchOp wsRoot
+                  , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+                  ]
+            tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
+            eprov <- resolveSessionProvider pr meta
+            case eprov of
+              Left err -> ccSend caps ("bg failed: " <> err)
+              Right (prov, mdl) -> do
+                mSystem <- case smAgent meta of
+                  Nothing  -> pure Nothing
+                  Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+                let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
+                      (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ())
+                runApp appEnv (runTurn env prompt)))
+        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner])
     let plainHandler t = do
           meta  <- readIORef (srActive sr)
           eprov <- resolveSessionProvider pr meta
@@ -354,26 +450,38 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy = do
                 (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
                    (debugRequestsPath paths (smId meta) eCfg) autonomy approvals (pure ()))
                 appEnv t
-    runInputT hlSettings (loop caps plainHandler tabsH)
+    runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where
-    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> InputT IO ()
-    loop caps plainHandler th = do
+    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()
+    loop caps plainHandler th reg = do
       mLine <- getInputLine "> "
       case mLine of
         Nothing   -> pure ()   -- EOF / Ctrl-D
         Just line -> do
-          case Seal.Routing.Route.route (T.pack line) of
-            Right (Seal.Routing.Route.Focus idx) -> liftIO (focusTabH th idx) >>= \r -> liftIO $ ccSend caps (case r of Left e -> "focus: " <> e; Right _ -> "focused tab " <> T.singleton (tabIndexToChar idx))
-            Right (Seal.Routing.Route.Inject idx payload) -> liftIO $ do
-              _ <- focusTabH th idx
-              plainHandler payload
-            Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
-            Right (Seal.Routing.Route.SlashCommand _) -> do
-              d <- liftIO $ ingest registry chain (RawInbound (T.pack line))
-              liftIO $ interpretDisposition caps plainHandler d
-            Right (Seal.Routing.Route.Plain t) -> liftIO $ plainHandler t
-            Left (Seal.Routing.Route.ParseError e) -> liftIO $ ccSend caps e
-          loop caps plainHandler th
+          -- A forked /bg turn may have registered a pending confirmation
+          -- (askHuman) for its background session. Deliver the next input
+          -- line as that answer before any normal routing; if no ask is
+          -- pending, deliverNextAnswerAny returns False and the line is
+          -- routed normally. This mirrors the per-session deliverNextAnswer
+          -- the inbox-driven channels run at the top of their loop, but is
+          -- session-agnostic because the CLI has one input stream serving
+          -- the active session plus any /bg background sessions.
+          delivered <- liftIO $ deliverNextAnswerAny askReply (T.pack line)
+          if delivered
+            then loop caps plainHandler th reg
+            else do
+              case Seal.Routing.Route.route (T.pack line) of
+                Right (Seal.Routing.Route.Focus idx) -> liftIO (focusTabH th idx) >>= \r -> liftIO $ ccSend caps (case r of Left e -> "focus: " <> e; Right _ -> "focused tab " <> T.singleton (tabIndexToChar idx))
+                Right (Seal.Routing.Route.Inject idx payload) -> liftIO $ do
+                  _ <- focusTabH th idx
+                  plainHandler payload
+                Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
+                Right (Seal.Routing.Route.SlashCommand _) -> do
+                  d <- liftIO $ ingest reg chain (RawInbound (T.pack line))
+                  liftIO $ interpretDisposition caps plainHandler d
+                Right (Seal.Routing.Route.Plain t) -> liftIO $ plainHandler t
+                Left (Seal.Routing.Route.ParseError e) -> liftIO $ ccSend caps e
+              loop caps plainHandler th reg
 
 -- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
 -- replying via the channel caps. Pure-ish (the handle mutations are STM).

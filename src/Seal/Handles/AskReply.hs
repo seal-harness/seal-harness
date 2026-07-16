@@ -46,6 +46,7 @@ module Seal.Handles.AskReply
   , askHumanWithMeta
   , deliverAnswer
   , deliverNextAnswer
+  , deliverNextAnswerAny
   , cancelAsk
   , cancelSessionAsks
   , pendingForSession
@@ -344,6 +345,36 @@ deliverNextAnswer store sid ans = do
 -- delivery.
 sortByCreatedAt :: [PendingAsk] -> [PendingAsk]
 sortByCreatedAt = sortBy (\a b -> compare (paCreatedAt a) (paCreatedAt b))
+
+-- | Deliver an inbound line as the answer to the oldest pending question
+-- across /all/ sessions (FIFO by 'paCreatedAt'). Returns 'True' if a
+-- pending question was found and answered, 'False' if none exists (the
+-- caller may route the line as a normal turn).
+--
+-- This is the session-agnostic counterpart of 'deliverNextAnswer': it serves
+-- channels with a single shared input stream that may answer questions for
+-- more than one session (e.g. the CLI TUI, where a @/bg@ turn forks a
+-- background session whose confirmation prompts must be answerable from the
+-- same @>@ prompt that serves the active session). Inbox-driven channels
+-- (Signal/Telegram) use the per-session 'deliverNextAnswer' because each
+-- conversation has its own inbound stream and cursor.
+deliverNextAnswerAny :: AskReplyStore -> Text -> IO Bool
+deliverNextAnswerAny store ans = do
+  let reply = AskReply ScopeOnce ans
+  mQid <- atomically $ do
+    m <- readTVar (arsPending store)
+    case sortByCreatedAt (Map.elems m) of
+      [] -> pure Nothing
+      pa : _ ->
+        let slot = paSlot pa in do
+          won <- tryPutTMVar slot (Right reply)
+          if won
+            then writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (paId pa))
+            else
+              writeTVar (arsPending store) (Map.delete (paId pa) m)
+              >> pure Nothing
+  pure (case mQid of Just _ -> True; Nothing -> False)
 
 -- | 'True' if the question was pending and is now cancelled.
 cancelAsk :: AskReplyStore -> AskId -> IO Bool

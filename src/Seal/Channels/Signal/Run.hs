@@ -259,16 +259,6 @@ runSignalMain autonomy = do
   let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
                                  , crTelegramBotApi = tgApi
                                  , crVaultStore = vaultStore }
-  let registry = mkRegistry
-        [ sessionCommandSpec sr
-        , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends)
-        , agentCommandSpec (bAgentDefs backends) cfgPath
-        , channelCommandSpec channelRt
-        , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
-        , terseGrammarSpec
-        ]
   -- Resolve the [signal] section + an optional vault-supplied account.
   -- For now the vault-supplied account is Nothing (the account comes from
   -- config); a future phase may pull it from the vault via CPS.
@@ -282,6 +272,16 @@ runSignalMain autonomy = do
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg
+  let registry = mkRegistry
+        [ sessionCommandSpec sr
+        , modelCommandSpec pr sr
+        , skillCommandSpec (bSkills backends)
+        , agentCommandSpec (bAgentDefs backends) cfgPath
+        , channelCommandSpec channelRt
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
+        ]
   case resolveSignalConfig (fcSignal cfg) Nothing of
     Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
     Right resolved -> runSignal chanDeps registry emptyChain tabsH resolved askReply

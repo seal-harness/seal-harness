@@ -96,6 +96,7 @@ library
         Seal.Command.Skill
         Seal.Command.Tab
         Seal.Command.Agent
+        Seal.Command.Background
         Seal.Command.Spec
         Seal.Command.Channel
         Seal.Config.File
@@ -315,6 +316,7 @@ test-suite tests
         Seal.Command.ServeSpec
         Seal.Command.SkillSpec
         Seal.Command.AgentSpec
+        Seal.Command.BackgroundSpec
         Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec

@@ -38,6 +38,7 @@ module Seal.Channels.Loop
   , handleTabCommand
   , plainTurn
   , buildIsaRegistry
+  , mkBgRunner
   ) where
 
 import Control.Concurrent (forkIO)
@@ -45,6 +46,7 @@ import Control.Monad (void)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -66,8 +68,9 @@ import Seal.Channel.Cli
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
   ( CursorStore, cursorLookup, cursorSet, newCursorStore )
+import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Spec (CommandAction (..), Registry, runCommandAction)
+import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes )
 import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir)
@@ -221,9 +224,19 @@ runChannelLoop
 runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
   withChannel $ \ch -> do
     let h = toHandle ch
-    loop h
+    -- A mutable cell holding the originating conversation's active session
+    -- id, updated each turn before any slash command is dispatched. The
+    -- /bg runner reads it to key the confirmation ask to the conversation
+    -- (not the fresh bg session), so the loop's deliverNextAnswer
+    -- short-circuit consumes the next inbound message as the answer. The
+    -- initial bottom is never read: the loop writes the real sid before
+    -- any /bg dispatch.
+    bgConvSid <- newIORef (error "bgConvSid: set before first dispatch" :: SessionId)
+    let bgRunner = mkBgRunner deps h askReply bgConvSid
+        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner])
+    loop h registryWithBg bgConvSid
   where
-    loop h = do
+    loop h reg bgConvSid = do
       (mSrc, body) <- chReceive h
       case mSrc of
         Nothing -> pure ()  -- EOF
@@ -239,9 +252,14 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
                 Nothing -> createConversationSession deps h key (msChannelKind ms) tabsH
             Nothing -> createConversationSession deps h key (msChannelKind ms) tabsH
           let sid = smId meta
+          -- Record the conversation's active session so the /bg runner
+          -- (dispatched below if this turn is a /bg) keys its
+          -- confirmation ask to this sid. Updated every turn, before any
+          -- slash-command dispatch.
+          writeIORef bgConvSid sid
           delivered <- deliverNextAnswer askReply sid body
           if delivered
-            then loop h
+            then loop h reg bgConvSid
             else do
               let handleCaps = mkHandleCaps h askReply sid
               case Route.route body of
@@ -252,27 +270,27 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
                     Just tab -> cursorSet (cdCursors deps) key (tRef tab)
                     Nothing -> pure ()
                   chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
-                  loop h
+                  loop h reg bgConvSid
                 Right (Route.Inject idx payload) -> do
                   _ <- focusTabH tabsH idx
                   void (forkIO (plainHandler h meta (Just ms) payload))
-                  loop h
+                  loop h reg bgConvSid
                 Right (Route.TabCommand tsc) -> do
                   _ <- handleTabCommand h tabsH tsc
-                  loop h
+                  loop h reg bgConvSid
                 Right (Route.SlashCommand _) -> do
-                  d <- ingest registry chain (RawInbound body)
+                  d <- ingest reg chain (RawInbound body)
                   case d of
-                    DispatchAction a -> runCommandAction a handleCaps >> loop h
-                    ShowText t       -> chSend h t >> loop h
-                    PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h
-                    Rejected msg     -> chSend h msg >> loop h
+                    DispatchAction a -> runCommandAction a handleCaps >> loop h reg bgConvSid
+                    ShowText t       -> chSend h t >> loop h reg bgConvSid
+                    PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid
+                    Rejected msg     -> chSend h msg >> loop h reg bgConvSid
                 Right (Route.Plain t) -> do
                   void (forkIO (plainHandler h meta (Just ms) t))
-                  loop h
+                  loop h reg bgConvSid
                 Left (Route.ParseError e) -> do
                   chSend h e
-                  loop h
+                  loop h reg bgConvSid
 
 -- | Build the per-turn 'ChannelCaps' for a channel handle.
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
@@ -376,7 +394,23 @@ handleTabCommand h tabsH = \case
 plainTurn
   :: ChannelDeps -> ChannelHandle -> AskReplyStore
   -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
-plainTurn deps h askReply meta mSrc t = do
+plainTurn deps h askReply meta =
+  runTurnOnSession deps h askReply (smId meta) meta
+
+-- | The shared turn body. 'askSid' is the 'SessionId' used to key the
+-- 'ccPrompt' ask/reply slot: for a normal turn it is the session's own sid
+-- (the conversation's active session); for a @/bg@ turn it is the
+-- /originating conversation's/ sid (NOT the fresh bg session's) so the
+-- channel loop's per-session 'deliverNextAnswer' short-circuit consumes the
+-- next inbound message as the confirmation answer — producing a modal
+-- "answer the pending question before resuming normal turns" state scoped
+-- to that conversation. The turn itself still runs on 'smId meta' (the bg
+-- session): transcript, 'aeSession', and the approval cache stay scoped to
+-- the bg session; only the ask-delivery key moves to the conversation.
+runTurnOnSession
+  :: ChannelDeps -> ChannelHandle -> AskReplyStore -> SessionId
+  -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
+runTurnOnSession deps h askReply askSid meta mSrc t = do
   let pr = cdProvider deps
       paths = cdPaths deps
       backends = cdBackends deps
@@ -407,7 +441,7 @@ plainTurn deps h askReply meta mSrc t = do
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
-          let handleCaps = mkHandleCaps h askReply sid
+          let handleCaps = mkHandleCaps h askReply askSid
               mintSession = channelMintSession sid
               isaReg = buildIsaRegistry
                 rt backends wsroot sid operatorCeiling execBackend autonomy
@@ -423,6 +457,31 @@ plainTurn deps h askReply meta mSrc t = do
                       { aeMessageSource = mSrc }
           runApp appEnv (runTurn env t)
           broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+
+-- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
+-- a fresh persisted session from the config defaults (channel label
+-- @"bg"@), then forks a turn against the invoking 'ChannelHandle'. The
+-- confirmation ask is keyed to the /originating conversation's/ active
+-- session id (read from 'bgConvSid', which the loop updates each turn) —
+-- NOT the fresh bg session's sid — so the channel loop's per-session
+-- 'deliverNextAnswer' short-circuit consumes the next inbound message as
+-- the confirmation answer (a modal "answer the pending question before
+-- resuming normal turns" state scoped to that conversation). The turn
+-- itself runs on the fresh bg session (transcript + 'aeSession' + approval
+-- cache stay scoped to it); only the ask-delivery key moves to the
+-- conversation. The assistant reply is delivered via the handle's
+-- @chSend@. No tab or cursor state is mutated.
+mkBgRunner :: ChannelDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> BgRunner
+mkBgRunner deps h askReply bgConvSid = BgRunner $ \prompt -> do
+  convSid <- readIORef bgConvSid
+  cfg <- cdConfig deps
+  (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe cfgProv mProv
+      model    = fromMaybe cfgModel mModel
+  meta <- newSessionMeta (cdPaths deps) provider model "bg" mAgent
+  saveSessionMeta (cdPaths deps) meta
+  void (forkIO (runTurnOnSession deps h askReply convSid meta Nothing prompt))
 
 -- | Build the ISA registry for a channel turn. Mirrors
 -- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set

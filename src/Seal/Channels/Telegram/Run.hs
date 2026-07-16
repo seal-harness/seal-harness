@@ -118,16 +118,6 @@ runTelegramMain autonomy = do
   let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
                                  , crTelegramBotApi = tgApi
                                  , crVaultStore = vaultStore }
-  let registry = mkRegistry
-        [ sessionCommandSpec sr
-        , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends)
-        , agentCommandSpec (bAgentDefs backends) cfgPath
-        , channelCommandSpec channelRt
-        , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
-        , terseGrammarSpec
-        ]
   askReply <- newAskReplyStore 0
   approvals <- newApprovalCache
   harnessReg <- Seal.Harness.Registry.newHarnessRegistry
@@ -138,6 +128,16 @@ runTelegramMain autonomy = do
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg
+  let registry = mkRegistry
+        [ sessionCommandSpec sr
+        , modelCommandSpec pr sr
+        , skillCommandSpec (bSkills backends)
+        , agentCommandSpec (bAgentDefs backends) cfgPath
+        , channelCommandSpec channelRt
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
+        ]
   -- Read the bot token from the vault (the wizard stores it there, not in
   -- config.toml). Falls back to the config token if present (for backward
   -- compat), but the vault token takes precedence.
