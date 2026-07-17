@@ -62,7 +62,23 @@ textMsg r t = Message r [CbText t]
 data ToolDefinition = ToolDefinition
   { tdName :: OpName, tdDescription :: Text, tdInputSchema :: Value }
   deriving stock (Eq, Show, Generic)
-instance ToJSON ToolDefinition
+
+-- | Custom 'ToJSON': emits @tdName@ + @tdDescription@ always, and
+-- @tdInputSchema@ only when it differs from 'stubSchema'. The keys match
+-- the derived instance's field names so 'FromJSON' (still derived) round-
+-- trips. This keeps the on-disk transcript envelope (@edTools@) and the
+-- debug @requests.jsonl@ consistent with the provider encoders (which also
+-- omit the field for stubs) so no @input_schema@ token cost leaks in
+-- on-demand mode through the generic derived instance. The provider
+-- 'encTool's still control the exact on-the-wire shape (@input_schema@ for
+-- Anthropic, @function.parameters@ for Ollama); this instance governs the
+-- provider-agnostic transcript view.
+instance ToJSON ToolDefinition where
+  toJSON (ToolDefinition n d sch) =
+    if sch == stubSchema
+      then object ["tdName" .= n, "tdDescription" .= d]
+      else object ["tdName" .= n, "tdDescription" .= d, "tdInputSchema" .= sch]
+
 instance FromJSON ToolDefinition
 
 -- | The minimal placeholder @input_schema@ emitted when on-demand schema
