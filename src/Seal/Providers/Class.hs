@@ -22,6 +22,9 @@ module Seal.Providers.Class
   ) where
 
 import Data.Aeson
+import Data.Aeson.Key (fromString)
+import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 
@@ -79,7 +82,21 @@ instance ToJSON ToolDefinition where
       then object ["tdName" .= n, "tdDescription" .= d]
       else object ["tdName" .= n, "tdDescription" .= d, "tdInputSchema" .= sch]
 
-instance FromJSON ToolDefinition
+-- | Custom 'FromJSON': @tdName@ + @tdDescription@ required; @tdInputSchema@
+-- OPTIONAL, defaulting to 'stubSchema' when the key is ABSENT. The 'ToJSON'
+-- instance omits @tdInputSchema@ for stub tools, so the derived instance
+-- (which treats every field as required) would reject those rows and —
+-- worse — take down the whole 'EnvelopeDelta' parse (aeson's 'parseJSON' is
+-- sequential), losing the system prompt from the reconstructed envelope.
+-- Key PRESENCE (not value null-ness) distinguishes "stored stub, omitted by
+-- ToJSON" from "explicitly null": an absent key defaults to 'stubSchema'
+-- (closing the stub round-trip), while a present 'null' stays 'Null' (so
+-- the arbitrary-data round-trip property still holds).
+instance FromJSON ToolDefinition where
+  parseJSON = withObject "ToolDefinition" $ \o -> ToolDefinition
+    <$> o .: "tdName"
+    <*> o .: "tdDescription"
+    <*> pure (fromMaybe stubSchema (KeyMap.lookup (fromString "tdInputSchema") o))
 
 -- | The minimal placeholder @input_schema@ emitted when on-demand schema
 -- loading is enabled. Both Anthropic and Ollama normally require an
