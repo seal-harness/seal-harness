@@ -1,4 +1,5 @@
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wno-partial-fields #-}
 -- | The provider-agnostic message/content/request/response model and the
 -- 'Provider' capability class. Concrete providers (Anthropic, …) implement it;
@@ -10,6 +11,7 @@ module Seal.Providers.Class
   , Message (..)
   , textMsg
   , ToolDefinition (..)
+  , stubSchema
   , ToolChoice (..)
   , CompletionRequest (..)
   , Usage (..)
@@ -62,6 +64,17 @@ data ToolDefinition = ToolDefinition
   deriving stock (Eq, Show, Generic)
 instance ToJSON ToolDefinition
 instance FromJSON ToolDefinition
+
+-- | The minimal placeholder @input_schema@ emitted when on-demand schema
+-- loading is enabled. Both Anthropic and Ollama normally require an
+-- @input_schema@ / @parameters@ field on every tool definition; when a
+-- 'ToolDefinition' carries this exact value, the provider encoders OMIT
+-- the field entirely rather than sending it inline — saving the few tokens
+-- the stub would otherwise cost on every tool, every turn. The model is
+-- expected to call @OPCODE_DESCRIBE@ to retrieve a tool's real schema
+-- before calling it.
+stubSchema :: Value
+stubSchema = object ["type" .= ("object" :: Text)]
 
 data ToolChoice = ToolAuto | ToolNone deriving stock (Eq, Show, Generic)
 instance ToJSON ToolChoice

@@ -15,15 +15,13 @@ module Seal.ISA.Registry
   , secretOpNames
   ) where
 
-import Data.Aeson (Value (..), object, (.=))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Data.Text (Text)
 
 import Seal.Core.Types (OpName (..))
-import Seal.Providers.Class (ToolDefinition (..))
+import Seal.Providers.Class (ToolDefinition (..), stubSchema)
 import Seal.ISA.Opcode
 
 -- | The registry carries both a name-indexed 'Map' (O(log n) dispatch
@@ -50,20 +48,15 @@ registryToolDefs = registryToolDefs' False
 -- the per-opcode schema JSON (the bulk of the tokens) is omitted. The model
 -- is expected to call the @OPCODE_DESCRIBE@ opcode to retrieve a tool's full
 -- schema before calling it. When @useStub@ is 'False' this is identical to
--- 'registryToolDefs'.
+-- 'registryToolDefs'. The provider encoders OMIT the @input_schema@ field
+-- entirely when it equals 'stubSchema' (see 'Seal.Providers.Class'), so the
+-- stub costs zero tokens on the wire rather than the few a real stub object
+-- would cost.
 registryToolDefs' :: Bool -> Registry -> [ToolDefinition]
 registryToolDefs' useStub (Registry _ order) =
   [ ToolDefinition (opName o) (opDesc o) (if useStub then stubSchema else opInSchema o)
   | o <- order
   ]
-
--- | The minimal placeholder @input_schema@ emitted when on-demand schema
--- loading is enabled. Both Anthropic and Ollama require an @input_schema@ /
--- @parameters@ field to be present on every tool definition; @{"type":"object"}@
--- is the smallest valid value and costs a handful of tokens regardless of the
--- opcode's real parameter count.
-stubSchema :: Value
-stubSchema = object ["type" .= ("object" :: Text)]
 
 -- | The set of opcode names whose tool results may carry secrets and must be
 -- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a

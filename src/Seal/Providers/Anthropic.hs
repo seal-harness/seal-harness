@@ -135,7 +135,14 @@ encBlock (CbToolResult (ToolCallId i) parts isErr) =
 
 encTool :: ToolDefinition -> Value
 encTool (ToolDefinition (OpName n) d sch) =
-  object ["name" .= n, "description" .= d, "input_schema" .= sch]
+  -- Omit input_schema entirely when it's the on-demand stub. Anthropic
+  -- normally requires input_schema on every tool; sending it only when the
+  -- model has a real schema to follow keeps the stub tools (the common case
+  -- under on-demand mode) at zero schema-token cost. The model retrieves a
+  -- tool's real schema via OPCODE_DESCRIBE before calling it.
+  if sch == stubSchema
+    then object ["name" .= n, "description" .= d]
+    else object ["name" .= n, "description" .= d, "input_schema" .= sch]
 
 -- Pure response mapping ----------------------------------------------------
 

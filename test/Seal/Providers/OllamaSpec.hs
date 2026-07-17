@@ -73,8 +73,11 @@ spec = describe "Seal.Providers.Ollama" $ do
              , object ["role" .= ("tool" :: String), "content" .= ("[tool error] two" :: String)] ]
 
     it "includes a tools array only when tools are present" $ do
-      let tool = ToolDefinition (OpName "FILE_READ") "read a file"
-                   (object ["type" .= ("object" :: String)])
+      let realSchema = object
+            [ "type" .= ("object" :: String)
+            , "properties" .= object ["path" .= object ["type" .= ("string" :: String)]]
+            ]
+          tool = ToolDefinition (OpName "FILE_READ") "read a file" realSchema
           req  = CompletionRequest (ModelId "m") Nothing [textMsg User "hi"]
                    [tool] ToolAuto 16
       case parseMaybe (withObject "req" (.: "tools")) (encodeRequest req) :: Maybe [Value] of
@@ -83,8 +86,22 @@ spec = describe "Seal.Providers.Ollama" $ do
           , "function" .= object
               [ "name" .= ("FILE_READ" :: String)
               , "description" .= ("read a file" :: String)
-              , "parameters" .= object ["type" .= ("object" :: String)] ]
+              , "parameters" .= realSchema ]
           ]
+        _ -> expectationFailure "expected one tool"
+
+    it "omits parameters when the tool input schema is the on-demand stub" $ do
+      let tool = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
+          req  = CompletionRequest (ModelId "m") Nothing [textMsg User "hi"]
+                   [tool] ToolAuto 16
+      case parseMaybe (withObject "req" (.: "tools")) (encodeRequest req) :: Maybe [Value] of
+        Just [t] -> case parseMaybe (withObject "fn" (.: "function")) t of
+          Just fn -> do
+            fn `shouldBe` object
+              [ "name" .= ("FILE_READ" :: String)
+              , "description" .= ("read a file" :: String)
+              ]
+          Nothing -> expectationFailure "expected a function object"
         _ -> expectationFailure "expected one tool"
 
   describe "decodeResponse" $ do
