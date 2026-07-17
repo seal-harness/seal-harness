@@ -226,7 +226,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    (EbLocal mkLocalExecHandlePlaceholder) caps sid 8 Nothing Full approvals Nothing (pure ())
+                    (EbLocal mkLocalExecHandlePlaceholder) caps sid 8 Nothing Full approvals Nothing (pure ()) False
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

@@ -10,13 +10,17 @@ module Seal.ISA.Registry
   , mkRegistry
   , lookupOp
   , registryToolDefs
+  , registryToolDefs'
+  , stubSchema
   , secretOpNames
   ) where
 
+import Data.Aeson (Value (..), object, (.=))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.Text (Text)
 
 import Seal.Core.Types (OpName (..))
 import Seal.Providers.Class (ToolDefinition (..))
@@ -37,8 +41,29 @@ lookupOp (Registry m _) n = Map.lookup n m
 -- order (the order 'mkRegistry' received). NOT alphabetical — the wiring
 -- layer controls the order so it can steer which tools the model tries first.
 registryToolDefs :: Registry -> [ToolDefinition]
-registryToolDefs (Registry _ order) =
-  [ ToolDefinition (opName o) (opDesc o) (opInSchema o) | o <- order ]
+registryToolDefs = registryToolDefs' False
+
+-- | Like 'registryToolDefs' but with a flag to swap full @input_schema@s for
+-- a minimal stub. When @useStub@ is 'True', each tool definition carries
+-- 'stubSchema' instead of the opcode's real 'opInSchema' — the name and
+-- description are preserved so the model still knows what tools exist, but
+-- the per-opcode schema JSON (the bulk of the tokens) is omitted. The model
+-- is expected to call the @OPCODE_DESCRIBE@ opcode to retrieve a tool's full
+-- schema before calling it. When @useStub@ is 'False' this is identical to
+-- 'registryToolDefs'.
+registryToolDefs' :: Bool -> Registry -> [ToolDefinition]
+registryToolDefs' useStub (Registry _ order) =
+  [ ToolDefinition (opName o) (opDesc o) (if useStub then stubSchema else opInSchema o)
+  | o <- order
+  ]
+
+-- | The minimal placeholder @input_schema@ emitted when on-demand schema
+-- loading is enabled. Both Anthropic and Ollama require an @input_schema@ /
+-- @parameters@ field to be present on every tool definition; @{"type":"object"}@
+-- is the smallest valid value and costs a handful of tokens regardless of the
+-- opcode's real parameter count.
+stubSchema :: Value
+stubSchema = object ["type" .= ("object" :: Text)]
 
 -- | The set of opcode names whose tool results may carry secrets and must be
 -- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a

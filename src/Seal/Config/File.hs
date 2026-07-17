@@ -18,6 +18,7 @@ module Seal.Config.File
   , providerBaseUrl
   , providerDefaultModel
   , retrievalMaxScanBytes
+  , onDemandSchemas
   , saveFileConfig
   , updateFileConfig
   , upsertProvider
@@ -95,6 +96,16 @@ data FileConfig = FileConfig
     -- debug whether the two-file storage format is correctly feeding the
     -- session history to the LLM. Absent (the default) means the file is
     -- not written.
+  , fcOnDemandSchemas :: Maybe Bool
+    -- ^ Optional @on_demand_schemas@ flag. When @true@, the full
+    -- @input_schema@ JSON for every opcode is replaced with a minimal
+    -- stub (@{\"type\":\"object\"}@) in the @tools@ field of each
+    -- 'CompletionRequest' (saving tokens on every turn), and a
+    -- read-only @OPCODE_DESCRIBE@ / @OPCODE_LIST@ pair is registered so
+    -- the model can retrieve an opcode's full input/output schema
+    -- on-demand before calling it. Absent (the default) preserves the
+    -- existing behavior: full schemas are sent inline and the describe
+    -- opcodes are not registered.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -158,6 +169,7 @@ defaultFileConfig = FileConfig
   , fcGateway         = Nothing
   , fcUntrustedExec   = Nothing
   , fcDebugSessionTranscript = Nothing
+  , fcOnDemandSchemas = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -194,6 +206,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= fcDebugSessionTranscript
+  <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= fcOnDemandSchemas
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -312,6 +325,14 @@ providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (fcProviders cfg)
 retrievalMaxScanBytes :: FileConfig -> Int
 retrievalMaxScanBytes cfg =
   fromMaybe defaultRetrievalMaxScanBytes (fcRetrieval cfg >>= rcMaxScanBytes)
+
+-- | The resolved on-demand-schemas flag. 'True' means the registry should
+-- emit stub @input_schema@s and register the @OPCODE_DESCRIBE@ /
+-- @OPCODE_LIST@ opcodes so the model can fetch full schemas on demand.
+-- Absent (the default) is 'False' — full schemas are sent inline, matching
+-- the pre-flag behavior.
+onDemandSchemas :: FileConfig -> Bool
+onDemandSchemas cfg = fromMaybe False (fcOnDemandSchemas cfg)
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).

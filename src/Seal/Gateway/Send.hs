@@ -44,7 +44,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
-  , fcDebugSessionTranscript )
+  , onDemandSchemas, fcDebugSessionTranscript )
 import Seal.Config.Paths (SealPaths, agentSessionDir, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
@@ -73,6 +73,7 @@ import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Harness
   ( harnessListOp, harnessStartOp, harnessStopOp )
+import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
@@ -249,16 +250,18 @@ plainTurn deps meta t = do
             Nothing -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
           let mintSession = webMintSession sid
+              onDemand = either (const False) onDemandSchemas eCfg
               isaReg = buildWebRegistry
                 (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
                 execBackend (sdAutonomy deps) mintSession
                 (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-                caps
+                caps onDemand
               env = mkSessionAgentEnv
                 caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
                 (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                 (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
+                onDemand
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           result <- runApp appEnv (runTurn env t)
           broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
@@ -293,50 +296,56 @@ buildWebRegistry
   -> TmuxRunner               -- ^ the tmux runner (real via mkRealTmuxRunner; fail-closes when tmux absent)
   -> Maybe Manager            -- ^ shared HTTP manager for WEB_FETCH / WEB_SEARCH (Nothing = fail-closed)
   -> ChannelCaps              -- ^ the per-turn caps (ASK_HUMAN/SHOW_HUMAN use these; built by 'webAskCaps')
+  -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST + emit stub schemas
   -> ISA.Registry
 buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
-                 mintSession mkWorker harnessReg tmuxRunner httpManager caps =
-  ISA.mkRegistry
-    [ showHumanOp caps
-    , askHumanOp caps
-    , secretGetOp rt
-    , memoryWriteOp (bMemory backends) sid
-    , memoryRecallOp defaultPageParams (bMemory backends)
-    , memoryDeleteOp (bMemory backends)
-    , skillWriteOp (bSkills backends) sid
-    , skillReadOp (bSkills backends)
-    , skillListOp (bSkills backends)
-    , skillDeleteOp (bSkills backends)
-    , agentDefWriteOp (bAgentDefs backends) sid
-    , agentDefReadOp (bAgentDefs backends)
-    , agentDefListOp (bAgentDefs backends)
-    , agentDefDeleteOp (bAgentDefs backends)
-    , agentInstancesOp (bRuntime backends)
-    , agentStartOp (bAgentDefs backends) (bRuntime backends) mintSession mkWorker
-    , agentStatusOp (bRuntime backends)
-    , agentStopOp (bRuntime backends)
-    , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
-    , fileReadOp wsRoot operatorCeiling
-    , fileWriteOp wsRoot operatorCeiling
-    , filePatchOp wsRoot
-    , shellExecOp wsRoot securityPolicy execBackend
-    , codeExecOp wsRoot securityPolicy codeAllowList execBackend
-    , processManageOp wsRoot securityPolicy execBackend
-    , webFetchOp webFetchCfg
-    , webSearchOp webSearchCfg
-    , harnessListOp harnessReg
-    , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
-        HfGeneric newHarnessId
-    , harnessStopOp harnessReg tmuxRunner
-    -- TODO browser, image, and tts ops
-    -- , browserOpenOp noBrowserDriver
-    -- , browserClickOp noBrowserDriver
-    -- , browserReadOp noBrowserDriver
-    -- , imageGenerateOp noImageProvider
-    -- , imageDescribeOp noImageProvider
-    -- , textToSpeechOp noTtsProvider
-    ]
+                 mintSession mkWorker harnessReg tmuxRunner httpManager caps onDemand =
+  reg
   where
+    baseOps =
+      [ showHumanOp caps
+      , askHumanOp caps
+      , secretGetOp rt
+      , memoryWriteOp (bMemory backends) sid
+      , memoryRecallOp defaultPageParams (bMemory backends)
+      , memoryDeleteOp (bMemory backends)
+      , skillWriteOp (bSkills backends) sid
+      , skillReadOp (bSkills backends)
+      , skillListOp (bSkills backends)
+      , skillDeleteOp (bSkills backends)
+      , agentDefWriteOp (bAgentDefs backends) sid
+      , agentDefReadOp (bAgentDefs backends)
+      , agentDefListOp (bAgentDefs backends)
+      , agentDefDeleteOp (bAgentDefs backends)
+      , agentInstancesOp (bRuntime backends)
+      , agentStartOp (bAgentDefs backends) (bRuntime backends) mintSession mkWorker
+      , agentStatusOp (bRuntime backends)
+      , agentStopOp (bRuntime backends)
+      , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+      , fileReadOp wsRoot operatorCeiling
+      , fileWriteOp wsRoot operatorCeiling
+      , filePatchOp wsRoot
+      , shellExecOp wsRoot securityPolicy execBackend
+      , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+      , processManageOp wsRoot securityPolicy execBackend
+      , webFetchOp webFetchCfg
+      , webSearchOp webSearchCfg
+      , harnessListOp harnessReg
+      , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
+          HfGeneric newHarnessId
+      , harnessStopOp harnessReg tmuxRunner
+      -- TODO browser, image, and tts ops
+      -- , browserOpenOp noBrowserDriver
+      -- , browserClickOp noBrowserDriver
+      -- , browserReadOp noBrowserDriver
+      -- , imageGenerateOp noImageProvider
+      -- , imageDescribeOp noImageProvider
+      -- , textToSpeechOp noTtsProvider
+      ]
+    -- Recursive knot: the describe/list ops close over the registry they
+    -- belong to, so the model can introspect every opcode including itself.
+    introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
+    reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
     -- Fail-closed defaults for the provider-pluggable opcodes. These surface
@@ -414,16 +423,18 @@ plainTurnWithCaps deps meta caps t = do
           Nothing -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
         let mintSession = webMintSession sid
+            onDemand = either (const False) onDemandSchemas eCfg
             isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
               execBackend (sdAutonomy deps) mintSession
               (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-              caps
+              caps onDemand
             env = mkSessionAgentEnv
               caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
               (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
+              onDemand
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
@@ -473,6 +484,7 @@ webMkWorker deps paths parentSid caps execBackend appEnv eCfg isaReg def childSi
               (adSystem def) isaReg childTHandle execBackend
               (debugPath paths childSid eCfg) (sdAutonomy deps) (sdApprovals deps)
               (broadcastNewEntries (sdBroker deps) paths childSid (modelText childModel) (smCreatedAt active))
+              (either (const False) onDemandSchemas eCfg)
         runApp appEnv (runTurn childEnv "")
 
 -- | Extract the 'Text' from a 'ModelId'.

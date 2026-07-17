@@ -158,6 +158,7 @@ library
         Seal.ISA.Ops.Memory
         Seal.ISA.Ops.Skills
         Seal.ISA.Ops.Agent
+        Seal.ISA.Ops.Registry
         Seal.ISA.Registry
         Seal.Memory.Types
         Seal.Memory.Backend
@@ -288,6 +289,7 @@ test-suite tests
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec
         Seal.Phase2bSpec
         Seal.Phase6aSpec

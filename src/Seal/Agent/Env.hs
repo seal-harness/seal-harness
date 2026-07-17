@@ -75,4 +75,11 @@ data AgentEnv = AgentEnv
     -- sees new entries live — including tool calls that are pending
     -- confirmation — rather than only at the end of the turn. The CLI and
     -- Signal channels set this to @pure ()@ (no live broadcast needed).
+  , aeOnDemandSchemas :: Bool
+    -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
+    -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,
+    -- and the registry is expected to include the @OPCODE_DESCRIBE@ /
+    -- @OPCODE_LIST@ opcodes so the model can fetch full schemas on demand.
+    -- 'False' (the default) sends full schemas inline, matching the
+    -- pre-flag behavior.
   }

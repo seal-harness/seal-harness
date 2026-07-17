@@ -30,7 +30,7 @@ import Seal.Handles.AskReply
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
-import Seal.ISA.Registry (registryToolDefs, lookupOp)
+import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Transcript.Entries
@@ -72,7 +72,7 @@ runTurn env userText = do
     let env0 = EnvelopeDelta
           { edModel = Just (aeModel env)
           , edSystem = Just (aeSystem env)
-          , edTools = Just (registryToolDefs (aeRegistry env))
+          , edTools = Just (registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env))
           , edToolChoice = Just ToolAuto
           , edMaxTokens = Just 4096
           }
@@ -99,7 +99,7 @@ runTurn env userText = do
                   { crModel = aeModel env
                   , crSystem = aeSystem env
                   , crMessages = msgs
-                  , crTools = registryToolDefs (aeRegistry env)
+                  , crTools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
                   , crToolChoice = ToolAuto
                   , crMaxTokens = 4096
                   }

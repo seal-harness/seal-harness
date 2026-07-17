@@ -55,6 +55,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           approvals
           Nothing
           (pure ())
+          False
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc

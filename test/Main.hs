@@ -93,6 +93,7 @@ import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.AgentSpec
+import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
 import qualified Seal.Phase6aSpec
@@ -213,6 +214,7 @@ main = hspec $ do
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
+  Seal.ISA.Ops.RegistrySpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec
   Seal.Phase6aSpec.spec

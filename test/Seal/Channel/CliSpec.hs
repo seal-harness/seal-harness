@@ -127,7 +127,7 @@ spec = do
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (EbLocal mkLocalExecHandlePlaceholder)
-                  Nothing Full approvals (pure ())
+                  Nothing Full approvals (pure ()) False
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing

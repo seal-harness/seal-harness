@@ -95,6 +95,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 approvals
                 Nothing
                 (pure ())
+                False
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
@@ -127,6 +128,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 approvals
                 Nothing
                 (pure ())
+                False
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
     -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)
@@ -178,6 +180,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       approvals
                       Nothing
                       (pure ())
+                      False
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- The on-disk conversation.jsonl must contain exactly 4 lines:
@@ -227,6 +230,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       approvals
                       (Just reqPath)
                       (pure ())
+                      False
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- requests.jsonl has one line per provider call. Each line is the full
@@ -286,6 +290,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       approvals
                       (Just reqPath)
                       (pure ())
+                      False
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- Read back the two-file format + the debug requests file.
@@ -363,7 +368,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
 
@@ -384,7 +389,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` False
 
@@ -405,7 +410,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ())
+                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
       readIORef prompts `shouldReturn` ([] :: [Text])
@@ -438,7 +443,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
                   (EbLocal mkLocalExecHandlePlaceholder) caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ())
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "ping")
       readIORef ran `shouldReturn` 1
       readIORef prompts `shouldReturn` ([] :: [Text])

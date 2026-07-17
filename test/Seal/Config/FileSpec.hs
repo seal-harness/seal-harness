@@ -12,7 +12,7 @@ import Test.Hspec
 
 import Seal.Config.File
   ( FileConfig (..), ProviderConfig (..), RetrievalConfig (..), defaultFileConfig
-  , defaultRetrievalMaxScanBytes, loadFileConfig, providerBaseUrl
+  , defaultRetrievalMaxScanBytes, loadFileConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveFileConfig
   , updateFileConfig, upsertProvider, UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), untrustedExecConfigFromFile )
@@ -38,6 +38,7 @@ spec = describe "Seal.Config.File" $ do
         , fcGateway          = Nothing
         , fcUntrustedExec   = Nothing
         , fcDebugSessionTranscript = Nothing
+        , fcOnDemandSchemas = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -96,6 +97,7 @@ spec = describe "Seal.Config.File" $ do
               , fcGateway          = Nothing
         , fcUntrustedExec   = Nothing
         , fcDebugSessionTranscript = Nothing
+        , fcOnDemandSchemas = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path
@@ -355,3 +357,39 @@ spec = describe "Seal.Config.File" $ do
         saveFileConfig path cfg
         Right back <- loadFileConfig path
         fcDebugSessionTranscript back `shouldBe` Just True
+
+  describe "on_demand_schemas flag" $ do
+    it "absent key decodes to Nothing" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "vault_path = \"/tmp/vault.age\"\n"
+        Right cfg <- loadFileConfig path
+        fcOnDemandSchemas cfg `shouldBe` Nothing
+
+    it "parses on_demand_schemas = true" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "on_demand_schemas = true\n"
+        Right cfg <- loadFileConfig path
+        fcOnDemandSchemas cfg `shouldBe` Just True
+
+    it "parses on_demand_schemas = false" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        TIO.writeFile path "on_demand_schemas = false\n"
+        Right cfg <- loadFileConfig path
+        fcOnDemandSchemas cfg `shouldBe` Just False
+
+    it "round-trips through save/load" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+            cfg  = defaultFileConfig { fcOnDemandSchemas = Just True }
+        saveFileConfig path cfg
+        Right back <- loadFileConfig path
+        fcOnDemandSchemas back `shouldBe` Just True
+
+    it "onDemandSchemas defaults to False when the key is absent" $
+      onDemandSchemas defaultFileConfig `shouldBe` False
+
+    it "onDemandSchemas returns True when the key is set" $
+      onDemandSchemas (defaultFileConfig { fcOnDemandSchemas = Just True }) `shouldBe` True
