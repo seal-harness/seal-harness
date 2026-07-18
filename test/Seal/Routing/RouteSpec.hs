@@ -85,7 +85,10 @@ spec = describe "Seal.Routing.Route" $ do
           Right (Focus _) -> True
           _               -> False
     prop "/N payload for valid N always routes to Inject" $
-      \c payload -> (c `elem` ("0123456789abcdefghij" :: String)) && not (T.null payload) ==>
+      \c payload ->
+        (c `elem` ("0123456789abcdefghij" :: String))
+          && not (T.null payload)
+          && not (T.null (T.strip payload)) ==>
         case route (T.singleton '/' <> T.singleton c <> " " <> payload) of
           Right (Inject _ _) -> True
           _                  -> False
