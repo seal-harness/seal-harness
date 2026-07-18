@@ -131,10 +131,18 @@ renderToolContent isErr parts =
 
 encTool :: ToolDefinition -> Value
 encTool (ToolDefinition (OpName n) d sch) =
-  object
-    [ "type" .= ("function" :: Text)
-    , "function" .= object ["name" .= n, "description" .= d, "parameters" .= sch]
-    ]
+  -- Omit parameters entirely when it's the on-demand stub (OpenAI/Ollama's
+  -- parameters field is optional). Keeps the stub tools at zero schema-token
+  -- cost; the model retrieves a tool's real schema via OPCODE_DESCRIBE.
+  if sch == stubSchema
+    then object
+           [ "type" .= ("function" :: Text)
+           , "function" .= object ["name" .= n, "description" .= d]
+           ]
+    else object
+           [ "type" .= ("function" :: Text)
+           , "function" .= object ["name" .= n, "description" .= d, "parameters" .= sch]
+           ]
 
 -- Pure response mapping ----------------------------------------------------
 

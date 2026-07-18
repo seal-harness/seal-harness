@@ -10,6 +10,8 @@ module Seal.ISA.Registry
   , mkRegistry
   , lookupOp
   , registryToolDefs
+  , registryToolDefs'
+  , stubSchema
   , secretOpNames
   ) where
 
@@ -19,7 +21,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 
 import Seal.Core.Types (OpName (..))
-import Seal.Providers.Class (ToolDefinition (..))
+import Seal.Providers.Class (ToolDefinition (..), stubSchema)
 import Seal.ISA.Opcode
 
 -- | The registry carries both a name-indexed 'Map' (O(log n) dispatch
@@ -37,8 +39,24 @@ lookupOp (Registry m _) n = Map.lookup n m
 -- order (the order 'mkRegistry' received). NOT alphabetical — the wiring
 -- layer controls the order so it can steer which tools the model tries first.
 registryToolDefs :: Registry -> [ToolDefinition]
-registryToolDefs (Registry _ order) =
-  [ ToolDefinition (opName o) (opDesc o) (opInSchema o) | o <- order ]
+registryToolDefs = registryToolDefs' False
+
+-- | Like 'registryToolDefs' but with a flag to swap full @input_schema@s for
+-- a minimal stub. When @useStub@ is 'True', each tool definition carries
+-- 'stubSchema' instead of the opcode's real 'opInSchema' — the name and
+-- description are preserved so the model still knows what tools exist, but
+-- the per-opcode schema JSON (the bulk of the tokens) is omitted. The model
+-- is expected to call the @OPCODE_DESCRIBE@ opcode to retrieve a tool's full
+-- schema before calling it. When @useStub@ is 'False' this is identical to
+-- 'registryToolDefs'. The provider encoders OMIT the @input_schema@ field
+-- entirely when it equals 'stubSchema' (see 'Seal.Providers.Class'), so the
+-- stub costs zero tokens on the wire rather than the few a real stub object
+-- would cost.
+registryToolDefs' :: Bool -> Registry -> [ToolDefinition]
+registryToolDefs' useStub (Registry _ order) =
+  [ ToolDefinition (opName o) (opDesc o) (if useStub then stubSchema else opInSchema o)
+  | o <- order
+  ]
 
 -- | The set of opcode names whose tool results may carry secrets and must be
 -- redacted from the on-disk @conversation.jsonl@. Only opcodes that return a

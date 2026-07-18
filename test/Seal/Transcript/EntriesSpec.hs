@@ -1,15 +1,19 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Transcript.EntriesSpec (spec) where
 
-import Data.Aeson (decode, encode)
+import Data.Aeson (Value (..), decode, encode)
+import Data.Aeson.Key (fromString)
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString qualified as BS
+import Data.Foldable (for_, toList)
 import Data.Map.Strict qualified as Map
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 import Test.QuickCheck
 
-import Seal.Core.Types (ModelId (..))
-import Seal.Providers.Class (StopReason (..), ToolChoice (..), Usage (..))
+import Seal.Core.Types (ModelId (..), OpName (..))
+import Seal.Providers.Class (StopReason (..), ToolChoice (..), Usage (..), stubSchema, ToolDefinition (..))
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Entries
 
@@ -69,6 +73,35 @@ spec = describe "Seal.Transcript.Entries" $ do
 
     it "emptyEnvelopeDelta round-trips as an empty object" $
       decode (encode emptyEnvelopeDelta) `shouldBe` Just emptyEnvelopeDelta
+
+    -- Regression: a ToolDefinition whose schema is the on-demand stub is
+    -- encoded WITHOUT input_schema. A required-field reader would reject
+    -- that row and take down the whole EnvelopeDelta parse, losing the
+    -- system prompt from the reconstructed envelope. The custom FromJSON
+    -- must default the absent field back to stubSchema.
+    it "round-trips a stub-schema ToolDefinition (input_schema omitted on encode, restored on decode)" $ do
+      let stubTd = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
+          delta  = emptyEnvelopeDelta { edTools = Just [stubTd] }
+          encoded = encode delta
+      -- the on-disk JSON must NOT carry input_schema for the stub tool;
+      -- decode the encoded bytes and inspect the tools array directly.
+      -- Keys follow the Anthropic wire shape: name / description / input_schema.
+      case decode encoded :: Maybe Value of
+        Just (Object o) -> case KeyMap.lookup (fromString "tools") o of
+          Just (Array tools) -> for_ (toList tools) $ \case
+            Object td -> do
+              KeyMap.member (fromString "input_schema") td `shouldBe` False
+              KeyMap.member (fromString "name") td `shouldBe` True
+              KeyMap.member (fromString "description") td `shouldBe` True
+            _         -> expectationFailure "expected a tool object"
+          _ -> expectationFailure "expected a tools array"
+        _ -> expectationFailure "expected an object"
+      decode encoded `shouldBe` Just delta
+
+    it "round-trips a null-schema ToolDefinition (input_schema present as null)" $ do
+      let nullTd = ToolDefinition (OpName "X") "d" Null
+          delta  = emptyEnvelopeDelta { edTools = Just [nullTd] }
+      decode (encode delta) `shouldBe` Just delta
 
   describe "applyDelta" $ do
     it "inherits unchanged fields" $

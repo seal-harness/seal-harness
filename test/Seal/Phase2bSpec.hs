@@ -125,6 +125,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
+                  , aeOnDemandSchemas = False
                 }
           in runApp appEnv (runTurn agentEnv body)
         plainHandler h mSrc body = case mSrc of

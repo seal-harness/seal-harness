@@ -155,19 +155,19 @@ teLineToFrontend rawLine =
       lookupT key = case KeyMap.lookup (k key) o of
         Just (A.String t) -> Just t
         _                 -> Nothing
-      payloadStr = maybe mempty A.encode (KeyMap.lookup (k "tePayload") o)
+      payloadStr = maybe mempty A.encode (KeyMap.lookup (k "payload") o)
   in object
-     [ "id"        .= lookupT "teId"
-     , "timestamp" .= lookupT "teTimestamp"
-     , "direction" .= lookupT "teDirection"
+     [ "id"        .= lookupT "id"
+     , "timestamp" .= lookupT "timestamp"
+     , "direction" .= lookupT "direction"
      , "payload"   .= TE.decodeUtf8 (BL.toStrict payloadStr)
-     , "harness"   .= lookupT "teCorrelation"
-     , "model"     .= lookupT "teModel"
+     , "harness"   .= lookupT "correlation"
+     , "model"     .= lookupT "model"
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
 
 -- | Synthesize a frontend TranscriptEntry from a conversation.jsonl line
--- (@msgRole@/@msgContent@). User → request; Assistant → response. The
+-- (@role@/@content@). User → request; Assistant → response. The
 -- line index (0-based) is used as the entry id — conversation.jsonl
 -- carries no per-entry id, and the line index is stable across reads of
 -- the same file, so the frontend's dedup-by-id works.
@@ -177,10 +177,10 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
         A.Object m -> m
         _          -> KeyMap.empty
       k = Key.fromText
-      role = case KeyMap.lookup (k "msgRole") o of
+      role = case KeyMap.lookup (k "role") o of
         Just (A.String t) -> t
         _                  -> "user"
-      rawContent = case KeyMap.lookup (k "msgContent") o of
+      rawContent = case KeyMap.lookup (k "content") o of
         Just (A.Array arr) -> arr
         _                  -> mempty
       contentBlocks = map cbToFrontend (V.toList rawContent)
@@ -226,24 +226,24 @@ cbToFrontend blk =
          _                 -> fallback
        Just "CbToolUse" -> object
          [ "type"  .= ("tool_use" :: Text)
-         , "id"    .= fromMaybe "" (lookupT "cbId" bo)
-         , "name"  .= fromMaybe "" (lookupT "cbName" bo)
-         , "input" .= fromMaybe A.Null (KeyMap.lookup (k "cbInput") bo)
+         , "id"    .= fromMaybe "" (lookupT "id" bo)
+         , "name"  .= fromMaybe "" (lookupT "name" bo)
+         , "input" .= fromMaybe A.Null (KeyMap.lookup (k "input") bo)
          ]
        Just "CbToolResult" -> object
          [ "type"        .= ("tool_result" :: Text)
-         , "tool_use_id" .= fromMaybe "" (lookupT "cbForId" bo)
-         , "content"     .= toolResultPartsToFrontend (KeyMap.lookup (k "cbParts") bo)
-         , "is_error"    .= fromMaybe False (lookupB "cbIsError" bo)
+         , "tool_use_id" .= fromMaybe "" (lookupT "forId" bo)
+         , "content"     .= toolResultPartsToFrontend (KeyMap.lookup (k "parts") bo)
+         , "is_error"    .= fromMaybe False (lookupB "isError" bo)
          ]
        _ -> fallback
   where
      fallback = object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
 
--- | Rewrite the on-disk 'cbParts' value into the Anthropic-style array
+-- | Rewrite the on-disk 'parts' value into the Anthropic-style array
 -- the frontend parses (@[{type:"text", text:"..."}]@). 'ToolResultPart'
 -- is a @newtype TrpText Text@, so aeson's derived 'ToJSON' serializes it
--- as a bare JSON string (not a 'TaggedObject'). The on-disk 'cbParts' is
+-- as a bare JSON string (not a 'TaggedObject'). The on-disk 'parts' is
 -- thus @["text"]@, not @[{tag:"TrpText", contents:"text"}]@. Handles both
 -- the bare-string shape and the object shape (defensive fallback).
 toolResultPartsToFrontend :: Maybe A.Value -> A.Value
@@ -321,9 +321,9 @@ rewritePayload val dir =
             Nothing -> []
           usageFields = case KeyMap.lookup (k "usage") o of
             Just (A.Object uo) ->
-              let uIn  = case KeyMap.lookup (k "uInput")  uo of
+              let uIn  = case KeyMap.lookup (k "input")  uo of
                     Just n -> Just n; _ -> Nothing
-                  uOut = case KeyMap.lookup (k "uOutput") uo of
+                  uOut = case KeyMap.lookup (k "output") uo of
                     Just n -> Just n; _ -> Nothing
               in case (uIn, uOut) of
                    (Just _, Just _) ->
@@ -353,8 +353,8 @@ rewritePayload val dir =
       in A.object fields
     _ -> val
 
--- | Rewrite one GHC-Generics 'Message' (@{msgRole, msgContent: [...]}@)
--- to the Anthropic-style shape (@{role, content: [...]}@) the frontend
+-- | Rewrite one 'Message' (@{role, content: [...]}@, strip-prefix camelCase
+-- JSON) to the Anthropic-style shape (@{role, content: [...]}@) the frontend
 -- parses, with content blocks rewritten by 'cbToFrontend'. The role is
 -- lowercased because GHC-Generics encodes 'User'/'Assistant' as
 -- @"User"@/@"Assistant"@ but the frontend checks @msg.role === "user"@.
@@ -363,10 +363,10 @@ rewriteMessage msg =
   case msg of
     A.Object mo ->
       let k = Key.fromText
-          role = case KeyMap.lookup (k "msgRole") mo of
+          role = case KeyMap.lookup (k "role") mo of
             Just (A.String t) -> T.toLower t
             _                 -> "user" :: Text
-          rawContent = case KeyMap.lookup (k "msgContent") mo of
+          rawContent = case KeyMap.lookup (k "content") mo of
             Just (A.Array arr) -> arr
             _                  -> mempty
           blocks = map cbToFrontend (V.toList rawContent)

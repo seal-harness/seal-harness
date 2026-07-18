@@ -142,8 +142,8 @@ describe('transcriptToMessages', () => {
         payload: JSON.stringify({
           system: 'sys',
           tools: [
-            { tdName: 'shell', tdDescription: 'run a shell command', tdInputSchema: { type: 'object' } },
-            { tdName: 'read', tdDescription: 'read a file', tdInputSchema: { type: 'object' } },
+            { name: 'shell', description: 'run a shell command', input_schema: { type: 'object' } },
+            { name: 'read', description: 'read a file', input_schema: { type: 'object' } },
           ],
           messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
         }),
@@ -161,7 +161,7 @@ describe('transcriptToMessages', () => {
     const parsed = JSON.parse(block.toolDefs!.json)
     expect(Array.isArray(parsed)).toBe(true)
     expect(parsed).toHaveLength(2)
-    expect(parsed[0]!.tdName).toBe('shell')
+    expect(parsed[0]!.name).toBe('shell')
   })
 
   it('emits a Tools row from Anthropic wire shape ({name, input_schema})', () => {
@@ -207,7 +207,7 @@ describe('transcriptToMessages', () => {
   })
 
   it('emits a Tools row only once per unique tool set', () => {
-    const tools = [{ tdName: 'shell', tdDescription: 'sh', tdInputSchema: {} }]
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'd1',

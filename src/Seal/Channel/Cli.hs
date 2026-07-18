@@ -47,7 +47,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (FileConfig, defaultFileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile,
+                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile, onDemandSchemas,
                           fcDebugSessionTranscript)
 import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
@@ -77,6 +77,7 @@ import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
+import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
@@ -178,8 +179,8 @@ resolveDefProvider pr providerLabel model =
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
-  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath autonomy approvals onEntry = AgentEnv
+  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath autonomy approvals onEntry onDemand = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -196,6 +197,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
   , aeApprovals  = approvals
   , aeDebugRequestsPath = debugReqPath
   , aeOnEntry    = onEntry
+  , aeOnDemandSchemas = onDemand
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -210,6 +212,15 @@ debugRequestsPath paths sid eCfg =
     Right cfg | Just True <- fcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
+
+-- | Resolve the on-demand-schemas flag from the loaded config. 'True' when
+-- @on_demand_schemas@ is set in the config file; 'False' on load error or
+-- when the key is absent (matching the default behavior).
+onDemandFromCfg :: Either a FileConfig -> Bool
+onDemandFromCfg eCfg =
+  case eCfg of
+    Right cfg -> onDemandSchemas cfg
+    _         -> False
 
 -- | Run the Haskeline TUI loop.
 --
@@ -318,9 +329,13 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
             Right (prov, model)   ->
               withTwoFileTranscript childDir $ \childTHandle -> do
                 let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
-                      (debugRequestsPath paths sid eCfg) autonomy approvals (pure ())
+                      (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
                 runApp appEnv (runTurn env "")
         isaReg = ISA.mkRegistry
+          (baseIsaOps ++ if onDemandFromCfg eCfg
+                           then [opcodeDescribeOp isaReg, opcodeListOp isaReg]
+                           else [])
+        baseIsaOps =
           [ showHumanOp caps
           , askHumanOp caps
           , fileReadOp wsRoot operatorCeiling
@@ -393,9 +408,13 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                     Right (prov, mdl) ->
                       withTwoFileTranscript childDir $ \childTHandle -> do
                         let childEnv = mkSessionAgentEnv bgCaps prov fallBackProvider mdl childSid (adSystem def) bgIsaReg childTHandle execBackend
-                              (debugRequestsPath paths childSid eCfg) autonomy approvals (pure ())
+                              (debugRequestsPath paths childSid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
                         runApp appEnv (runTurn childEnv "")
                 bgIsaReg = ISA.mkRegistry
+                  (baseBgIsaOps ++ if onDemandFromCfg eCfg
+                                     then [opcodeDescribeOp bgIsaReg, opcodeListOp bgIsaReg]
+                                     else [])
+                baseBgIsaOps =
                   [ showHumanOp bgCaps
                   , askHumanOp bgCaps
                   , fileReadOp wsRoot operatorCeiling
@@ -431,7 +450,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   Nothing  -> pure Nothing
                   Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
                 let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
-                      (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ())
+                      (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
                 runApp appEnv (runTurn env prompt)))
         registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner])
     let plainHandler t = do
@@ -448,7 +467,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                 Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
               handlePlain
                 (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
-                   (debugRequestsPath paths (smId meta) eCfg) autonomy approvals (pure ()))
+                   (debugRequestsPath paths (smId meta) eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg))
                 appEnv t
     runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where

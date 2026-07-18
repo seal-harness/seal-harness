@@ -1258,14 +1258,15 @@ function extractToolCalls(
 }
 
 /** Extract tool-definition names from a tools array. Handles three shapes:
- *   - the transcript/CompletionRequest shape `[{tdName, tdDescription, tdInputSchema}]`
- *     (GHC-Generics-derived field names — what the reconstructed payload carries),
+ *   - the transcript/CompletionRequest shape `[{name, description, input_schema}]`
+ *     (the Anthropic wire shape — what the reconstructed payload carries since
+ *     ToolDefinition's ToJSON emits the wire keys directly),
  *   - the Anthropic wire shape `[{name, description, input_schema}]`,
  *   - the Ollama wire shape `[{type:"function", function:{name, description, parameters}}]`.
  *  Unknown shapes fall back to a JSON one-liner per entry so we never
  *  silently lose structure. Returns the tool names in document order. */
 function extractToolDefNames(tools: unknown[]): string[] {
-  const nameFields = ['tdName', 'name']
+  const nameFields = ['name']
   return tools.map((t) => {
     if (t == null || typeof t !== 'object') return JSON.stringify(t)
     const o = t as Record<string, unknown>

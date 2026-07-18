@@ -2,6 +2,7 @@
 module Seal.Providers.AnthropicSpec (spec) where
 
 import Data.Aeson
+import Data.Aeson.Types (parseMaybe)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -26,6 +27,37 @@ spec = describe "Seal.Providers.Anthropic" $ do
                                  , "content" .= [object [ "type" .= ("text" :: String)
                                                          , "text" .= ("hi" :: String)]]]]
       ]
+
+  it "encodeRequest includes input_schema for a real tool schema" $ do
+    let realSchema = object
+          [ "type" .= ("object" :: String)
+          , "properties" .= object ["path" .= object ["type" .= ("string" :: String)]]
+          ]
+        tool = ToolDefinition (OpName "FILE_READ") "read a file" realSchema
+        req  = CompletionRequest (ModelId "m") Nothing [textMsg User "hi"]
+                 [tool] ToolAuto 16
+    case parseMaybe (withObject "req" (.: "tools")) (encodeRequest req) :: Maybe [Value] of
+      Just [t] -> t `shouldBe` object
+        [ "name" .= ("FILE_READ" :: String)
+        , "description" .= ("read a file" :: String)
+        , "input_schema" .= realSchema
+        ]
+      _ -> expectationFailure "expected one tool"
+
+  it "encodeRequest omits input_schema when the tool schema is the on-demand stub" $ do
+    let tool = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
+        req  = CompletionRequest (ModelId "m") Nothing [textMsg User "hi"]
+                 [tool] ToolAuto 16
+    case parseMaybe (withObject "req" (.: "tools")) (encodeRequest req) :: Maybe [Value] of
+      Just [t] -> do
+        t `shouldBe` object
+          [ "name" .= ("FILE_READ" :: String)
+          , "description" .= ("read a file" :: String)
+          ]
+        case parseMaybe (withObject "tool" (.: "input_schema")) t of
+          Just (_ :: Value) -> expectationFailure "input_schema should be omitted for stubs"
+          Nothing            -> pure ()
+      _ -> expectationFailure "expected one tool"
 
   it "decodeResponse parses text + stop_reason + usage" $ do
     let body = object
