@@ -18,13 +18,17 @@ import Data.Time (UTCTime)
 import GHC.Generics (Generic)
 
 import Seal.Core.Types (ModelId)
+import Seal.Util.AesonUtils (stripPrefixToJSON, stripPrefixParseJSON)
 
 data Direction = Request | Response
   deriving stock (Eq, Show, Generic)
 
-instance ToJSON Direction
-instance FromJSON Direction
+instance ToJSON Direction where toJSON = stripPrefixToJSON
+instance FromJSON Direction where parseJSON = stripPrefixParseJSON
 
+-- | JSON keys (via 'stripPrefixToJSON'): @teId@→@id@, @teTimestamp@→@timestamp@,
+-- @teModel@→@model@, @teDirection@→@direction@, @tePayload@→@payload@,
+-- @teDurationMs@→@durationMs@, @teCorrelation@→@correlation@, @teMeta@→@meta@.
 data TranscriptEntry = TranscriptEntry
   { teId :: Text
   , teTimestamp :: UTCTime
@@ -36,8 +40,8 @@ data TranscriptEntry = TranscriptEntry
   , teMeta :: Map Text Value
   } deriving stock (Eq, Show, Generic)
 
-instance ToJSON TranscriptEntry
-instance FromJSON TranscriptEntry
+instance ToJSON TranscriptEntry where toJSON = stripPrefixToJSON
+instance FromJSON TranscriptEntry where parseJSON = stripPrefixParseJSON
 
 -- | One JSONL line: the canonical aeson encoding, strict, no trailing newline.
 -- The daemon appends the newline when writing.

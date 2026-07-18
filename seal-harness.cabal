@@ -49,6 +49,7 @@ library
         Seal.Providers.ContextWindow
         Seal.Providers.Ollama
         Seal.Providers.Registry
+        Seal.Util.AesonUtils
         Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv

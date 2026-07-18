@@ -75,26 +75,30 @@ spec = describe "Seal.Transcript.Entries" $ do
       decode (encode emptyEnvelopeDelta) `shouldBe` Just emptyEnvelopeDelta
 
     -- Regression: a ToolDefinition whose schema is the on-demand stub is
-    -- encoded WITHOUT tdInputSchema. The derived FromJSON would reject that
-    -- row and take down the whole EnvelopeDelta parse, losing the system
-    -- prompt from the reconstructed envelope. The custom FromJSON must
-    -- default the absent field back to stubSchema.
-    it "round-trips a stub-schema ToolDefinition (tdInputSchema omitted on encode, restored on decode)" $ do
+    -- encoded WITHOUT input_schema. A required-field reader would reject
+    -- that row and take down the whole EnvelopeDelta parse, losing the
+    -- system prompt from the reconstructed envelope. The custom FromJSON
+    -- must default the absent field back to stubSchema.
+    it "round-trips a stub-schema ToolDefinition (input_schema omitted on encode, restored on decode)" $ do
       let stubTd = ToolDefinition (OpName "FILE_READ") "read a file" stubSchema
           delta  = emptyEnvelopeDelta { edTools = Just [stubTd] }
           encoded = encode delta
-      -- the on-disk JSON must NOT carry tdInputSchema for the stub tool;
-      -- decode the encoded bytes and inspect the tools array directly
+      -- the on-disk JSON must NOT carry input_schema for the stub tool;
+      -- decode the encoded bytes and inspect the tools array directly.
+      -- Keys follow the Anthropic wire shape: name / description / input_schema.
       case decode encoded :: Maybe Value of
         Just (Object o) -> case KeyMap.lookup (fromString "tools") o of
           Just (Array tools) -> for_ (toList tools) $ \case
-            Object td -> KeyMap.member (fromString "tdInputSchema") td `shouldBe` False
+            Object td -> do
+              KeyMap.member (fromString "input_schema") td `shouldBe` False
+              KeyMap.member (fromString "name") td `shouldBe` True
+              KeyMap.member (fromString "description") td `shouldBe` True
             _         -> expectationFailure "expected a tool object"
           _ -> expectationFailure "expected a tools array"
         _ -> expectationFailure "expected an object"
       decode encoded `shouldBe` Just delta
 
-    it "round-trips a null-schema ToolDefinition (tdInputSchema present as null)" $ do
+    it "round-trips a null-schema ToolDefinition (input_schema present as null)" $ do
       let nullTd = ToolDefinition (OpName "X") "d" Null
           delta  = emptyEnvelopeDelta { edTools = Just [nullTd] }
       decode (encode delta) `shouldBe` Just delta
