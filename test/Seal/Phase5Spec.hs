@@ -7,21 +7,23 @@
 -- The session transcript stays in the two-file format.
 module Seal.Phase5Spec (spec) where
 
-import Control.Concurrent (threadDelay)
 import Data.Aeson (object, (.=))
 import Data.IORef
 import Data.Text (Text)
+import Data.Text qualified as T
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend qualified as Def
-import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
+import Seal.Agent.Runtime.Delegation
+  ( ChildWorkerOutcome (..), ChildExitReason (..)
+  , defaultDelegationConfig, newSpawnPauseFlag )
 import Seal.Agent.Runtime.Registry
-  ( AgentStatus (..), agentStatus, newAgentRuntime )
+  ( newAgentRuntime )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..))
@@ -29,11 +31,12 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
-import Seal.ISA.Opcode (localBackend)
+import Seal.ISA.Opcode (localBackend, OpResult (..))
 import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.ISA.Ops.Agent
   ( agentDefWriteOp, agentDefReadOp, agentInstancesOp
-  , agentStartOp, agentStatusOp, agentStopOp )
+  , agentStartOp, agentStatusOp, agentStopOp, agentInterruptOp
+  , AgentStartWiring (..) )
 import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Skills
@@ -41,7 +44,7 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Registry qualified as ISA
 import Seal.Memory.Backend qualified as Mem
 import Seal.Providers.Class
-  ( CompletionResponse (..), ContentBlock (..), Provider (..)
+  ( ToolResultPart (..), CompletionResponse (..), ContentBlock (..), Provider (..)
   , StopReason (..), Usage (..), SomeProvider (..) )
 import Seal.Skills.Backend qualified as Skill
 import Seal.Security.Policy (AutonomyLevel (..))
@@ -105,6 +108,20 @@ buildRegistry cfgRoot workerRan sid = do
   skillBackend  <- Skill.markdownSkillBackend (cfgRoot </> "skills") repo
   defBackend    <- Def.markdownAgentDefBackend (cfgRoot </> "agents") repo
   rt            <- newAgentRuntime
+  pauseFlag     <- newSpawnPauseFlag
+  let worker _ _ _ _ = do
+        modifyIORef' workerRan (+1)
+        pure (ChildWorkerOutcome (Just "worker done") CerCompleted 0 0 (Just sid))
+      startWiring = AgentStartWiring
+        { aswDefBackend = defBackend
+        , aswRuntime = rt
+        , aswConfig = pure defaultDelegationConfig
+        , aswPauseFlag = pauseFlag
+        , aswParentActivity = Nothing
+        , aswMintSession = pure sid
+        , aswParentDepth = 0
+        , aswWorker = worker
+        }
   pure $ ISA.mkRegistry
     [ memoryWriteOp memBackend sid
     , memoryRecallOp defaultPageParams memBackend
@@ -116,9 +133,10 @@ buildRegistry cfgRoot workerRan sid = do
     , agentDefWriteOp defBackend sid
     , agentDefReadOp defBackend
     , agentInstancesOp rt
-    , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
+    , agentStartOp startWiring
     , agentStatusOp rt
     , agentStopOp rt
+    , agentInterruptOp rt
     ]
 
 spec :: Spec
@@ -170,19 +188,34 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       -- 4. The model saw the final text.
       readIORef sent `shouldReturn` ["ollama/llama3> all four evolutionary mutations applied"]
 
-  it "AGENT_START forks a worker; AGENT_STATUS reads Running; AGENT_STOP stops it (Trusted file-write, no Audited log)" $
+  it "AGENT_START runs synchronously and returns a summary (Trusted, no Audited log)" $
     withSystemTempDirectory "seal-phase5" $ \root -> do
       let cfgRoot = root </> "config"
       ensureConfigRepo cfgRoot
       workerRan <- newIORef (0 :: Int)
       defBackend <- Def.markdownAgentDefBackend (cfgRoot </> "agents") (openConfigRepo cfgRoot)
       rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
       let sid = sampleSession
+          worker _ _ _ _ = do
+            modifyIORef' workerRan (+1)
+            pure (ChildWorkerOutcome (Just "worker done") CerCompleted 0 0 (Just sid))
+          startWiring = AgentStartWiring
+            { aswDefBackend = defBackend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure sid
+            , aswParentDepth = 0
+            , aswWorker = worker
+            }
           reg = ISA.mkRegistry
             [ agentDefWriteOp defBackend sid
-            , agentStartOp defBackend rt (pure sid) (\_ _ -> modifyIORef' workerRan (+1) >> threadDelay 1000000)
+            , agentStartOp startWiring
             , agentStatusOp rt
             , agentStopOp rt
+            , agentInterruptOp rt
             ]
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
@@ -195,22 +228,19 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                            ]))
       -- The def file landed on disk.
       doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
-      -- Start it via dispatch (Trusted — no file write, just runtime).
+      -- Start it via dispatch (synchronous — the worker runs to completion
+      -- before dispatch returns; no AGENT_STATUS Running state to observe).
       rStart <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_START")
-                              (object ["id" .= ("worker" :: Text)]))
+                            (object ["id" .= ("worker" :: Text), "goal" .= ("do work" :: Text)]))
       rStart `shouldSatisfy` isRight
-      threadDelay 50000
+      -- Synchronous: the worker has already run exactly once.
       readIORef workerRan `shouldReturn` 1
-      let workerDef = case mkAgentDefId "worker" of
-            Right aid -> aid
-            Left _    -> error "unreachable: worker always validates"
-      mStatus <- agentStatus rt workerDef
-      mStatus `shouldSatisfy` (Just Running ==)
-      -- Stop it via dispatch (Trusted).
-      rStop <- runTestApp (dispatch reg tHandle localBackend (EbLocal mkLocalExecHandlePlaceholder) (OpName "AGENT_STOP")
-                            (object ["id" .= ("worker" :: Text)]))
-      rStop `shouldSatisfy` isRight
-      agentStatus rt workerDef `shouldReturn` Nothing
+      -- The result text carries the summary.
+      case rStart of
+        Right res -> case orParts res of
+          [TrpText t] -> T.isInfixOf "worker done" t `shouldBe` True
+          _           -> expectationFailure "expected a single text part"
+        Left _ -> expectationFailure "dispatch failed"
 
 isRight :: Either a b -> Bool
 isRight (Right _) = True

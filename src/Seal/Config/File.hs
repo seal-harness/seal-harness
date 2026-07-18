@@ -10,9 +10,11 @@ module Seal.Config.File
   , RetrievalConfig (..)
   , UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..)
+  , DelegationFileConfig (..)
   , defaultFileConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
+  , defaultDelegationConfig
   , emptyProviderConfig
   , loadFileConfig
   , providerBaseUrl
@@ -106,6 +108,9 @@ data FileConfig = FileConfig
     -- on-demand before calling it. Absent (the default) preserves the
     -- existing behavior: full schemas are sent inline and the describe
     -- opcodes are not registered.
+  , fcDelegation :: Maybe DelegationFileConfig
+    -- ^ Optional @[delegation]@ section (subagent spawning tunables).
+    -- Absent means 'defaultDelegationConfig' applies at resolution time.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -148,6 +153,34 @@ data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
   , uerfcWorkspace  :: Maybe Text
   } deriving stock (Eq, Show)
 
+-- | The @[delegation]@ section (subagent spawning tunables). Every field is
+-- optional; a missing key decodes as 'Nothing' and the resolver falls back to
+-- the compiled-in default. Mirrors Hermes' @delegation.*@ config knobs.
+data DelegationFileConfig = DelegationFileConfig
+  { dfcMaxConcurrentChildren :: Maybe Int
+    -- ^ Cap on parallel children per AGENT_START batch. Default 3, floor 1.
+  , dfcChildTimeoutSeconds  :: Maybe Double
+    -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
+  , dfcMaxSpawnDepth         :: Maybe Int
+    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+  , dfcOrchestratorEnabled   :: Maybe Bool
+    -- ^ Kill switch for the orchestrator role. Default True.
+  , dfcProvider              :: Maybe Text
+    -- ^ Per-child provider override (route subagents to a different provider).
+  , dfcModel                 :: Maybe Text
+    -- ^ Per-child model override.
+  , dfcBaseUrl               :: Maybe Text
+    -- ^ Per-child base URL override (OpenAI-compatible direct endpoint).
+  , dfcApiKey                :: Maybe Text
+    -- ^ Per-child API key override (used when @dfcBaseUrl@ is set).
+  , dfcApiMode               :: Maybe Text
+    -- ^ Per-child API mode override (@chat_completions@ /
+    -- @anthropic_messages@).
+  , dfcSubagentAutoApprove   :: Maybe Bool
+    -- ^ Whether subagent dangerous-command approvals auto-approve. Default
+    -- False (auto-deny). Not yet wired; reserved for future use.
+  } deriving stock (Eq, Show)
+
 emptyProviderConfig :: ProviderConfig
 emptyProviderConfig = ProviderConfig Nothing Nothing
 
@@ -170,11 +203,29 @@ defaultFileConfig = FileConfig
   , fcUntrustedExec   = Nothing
   , fcDebugSessionTranscript = Nothing
   , fcOnDemandSchemas = Nothing
+  , fcDelegation      = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
 defaultRetrievalConfig :: RetrievalConfig
 defaultRetrievalConfig = RetrievalConfig { rcMaxScanBytes = Nothing }
+
+-- | 'DelegationFileConfig' with all fields absent (operator did not set them).
+-- The resolver ('Seal.Agent.Runtime.Delegation.resolveDelegationConfig')
+-- fills in the compiled-in defaults.
+defaultDelegationConfig :: DelegationFileConfig
+defaultDelegationConfig = DelegationFileConfig
+  { dfcMaxConcurrentChildren = Nothing
+  , dfcChildTimeoutSeconds   = Nothing
+  , dfcMaxSpawnDepth          = Nothing
+  , dfcOrchestratorEnabled    = Nothing
+  , dfcProvider               = Nothing
+  , dfcModel                  = Nothing
+  , dfcBaseUrl                 = Nothing
+  , dfcApiKey                  = Nothing
+  , dfcApiMode                 = Nothing
+  , dfcSubagentAutoApprove    = Nothing
+  }
 
 -- | The compiled-in default for the operator ceiling on bytes scanned per
 -- retrieval (≥ the prior 'FILE_READ' 65536 bound). Used when the
@@ -207,6 +258,7 @@ fileConfigCodec = FileConfig
   <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= fcDebugSessionTranscript
   <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= fcOnDemandSchemas
+  <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= fcDelegation
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -235,6 +287,22 @@ untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
   <*> Toml.dioptional (Toml.string "identity")  .= uerfcIdentity
   <*> Toml.dioptional (Toml.string "known_hosts") .= uerfcKnownHosts
   <*> Toml.dioptional (Toml.text "workspace")   .= uerfcWorkspace
+
+-- | Bidirectional tomland codec for the @[delegation]@ section. Every field
+-- is optional at the TOML layer. 'dfcChildTimeoutSeconds' uses 'Toml.double'
+-- so fractional seconds (e.g. @30.5@) round-trip cleanly.
+delegationConfigCodec :: Toml.TomlCodec DelegationFileConfig
+delegationConfigCodec = DelegationFileConfig
+  <$> Toml.dioptional (Toml.int    "max_concurrent_children") .= dfcMaxConcurrentChildren
+  <*> Toml.dioptional (Toml.double "child_timeout_seconds")    .= dfcChildTimeoutSeconds
+  <*> Toml.dioptional (Toml.int    "max_spawn_depth")          .= dfcMaxSpawnDepth
+  <*> Toml.dioptional (Toml.bool   "orchestrator_enabled")    .= dfcOrchestratorEnabled
+  <*> Toml.dioptional (Toml.text   "provider")                .= dfcProvider
+  <*> Toml.dioptional (Toml.text   "model")                   .= dfcModel
+  <*> Toml.dioptional (Toml.text   "base_url")                 .= dfcBaseUrl
+  <*> Toml.dioptional (Toml.text   "api_key")                  .= dfcApiKey
+  <*> Toml.dioptional (Toml.text   "api_mode")                 .= dfcApiMode
+  <*> Toml.dioptional (Toml.bool   "subagent_auto_approve")    .= dfcSubagentAutoApprove
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization

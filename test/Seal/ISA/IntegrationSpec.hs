@@ -16,7 +16,6 @@
 -- on each opcode's contract.
 module Seal.ISA.IntegrationSpec (spec) where
 
-import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), encode, object, (.=))
@@ -33,11 +32,13 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend qualified as AgentDefBackend
-import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
+import Seal.Agent.Runtime.Delegation
+  ( ChildWorkerOutcome (..), ChildExitReason (..)
+  , defaultDelegationConfig, newSpawnPauseFlag )
 import Seal.Agent.Runtime.Registry
-  (AgentStatus (..), agentStatus, newAgentRuntime, stopAgent)
+  (newAgentRuntime)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
@@ -699,9 +700,10 @@ spec = describe "Seal.ISA.Integration" $ do
   -- AGENT_START / STATUS / INSTANCES / STOP
   -- ----------------------------------------------------------------------
   describe "AGENT_START" $ do
-    it "\"Start the 'greeter' agent.\" -> AGENT_START -> instance Running in the runtime" $ do
+    it "\"Start the 'greeter' agent.\" -> AGENT_START -> runs synchronously and returns a summary" $ do
       backend <- AgentDefBackend.noneBackend
       rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
       ran <- newIORef (0 :: Int)
       _ <- runTestApp (dispatchOne (Registry.mkRegistry [agentDefWriteOp backend sid])
                           (OpName "AGENT_DEF_WRITE")
@@ -709,20 +711,29 @@ spec = describe "Seal.ISA.Integration" $ do
                                   , "name" .= ("g" :: Text)
                                   , "provider" .= ("ollama" :: Text)
                                   , "model" .= ("llama3" :: Text) ]))
-      let worker _ _ = do modifyIORef' ran (+ 1); threadDelay 1000000
-          op = agentStartOp backend rt (pure (SessionId "fresh")) worker
+      let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (SessionId "child")))
+          wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = worker
+            }
+          op = agentStartOp wiring
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_START")
-                        (object ["id" .= ("greeter" :: Text)]))
+                        (object ["id" .= ("greeter" :: Text), "goal" .= ("say hi" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
-          threadDelay 50000
+          -- Synchronous: the worker has already run by the time dispatch returns.
           readIORef ran `shouldReturn` 1
-          status <- agentStatus rt (right (mkAgentDefId "greeter"))
-          status `shouldBe` Just Running
-          _ <- stopAgent rt (right (mkAgentDefId "greeter"))
-          pure ()
+          case orParts res of
+            [TrpText t] -> T.isInfixOf "hi" t `shouldBe` True
+            _           -> expectationFailure "expected a single text part"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
   describe "AGENT_STATUS" $ do
@@ -731,7 +742,7 @@ spec = describe "Seal.ISA.Integration" $ do
       let op = agentStatusOp rt
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_STATUS")
-                        (object ["id" .= ("greeter" :: Text)]))
+                        (object ["subagent_id" .= ("sa-greeter-00000001" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
@@ -756,7 +767,7 @@ spec = describe "Seal.ISA.Integration" $ do
       let op = agentStopOp rt
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "AGENT_STOP")
-                        (object ["id" .= ("greeter" :: Text)]))
+                        (object ["subagent_id" .= ("sa-greeter-00000001" :: Text)]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
