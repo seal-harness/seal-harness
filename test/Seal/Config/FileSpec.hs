@@ -39,6 +39,7 @@ spec = describe "Seal.Config.File" $ do
         , fcUntrustedExec   = Nothing
         , fcDebugSessionTranscript = Nothing
         , fcOnDemandSchemas = Nothing
+        , fcDelegation      = Nothing
         }
 
   describe "loadFileConfig" $ do
@@ -98,6 +99,7 @@ spec = describe "Seal.Config.File" $ do
         , fcUntrustedExec   = Nothing
         , fcDebugSessionTranscript = Nothing
         , fcOnDemandSchemas = Nothing
+        , fcDelegation      = Nothing
               }
         saveFileConfig path cfg
         result <- loadFileConfig path

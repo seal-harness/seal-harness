@@ -48,15 +48,15 @@ import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (FileConfig, defaultFileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile, onDemandSchemas,
-                          fcDebugSessionTranscript)
-import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionRequestsPath)
+                          fcDebugSessionTranscript, fcDelegation)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Opcode (localBackend)
+import Seal.ISA.Opcode (localBackend, opName)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 #endif
@@ -72,7 +72,8 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp )
+  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
+  , agentInterruptOp, AgentStartWiring (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -83,6 +84,13 @@ import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
 import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
+import Seal.Agent.Runtime.Delegation
+  ( DelegationConfig, defaultDelegationConfig, fromFileConfig
+  , SpawnPauseFlag, newSpawnPauseFlag
+  , ParentActivity, newParentActivity
+  , ChildTask (..) )
+import Seal.Agent.Runtime.Delegation.Worker
+  ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -109,27 +117,45 @@ import Seal.Vault.Commands (VaultRuntime (..))
 -- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). The three
 -- store backends are disk-backed (Markdown files under @config\/@); disk is
 -- canonical and git is the versioning + audit layer. The agent runtime is an
--- in-process STM registry (lifecycle only — not persisted).
+-- in-process STM registry (lifecycle only — not persisted). The delegation
+-- knobs (config, pause flag, parent-activity cell) are process-global so
+-- AGENT_START calls across all channels share one pause / heartbeat state.
 data Backends = Backends
   { bMemory    :: Mem.MemoryBackend
   , bSkills    :: Skill.SkillBackend
   , bAgentDefs :: Def.AgentDefBackend
   , bRuntime   :: AgentRuntime
+  , bDelegationConfig :: IO DelegationConfig
+    -- ^ Reload the [delegation] config per AGENT_START call (so config
+    -- changes take effect without a restart). The IO action reads
+    -- @config.toml@ and returns the resolved 'DelegationConfig'.
+  , bSpawnPauseFlag :: SpawnPauseFlag
+    -- ^ Process-global spawn-pause flag (operator can freeze new fan-out).
+  , bParentActivity :: ParentActivity
+    -- ^ Process-global parent-activity cell (heartbeat target).
   }
 
 -- | Construct the disk-backed backends for the given config repo. The three
 -- stores read their directories on demand (no startup materialization needed
--- — disk is canonical, so @\/skill list@ etc. just enumerate the dir).
+-- — disk is canonical, so @\/skill list@ etc. just enumerate the dir). The
+-- delegation knobs are process-global; the config is re-read per AGENT_START
+-- call so config changes take effect without a restart.
 newBackends :: FilePath -> ConfigRepo -> IO Backends
 newBackends cfgRoot repo = do
   let skillsDir    = cfgRoot </> "skills"
       agentsDir    = cfgRoot </> "agents"
       memoryDir    = cfgRoot </> "memory"
+  rt          <- newAgentRuntime
+  pauseFlag   <- newSpawnPauseFlag
+  parentAct   <- newParentActivity
   Backends
     <$> Mem.markdownMemoryBackend memoryDir repo
     <*> Skill.markdownSkillBackend skillsDir repo
     <*> Def.markdownAgentDefBackend agentsDir repo
-    <*> newAgentRuntime
+    <*> pure rt
+    <*> pure (pure defaultDelegationConfig)  -- overridden at call sites that have a config path
+    <*> pure pauseFlag
+    <*> pure parentAct
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -303,34 +329,90 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
             Right s  -> pure s
             -- unreachable: formatSessionId only emits digits and dashes
             Left _e  -> pure sid0
-        -- The AGENT_START worker-builder: resolve the def's provider+model,
-        -- open a fresh two-file transcript under
-        -- @\<parent-session\>\/agents\/\<child-id\>@, build a fresh AgentEnv
-        -- bound to the new session + child transcript, and run a turn. The
-        -- child gets its OWN TwoFileHandle so its conversation/entries stay
-        -- separate from the parent's — mixing them would corrupt the two-file
-        -- format's per-session erConvLen and envelope-delta fold.
-        mkWorker def sid = do
-          let childDir = agentSessionDir paths sid0 sid
-          createDirectoryIfMissing True childDir
-          -- Resolve the def's provider+model. Empty fields (e.g. a
-          -- DirScheme agent with no AGENTS.md frontmatter) fall back to
-          -- the active session's provider+model (symmetric). A
-          -- non-empty-but-unknown provider still fails with the existing
-          -- error.
+        -- The AGENT_START worker-builder: build a fresh AgentEnv for the
+        -- child (its own two-file transcript under
+        -- @\<parent-session\>\/agents\/\<child-id\>@), run 'runTurn' with the
+        -- goal as the first user message, and capture the final text
+        -- response as the summary. The child's ISA registry is narrowed:
+        -- the delegation blocklist strips AGENT_START/AGENT_DEF_*/lifecycle
+        -- opcodes so the child can't recurse or mutate defs.
+        --
+        -- Provider resolution honors the [delegation] provider/model/base_url
+        -- override when set, else falls back to the def's provider/model
+        -- (which itself falls back to the active session's when empty).
+        resolveChildProvider def = do
           active <- readIORef (srActive sr)
           let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
               fallBackModel = case adModel def of
                 ModelId m | T.null m -> smModel active
                           | otherwise -> m
-          eprov <- resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-          case eprov of
-            Left err              -> ccSend caps ("agent start failed: " <> err)
-            Right (prov, model)   ->
-              withTwoFileTranscript childDir $ \childTHandle -> do
-                let env = mkSessionAgentEnv caps prov fallBackProvider model sid (adSystem def) isaReg childTHandle execBackend
-                      (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
-                runApp appEnv (runTurn env "")
+          resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
+        childSystemPrompt def task =
+          let base = adSystem def
+              ctx  = ctContext task
+          in case (base, ctx) of
+               (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+               (Just b, _)                       -> Just b
+               (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+               (Nothing, Nothing)                -> Nothing
+        childRegistryBuilder _def childSid childCaps = do
+          let childBaseOps =
+                [ showHumanOp childCaps
+                , askHumanOp childCaps
+                , fileReadOp wsRoot operatorCeiling
+                , secretGetOp rt
+                , memoryWriteOp memoryBackend childSid
+                , memoryRecallOp defaultPageParams memoryBackend
+                , memoryDeleteOp memoryBackend
+                , skillWriteOp skillBackend childSid
+                , skillReadOp skillBackend
+                , skillListOp skillBackend
+                , skillDeleteOp skillBackend
+                , agentDefReadOp agentDefBackend
+                , agentDefListOp agentDefBackend
+                -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
+                -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
+                -- AGENT_INTERRUPT
+                , shellExecOp wsRoot cliSecurityPolicy execBackend
+                , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                , processManageOp wsRoot cliSecurityPolicy execBackend
+                , fileWriteOp wsRoot operatorCeiling
+                , filePatchOp wsRoot
+                , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+                ]
+          pure (ISA.mkRegistry
+                  (filterBlocklisted childBaseOps opName
+                     ++ if onDemandFromCfg eCfg
+                          then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
+                          else []))
+        delegateDeps = DelegationWorkerDeps
+          { dwdPaths = paths
+          , dwdParentSid = sid0
+          , dwdAppEnv = appEnv
+          , dwdExecBackend = execBackend
+          , dwdAutonomy = autonomy
+          , dwdApprovals = approvals
+          , dwdOnDemand = onDemandFromCfg eCfg
+          , dwdParentDepth = 0
+          , dwdResolveProvider = resolveChildProvider
+          , dwdChildRegistry = childRegistryBuilder
+          , dwdChildSystemPrompt = childSystemPrompt
+          , dwdOnEntry = pure ()
+          }
+        mkWorker = mkDelegateWorker delegateDeps
+        delegationCfg = do
+          eCfg' <- loadFileConfig (prConfigPath pr)
+          pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+        startWiring = AgentStartWiring
+          { aswDefBackend = agentDefBackend
+          , aswRuntime = agentRuntime
+          , aswConfig = delegationCfg
+          , aswPauseFlag = bSpawnPauseFlag backends
+          , aswParentActivity = Just (bParentActivity backends)
+          , aswMintSession = mintAgentSession
+          , aswParentDepth = 0
+          , aswWorker = mkWorker
+          }
         isaReg = ISA.mkRegistry
           (baseIsaOps ++ if onDemandFromCfg eCfg
                            then [opcodeDescribeOp isaReg, opcodeListOp isaReg]
@@ -352,9 +434,10 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           , agentDefListOp agentDefBackend
           , agentDefDeleteOp agentDefBackend
           , agentInstancesOp agentRuntime
-          , agentStartOp agentDefBackend agentRuntime mintAgentSession mkWorker
+          , agentStartOp startWiring
           , agentStatusOp agentRuntime
           , agentStopOp agentRuntime
+          , agentInterruptOp agentRuntime
           , shellExecOp wsRoot cliSecurityPolicy execBackend
           , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
           , processManageOp wsRoot cliSecurityPolicy execBackend
@@ -394,26 +477,80 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   case mkSessionId (formatSessionId now) of
                     Right s  -> pure s
                     Left _e  -> pure bgSid
-                bgMkWorker def childSid = do
-                  let childDir = agentSessionDir paths bgSid childSid
-                  createDirectoryIfMissing True childDir
+                bgResolveChildProvider def = do
                   active <- readIORef (srActive sr)
                   let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
                       fallBackModel = case adModel def of
                         ModelId m | T.null m -> smModel active
                                   | otherwise -> m
-                  eprov <- resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-                  case eprov of
-                    Left err -> ccSend bgCaps ("agent start failed: " <> err)
-                    Right (prov, mdl) ->
-                      withTwoFileTranscript childDir $ \childTHandle -> do
-                        let childEnv = mkSessionAgentEnv bgCaps prov fallBackProvider mdl childSid (adSystem def) bgIsaReg childTHandle execBackend
-                              (debugRequestsPath paths childSid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
-                        runApp appEnv (runTurn childEnv "")
+                  resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
+                bgChildSystemPrompt def task =
+                  let base = adSystem def
+                      ctx  = ctContext task
+                  in case (base, ctx) of
+                       (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+                       (Just b, _)                       -> Just b
+                       (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+                       (Nothing, Nothing)                -> Nothing
+                bgChildRegistryBuilder _def childSid childCaps = do
+                  let childBaseOps =
+                        [ showHumanOp childCaps
+                        , askHumanOp childCaps
+                        , fileReadOp wsRoot operatorCeiling
+                        , secretGetOp rt
+                        , memoryWriteOp memoryBackend childSid
+                        , memoryRecallOp defaultPageParams memoryBackend
+                        , memoryDeleteOp memoryBackend
+                        , skillWriteOp skillBackend childSid
+                        , skillReadOp skillBackend
+                        , skillListOp skillBackend
+                        , skillDeleteOp skillBackend
+                        , agentDefReadOp agentDefBackend
+                        , agentDefListOp agentDefBackend
+                        , shellExecOp wsRoot cliSecurityPolicy execBackend
+                        , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                        , processManageOp wsRoot cliSecurityPolicy execBackend
+                        , fileWriteOp wsRoot operatorCeiling
+                        , filePatchOp wsRoot
+                        , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+                        ]
+                  pure (ISA.mkRegistry
+                          (filterBlocklisted childBaseOps opName
+                             ++ if onDemandFromCfg eCfg
+                                  then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
+                                  else []))
+                bgDelegateDeps = DelegationWorkerDeps
+                  { dwdPaths = paths
+                  , dwdParentSid = bgSid
+                  , dwdAppEnv = appEnv
+                  , dwdExecBackend = execBackend
+                  , dwdAutonomy = autonomy
+                  , dwdApprovals = approvals
+                  , dwdOnDemand = onDemandFromCfg eCfg
+                  , dwdParentDepth = 0
+                  , dwdResolveProvider = bgResolveChildProvider
+                  , dwdChildRegistry = bgChildRegistryBuilder
+                  , dwdChildSystemPrompt = bgChildSystemPrompt
+                  , dwdOnEntry = pure ()
+                  }
+                bgMkWorker = mkDelegateWorker bgDelegateDeps
+                bgDelegationCfg = do
+                  eCfg' <- loadFileConfig (prConfigPath pr)
+                  pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+                bgStartWiring = AgentStartWiring
+                  { aswDefBackend = agentDefBackend
+                  , aswRuntime = agentRuntime
+                  , aswConfig = bgDelegationCfg
+                  , aswPauseFlag = bSpawnPauseFlag backends
+                  , aswParentActivity = Just (bParentActivity backends)
+                  , aswMintSession = bgMintSession
+                  , aswParentDepth = 0
+                  , aswWorker = bgMkWorker
+                  }
                 bgIsaReg = ISA.mkRegistry
                   (baseBgIsaOps ++ if onDemandFromCfg eCfg
-                                     then [opcodeDescribeOp bgIsaReg, opcodeListOp bgIsaReg]
-                                     else [])
+                                      then [opcodeDescribeOp bgIsaReg, opcodeListOp bgIsaReg]
+                                      else [])
                 baseBgIsaOps =
                   [ showHumanOp bgCaps
                   , askHumanOp bgCaps
@@ -431,9 +568,10 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   , agentDefListOp agentDefBackend
                   , agentDefDeleteOp agentDefBackend
                   , agentInstancesOp agentRuntime
-                  , agentStartOp agentDefBackend agentRuntime bgMintSession bgMkWorker
+                  , agentStartOp bgStartWiring
                   , agentStatusOp agentRuntime
                   , agentStopOp agentRuntime
+                  , agentInterruptOp agentRuntime
                   , shellExecOp wsRoot cliSecurityPolicy execBackend
                   , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
                   , processManageOp wsRoot cliSecurityPolicy execBackend

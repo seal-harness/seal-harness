@@ -19,6 +19,7 @@ module Seal.Gateway.Send
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Monad (when)
+import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
@@ -44,8 +45,8 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
-  , onDemandSchemas, fcDebugSessionTranscript )
-import Seal.Config.Paths (SealPaths, agentSessionDir, sessionConversationPath, sessionDir, sessionRequestsPath)
+  , onDemandSchemas, fcDelegation, fcDebugSessionTranscript )
+import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo)
@@ -65,8 +66,12 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
-  , AgentWorkerBuilder
-  )
+  , agentInterruptOp, AgentStartWiring (..) )
+import Seal.Agent.Runtime.Delegation
+  ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
+import Seal.Agent.Runtime.Delegation.Worker
+  ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
+import Seal.ISA.Opcode (opName)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Code (codeExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -249,12 +254,13 @@ plainTurn deps meta t = do
           mSystem <- case smAgent meta of
             Nothing -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-          let mintSession = webMintSession sid
-              onDemand = either (const False) onDemandSchemas eCfg
+          let onDemand = either (const False) onDemandSchemas eCfg
+              startWiring = webStartWiring
+                deps paths sid caps execBackend appEnv eCfg
+                wsroot operatorCeiling
               isaReg = buildWebRegistry
                 (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
-                execBackend (sdAutonomy deps) mintSession
-                (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
+                execBackend (sdAutonomy deps) startWiring
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                 caps onDemand
               env = mkSessionAgentEnv
@@ -290,16 +296,15 @@ plainTurn deps meta t = do
 buildWebRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> ExecBackend -> Policy.AutonomyLevel
-  -> IO SessionId            -- ^ mint a fresh SessionId for a forked agent
-  -> AgentWorkerBuilder       -- ^ the AGENT_START worker (closes over per-turn tHandle/caps/execBackend)
-  -> HarnessRegistry          -- ^ the live harness registry (shared with the gateway)
-  -> TmuxRunner               -- ^ the tmux runner (real via mkRealTmuxRunner; fail-closes when tmux absent)
-  -> Maybe Manager            -- ^ shared HTTP manager for WEB_FETCH / WEB_SEARCH (Nothing = fail-closed)
-  -> ChannelCaps              -- ^ the per-turn caps (ASK_HUMAN/SHOW_HUMAN use these; built by 'webAskCaps')
-  -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST + emit stub schemas
+  -> AgentStartWiring
+  -> HarnessRegistry
+  -> TmuxRunner
+  -> Maybe Manager
+  -> ChannelCaps
+  -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
 buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
-                 mintSession mkWorker harnessReg tmuxRunner httpManager caps onDemand =
+                 startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
@@ -318,9 +323,10 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , agentDefListOp (bAgentDefs backends)
       , agentDefDeleteOp (bAgentDefs backends)
       , agentInstancesOp (bRuntime backends)
-      , agentStartOp (bAgentDefs backends) (bRuntime backends) mintSession mkWorker
+      , agentStartOp startWiring
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
+      , agentInterruptOp (bRuntime backends)
       , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
@@ -422,12 +428,13 @@ plainTurnWithCaps deps meta caps t = do
         mSystem <- case smAgent meta of
           Nothing -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-        let mintSession = webMintSession sid
-            onDemand = either (const False) onDemandSchemas eCfg
+        let onDemand = either (const False) onDemandSchemas eCfg
+            startWiring = webStartWiring
+              deps paths sid caps execBackend appEnv eCfg
+              wsRoot operatorCeiling
             isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              execBackend (sdAutonomy deps) mintSession
-              (webMkWorker deps paths sid caps execBackend appEnv eCfg isaReg)
+              execBackend (sdAutonomy deps) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
             env = mkSessionAgentEnv
@@ -450,42 +457,106 @@ webMintSession fallback = do
     -- unreachable: formatSessionId only emits digits and dashes
     Left _e  -> pure fallback
 
+-- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
+-- 'SendDeps' + parent session id + 'ChannelCaps' + 'ExecBackend' + 'Env' +
+-- loaded config + wsRoot + operatorCeiling.
+webStartWiring
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
+  -> Either a FileConfig -> WorkspaceRoot -> Int -> AgentStartWiring
+webStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling =
+  AgentStartWiring
+    { aswDefBackend = bAgentDefs (sdBackends deps)
+    , aswRuntime = bRuntime (sdBackends deps)
+    , aswConfig = do
+        eCfg' <- loadFileConfig (prConfigPath (sdProvider deps))
+        pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+    , aswPauseFlag = bSpawnPauseFlag (sdBackends deps)
+    , aswParentActivity = Just (bParentActivity (sdBackends deps))
+    , aswMintSession = webMintSession parentSid
+    , aswParentDepth = 0
+    , aswWorker = webMkWorker deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling
+    }
+
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
--- 'mkWorker': resolve the def's provider+model, open a fresh two-file
--- transcript under the parent session's agents dir, build a fresh 'AgentEnv'
--- bound to the child session + transcript, and run the turn loop. The child
--- shares the parent's 'isaReg' (same tool set) but gets its OWN 'TwoFileHandle'
--- so its conversation/entries stay separate (the two-file format's
--- 'erConvLen' and envelope-delta fold are per-session). Web 'ChannelCaps' are
--- no-op (replies surface via transcript poll), so provider-resolution errors
--- are swallowed here and surface only in the agent transcript.
+-- worker: resolve the def's provider+model (falling back to the parent
+-- session meta when the def fields are empty), open a fresh two-file
+-- transcript under the parent session's agents dir, build a narrowed child
+-- ISA registry (blocklist strips AGENT_START/AGENT_DEF_*/lifecycle opcodes),
+-- and run 'runTurn' with the goal as the first user message. The final text
+-- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
+-- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> ISA.Registry -> AgentWorkerBuilder
-webMkWorker deps paths parentSid caps execBackend appEnv eCfg isaReg def childSid = do
-  let childDir = agentSessionDir paths parentSid childSid
-  createDirectoryIfMissing True childDir
-  -- Resolve the def's provider+model. Empty fields fall back to the parent
-  -- session's provider+model (symmetric with the CLI). A non-empty-but-unknown
-  -- provider fails; the error surfaces in the agent transcript (web caps are
-  -- no-op so we can't ccSend it).
-  active <- readIORef (srActive (sdSession deps))
-  let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-      fallBackModel = case adModel def of
-        ModelId m | T.null m -> smModel active
-                  | otherwise -> m
-  eChildProv <- resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
-  case eChildProv of
-    Left _err             -> pure ()  -- web caps are no-op; error logged via transcript
-    Right (childProv, childModel) ->
-      withTwoFileTranscript childDir $ \childTHandle -> do
-        let childEnv = mkSessionAgentEnv
-              caps childProv fallBackProvider childModel childSid
-              (adSystem def) isaReg childTHandle execBackend
-              (debugPath paths childSid eCfg) (sdAutonomy deps) (sdApprovals deps)
-              (broadcastNewEntries (sdBroker deps) paths childSid (modelText childModel) (smCreatedAt active))
-              (either (const False) onDemandSchemas eCfg)
-        runApp appEnv (runTurn childEnv "")
+  -> Either a FileConfig -> WorkspaceRoot -> Int
+  -> AgentWorkerBuilder
+webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCeiling =
+  mkDelegateWorker DelegationWorkerDeps
+    { dwdPaths = paths
+    , dwdParentSid = parentSid
+    , dwdAppEnv = appEnv
+    , dwdExecBackend = execBackend
+    , dwdAutonomy = sdAutonomy deps
+    , dwdApprovals = sdApprovals deps
+    , dwdOnDemand = either (const False) onDemandSchemas eCfg
+    , dwdParentDepth = 0
+    , dwdResolveProvider = resolveChild
+    , dwdChildRegistry = buildChildRegistry
+    , dwdChildSystemPrompt = childSystemPrompt
+    , dwdOnEntry = pure ()  -- web child onEntry: no live broadcast (would need the broker + child sid)
+    }
+  where
+    resolveChild def = do
+      active <- readIORef (srActive (sdSession deps))
+      let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+          fallBackModel = case adModel def of
+            ModelId m | T.null m -> smModel active
+                      | otherwise -> m
+      resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
+    childSystemPrompt def task =
+      let base = adSystem def
+          ctx  = ctContext task
+      in case (base, ctx) of
+           (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+           (Just b, _)                       -> Just b
+           (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+           (Nothing, Nothing)                -> Nothing
+    buildChildRegistry _def childSid childCaps = do
+      let childBaseOps =
+            [ showHumanOp childCaps
+            , askHumanOp childCaps
+            , secretGetOp (sdVault deps)
+            , memoryWriteOp (bMemory (sdBackends deps)) childSid
+            , memoryRecallOp defaultPageParams (bMemory (sdBackends deps))
+            , memoryDeleteOp (bMemory (sdBackends deps))
+            , skillWriteOp (bSkills (sdBackends deps)) childSid
+            , skillReadOp (bSkills (sdBackends deps))
+            , skillListOp (bSkills (sdBackends deps))
+            , skillDeleteOp (bSkills (sdBackends deps))
+            , agentDefReadOp (bAgentDefs (sdBackends deps))
+            , agentDefListOp (bAgentDefs (sdBackends deps))
+            -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
+            -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
+            -- AGENT_INTERRUPT
+            , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+            , fileReadOp wsRoot operatorCeiling
+            , fileWriteOp wsRoot operatorCeiling
+            , filePatchOp wsRoot
+            , shellExecOp wsRoot securityPolicy execBackend
+            , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+            , processManageOp wsRoot securityPolicy execBackend
+            , webFetchOp webFetchCfg
+            , webSearchOp webSearchCfg
+            ]
+      pure (ISA.mkRegistry (filterBlocklisted childBaseOps opName))
+      where
+        securityPolicy = Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps)
+        codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+        webFetchCfg = WebFetchConfig
+          { wfcManager = sdHttpManager deps, wfcAllowList = []
+          , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }
+        webSearchCfg = WebSearchConfig
+          { wscManager = sdHttpManager deps, wscEndpoint = ""
+          , wscAllowList = [], wscAuthKey = Nothing }
 
 -- | Extract the 'Text' from a 'ModelId'.
 modelText :: ModelId -> Text
@@ -593,9 +664,8 @@ fanoutLastReply replies paths sid = do
       raw <- TIO.readFile convPath
       let lines' = filter (not . T.null) (T.lines raw)
           msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
-      case lastAssistantText msgs of
-        Just reply -> replyFanout replies sid reply
-        Nothing    -> pure ()
+      for_ (lastAssistantText msgs) $ \reply ->
+        replyFanout replies sid reply
 
 -- | Extract the concatenated text content of the last 'Assistant' message
 -- in a list. Tool-use blocks are skipped (only 'CbText' is extracted).

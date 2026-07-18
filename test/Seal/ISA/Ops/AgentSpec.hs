@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.AgentSpec (spec) where
 
-import Control.Concurrent (threadDelay)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
@@ -12,6 +11,11 @@ import Test.Hspec
 
 import Seal.Agent.Def.Backend
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
+import Seal.Agent.Runtime.Delegation qualified as Del
+import Seal.Agent.Runtime.Delegation
+  ( ChildExitReason (..), ChildWorkerOutcome (..)
+  , defaultDelegationConfig, dcChildTimeoutSeconds
+  , newSpawnPauseFlag, setSpawnPaused )
 import Seal.Agent.Runtime.Registry
 import Seal.Core.Types (SessionId (..))
 import Seal.ISA.Opcode
@@ -32,12 +36,18 @@ sampleDefId = case mkAgentDefId "a1" of
   Right aid -> aid
   Left _    -> AgentDefId "fallback"
 
--- | A worker that records it ran, then blocks so the instance stays Running
--- for status assertions. The test stops the agent before the delay elapses.
-blockingWorker :: IORef Int -> AgentDef -> SessionId -> IO ()
-blockingWorker ref _ _ = do
-  modifyIORef' ref (+ 1)
-  threadDelay 1000000
+-- | A worker that records it ran, returns a fixed summary, and completes
+-- (synchronous semantics). The new AGENT_START blocks until the worker
+-- returns, so this is the test analog of a child that runs to completion.
+recordingWorker :: IORef Int -> Del.AgentWorkerBuilder
+recordingWorker ref _ _ _ _ = do
+  modifyIORef' ref (+1)
+  pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (SessionId "child")))
+
+-- | A worker that simulates a def-not-found resolution error (returns an
+-- error outcome).
+errorWorker :: Del.AgentWorkerBuilder
+errorWorker _ _ _ _ = pure (ChildWorkerOutcome (Just "fail") CerError 0 0 Nothing)
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Agent" $ do
@@ -144,62 +154,156 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         [TrpText t] -> T.isInfixOf "not present" t `shouldBe` True
         _           -> expectationFailure "expected a single text part"
 
-  describe "AGENT_START / STATUS / INSTANCES / STOP" $ do
-    it "starts an agent, status Running, then stops it" $ do
+  describe "AGENT_START (synchronous, goal-driven)" $ do
+    it "runs a child to completion and returns a summary" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
       ran <- newIORef (0 :: Int)
       _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
-      let start = agentStartOp backend rt (pure (SessionId "fresh")) (blockingWorker ran)
-      rStart <- runTestApp (opRun start localBackend (object ["id" .= ("a1" :: Text)]))
-      orIsError rStart `shouldBe` False
-      threadDelay 50000
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = recordingWorker ran
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      orIsError r `shouldBe` False
+      -- The worker ran exactly once (synchronous, single-task mode).
       readIORef ran `shouldReturn` 1
-      mStatus <- agentStatus rt sampleDefId
-      mStatus `shouldSatisfy` (Just Running ==)
-      let stop = agentStopOp rt
-      rStop <- runTestApp (opRun stop localBackend (object ["id" .= ("a1" :: Text)]))
-      orIsError rStop `shouldBe` False
-      agentStatus rt sampleDefId `shouldReturn` Nothing
+      -- The result text contains the summary.
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "done" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
 
     it "AGENT_START errors when the def does not exist" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
-      let start = agentStartOp backend rt (pure (SessionId "fresh")) (\_ _ -> pure ())
-      r <- runTestApp (opRun start localBackend (object ["id" .= ("nope" :: Text)]))
-      orIsError r `shouldBe` True
+      pauseFlag <- newSpawnPauseFlag
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = errorWorker
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("nope" :: Text), "goal" .= ("x" :: Text)]))
+      -- def-not-found surfaces as a per-child error result (the opcode does
+      -- not reject the whole call; it returns a ChildResult with CsError).
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "agent def not found" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
 
-    it "AGENT_INSTANCES reports running instances" $ do
+    it "AGENT_START requires a goal (single-task mode)" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
       _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
-      let worker _ _ = threadDelay 1000000
-          start = agentStartOp backend rt (pure (SessionId "fresh")) worker
-      _ <- runTestApp (opRun start localBackend (object ["id" .= ("a1" :: Text)]))
-      threadDelay 50000
-      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
-      case orParts r of
-        [TrpText t] -> T.isInfixOf "a1:" t `shouldBe` True
-        _           -> expectationFailure "expected a single text part"
-      _ <- stopAgent rt sampleDefId
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = errorWorker
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend (object ["id" .= ("a1" :: Text)]))
+      orIsError r `shouldBe` True
+
+    it "AGENT_START supports batch mode (tasks array)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = recordingWorker ran
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("task one" :: Text)]
+                                                , object ["id" .= ("a1" :: Text), "goal" .= ("task two" :: Text)] ]]))
+      orIsError r `shouldBe` False
+      -- Both tasks ran (batch mode fans out).
+      readIORef ran `shouldReturn` 2
+
+    it "AGENT_START rejects when spawn is paused" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      _ <- setSpawnPaused pauseFlag True
+      ran <- newIORef (0 :: Int)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (SessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = recordingWorker ran
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))
+      orIsError r `shouldBe` True
+      readIORef ran `shouldReturn` 0
+      _ <- setSpawnPaused pauseFlag False
       pure ()
+
+  describe "AGENT_INSTANCES / STATUS / STOP / INTERRUPT (subagent-id keyed)" $ do
+    it "AGENT_INSTANCES reports (no agents running) when the synchronous model has finished" $ do
+      rt <- newAgentRuntime
+      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> t `shouldBe` "(no agents running)"
+        _           -> expectationFailure "expected a single text part"
 
     it "AGENT_STATUS reports not running when absent" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentStatusOp rt) localBackend (object ["id" .= ("a1" :: Text)]))
+      r <- runTestApp (opRun (agentStatusOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText t] -> t `shouldBe` "not running"
         _           -> expectationFailure "expected a single text part"
 
-    it "AGENT_STOP is idempotent on a non-running def id" $ do
+    it "AGENT_STOP is idempotent on a non-running subagent id" $ do
       rt <- newAgentRuntime
-      r <- runTestApp (opRun (agentStopOp rt) localBackend (object ["id" .= ("nope" :: Text)]))
+      r <- runTestApp (opRun (agentStopOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText t] -> t `shouldBe` "stopped"
+        _           -> expectationFailure "expected a single text part"
+
+    it "AGENT_INTERRUPT returns 'subagent not running' when no match" $ do
+      rt <- newAgentRuntime
+      r <- runTestApp (opRun (agentInterruptOp rt) localBackend (object ["subagent_id" .= ("sa-x-00000001" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> t `shouldBe` "subagent not running"
         _           -> expectationFailure "expected a single text part"
 
   describe "secret discipline" $

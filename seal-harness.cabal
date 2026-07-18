@@ -146,6 +146,8 @@ library
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
         Seal.Agent.Runtime.Registry
+        Seal.Agent.Runtime.Delegation
+        Seal.Agent.Runtime.Delegation.Worker
         Seal.ISA.Dispatch
         Seal.ISA.Opcode
         Seal.ISA.Ops.Human

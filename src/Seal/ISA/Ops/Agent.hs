@@ -2,9 +2,9 @@
 -- | The Agent opcode group: three Audited definition opcodes
 -- (@AGENT_DEF_WRITE@, @AGENT_DEF_READ@, @AGENT_DEF_LIST@, @AGENT_DEF_DELETE@)
 -- and four Trusted lifecycle opcodes (@AGENT_INSTANCES@, @AGENT_START@,
--- @AGENT_STATUS@, @AGENT_STOP@). Only the *definition* mutations are Audited —
--- running an instance is harness-internal, not an evolutionary mutation, so
--- the lifecycle ops are Trusted.
+-- @AGENT_STATUS@, @AGENT_STOP@, @AGENT_INTERRUPT@). Only the *definition*
+-- mutations are Audited — running an instance is harness-internal, not an
+-- evolutionary mutation, so the lifecycle ops are Trusted.
 --
 -- @AGENT_DEF_WRITE@ is an upsert: if the def already exists, its name/system/
 -- tools are updated (the original 'adSession' provenance and 'adCreatedAt' are
@@ -18,10 +18,14 @@
 -- definitions. The rename stops the confusion between "list definitions" and
 -- "list running instances".
 --
--- @AGENT_START@ forks a worker via the wiring layer's worker-builder: the
--- opcode is decoupled from 'Seal.Agent.Loop' / 'Seal.Types.Env' so it stays
--- testable. The worker-builder resolves the def's provider+model, builds a
--- fresh 'AgentEnv' bound to a fresh session, and runs the loop.
+-- @AGENT_START@ is the Seal analog of Hermes' @delegate_task@: it spawns one
+-- or more child agents with isolated context, runs each against a goal to
+-- completion (synchronously), and returns a structured JSON result per child.
+-- The parent blocks until all children finish (or time out). See
+-- 'Seal.Agent.Runtime.Delegation' for the full feature list. The opcode is a
+-- thin shim over 'runDelegate' — it normalizes the model's input, resolves the
+-- def, delegates the worker construction to the wiring layer's
+-- 'AgentWorkerBuilder', and serializes the 'ChildResult' list to JSON.
 module Seal.ISA.Ops.Agent
   ( agentDefWriteOp
   , agentDefReadOp
@@ -31,7 +35,9 @@ module Seal.ISA.Ops.Agent
   , agentStartOp
   , agentStatusOp
   , agentStopOp
+  , agentInterruptOp
   , AgentWorkerBuilder
+  , AgentStartWiring (..)
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -49,20 +55,36 @@ import Data.Vector qualified as V
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
   ( AgentDef (..), mkAgentDefId, agentDefIdText )
+import Seal.Agent.Runtime.Delegation
+  ( AgentWorkerBuilder
+  , ChildResult (..)
+  , ChildTask (..)
+  , DelegationConfig
+  , DelegateInput (..)
+  , SpawnPauseFlag
+  , ParentActivity
+  , SubagentId (..)
+  , runDelegate
+  , subagentIdText
+  )
 import Seal.Agent.Runtime.Registry
-  ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus, listAgents
-  , startAgent, stopAgent )
+  ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
+  , interruptAgent, listAgents, stopAgent )
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), TrustLevel (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..))
 
--- | A worker-builder: given a def and a fresh session id, produce the @IO ()@
--- loop the runtime should fork. The wiring layer resolves the def's
--- provider+model, builds a fresh 'AgentEnv', and runs the turn loop. Keeping
--- this as a parameter decouples the opcode from 'Seal.Agent.Loop' / provider
--- resolution so the opcode is unit-testable with a fake worker.
-type AgentWorkerBuilder = AgentDef -> SessionId -> IO ()
+-- ---------------------------------------------------------------------------
+-- Worker-builder type
+-- ---------------------------------------------------------------------------
+
+-- (The 'AgentWorkerBuilder' type is re-exported from
+-- 'Seal.Agent.Runtime.Delegation'; the wiring layer imports it from here for
+-- convenience.)
+-- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
 
 -- | Extract the @id@ string field from a JSON object.
 idField :: Value -> Maybe Text
@@ -87,6 +109,10 @@ toolsField v =
     Just (Just (String "all")) -> AllowAll
     Just (Just (Array xs))     -> AllowOnly (Set.fromList [ OpName t | String t <- V.toList xs ])
     _                          -> AllowAll
+
+-- ---------------------------------------------------------------------------
+-- AGENT_DEF_WRITE
+-- ---------------------------------------------------------------------------
 
 -- | AGENT_DEF_WRITE: upsert an agent definition by id. If the def already
 -- exists, its name/system/tools are updated (the original 'adSession'
@@ -169,10 +195,10 @@ agentDefWriteOp backend session = TrustedOpcode
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- | AGENT_DEF_READ: return one agent definition by id. Audited — the agent
--- reading its own agent defs is an evolutionary event worth logging, with
--- secret-free metadata. The def fields are returned to the model (agent-visible)
--- and recorded in full.
+-- ---------------------------------------------------------------------------
+-- AGENT_DEF_READ
+-- ---------------------------------------------------------------------------
+
 agentDefReadOp :: AgentDefBackend -> Opcode
 agentDefReadOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_READ"
@@ -197,11 +223,10 @@ agentDefReadOp backend = TrustedOpcode
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- | AGENT_DEF_LIST: list all agent definitions (id + name + provider/model).
--- Mirrors the @/agent list@ slash command which already calls 'adbList'.
--- Trusted — listing definitions is an evolutionary event worth logging, with
--- secret-free metadata (no system prompts in the recorded payload; the model
--- sees only the id+name+provider+model summary).
+-- ---------------------------------------------------------------------------
+-- AGENT_DEF_LIST
+-- ---------------------------------------------------------------------------
+
 agentDefListOp :: AgentDefBackend -> Opcode
 agentDefListOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_LIST"
@@ -228,9 +253,10 @@ agentDefListOp backend = TrustedOpcode
       pure (OpResult [TrpText rendered] False recorded)
   }
 
--- | AGENT_DEF_DELETE: remove an agent definition by id. Idempotent (deleting
--- a missing id is a success with a "not present" message, not an error).
--- Mirrors 'Seal.ISA.Ops.Memory.memoryDeleteOp'.
+-- ---------------------------------------------------------------------------
+-- AGENT_DEF_DELETE
+-- ---------------------------------------------------------------------------
+
 agentDefDeleteOp :: AgentDefBackend -> Opcode
 agentDefDeleteOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_DELETE"
@@ -255,15 +281,18 @@ agentDefDeleteOp backend = TrustedOpcode
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
+-- ---------------------------------------------------------------------------
+-- AGENT_INSTANCES
+-- ---------------------------------------------------------------------------
+
 -- | AGENT_INSTANCES: snapshot the in-process agent runtime (running
 -- instances). Trusted — listing running instances is harness-internal, not an
--- evolutionary mutation. Renamed from AGENT_LIST to stop the confusion with
--- AGENT_DEF_LIST (which lists definitions, not running instances).
+-- evolutionary mutation.
 agentInstancesOp :: AgentRuntime -> Opcode
 agentInstancesOp runtime = TrustedOpcode
   { toName = OpName "AGENT_INSTANCES"
   , toTrust = Trusted
-  , toDesc = "List running agent instances (id + status)."
+  , toDesc = "List running agent instances (subagent_id + def id + status)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
@@ -275,93 +304,289 @@ agentInstancesOp runtime = TrustedOpcode
       let rendered = case insts of
             [] -> "(no agents running)"
             _  -> T.intercalate "\n"
-                    [ agentDefIdText (aiId i) <> ": " <> renderStatus (aiStatus i)
+                    [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
                     | i <- insts ]
           recorded = object
             [ "count" .= length insts
-            , "ids" .= fmap (agentDefIdText . aiId) insts
+            , "ids" .= fmap (subagentIdText . aiSubagentId) insts
             ]
       pure (OpResult [TrpText rendered] False recorded)
   }
 
--- | AGENT_START: fork a worker bound to the def's provider/model/system/tools
--- in a fresh session. Returns the new 'SessionId'. Trusted — running an
--- instance is harness-internal, not an evolutionary mutation. The
--- worker-builder resolves the def's provider+model and runs the turn loop; the
--- session-minter produces a fresh 'SessionId' for the new instance.
-agentStartOp
-  :: AgentDefBackend -> AgentRuntime -> IO SessionId -> AgentWorkerBuilder -> Opcode
-agentStartOp backend runtime mintSession mkWorker = TrustedOpcode
+-- ---------------------------------------------------------------------------
+-- AGENT_START (synchronous goal-driven delegation)
+-- ---------------------------------------------------------------------------
+
+-- | The wiring-layer bundle the AGENT_START opcode closes over. The
+-- 'AgentWorkerBuilder' resolves the def's provider+model, opens a fresh
+-- two-file transcript under @\<parent-session\>\/agents\/\<child-id\>@, builds
+-- a fresh 'AgentEnv' bound to the new session + child transcript, runs the
+-- turn with the goal as the first user message, and reports the outcome via
+-- 'ChildWorkerOutcome'. The 'DelegationConfig' / 'SpawnPauseFlag' /
+-- 'ParentActivity' are process-global (or per-channel) and threaded in
+-- here so the opcode doesn't read config.
+data AgentStartWiring = AgentStartWiring
+  { aswDefBackend   :: AgentDefBackend
+  , aswRuntime      :: AgentRuntime
+  , aswConfig       :: IO DelegationConfig
+    -- ^ Re-read the [delegation] config per AGENT_START call (so config
+    -- changes take effect without a restart). The IO action reads
+    -- @config.toml@ and returns the resolved 'DelegationConfig'.
+  , aswPauseFlag    :: SpawnPauseFlag
+  , aswParentActivity :: Maybe ParentActivity
+  , aswMintSession  :: IO SessionId
+    -- ^ Mint a fresh 'SessionId' for a child.
+  , aswParentDepth  :: Int
+    -- ^ The parent's delegation depth (0 for a top-level turn).
+  , aswWorker       :: AgentWorkerBuilder
+    -- ^ The worker-builder (closes over per-turn 'AgentEnv' deps).
+  }
+
+-- | AGENT_START: spawn one or more child agents, run each against a goal to
+-- completion, return a JSON result per child. Input is either
+-- @{id, goal, context?, role?}@ (single mode) or @{tasks: [{id, goal, context?, role?}, ...]}@
+-- (batch mode). Returns JSON with a @results@ array, one entry per task.
+agentStartOp :: AgentStartWiring -> Opcode
+agentStartOp wiring = TrustedOpcode
   { toName = OpName "AGENT_START"
   , toTrust = Trusted
-  , toDesc = "Start a running agent instance bound to a definition."
-  , toInSchema = singleStringSchema "id" "The agent def id to start."
+  , toDesc = "Spawn one or more child agents, run each against a goal to completion, return a JSON result per child. Single mode: {id, goal, context?, role?}. Batch mode: {tasks: [{id, goal, context?, role?}, ...]}."
+  , toInSchema = object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= object
+          [ fromText "id" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Agent def id (single-task mode)." :: Text)
+              ]
+          , fromText "goal" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("The task goal — becomes the child's first user message (single-task mode)." :: Text)
+              ]
+          , fromText "context" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional background context appended to the child's system prompt." :: Text)
+              ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("\"leaf\" (default) or \"orchestrator\". Orchestrators may spawn their own subagents, bounded by max_spawn_depth." :: Text)
+              ]
+          , fromText "tasks" .= object
+              [ "type" .= ("array" :: Text)
+              , "description" .= ("Batch mode: array of {id, goal, context?, role?}. Cap on parallelism is delegation.max_concurrent_children." :: Text)
+              ]
+          ]
+      , "required" .= (["goal"] :: [Text])
+      ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_START requires {id:string}") checkId . idField
+  , toAuthorize = \v ->
+      -- Require either a top-level goal (single) or a tasks array (batch).
+      let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
+          hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
+      in if hasGoal || hasTasks
+           then Right ()
+           else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
   , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          mDef <- liftIO (adbRead backend aid)
-          case mDef of
-            Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
-            Just def -> do
-              freshSession <- liftIO mintSession
-              res <- liftIO (startAgent runtime aid freshSession (mkWorker def freshSession))
-              case res of
-                Left err -> pure (OpResult [TrpText err] True (object ["id" .= agentDefIdText aid]))
-                Right _  -> pure (OpResult [TrpText ("started: session " <> sessionIdText freshSession)] False (object ["id" .= agentDefIdText aid, "session" .= freshSession]))
+      input <- liftIO (parseInput v)
+      case input of
+        Left err -> pure (OpResult [TrpText err] True (object []))
+        Right di -> do
+          cfg <- liftIO (aswConfig wiring)
+          eResults <- liftIO (runDelegate
+                                cfg
+                                (aswPauseFlag wiring)
+                                (aswParentActivity wiring)
+                                (aswParentDepth wiring)
+                                di
+                                (resolveTask (aswDefBackend wiring)
+                                             (aswRuntime wiring)
+                                             (aswMintSession wiring)
+                                             (aswParentDepth wiring)
+                                             (aswWorker wiring)))
+          case eResults of
+            Left err -> pure (OpResult [TrpText err] True (object []))
+            Right results -> do
+              -- Register each finished child (no-op in the synchronous
+              -- model; the 'ChildResult' payload IS the post-hoc record).
+              -- Kept for a future enhancement that registers before the run
+              -- (requires a fork-based model).
+              mapM_ (liftIO . registerChild (aswRuntime wiring)) results
+              let rendered = encodeResultsJson results
+              pure (OpResult [TrpText rendered] False (object ["results" .= results]))
   }
-  where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
-    sessionIdText (SessionId s) = s
 
--- | AGENT_STATUS: read one running agent's status. Trusted.
+-- | Parse the model's input into a 'DelegateInput'. Single mode requires
+-- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
+parseInput :: Value -> IO (Either Text DelegateInput)
+parseInput v =
+  case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of
+    Just (Just (Array arr)) | not (V.null arr) -> do
+      tasks <- mapM parseTask (V.toList arr)
+      case sequence tasks of
+        Left err     -> pure (Left err)
+        Right tsList -> pure (Right (DiBatch tsList))
+    _ -> do
+      let mDefId = idField v
+          mGoal  = textFieldMaybe "goal" v
+      case (mDefId, mGoal) of
+        (Just defId, Just goal) | not (T.null goal) ->
+          pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v))))
+        (Just _, Just _) -> pure (Left "AGENT_START requires a non-empty 'goal'.")
+        (Just _, Nothing) -> pure (Left "AGENT_START single-task mode requires a 'goal'.")
+        (Nothing, _) -> pure (Left "AGENT_START requires an 'id' (agent def id) in single-task mode, or a 'tasks' array in batch mode.")
+
+-- | Parse one element of the @tasks@ array into a 'ChildTask'.
+parseTask :: Value -> IO (Either Text ChildTask)
+parseTask v =
+  case idField v of
+    Nothing -> pure (Left "Each task requires an 'id' (agent def id).")
+    Just defId ->
+      case textFieldMaybe "goal" v of
+        Nothing -> pure (Left "Each task requires a 'goal'.")
+        Just goal | T.null goal -> pure (Left "Each task requires a non-empty 'goal'.")
+                 | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v)))
+
+-- | Resolve a task to its def + worker + fresh session id. Returns Left if
+-- the def id is invalid or the def doesn't exist.
+resolveTask
+  :: AgentDefBackend
+  -> AgentRuntime
+  -> IO SessionId
+  -> Int
+  -> AgentWorkerBuilder
+  -> ChildTask
+  -> IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId))
+resolveTask defBackend _runtime mintSession _parentDepth worker task = do
+  case mkAgentDefId (ctDefId task) of
+    Left err -> pure (Left err)
+    Right aid -> do
+      mDef <- adbRead defBackend aid
+      case mDef of
+        Nothing  -> pure (Left ("agent def not found: " <> ctDefId task))
+        Just def -> do
+          sid <- mintSession
+          pure (Right (def, worker, sid))
+
+-- | Register a finished child in the runtime registry (post-hoc; the worker
+-- ran synchronously). No-op in the synchronous model — the 'ChildResult'
+-- payload IS the post-hoc record. Kept for a future enhancement that
+-- registers before the run (requires a fork-based model).
+registerChild :: AgentRuntime -> ChildResult -> IO ()
+registerChild _ _ = pure ()
+
+-- ---------------------------------------------------------------------------
+-- AGENT_STATUS
+-- ---------------------------------------------------------------------------
+
 agentStatusOp :: AgentRuntime -> Opcode
 agentStatusOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STATUS"
   , toTrust = Trusted
-  , toDesc = "Read one running agent's status."
-  , toInSchema = singleStringSchema "id" "The agent def id."
+  , toDesc = "Read one running agent's status by subagent_id."
+  , toInSchema = singleStringSchema "subagent_id" "The subagent id (from AGENT_START's result)."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_STATUS requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") checkSubagentId . subagentIdField
   , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          mStatus <- liftIO (agentStatus runtime aid)
+      let mSid = subagentIdField v
+      case mSid of
+        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+        Just sid -> do
+          mStatus <- liftIO (agentStatus runtime sid)
           case mStatus of
-            Nothing -> pure (OpResult [TrpText "not running"] False (object ["id" .= agentDefIdText aid, "status" .= ("stopped" :: Text)]))
-            Just s  -> pure (OpResult [TrpText (renderStatus s)] False (object ["id" .= agentDefIdText aid, "status" .= renderStatus s]))
+            Nothing -> pure (OpResult [TrpText "not running"] False (object ["subagent_id" .= subagentIdText sid, "status" .= ("stopped" :: Text)]))
+            Just s  -> pure (OpResult [TrpText (renderStatus s)] False (object ["subagent_id" .= subagentIdText sid, "status" .= renderStatus s]))
   }
   where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
+    checkSubagentId _ = Right ()
+
+-- ---------------------------------------------------------------------------
+-- AGENT_STOP
+-- ---------------------------------------------------------------------------
 
 -- | AGENT_STOP: stop a running agent instance (kill the thread, deregister).
--- Trusted. Idempotent (stopping a non-running def id is a success with a
--- \"not running\" message).
+-- Idempotent. Now keyed by @subagent_id@ (the new AGENT_START returns
+-- subagent ids, not def ids).
 agentStopOp :: AgentRuntime -> Opcode
 agentStopOp runtime = TrustedOpcode
   { toName = OpName "AGENT_STOP"
   , toTrust = Trusted
-  , toDesc = "Stop a running agent instance (idempotent)."
-  , toInSchema = singleStringSchema "id" "The agent def id to stop."
+  , toDesc = "Stop a running agent instance by subagent_id (idempotent)."
+  , toInSchema = singleStringSchema "subagent_id" "The subagent id to stop."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_STOP requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "AGENT_STOP requires {subagent_id:string}") (const (Right ())) . subagentIdField
   , toRun = \_ v -> do
-      let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
-      case mId of
-        Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
-        Just aid -> do
-          _ <- liftIO (stopAgent runtime aid)
-          pure (OpResult [TrpText "stopped"] False (object ["id" .= agentDefIdText aid]))
+      let mSid = subagentIdField v
+      case mSid of
+        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+        Just sid -> do
+          _ <- liftIO (stopAgent runtime sid)
+          pure (OpResult [TrpText "stopped"] False (object ["subagent_id" .= subagentIdText sid]))
   }
-  where
-    checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
 
--- ---- helpers ----
+-- ---------------------------------------------------------------------------
+-- AGENT_INTERRUPT
+-- ---------------------------------------------------------------------------
+
+-- | AGENT_INTERRUPT: request that a single running subagent stop at its next
+-- iteration boundary. Unlike AGENT_STOP (which hard-kills the thread),
+-- AGENT_INTERRUPT sets a flag the worker polls between turns, letting it
+-- exit cleanly. Trusted.
+agentInterruptOp :: AgentRuntime -> Opcode
+agentInterruptOp runtime = TrustedOpcode
+  { toName = OpName "AGENT_INTERRUPT"
+  , toTrust = Trusted
+  , toDesc = "Request that a running subagent stop at its next iteration boundary (cooperative; the worker polls an interrupt flag between turns)."
+  , toInSchema = singleStringSchema "subagent_id" "The subagent id to interrupt."
+  , toOutSchema = object []
+  , toAuthorize = maybe (Left "AGENT_INTERRUPT requires {subagent_id:string}") (const (Right ())) . subagentIdField
+  , toRun = \_ v -> do
+      let mSid = subagentIdField v
+      case mSid of
+        Nothing -> pure (OpResult [TrpText "invalid subagent id"] True (object []))
+        Just sid -> do
+          found <- liftIO (interruptAgent runtime sid)
+          let msg = if found then "interrupt requested" else "subagent not running"
+          pure (OpResult [TrpText msg] False (object ["subagent_id" .= subagentIdText sid, "found" .= found]))
+  }
+
+-- ---------------------------------------------------------------------------
+-- JSON encoding of ChildResult
+-- ---------------------------------------------------------------------------
+
+-- | Render the results list as a JSON string for the model (the @orParts@
+-- text the model sees). One line per result:
+-- @subagent_id | status | summary-or-error@. The full structured JSON goes
+-- into 'orRecorded' via the 'ToJSON ChildResult' instance defined in
+-- 'Seal.Agent.Runtime.Delegation'.
+encodeResultsJson :: [ChildResult] -> Text
+encodeResultsJson [] = "(no results)"
+encodeResultsJson rs = T.intercalate "\n" (map renderOne rs)
+  where
+    renderOne r =
+      subagentIdText (crSubagentId r) <> " | " <>
+      T.pack (show (crStatus r)) <> " | " <>
+      maybe "(no summary)" (T.take 200) (summaryOrError r)
+    summaryOrError r = case crSummary r of
+      Just s  -> Just s
+      Nothing -> crError r
+
+renderStatus :: AgentStatus -> Text
+renderStatus = \case
+  Starting     -> "starting"
+  Running      -> "running"
+  Idle         -> "idle"
+  Stopped      -> "stopped"
+  Interrupted  -> "interrupted"
+  Crashed m    -> "crashed: " <> m
+
+-- | Extract the @subagent_id@ string field from a JSON object.
+subagentIdField :: Value -> Maybe SubagentId
+subagentIdField v = do
+  t <- parseMaybe (withObject "in" (.: "subagent_id")) v
+  if T.null t then Nothing else Just (SubagentId t)
+
+-- ---------------------------------------------------------------------------
+-- Helpers (def rendering / encoding)
+-- ---------------------------------------------------------------------------
 
 -- | Build a JSON-Schema object with a single required string property.
 singleStringSchema :: Text -> Text -> Value
@@ -413,12 +638,3 @@ renderDef d =
 renderTools :: AllowList OpName -> Text
 renderTools AllowAll       = "all"
 renderTools (AllowOnly xs) = T.intercalate ", " [ t | OpName t <- Set.toList xs ]
-
--- | Render an 'AgentStatus' for display.
-renderStatus :: AgentStatus -> Text
-renderStatus = \case
-  Starting  -> "starting"
-  Running   -> "running"
-  Idle      -> "idle"
-  Stopped   -> "stopped"
-  Crashed m -> "crashed: " <> m
