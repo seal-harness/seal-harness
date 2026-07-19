@@ -597,6 +597,13 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   _ <- focusTabH th idx
                   plainHandler payload
                 Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
+                Right Seal.Routing.Route.NewSession -> do
+                  -- /new is registered as a CommandSpec in the registry
+                  -- (the CLI tracks "current" via srActive, not a cursor),
+                  -- so re-route to the registry path below. Falling
+                  -- through by re-parsing as SlashCommand.
+                  d <- liftIO $ ingest reg chain (RawInbound (T.pack line))
+                  liftIO $ interpretDisposition caps plainHandler d
                 Right (Seal.Routing.Route.SlashCommand _) -> do
                   d <- liftIO $ ingest reg chain (RawInbound (T.pack line))
                   liftIO $ interpretDisposition caps plainHandler d

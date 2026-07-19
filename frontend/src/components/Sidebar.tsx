@@ -6,13 +6,32 @@ import { ActiveTabs } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { ActivityDot } from './StatusDot'
 
-function SectionHeader({ label }: { label: string }) {
+/** A "Recent Sessions" section header with a "New session" `+` button
+ *  (same glyph as the Active Tabs `+`, but a distinct label/title so screen
+ *  readers + tooltips disambiguate: this one creates a bare session and
+ *  focuses it; that one opens the new-tab composer). */
+function RecentSessionsHeader({ onNewSession }: { onNewSession: () => void }) {
   return (
     <div
-      className="px-3 py-1.5 text-xs font-semibold uppercase"
-      style={{ color: 'var(--text-muted)', letterSpacing: '0.08em' }}
+      className="px-3 py-1.5 flex items-center justify-between"
+      style={{ color: 'var(--text-muted)' }}
     >
-      {label}
+      <span
+        className="text-xs font-semibold uppercase"
+        style={{ letterSpacing: '0.08em' }}
+      >
+        Recent Sessions
+      </span>
+      <button
+        type="button"
+        className="btn btn-ghost flex items-center justify-center"
+        style={{ width: 22, height: 22, padding: 0, fontSize: 14, lineHeight: 1 }}
+        onClick={onNewSession}
+        aria-label="New session"
+        title="New session"
+      >
+        +
+      </button>
     </div>
   )
 }
@@ -202,6 +221,7 @@ export function Sidebar({
   onSelectTab,
   onSelectSession,
   onNewTab,
+  onNewSession,
   onArchiveSession,
   onUnarchiveSession,
   onCloseTab,
@@ -222,6 +242,7 @@ export function Sidebar({
   onSelectTab: (index: number) => void
   onSelectSession: (id: string) => void
   onNewTab: () => void
+  onNewSession: () => void
   onArchiveSession: (id: string) => void
   onUnarchiveSession: (id: string) => void
   onCloseTab: (index: number) => void
@@ -282,7 +303,7 @@ export function Sidebar({
 
         {recentSessions.length > 0 && (
           <>
-            <SectionHeader label="Recent Sessions" />
+            <RecentSessionsHeader onNewSession={onNewSession} />
             {recentSessions.map((s) => (
               <SessionRow
                 key={s.id}

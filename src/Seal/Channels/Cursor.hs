@@ -15,6 +15,7 @@ module Seal.Channels.Cursor
   , cursorLookup
   , cursorSet
   , cursorClear
+  , cursorMigrateAll
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -61,3 +62,18 @@ cursorClear :: CursorStore -> ConversationKey -> IO ()
 cursorClear (CursorStore tv) key = atomically $ do
   m <- readTVar tv
   writeTVar tv (Map.delete key m)
+
+-- | Migrate every conversation whose cursor equals @oldRef@ to @newRef@.
+-- Used by @\/new@ on inbox channels: when a tab is rebound to a fresh
+-- session, every conversation focused on that tab follows the rebind (per
+-- the user's model: a tab has one session at a time; all channels focused
+-- on the tab follow it to the new session). Returns the count of migrated
+-- cursors (for the confirmation line / observability). Single STM
+-- transaction — race-safe vs concurrent cursorLookup/cursorSet.
+cursorMigrateAll :: CursorStore -> TabRef -> TabRef -> IO Int
+cursorMigrateAll (CursorStore tv) oldRef newRef = atomically $ do
+  m <- readTVar tv
+  let (matched, rest) = Map.partition (== oldRef) m
+      m' = Map.map (const newRef) matched <> rest
+  writeTVar tv m'
+  pure (Map.size matched)

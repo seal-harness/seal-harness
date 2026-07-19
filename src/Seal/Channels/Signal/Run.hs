@@ -151,6 +151,16 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
                 Right (Seal.Routing.Route.TabCommand tsc) -> do
                   _ <- handleTabCommand' h tabsH tsc
                   loop h handleCaps
+                Right Seal.Routing.Route.NewSession -> do
+                  -- /new is registered as a CommandSpec in the registry
+                  -- (this standalone loop tracks "current" via srActive, not
+                  -- a cursor). Fall through to the registry path.
+                  d <- ingest registry chain (RawInbound body)
+                  case d of
+                    DispatchAction a -> runCommandAction a handleCaps >> loop h handleCaps
+                    ShowText t       -> chSend h t >> loop h handleCaps
+                    PlainMessage t   -> void (forkIO (plainHandler h mSrc t)) >> loop h handleCaps
+                    Rejected msg     -> chSend h msg >> loop h handleCaps
                 Right (Seal.Routing.Route.SlashCommand _) -> do
                   d <- ingest registry chain (RawInbound body)
                   case d of

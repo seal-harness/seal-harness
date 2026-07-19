@@ -24,6 +24,7 @@ import {
   cancelQuestion,
   type SendResult,
   type NewTabResponse,
+  createBareSession,
 } from './hooks/useApi'
 import { useListsStream } from './hooks/useListsStream'
 import { useNewTabSpec } from './hooks/useNewTabSpec'
@@ -437,6 +438,23 @@ export default function App() {
     setComposerOpen(true)
   }, [syncPath])
 
+  // The "Recent Sessions +" button: create a bare session (no tab attached)
+  // and focus it. Distinct from handleNewTab (which opens the new-tab
+  // composer). On success the WS `lists` broadcast refreshes the sidebar;
+  // we navigate to the new session immediately so the chat input wires up.
+  // Bind the configured default agent (if any) so the SessionSetup screen's
+  // default dropdown selection actually takes effect — mirrors
+  // handleComposerSubmit's post-create binding.
+  const handleNewBareSession = useCallback(async () => {
+    const res = await createBareSession()
+    if (!res) return
+    const id = `session:${res.session_id}`
+    setSelectedId(id)
+    syncPath(id)
+    const def = agents.find((a) => a.isDefault)
+    if (def) void setSessionAgent(res.session_id, def.name)
+  }, [syncPath, agents])
+
   const handleBranch = useCallback((entryId: string) => {
     setBranchFrom(entryId)
     setComposerOpen(true)
@@ -613,6 +631,7 @@ export default function App() {
           onSelectTab={handleSelectTab}
           onSelectSession={handleSelectSession}
           onNewTab={handleNewTab}
+          onNewSession={handleNewBareSession}
           onArchiveSession={handleArchiveSession}
           onUnarchiveSession={handleUnarchiveSession}
           onCloseTab={handleCloseTab}

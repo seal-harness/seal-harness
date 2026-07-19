@@ -293,6 +293,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -318,6 +319,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -334,6 +336,32 @@ describe('Sidebar', () => {
     expect(screen.getByTestId('archived-section')).toBeTruthy()
   })
 
+  it('fires onNewSession when the Recent Sessions + (sparkle) button is clicked', () => {
+    const onNewSession = vi.fn()
+    const sessions = [makeSession({ id: 's1', description: 'Sess' })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onNewSession={onNewSession}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onArchiveTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('New session'))
+    expect(onNewSession).toHaveBeenCalled()
+  })
+
   it('renders the harness-kind tabs under Running Harnesses, not Active Tabs', () => {
     const tabs = [
       makeTab({ index: 0, kind: 'session:anthropic', label: 'provider tab' }),
@@ -348,6 +376,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -374,6 +403,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={onArchiveSession}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -398,6 +428,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -425,6 +456,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}

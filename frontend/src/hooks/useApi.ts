@@ -516,6 +516,31 @@ export async function createTab(body: CreateTabBody): Promise<NewTabResponse | n
   }
 }
 
+/** Response from POST /api/sessions/new (bare new session, no tab). */
+export interface NewBareSessionResponse {
+  session_id: string
+}
+
+/** Create a bare session (no tab attached) and focus it. The "Recent
+ *  Sessions +" button calls this. Body is optional; provider/model/agent
+ *  override config defaults when present. Returns the new session id, or
+ *  null on failure. */
+export async function createBareSession(
+  body?: { provider?: string; model?: string; agent?: string }
+): Promise<NewBareSessionResponse | null> {
+  try {
+    const res = await fetch('/api/sessions/new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
+    if (!res.ok) return null
+    return await res.json() as NewBareSessionResponse
+  } catch {
+    return null
+  }
+}
+
 /** Close a tab by index. Returns true if the backend accepted the close. */
 export async function closeTab(index: number): Promise<boolean> {
   try {

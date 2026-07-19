@@ -2,7 +2,7 @@
 -- | Top-level TUI entry: path resolution -> config -> vault -> registry -> loop.
 module Seal.Tui (runTui) where
 
-import Data.IORef (newIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
 
@@ -14,6 +14,7 @@ import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
   , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
@@ -32,8 +33,10 @@ import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
-import Seal.Tabs (newTabsHandle)
+import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
+import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
@@ -125,6 +128,30 @@ runTui autonomy = do
   -- routes through askHuman, and the CLI loop delivers the next input line
   -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
   askReply <- newAskReplyStore 0
+  -- The /new command: mints a fresh session, swaps srActive, and rebinds the
+  -- tab (if any) bound to the old sid to the new sid. The ndRebind closure
+  -- reads the old sid from srActive BEFORE swapping, rebinds the matching
+  -- tab in TabsHandle, then writes the new meta to srActive, and returns
+  -- the old sid so the confirmation line can name it.
+  let newDeps = NewDeps
+        { ndPaths = paths
+        , ndCfg = pure cfg
+        , ndAgentDefs = backends
+        , ndChannelLabel = "cli"
+        , ndRebind = \_caps newMeta -> do
+            oldMeta <- readIORef activeRef
+            let oldSid = smId oldMeta
+            -- Rebind the tab (if any) bound to the old sid to the new sid.
+            -- At most one tab can match by I2.
+            snap <- snapshotTabs tabsH
+            case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
+              []       -> pure ()  -- no tab bound to old sid; just swap srActive
+              (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
+                Left e  -> putStrLn ("warning: /new tab rebind failed: " <> T.unpack e)
+                Right _ -> pure ()
+            writeIORef activeRef newMeta
+            pure oldSid
+        }
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
@@ -136,5 +163,6 @@ runTui autonomy = do
         , tabCommandSpec tabsH
         , tabsCommandSpec tabsH
         , terseGrammarSpec
+        , newCommandSpec newDeps
         ]
   runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply

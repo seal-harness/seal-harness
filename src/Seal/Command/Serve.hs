@@ -8,7 +8,7 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -29,6 +29,7 @@ import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
@@ -53,7 +54,9 @@ import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
-import Seal.Tabs (newTabsHandle)
+import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
+import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+import Seal.Session.Meta (SessionMeta (..))
 import Seal.Telegram.Config (resolveTelegramConfig)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
@@ -119,6 +122,26 @@ runServeMain autonomy = do
              , srConfigPath = cfgPath
              , srActive     = activeRef
              }
+      -- The /new command for the web: mints a fresh session, swaps srActive,
+      -- rebinds the tab (if any) bound to the old sid to the new sid, and
+      -- returns the old sid. Mirrors the CLI's ndRebind.
+      newDeps = NewDeps
+        { ndPaths = paths
+        , ndCfg = loadCfg
+        , ndAgentDefs = backends
+        , ndChannelLabel = "web"
+        , ndRebind = \_caps newMeta -> do
+            oldMeta <- readIORef activeRef
+            let oldSid = smId oldMeta
+            snap <- snapshotTabs tabsH
+            case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
+              []       -> pure ()
+              (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
+                Left _  -> pure ()  -- best-effort; the swap still happens
+                Right _ -> pure ()
+            writeIORef activeRef newMeta
+            pure oldSid
+        }
       -- The slash-command registry mirrors the TUI's. Web slash commands are
       -- best-effort: interactive-only specs (which prompt via ccPrompt) are
       -- included but the web caps return "" — a deferral story is a later phase.
@@ -133,6 +156,7 @@ runServeMain autonomy = do
         , tabsCommandSpec tabsH
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
+        , newCommandSpec newDeps
         ]
       sendDeps = SendDeps
         { sdPaths      = paths

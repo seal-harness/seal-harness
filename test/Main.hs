@@ -50,6 +50,7 @@ import qualified Seal.Command.CallSpec
 import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
+import qualified Seal.Command.NewSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Vault.BackendSpec
 import qualified Seal.Vault.CommandsSpec
@@ -172,6 +173,7 @@ main = hspec $ do
   Seal.Command.ChannelSpec.spec
   Seal.Command.SpecSpec.spec
   Seal.Command.TabSpec.spec
+  Seal.Command.NewSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Vault.BackendSpec.spec
   Seal.Vault.CommandsSpec.spec

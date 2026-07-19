@@ -25,6 +25,7 @@ module Seal.Tabs.Types
   , lookupByRef
   , removeTab
   , renameTab
+  , rebindTab
   , slotOf
   ) where
 
@@ -150,6 +151,23 @@ renameTab (TabList ts) i name =
       | otherwise     = case go rest of
           Just rest' -> Just (t : rest')
           Nothing   -> Nothing
+
+-- | Rebind a tab's 'TabRef' in place — preserve its index, kind, label, and
+-- status, only swapping @tRef@. Used by @\/new@ to point an existing tab at a
+-- fresh session.
+--
+-- I2 (no two tabs share a 'TabRef') is preserved: 'Left' if the new ref is
+-- already bound to a /different/ tab. Rebinding a tab to its own current
+-- ref is a no-op 'Right' (idempotent — the I2 check excludes the target
+-- slot itself). 'Left' if the index is out of range.
+rebindTab :: TabIndex -> TabRef -> TabList -> Either Text TabList
+rebindTab idx newRef (TabList ts) =
+  case break (\t -> tIndex t == idx) ts of
+    (_, []) -> Left "tab index out of range"
+    (before, target : after) ->
+      if newRef `elem` map tRef (before <> after)
+        then Left "tab ref already bound to another tab"
+        else Right (TabList (before <> [target { tRef = newRef }] <> after))
 
 -- | The current slot of a 'TabRef' (I3: resolved at read time). 'Nothing' if
 -- the ref is no longer in the list (the cursor is stale).

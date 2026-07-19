@@ -208,6 +208,7 @@ handleSend deps sid rawText = do
           Left err -> pure (SendError 400 err)
           Right () -> pure SendAssistant
       Right (SlashCommand _) -> runSlash deps meta rawText
+      Right NewSession       -> runSlash deps meta rawText
       Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)")
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)")
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)")

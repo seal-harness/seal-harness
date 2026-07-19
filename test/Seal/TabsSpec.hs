@@ -72,3 +72,46 @@ spec = describe "Seal.Tabs.TabsHandle" $ do
     r1 `shouldSatisfy` isRight
     r2 <- focusTabH h (mk 5)
     r2 `shouldSatisfy` isLeft
+
+  describe "rebindTabH" $ do
+    it "swaps the tab's ref, preserving index/kind/label/status" $ do
+      h <- newTabsHandle
+      _ <- insertTabH h (BoundSession (sid "a")) KindAi (Just "work")
+      r <- rebindTabH h (mk 0) (BoundSession (sid "b"))
+      r `shouldSatisfy` isRight
+      snap <- snapshotTabs h
+      case tlTabs snap of
+        [t] -> do
+          tRef t   `shouldBe` BoundSession (sid "b")
+          tIndex t `shouldBe` mk 0
+          tKind t  `shouldBe` KindAi
+          tLabel t `shouldBe` Just "work"
+          tStatus t `shouldBe` Live
+        _ -> expectationFailure "expected one tab"
+
+    it "out-of-range index is Left" $ do
+      h <- newTabsHandle
+      _ <- insertTabH h (BoundSession (sid "a")) KindAi Nothing
+      r <- rebindTabH h (mk 5) (BoundSession (sid "b"))
+      r `shouldSatisfy` isLeft
+
+    it "I2: new ref already bound to a different tab is Left" $ do
+      h <- newTabsHandle
+      _ <- insertTabH h (BoundSession (sid "a")) KindAi Nothing
+      _ <- insertTabH h (BoundSession (sid "b")) KindAi Nothing
+      -- rebinding tab 1 to sid "a" (already on tab 0) must fail
+      r <- rebindTabH h (mk 1) (BoundSession (sid "a"))
+      r `shouldSatisfy` isLeft
+      -- and must not have mutated either tab
+      snap <- snapshotTabs h
+      map tRef (tlTabs snap) `shouldBe` [BoundSession (sid "a"), BoundSession (sid "b")]
+
+    it "rebind-to-same-ref is a no-op Right" $ do
+      h <- newTabsHandle
+      _ <- insertTabH h (BoundSession (sid "a")) KindAi (Just "work")
+      r <- rebindTabH h (mk 0) (BoundSession (sid "a"))
+      r `shouldSatisfy` isRight
+      snap <- snapshotTabs h
+      case tlTabs snap of
+        [t] -> tRef t `shouldBe` BoundSession (sid "a")
+        _   -> expectationFailure "expected one tab"

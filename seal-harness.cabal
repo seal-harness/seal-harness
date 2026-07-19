@@ -99,6 +99,7 @@ library
         Seal.Command.Agent
         Seal.Command.Background
         Seal.Command.Call
+        Seal.Command.New
         Seal.Command.Spec
         Seal.Command.Channel
         Seal.Config.File
@@ -327,6 +328,7 @@ test-suite tests
         Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
+        Seal.Command.NewSpec
         Seal.Config.FileSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
