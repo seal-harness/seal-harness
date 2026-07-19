@@ -261,20 +261,42 @@ export default function App() {
     }
   }, [currentSessionId])
 
+  const syncPath = useCallback((id: string | null) => {
+    if (typeof window !== 'undefined') {
+      window.history.pushState(null, '', pathFromSelectedId(id))
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onPopState = () => setSelectedId(selectedIdFromPath())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
   // ── Send routing ──────────────────────────────────────────────────────
   // A `kind:"slash"` send response adds no transcript entry: render a
-  // transient bubble and clear the optimistic spinner. Any other kind
-  // falls through to the transcript-driven clear path. Returns true when
-  // the caller must NOT keep a pending spinner.
+  // transient bubble and clear the optimistic spinner. When the slash
+  // command mints a fresh session (e.g. /new), `session_id` is set and the
+  // SPA navigates to it so the new session becomes the focused one. Any
+  // other kind falls through to the transcript-driven clear path. Returns
+  // true when the caller must NOT keep a pending spinner.
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
     if (res && res.kind === 'slash') {
       setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq }])
       setPendingMessage(null)
       setPendingMessageModel(null)
+      // /new swaps the backend's active session; navigate the SPA to it so
+      // the chat input wires up to the new session.
+      if (res.session_id) {
+        const id = `session:${res.session_id}`
+        setSelectedId(id)
+        syncPath(id)
+      }
       return true
     }
     return false
-  }, [])
+  }, [syncPath])
 
   const transcriptMessages = useMemo(() => transcriptToMessages(entries), [entries])
 
@@ -403,19 +425,6 @@ export default function App() {
   }, [send, entries.length, currentSessionId, archivedSessions, sessions, modelOverride, lastTranscriptModel, handleSendResult])
 
   // ── Selection handlers ────────────────────────────────────────────────
-  const syncPath = useCallback((id: string | null) => {
-    if (typeof window !== 'undefined') {
-      window.history.pushState(null, '', pathFromSelectedId(id))
-    }
-  }, [])
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    const onPopState = () => setSelectedId(selectedIdFromPath())
-    window.addEventListener('popstate', onPopState)
-    return () => window.removeEventListener('popstate', onPopState)
-  }, [])
-
   const handleSelectTab = useCallback((index: number) => {
     const id = `tab:${index}`
     setSelectedId(id)

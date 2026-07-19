@@ -49,7 +49,7 @@ import Seal.Config.File
   , onDemandSchemas, fcDelegation, fcDebugSessionTranscript )
 import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
@@ -166,17 +166,27 @@ data SendDeps = SendDeps
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
 -- this into the JSON response body the frontend's @SendResult@ parses.
 data SendOutcome
-  = SendSlash Text      -- ^ transient slash-command output (no transcript entry)
+  = SendSlash Text (Maybe SessionId)
+    -- ^ transient slash-command output (no transcript entry). The optional
+    -- 'SessionId' is set by slash commands that mint+focus a new session
+    -- (e.g. @\/new@) so the frontend can navigate to it. 'Nothing' for
+    -- ordinary slash commands.
   | SendAssistant       -- ^ plain turn; reply lands in the transcript
   | SendError Int Text  -- ^ HTTP status code + message (400/404/500)
   deriving stock (Eq, Show)
 
 -- | Encode a 'SendOutcome' as the JSON the frontend's @SendResult@ parses.
 -- Errors carry an @error@ field (the frontend logs them); success carries
--- @kind@ + @response@.
+-- @kind@ + @response@; @\/new@ also carries @session_id@ so the SPA can
+-- navigate to the freshly-minted session.
 sendOutcomeJson :: SendOutcome -> (Int, Value)
 sendOutcomeJson = \case
-  SendSlash t    -> (200, object [ "kind" .= ("slash" :: Text), "response" .= t ])
+  SendSlash t mSid ->
+    (200, object
+      [ "kind" .= ("slash" :: Text)
+      , "response" .= t
+      , "session_id" .= (sessionIdText <$> mSid)
+      ])
   SendAssistant  -> (200, object [ "kind" .= ("assistant" :: Text), "response" .= ("" :: Text) ])
   SendError c m  -> (c, object [ "error" .= m ])
 
@@ -201,7 +211,7 @@ handleSend deps sid rawText = do
   case mMeta of
     Nothing -> pure (SendError 404 "session not found")
     Just meta -> case route rawText of
-      Left (ParseError e) -> pure (SendSlash e)
+      Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
         er <- plainTurn deps meta t
         case er of
@@ -209,9 +219,9 @@ handleSend deps sid rawText = do
           Right () -> pure SendAssistant
       Right (SlashCommand _) -> runSlash deps meta rawText
       Right NewSession       -> runSlash deps meta rawText
-      Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)")
-      Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)")
-      Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)")
+      Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)" Nothing)
+      Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
+      Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.
@@ -397,18 +407,29 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
 -- 'ccSend' appends to an MVar-backed list, then returned as the @response@.
 -- 'ccPrompt' routes through the ask/reply store so ASK_HUMAN (e.g. from a
 -- slash command that delegates to the agent) surfaces to the frontend.
+--
+-- For @\/new@ specifically: the command's 'ndRebind' swaps the active-session
+-- ref ('sdSession') to the freshly-minted session. After the action runs, we
+-- re-read the active session and, if its id differs from the one we entered
+-- with, include the new id in the 'SendSlash' outcome so the frontend can
+-- navigate to it. (This avoids widening the 'CommandAction' contract or
+-- threading a per-call IORef through the registry.)
 runSlash :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
 runSlash deps meta fullLine = do
   outVar <- newMVar ([] :: [Text])
   let askCaps = webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
       caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
+      enteredSid = smId meta
   d <- ingest (sdRegistry deps) (sdPreprocess deps) (RawInbound fullLine)
   case d of
     DispatchAction (CommandAction act) -> do
       act caps
       chunks <- readMVar outVar
-      pure (SendSlash (T.intercalate "\n" chunks))
-    ShowText t -> pure (SendSlash t)
+      -- If the action swapped the active session (e.g. /new), thread the
+      -- new sid into the outcome so the frontend navigates to it.
+      mNewSid <- newSessionIdIfChanged deps enteredSid
+      pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
+    ShowText t -> pure (SendSlash t Nothing)
     Rejected t -> pure (SendError 400 t)
     PlainMessage t -> do
       er <- plainTurnWithCaps deps meta caps t
@@ -416,7 +437,18 @@ runSlash deps meta fullLine = do
         Left err -> pure (SendError 400 err)
         Right () -> do
           chunks <- readMVar outVar
-          pure (SendSlash (T.intercalate "\n" chunks))
+          pure (SendSlash (T.intercalate "\n" chunks) Nothing)
+
+-- | After a slash action runs, check whether the active session changed.
+-- Returns the new 'SessionId' if 'sdSession' now points at a different
+-- session than @enteredSid@; 'Nothing' otherwise. Used by @\/new@ to
+-- thread the freshly-minted sid into the 'SendSlash' outcome.
+newSessionIdIfChanged :: SendDeps -> SessionId -> IO (Maybe SessionId)
+newSessionIdIfChanged deps enteredSid = do
+  active <- readIORef (srActive (sdSession deps))
+  if smId active == enteredSid
+    then pure Nothing
+    else pure (Just (smId active))
 
 -- | The plain-turn helper for a slash-dispatched PlainMessage (when the
 -- preprocess chain passes a leading-/ line through but the registry doesn't

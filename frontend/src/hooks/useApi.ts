@@ -255,10 +255,13 @@ export function useTranscript(sessionId: string | null) {
  *  OPEN enum — the frontend must tolerate future/unknown kinds. */
 export type SendKind = 'slash' | 'assistant' | (string & {})
 
-/** Parsed 200 body of POST /api/sessions/:id/send. */
+/** Parsed 200 body of POST /api/sessions/:id/send. `session_id` is set only
+ *  by slash commands that mint+focus a new session (e.g. /new) so the SPA
+ *  can navigate to it; absent for ordinary slash commands + plain turns. */
 export interface SendResult {
   response: string
   kind: SendKind
+  session_id?: string | null
 }
 
 export function useSendMessage(sessionId: string | null, onComplete: () => void) {

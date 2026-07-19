@@ -34,7 +34,7 @@ import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..))
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -1268,6 +1268,33 @@ spec = describe "Seal.Gateway.API" $ do
   -- A session that doesn't exist on disk returns 404. This exercises the
   -- handleSend -> loadSessionMeta -> Nothing path without needing a real
   -- provider/vault (the lookup happens before provider resolution).
+  it "sendOutcomeJson (SendSlash with new sid) includes session_id" $ do
+    let sid = case mkSessionId "20260719-120000-001" of
+          Right s -> s
+          Left _  -> error "invalid sid"
+        (code, val) = sendOutcomeJson (SendSlash "new session minted" (Just sid))
+    code `shouldBe` 200
+    case val of
+      A.Object o -> do
+        case KeyMap.lookup (Key.fromText "kind") o of
+          Just (A.String k) -> k `shouldBe` "slash"
+          _ -> expectationFailure "expected kind: slash"
+        case KeyMap.lookup (Key.fromText "session_id") o of
+          Just (A.String s) -> s `shouldBe` "20260719-120000-001"
+          _ -> expectationFailure "expected session_id string"
+      _ -> expectationFailure "expected JSON object"
+
+  it "sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id" $ do
+    let (code, val) = sendOutcomeJson (SendSlash "/help output" Nothing)
+    code `shouldBe` 200
+    case val of
+      A.Object o ->
+        case KeyMap.lookup (Key.fromText "session_id") o of
+          Just A.Null -> pure ()  -- explicit null is fine
+          Nothing     -> pure ()  -- omitted is also fine
+          _ -> expectationFailure "expected null/absent session_id"
+      _ -> expectationFailure "expected JSON object"
+
   it "POST /api/sessions/<sid>/send with adSend wired returns 404 for a missing session" $ do
     withSystemTempDirectory "seal-send" $ \tmp -> do
       tabsH <- newTabsHandle
