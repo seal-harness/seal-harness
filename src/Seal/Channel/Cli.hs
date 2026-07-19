@@ -107,7 +107,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, formatSessionId
-  , newSession, resolveDefaultAgent )
+  , newSession, resolveDefaultAgent, saveSessionMeta )
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -264,7 +264,6 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
-      sessionDirPath = sessionDir paths (smId active0)
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = ChannelCaps
@@ -304,149 +303,209 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
       -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
       execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
       defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromFile
-  -- The two-file transcript bracket wraps the whole loop so every turn shares
-  -- one writer. The opcodes (and thus the ISA registry) close over `caps`, so
-  -- they are built here where both `caps` and the transcript handle are in
-  -- scope. Legacy sessions with an existing @transcript.jsonl@ are left
+  -- Per-turn transcript + ISA registry construction.
+  --
+  -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
+  -- for `sid0` and built one `isaReg` at launch, baking `sid0` into
+  -- `memoryWriteOp`/`skillWriteOp`/`agentDefWriteOp`. That was "correct by
+  -- accident" while `srActive` never changed after launch — but it's a
+  -- latent audit-trail integrity bug: any future change that swaps
+  -- `srActive` (e.g. `/new`, or a CLI `/tab focus` that rebinds the active
+  -- session) would silently write the new session's transcript + memory +
+  -- skill + agent-def entries to the OLD session's dirs/keys.
+  --
+  -- The fix mirrors `runTurnOnSession` in `Seal.Channels.Loop`: rebuild
+  -- `isaReg` and reopen the transcript **per turn** using `smId meta`
+  -- read fresh from `srActive`. The per-turn helpers (`buildCliIsaReg`,
+  -- `buildCliStartWiring`, `cliChildRegistryBuilder`, `cliResolveChildProvider`,
+  -- `cliChildSystemPrompt`, `cliMintAgentSession`) close over the
+  -- turn-invariant bits (wsRoot, eCfg, backends, caps, rt, paths, autonomy,
+  -- approvals, appEnv, execBackend, askReply, pr, sr) and take `sid` (and
+  -- `caps`/`tHandle` where needed) as parameters. The `withTwoFileTranscript`
+  -- bracket moves inside `plainHandler` and `callDispatcher`. The `/bg`
+  -- runner already opened its own per-invocation bracket, so it's unaffected
+  -- (it mints its own bgSid and never touches `srActive`).
+  --
+  -- File-handle churn is acceptable: the inbox loop already pays this per
+  -- turn. Legacy sessions with an existing `transcript.jsonl` are left
   -- untouched (the legacy read path handles them); new sessions get the
-  -- @conversation.jsonl@ + @entries.jsonl@ pair. The evolutionary-store
-  -- backends (memory/skills/agent-defs) are disk-backed Markdown files under
-  -- @config\/@, shared with the @\/skill@ and @\/agent@ command specs (built in
-  -- 'Seal.Tui.runTui' from the same 'Backends' record). Disk is canonical;
-  -- git is the versioning + audit layer. No startup materialization is needed
-  -- — the backends read their directories on demand.
+  -- `conversation.jsonl` + `entries.jsonl` pair. The evolutionary-store
+  -- backends (memory/skills/agent-defs) are disk-backed Markdown files
+  -- under `config/`, shared with the `/skill` and `/agent` command specs
+  -- (built in `Seal.Tui.runTui` from the same `Backends` record). Disk is
+  -- canonical; git is the versioning + audit layer. No startup
+  -- materialization is needed — the backends read their directories on
+  -- demand.
   let memoryBackend    = bMemory backends
       skillBackend     = bSkills backends
-      agentDefBackend  = bAgentDefs backends
-      agentRuntime     = bRuntime backends
-  withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    let sid0 = smId active0
-        -- Mint a fresh SessionId for a forked agent instance. Each start
-        -- gets its own timestamped id (a re-start of the same def does not
-        -- append to a prior instance's transcript).
-        mintAgentSession = do
-          now <- getCurrentTime
-          case mkSessionId (formatSessionId now) of
-            Right s  -> pure s
-            -- unreachable: formatSessionId only emits digits and dashes
-            Left _e  -> pure sid0
-        -- The AGENT_START worker-builder: build a fresh AgentEnv for the
-        -- child (its own two-file transcript under
-        -- @\<parent-session\>\/agents\/\<child-id\>@), run 'runTurn' with the
-        -- goal as the first user message, and capture the final text
-        -- response as the summary. The child's ISA registry is narrowed:
-        -- the delegation blocklist strips AGENT_START/AGENT_DEF_*/lifecycle
-        -- opcodes so the child can't recurse or mutate defs.
-        --
-        -- Provider resolution honors the [delegation] provider/model/base_url
-        -- override when set, else falls back to the def's provider/model
-        -- (which itself falls back to the active session's when empty).
-        resolveChildProvider def = do
-          active <- readIORef (srActive sr)
-          let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-              fallBackModel = case adModel def of
-                ModelId m | T.null m -> smModel active
-                          | otherwise -> m
-          resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-        childSystemPrompt def task =
-          let base = adSystem def
-              ctx  = ctContext task
-          in case (base, ctx) of
-               (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-               (Just b, _)                       -> Just b
-               (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-               (Nothing, Nothing)                -> Nothing
-        childRegistryBuilder _def childSid childCaps = do
-          let childBaseOps =
-                [ showHumanOp childCaps
-                , askHumanOp childCaps
-                , fileReadOp wsRoot operatorCeiling
-                , secretGetOp rt
-                , memoryWriteOp memoryBackend childSid
-                , memoryRecallOp defaultPageParams memoryBackend
-                , memoryDeleteOp memoryBackend
-                , skillWriteOp skillBackend childSid
-                , skillReadOp skillBackend
-                , skillListOp skillBackend
-                , skillDeleteOp skillBackend
-                , agentDefReadOp agentDefBackend
-                , agentDefListOp agentDefBackend
-                -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
-                -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
-                -- AGENT_INTERRUPT
-                , shellExecOp wsRoot cliSecurityPolicy execBackend
-                , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-                , processManageOp wsRoot cliSecurityPolicy execBackend
-                , fileWriteOp wsRoot operatorCeiling
-                , filePatchOp wsRoot
-                , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
-                ]
-          pure (ISA.mkRegistry
-                  (filterBlocklisted childBaseOps opName
-                     ++ if onDemandFromCfg eCfg
-                          then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
-                          else []))
-        delegateDeps = DelegationWorkerDeps
-          { dwdPaths = paths
-          , dwdParentSid = sid0
-          , dwdAppEnv = appEnv
-          , dwdExecBackend = execBackend
-          , dwdAutonomy = autonomy
-          , dwdApprovals = approvals
-          , dwdOnDemand = onDemandFromCfg eCfg
-          , dwdParentDepth = 0
-          , dwdResolveProvider = resolveChildProvider
-          , dwdChildRegistry = childRegistryBuilder
-          , dwdChildSystemPrompt = childSystemPrompt
-          , dwdOnEntry = pure ()
-          }
-        mkWorker = mkDelegateWorker delegateDeps
-        delegationCfg = do
-          eCfg' <- loadFileConfig (prConfigPath pr)
-          pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
-        startWiring = AgentStartWiring
+      agentDefBackend   = bAgentDefs backends
+      agentRuntime      = bRuntime backends
+      onDemand          = onDemandFromCfg eCfg
+      -- Mint a fresh SessionId for a forked agent instance. Each start
+      -- gets its own timestamped id (a re-start of the same def does not
+      -- append to a prior instance's transcript).
+      mintAgentSession sid = do
+        now <- getCurrentTime
+        case mkSessionId (formatSessionId now) of
+          Right s  -> pure s
+          -- unreachable: formatSessionId only emits digits and dashes
+          Left _e  -> pure sid
+      -- The AGENT_START worker-builder: build a fresh AgentEnv for the
+      -- child (its own two-file transcript under
+      -- @\<parent-session\>\/agents\/\<child-id\>@), run 'runTurn' with the
+      -- goal as the first user message, and capture the final text
+      -- response as the summary. The child's ISA registry is narrowed:
+      -- the delegation blocklist strips AGENT_START/AGENT_DEF_*/lifecycle
+      -- opcodes so the child can't recurse or mutate defs.
+      --
+      -- Provider resolution honors the [delegation] provider/model/base_url
+      -- override when set, else falls back to the def's provider/model
+      -- (which itself falls back to the active session's when empty).
+      cliResolveChildProvider def = do
+        active <- readIORef (srActive sr)
+        let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
+            fallBackModel = case adModel def of
+              ModelId m | T.null m -> smModel active
+                        | otherwise -> m
+        resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
+      cliChildSystemPrompt def task =
+        let base = adSystem def
+            ctx  = ctContext task
+        in case (base, ctx) of
+             (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+             (Just b, _)                       -> Just b
+             (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+             (Nothing, Nothing)                -> Nothing
+      cliChildRegistryBuilder _def childSid childCaps = do
+        let childBaseOps =
+              [ showHumanOp childCaps
+              , askHumanOp childCaps
+              , fileReadOp wsRoot operatorCeiling
+              , secretGetOp rt
+              , memoryWriteOp memoryBackend childSid
+              , memoryRecallOp defaultPageParams memoryBackend
+              , memoryDeleteOp memoryBackend
+              , skillWriteOp skillBackend childSid
+              , skillReadOp skillBackend
+              , skillListOp skillBackend
+              , skillDeleteOp skillBackend
+              , agentDefReadOp agentDefBackend
+              , agentDefListOp agentDefBackend
+              -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
+              -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
+              -- AGENT_INTERRUPT
+              , shellExecOp wsRoot cliSecurityPolicy execBackend
+              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
+              , processManageOp wsRoot cliSecurityPolicy execBackend
+              , fileWriteOp wsRoot operatorCeiling
+              , filePatchOp wsRoot
+              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              ]
+        pure (ISA.mkRegistry
+                (filterBlocklisted childBaseOps opName
+                   ++ if onDemand
+                        then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
+                        else []))
+      -- Build the AGENT_START wiring for a given parent sid. The worker
+      -- builder is fixed across turns (it closes over the per-turn
+      -- helpers above); only the parent sid varies.
+      cliStartWiring sid =
+        let delegateDeps = DelegationWorkerDeps
+              { dwdPaths = paths
+              , dwdParentSid = sid
+              , dwdAppEnv = appEnv
+              , dwdExecBackend = execBackend
+              , dwdAutonomy = autonomy
+              , dwdApprovals = approvals
+              , dwdOnDemand = onDemand
+              , dwdParentDepth = 0
+              , dwdResolveProvider = cliResolveChildProvider
+              , dwdChildRegistry = cliChildRegistryBuilder
+              , dwdChildSystemPrompt = cliChildSystemPrompt
+              , dwdOnEntry = pure ()
+              }
+            mkWorker = mkDelegateWorker delegateDeps
+            delegationCfg = do
+              eCfg' <- loadFileConfig (prConfigPath pr)
+              pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+        in AgentStartWiring
           { aswDefBackend = agentDefBackend
           , aswRuntime = agentRuntime
           , aswConfig = delegationCfg
           , aswPauseFlag = bSpawnPauseFlag backends
           , aswParentActivity = Just (bParentActivity backends)
-          , aswMintSession = mintAgentSession
+          , aswMintSession = mintAgentSession sid
           , aswParentDepth = 0
           , aswWorker = mkWorker
           }
-        isaReg = ISA.mkRegistry
-          (baseIsaOps ++ if onDemandFromCfg eCfg
-                           then [opcodeDescribeOp isaReg, opcodeListOp isaReg]
-                           else [])
-        baseIsaOps =
-          [ showHumanOp caps
-          , askHumanOp caps
-          , fileReadOp wsRoot operatorCeiling
-          , secretGetOp rt
-          , memoryWriteOp memoryBackend sid0
-          , memoryRecallOp defaultPageParams memoryBackend
-          , memoryDeleteOp memoryBackend
-          , skillWriteOp skillBackend sid0
-          , skillReadOp skillBackend
-          , skillListOp skillBackend
-          , skillDeleteOp skillBackend
-          , agentDefWriteOp agentDefBackend sid0
-          , agentDefReadOp agentDefBackend
-          , agentDefListOp agentDefBackend
-          , agentDefDeleteOp agentDefBackend
-          , agentInstancesOp agentRuntime
-          , agentStartOp startWiring
-          , agentStatusOp agentRuntime
-          , agentStopOp agentRuntime
-          , agentInterruptOp agentRuntime
-          , shellExecOp wsRoot cliSecurityPolicy execBackend
-          , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-          , processManageOp wsRoot cliSecurityPolicy execBackend
-          , fileWriteOp wsRoot operatorCeiling
-          , filePatchOp wsRoot
-          , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
-          ]
-    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+      -- Build the session's ISA registry for a given sid + caps + startWiring.
+      -- `caps'` is the ChannelCaps the showHuman/askHuman opcodes close over
+      -- (the main turn uses `caps`; the /bg runner uses `bgCaps` so bg-spawned
+      -- ASK_HUMAN routes through `askHuman` keyed to bgSid). The recursive
+      -- describe/list ops close over the registry they belong to (let-knot).
+      -- `tHandle` is NOT closed over here — the dispatcher threads it at call
+      -- time.
+      cliIsaReg sid startWiring caps' =
+        let reg = ISA.mkRegistry
+              (baseOps reg ++ if onDemand
+                                then [opcodeDescribeOp reg, opcodeListOp reg]
+                                else [])
+            baseOps _reg =
+              [ showHumanOp caps'
+              , askHumanOp caps'
+              , fileReadOp wsRoot operatorCeiling
+              , secretGetOp rt
+              , memoryWriteOp memoryBackend sid
+              , memoryRecallOp defaultPageParams memoryBackend
+              , memoryDeleteOp memoryBackend
+              , skillWriteOp skillBackend sid
+              , skillReadOp skillBackend
+              , skillListOp skillBackend
+              , skillDeleteOp skillBackend
+              , agentDefWriteOp agentDefBackend sid
+              , agentDefReadOp agentDefBackend
+              , agentDefListOp agentDefBackend
+              , agentDefDeleteOp agentDefBackend
+              , agentInstancesOp agentRuntime
+              , agentStartOp startWiring
+              , agentStatusOp agentRuntime
+              , agentStopOp agentRuntime
+              , agentInterruptOp agentRuntime
+              , shellExecOp wsRoot cliSecurityPolicy execBackend
+              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
+              , processManageOp wsRoot cliSecurityPolicy execBackend
+              , fileWriteOp wsRoot operatorCeiling
+              , filePatchOp wsRoot
+              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              ]
+        in reg
+      -- Resolve the bound agent's system prompt (re-read per turn; agent
+      -- dirs are small). Nothing when no agent is bound or the def has no
+      -- system prompt.
+      resolveSystem meta = case smAgent meta of
+        Nothing  -> pure Nothing
+        Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+      -- The per-turn body: open the transcript for `sid`, build the ISA
+      -- registry, run a turn under a `withTwoFileTranscript` bracket.
+      -- Mirrors `runTurnOnSession` from `Seal.Channels.Loop`. Used by
+      -- `plainHandler` (for plain-text turns). `callDispatcher` uses
+      -- `withCliTurnDispatch` below (it needs to return the structured
+      -- `Either DispatchError OpResult`).
+      withCliTurn meta act = do
+        let sid = smId meta
+            sessionDirPath' = sessionDir paths sid
+        createDirectoryIfMissing True sessionDirPath'
+        saveSessionMeta paths meta
+        withTwoFileTranscript sessionDirPath' $ \tHandle -> do
+          let startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps
+          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+          eprov <- resolveSessionProvider pr meta
+          case eprov of
+            Left err -> ccSend caps err
+            Right (prov, model) -> do
+              mSystem <- resolveSystem meta
+              act sid tHandle isaReg prov model mSystem
     -- The /bg runner: mint a fresh persisted session from the config
     -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
     -- (notify = print the question via ccSend, so the confirmation appears
@@ -454,167 +513,65 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
     -- registry. The fork lets the CLI loop keep reading input; the loop's
     -- deliverNextAnswerAny routes the next line as the confirmation answer.
     -- The assistant reply is delivered via the bg caps' ccSend (println).
-    -- No tab/cursor state is touched.
-    let bgRunner = BgRunner $ \prompt -> do
-          cfg <- fromRight defaultFileConfig <$> loadFileConfig (prConfigPath pr)
-          (mAgent, mProv, mModel) <- resolveDefaultAgent agentDefBackend cfg
-          let (cfgProv, cfgModel) = defaultSessionSelection cfg
-              provider = fromMaybe cfgProv mProv
-              model    = fromMaybe cfgModel mModel
-          meta <- newSession paths provider model "bg" mAgent
-          let bgSid = smId meta
-              sessionDirPath' = sessionDir paths bgSid
-          createDirectoryIfMissing True sessionDirPath'
-          void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
-            let bgCaps = ChannelCaps
-                  { ccSend = ccSend caps
-                  , ccPrompt = \q -> do
-                      outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
-                      pure (fromRight "" outcome)
-                  , ccPromptSecret = ccPromptSecret caps
-                  }
-                bgMintSession = do
-                  now <- getCurrentTime
-                  case mkSessionId (formatSessionId now) of
-                    Right s  -> pure s
-                    Left _e  -> pure bgSid
-                bgResolveChildProvider def = do
-                  active <- readIORef (srActive sr)
-                  let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-                      fallBackModel = case adModel def of
-                        ModelId m | T.null m -> smModel active
-                                  | otherwise -> m
-                  resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-                bgChildSystemPrompt def task =
-                  let base = adSystem def
-                      ctx  = ctContext task
-                  in case (base, ctx) of
-                       (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-                       (Just b, _)                       -> Just b
-                       (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-                       (Nothing, Nothing)                -> Nothing
-                bgChildRegistryBuilder _def childSid childCaps = do
-                  let childBaseOps =
-                        [ showHumanOp childCaps
-                        , askHumanOp childCaps
-                        , fileReadOp wsRoot operatorCeiling
-                        , secretGetOp rt
-                        , memoryWriteOp memoryBackend childSid
-                        , memoryRecallOp defaultPageParams memoryBackend
-                        , memoryDeleteOp memoryBackend
-                        , skillWriteOp skillBackend childSid
-                        , skillReadOp skillBackend
-                        , skillListOp skillBackend
-                        , skillDeleteOp skillBackend
-                        , agentDefReadOp agentDefBackend
-                        , agentDefListOp agentDefBackend
-                        , shellExecOp wsRoot cliSecurityPolicy execBackend
-                        , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-                        , processManageOp wsRoot cliSecurityPolicy execBackend
-                        , fileWriteOp wsRoot operatorCeiling
-                        , filePatchOp wsRoot
-                        , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
-                        ]
-                  pure (ISA.mkRegistry
-                          (filterBlocklisted childBaseOps opName
-                             ++ if onDemandFromCfg eCfg
-                                  then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
-                                  else []))
-                bgDelegateDeps = DelegationWorkerDeps
-                  { dwdPaths = paths
-                  , dwdParentSid = bgSid
-                  , dwdAppEnv = appEnv
-                  , dwdExecBackend = execBackend
-                  , dwdAutonomy = autonomy
-                  , dwdApprovals = approvals
-                  , dwdOnDemand = onDemandFromCfg eCfg
-                  , dwdParentDepth = 0
-                  , dwdResolveProvider = bgResolveChildProvider
-                  , dwdChildRegistry = bgChildRegistryBuilder
-                  , dwdChildSystemPrompt = bgChildSystemPrompt
-                  , dwdOnEntry = pure ()
-                  }
-                bgMkWorker = mkDelegateWorker bgDelegateDeps
-                bgDelegationCfg = do
-                  eCfg' <- loadFileConfig (prConfigPath pr)
-                  pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
-                bgStartWiring = AgentStartWiring
-                  { aswDefBackend = agentDefBackend
-                  , aswRuntime = agentRuntime
-                  , aswConfig = bgDelegationCfg
-                  , aswPauseFlag = bSpawnPauseFlag backends
-                  , aswParentActivity = Just (bParentActivity backends)
-                  , aswMintSession = bgMintSession
-                  , aswParentDepth = 0
-                  , aswWorker = bgMkWorker
-                  }
-                bgIsaReg = ISA.mkRegistry
-                  (baseBgIsaOps ++ if onDemandFromCfg eCfg
-                                      then [opcodeDescribeOp bgIsaReg, opcodeListOp bgIsaReg]
-                                      else [])
-                baseBgIsaOps =
-                  [ showHumanOp bgCaps
-                  , askHumanOp bgCaps
-                  , fileReadOp wsRoot operatorCeiling
-                  , secretGetOp rt
-                  , memoryWriteOp memoryBackend bgSid
-                  , memoryRecallOp defaultPageParams memoryBackend
-                  , memoryDeleteOp memoryBackend
-                  , skillWriteOp skillBackend bgSid
-                  , skillReadOp skillBackend
-                  , skillListOp skillBackend
-                  , skillDeleteOp skillBackend
-                  , agentDefWriteOp agentDefBackend bgSid
-                  , agentDefReadOp agentDefBackend
-                  , agentDefListOp agentDefBackend
-                  , agentDefDeleteOp agentDefBackend
-                  , agentInstancesOp agentRuntime
-                  , agentStartOp bgStartWiring
-                  , agentStatusOp agentRuntime
-                  , agentStopOp agentRuntime
-                  , agentInterruptOp agentRuntime
-                  , shellExecOp wsRoot cliSecurityPolicy execBackend
-                  , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-                  , processManageOp wsRoot cliSecurityPolicy execBackend
-                  , fileWriteOp wsRoot operatorCeiling
-                  , filePatchOp wsRoot
-                  , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
-                  ]
-            tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
-            eprov <- resolveSessionProvider pr meta
-            case eprov of
-              Left err -> ccSend caps ("bg failed: " <> err)
-              Right (prov, mdl) -> do
-                mSystem <- case smAgent meta of
-                  Nothing  -> pure Nothing
-                  Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
-                let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
-                      (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
-                runApp appEnv (runTurn env prompt)))
-        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher])
-        -- The /call dispatcher: dispatch an opcode against the active
-        -- session's ISA registry + transcript under Full autonomy (the
-        -- operator is the approver by typing /call). Returns the
-        -- structured DispatchError/OpResult for the command to render.
-        callDispatcher callOpName val =
-          runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
-    let plainHandler t = do
-          meta  <- readIORef (srActive sr)
+    -- No tab/cursor state is touched. The bg session's ISA registry is
+    -- built per-invocation (its own sid, its own transcript bracket) —
+    -- unchanged by the per-turn refactor.
+      bgRunner = BgRunner $ \prompt -> do
+        cfg <- fromRight defaultFileConfig <$> loadFileConfig (prConfigPath pr)
+        (mAgent, mProv, mModel) <- resolveDefaultAgent agentDefBackend cfg
+        let (cfgProv, cfgModel) = defaultSessionSelection cfg
+            provider = fromMaybe cfgProv mProv
+            model    = fromMaybe cfgModel mModel
+        meta <- newSession paths provider model "bg" mAgent
+        let bgSid = smId meta
+            sessionDirPath' = sessionDir paths bgSid
+        createDirectoryIfMissing True sessionDirPath'
+        void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
+          let bgCaps = ChannelCaps
+                { ccSend = ccSend caps
+                , ccPrompt = \q -> do
+                    outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
+                    pure (fromRight "" outcome)
+                , ccPromptSecret = ccPromptSecret caps
+                }
+              bgStartWiring = cliStartWiring bgSid
+              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps
+          tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
-            Left err            -> ccSend caps err
-            Right (prov, model) -> do
-              -- Resolve the bound agent's system prompt (re-read per turn;
-              -- agent dirs are small). Nothing when no agent is bound or
-              -- the def has no system prompt.
-              mSystem <- case smAgent meta of
-                Nothing -> pure Nothing
-                Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
-              handlePlain
-                (mkSessionAgentEnv caps prov (smProvider meta) model (smId meta) mSystem isaReg tHandle execBackend
-                   (debugRequestsPath paths (smId meta) eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg))
-                appEnv t
-    runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
+            Left err -> ccSend caps ("bg failed: " <> err)
+            Right (prov, mdl) -> do
+              mSystem <- resolveSystem meta
+              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
+                    (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
+              runApp appEnv (runTurn env prompt)))
+      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher])
+      -- The /call dispatcher: dispatch an opcode against the active
+      -- session's ISA registry + transcript under Full autonomy (the
+      -- operator is the approver by typing /call). Returns the
+      -- structured DispatchError/OpResult for the command to render.
+      -- Rebuilt per invocation via `withCliTurn` so a `/new` swap of
+      -- `srActive` flows the new sid's transcript + isaReg into the
+      -- dispatch.
+      callDispatcher callOpName val = do
+        meta <- readIORef (srActive sr)
+        let sid = smId meta
+            sessionDirPath' = sessionDir paths sid
+        createDirectoryIfMissing True sessionDirPath'
+        saveSessionMeta paths meta
+        withTwoFileTranscript sessionDirPath' $ \tHandle -> do
+          let startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps
+          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+          runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+      plainHandler t = do
+        meta <- readIORef (srActive sr)
+        withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->
+          handlePlain
+            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+               (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand)
+            appEnv t
+  runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()
     loop caps plainHandler th reg = do
