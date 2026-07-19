@@ -3,7 +3,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { NewTabComposer } from '../NewTabComposer'
 import { adoptWindow, createTab } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
-import type { AgentInfo, DiscoverableWindow, ProviderInfo } from '../../types'
+import type { DiscoverableWindow, ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   adoptWindow: vi.fn(async () => ({ ok: true, sessionId: 'adopted-1' })),
@@ -14,10 +14,6 @@ vi.mock('../../hooks/useApi', () => ({
 
 function makeProvider(overrides: Partial<ProviderInfo> = {}): ProviderInfo {
   return { name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4', ...overrides }
-}
-
-function makeAgent(overrides: Partial<AgentInfo> = {}): AgentInfo {
-  return { name: 'dev', isDefault: true, ...overrides }
 }
 
 function makeWindow(overrides: Partial<DiscoverableWindow> = {}): DiscoverableWindow {
@@ -41,9 +37,6 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     modelsLoading: false,
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),
-    agent: 'dev',
-    agents: [makeAgent()],
-    handleAgentChange: vi.fn(),
     customModels: [],
     flavour: 'claude-code',
     setFlavour: vi.fn(),
@@ -79,11 +72,13 @@ afterEach(() => {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 describe('NewTabComposer — provider kind', () => {
-  it('renders provider + model + agent dropdowns', () => {
+  it('renders provider + model dropdowns (no agent field)', () => {
     render(<NewTabComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />)
     expect(screen.getByLabelText('Provider')).toBeTruthy()
     expect(screen.getByLabelText('Model')).toBeTruthy()
-    expect(screen.getByLabelText('Agent')).toBeTruthy()
+    // The agent field was removed from the new-tab composer (the agent is
+    // chosen later on the SessionSetup screen).
+    expect(screen.queryByLabelText('Agent')).toBeNull()
   })
 
   it('submit calls createTab then onSubmit', async () => {

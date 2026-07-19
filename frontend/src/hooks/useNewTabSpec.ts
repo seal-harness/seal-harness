@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useAgents, useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, type LastOptions } from './useApi'
-import type { AgentInfo, DiscoverableWindow, ProviderInfo } from '../types'
+import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, type LastOptions } from './useApi'
+import type { DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
 
@@ -14,7 +14,7 @@ export const CUSTOM_MODEL_VALUE = '__custom__'
 /** State + handlers + computed values for the "new tab" inline composer.
  *
  * Rebuilt against Seal's flat `/api/tabs/new` body (T10's `CreateTabBody`:
- * `{kind, provider?, model?, agent?, branch_from?, harness_id?}`). The hook
+ * `{kind, provider?, model?, branch_from?, harness_id?}`). The hook
  * keeps the form in a continuously-valid state so the bottom message input
  * stays active; the only way to land in an invalid state is to opt into one
  * explicitly (pick "Custom…" model and don't fill it; pick the custom
@@ -36,10 +36,6 @@ export interface NewTabSpec {
   modelsLoading: boolean
   useCustomModel: boolean
   handleModelSelectChange: (v: string) => void
-
-  agent: string
-  agents: AgentInfo[]
-  handleAgentChange: (v: string) => void
 
   /** Custom model ids the user has typed before, most-recent first, deduped.
    *  Loaded from the persisted UI state on mount; the combobox offers these
@@ -86,11 +82,6 @@ export function useNewTabSpec(): NewTabSpec {
   const [useCustomModel, setUseCustomModel] = useState(false)
   const [models, setModels] = useState<{ name: string; contextWindow: number }[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
-
-  // Agent
-  const { agents } = useAgents()
-  const [agent, setAgent] = useState<string>('')
-  const [agentTouched, setAgentTouched] = useState(false)
 
   // Custom-model history (loaded from persisted UI state). The combobox
   // offers these as suggestions; `recordCustomModel` appends on submit.
@@ -147,10 +138,6 @@ export function useNewTabSpec(): NewTabSpec {
       if (opts.attachSession) setAttachSession(opts.attachSession)
       if (opts.attachWindow) setAttachWindow(opts.attachWindow)
       if (opts.attachManual) setAttachManual(true)
-      if (opts.agent) {
-        setAgent(opts.agent)
-        setAgentTouched(true)
-      }
       // Provider + model: stage the model so the model-fetch effect (which
       // fires when the restored provider lands) honors it instead of the
       // configured default. The fetch effect clears the ref once consumed.
@@ -215,13 +202,6 @@ export function useNewTabSpec(): NewTabSpec {
     return () => { cancelled = true }
   }, [kind, provider, configuredProviders])
 
-  // Auto-select the configured default agent.
-  useEffect(() => {
-    if (agentTouched) return
-    const def = Array.isArray(agents) ? agents.find((a) => a.isDefault) : undefined
-    if (def) setAgent(def.name)
-  }, [agents, agentTouched])
-
   const handleModelSelectChange = useCallback((value: string) => {
     if (value === CUSTOM_MODEL_VALUE) {
       setUseCustomModel(true)
@@ -230,11 +210,6 @@ export function useNewTabSpec(): NewTabSpec {
       setUseCustomModel(false)
       setModel(value)
     }
-  }, [])
-
-  const handleAgentChange = useCallback((value: string) => {
-    setAgentTouched(true)
-    setAgent(value)
   }, [])
 
   // Validation. Defaults are designed to keep this null.
@@ -258,9 +233,7 @@ export function useNewTabSpec(): NewTabSpec {
 
   const buildBody = useCallback((): CreateTabBody => {
     if (kind === 'provider') {
-      const body: CreateTabBody = { kind: 'provider', provider, model: model.trim() }
-      if (agent.trim()) body.agent = agent.trim()
-      return body
+      return { kind: 'provider', provider, model: model.trim() }
     }
     if (kind === 'harness') {
       // Seal's T10 takes a flat `kind: 'harness'` + harness_id. The harness
@@ -275,7 +248,7 @@ export function useNewTabSpec(): NewTabSpec {
     // adoptWindow directly with the session/window/windowIndex). Return a
     // sentinel the caller will not send.
     return { kind: 'attach', harness_id: attachSession }
-  }, [kind, provider, model, agent, flavour, customBinary, attachSession])
+  }, [kind, provider, model, flavour, customBinary, attachSession])
 
   // Persist the current form selection + record the custom model (if any).
   // Best-effort; failures are swallowed (the UI still works within the
@@ -287,7 +260,6 @@ export function useNewTabSpec(): NewTabSpec {
       provider,
       model: model.trim(),
       useCustomModel,
-      agent: agent.trim(),
       flavour,
       customBinary: customBinary.trim(),
       attachSession,
@@ -302,14 +274,13 @@ export function useNewTabSpec(): NewTabSpec {
         return next.slice(0, 32)
       })
     }
-  }, [kind, provider, model, useCustomModel, agent, flavour, customBinary, attachSession, attachWindow, attachManual])
+  }, [kind, provider, model, useCustomModel, flavour, customBinary, attachSession, attachWindow, attachManual])
 
   return {
     kind, setKind,
     configuredProviders, providersLoaded,
     provider, setProvider,
     model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
-    agent, agents, handleAgentChange,
     customModels,
     flavour, setFlavour,
     customBinary, setCustomBinary,

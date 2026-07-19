@@ -24,12 +24,14 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Agent.Def.Backend (noneBackend)
+import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
+import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (ModelId (..), mkSessionId, ToolCallId (..), OpName (..))
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -151,6 +153,7 @@ mkDepsFor paths = do
     , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
+    , adDefaultAgent    = Nothing
     }
 
 spec :: Spec
@@ -735,10 +738,114 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 204
 
+  it "PUT /api/sessions/<sid>/agent returns 200 when the session exists" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("dev" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/agent with empty body clears the binding" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-043"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/agent returns 404 when the session is missing" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "20260701-999999-999", "agent"]
+      (A.encode (A.object [ "agent" .= ("dev" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/sessions/<sid>/agent returns 400 on an invalid agent id" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "agent"]
+      (A.encode (A.object [ "agent" .= ("bad/id with spaces" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
   it "GET /api/agents returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "agents"])
     status `shouldBe` 200
+
+  it "GET /api/agents marks the configured default agent isDefault=true" $ do
+    -- Seed two agent defs, configure `default_agent = "zoe"`, and verify
+    -- the zoe entry has isDefault=true and the other false.
+    let mkAppDefault = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
+          let now = UTCTime (fromGregorian 2026 7 1) 0
+          let zoeId  = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
+              devId  = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "dev"
+              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+          adbUpdate adb mkZoe
+          adbUpdate adb mkDev
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adProviders       = pure knownProviders
+                , adUiState         = uiState
+                , adSend            = Nothing
+                , adDefaultAgent    = Just "zoe"
+                }
+          pure (apiApp deps)
+    app <- mkAppDefault
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "agents"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode agents body: " ++ show body)
+    length arr `shouldBe` 2
+    let isDefaultOf v = case v of
+          A.Object o -> case lookupK "isDefault" o of
+            Just (A.Bool b) -> Just b
+            _               -> Nothing
+          _ -> Nothing
+        nameOf v = case v of
+          A.Object o -> case lookupK "name" o of
+            Just (A.String n) -> Just n
+            _                  -> Nothing
+          _ -> Nothing
+    let zoe = filter (\v -> nameOf v == Just "zoe") arr
+        dev = filter (\v -> nameOf v == Just "dev") arr
+    length zoe `shouldBe` 1
+    length dev `shouldBe` 1
+    case zoe of (z:_) -> isDefaultOf z `shouldBe` Just True
+                _     -> expectationFailure "zoe missing"
+    case dev of (d:_) -> isDefaultOf d `shouldBe` Just False
+                _     -> expectationFailure "dev missing"
 
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
@@ -764,6 +871,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adProviders       = pure [OllamaProvider]
                 , adUiState         = uiState
                 , adSend            = Nothing
+                , adDefaultAgent    = Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -918,6 +1026,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
+            , adDefaultAgent    = Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -999,6 +1108,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
+            , adDefaultAgent    = Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).

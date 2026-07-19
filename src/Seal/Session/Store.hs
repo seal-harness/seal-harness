@@ -14,6 +14,7 @@ module Seal.Session.Store
   , resolveDefaultAgent
   , initSession
   , initSessionMeta
+  , updateSessionAgent
   , SessionRuntime (..)
   ) where
 
@@ -38,7 +39,7 @@ import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Config.File (FileConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
-import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 
@@ -171,3 +172,22 @@ initSessionMeta paths cfg backend = do
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
   newSessionMeta paths provider model "web" mAgent
+
+-- | Update the bound agent for an existing session. Loads the current
+-- 'SessionMeta' from disk, replaces 'smAgent' (Nothing when the supplied id
+-- is empty/invalid), and persists atomically. Returns 'False' when the
+-- session's @session.json@ can't be found or parsed (the caller surfaces a
+-- 404/400); 'True' on a successful write.
+updateSessionAgent :: SealPaths -> SessionId -> Maybe AgentDefId -> IO Bool
+updateSessionAgent paths sid mAgent = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          saveSessionMeta paths (meta { smAgent = mAgent })
+          pure True

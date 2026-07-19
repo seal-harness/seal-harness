@@ -57,6 +57,7 @@ mkDeps = do
     , adProviders = pure knownProviders
     , adUiState = uiState
     , adSend = Nothing
+    , adDefaultAgent = Nothing
     })
 
 spec :: Spec
