@@ -133,7 +133,7 @@ spec = describe "Seal.Phase2bSpec" $ do
           Nothing -> pure ()
     tabsH <- newTabsHandle
     askReply <- newAskReplyStore 0
-    let meta = SessionMeta sid "ollama" "test" "signal" Nothing
+    let meta = SessionMeta sid "ollama" "test" "signal" Nothing Nothing Nothing
                  (UTCTime (fromGregorian 2026 1 1) 0)
                  (UTCTime (fromGregorian 2026 1 1) 0)
     activeRef <- newIORef meta

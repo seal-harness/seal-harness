@@ -18,7 +18,7 @@ sampleMeta =
   let sid = fromRight (error "bad id") (mkSessionId "20260701-120000-042")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "cli", smAgent = Nothing
+       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 spec :: Spec
@@ -52,3 +52,29 @@ spec = describe "Seal.Session.Meta" $ do
     let aid = fromRight (error "bad agent id") (mkAgentDefId "zoe")
         m = sampleMeta { smAgent = Just aid }
     fmap smAgent (decode (encode m)) `shouldBe` Just (Just aid)
+
+  it "round-trips smSystemOverride = Just t" $ do
+    let m = sampleMeta { smSystemOverride = Just "be concise" }
+    fmap smSystemOverride (decode (encode m)) `shouldBe` Just (Just "be concise")
+
+  it "defaults smSystemOverride to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smSystemOverride (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smAgentName = Just t" $ do
+    let m = sampleMeta { smAgentName = Just "zoe" }
+    fmap smAgentName (decode (encode m)) `shouldBe` Just (Just "zoe")
+
+  it "defaults smAgentName to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smAgentName (decode (encode j)) `shouldBe` Just Nothing

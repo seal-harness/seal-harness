@@ -6,6 +6,7 @@ module Seal.Gateway.API
   , ApiDeps (..)
   ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -44,7 +45,7 @@ import Seal.Providers.Registry
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions, newSession, updateSessionAgent)
+import Seal.Session.Store (SessionRuntime (..), listSessions, newSession, updateSessionAgent, updateSessionSystemOverride)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 import Seal.Web.UiState
@@ -117,10 +118,17 @@ apiApp deps req respond =
     (m', ["api", "sessions", _sid, "archived"]) | m' == methodPut -> do
       _body <- collectBody req
       respond noContent
-    -- T11 STUB: PUT /api/sessions/:id/prompt — 204 (no persistence yet).
-    (m', ["api", "sessions", _sid, "prompt"]) | m' == methodPut -> do
-      _body <- collectBody req
-      respond noContent
+    -- PUT /api/sessions/:id/prompt — set or clear an ad-hoc system prompt
+    -- override for the session (the Session setup screen's "Use a one-off
+    -- agent file" upload). Body: {"prompt":"<text>"} (empty/missing
+    -- clears). When set, 'plainTurn' uses this verbatim as the system
+    -- prompt instead of the bound agent's 'adSystem'. Returns 200 {ok:true}
+    -- on success, 404 when the session doesn't exist.
+    (m', ["api", "sessions", sid, "prompt"]) | m' == methodPut -> do
+      body <- collectBody req
+      case mkSessionId sid of
+        Left e  -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> respond =<< handleSessionPrompt deps sId body
     -- PUT /api/sessions/:id/agent — bind (or clear) the session's agent
     -- definition. Body: {"agent":"<id>"} (empty/missing clears). Persists
     -- the updated 'SessionMeta' to disk so subsequent /send turns pick up
@@ -343,6 +351,36 @@ handleTabNew deps v =
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
 
+-- | Handle PUT /api/sessions/:id/prompt. Parses the @prompt@ field from
+-- the body (an empty/missing value clears the override), trims it, and
+-- persists via 'updateSessionSystemOverride'. The optional @name@ field
+-- is a fallback display label (e.g. the uploaded filename) used when the
+-- file content has no TOML frontmatter @id@. Returns 200 {ok:true} on
+-- success, 404 when the session has no @session.json@ on disk, 400 on
+-- invalid JSON.
+handleSessionPrompt :: ApiDeps -> SessionId -> BL.ByteString -> IO Response
+handleSessionPrompt deps sid body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> do
+      let (mPrompt, mName) = case v of
+            A.Object o ->
+              let p = case KeyMap.lookup (Key.fromText "prompt") o of
+                    Just (A.String t)
+                      | not (T.null (T.strip t)) -> Just t
+                      | otherwise                -> Nothing
+                    _                            -> Nothing
+                  n = case KeyMap.lookup (Key.fromText "name") o of
+                    Just (A.String t)
+                      | not (T.null (T.strip t)) -> Just (T.strip t)
+                      | otherwise                -> Nothing
+                    _                            -> Nothing
+              in (p, n)
+            _ -> (Nothing, Nothing)
+      ok <- updateSessionSystemOverride (srPaths (adSessionRuntime deps)) sid mPrompt mName
+      pure (if ok then jsonOk (object ["ok" .= True])
+                  else errJson status404 "session not found")
+
 -- | Handle PUT /api/sessions/:id/agent. Parses the @agent@ field from the
 -- body (an empty/missing value clears the binding), validates it as an
 -- 'AgentDefId', and persists the change via 'updateSessionAgent'. Returns
@@ -539,10 +577,16 @@ sessionWire (BoundHarness _)   = Nothing
 -- @channelUserId@) are returned as @null@. @firstMessageSnippet@ is derived
 -- from the session's transcript (the first user message), so a session
 -- has a readable title before the user sets an explicit description.
+--
+-- @agent@ is the display label for the session's active agent (used by
+-- the sidebar / chat header). It prefers 'smAgentName' (set whenever an
+-- agent is effective — either a bound 'smAgent' or a one-off uploaded
+-- file's frontmatter id), falling back to 'smAgent'\'s id for
+-- backwards-compat with old session.json files that predate smAgentName.
 sessionInfoJson :: Maybe Text -> SessionMeta -> Value
 sessionInfoJson mSnippet m = object
   [ "id" .= sessionIdText (smId m)
-  , "agent" .= (agentDefIdText <$> smAgent m)
+  , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
   , "model" .= smModel m
   , "lastActive" .= smLastActive m

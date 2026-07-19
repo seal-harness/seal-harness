@@ -14,6 +14,7 @@ import {
   setSessionArchived,
   setSessionDescription,
   setSessionAgent,
+  setSessionPrompt,
   closeTab,
   dismissTab,
   acknowledgeTab,
@@ -219,11 +220,44 @@ export default function App() {
 
   // Apply an agent change for the focused session: update local state AND
   // persist the binding to the backend so the next /send turn picks up the
-  // new system prompt. Best-effort; a failure is logged but the local state
+  // new system prompt. The backend clears any one-off file override
+  // (smSystemOverride) atomically when binding an agent, so we only fire
+  // this single PUT. Best-effort; a failure is logged but the local state
   // still updates so the UI stays responsive.
   const handleAgentChange = useCallback((agent: string) => {
     setSelectedAgent(agent)
     if (currentSessionId) void setSessionAgent(currentSessionId, agent || null)
+  }, [currentSessionId])
+
+  // Apply a one-off agent-file upload (or clear local state) for the
+  // focused session.
+  //
+  // Upload (file non-null): persist the file content as the session's
+  // system-prompt override (PUT /api/sessions/:id/prompt). The backend
+  // atomically clears the bound agent (smAgent) so the sidebar drops the
+  // stale "agent X" label, and sets smAgentName to the file's frontmatter
+  // id (or the filename fallback when no frontmatter id is present) so
+  // the sidebar shows the uploaded agent's identity. Only this single
+  // PUT is fired.
+  //
+  // Clear (file null): NO PUT is fired here — clearing the override is
+  // always paired with re-binding an agent (the Remove button and the
+  // dropdown's onChange both call onAgentChange, whose PUT /agent
+  // atomically clears the override via the backend's mutual-exclusion
+  // rule). Firing a separate PUT /prompt here would race that PUT /agent.
+  // We only reset local state so the upload pane re-renders.
+  const handleCustomPromptFile = useCallback((file: { name: string; content: string } | null) => {
+    setCustomPromptFile(file)
+    if (!currentSessionId) return
+    if (file) {
+      // Pass the filename as the optional `name` arg — the backend uses
+      // it as the smAgentName fallback when the file has no frontmatter id.
+      void setSessionPrompt(currentSessionId, file.content, file.name)
+      // Mirror the backend's mutual-exclusion locally so the dropdown
+      // immediately reflects the cleared binding (the WS lists broadcast
+      // arrives a moment later).
+      setSelectedAgent(null)
+    }
   }, [currentSessionId])
 
   // ── Send routing ──────────────────────────────────────────────────────
@@ -623,7 +657,7 @@ export default function App() {
             currentAgent={selectedAgent}
             onAgentChange={handleAgentChange}
             customPromptFile={customPromptFile}
-            onCustomPromptFile={setCustomPromptFile}
+            onCustomPromptFile={handleCustomPromptFile}
             newTabFocusTick={newTabFocusTick}
             selectedId={selectedId}
             onBranch={selectedSession?.runtime.startsWith('session:') ? handleBranch : undefined}

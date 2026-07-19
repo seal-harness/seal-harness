@@ -1001,11 +1001,14 @@ function SessionSetup({
     const reader = new FileReader()
     reader.onload = (e) => {
       const content = e.target?.result as string
+      // Only fire the prompt-override path; the backend atomically clears
+      // the bound agent (smAgent) so the sidebar drops the stale "agent X"
+      // label. We do NOT call onAgentChange here — that would race a
+      // second PUT against the prompt PUT (last-writer-wins clobbering).
       onCustomPromptFile({ name: file.name, content })
-      onAgentChange('')
     }
     reader.readAsText(file)
-  }, [onCustomPromptFile, onAgentChange])
+  }, [onCustomPromptFile])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -1099,6 +1102,11 @@ function SessionSetup({
                 style={{ color: 'var(--text-faint)', background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}
                 onClick={(e) => {
                   e.stopPropagation()
+                  // Clear the local file state (no PUT — the onAgentChange
+                  // below fires a single PUT /agent that atomically clears
+                  // the backend's smSystemOverride via updateSessionAgent's
+                  // mutual-exclusion rule). Re-binds the default agent so
+                  // the sidebar shows it again.
                   onCustomPromptFile(null)
                   const def = agents.find((a) => a.isDefault)
                   onAgentChange(def?.name ?? agents[0]?.name ?? '')

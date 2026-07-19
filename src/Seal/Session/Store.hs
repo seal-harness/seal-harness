@@ -15,6 +15,7 @@ module Seal.Session.Store
   , initSession
   , initSessionMeta
   , updateSessionAgent
+  , updateSessionSystemOverride
   , SessionRuntime (..)
   ) where
 
@@ -23,6 +24,7 @@ import Data.Aeson (decode, encode)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef)
 import Data.List (sortOn)
+import Control.Applicative ((<|>))
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
@@ -35,13 +37,14 @@ import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
 import Seal.Config.File (FileConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Store.Markdown (decodeDoc, fmLookup)
 
 -- | The mutable active-session ref plus the paths the commands need.
 data SessionRuntime = SessionRuntime
@@ -73,6 +76,7 @@ newSessionMeta _paths provider model channel mAgent = do
   pure SessionMeta
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
+    , smSystemOverride = Nothing, smAgentName = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -178,6 +182,14 @@ initSessionMeta paths cfg backend = do
 -- is empty/invalid), and persists atomically. Returns 'False' when the
 -- session's @session.json@ can't be found or parsed (the caller surfaces a
 -- 404/400); 'True' on a successful write.
+--
+-- /Mutual exclusion/: binding an agent clears any 'smSystemOverride'
+-- (one-off uploaded file) — the two are alternative sources of the system
+-- prompt, and the backend enforces they never coexist so the UI never
+-- shows a stale \"agent X\" label while an uploaded file is actually
+-- driving the prompt. The frontend only needs to fire this single PUT.
+-- 'smAgentName' is set to the agent's id so the sidebar has a stable
+-- display label.
 updateSessionAgent :: SealPaths -> SessionId -> Maybe AgentDefId -> IO Bool
 updateSessionAgent paths sid mAgent = do
   let mp = sessionMetaPath paths sid
@@ -189,5 +201,67 @@ updateSessionAgent paths sid mAgent = do
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
-          saveSessionMeta paths (meta { smAgent = mAgent })
+          -- Clear the override + set the display name when binding an
+          -- agent; clear both when clearing the agent.
+          let next = case mAgent of
+                Just aid -> meta { smAgent = mAgent
+                                 , smSystemOverride = Nothing
+                                 , smAgentName = Just (agentDefIdText aid) }
+                Nothing  -> meta { smAgent = Nothing, smAgentName = Nothing }
+          saveSessionMeta paths next
           pure True
+
+-- | Update (or clear) the ad-hoc system prompt override for a session.
+-- 'Nothing' clears the override (fall back to the bound agent's
+-- 'adSystem'); 'Just t' sets it so 'plainTurn' uses @t@ verbatim as the
+-- system prompt. Returns 'False' when the session's @session.json@ can't
+-- be found or parsed; 'True' on a successful write.
+--
+-- The display label is resolved in this order:
+-- 1. The @id@ field in the file's TOML frontmatter (when parseable).
+-- 2. The caller-supplied @mFallbackName@ (e.g. the uploaded filename).
+-- 3. 'Nothing' — no label.
+--
+-- /Mutual exclusion/: setting an override clears 'smAgent' so the session
+-- doesn't display a stale agent label in the UI while an uploaded file is
+-- actually driving the prompt. Clearing the override leaves 'smAgent'
+-- untouched (the caller can re-bind an agent in a follow-up PUT if
+-- desired). The frontend only needs to fire this single PUT.
+updateSessionSystemOverride
+  :: SealPaths
+  -> SessionId
+  -> Maybe Text          -- ^ the file content (Nothing = clear)
+  -> Maybe Text          -- ^ fallback display label (e.g. filename) when no frontmatter id
+  -> IO Bool
+updateSessionSystemOverride paths sid mOverride mFallbackName = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = case mOverride of
+                Just content ->
+                  let label = parseAgentFileId content <|> mFallbackName
+                  in meta { smSystemOverride = Just content
+                          , smAgent = Nothing
+                          , smAgentName = label }
+                Nothing ->
+                  -- Clearing: leave smAgentName untouched (the follow-up
+                  -- updateSessionAgent from the Remove button will reset
+                  -- it to the default agent's id).
+                  meta { smSystemOverride = Nothing }
+          saveSessionMeta paths next
+          pure True
+
+-- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
+-- Returns 'Nothing' when the file has no frontmatter or no @id@ key.
+parseAgentFileId :: Text -> Maybe Text
+parseAgentFileId content =
+  let (fm, _body) = decodeDoc content
+  in case fmLookup "id" fm of
+       Just t | not (T.null (T.strip t)) -> Just (T.strip t)
+       _                                 -> Nothing

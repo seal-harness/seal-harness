@@ -35,7 +35,7 @@ import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
 import System.FilePath ((</>))
 
-import Seal.Agent.Def.Backend (adbRead)
+import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
@@ -221,6 +221,19 @@ loadSessionMeta paths sid = do
     else do
       (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
 
+-- | Resolve the system prompt for a web turn. An ad-hoc
+-- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
+-- Session setup screen's "Use a one-off agent file" upload) takes
+-- precedence over the bound agent's 'adSystem'. Returns 'Nothing' when
+-- neither is set.
+resolveSystemPrompt :: AgentDefBackend -> SessionMeta -> IO (Maybe Text)
+resolveSystemPrompt agentDefBackend meta =
+  case smSystemOverride meta of
+    Just t | not (T.null (T.strip t)) -> pure (Just t)
+    _ -> case smAgent meta of
+           Nothing  -> pure Nothing
+           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
 -- and uses the ask/reply-backed 'ChannelCaps' ('webAskCaps') so ASK_HUMAN
@@ -251,9 +264,7 @@ plainTurn deps meta t = do
               defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
               agentDefBackend = bAgentDefs (sdBackends deps)
               caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-          mSystem <- case smAgent meta of
-            Nothing -> pure Nothing
-            Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+          mSystem <- resolveSystemPrompt agentDefBackend meta
           let onDemand = either (const False) onDemandSchemas eCfg
               startWiring = webStartWiring
                 deps paths sid caps execBackend appEnv eCfg
@@ -425,9 +436,7 @@ plainTurnWithCaps deps meta caps t = do
             execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
             agentDefBackend = bAgentDefs (sdBackends deps)
-        mSystem <- case smAgent meta of
-          Nothing -> pure Nothing
-          Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+        mSystem <- resolveSystemPrompt agentDefBackend meta
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps execBackend appEnv eCfg
