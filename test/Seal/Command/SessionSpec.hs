@@ -30,7 +30,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 meta :: T.Text -> SessionMeta
 meta idText =
   let sid = fromRight (error $ "invalid session id: " <> show idText) (mkSessionId idText)
-  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing aTime aTime
+  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing aTime aTime
 
 mkSR :: FilePath -> SessionMeta -> IO SessionRuntime
 mkSR root active = do

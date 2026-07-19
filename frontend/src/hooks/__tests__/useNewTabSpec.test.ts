@@ -25,12 +25,11 @@ afterEach(() => {
 })
 
 describe('useNewTabSpec', () => {
-  it('defaults to kind=provider and auto-loads providers + models + agent', async () => {
+  it('defaults to kind=provider and auto-loads providers + models', async () => {
     const { result } = renderHook(() => useNewTabSpec())
     expect(result.current.kind).toBe('provider')
     await waitFor(() => expect(result.current.providersLoaded).toBe(true))
     await waitFor(() => expect(result.current.models.length).toBeGreaterThan(0))
-    await waitFor(() => expect(result.current.agent).toBe('dev'))
     expect(result.current.provider).toBe('anthropic')
     expect(result.current.model).toBe('claude-sonnet-4')
     expect(result.current.validationError).toBeNull()
@@ -40,7 +39,7 @@ describe('useNewTabSpec', () => {
     const { result } = renderHook(() => useNewTabSpec())
     await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
     const body = result.current.buildBody()
-    expect(body).toEqual({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4', agent: 'dev' })
+    expect(body).toEqual({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })
   })
 
   it('buildBody produces {kind:"harness", harness_id:flavour} for kind=harness', async () => {

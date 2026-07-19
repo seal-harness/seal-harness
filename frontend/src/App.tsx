@@ -13,6 +13,8 @@ import {
   useArchivedSessions,
   setSessionArchived,
   setSessionDescription,
+  setSessionAgent,
+  setSessionPrompt,
   closeTab,
   dismissTab,
   acknowledgeTab,
@@ -201,6 +203,13 @@ export default function App() {
   const [modelOverride, setModelOverride] = useState<string | null>(null)
   useEffect(() => { setModelOverride(null) }, [currentSessionId])
 
+  // Reset the selected agent whenever the focused session changes so the
+  // SessionSetup dropdown re-resolves to the configured default agent (or
+  // the session's bound agent) instead of inheriting the previous
+  // session's selection. The default-agent effect below re-runs on the
+  // next render once `agents` is available.
+  useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
+
   // Initialize selectedAgent from the default agent once agents load.
   useEffect(() => {
     if (selectedAgent === null && agents.length > 0) {
@@ -208,6 +217,48 @@ export default function App() {
       setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
     }
   }, [agents, selectedAgent])
+
+  // Apply an agent change for the focused session: update local state AND
+  // persist the binding to the backend so the next /send turn picks up the
+  // new system prompt. The backend clears any one-off file override
+  // (smSystemOverride) atomically when binding an agent, so we only fire
+  // this single PUT. Best-effort; a failure is logged but the local state
+  // still updates so the UI stays responsive.
+  const handleAgentChange = useCallback((agent: string) => {
+    setSelectedAgent(agent)
+    if (currentSessionId) void setSessionAgent(currentSessionId, agent || null)
+  }, [currentSessionId])
+
+  // Apply a one-off agent-file upload (or clear local state) for the
+  // focused session.
+  //
+  // Upload (file non-null): persist the file content as the session's
+  // system-prompt override (PUT /api/sessions/:id/prompt). The backend
+  // atomically clears the bound agent (smAgent) so the sidebar drops the
+  // stale "agent X" label, and sets smAgentName to the file's frontmatter
+  // id (or the filename fallback when no frontmatter id is present) so
+  // the sidebar shows the uploaded agent's identity. Only this single
+  // PUT is fired.
+  //
+  // Clear (file null): NO PUT is fired here — clearing the override is
+  // always paired with re-binding an agent (the Remove button and the
+  // dropdown's onChange both call onAgentChange, whose PUT /agent
+  // atomically clears the override via the backend's mutual-exclusion
+  // rule). Firing a separate PUT /prompt here would race that PUT /agent.
+  // We only reset local state so the upload pane re-renders.
+  const handleCustomPromptFile = useCallback((file: { name: string; content: string } | null) => {
+    setCustomPromptFile(file)
+    if (!currentSessionId) return
+    if (file) {
+      // Pass the filename as the optional `name` arg — the backend uses
+      // it as the smAgentName fallback when the file has no frontmatter id.
+      void setSessionPrompt(currentSessionId, file.content, file.name)
+      // Mirror the backend's mutual-exclusion locally so the dropdown
+      // immediately reflects the cleared binding (the WS lists broadcast
+      // arrives a moment later).
+      setSelectedAgent(null)
+    }
+  }, [currentSessionId])
 
   // ── Send routing ──────────────────────────────────────────────────────
   // A `kind:"slash"` send response adds no transcript entry: render a
@@ -412,8 +463,18 @@ export default function App() {
       const id = res.session_id ? `session:${res.session_id}` : `tab:${res.tab_index}`
       setSelectedId(id)
       syncPath(id)
+      // Bind the configured default agent (if any) to the freshly-created
+      // session so the SessionSetup screen's default dropdown selection
+      // actually takes effect. The composer no longer sends body.agent, so
+      // without this the session would start unbound and the agent's
+      // system prompt would never be injected on the first turn. The
+      // user can still override via the SessionSetup dropdown.
+      if (res.session_id) {
+        const def = agents.find((a) => a.isDefault)
+        if (def) void setSessionAgent(res.session_id, def.name)
+      }
     }
-  }, [syncPath])
+  }, [syncPath, agents])
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)
@@ -594,9 +655,9 @@ export default function App() {
             sessionStart={selectedSession?.createdAt ?? null}
             agents={agents}
             currentAgent={selectedAgent}
-            onAgentChange={setSelectedAgent}
+            onAgentChange={handleAgentChange}
             customPromptFile={customPromptFile}
-            onCustomPromptFile={setCustomPromptFile}
+            onCustomPromptFile={handleCustomPromptFile}
             newTabFocusTick={newTabFocusTick}
             selectedId={selectedId}
             onBranch={selectedSession?.runtime.startsWith('session:') ? handleBranch : undefined}

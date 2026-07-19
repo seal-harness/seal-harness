@@ -31,7 +31,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 mkSR :: FilePath -> IO SessionRuntime
 mkSR root = do
   let sid = fromRight (error "invalid session id") (mkSessionId "20260701-120000-002")
-      m0 = SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing aTime aTime
+      m0 = SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing aTime aTime
       paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys")
   ref <- newIORef m0
   pure SessionRuntime { srPaths = paths, srConfigPath = root </> "config.toml", srActive = ref }

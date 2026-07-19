@@ -344,6 +344,21 @@ export async function setSessionPrompt(sessionId: string, prompt: string, name?:
   }
 }
 
+/** Bind (or unbind) the agent definition for a session. An empty/null agent
+ *  clears the binding. Returns true when the backend accepted the change. */
+export async function setSessionAgent(sessionId: string, agent: string | null): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/agent`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent: agent ?? '' }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 // ── Pending questions (human-confirmation gate / ASK_HUMAN) ────────────
 
 /** One pending human-confirmation question (Untrusted opcode gate or
@@ -608,7 +623,6 @@ export interface LastOptions {
   provider: string
   model: string
   useCustomModel: boolean
-  agent: string
   flavour: string
   customBinary: string
   attachSession: string

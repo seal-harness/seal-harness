@@ -678,7 +678,7 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
           , wscAllowList = [], wscAuthKey = Nothing }
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smAgent = Nothing
+      , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
       , smCreatedAt = t, smLastActive = t }
     loadMeta p sid = do
       let mp = sessionDir p sid </> "session.json"

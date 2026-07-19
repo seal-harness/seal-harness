@@ -54,7 +54,6 @@ data LastOptions = LastOptions
   , loProvider      :: Text
   , loModel         :: Text
   , loUseCustomModel :: Bool
-  , loAgent         :: Text
   , loFlavour       :: Text
   , loCustomBinary  :: Text
   , loAttachSession :: Text
@@ -79,7 +78,6 @@ instance ToJSON LastOptions where
     , "provider"       .= loProvider o
     , "model"          .= loModel o
     , "useCustomModel" .= loUseCustomModel o
-    , "agent"          .= loAgent o
     , "flavour"        .= loFlavour o
     , "customBinary"   .= loCustomBinary o
     , "attachSession"  .= loAttachSession o
@@ -93,7 +91,6 @@ instance FromJSON LastOptions where
     <*> o .:? "provider"       .!= ""
     <*> o .:? "model"          .!= ""
     <*> o .:? "useCustomModel" .!= False
-    <*> o .:? "agent"          .!= ""
     <*> o .:? "flavour"        .!= "claude-code"
     <*> o .:? "customBinary"   .!= ""
     <*> o .:? "attachSession"  .!= ""

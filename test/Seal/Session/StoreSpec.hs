@@ -66,7 +66,7 @@ spec = describe "Seal.Session.Store" $ do
               let sid = fromRight (error "invalid sid") (Seal.Core.Types.mkSessionId idText)
               saveSessionMeta paths SessionMeta
                 { smId = sid, smProvider = "anthropic", smModel = "m"
-                , smChannel = "cli", smAgent = Nothing
+                , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })

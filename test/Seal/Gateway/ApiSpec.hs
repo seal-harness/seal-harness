@@ -24,12 +24,14 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Agent.Def.Backend (noneBackend)
+import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
+import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
-import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (ModelId (..), mkSessionId, ToolCallId (..), OpName (..))
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -70,7 +72,7 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -151,6 +153,7 @@ mkDepsFor paths = do
     , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
+    , adDefaultAgent    = Nothing
     }
 
 spec :: Spec
@@ -292,7 +295,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -322,7 +325,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -353,7 +356,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -728,17 +731,332 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 204
 
-  it "PUT /api/sessions/<sid>/prompt returns 204" $ do
+  it "PUT /api/sessions/<sid>/prompt returns 200 when the session exists" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-051"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "prompt"]
+        (A.encode (A.object [ "prompt" .= ("be concise" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/prompt with empty body clears the override" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-052"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "prompt"]
+        (A.encode (A.object [ "prompt" .= ("" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/prompt returns 404 when the session is missing" $ do
     app <- mkApp
-    req <- testPut ["api", "sessions", "sess1", "prompt"]
+    req <- testPut ["api", "sessions", "20260701-999999-998", "prompt"]
       (A.encode (A.object [ "prompt" .= ("x" :: T.Text) ]))
     status <- runAppStatus app req
-    status `shouldBe` 204
+    status `shouldBe` 404
+
+  it "PUT /api/sessions/<sid>/agent returns 200 when the session exists" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("dev" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/agent with empty body clears the binding" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-043"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+
+  it "PUT /api/sessions/<sid>/agent returns 404 when the session is missing" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "20260701-999999-999", "agent"]
+      (A.encode (A.object [ "agent" .= ("dev" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/sessions/<sid>/agent returns 400 on an invalid agent id" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "agent"]
+      (A.encode (A.object [ "agent" .= ("bad/id with spaces" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "PUT /api/sessions/<sid>/agent atomically clears an existing system_override" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-061"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) (Just "one-off") Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("zoe" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      -- Reload session.json and verify smAgent=zoe, smSystemOverride=Nothing
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "agent" o `shouldBe` Just (A.String "zoe")
+          lookupK "system_override" o `shouldBe` Just A.Null
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/prompt atomically clears an existing agent binding" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-062"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "prompt"]
+        (A.encode (A.object [ "prompt" .= ("be concise" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "agent" o `shouldBe` Just A.Null
+          lookupK "system_override" o `shouldBe` Just (A.String "be concise")
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/agent with empty body does NOT clobber an active system_override" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-063"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just "one-off") Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "agent" o `shouldBe` Just A.Null
+          lookupK "system_override" o `shouldBe` Just (A.String "one-off")
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/agent sets agent_name to the agent's id" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-071"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "agent"]
+        (A.encode (A.object [ "agent" .= ("zoe" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> lookupK "agent_name" o `shouldBe` Just (A.String "zoe")
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/prompt sets agent_name from the file's frontmatter id" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-072"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+          fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "prompt"]
+        (A.encode (A.object [ "prompt" .= (fileContent :: T.Text), "name" .= ("my-agent.md" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) -> do
+          lookupK "agent" o `shouldBe` Just A.Null
+          lookupK "system_override" o `shouldBe` Just (A.String fileContent)
+          lookupK "agent_name" o `shouldBe` Just (A.String "my-uploaded-agent")
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "PUT /api/sessions/<sid>/prompt falls back to the name field when no frontmatter id" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-073"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+          fileContent = "You are a helpful agent with no frontmatter."
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "prompt"]
+        (A.encode (A.object [ "prompt" .= (fileContent :: T.Text), "name" .= ("random-prompt.md" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      let mp = sessionMetaPath paths sid
+      mSaved <- A.decode <$> BL.readFile mp :: IO (Maybe A.Value)
+      case mSaved of
+        Just (A.Object o) ->
+          lookupK "agent_name" o `shouldBe` Just (A.String "random-prompt.md")
+        _ -> expectationFailure "session.json missing or unparseable"
+
+  it "GET /api/sessions emits agent from agent_name when set" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-074"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "my-uploaded-agent")
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      length arr `shouldBe` 1
+      case arr of
+        (A.Object o : _) -> lookupK "agent" o `shouldBe` Just (A.String "my-uploaded-agent")
+        _                -> expectationFailure "no session row"
 
   it "GET /api/agents returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "agents"])
     status `shouldBe` 200
+
+  it "GET /api/agents marks the configured default agent isDefault=true" $ do
+    -- Seed two agent defs, configure `default_agent = "zoe"`, and verify
+    -- the zoe entry has isDefault=true and the other false.
+    let mkAppDefault = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
+          let now = UTCTime (fromGregorian 2026 7 1) 0
+          let zoeId  = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
+              devId  = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "dev"
+              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+          adbUpdate adb mkZoe
+          adbUpdate adb mkDev
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adProviders       = pure knownProviders
+                , adUiState         = uiState
+                , adSend            = Nothing
+                , adDefaultAgent    = Just "zoe"
+                }
+          pure (apiApp deps)
+    app <- mkAppDefault
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "agents"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode agents body: " ++ show body)
+    length arr `shouldBe` 2
+    let isDefaultOf v = case v of
+          A.Object o -> case lookupK "isDefault" o of
+            Just (A.Bool b) -> Just b
+            _               -> Nothing
+          _ -> Nothing
+        nameOf v = case v of
+          A.Object o -> case lookupK "name" o of
+            Just (A.String n) -> Just n
+            _                  -> Nothing
+          _ -> Nothing
+    let zoe = filter (\v -> nameOf v == Just "zoe") arr
+        dev = filter (\v -> nameOf v == Just "dev") arr
+    length zoe `shouldBe` 1
+    length dev `shouldBe` 1
+    case zoe of (z:_) -> isDefaultOf z `shouldBe` Just True
+                _     -> expectationFailure "zoe missing"
+    case dev of (d:_) -> isDefaultOf d `shouldBe` Just False
+                _     -> expectationFailure "dev missing"
 
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
@@ -764,6 +1082,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adProviders       = pure [OllamaProvider]
                 , adUiState         = uiState
                 , adSend            = Nothing
+                , adDefaultAgent    = Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -918,6 +1237,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
+            , adDefaultAgent    = Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -999,6 +1319,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
+            , adDefaultAgent    = Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).

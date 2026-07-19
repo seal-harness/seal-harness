@@ -42,7 +42,6 @@ interface NewTabComposerProps {
 // ── Component ─────────────────────────────────────────────────────────
 
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
-  const safeAgents = Array.isArray(spec.agents) ? spec.agents : []
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
 
@@ -170,23 +169,6 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               />
             </Row>
           )}
-
-          <Row label="Agent" htmlFor="provider-agent">
-            <select
-              id="provider-agent"
-              value={spec.agent}
-              onChange={(e) => spec.handleAgentChange(e.target.value)}
-              className="composer-select"
-              style={inputStyle}
-            >
-              <option value="">(none)</option>
-              {safeAgents.map((a) => (
-                <option key={a.name} value={a.name}>
-                  {a.name}{a.isDefault ? ' (default)' : ''}
-                </option>
-              ))}
-            </select>
-          </Row>
 
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">
