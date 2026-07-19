@@ -270,6 +270,22 @@ spec = describe "Seal.ISA.Integration" $ do
             bs `shouldBe` "bar\nbaz\n"
           Left e -> expectationFailure ("dispatch failed: " <> show e)
 
+    it "\"Model sent 'diff' key instead of 'patch'.\" -> FILE_PATCH -> accepted via 'diff' alias, file patched" $
+      withSystemTempDirectory "seal-int" $ \root -> do
+        BS.writeFile (root </> "code.txt") "foo\nbaz\n"
+        let op = filePatchOp (WorkspaceRoot root)
+            reg = Registry.mkRegistry [op]
+            wrongDiff = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
+        r <- runTestApp (dispatchOne reg (OpName "FILE_PATCH")
+                          (object [ "path" .= ("code.txt" :: Text)
+                                  , "diff" .= (wrongDiff :: Text) ]))
+        case r of
+          Right res -> do
+            orIsError res `shouldBe` False
+            bs <- BS.readFile (root </> "code.txt")
+            bs `shouldBe` "bar\nbaz\n"
+          Left e -> expectationFailure ("expected dispatch to succeed via 'diff' alias, got " <> show e)
+
   -- ----------------------------------------------------------------------
   -- SHELL_EXEC
   -- ----------------------------------------------------------------------

@@ -38,6 +38,50 @@ spec = describe "FILE_PATCH" $ do
       bs <- BS.readFile (root </> "a.txt")
       bs `shouldBe` "hello\nworld!\n"
 
+  -- The short form @@@ -1 +1 @@@ is what @git diff@ emits when the hunk has
+  -- length 1 (the @,1@ is omitted). The model produces this naturally; the
+  -- session 20260719-000547-115 transcript shows it being rejected with
+  -- "malformed hunk header numbers". The applier should accept the short
+  -- form and treat the omitted length as 1.
+  it "accepts the short hunk header form @@ -1 +1 @@ (length 1 implied)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\nworld\n"
+      let op = filePatchOp (WorkspaceRoot root)
+          diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-hello\n+hi\n"
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        , "patch" .= (diff :: String)
+        ]))
+      orIsError r `shouldBe` False
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hi\nworld\n"
+
+  it "accepts the short hunk header form for the new-side only (@@ -1,2 +1 @@)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\nworld\n"
+      let op = filePatchOp (WorkspaceRoot root)
+          diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1 @@\n-hello\n-world\n+hi\n"
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        , "patch" .= (diff :: String)
+        ]))
+      orIsError r `shouldBe` False
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hi\n"
+
+  it "accepts the short hunk header form for the old-side only (@@ -1 +1,2 @@)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\n"
+      let op = filePatchOp (WorkspaceRoot root)
+          diff = "--- a.txt\n+++ a.txt\n@@ -1 +1,2 @@\n-hello\n+hi\n+world\n"
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        , "patch" .= (diff :: String)
+        ]))
+      orIsError r `shouldBe` False
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hi\nworld\n"
+
   it "orRecorded captures path + patch hash + line counts (not the patch body)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "line1\nline2\n"
@@ -79,3 +123,42 @@ spec = describe "FILE_PATCH" $ do
         [ "patch" .= (diff :: String)
         ]))
       orIsError r `shouldBe` True
+
+  it "'diff' field is accepted as an alias for 'patch' (permissive parsing)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\nworld\n"
+      let op = filePatchOp (WorkspaceRoot root)
+          -- Model used the common-but-wrong key 'diff' instead of 'patch';
+          -- patchField accepts 'diff' as a fallback alias so the model's first
+          -- attempt succeeds without a round-trip through OPCODE_DESCRIBE.
+          diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+world!\n"
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        , "diff" .= (diff :: String)
+        ]))
+      orIsError r `shouldBe` False
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hello\nworld!\n"
+
+  it "missing both 'patch' and 'diff' fields -> error, not silent no-op success" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\nworld\n"
+      let op = filePatchOp (WorkspaceRoot root)
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        ]))
+      orIsError r `shouldBe` True
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hello\nworld\n"
+
+  it "empty patch string -> error, not silent no-op success" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello\nworld\n"
+      let op = filePatchOp (WorkspaceRoot root)
+      r <- runTestApp (uoRun op localBackend testExecBackend (object
+        [ "path" .= ("a.txt" :: String)
+        , "patch" .= ("" :: String)
+        ]))
+      orIsError r `shouldBe` True
+      bs <- BS.readFile (root </> "a.txt")
+      bs `shouldBe` "hello\nworld\n"

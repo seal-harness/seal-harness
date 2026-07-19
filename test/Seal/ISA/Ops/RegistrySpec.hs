@@ -8,9 +8,11 @@ import Test.Hspec
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
 import Seal.ISA.Opcode
+import Seal.ISA.Ops.File qualified
 import Seal.ISA.Ops.Registry
 import Seal.ISA.Registry
 import Seal.Providers.Class (ToolDefinition (..), ToolResultPart (..))
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -73,7 +75,23 @@ spec = describe "Seal.ISA.Ops.Registry" $ do
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText t] -> "OPCODE_DESCRIBE" `T.isInfixOf` t `shouldBe` True
-        _           -> expectationFailure "expected a single text part"
+        _ -> expectationFailure "expected a single text part"
+
+    -- The model frequently guesses 'diff' as the field name for FILE_PATCH;
+    -- the describe output must surface the canonical 'patch' field name
+    -- prominently (and mention the 'diff' alias) so a model that reads the
+    -- describe text gets the field right without a wasted Denied round-trip.
+    it "FILE_PATCH describe output names the 'patch' field and the 'diff' alias" $ do
+      let fp     = Seal.ISA.Ops.File.filePatchOp (WorkspaceRoot "/ws")
+          reg'   = mkRegistry [ fp, opcodeDescribeOp reg' ]
+          op     = opcodeDescribeOp reg'
+      r <- runTestApp (opRun op localBackend (object ["name" .= ("FILE_PATCH" :: T.Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> do
+          "patch" `T.isInfixOf` t `shouldBe` True
+          "diff"  `T.isInfixOf` t `shouldBe` True
+        _ -> expectationFailure "expected a single text part"
 
   describe "OPCODE_LIST" $ do
     it "lists every opcode name + description" $ do
