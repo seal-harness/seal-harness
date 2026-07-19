@@ -283,7 +283,7 @@ describe('RunningHarnesses', () => {
 // ── Sidebar ────────────────────────────────────────────────────────────
 
 describe('Sidebar', () => {
-  it('renders the empty-state message when there are no tabs/sessions/archived', () => {
+  it('renders the Active Tabs + Recent Sessions headers (and their + buttons) even when empty', () => {
     render(
       <Sidebar
         tabs={[]}
@@ -293,6 +293,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -302,7 +303,10 @@ describe('Sidebar', () => {
         onReleaseTab={() => {}}
       />,
     )
-    expect(screen.getByText('No tabs or sessions yet.')).toBeTruthy()
+    expect(screen.getByText('Active Tabs')).toBeTruthy()
+    expect(screen.getByText('Recent Sessions')).toBeTruthy()
+    expect(screen.getByLabelText('New tab')).toBeTruthy()
+    expect(screen.getByLabelText('New session')).toBeTruthy()
   })
 
   it('renders Active Tabs + Recent Sessions + Archived sections together', () => {
@@ -318,6 +322,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -334,6 +339,32 @@ describe('Sidebar', () => {
     expect(screen.getByTestId('archived-section')).toBeTruthy()
   })
 
+  it('fires onNewSession when the Recent Sessions + (sparkle) button is clicked', () => {
+    const onNewSession = vi.fn()
+    const sessions = [makeSession({ id: 's1', description: 'Sess' })]
+    render(
+      <Sidebar
+        tabs={[]}
+        sessions={sessions}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onNewSession={onNewSession}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onArchiveTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('New session'))
+    expect(onNewSession).toHaveBeenCalled()
+  })
+
   it('renders the harness-kind tabs under Running Harnesses, not Active Tabs', () => {
     const tabs = [
       makeTab({ index: 0, kind: 'session:anthropic', label: 'provider tab' }),
@@ -348,6 +379,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -374,6 +406,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={onArchiveSession}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -398,6 +431,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -425,6 +459,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}

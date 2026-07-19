@@ -9,6 +9,7 @@ module Seal.Tabs
   , insertTabH
   , removeTabH
   , renameTabH
+  , rebindTabH
   , focusTabH
   ) where
 
@@ -18,7 +19,7 @@ import Data.Text (Text)
 import Seal.Handles.Tab (TabIndex, TabKind)
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef, emptyTabList, insertTab
-  , removeTab, renameTab, tabCount )
+  , removeTab, renameTab, rebindTab, tabCount )
 
 -- | The live tab-list handle. Backed by a 'TVar' so concurrent tab commands
 -- are race-safe (each operation is one STM transaction).
@@ -56,6 +57,17 @@ renameTabH :: TabsHandle -> TabIndex -> Text -> IO (Either Text ())
 renameTabH (TabsHandle tv) idx name = atomically $ do
   tl <- readTVar tv
   case renameTab tl idx name of
+    Left e       -> pure (Left e)
+    Right tl' -> writeTVar tv tl' >> pure (Right ())
+
+-- | Rebind a tab's 'TabRef' in place (preserves index/kind/label/status;
+-- used by @\/new@). 'Left' on out-of-range index or I2 violation (the new
+-- ref is already bound to a different tab). Rebind-to-same-ref is a no-op
+-- 'Right'. Single STM transaction — race-safe vs concurrent tab ops.
+rebindTabH :: TabsHandle -> TabIndex -> TabRef -> IO (Either Text ())
+rebindTabH (TabsHandle tv) idx newRef = atomically $ do
+  tl <- readTVar tv
+  case rebindTab idx newRef tl of
     Left e       -> pure (Left e)
     Right tl' -> writeTVar tv tl' >> pure (Right ())
 

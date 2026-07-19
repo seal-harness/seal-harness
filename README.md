@@ -214,6 +214,10 @@ seal --provider ollama --model llama3
 
 # With tool access and persistent memory
 seal --allow git --allow ls --memory sqlite
+
+# Start a fresh session in the current tab (the old conversation stays in
+# /session list — resume it with /tab resume <id>)
+/new
 ```
 
 ## The Instruction Set

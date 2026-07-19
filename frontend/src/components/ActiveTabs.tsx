@@ -309,6 +309,7 @@ export function ActiveTabs({
           Active Tabs
         </span>
         <button
+          type="button"
           className="btn btn-ghost flex items-center justify-center"
           style={{ width: 22, height: 22, padding: 0, fontSize: 14, lineHeight: 1 }}
           onClick={onNewTab}

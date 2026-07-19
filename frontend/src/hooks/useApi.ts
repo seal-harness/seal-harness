@@ -255,10 +255,13 @@ export function useTranscript(sessionId: string | null) {
  *  OPEN enum — the frontend must tolerate future/unknown kinds. */
 export type SendKind = 'slash' | 'assistant' | (string & {})
 
-/** Parsed 200 body of POST /api/sessions/:id/send. */
+/** Parsed 200 body of POST /api/sessions/:id/send. `session_id` is set only
+ *  by slash commands that mint+focus a new session (e.g. /new) so the SPA
+ *  can navigate to it; absent for ordinary slash commands + plain turns. */
 export interface SendResult {
   response: string
   kind: SendKind
+  session_id?: string | null
 }
 
 export function useSendMessage(sessionId: string | null, onComplete: () => void) {
@@ -511,6 +514,31 @@ export async function createTab(body: CreateTabBody): Promise<NewTabResponse | n
     })
     if (!res.ok) return null
     return await res.json() as NewTabResponse
+  } catch {
+    return null
+  }
+}
+
+/** Response from POST /api/sessions/new (bare new session, no tab). */
+export interface NewBareSessionResponse {
+  session_id: string
+}
+
+/** Create a bare session (no tab attached) and focus it. The "Recent
+ *  Sessions +" button calls this. Body is optional; provider/model/agent
+ *  override config defaults when present. Returns the new session id, or
+ *  null on failure. */
+export async function createBareSession(
+  body?: { provider?: string; model?: string; agent?: string }
+): Promise<NewBareSessionResponse | null> {
+  try {
+    const res = await fetch('/api/sessions/new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
+    if (!res.ok) return null
+    return await res.json() as NewBareSessionResponse
   } catch {
     return null
   }

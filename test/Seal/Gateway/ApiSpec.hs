@@ -2,6 +2,7 @@
 module Seal.Gateway.ApiSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (threadDelay)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -33,7 +34,7 @@ import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..))
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -205,6 +206,73 @@ spec = describe "Seal.Gateway.API" $ do
       (A.encode (A.object [ "kind" .= ("shell" :: T.Text) ]))
     status <- runAppStatus app req
     status `shouldBe` 501
+
+  it "POST /api/sessions/new creates a bare session and returns 200 + session_id" $ do
+    app <- mkApp
+    req <- testPost ["api", "sessions", "new"]
+      (A.encode (A.object [ "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String sid) -> T.length sid `shouldSatisfy` (> 0)
+        _ -> expectationFailure ("expected session_id string, got: " <> show body)
+      _ -> expectationFailure ("expected JSON object, got: " <> show body)
+    -- No tab should have been inserted (bare session).
+    app2 <- mkApp
+    ( _, body2) <- runAppBody app2 (testRequest methodGet ["api", "tabs"])
+    case A.decode body2 :: Maybe [A.Value] of
+      Just tabs -> tabs `shouldSatisfy` null
+      Nothing   -> expectationFailure "expected a tabs array"
+
+  it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
+    app <- mkApp
+    req <- testPost ["api", "sessions", "99999999-000000-000", "new"] (A.encode (A.object []))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/sessions/:id/new on an existing session rebinds its tab + returns 200" $ do
+    app <- mkApp
+    -- First create a provider tab (which mints a session).
+    req1 <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text), "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
+    (s1, b1) <- runAppBody app req1
+    s1 `shouldBe` 200
+    oldSid <- case A.decode b1 :: Maybe A.Value of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String sid) -> pure sid
+        _ -> pure (error "expected session_id in tab-new response")
+      _ -> pure (error "expected JSON object")
+    -- Sleep >1ms so the new session mints a distinct id (formatSessionId is
+    -- millisecond-precision; back-to-back mint calls in the same ms would
+    -- collide).
+    threadDelay 5000  -- 5ms
+    -- Now POST /api/sessions/<oldSid>/new — should rebind the tab to a fresh sid.
+    req2 <- testPost ["api", "sessions", oldSid, "new"] (A.encode (A.object []))
+    (s2, b2) <- runAppBody app req2
+    s2 `shouldBe` 200
+    let mResp = A.decode b2 :: Maybe A.Value
+    case mResp of
+      Just (A.Object o) -> do
+        case KeyMap.lookup (Key.fromText "session_id") o of
+          Just (A.String newSid) -> newSid `shouldNotBe` oldSid
+          _ -> expectationFailure ("expected session_id, got: " <> show b2)
+        case KeyMap.lookup (Key.fromText "rebound") o of
+          Just (A.Bool r) -> r `shouldBe` True
+          _ -> expectationFailure ("expected rebound: true, got: " <> show b2)
+        case KeyMap.lookup (Key.fromText "tab_index") o of
+          Just (A.Number n) -> n `shouldBe` 0
+          _ -> expectationFailure ("expected tab_index: 0, got: " <> show b2)
+      _ -> expectationFailure ("expected JSON object, got: " <> show b2)
+    -- The tab should now be bound to the NEW sid (one tab; ref != oldSid).
+    ( _, tabsBody) <- runAppBody app (testRequest methodGet ["api", "tabs"])
+    case A.decode tabsBody :: Maybe [A.Value] of
+      Just [A.Object tabObj] ->
+        case KeyMap.lookup (Key.fromText "session_id") tabObj of
+          Just (A.String sid') -> sid' `shouldNotBe` oldSid
+          _ -> expectationFailure "expected session_id in tab row"
+      Just xs -> expectationFailure ("expected one tab, got " <> show (length xs))
+      Nothing -> expectationFailure "expected a tabs array"
 
   it "GET /api/harnesses returns 200" $ do
     app <- mkApp
@@ -1200,6 +1268,33 @@ spec = describe "Seal.Gateway.API" $ do
   -- A session that doesn't exist on disk returns 404. This exercises the
   -- handleSend -> loadSessionMeta -> Nothing path without needing a real
   -- provider/vault (the lookup happens before provider resolution).
+  it "sendOutcomeJson (SendSlash with new sid) includes session_id" $ do
+    let sid = case mkSessionId "20260719-120000-001" of
+          Right s -> s
+          Left _  -> error "invalid sid"
+        (code, val) = sendOutcomeJson (SendSlash "new session minted" (Just sid))
+    code `shouldBe` 200
+    case val of
+      A.Object o -> do
+        case KeyMap.lookup (Key.fromText "kind") o of
+          Just (A.String k) -> k `shouldBe` "slash"
+          _ -> expectationFailure "expected kind: slash"
+        case KeyMap.lookup (Key.fromText "session_id") o of
+          Just (A.String s) -> s `shouldBe` "20260719-120000-001"
+          _ -> expectationFailure "expected session_id string"
+      _ -> expectationFailure "expected JSON object"
+
+  it "sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id" $ do
+    let (code, val) = sendOutcomeJson (SendSlash "/help output" Nothing)
+    code `shouldBe` 200
+    case val of
+      A.Object o ->
+        case KeyMap.lookup (Key.fromText "session_id") o of
+          Just A.Null -> pure ()  -- explicit null is fine
+          Nothing     -> pure ()  -- omitted is also fine
+          _ -> expectationFailure "expected null/absent session_id"
+      _ -> expectationFailure "expected JSON object"
+
   it "POST /api/sessions/<sid>/send with adSend wired returns 404 for a missing session" $ do
     withSystemTempDirectory "seal-send" $ \tmp -> do
       tabsH <- newTabsHandle

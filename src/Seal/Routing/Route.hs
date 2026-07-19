@@ -30,6 +30,7 @@ data RoutingDecision
   | Inject TabIndex Text           -- ^ /N payload
   | Plain Text                     -- ^ plain text to the focused tab
   | TabCommand TabSlashCommand     -- ^ /tab …
+  | NewSession                     -- ^ /new — start a fresh session in the current tab
   | SlashCommand Text              -- ^ other /commands (deferred to the registry)
   deriving stock (Eq, Show)
 
@@ -39,6 +40,7 @@ data RoutingDecision
 --                   or followed by a space)
 -- * @\/N payload@  -> 'Inject' N payload
 -- * @\/tab …@      -> 'TabCommand' (parsed via the /tab command ADT)
+-- * @\/new@        -> 'NewSession' (start a fresh session in the current tab)
 -- * @\/<other>…@   -> 'SlashCommand' (deferred to the registry — this is
 --                   multi-char commands like @\/vault@, @\/help@, @\/ping@)
 -- * anything else  -> 'Plain'
@@ -63,6 +65,8 @@ route t
                    Right idx -> Right (focusOrInject idx after)
              | T.isPrefixOf "tab" rest && (T.length rest == 3 || T.head (T.drop 3 rest) == ' ') ->
                  Right (TabCommand (parseTabCmd (T.drop 3 rest)))
+             | rest == "new" || T.isPrefixOf "new " rest ->
+                 Right NewSession
              | otherwise ->
                  Right (SlashCommand rest)
   where

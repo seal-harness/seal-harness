@@ -14,6 +14,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive qualified as CI
+import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 
@@ -26,10 +27,12 @@ import Network.HTTP.Types
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
+import System.Directory (doesFileExist)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
-import Seal.Config.Paths (SealPaths)
+import Seal.Config.File (defaultFileConfig, loadFileConfig)
+import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
@@ -45,8 +48,10 @@ import Seal.Providers.Registry
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions, newSession, updateSessionAgent, updateSessionSystemOverride)
-import Seal.Tabs (TabsHandle, insertTabH, removeTabH, snapshotTabs)
+import Seal.Session.Store
+  ( SessionRuntime (..), defaultSessionSelection, listSessions, newSession
+  , resolveDefaultAgent, updateSessionAgent, updateSessionSystemOverride )
+import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
@@ -242,6 +247,22 @@ apiApp deps req respond =
       case A.decode body :: Maybe A.Value of
         Just v  -> respond =<< handleTabNew deps v
         Nothing -> respond (errJson status400 "invalid JSON body")
+    -- POST /api/sessions/new — create a bare session (no tab attached) and
+    -- focus it. The "Recent Sessions +" button calls this. Body is optional
+    -- (provider/model/agent override config defaults when present, matching
+    -- POST /api/tabs/new's provider branch).
+    (m', ["api", "sessions", "new"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleSessionNew deps v
+        Nothing -> respond =<< handleSessionNew deps (A.object [])
+    -- POST /api/sessions/:id/new — rebind the tab (if any) bound to :id to a
+    -- fresh session, and return the new sid + tab_index + rebound flag. The
+    -- old session is kept on disk. 404 when :id doesn't resolve to an
+    -- on-disk session (matches handleSessionPrompt/handleSessionAgent —
+    -- prevents orphan-session spam).
+    (m', ["api", "sessions", sid, "new"]) | m' == methodPost ->
+      respond =<< handleSessionRebindNew deps sid
     (m', ["api", "tabs", idx, "close"]) | m' == methodPost ->
       respond =<< handleTabRemove deps idx
     (m', ["api", "tabs", idx, "dismiss"]) | m' == methodPost ->
@@ -350,6 +371,76 @@ handleTabNew deps v =
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | Handle POST /api/sessions/new — create a bare session (no tab attached)
+-- and return its id. The "Recent Sessions +" button calls this. Body is
+-- optional; provider/model/agent override the CONFIG defaults when present
+-- — so a user who configured `default_provider = "anthropic"` gets
+-- anthropic as the default, not a hardcoded fallback. When the body omits
+-- a field, the config default applies; when no default agent is
+-- configured, the session starts unbound. Does NOT touch TabsHandle.
+handleSessionNew :: ApiDeps -> A.Value -> IO Response
+handleSessionNew deps v = do
+  let paths = srPaths (adSessionRuntime deps)
+      cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadFileConfig cfgPath
+  let cfg = fromRight defaultFileConfig eCfg
+  (mDefAgent, mDefProv, mDefModel) <- resolveDefaultAgent (adAgentDefs deps) cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe (fromMaybe cfgProv mDefProv) (lookupBodyStr "provider")
+      model    = fromMaybe (fromMaybe cfgModel mDefModel) (lookupBodyStr "model")
+      mAgent = case lookupBodyStr "agent" of
+        Just t  -> eitherToMaybe (mkAgentDefId t)
+        Nothing -> mDefAgent
+  meta <- newSession paths provider model "web" mAgent
+  pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
+  where
+    objOf (A.Object o) = Just o
+    objOf _            = Nothing
+    lookupBodyStr k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
+      Just (A.String t) | not (T.null t) -> Just t
+      _                                 -> Nothing
+    eitherToMaybe (Right x) = Just x
+    eitherToMaybe (Left _)  = Nothing
+
+-- | Handle POST /api/sessions/:id/new — rebind the tab (if any) bound to
+-- :id to a fresh session, and return the new sid + tab_index + rebound
+-- flag. The old session is kept on disk (still in /session list). 404 when
+-- :id doesn't resolve to an on-disk session (prevents orphan-session spam;
+-- matches handleSessionPrompt/handleSessionAgent).
+handleSessionRebindNew :: ApiDeps -> Text -> IO Response
+handleSessionRebindNew deps sidTxt =
+  case mkSessionId sidTxt of
+    Left e  -> pure (errJson status400 ("invalid session id: " <> e))
+    Right oldSid -> do
+      let paths = srPaths (adSessionRuntime deps)
+          mp = sessionMetaPath paths oldSid
+      exists <- doesFileExist mp
+      if not exists
+        then pure (errJson status404 "session not found")
+        else do
+          mOldMeta <- (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+          case mOldMeta of
+            Nothing -> pure (errJson status404 "session not found")
+            Just oldMeta -> do
+              meta <- newSession paths (smProvider oldMeta) (smModel oldMeta) "web" (smAgent oldMeta)
+              let newSid = smId meta
+              snap <- snapshotTabs (adTabsHandle deps)
+              case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
+                []       -> pure (jsonOk (object
+                  [ "session_id" .= sessionIdText newSid
+                  , "tab_index" .= (Nothing :: Maybe Int)
+                  , "rebound" .= False
+                  ]))
+                (tab : _) -> do
+                  r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
+                  case r of
+                    Left e -> pure (errJson status400 ("tab rebind failed: " <> e))
+                    Right _ -> pure (jsonOk (object
+                      [ "session_id" .= sessionIdText newSid
+                      , "tab_index" .= tabIndexToInt (tIndex tab)
+                      , "rebound" .= True
+                      ]))
 
 -- | Handle PUT /api/sessions/:id/prompt. Parses the @prompt@ field from
 -- the body (an empty/missing value clears the override), trims it, and
