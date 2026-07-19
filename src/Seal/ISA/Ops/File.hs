@@ -12,10 +12,12 @@ module Seal.ISA.Ops.File
   ) where
 
 import Control.Exception (try)
+import Control.Applicative ((<|>))
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
+import Data.Char (isDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -277,12 +279,21 @@ modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe T
 filePatchOp :: WorkspaceRoot -> Opcode
 filePatchOp root = UntrustedOpcode
   { uoName = OpName "FILE_PATCH"
-  , uoDesc = "Apply a unified diff to a workspace file (SafePath-confined, atomic write)."
+  , uoDesc = "Apply a unified diff to a workspace file (SafePath-confined, atomic write). \
+             \Input fields are {path: string, patch: string} — the patch field is named \
+             \'patch' (not 'diff'). The patch is a standard unified diff as @git diff@ \
+             \would emit; both the long hunk header form (@@@ -1,2 +1,2 @@@) and the \
+             \short form (@@@ -1 +1 @@@, length 1 implied) are accepted. No shell is \
+             \invoked — the diff is parsed and applied in-process."
   , uoInSchema = filePatchSchema
   , uoOutSchema = object []
-  , uoAuthorize =
-      maybe (Left "FILE_PATCH requires {path:string, patch:string}") (const (Right ()))
-        . pathField
+  , uoAuthorize = \v ->
+      case (pathField v, patchField v) of
+        (Nothing, _)      -> Left "FILE_PATCH requires {path:string, patch:string}"
+        (_, Nothing)      -> Left "FILE_PATCH requires {path:string, patch:string}"
+        (_, Just p)
+          | T.null p      -> Left "FILE_PATCH requires a non-empty patch"
+          | otherwise     -> Right ()
   , uoRun = \backend _execBackend v -> do
       let rel   = maybe "" T.unpack (pathField v)
           patch = maybe "" T.unpack (patchField v)
@@ -292,25 +303,35 @@ filePatchOp root = UntrustedOpcode
         Left err ->
           pure $ OpResult [TrpText (T.pack (show err))] True recorded
         Right safe -> do
-          -- Read the existing file, apply the diff, write atomically.
-          eContent <- runLocal backend $ try @IOError (BS.readFile (getSafePath safe))
-          case eContent of
-            Left ioErr ->
-              pure $ OpResult [TrpText ("FILE_PATCH: read failed: " <> T.pack (show ioErr))] True recorded
-            Right content -> do
-              case applyUnifiedDiff (TE.decodeUtf8Lenient content) (T.pack patch) of
-                Left applyErr ->
-                  pure $ OpResult [TrpText ("FILE_PATCH: apply failed: " <> applyErr)] True recorded
-                Right newContent -> do
-                  eUnit <- runLocal backend $ try @IOError $ do
-                    let tmpPath = getSafePath safe <> ".seal-patch-tmp"
-                    BS.writeFile tmpPath (TE.encodeUtf8 newContent)
-                    renameFile tmpPath (getSafePath safe)
-                  case eUnit of
-                    Left ioErr ->
-                      pure $ OpResult [TrpText ("FILE_PATCH: write failed: " <> T.pack (show ioErr))] True recorded
-                    Right _ ->
-                      pure $ OpResult [TrpText ("patched " <> T.pack rel)] False recorded
+          -- Defense-in-depth: a non-empty patch must reach the applier. The
+          -- authorize gate already rejects an empty/missing 'patch', but if
+          -- the opcode is ever invoked with the gate bypassed (e.g. Full
+          -- autonomy doesn't skip authorize, but a future caller might),
+          -- refuse to silently no-op here rather than rewrite the file with
+          -- its own contents and report success.
+          case patch of
+            "" -> pure $ OpResult
+                    [TrpText "FILE_PATCH requires a non-empty patch"] True recorded
+            _  -> do
+              -- Read the existing file, apply the diff, write atomically.
+              eContent <- runLocal backend $ try @IOError (BS.readFile (getSafePath safe))
+              case eContent of
+                Left ioErr ->
+                  pure $ OpResult [TrpText ("FILE_PATCH: read failed: " <> T.pack (show ioErr))] True recorded
+                Right content -> do
+                  case applyUnifiedDiff (TE.decodeUtf8Lenient content) (T.pack patch) of
+                    Left applyErr ->
+                      pure $ OpResult [TrpText ("FILE_PATCH: apply failed: " <> applyErr)] True recorded
+                    Right newContent -> do
+                      eUnit <- runLocal backend $ try @IOError $ do
+                        let tmpPath = getSafePath safe <> ".seal-patch-tmp"
+                        BS.writeFile tmpPath (TE.encodeUtf8 newContent)
+                        renameFile tmpPath (getSafePath safe)
+                      case eUnit of
+                        Left ioErr ->
+                          pure $ OpResult [TrpText ("FILE_PATCH: write failed: " <> T.pack (show ioErr))] True recorded
+                        Right _ ->
+                          pure $ OpResult [TrpText ("patched " <> T.pack rel)] False recorded
   }
 
 filePatchSchema :: Value
@@ -324,14 +345,21 @@ filePatchSchema =
             ]
         , fromText "patch" .= object
             [ "type" .= ("string" :: Text)
-            , "description" .= ("The unified diff to apply (in-process, no shell)." :: Text)
+            , "description" .= ("The unified diff to apply, named 'patch' (NOT 'diff'). \
+                                \Standard @git diff@ output; both @@ -1,2 +1,2 @@ and \
+                                \@@ -1 +1 @@ hunk headers are accepted. Applied in-process, no shell." :: Text)
             ]
         ]
     , "required" .= (["path", "patch"] :: [Text])
     ]
 
 patchField :: Value -> Maybe Text
-patchField = parseMaybe (withObject "in" (.: "patch"))
+-- | Accept the canonical 'patch' field, falling back to 'diff' (a name the
+-- model frequently guesses first). Both map to the same unified-diff payload;
+-- preferring 'patch' preserves the schema contract, while the 'diff' alias
+-- avoids a round-trip through OPCODE_DESCRIBE just to learn the field name.
+patchField v = parseMaybe (withObject "in" (.: "patch")) v
+           <|> parseMaybe (withObject "in" (.: "diff")) v
 
 -- | Apply a minimal unified diff to the original content. Returns
 -- @Left errMsg@ if the patch is malformed or the context doesn't match;
@@ -392,22 +420,38 @@ applyUnifiedDiff original patch =
       | T.null h = applyHunkLines [] hs
       | otherwise = Left ("unexpected hunk line at end: " <> h)
       where keep x acc = (x :) <$> acc
-    -- Parse @@ -oldStart,oldLen +newStart,newLen @@ <rest...>
+    -- Parse @@ -oldStart[,oldLen] +newStart[,newLen] @@ <rest...>
+    -- The ,oldLen / ,newLen are optional: when omitted, the length is 1
+    -- (this is the short form @git diff@ emits for single-line hunks, e.g.
+    -- @@@ -1 +1 @@@). The lengths are currently unused by the applier — we
+    -- only need the start line numbers — but both forms must parse so the
+    -- model's natural @git diff@-style output isn't rejected as malformed.
     parseHunkHeader h =
       case T.stripPrefix "@@ -" h of
         Nothing -> Left ("malformed hunk header: " <> h)
-        Just rest ->
-          case T.breakOn "," rest of
-            (oldStartStr, afterOldLen) ->
-              let oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int
-                  afterPlus = T.dropWhile (/= '+') (snd (T.breakOn " " (T.drop 1 afterOldLen)))
-                  afterPlus' = T.drop 1 afterPlus  -- drop the +
-                  (newStartStr, _) = T.breakOn "," afterPlus'
-                  newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
-              in case (oldStart, newStart) of
-                   (Just os_, Just ns_) -> Right (os_, Nothing, ns_, Nothing)
-                   _ -> Left ("malformed hunk header numbers: " <> h)
+        Just rest0 ->
+          let (oldStartStr, afterOld) = breakNum rest0
+              afterPlus0 = T.dropWhile (/= '+') afterOld
+              afterPlus  = T.drop 1 afterPlus0  -- drop the +
+              (newStartStr, _) = breakNum afterPlus
+              oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int
+              newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
+          in case (oldStart, newStart) of
+               (Just os_, Just ns_) -> Right (os_, Nothing, ns_, Nothing)
+               _ -> Left ("malformed hunk header numbers: " <> h)
       where
+        -- | Take leading digits (the start), then skip an optional @,len@
+        -- suffix, returning the start-numeric string and the remainder
+        -- starting at the next token (the space before @+@). Examples:
+        --
+        --   breakNum "1 +1 @@ "   == ("1", " +1 @@ ")
+        --   breakNum "1,2 +1 @@ " == ("1", " +1 @@ ")
+        breakNum :: Text -> (Text, Text)
+        breakNum s =
+          let (digits, rest) = T.span isDigit s
+          in case T.uncons rest of
+               Just (',', rest') -> (digits, T.dropWhile isDigit rest')
+               _                 -> (digits, rest)
         readMaybe :: String -> Maybe Int
         readMaybe s = case reads s :: [(Int, String)] of
           [(n, _)] -> Just n

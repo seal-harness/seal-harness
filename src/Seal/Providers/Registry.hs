@@ -21,7 +21,7 @@ module Seal.Providers.Registry
   ) where
 
 import Control.Monad (void, filterM)
-import Data.IORef (newIORef)
+import Data.IORef (IORef, newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -88,13 +88,17 @@ resolveDefaultModel Nothing  lbl =
 
 -- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
 -- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
--- re-run @\/provider login@) rather than silently falling back.
+-- re-run @\/provider login@) rather than silently falling back. The @callCounter@
+-- is shared across turns so Ollama-synthesized tool-call ids stay unique across
+-- a whole session (Ollama responses carry no id, so Seal synthesizes
+-- @call_<i>@; the counter must outlive any single 'Ollama' value, which is
+-- rebuilt each turn — see 'ProviderRuntime.prCallCounter').
 resolveProvider
   :: Maybe VaultHandle -> Manager -> Text -> KnownProvider -> ModelId
-  -> IO (Either Text SomeProvider)
-resolveProvider Nothing _ _ AnthropicProvider _ =
+  -> IORef Int -> IO (Either Text SomeProvider)
+resolveProvider Nothing _ _ AnthropicProvider _ _ =
   pure (Left "vault not configured \x2014 run /vault setup")
-resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model = do
+resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do
   eOAuth <- vhGet vh "ANTHROPIC_OAUTH_TOKENS"
   case eOAuth of
     Right blob -> case deserializeTokens blob of
@@ -114,17 +118,17 @@ resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model = do
       pure $ case eKey of
         Left e         -> Left (credErr AnthropicProvider e)
         Right keyBytes -> Right (SomeProvider (mkAnthropic mgr (mkApiKey keyBytes) model))
-resolveProvider mvh mgr baseUrl OllamaProvider model
+resolveProvider mvh mgr baseUrl OllamaProvider model callCounter
   | not (ollamaNeedsKey baseUrl) =
       -- local/custom host: keyless, never touch the vault
-      Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model
+      Right . SomeProvider <$> mkOllama mgr baseUrl Nothing model callCounter
   | otherwise = case mvh of
       Nothing ->
         pure (Left "Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama")
       Just vh -> do
         eKey <- vhGet vh (vaultKeyName OllamaProvider)
         case eKey of
-          Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model
+          Right kb -> Right . SomeProvider <$> mkOllama mgr baseUrl (Just (mkApiKey kb)) model callCounter
           Left e   -> pure (Left (vaultErrText e))
 
 -- | Run a completion through an existentially-wrapped provider.

@@ -40,9 +40,10 @@ mkPR :: FilePath -> Maybe VaultHandle -> IO ProviderRuntime
 mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
+  cntRef <- newIORef 0
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
 
 runModel :: ProviderRuntime -> SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runModel pr sr argv caps =

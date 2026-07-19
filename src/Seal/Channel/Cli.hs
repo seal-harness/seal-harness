@@ -187,7 +187,7 @@ resolveSessionProvider pr meta =
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
           model   = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
 
 -- | Resolve a provider+model from explicit labels (for AGENT_START, which
 -- builds a fresh AgentEnv from a def rather than the active session).
@@ -199,7 +199,7 @@ resolveDefProvider pr providerLabel model =
       eCfg <- loadFileConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model)
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
 
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv

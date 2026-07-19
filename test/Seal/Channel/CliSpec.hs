@@ -93,12 +93,14 @@ spec = do
     it "reports when the vault is not configured" $ do
       ref <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
       let pr = ProviderRuntime
                  { prConfigPath = "/nonexistent/config.toml"
                  , prVault = VaultRuntime
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
-                 , prManager = mgr }
+                 , prManager = mgr
+                 , prCallCounter = cntRef }
       r <- resolveSessionProvider pr (metaWith "anthropic" "claude-opus-4-8")
       case r of
         Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
@@ -107,12 +109,14 @@ spec = do
     it "reports an unknown provider label in the session" $ do
       ref <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
       let pr = ProviderRuntime
                  { prConfigPath = "/x/config.toml"
                  , prVault = VaultRuntime
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
-                 , prManager = mgr }
+                 , prManager = mgr
+                 , prCallCounter = cntRef }
       r <- resolveSessionProvider pr (metaWith "bogus" "m")
       case r of
         Left e  -> e `shouldSatisfy` ("unknown provider" `T.isInfixOf`)

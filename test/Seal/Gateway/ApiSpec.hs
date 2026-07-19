@@ -957,8 +957,9 @@ spec = describe "Seal.Gateway.API" $ do
       -- stubbed, so the vault is never consulted.
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }

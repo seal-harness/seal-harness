@@ -90,7 +90,7 @@ listCmd pr _ (Just provLbl) = CommandAction $ \caps ->
       eCfg <- loadFileConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
-      eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp)
+      eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp) (prCallCounter pr)
       case eProv of
         Left e   -> ccSend caps ("could not list " <> providerLabel kp <> " models: " <> e)
         Right sp -> do

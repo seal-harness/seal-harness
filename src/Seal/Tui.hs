@@ -83,10 +83,12 @@ runTui autonomy = do
   -- A dedicated manager for the /provider test round-trip. (M2 consolidates
   -- this with the chat provider's manager when the startup hardcode is removed.)
   mgr <- newTlsManager
+  callCounter <- newIORef 0
   let pr = ProviderRuntime
-            { prConfigPath = cfgPath
-            , prVault      = rt
-            , prManager    = mgr
+            { prConfigPath  = cfgPath
+            , prVault       = rt
+            , prManager     = mgr
+            , prCallCounter = callCounter
             }
   -- The config directory is a git repo (versioning + audit for the
   -- evolutionary stores: skills, agent-defs, memory live as Markdown files
