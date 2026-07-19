@@ -451,11 +451,11 @@ export default function App() {
   // and focus it. Distinct from handleNewTab (which opens the new-tab
   // composer). On success the WS `lists` broadcast refreshes the sidebar;
   // we navigate to the new session immediately so the chat input wires up.
-  // Preserve the currently-focused session's provider/model/agent so a
+  // When a session is focused, pass its provider/model/agent so a
   // mid-session /model use change (or a bound agent) survives the new
-  // session — mirrors /new's behavior. When nothing is focused, fall back
-  // to the config defaults (empty body). Bind the default agent only when
-  // no agent was inherited (matches handleComposerSubmit).
+  // session — mirrors /new's preservation behavior. When nothing is
+  // focused, send an empty body so the backend uses the user's configured
+  // defaults (default_provider/default_model/default_agent in config.toml).
   const handleNewBareSession = useCallback(async () => {
     const cur = sessions.find((s) => s.id === currentSessionId)
       ?? archivedSessions.find((s) => s.id === currentSessionId)
@@ -470,14 +470,7 @@ export default function App() {
     const id = `session:${res.session_id}`
     setSelectedId(id)
     syncPath(id)
-    // When no agent was inherited from the current session, bind the
-    // configured default agent so the SessionSetup dropdown's default
-    // selection takes effect (mirrors handleComposerSubmit).
-    if (!agent) {
-      const def = agents.find((a) => a.isDefault)
-      if (def) void setSessionAgent(res.session_id, def.name)
-    }
-  }, [syncPath, agents, sessions, archivedSessions, currentSessionId])
+  }, [syncPath, sessions, archivedSessions, currentSessionId])
 
   const handleBranch = useCallback((entryId: string) => {
     setBranchFrom(entryId)

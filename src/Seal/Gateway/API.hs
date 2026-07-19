@@ -14,6 +14,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.CaseInsensitive qualified as CI
+import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 
@@ -30,6 +31,7 @@ import System.Directory (doesFileExist)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
+import Seal.Config.File (defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Handles.AskReply
@@ -46,7 +48,9 @@ import Seal.Providers.Registry
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), listSessions, newSession, updateSessionAgent, updateSessionSystemOverride)
+import Seal.Session.Store
+  ( SessionRuntime (..), defaultSessionSelection, listSessions, newSession
+  , resolveDefaultAgent, updateSessionAgent, updateSessionSystemOverride )
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 import Seal.Web.UiState
@@ -370,15 +374,34 @@ handleTabNew deps v =
 
 -- | Handle POST /api/sessions/new — create a bare session (no tab attached)
 -- and return its id. The "Recent Sessions +" button calls this. Body is
--- optional; provider/model/agent override config defaults when present
--- (mirrors handleTabNew's provider branch). Does NOT touch TabsHandle.
+-- optional; provider/model/agent override the CONFIG defaults when present
+-- — so a user who configured `default_provider = "anthropic"` gets
+-- anthropic as the default, not a hardcoded fallback. When the body omits
+-- a field, the config default applies; when no default agent is
+-- configured, the session starts unbound. Does NOT touch TabsHandle.
 handleSessionNew :: ApiDeps -> A.Value -> IO Response
 handleSessionNew deps v = do
   let paths = srPaths (adSessionRuntime deps)
-      (provider, model) = parseProviderModel v
-      mAgent = parseAgentField v
+      cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadFileConfig cfgPath
+  let cfg = fromRight defaultFileConfig eCfg
+  (mDefAgent, mDefProv, mDefModel) <- resolveDefaultAgent (adAgentDefs deps) cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe (fromMaybe cfgProv mDefProv) (lookupBodyStr "provider")
+      model    = fromMaybe (fromMaybe cfgModel mDefModel) (lookupBodyStr "model")
+      mAgent = case lookupBodyStr "agent" of
+        Just t  -> eitherToMaybe (mkAgentDefId t)
+        Nothing -> mDefAgent
   meta <- newSession paths provider model "web" mAgent
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
+  where
+    objOf (A.Object o) = Just o
+    objOf _            = Nothing
+    lookupBodyStr k = case objOf v >>= KeyMap.lookup (Key.fromText k) of
+      Just (A.String t) | not (T.null t) -> Just t
+      _                                 -> Nothing
+    eitherToMaybe (Right x) = Just x
+    eitherToMaybe (Left _)  = Nothing
 
 -- | Handle POST /api/sessions/:id/new — rebind the tab (if any) bound to
 -- :id to a fresh session, and return the new sid + tab_index + rebound
