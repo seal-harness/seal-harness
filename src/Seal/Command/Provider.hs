@@ -12,7 +12,7 @@ module Seal.Command.Provider
 
 import Control.Exception (SomeException, try)
 import Data.Either (fromRight)
-import Data.IORef (readIORef)
+import Data.IORef (IORef, readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -70,10 +70,16 @@ formatTestResult label = \case
 
 -- | Everything the @/provider@ handlers need: where config lives, the vault
 -- (for credentials), and an HTTP manager (for the live @test@ round-trip).
+-- The @prCallCounter@ is a process-lifetime monotonic counter shared across
+-- every Ollama provider instance built by 'Seal.Providers.Registry.resolveProvider'.
+-- Ollama tool-call responses carry no id, so Seal synthesizes @call_<i>@;
+-- the counter must outlive any single 'Ollama' value (which is rebuilt each
+-- turn) so ids stay unique across a whole session.
 data ProviderRuntime = ProviderRuntime
-  { prConfigPath :: FilePath
-  , prVault      :: VaultRuntime
-  , prManager    :: Manager
+  { prConfigPath  :: FilePath
+  , prVault       :: VaultRuntime
+  , prManager     :: Manager
+  , prCallCounter :: IORef Int
   }
 
 providerCommandSpec :: ProviderRuntime -> CommandSpec
@@ -288,7 +294,7 @@ testCmd pr lbl = CommandAction $ \caps ->
             Left _  -> defaultModelFor kp
           baseUrl = fromMaybe defaultOllamaBaseUrl
                       (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
-      eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model
+      eProv <- resolveProvider (Just vh) (prManager pr) baseUrl kp model (prCallCounter pr)
       case eProv of
         Left e   -> ccSend caps (formatTestResult (providerLabel kp) (Left e))
         Right sp -> do

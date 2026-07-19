@@ -235,10 +235,12 @@ runSignalMain autonomy = do
             , vrHandleRef  = ref
             }
   mgr <- newTlsManager
+  callCounter <- newIORef 0
   let pr = ProviderRuntime
-            { prConfigPath = cfgPath
-            , prVault      = rt
-            , prManager    = mgr
+            { prConfigPath  = cfgPath
+            , prVault       = rt
+            , prManager     = mgr
+            , prCallCounter = callCounter
             }
   -- The config directory is a git repo (versioning for the evolutionary stores)
   let cfgRoot = spConfig paths

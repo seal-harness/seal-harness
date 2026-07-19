@@ -18,6 +18,8 @@ module Seal.Providers.Ollama
   , unreachableMsg
   , encodeRequest
   , decodeResponse
+  , countToolCalls
+  , claimToolCallIds
   ) where
 
 import Control.Exception (try)
@@ -27,7 +29,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser, parseEither)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.IORef (IORef, atomicModifyIORef')
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -49,12 +51,18 @@ data Ollama = Ollama
   , olManager :: Manager
   , olBaseUrl :: Text          -- e.g. "http://localhost:11434" | "https://ollama.com"
   , olApiKey  :: Maybe ApiKey  -- Nothing = local (no auth); Just = cloud (Bearer)
-  , olCallCounter :: IORef Int -- ^ monotonic counter for globally-unique tool-call ids
+  , olCallCounter :: IORef Int -- ^ monotonic counter for unique tool-call ids.
+                               --   Shared across turns — the caller owns it
+                               --   so ids stay unique across a whole session
+                               --   (not just within one provider instance).
   }
 
-mkOllama :: Manager -> Text -> Maybe ApiKey -> ModelId -> IO Ollama
-mkOllama mgr base mKey model = do
-  counter <- newIORef 0
+-- | Build an 'Ollama' using an externally-owned counter. The counter must be
+--   shared across every 'Ollama' built for the same process (typically held in
+--   'ProviderRuntime') so tool-call ids never repeat across turns. The model
+--   field is filled in by the caller.
+mkOllama :: Manager -> Text -> Maybe ApiKey -> ModelId -> IORef Int -> IO Ollama
+mkOllama mgr base mKey model counter =
   pure (Ollama model mgr base mKey counter)
 
 -- URL + headers ------------------------------------------------------------
@@ -223,10 +231,7 @@ sendChat o hdrs cr = do
         then case eitherDecode (responseBody resp) of
           Left e  -> pure (Left (T.pack e))
           Right v -> do
-            startIdx <- atomicModifyIORef' (olCallCounter o) (\i -> (i, i))
-            let toolCount = countToolCalls v
-                nextIdx = startIdx + toolCount
-            _ <- atomicModifyIORef' (olCallCounter o) (\_ -> (nextIdx, ()))
+            startIdx <- claimToolCallIds (olCallCounter o) (countToolCalls v)
             pure (decodeResponseFrom startIdx v)
         else pure $ Left $ ollamaErrorText code
           (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (responseBody resp)))
@@ -240,6 +245,15 @@ countToolCalls v = case v of
       _ -> 0
     _ -> 0
   _ -> 0
+
+-- | Atomically claim @n@ contiguous tool-call ids, returning the inclusive
+-- start of the claimed range. 'atomicModifyIORef'' advances the counter by
+-- @n@ and returns the previous value in one CAS, so concurrent callers can
+-- never overlap (the read-then-advance pattern raced here: two threads both
+-- read 0 before either advanced, both emitted "call_0"). Claiming 0 is a
+-- no-op read. Exposed for the concurrency test in 'OllamaSpec'.
+claimToolCallIds :: IORef Int -> Int -> IO Int
+claimToolCallIds counter n = atomicModifyIORef' counter (\i -> (i + n, i))
 
 -- | GET {base}/api/tags → the installed model names.
 listTags :: Manager -> Text -> RequestHeaders -> IO (Either Text [ModelId])

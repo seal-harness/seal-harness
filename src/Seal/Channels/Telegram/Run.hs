@@ -95,10 +95,12 @@ runTelegramMain autonomy = do
             , vrHandleRef  = ref
             }
   mgr <- newTlsManager
+  callCounter <- newIORef 0
   let pr = ProviderRuntime
-            { prConfigPath = cfgPath
-            , prVault      = rt
-            , prManager    = mgr
+            { prConfigPath  = cfgPath
+            , prVault       = rt
+            , prManager     = mgr
+            , prCallCounter = callCounter
             }
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
