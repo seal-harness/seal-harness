@@ -283,7 +283,7 @@ describe('RunningHarnesses', () => {
 // ── Sidebar ────────────────────────────────────────────────────────────
 
 describe('Sidebar', () => {
-  it('renders the empty-state message when there are no tabs/sessions/archived', () => {
+  it('renders the Active Tabs + Recent Sessions headers (and their + buttons) even when empty', () => {
     render(
       <Sidebar
         tabs={[]}
@@ -303,7 +303,10 @@ describe('Sidebar', () => {
         onReleaseTab={() => {}}
       />,
     )
-    expect(screen.getByText('No tabs or sessions yet.')).toBeTruthy()
+    expect(screen.getByText('Active Tabs')).toBeTruthy()
+    expect(screen.getByText('Recent Sessions')).toBeTruthy()
+    expect(screen.getByLabelText('New tab')).toBeTruthy()
+    expect(screen.getByLabelText('New session')).toBeTruthy()
   })
 
   it('renders Active Tabs + Recent Sessions + Archived sections together', () => {

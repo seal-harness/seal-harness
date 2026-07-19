@@ -123,8 +123,10 @@ describe('App — layout', () => {
     // is selected, so assert at least one occurrence) + the version pill.
     expect(screen.getAllByText('Seal Harness').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByText('v0.1.0')).toBeTruthy()
-    // Sidebar: empty-state copy (no tabs/sessions).
-    expect(screen.getByText('No tabs or sessions yet.')).toBeTruthy()
+    // Sidebar: Active Tabs + Recent Sessions headers always render (even
+    // when empty) so the + buttons are always reachable.
+    expect(screen.getByText('Active Tabs')).toBeTruthy()
+    expect(screen.getByText('Recent Sessions')).toBeTruthy()
     // ChatArea: empty-state message (no selection → ChatArea empty state).
     expect(screen.getByText(/No messages yet|Select a session/i)).toBeTruthy()
     // BottomBar: token label + idle indicator.

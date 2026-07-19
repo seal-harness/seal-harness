@@ -301,27 +301,18 @@ export function Sidebar({
           onRelease={onReleaseTab}
         />
 
-        {recentSessions.length > 0 && (
-          <>
-            <RecentSessionsHeader onNewSession={onNewSession} />
-            {recentSessions.map((s) => (
-              <SessionRow
-                key={s.id}
-                session={s}
-                selected={selectedId === `session:${s.id}`}
-                onSelect={() => onSelectSession(s.id)}
-                onArchive={onArchiveSession}
-                activity={sessionActivity?.[s.id]}
-              />
-            ))}
-          </>
-        )}
+        <RecentSessionsHeader onNewSession={onNewSession} />
+        {recentSessions.map((s) => (
+          <SessionRow
+            key={s.id}
+            session={s}
+            selected={selectedId === `session:${s.id}`}
+            onSelect={() => onSelectSession(s.id)}
+            onArchive={onArchiveSession}
+            activity={sessionActivity?.[s.id]}
+          />
+        ))}
 
-        {tabs.length === 0 && sessions.length === 0 && archivedSessions.length === 0 && (
-          <div className="px-3 py-4 text-xs" style={{ color: 'var(--text-muted)' }}>
-            No tabs or sessions yet.
-          </div>
-        )}
       </div>
       <ArchivedSection
         sessions={archivedSessions}
