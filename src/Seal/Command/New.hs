@@ -60,6 +60,10 @@ data NewDeps = NewDeps
   , ndCfg          :: IO FileConfig
   , ndAgentDefs    :: Backends
   , ndChannelLabel :: Text
+  , ndOldMeta      :: IO SessionMeta
+    -- ^ Read the current (pre-swap) active session. Used to preserve the
+    -- old session's provider/model/agent in the freshly-minted session
+    -- (so @\/model use@ changes survive @\/new@).
   , ndRebind        :: ChannelCaps -> SessionMeta -> IO SessionId
     -- ^ Swap active-session ref + rebind the current tab; return the old sid.
   }
@@ -83,18 +87,31 @@ newParserInfo deps =
     <> header   "new — start a fresh session in the current tab (old session kept in /session list)"
     )
 
--- | The @/new@ action: mint a session from config defaults, call 'ndRebind'
--- (which swaps the active-session ref + rebinds the tab + returns the old
--- sid), and send the confirmation line.
+-- | The @/new@ action: read the old session, mint a fresh session that
+-- preserves the old provider/model/agent, call 'ndRebind' (which swaps the
+-- active-session ref + rebinds the tab + returns the old sid), and send the
+-- confirmation line.
 newCmd :: NewDeps -> CommandAction
 newCmd deps = CommandAction $ \caps -> do
-  meta <- mintNewSession deps
+  oldMeta <- ndOldMeta deps
+  meta <- mintNewSessionFrom oldMeta deps
   oldSid <- ndRebind deps caps meta
   ccSend caps (renderNewConfirmation meta oldSid)
 
--- | Mint a fresh 'SessionMeta' from the config defaults, persisted to disk
--- via 'newSession' (so @/session list@ picks it up). Shared by the
--- registry path (CLI/web) and the loop-level inbox path.
+-- | Mint a fresh 'SessionMeta' that preserves the old session's
+-- provider/model/agent (so mid-session @\/model use@ changes survive
+-- @\/new@). The new session gets a fresh id + timestamps; everything else
+-- is copied from the old meta. Persisted to disk via 'newSession' so
+-- @/session list@ picks it up. Shared by the registry path (CLI/web) and
+-- the loop-level inbox path.
+mintNewSessionFrom :: SessionMeta -> NewDeps -> IO SessionMeta
+mintNewSessionFrom oldMeta deps =
+  newSession (ndPaths deps) (smProvider oldMeta) (smModel oldMeta)
+             (ndChannelLabel deps) (smAgent oldMeta)
+
+-- | Mint a fresh 'SessionMeta' from the config defaults. Kept for callers
+-- that genuinely want config defaults (none today, but reserved for the
+-- bare-session "Recent Sessions +" path which is a separate endpoint).
 mintNewSession :: NewDeps -> IO SessionMeta
 mintNewSession deps = do
   cfg <- ndCfg deps

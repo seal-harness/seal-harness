@@ -348,15 +348,14 @@ handleNewSession
   :: ChannelDeps -> ChannelHandle -> TabsHandle
   -> ChannelKind -> SessionMeta -> IO ()
 handleNewSession deps h tabsH kind oldMeta = do
-  cfg <- cdConfig deps
-  (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
-  let (cfgProv, cfgModel) = defaultSessionSelection cfg
-      provider = fromMaybe cfgProv mProv
-      model    = fromMaybe cfgModel mModel
-      channelLabel = channelKindToText kind
+  -- Preserve the old session's provider/model/agent (so mid-session
+  -- /model use changes survive /new). The new session gets a fresh id +
+  -- timestamps; everything else is copied from the old meta.
+  let channelLabel = channelKindToText kind
       oldSid = smId oldMeta
       oldRef = BoundSession oldSid
-  newMeta <- newSessionMeta (cdPaths deps) provider model channelLabel mAgent
+  newMeta <- newSessionMeta (cdPaths deps) (smProvider oldMeta) (smModel oldMeta)
+                            channelLabel (smAgent oldMeta)
   saveSessionMeta (cdPaths deps) newMeta
   -- Rebind the tab (if any) bound to the old sid to the new sid.
   snap <- snapshotTabs tabsH

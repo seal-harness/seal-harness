@@ -138,6 +138,7 @@ runTui autonomy = do
         , ndCfg = pure cfg
         , ndAgentDefs = backends
         , ndChannelLabel = "cli"
+        , ndOldMeta = readIORef activeRef
         , ndRebind = \_caps newMeta -> do
             oldMeta <- readIORef activeRef
             let oldSid = smId oldMeta

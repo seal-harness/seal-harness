@@ -27,6 +27,7 @@ stubDeps =
     , ndCfg = error "ndCfg: unused"
     , ndAgentDefs = error "ndAgentDefs: unused"
     , ndChannelLabel = "test"
+    , ndOldMeta = error "ndOldMeta: unused by parse/render tests"
     , ndRebind = \_caps _newMeta -> pure (mkSid "20260701-000000-000")
     }
 

@@ -130,6 +130,7 @@ runServeMain autonomy = do
         , ndCfg = loadCfg
         , ndAgentDefs = backends
         , ndChannelLabel = "web"
+        , ndOldMeta = readIORef activeRef
         , ndRebind = \_caps newMeta -> do
             oldMeta <- readIORef activeRef
             let oldSid = smId oldMeta
