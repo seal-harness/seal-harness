@@ -56,7 +56,7 @@ import Seal.Harness.Tmux (TmuxRunner (..), mkTmuxIdent)
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
 import Seal.ISA.Opcode (OpResult (..), localBackend)
 import Seal.ISA.Ops.Agent
-import Seal.ISA.Ops.Code
+import Seal.ISA.Ops.Bin
 import Seal.ISA.Ops.File
 import Seal.ISA.Ops.Harness
 import Seal.ISA.Ops.Human
@@ -313,31 +313,31 @@ spec = describe "Seal.ISA.Integration" $ do
       r `shouldBe` Left (Denied "SHELL_EXEC denied by autonomy policy")
 
   -- ----------------------------------------------------------------------
-  -- CODE_EXEC
+  -- BIN_EXEC
   -- ----------------------------------------------------------------------
-  describe "CODE_EXEC" $ do
-    it "\"Run this Python script: print('hi').\" -> CODE_EXEC -> interpreter output" $ do
+  describe "BIN_EXEC" $ do
+    it "\"Run this Python script: print('hi').\" -> BIN_EXEC -> binary output" $ do
       seen <- newIORef ([] :: [Text])
       let backend = fakeBackend seen "hi\n"
-          allowList = Set.fromList ["python3" :: Text]
-          op = codeExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList backend
+          allowList = Just (Set.fromList ["python3" :: Text])
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList backend
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg backend (OpName "CODE_EXEC")
-                        (object [ "interpreter" .= ("python3" :: Text)
-                                , "script" .= ("print('hi')" :: Text) ]))
+      r <- runTestApp (dispatchOneWith reg backend (OpName "BIN_EXEC")
+                        (object [ "binary" .= ("python3" :: Text)
+                                , "args" .= (["-c", "print('hi')"] :: [Text]) ]))
       case r of
         Right res -> do
           orIsError res `shouldBe` False
           orParts res `shouldBe` [TrpText "hi\n"]
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-    it "\"Run a bash script.\" -> CODE_EXEC with non-allow-listed interpreter -> Denied" $ do
-      let op = codeExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) mempty failBackend
+    it "\"Run rm.\" -> BIN_EXEC with non-allow-listed binary -> Denied" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just mempty) failBackend
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg failBackend (OpName "CODE_EXEC")
-                        (object [ "interpreter" .= ("bash" :: Text)
-                                , "script" .= ("echo hi" :: Text) ]))
-      r `shouldBe` Left (Denied "CODE_EXEC: interpreter \"bash\" not in the allow-list")
+      r <- runTestApp (dispatchOneWith reg failBackend (OpName "BIN_EXEC")
+                        (object [ "binary" .= ("rm" :: Text)
+                                , "args" .= (["-rf", "/"] :: [Text]) ]))
+      r `shouldBe` Left (Denied "BIN_EXEC: binary \"rm\" not in the allow-list")
 
   -- ----------------------------------------------------------------------
   -- PROCESS_MANAGE

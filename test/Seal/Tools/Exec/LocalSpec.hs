@@ -7,7 +7,7 @@ import Test.Hspec
 
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args
-  ( mkShellCommand, mkInterpName, mkScriptArg )
+  ( mkShellCommand, mkBinName, mkBinArg )
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 import Seal.Tools.Exec.Types (ExecError (..), LocalExecHandle (..))
 
@@ -52,23 +52,34 @@ spec = describe "Seal.Tools.Exec.Local" $ do
           out `shouldSatisfy` T.isInfixOf "[exit code: 1]"
         Left e -> expectationFailure ("expected Right, got Left " ++ show e)
 
-  describe "lehExecProgram (real interpreter on PATH)" $ do
+  describe "lehExecBin (real binary on PATH)" $ do
     it "returns stdout on exit 0" $ do
-      -- lehExecProgram runs <interp> <args...> with fixed argv (no shell).
+      -- lehExecBin runs <binary> <args...> with fixed argv (no shell).
       -- Use `echo` (always on PATH) with a single arg.
-      interp <- requireRight "invalid interp" (mkInterpName "echo")
-      arg <- requireRight "invalid arg" (mkScriptArg "via_interp")
-      res <- lehExecProgram h interp [arg]
+      bin <- requireRight "invalid bin" (mkBinName "echo")
+      arg <- requireRight "invalid arg" (mkBinArg "via_bin")
+      res <- lehExecBin h bin [arg]
       case res of
-        Right out -> T.strip out `shouldBe` "via_interp"
+        Right out -> T.strip out `shouldBe` "via_bin"
         Left ExecNotImplemented -> pendingWith "echo not on PATH"
         Left _ -> pendingWith "unexpected Left"
 
-    it "returns Left ExecNotImplemented when interpreter is not on PATH (127)" $ do
+    it "returns Left ExecNotImplemented when binary is not on PATH (127)" $ do
       -- 127 for a program (not shell) means the binary itself is not on PATH.
-      interp <- requireRight "invalid interp" (mkInterpName "this_interpreter_does_not_exist_12345")
-      res <- lehExecProgram h interp []
+      bin <- requireRight "invalid bin" (mkBinName "this_binary_does_not_exist_12345")
+      res <- lehExecBin h bin []
       res `shouldBe` Left ExecNotImplemented
+
+    it "passes leading-dash args verbatim (flag, not option injection)" $ do
+      -- `printf` accepts -format strings; pass a leading-dash arg to prove
+      -- the raw argv model forwards it as a single token, not a flag to a shell.
+      bin <- requireRight "invalid bin" (mkBinName "printf")
+      arg <- requireRight "invalid arg" (mkBinArg "--")
+      res <- lehExecBin h bin [arg, arg]
+      case res of
+        Right out -> out `shouldSatisfy` (not . T.null)
+        Left ExecNotImplemented -> pendingWith "printf not on PATH"
+        Left _ -> pendingWith "unexpected Left"
 
 requireRight :: String -> Either a b -> IO b
 requireRight _ (Right x) = pure x

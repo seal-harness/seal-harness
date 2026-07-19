@@ -22,7 +22,6 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
-import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -43,6 +42,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
+import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
@@ -57,6 +57,7 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
+import Seal.ISA.Dispatch (dispatch)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 #endif
@@ -75,7 +76,7 @@ import Seal.ISA.Ops.Agent
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, AgentStartWiring (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Code (codeExecOp)
+import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
@@ -374,7 +375,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                 -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
                 -- AGENT_INTERRUPT
                 , shellExecOp wsRoot cliSecurityPolicy execBackend
-                , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
                 , processManageOp wsRoot cliSecurityPolicy execBackend
                 , fileWriteOp wsRoot operatorCeiling
                 , filePatchOp wsRoot
@@ -439,7 +440,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           , agentStopOp agentRuntime
           , agentInterruptOp agentRuntime
           , shellExecOp wsRoot cliSecurityPolicy execBackend
-          , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+          , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
           , processManageOp wsRoot cliSecurityPolicy execBackend
           , fileWriteOp wsRoot operatorCeiling
           , filePatchOp wsRoot
@@ -508,7 +509,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                         , agentDefReadOp agentDefBackend
                         , agentDefListOp agentDefBackend
                         , shellExecOp wsRoot cliSecurityPolicy execBackend
-                        , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                        , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
                         , processManageOp wsRoot cliSecurityPolicy execBackend
                         , fileWriteOp wsRoot operatorCeiling
                         , filePatchOp wsRoot
@@ -573,7 +574,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   , agentStopOp agentRuntime
                   , agentInterruptOp agentRuntime
                   , shellExecOp wsRoot cliSecurityPolicy execBackend
-                  , codeExecOp wsRoot cliSecurityPolicy codeAllowList execBackend
+                  , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
                   , processManageOp wsRoot cliSecurityPolicy execBackend
                   , fileWriteOp wsRoot operatorCeiling
                   , filePatchOp wsRoot
@@ -590,7 +591,13 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                 let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
                       (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) (onDemandFromCfg eCfg)
                 runApp appEnv (runTurn env prompt)))
-        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner])
+        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher])
+        -- The /call dispatcher: dispatch an opcode against the active
+        -- session's ISA registry + transcript under Full autonomy (the
+        -- operator is the approver by typing /call). Returns the
+        -- structured DispatchError/OpResult for the command to render.
+        callDispatcher callOpName val =
+          runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
     let plainHandler t = do
           meta  <- readIORef (srActive sr)
           eprov <- resolveSessionProvider pr meta
@@ -714,7 +721,7 @@ execBackendFromFile _wsRoot cfg =
 cliSecurityPolicy :: SecurityPolicy
 cliSecurityPolicy = SecurityPolicy AllowAll Supervised
 
--- | The set of interpreters CODE_EXEC may run. Conservative default; can be
--- tightened via config in a later phase.
-codeAllowList :: Set Text
-codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+-- | The set of binaries BIN_EXEC may run (optional allow-list). 'Nothing'
+-- disables the allow-list (any binary, subject only to the autonomy policy).
+binAllowList :: Maybe (Set Text)
+binAllowList = Nothing

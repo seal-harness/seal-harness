@@ -337,7 +337,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 { lehExecShell = \_ _ -> do
                     writeIORef ran True
                     pure (Right "executed")
-                , lehExecProgram = \_ _ -> do
+                , lehExecBin = \_ _ -> do
                     writeIORef ran True
                     pure (Right "executed")
                 }

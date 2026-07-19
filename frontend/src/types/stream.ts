@@ -90,7 +90,7 @@ export interface ListsEvent {
 }
 
 /** A pending human-confirmation question from an Untrusted opcode (SHELL_EXEC,
- *  CODE_EXEC, etc.) under Supervised autonomy, or from ASK_HUMAN. The agent
+ *  BIN_EXEC, etc.) under Supervised autonomy, or from ASK_HUMAN. The agent
  *  loop is blocked until the human answers via POST .../questions/:qid/answer
  *  or cancels via POST .../questions/:qid/cancel. */
 export interface AskEvent {

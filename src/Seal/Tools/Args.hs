@@ -17,12 +17,12 @@ module Seal.Tools.Args
   , ShellCommand (..)
   , mkShellCommand
   , textShellCommand
-  , InterpName (..)
-  , mkInterpName
-  , textInterpName
-  , ScriptArg (..)
-  , mkScriptArg
-  , textScriptArg
+  , BinName (..)
+  , mkBinName
+  , textBinName
+  , BinArg (..)
+  , mkBinArg
+  , textBinArg
   ) where
 
 import Data.Char (isControl)
@@ -63,37 +63,41 @@ mkShellCommand t
 textShellCommand :: ShellCommand -> Text
 textShellCommand (ShellCommand t) = t
 
--- | An interpreter name (e.g. @python3@, @node@). Rejects path separators
--- (the interpreter must be a name resolvable on PATH, not a path — the
--- executor looks it up via a fixed-argv @<name> <script>@, never a
--- constructed path), leading-dash (option injection), control chars, NUL,
--- empty.
-newtype InterpName = InterpName Text
+-- | A binary name (e.g. @python3@, @node@, @ls@). The executor resolves
+-- it on PATH via 'System.Process.proc' (RawCommand — no shell), so the
+-- value never passes through a shell. Minimal validation: reject empty
+-- and NUL (which would truncate the C-string). Leading dashes are
+-- permitted (a binary *may* legitimately begin with @-@), and the
+-- argv-passing model means leading-dash args are passed as argv tokens,
+-- not flags to a shell. Path separators are permitted (the binary may be
+-- an absolute or relative path). Control chars other than NUL are
+-- permitted (the executor passes them verbatim through argv).
+newtype BinName = BinName Text
   deriving stock (Eq, Show)
 
-mkInterpName :: Text -> Either Text InterpName
-mkInterpName t
-  | T.null t            = Left "interpreter name is empty"
-  | T.head t == '-'     = Left "interpreter name must not start with '-' (option injection)"
-  | T.any isNameBad t   = Left "interpreter name has invalid characters"
-  | otherwise           = Right (InterpName t)
-  where
-    isNameBad c = c == '/' || c == '\\' || isControl c
+mkBinName :: Text -> Either Text BinName
+mkBinName t
+  | T.null t          = Left "binary name is empty"
+  | T.any (== '\0') t = Left "binary name contains NUL"
+  | otherwise         = Right (BinName t)
 
-textInterpName :: InterpName -> Text
-textInterpName (InterpName t) = t
+textBinName :: BinName -> Text
+textBinName (BinName t) = t
 
--- | A script argument to an interpreter. Rejects leading-dash (option
--- injection against the interpreter), NUL, empty.
-newtype ScriptArg = ScriptArg Text
+-- | A single argv token passed to a binary. The executor uses
+-- 'System.Process.proc' (RawCommand), so the value is never interpreted
+-- by a shell — it is passed verbatim as one argv entry. Minimal
+-- validation: reject empty and NUL. Leading dashes are permitted (a
+-- leading-dash arg is a flag for the binary, not option injection — the
+-- caller explicitly chose to pass it).
+newtype BinArg = BinArg Text
   deriving stock (Eq, Show)
 
-mkScriptArg :: Text -> Either Text ScriptArg
-mkScriptArg t
-  | T.null t            = Left "script arg is empty"
-  | T.head t == '-'     = Left "script arg must not start with '-' (option injection)"
-  | T.any (== '\0') t   = Left "script arg contains NUL"
-  | otherwise           = Right (ScriptArg t)
+mkBinArg :: Text -> Either Text BinArg
+mkBinArg t
+  | T.null t          = Left "bin arg is empty"
+  | T.any (== '\0') t = Left "bin arg contains NUL"
+  | otherwise         = Right (BinArg t)
 
-textScriptArg :: ScriptArg -> Text
-textScriptArg (ScriptArg t) = t
+textBinArg :: BinArg -> Text
+textBinArg (BinArg t) = t

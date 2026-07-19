@@ -15,6 +15,7 @@ module Seal.Gateway.Send
   , handleSend
   , handleAnswerDelivery
   , handleAskCancel
+  , webCallDispatcher
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
@@ -25,7 +26,6 @@ import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef)
 import Data.Maybe (mapMaybe)
-import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -42,6 +42,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
   ( Backends (..), execBackendFromFile, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
@@ -71,9 +72,10 @@ import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
-import Seal.ISA.Opcode (opName)
+import Seal.ISA.Opcode (localBackend, opName)
+import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Code (codeExecOp)
+import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Harness
@@ -343,7 +345,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy execBackend
-      , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+      , binExecOp wsRoot securityPolicy binAllowList execBackend
       , processManageOp wsRoot securityPolicy execBackend
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
@@ -364,7 +366,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
-    codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+    binAllowList = Nothing
     -- Fail-closed defaults for the provider-pluggable opcodes. These surface
     -- as available tools to the LLM; the opcodes return a structured error
     -- until a real provider is configured (operator-supplied via config in a
@@ -455,6 +457,40 @@ plainTurnWithCaps deps meta caps t = do
         result <- runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
         pure result)
+
+-- | Build a 'CallDispatcher' for the web channel. Resolves the active
+-- session at call time, opens its transcript, builds the session's ISA
+-- registry, and dispatches the opcode via 'Seal.ISA.Dispatch.dispatch'
+-- under 'Full' autonomy semantics (the operator is the approver by
+-- typing @/call@). Mirrors 'plainTurnWithCaps' but invokes 'dispatch'
+-- directly instead of 'runTurn'. Returns the structured result for
+-- 'Seal.Command.Call.renderOpResult' to render.
+webCallDispatcher :: SendDeps -> CallDispatcher
+webCallDispatcher deps callOpName val = do
+  meta <- readIORef (srActive (sdSession deps))
+  let sid = smId meta
+      paths = sdPaths deps
+      sessionDirPath = sessionDir paths sid
+  createDirectoryIfMissing True sessionDirPath
+  withTwoFileTranscript sessionDirPath $ \tHandle -> do
+    wsRoot <- WorkspaceRoot <$> getCurrentDirectory
+    appEnv <- mkEnv defaultConfig
+    eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+    let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+        execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+        defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
+        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    let onDemand = either (const False) onDemandSchemas eCfg
+        startWiring = webStartWiring
+          deps paths sid caps execBackend appEnv eCfg
+          wsRoot operatorCeiling
+        isaReg = buildWebRegistry
+          (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+          execBackend (sdAutonomy deps) startWiring
+          (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+          caps onDemand
+    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the CLI's
 -- 'mintAgentSession'). Each start gets its own timestamped id.
@@ -551,7 +587,7 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
             , fileWriteOp wsRoot operatorCeiling
             , filePatchOp wsRoot
             , shellExecOp wsRoot securityPolicy execBackend
-            , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+            , binExecOp wsRoot securityPolicy binAllowList execBackend
             , processManageOp wsRoot securityPolicy execBackend
             , webFetchOp webFetchCfg
             , webSearchOp webSearchCfg
@@ -559,7 +595,7 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
       pure (ISA.mkRegistry (filterBlocklisted childBaseOps opName))
       where
         securityPolicy = Policy.SecurityPolicy Policy.AllowAll (sdAutonomy deps)
-        codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+        binAllowList = Nothing
         webFetchCfg = WebFetchConfig
           { wfcManager = sdHttpManager deps, wfcAllowList = []
           , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }

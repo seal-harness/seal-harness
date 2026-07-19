@@ -48,7 +48,6 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
-import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
@@ -101,7 +100,7 @@ import Seal.ISA.Ops.Agent
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, AgentStartWiring (..) )
 import Seal.ISA.Opcode (opName)
-import Seal.ISA.Ops.Code (codeExecOp)
+import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
@@ -535,7 +534,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy execBackend
-      , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+      , binExecOp wsRoot securityPolicy binAllowList execBackend
       , processManageOp wsRoot securityPolicy execBackend
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
@@ -547,7 +546,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
     introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
-    codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+    binAllowList = Nothing
     webSearchCfg = WebSearchConfig
       { wscManager   = httpManager
       , wscEndpoint  = ""
@@ -661,7 +660,7 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
             , fileWriteOp wsRoot operatorCeiling
             , filePatchOp wsRoot
             , shellExecOp wsRoot securityPolicy execBackend
-            , codeExecOp wsRoot securityPolicy codeAllowList execBackend
+            , binExecOp wsRoot securityPolicy binAllowList execBackend
             , processManageOp wsRoot securityPolicy execBackend
             , webFetchOp webFetchCfg
             , webSearchOp webSearchCfg
@@ -669,7 +668,7 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
       pure (ISA.mkRegistry (filterBlocklisted childBaseOps opName))
       where
         securityPolicy = Policy.SecurityPolicy Policy.AllowAll (cdAutonomy deps)
-        codeAllowList = Set.fromList ["python3", "node", "bash", "sh"]
+        binAllowList = Nothing
         webFetchCfg = WebFetchConfig
           { wfcManager = cdHttpManager deps, wfcAllowList = []
           , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }

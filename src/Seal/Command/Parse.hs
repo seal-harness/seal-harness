@@ -6,6 +6,7 @@ module Seal.Command.Parse
   ) where
 
 import Data.Char (isSpace)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -120,18 +121,48 @@ parseSlash registry fullLine =
                 (n:_) -> Just (CommandName n))
          else if isTopLevelHelp
               then ParseHelp (Just headName)
-              else case lookupSpec registry headName of
-                Nothing   -> ParseFailure ("unknown command: " <> h)
-                Just spec ->
-                  -- execParserPure expects [String], not [Text]
-                  let args  = map T.unpack rest
-                      -- defaultPrefs: enables --help/--version, no disambiguation,
-                      -- single-line error context. CompletionInvoked is reserved
-                      -- (see note above).
-                      prefs = defaultPrefs
-                  in case execParserPure prefs (csParserInfo spec) args of
-                    Success act         -> ParsedAction act
-                    Failure f           ->
-                      let (msg, _) = renderFailure f (T.unpack h)
-                      in ParseFailure (T.pack msg)
-                    CompletionInvoked _ -> ParseFailure ""
+              else if T.toCaseFold h == "call" && isJust (lookupSpec registry headName)
+                   then parseCallRaw registry h line
+                   else case lookupSpec registry headName of
+                     Nothing   -> ParseFailure ("unknown command: " <> h)
+                     Just spec ->
+                       -- execParserPure expects [String], not [Text]
+                       let args  = map T.unpack rest
+                           -- defaultPrefs: enables --help/--version, no disambiguation,
+                           -- single-line error context. CompletionInvoked is reserved
+                           -- (see note above).
+                           prefs = defaultPrefs
+                       in case execParserPure prefs (csParserInfo spec) args of
+                         Success act         -> ParsedAction act
+                         Failure f           ->
+                           let (msg, _) = renderFailure f (T.unpack h)
+                           in ParseFailure (T.pack msg)
+                         CompletionInvoked _ -> ParseFailure ""
+
+-- | Special-case parser for @/call@: the JSON payload may contain
+-- double-quotes and spaces that the shell-words tokenizer would strip or
+-- split. To preserve the raw JSON, we bypass the tokenizer for the JSON
+-- portion: split the line (post-/@/@) into the command name, the opcode
+-- name, and the raw rest-of-line as a single string. The @call@ parser
+-- then receives @[OP, JSON-raw]@ as its argv.
+parseCallRaw :: Registry -> Text -> Text -> ParseOutcome
+parseCallRaw registry h line =
+  -- line is the full command minus the leading '/'. Drop the command name
+  -- ("call") to reach "OP JSON-raw".
+  let afterCall = T.dropWhile (== ' ') (T.drop (T.length h) line)
+      -- Split into OP and the raw JSON rest on the first run of whitespace.
+      (opText, jsonRest) = T.break isSpace afterCall
+      jsonRest' = T.dropWhile isSpace jsonRest
+      mSpec = lookupSpec registry (CommandName h)
+      args = case T.null jsonRest' of
+               True  -> [T.unpack opText]                 -- /call OP
+               False -> [T.unpack opText, T.unpack jsonRest']  -- /call OP {json...}
+  in case mSpec of
+       Nothing   -> ParseFailure ("unknown command: " <> h)
+       Just spec ->
+         case execParserPure defaultPrefs (csParserInfo spec) args of
+           Success act         -> ParsedAction act
+           Failure f           ->
+             let (msg, _) = renderFailure f (T.unpack h)
+             in ParseFailure (T.pack msg)
+           CompletionInvoked _ -> ParseFailure ""

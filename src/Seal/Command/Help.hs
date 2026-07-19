@@ -85,6 +85,7 @@ renderHelpIndex reg =
     groupHeader GroupVault    = "Vault"
     groupHeader GroupSkills   = "Skills"
     groupHeader GroupAgent    = "Agents"
+    groupHeader GroupTools    = "Tools"
 
     renderSpec :: CommandSpec -> Text
     renderSpec s =

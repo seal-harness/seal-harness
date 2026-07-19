@@ -27,17 +27,18 @@ import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Command.Agent (agentCommandSpec)
+import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
+import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
-import Seal.Gateway.Send (SendDeps (..))
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker)
@@ -128,10 +129,11 @@ runServeMain autonomy = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
-         , tabCommandSpec tabsH
-         , tabsCommandSpec tabsH
-         , terseGrammarSpec
-         ]
+        , tabCommandSpec tabsH
+        , tabsCommandSpec tabsH
+        , terseGrammarSpec
+        , callCommandSpec (webCallDispatcher sendDeps)
+        ]
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt

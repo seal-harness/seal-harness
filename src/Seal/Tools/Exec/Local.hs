@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The untrusted LOCAL executor (the 'EbLocal' arm of 'ExecBackend').
 -- Behind the 'BackendExec' seam, the Untrusted opcode implementations
--- call 'lehExecShell'/'lehExecProgram' on this handle. The real
+-- call 'lehExecShell'/'lehExecBin' on this handle. The real
 -- implementation uses 'System.Process' (mirrors
 -- 'Seal.Harness.Tmux.readTmuxNoInput': fixed argv, no shell interpreter
 -- for the program path; @/bin/sh -c@ ONLY for 'SHELL_EXEC' with a validated
@@ -30,7 +30,7 @@ import System.Process
 
 import Seal.Security.Path (WorkspaceRoot (..), mkSafePath, getSafePath)
 import Seal.Tools.Args
-  (InterpName, ScriptArg, ShellCommand, textInterpName, textScriptArg, textShellCommand)
+  (BinName, BinArg, ShellCommand, textBinName, textBinArg, textShellCommand)
 import Seal.Tools.Exec.Types
 
 -- | The real 'LocalExecHandle': wires 'System.Process' behind the two IO
@@ -46,10 +46,10 @@ mkLocalExecHandle wsRoot = LocalExecHandle
           case e of
             Left _err -> pure (Left ExecNotImplemented)
             Right sp  -> runShell argv (Just (getSafePath sp))
-  , lehExecProgram = \interp sargs ->
-      let interpName = T.unpack (textInterpName interp)
-          argTexts   = map (T.unpack . textScriptArg) sargs
-          argv       = interpName : argTexts
+  , lehExecBin = \bin bargs ->
+      let binName  = T.unpack (textBinName bin)
+          argTexts = map (T.unpack . textBinArg) bargs
+          argv     = binName : argTexts
       in runProgram argv Nothing
   }
 
@@ -58,11 +58,11 @@ mkLocalExecHandle wsRoot = LocalExecHandle
 -- callers use 'mkLocalExecHandle'.
 mkLocalExecHandleFromFns
   :: (ShellCommand -> Maybe RemotePath -> IO (Either ExecError Text))
-  -> (InterpName -> [ScriptArg] -> IO (Either ExecError Text))
+  -> (BinName -> [BinArg] -> IO (Either ExecError Text))
   -> LocalExecHandle
-mkLocalExecHandleFromFns shellFn progFn = LocalExecHandle
+mkLocalExecHandleFromFns shellFn binFn = LocalExecHandle
   { lehExecShell = shellFn
-  , lehExecProgram = progFn
+  , lehExecBin = binFn
   }
 
 -- | Run a shell command via @/bin/sh -c@. The shell itself always launches
@@ -73,8 +73,8 @@ mkLocalExecHandleFromFns shellFn progFn = LocalExecHandle
 runShell :: [String] -> Maybe String -> IO (Either ExecError Text)
 runShell = runFixedArgv False
 
--- | Run a named interpreter (resolved on PATH). Unlike the shell, a 127 exit
--- here means the interpreter binary itself is not on PATH, so it's mapped to
+-- | Run a named binary (resolved on PATH or by path). A 127 exit
+-- here means the binary itself is not on PATH, so it's mapped to
 -- 'Left ExecNotImplemented' (the executor is not available). Other non-zero
 -- exits are normal failures, returned via 'Right' with the output + exit code.
 runProgram :: [String] -> Maybe String -> IO (Either ExecError Text)
@@ -109,7 +109,7 @@ runFixedArgv treat127AsMissing argv mCwd = do
     Left _ioErr                     -> pure (Left ExecNotImplemented)  -- binary missing/launch fail
     Right (ExitSuccess, out, _)     -> pure (Right out)
     Right (ExitFailure 127, _, _)
-      | treat127AsMissing            -> pure (Left ExecNotImplemented)  -- interpreter not on PATH
+      | treat127AsMissing            -> pure (Left ExecNotImplemented)  -- binary not on PATH
     Right (ExitFailure n, out, err)  -> pure (Right (formatExitResult n out err))
 
 -- | Format a non-zero exit result for the tool-call consumer. Combines stdout

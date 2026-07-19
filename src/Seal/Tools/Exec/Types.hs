@@ -51,7 +51,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
 
-import Seal.Tools.Args (InterpName, ScriptArg, ShellCommand)
+import Seal.Tools.Args (BinName, BinArg, ShellCommand)
 
 -- ---------------------------------------------------------------------------
 -- TerminalBackend family
@@ -202,9 +202,10 @@ data LocalExecHandle = LocalExecHandle
   { lehExecShell :: ShellCommand -> Maybe RemotePath -> IO (Either ExecError Text)
     -- ^ run a validated 'ShellCommand' via @/bin/sh -c@ (single arg, fixed
     -- argv), with an optional cwd ('SafePath'-confined to the workspace root)
-  , lehExecProgram :: InterpName -> [ScriptArg] -> IO (Either ExecError Text)
-    -- ^ run a named interpreter (resolved on PATH, fixed argv:
-    -- @<name> <script>@) with validated script args
+  , lehExecBin :: BinName -> [BinArg] -> IO (Either ExecError Text)
+    -- ^ run a named binary (resolved on PATH or by absolute/relative path,
+    -- via 'System.Process.proc' RawCommand — no shell) with validated argv
+    -- args. Used by the BIN_EXEC opcode.
   }
 
 -- | A placeholder constructor for tests that don't exercise the IO
@@ -213,7 +214,7 @@ data LocalExecHandle = LocalExecHandle
 mkLocalExecHandlePlaceholder :: LocalExecHandle
 mkLocalExecHandlePlaceholder = LocalExecHandle
   { lehExecShell = \_ _ -> pure (Right "")
-  , lehExecProgram = \_ _ -> pure (Right "")
+  , lehExecBin = \_ _ -> pure (Right "")
   }
 
 -- ---------------------------------------------------------------------------

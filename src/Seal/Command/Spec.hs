@@ -27,6 +27,7 @@ data CommandGroup
   | GroupVault
   | GroupSkills
   | GroupAgent
+  | GroupTools
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data Availability

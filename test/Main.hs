@@ -46,6 +46,7 @@ import qualified Seal.Command.ServeSpec
 import qualified Seal.Command.SkillSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
+import qualified Seal.Command.CallSpec
 import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
@@ -115,7 +116,7 @@ import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
-import qualified Seal.ISA.Ops.CodeSpec
+import qualified Seal.ISA.Ops.BinSpec
 import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
@@ -167,6 +168,7 @@ main = hspec $ do
   Seal.Command.SkillSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
+  Seal.Command.CallSpec.spec
   Seal.Command.ChannelSpec.spec
   Seal.Command.SpecSpec.spec
   Seal.Command.TabSpec.spec
@@ -236,7 +238,7 @@ main = hspec $ do
   Seal.ISA.Ops.FileSpec.spec
   Seal.ISA.Ops.ShellSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
-  Seal.ISA.Ops.CodeSpec.spec
+  Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
   Seal.ISA.Ops.SecretSpec.spec

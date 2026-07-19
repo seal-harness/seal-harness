@@ -236,7 +236,7 @@ logged in session transcript AND in a unified cross-session append-only log).
 | **Tools (Meta)** | `TOOL_SEARCH`, `TOOL_DESCRIBE`, `TOOL_CALL`, `TOOL_LIST` | Trusted |
 | **MCP** | `MCP_LIST`, `MCP_CONNECT`, `MCP_DISCONNECT` | Trusted |
 | **Harnesses** | `HARNESS_LIST`, `HARNESS_START`, `HARNESS_STOP`, `PLAN_MODE` | Trusted |
-| **Execution** | `SHELL_EXEC`, `PROCESS_MANAGE`, `CODE_EXEC` | Untrusted |
+| **Execution** | `SHELL_EXEC`, `PROCESS_MANAGE`, `BIN_EXEC` | Untrusted |
 | **Files** | `FILE_READ`, `FILE_WRITE`, `SEARCH_FILES`, `FILE_PATCH` | Untrusted |
 | **Web & Browser** | `WEB_SEARCH`, `WEB_EXTRACT`, `BROWSER_*` | Untrusted |
 | **Media** | `IMAGE_ANALYZE`, `IMAGE_GENERATE`, `TEXT_TO_SPEECH` | Untrusted |
