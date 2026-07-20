@@ -7,7 +7,7 @@ module Seal.Gateway.API
   ) where
 
 import Control.Applicative ((<|>))
-import Data.Aeson (Value, object, (.=))
+import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -17,23 +17,31 @@ import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
+import Data.Time (getCurrentTime)
+import Data.Vector qualified as V
 
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read (decimal)
 import Network.HTTP.Types
-  ( Header, HeaderName, Status, methodGet, methodOptions, methodPost, methodPut
-  , status200, status204, status400, status403, status404, status500, status501 )
+  ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
+  , methodPost, methodPut
+  , status200, status201, status204, status400, status403, status404, status500, status501 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
 import System.Directory (doesFileExist)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId, agentDefIdText, mkAgentDefId)
+import Seal.Agent.Def.Types
+  ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), mkSessionId, sessionIdText)
+import Seal.Skills.Backend (SkillBackend (..))
+import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (defaultFileConfig, loadFileConfig)
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
-import Seal.Core.Types (SessionId (..), mkSessionId, sessionIdText)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
@@ -63,7 +71,8 @@ data ApiDeps = ApiDeps
   , adTabsHandle      :: TabsHandle
   , adHarnessRegistry :: HarnessRegistry    -- ^ the live harness registry
   , adAdoptConsent    :: Maybe ConsentChannel  -- ^ 'Just CcWeb' for the web gateway; 'Nothing' headless
-  , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11)
+  , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11) + /api/agents CRUD
+  , adSkills          :: SkillBackend         -- ^ for /api/skills CRUD
   , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
@@ -197,10 +206,63 @@ apiApp deps req respond =
       respond (jsonLBS status200 (A.encode ([] :: [Value])))
     -- T11: GET /api/agents -> the agent defs. @isDefault@ is a UI
     -- convenience; it's resolved against 'adDefaultAgent' (the configured
-    -- @default_agent@ id) by name.
+    -- @default_agent@ id) by name. The full def (provider/model/system/
+    -- tools/timestamps) is returned so the Agents CRUD UI can render + edit
+    -- every field. The @name@ field carries the agent's id (not the
+    -- human-readable display name) so the frontend can echo it back as
+    -- @body.agent@ / PUT /agent and the backend can re-validate it via
+    -- 'mkAgentDefId'. The display name lives in the def's frontmatter.
     (m', ["api", "agents"]) | m' == methodGet -> do
       defs <- adbList (adAgentDefs deps)
       respond (jsonLBS status200 (A.encode (map (agentInfoJson (adDefaultAgent deps)) defs)))
+    -- GET /api/agents/:id -> a single agent def by id. 404 when absent or
+    -- the id fails 'mkAgentDefId'.
+    (m', ["api", "agents", aid]) | m' == methodGet ->
+      respond =<< handleAgentGet deps aid
+    -- POST /api/agents -> create a new agent def. The id is the caller's
+    -- (must pass 'isValidAgentDefId'); provider/model/system/tools are
+    -- optional. Returns 201 + the created def on success, 400 on a bad id
+    -- or invalid body. If a def with the id already exists, it is REPLACED
+    -- (matching the backend's idempotent 'adbUpdate').
+    (m', ["api", "agents"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleAgentCreate deps body
+    -- PUT /api/agents/:id -> replace an existing agent def. The body may
+    -- omit the id (it's taken from the path); the path id must pass
+    -- 'isValidAgentDefId'. Returns 200 + the updated def on success, 400 on
+    -- a bad id or invalid body, 404 when no def exists at that id.
+    (m', ["api", "agents", aid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleAgentUpdate deps aid body
+    -- DELETE /api/agents/:id -> remove a def. Idempotent (204 whether or
+    -- not the def existed). 400 on a malformed id.
+    (m', ["api", "agents", aid]) | m' == methodDelete ->
+      respond =<< handleAgentDelete deps aid
+    -- GET /api/skills -> all skills, sorted by id.
+    (m', ["api", "skills"]) | m' == methodGet -> do
+      skills <- sbList (adSkills deps)
+      respond (jsonLBS status200 (A.encode (map skillInfoJson skills)))
+    -- GET /api/skills/:id -> a single skill by id. 404 when absent or the id
+    -- fails 'mkSkillId'.
+    (m', ["api", "skills", sid]) | m' == methodGet ->
+      respond =<< handleSkillGet deps sid
+    -- POST /api/skills -> create a new skill. The id is the caller's; the
+    -- body must include @description@ and @body@. Returns 201 + the created
+    -- skill. Replaces an existing skill with the same id (idempotent
+    -- 'sbCreate').
+    (m', ["api", "skills"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleSkillCreate deps body
+    -- PUT /api/skills/:id -> replace an existing skill. Body may omit the
+    -- id (taken from the path). Returns 200 + the updated skill, or 404
+    -- when no skill exists at that id.
+    (m', ["api", "skills", sid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleSkillUpdate deps sid body
+    -- DELETE /api/skills/:id -> remove a skill. Idempotent (204 whether or
+    -- not the skill existed). 400 on a malformed id.
+    (m', ["api", "skills", sid]) | m' == methodDelete ->
+      respond =<< handleSkillDelete deps sid
     -- T11: GET /api/providers -> the configured provider list. @isDefault@
     -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
     -- T11, so only @name@ is emitted.
@@ -507,6 +569,260 @@ parseAgentBinding (A.Object o) =
     Just _                  -> AgentInvalid "expected a string"
 parseAgentBinding _ = AgentClear
 
+-- ── Agent CRUD ───────────────────────────────────────────────────────────
+
+-- | Handle GET /api/agents/:id. Returns 200 + the def on success, 404 when
+-- the def is absent, 400 on a malformed id.
+handleAgentGet :: ApiDeps -> Text -> IO Response
+handleAgentGet deps aidTxt =
+  case mkAgentDefId aidTxt of
+    Left e  -> pure (errJson status400 ("invalid agent id: " <> e))
+    Right aid -> do
+      m <- adbRead (adAgentDefs deps) aid
+      case m of
+        Nothing -> pure (errJson status404 "agent not found")
+        Just d  -> pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+
+-- | Handle POST /api/agents. The body carries @id@, optional @name@
+-- (defaults to the id), @provider@, @model@, @system@, @tools@. Provenance
+-- fields (@created_at@ / @updated_at@ / @session@) are stamped server-side
+-- so the client cannot forge them. The id must pass 'isValidAgentDefId'.
+-- An existing def with the same id is REPLACED (matches the idempotent
+-- 'adbUpdate' semantics). Returns 201 + the created def.
+handleAgentCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleAgentCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseAgentIdField v of
+      Left e -> pure (errJson status400 ("invalid or missing 'id': " <> e))
+      Right aid -> do
+        d <- stampAgentDef deps aid v Nothing
+        adbUpdate (adAgentDefs deps) d
+        pure (jsonCreated (agentInfoJson (adDefaultAgent deps) d))
+
+-- | Handle PUT /api/agents/:id. The path id is authoritative for finding
+-- the existing def; the body may carry a @new_id@ field to RENAME the def
+-- (the old id is deleted, the new one is written — provenance is
+-- preserved). Without @new_id@ the id is unchanged. The body may also
+-- supply @name@ / @provider@ / @model@ / @system@ / @tools@. Returns 200 +
+-- the updated def, 404 when no def exists at the path id, 400 on a bad id
+-- or invalid @new_id@.
+handleAgentUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleAgentUpdate deps aidTxt body =
+  case mkAgentDefId aidTxt of
+    Left e -> pure (errJson status400 ("invalid agent id: " <> e))
+    Right aid -> do
+      mExisting <- adbRead (adAgentDefs deps) aid
+      case mExisting of
+        Nothing -> pure (errJson status404 "agent not found")
+        Just existing -> case A.decode body :: Maybe A.Value of
+          Nothing -> pure (errJson status400 "invalid JSON body")
+          Just v  -> case parseRenameId v of
+            Just (Left e) -> pure (errJson status400 ("invalid new_id: " <> e))
+            Just (Right newId) | newId /= aid -> do
+              d <- stampAgentDef deps newId v (Just existing)
+              adbUpdate (adAgentDefs deps) d
+              adbDelete (adAgentDefs deps) aid
+              pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+            _ -> do
+              d <- stampAgentDef deps aid v (Just existing)
+              adbUpdate (adAgentDefs deps) d
+              pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+
+-- | Parse an optional @new_id@ field from a JSON body for rename-on-PUT.
+-- Returns 'Nothing' when the field is absent or @null@; @Just (Left err)@
+-- on a malformed value; @Just (Right aid)@ on a valid 'AgentDefId'.
+parseRenameId :: A.Value -> Maybe (Either Text AgentDefId)
+parseRenameId (A.Object o) =
+  case KeyMap.lookup (Key.fromText "new_id") o of
+    Nothing              -> Nothing
+    Just A.Null          -> Nothing
+    Just (A.String t)
+      | T.null (T.strip t) -> Nothing
+      | otherwise         -> Just (mkAgentDefId t)
+    Just _               -> Just (Left "new_id must be a string")
+parseRenameId _ = Nothing
+
+-- | Handle DELETE /api/agents/:id. Idempotent: 204 whether or not the def
+-- existed. 400 on a malformed id.
+handleAgentDelete :: ApiDeps -> Text -> IO Response
+handleAgentDelete deps aidTxt =
+  case mkAgentDefId aidTxt of
+    Left e  -> pure (errJson status400 ("invalid agent id: " <> e))
+    Right aid -> do
+      adbDelete (adAgentDefs deps) aid
+      pure noContent
+
+-- | Build an 'AgentDef' from a JSON body + the authoritative id. When
+-- @mExisting@ is 'Just', provenance (@created_at@ / @session@) is preserved
+-- from the existing def; otherwise both are stamped now (@session@ = @"web"@).
+-- @updated_at@ is always re-stamped. The body may supply @name@ (defaults to
+-- the id), @provider@ (default @""@), @model@ (default @""@), @system@
+-- (default 'Nothing' when absent or @null@), and @tools@ (default 'AllowAll').
+stampAgentDef :: ApiDeps -> AgentDefId -> A.Value -> Maybe AgentDef -> IO AgentDef
+stampAgentDef _deps aid v mExisting = do
+  now <- getCurrentTime
+  let o = case v of A.Object o' -> o'; _ -> KeyMap.empty
+      lookupStr k = case KeyMap.lookup (Key.fromText k) o of
+        Just (A.String t) -> Just t
+        _                 -> Nothing
+      lookupVal k = KeyMap.lookup (Key.fromText k) o
+      nm          = fromMaybe (agentDefIdText aid) (lookupStr "name")
+      provider    = fromMaybe "" (lookupStr "provider")
+      model       = ModelId (fromMaybe "" (lookupStr "model"))
+      mSystem     = case lookupVal "system" of
+        Just (A.String t) | not (T.null t) -> Just t
+        Just A.Null                        -> Nothing
+        Nothing                            -> Nothing
+        _                                  -> Nothing
+      tools       = maybe AllowAll allowListFromValue (lookupVal "tools")
+      createdAt   = maybe now adCreatedAt mExisting
+      session     = maybe (SessionId "web") adSession mExisting
+  pure AgentDef
+    { adId        = aid
+    , adName      = nm
+    , adProvider  = provider
+    , adModel     = model
+    , adSystem    = mSystem
+    , adTools     = tools
+    , adCreatedAt = createdAt
+    , adUpdatedAt = now
+    , adSession   = session
+    }
+
+-- | Parse the @id@ field from a POST /api/agents body. Returns 'Left' with
+-- an error message when absent, empty, or fails 'isValidAgentDefId'.
+parseAgentIdField :: A.Value -> Either Text AgentDefId
+parseAgentIdField (A.Object o) =
+  case KeyMap.lookup (Key.fromText "id") o of
+    Just (A.String t)
+      | not (T.null (T.strip t)) -> case mkAgentDefId t of
+                                      Right aid -> Right aid
+                                      Left e    -> Left e
+      | otherwise                -> Left "id is empty"
+    Just _                       -> Left "id must be a string"
+    Nothing                      -> Left "id is required"
+parseAgentIdField _ = Left "id is required"
+
+-- ── Skill CRUD ───────────────────────────────────────────────────────────
+
+-- | Handle GET /api/skills/:id. Returns 200 + the skill on success, 404
+-- when absent, 400 on a malformed id.
+handleSkillGet :: ApiDeps -> Text -> IO Response
+handleSkillGet deps sidTxt =
+  case mkSkillId sidTxt of
+    Left e  -> pure (errJson status400 ("invalid skill id: " <> e))
+    Right sid -> do
+      m <- sbRead (adSkills deps) sid
+      case m of
+        Nothing -> pure (errJson status404 "skill not found")
+        Just s  -> pure (jsonOk (skillInfoJson s))
+
+-- | Handle POST /api/skills. The body carries @id@, @description@, and
+-- @body@. Provenance (@created_at@ / @updated_at@ / @session@) is stamped
+-- server-side. An existing skill with the same id is REPLACED (matches the
+-- idempotent 'sbCreate' semantics). Returns 201 + the created skill.
+handleSkillCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleSkillCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseSkillIdField v of
+      Left e -> pure (errJson status400 ("invalid or missing 'id': " <> e))
+      Right sid -> do
+        s <- stampSkill sid v Nothing
+        sbCreate (adSkills deps) s
+        pure (jsonCreated (skillInfoJson s))
+
+-- | Handle PUT /api/skills/:id. The path id is authoritative for finding
+-- the existing skill; the body may carry a @new_id@ field to RENAME the
+-- skill (old id deleted, new one written — provenance preserved). Without
+-- @new_id@ the id is unchanged. Returns 200 + the updated skill, 404 when
+-- no skill exists at the path id, 400 on a bad id or invalid @new_id@.
+handleSkillUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleSkillUpdate deps sidTxt body =
+  case mkSkillId sidTxt of
+    Left e -> pure (errJson status400 ("invalid skill id: " <> e))
+    Right sid -> do
+      mExisting <- sbRead (adSkills deps) sid
+      case mExisting of
+        Nothing -> pure (errJson status404 "skill not found")
+        Just existing -> case A.decode body :: Maybe A.Value of
+          Nothing -> pure (errJson status400 "invalid JSON body")
+          Just v  -> case parseSkillRenameId v of
+            Just (Left e) -> pure (errJson status400 ("invalid new_id: " <> e))
+            Just (Right newSid) | newSid /= sid -> do
+              s <- stampSkill newSid v (Just existing)
+              sbUpdate (adSkills deps) s
+              sbDelete (adSkills deps) sid
+              pure (jsonOk (skillInfoJson s))
+            _ -> do
+              s <- stampSkill sid v (Just existing)
+              sbUpdate (adSkills deps) s
+              pure (jsonOk (skillInfoJson s))
+
+-- | Parse an optional @new_id@ field for rename-on-PUT of a skill.
+-- 'Nothing' when absent/null/empty; @Just (Left err)@ on a malformed
+-- value; @Just (Right sid)@ on a valid 'SkillId'.
+parseSkillRenameId :: A.Value -> Maybe (Either Text SkillId)
+parseSkillRenameId (A.Object o) =
+  case KeyMap.lookup (Key.fromText "new_id") o of
+    Nothing              -> Nothing
+    Just A.Null          -> Nothing
+    Just (A.String t)
+      | T.null (T.strip t) -> Nothing
+      | otherwise         -> Just (mkSkillId t)
+    Just _               -> Just (Left "new_id must be a string")
+parseSkillRenameId _ = Nothing
+
+-- | Handle DELETE /api/skills/:id. Idempotent: 204 whether or not the
+-- skill existed. 400 on a malformed id.
+handleSkillDelete :: ApiDeps -> Text -> IO Response
+handleSkillDelete deps sidTxt =
+  case mkSkillId sidTxt of
+    Left e  -> pure (errJson status400 ("invalid skill id: " <> e))
+    Right sid -> do
+      sbDelete (adSkills deps) sid
+      pure noContent
+
+-- | Build a 'Skill' from a JSON body + the authoritative id. When
+-- @mExisting@ is 'Just', provenance (@created_at@ / @session@) is preserved
+-- from the existing skill; otherwise both are stamped now (@session@ =
+-- @"web"@). @updated_at@ is always re-stamped. The body may supply
+-- @description@ (default @""@) and @body@ (default @""@).
+stampSkill :: SkillId -> A.Value -> Maybe Skill -> IO Skill
+stampSkill sid v mExisting = do
+  now <- getCurrentTime
+  let o = case v of A.Object o' -> o'; _ -> KeyMap.empty
+      lookupStr k = case KeyMap.lookup (Key.fromText k) o of
+        Just (A.String t) -> Just t
+        _                 -> Nothing
+      description = fromMaybe "" (lookupStr "description")
+      body        = fromMaybe "" (lookupStr "body")
+      createdAt   = maybe now skCreatedAt mExisting
+      session     = maybe (SessionId "web") skSession mExisting
+  pure Skill
+    { skId          = sid
+    , skDescription = description
+    , skBody        = body
+    , skCreatedAt   = createdAt
+    , skUpdatedAt   = now
+    , skSession     = session
+    }
+
+-- | Parse the @id@ field from a POST /api/skills body. Returns 'Left' with
+-- an error message when absent, empty, or fails 'mkSkillId'.
+parseSkillIdField :: A.Value -> Either Text SkillId
+parseSkillIdField (A.Object o) =
+  case KeyMap.lookup (Key.fromText "id") o of
+    Just (A.String t)
+      | not (T.null (T.strip t)) -> case mkSkillId t of
+                                      Right sid -> Right sid
+                                      Left e    -> Left e
+      | otherwise                -> Left "id is empty"
+    Just _                       -> Left "id must be a string"
+    Nothing                      -> Left "id is required"
+parseSkillIdField _ = Left "id is required"
+
 -- | Encode the persisted 'UiState' for GET /api/ui/state. The shape mirrors
 -- the on-disk JSON: an object with @last_options@ (the LastOptions record)
 -- and @custom_models@ (a list of strings, most-recent first).
@@ -766,11 +1082,57 @@ parseScopeBody body =
 -- frontend can echo it back as @body.agent@ / PUT /agent and the backend
 -- can re-validate it via 'mkAgentDefId'. The display name lives in the
 -- def's frontmatter and isn't needed by the dropdown.
+--
+-- The full def (provider/model/system/tools/timestamps) is included so the
+-- Agents CRUD UI can render + edit every field without a second round-trip.
+-- The @tools@ field uses the same wire shape as 'AgentDef''s JSON instance:
+-- @"all"@ or an array of opcode-name strings.
 agentInfoJson :: Maybe Text -> AgentDef -> Value
-agentInfoJson mDefaultId d = object
+agentInfoJson mDefaultId d = A.object
   [ "name" .= agentDefIdText (adId d)
   , "isDefault" .= (Just (agentDefIdText (adId d)) == mDefaultId)
+  , "id" .= agentDefIdText (adId d)
+  , "displayName" .= adName d
+  , "provider" .= adProvider d
+  , "model" .= adModel d
+  , "system" .= adSystem d
+  , "tools" .= allowListToValue (adTools d)
+  , "created_at" .= adCreatedAt d
+  , "updated_at" .= adUpdatedAt d
+  , "session" .= adSession d
   ]
+
+-- | Render an 'AllowList OpName' as a JSON value: @"all"@ for 'AllowAll', or
+-- an array of opcode-name strings for 'AllowOnly'. Mirrors the instance in
+-- "Seal.Agent.Def.Types" but inlined here to avoid an orphan instance.
+allowListToValue :: AllowList OpName -> Value
+allowListToValue AllowAll       = String "all"
+allowListToValue (AllowOnly xs) = A.toJSON (map unOpNameText (Set.toList xs))
+  where unOpNameText (OpName t) = t
+
+-- | Decode an 'AllowList OpName' from @"all"@, an array of opcode-name
+-- strings, or @null@/missing (treated as 'AllowAll').
+allowListFromValue :: Value -> AllowList OpName
+allowListFromValue (String "all") = AllowAll
+allowListFromValue (A.Array xs)   = AllowOnly (Set.fromList [ OpName t | String t <- V.toList xs ])
+allowListFromValue _               = AllowAll
+
+-- | Map a 'Skill' to the frontend's 'SkillInfo' JSON shape (snake_case keys
+-- match the wire convention used elsewhere). The body is included in full
+-- so the Skills CRUD UI can render + edit it without a second round-trip.
+skillInfoJson :: Skill -> Value
+skillInfoJson s = A.object
+  [ "id" .= skillIdText (skId s)
+  , "description" .= skDescription s
+  , "body" .= skBody s
+  , "created_at" .= skCreatedAt s
+  , "updated_at" .= skUpdatedAt s
+  , "session" .= skSession s
+  ]
+
+-- | A 201 Created with a JSON body + CORS headers.
+jsonCreated :: Value -> Response
+jsonCreated v = responseLBS status201 (corsHeaders <> [jsonHeader]) (A.encode v)
 
 -- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape. T11
 -- emits only @name@; @isDefault@ / @defaultModel@ are UI conveniences not
@@ -825,7 +1187,7 @@ errJson st msg = responseLBS st (corsHeaders <> [jsonHeader])
 corsHeaders :: [Header]
 corsHeaders =
   [ (mkHN "Access-Control-Allow-Origin", "*")
-  , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+  , (mkHN "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
   , (mkHN "Access-Control-Allow-Headers", "Content-Type")
   ]
 

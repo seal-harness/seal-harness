@@ -288,3 +288,198 @@ describe('fetchModelContext', () => {
     expect(fetchCalls.some((c) => c.url === '/api/providers/anthropic/models/claude-sonnet-4/context')).toBe(true)
   })
 })
+// ── Agent CRUD ──────────────────────────────────────────────────────────
+
+import {
+  fetchAgentDefs,
+  fetchAgentDef,
+  createAgentDef,
+  updateAgentDef,
+  deleteAgentDef,
+  useAgentDefs,
+} from '../useApi'
+
+describe('Agent CRUD', () => {
+  it('fetchAgentDefs GETs /api/agents and returns the list', async () => {
+    setNextResponse([
+      {
+        id: 'planner', name: 'planner', isDefault: true, displayName: 'Planner',
+        provider: 'ollama', model: 'llama3.2', system: 'plan tasks',
+        tools: 'all', created_at: 't', updated_at: 't', session: 'web',
+      },
+    ])
+    const res = await fetchAgentDefs()
+    expect(res).toHaveLength(1)
+    expect(res![0]!.id).toBe('planner')
+    expect(fetchCalls.some((c) => c.url === '/api/agents')).toBe(true)
+  })
+
+  it('fetchAgentDef GETs /api/agents/:id', async () => {
+    setNextResponse({
+      id: 'planner', name: 'planner', isDefault: false, displayName: 'Planner',
+      provider: '', model: '', system: null, tools: 'all',
+      created_at: 't', updated_at: 't', session: 'web',
+    })
+    const res = await fetchAgentDef('planner')
+    expect(res?.id).toBe('planner')
+    expect(fetchCalls.some((c) => c.url === '/api/agents/planner')).toBe(true)
+  })
+
+  it('createAgentDef POSTs /api/agents with the input body', async () => {
+    setNextResponse({
+      id: 'coder', name: 'coder', isDefault: false, displayName: 'Coder',
+      provider: 'anthropic', model: 'claude-sonnet-4', system: 'be terse',
+      tools: ['FILE_READ'], created_at: 't', updated_at: 't', session: 'web',
+    }, 201)
+    const res = await createAgentDef({ id: 'coder', system: 'be terse', tools: ['FILE_READ'] })
+    expect(res?.id).toBe('coder')
+    const call = fetchCalls.find((c) => c.url === '/api/agents' && c.init?.method === 'POST')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ id: 'coder', system: 'be terse', tools: ['FILE_READ'] })
+  })
+
+  it('createAgentDef returns null on a 400', async () => {
+    setNextResponse({ error: 'bad id' }, 400)
+    const res = await createAgentDef({ id: 'bad id!' })
+    expect(res).toBeNull()
+  })
+
+  it('updateAgentDef PUTs /api/agents/:id (no id in the body)', async () => {
+    setNextResponse({
+      id: 'eddy', name: 'eddy', isDefault: false, displayName: 'Eddy 2',
+      provider: 'anthropic', model: 'claude-sonnet-4', system: null, tools: 'all',
+      created_at: 't', updated_at: 't', session: 'web',
+    })
+    const res = await updateAgentDef('eddy', { name: 'Eddy 2', provider: 'anthropic' })
+    expect(res?.displayName).toBe('Eddy 2')
+    const call = fetchCalls.find((c) => c.url === '/api/agents/eddy' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ name: 'Eddy 2', provider: 'anthropic' })
+  })
+
+  it('deleteAgentDef DELETEs /api/agents/:id and returns true on 204', async () => {
+    // 204 No Content must have an empty body; use Response with null body.
+    nextResponse = new Response(null, { status: 204 })
+    const ok = await deleteAgentDef('gone')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/agents/gone' && c.init?.method === 'DELETE')
+    expect(call).toBeTruthy()
+  })
+
+  it('deleteAgentDef returns false on a network error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network') }))
+    const ok = await deleteAgentDef('gone')
+    expect(ok).toBe(false)
+  })
+})
+
+describe('useAgentDefs', () => {
+  it('fetches GET /api/agents on mount and populates state', async () => {
+    setNextResponse([
+      {
+        id: 'planner', name: 'planner', isDefault: true, displayName: 'Planner',
+        provider: 'ollama', model: 'llama3.2', system: null, tools: 'all',
+        created_at: 't', updated_at: 't', session: 'web',
+      },
+    ])
+    const { result } = renderHook(() => useAgentDefs())
+    await waitFor(() => expect(result.current.agents).toHaveLength(1))
+    expect(result.current.agents[0]!.id).toBe('planner')
+    expect(result.current.loaded).toBe(true)
+    expect(result.current.error).toBe(false)
+  })
+
+  it('sets error=true on a 500', async () => {
+    setNextResponse('err', 500)
+    const { result } = renderHook(() => useAgentDefs())
+    await waitFor(() => expect(result.current.error).toBe(true))
+  })
+
+  it('refresh() triggers a re-fetch', async () => {
+    setNextResponse([
+      {
+        id: 'a1', name: 'a1', isDefault: false, displayName: 'A1',
+        provider: '', model: '', system: null, tools: 'all',
+        created_at: 't', updated_at: 't', session: 'web',
+      },
+    ])
+    const { result } = renderHook(() => useAgentDefs())
+    await waitFor(() => expect(result.current.agents).toHaveLength(1))
+    const initialCalls = fetchCalls.length
+    act(() => result.current.refresh())
+    await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+})
+
+// ── Skill CRUD ──────────────────────────────────────────────────────────
+
+import {
+  fetchSkills,
+  fetchSkill,
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  useSkills,
+} from '../useApi'
+
+describe('Skill CRUD', () => {
+  it('fetchSkills GETs /api/skills', async () => {
+    setNextResponse([
+      { id: 'coding', description: 'Coding', body: 'body', created_at: 't', updated_at: 't', session: 'web' },
+    ])
+    const res = await fetchSkills()
+    expect(res).toHaveLength(1)
+    expect(res![0]!.id).toBe('coding')
+  })
+
+  it('fetchSkill GETs /api/skills/:id', async () => {
+    setNextResponse({ id: 'coding', description: 'Coding', body: 'b', created_at: 't', updated_at: 't', session: 'web' })
+    const res = await fetchSkill('coding')
+    expect(res?.id).toBe('coding')
+    expect(fetchCalls.some((c) => c.url === '/api/skills/coding')).toBe(true)
+  })
+
+  it('createSkill POSTs /api/skills with the input body', async () => {
+    setNextResponse({ id: 'coding', description: 'Coding', body: 'b', created_at: 't', updated_at: 't', session: 'web' }, 201)
+    const res = await createSkill({ id: 'coding', description: 'Coding', body: 'b' })
+    expect(res?.id).toBe('coding')
+    const call = fetchCalls.find((c) => c.url === '/api/skills' && c.init?.method === 'POST')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ id: 'coding', description: 'Coding', body: 'b' })
+  })
+
+  it('updateSkill PUTs /api/skills/:id (no id in the body)', async () => {
+    setNextResponse({ id: 'writer', description: 'Writer 2', body: 'b2', created_at: 't', updated_at: 't', session: 'web' })
+    const res = await updateSkill('writer', { description: 'Writer 2', body: 'b2' })
+    expect(res?.description).toBe('Writer 2')
+    const call = fetchCalls.find((c) => c.url === '/api/skills/writer' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ description: 'Writer 2', body: 'b2' })
+  })
+
+  it('deleteSkill DELETEs /api/skills/:id and returns true on 204', async () => {
+    nextResponse = new Response(null, { status: 204 })
+    const ok = await deleteSkill('gone')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/skills/gone' && c.init?.method === 'DELETE')
+    expect(call).toBeTruthy()
+  })
+})
+
+describe('useSkills', () => {
+  it('fetches GET /api/skills on mount and populates state', async () => {
+    setNextResponse([
+      { id: 'coding', description: 'Coding', body: 'b', created_at: 't', updated_at: 't', session: 'web' },
+    ])
+    const { result } = renderHook(() => useSkills())
+    await waitFor(() => expect(result.current.skills).toHaveLength(1))
+    expect(result.current.skills[0]!.id).toBe('coding')
+    expect(result.current.loaded).toBe(true)
+  })
+
+  it('sets error=true on a 500', async () => {
+    setNextResponse('err', 500)
+    const { result } = renderHook(() => useSkills())
+    await waitFor(() => expect(result.current.error).toBe(true))
+  })
+})

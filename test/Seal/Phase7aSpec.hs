@@ -31,6 +31,7 @@ import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
+import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -54,6 +55,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     tabsH <- newTabsHandle
     reg   <- newHarnessRegistry
     adb   <- noneBackend
+    skills <- Skill.noneBackend
     activeRef <- newIORef fakeMeta
     uiState <- newUiStateHandle fakePaths
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
@@ -63,6 +65,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
+          , adSkills = skills
           , adProviders = pure knownProviders
           , adUiState = uiState
           , adSend = Nothing
@@ -96,6 +99,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     tabsH <- newTabsHandle
     reg   <- newHarnessRegistry
     adb   <- noneBackend
+    skills <- Skill.noneBackend
     activeRef <- newIORef fakeMeta
     uiState <- newUiStateHandle fakePaths
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
@@ -105,6 +109,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adHarnessRegistry = reg
           , adAdoptConsent = Just CcWeb
           , adAgentDefs = adb
+          , adSkills = skills
           , adProviders = pure knownProviders
           , adUiState = uiState
           , adSend = Nothing

@@ -187,6 +187,7 @@ runServeMain autonomy = do
         , adHarnessRegistry = reg
         , adAdoptConsent    = Just CcWeb
         , adAgentDefs       = bAgentDefs backends
+        , adSkills          = bSkills backends
         , adProviders       = do
             -- The configured-provider list is computed on each request so
             -- newly-added credentials are reflected without a restart. The

@@ -21,6 +21,7 @@ import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
+import Seal.Skills.Backend qualified as Skill (noneBackend)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
@@ -45,6 +46,7 @@ mkDeps = do
   tabsH <- newTabsHandle
   reg   <- newHarnessRegistry
   adb   <- noneBackend
+  skills <- Skill.noneBackend
   activeRef <- newIORef fakeMeta
   uiState <- newUiStateHandle fakePaths
   let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
@@ -54,6 +56,7 @@ mkDeps = do
     , adHarnessRegistry = reg
     , adAdoptConsent = Just CcWeb
     , adAgentDefs = adb
+    , adSkills = skills
     , adProviders = pure knownProviders
     , adUiState = uiState
     , adSend = Nothing
