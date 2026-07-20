@@ -32,6 +32,7 @@ import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
@@ -2080,3 +2081,99 @@ spec = describe "Seal.Gateway.API" $ do
           -- (the frontend's block payload encodes it).
           T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
             `shouldBe` True
+  -- ── Regression: benign slash commands must not navigate ─────────────
+  -- The web gateway is multi-session: srActive is a process-global ref
+  -- that may point at a DIFFERENT session than the one a request targets.
+  -- A benign slash command (e.g. /skill list) must NOT cause the
+  -- frontend to navigate away. The SendSlash outcome's session_id must
+  -- be null/absent when the slash command didn't actually swap the
+  -- active session during this call. See the runSlash
+  -- newSessionIdIfChangedFrom fix in Seal.Gateway.Send.
+  it "regression: /skill list on a non-active session returns no session_id" $
+    withSystemTempDirectory "seal-slash" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      tmuxR <- mkRealTmuxRunner
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
+      let paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+          -- Two sessions on disk: the "active" one and the "request" one.
+          -- The request will target the non-active one.
+          activeSidTxt = "20260720-214230-238"
+          requestSidTxt = "20260720-214349-258"
+          activeSid = case mkSessionId activeSidTxt of Right s -> s; Left _ -> error "active sid"
+          requestSid = case mkSessionId requestSidTxt of Right s -> s; Left _ -> error "request sid"
+          activeMeta = fakeMeta { smId = activeSid }
+          requestMeta = fakeMeta { smId = requestSid }
+      -- Persist the request session's meta so handleSend's loadSessionMeta finds it.
+      saveSessionMeta paths requestMeta
+      -- The process-global active ref points at the OTHER session.
+      activeRef <- newIORef activeMeta
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) ]
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = registry
+            , sdResolve    = \_ -> pure (Left "unused")
+            , sdAutonomy   = Policy.Full
+            , sdBroker     = Nothing
+            , sdHarnessRegistry = reg
+            , sdTmuxRunner  = tmuxR
+            , sdHttpManager = Nothing
+            , sdAskReply    = askReply
+            , sdApprovals   = approvals
+            , sdReplies     = error "sdReplies: unused on the slash path"
+            , sdLocks       = error "sdLocks: unused on the slash path"
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = bAgentDefs backends
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = error "adUiState: unused on the slash path"
+            , adSend            = Just sendDeps
+            , adDefaultAgent    = pure Nothing
+            }
+          app = apiApp deps
+      -- Send /skill list to the REQUEST session (not the active one).
+      sendReq <- testPost ["api", "sessions", requestSidTxt, "send"]
+        (A.encode (A.object [ "message" .= ("/skill list" :: T.Text) ]))
+      (status, body) <- runAppBody app sendReq
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          -- kind must be "slash"
+          case KeyMap.lookup (Key.fromText "kind") o of
+            Just (A.String k) -> k `shouldBe` "slash"
+            _ -> expectationFailure "expected kind: slash"
+          -- session_id must be absent or null — the slash command did NOT
+          -- swap the active session, so the frontend must NOT navigate.
+          case KeyMap.lookup (Key.fromText "session_id") o of
+            Nothing         -> pure ()
+            Just A.Null     -> pure ()
+            Just other      -> expectationFailure ("expected no session_id, got: " <> show other)
+        _ -> expectationFailure "expected JSON object"

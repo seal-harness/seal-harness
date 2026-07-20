@@ -419,7 +419,18 @@ runSlash deps meta fullLine = do
   outVar <- newMVar ([] :: [Text])
   let askCaps = webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
       caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
-      enteredSid = smId meta
+  -- Snapshot the active-session ref BEFORE the action runs. The web
+  -- gateway is multi-session: @srActive@ is a process-global ref that
+  -- points at whatever session the last @\/new@ (or session creation)
+  -- left it at — which may be a DIFFERENT session than the one this
+  -- request is operating on. Comparing the post-action @srActive@ to
+  -- the request's sid would falsely report a change for every session
+  -- that isn't currently "active", causing the frontend to navigate
+  -- away on benign slash commands like @\/skill list@. Instead we
+  -- compare before vs after: only a slash command that actually
+  -- swapped @srActive@ during THIS call (e.g. @\/new@) reports a
+  -- change.
+  activeBefore <- readIORef (srActive (sdSession deps))
   d <- ingest (sdRegistry deps) (sdPreprocess deps) (RawInbound fullLine)
   case d of
     DispatchAction (CommandAction act) -> do
@@ -427,7 +438,7 @@ runSlash deps meta fullLine = do
       chunks <- readMVar outVar
       -- If the action swapped the active session (e.g. /new), thread the
       -- new sid into the outcome so the frontend navigates to it.
-      mNewSid <- newSessionIdIfChanged deps enteredSid
+      mNewSid <- newSessionIdIfChangedFrom deps (smId activeBefore)
       pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
     ShowText t -> pure (SendSlash t Nothing)
     Rejected t -> pure (SendError 400 t)
@@ -439,14 +450,18 @@ runSlash deps meta fullLine = do
           chunks <- readMVar outVar
           pure (SendSlash (T.intercalate "\n" chunks) Nothing)
 
--- | After a slash action runs, check whether the active session changed.
--- Returns the new 'SessionId' if 'sdSession' now points at a different
--- session than @enteredSid@; 'Nothing' otherwise. Used by @\/new@ to
--- thread the freshly-minted sid into the 'SendSlash' outcome.
-newSessionIdIfChanged :: SendDeps -> SessionId -> IO (Maybe SessionId)
-newSessionIdIfChanged deps enteredSid = do
+-- | After a slash action runs, check whether the active session changed
+-- DURING this call. Returns the new 'SessionId' if 'sdSession' now points
+-- at a different session than @beforeSid@ (the snapshot taken before the
+-- action ran); 'Nothing' otherwise. Used by @\/new@ to thread the
+-- freshly-minted sid into the 'SendSlash' outcome. Comparing to the
+-- pre-action snapshot (rather than the request's sid) avoids false
+-- positives on multi-session web gateways where @srActive@ may already
+-- point at a different session than the one this request targets.
+newSessionIdIfChangedFrom :: SendDeps -> SessionId -> IO (Maybe SessionId)
+newSessionIdIfChangedFrom deps beforeSid = do
   active <- readIORef (srActive (sdSession deps))
-  if smId active == enteredSid
+  if smId active == beforeSid
     then pure Nothing
     else pure (Just (smId active))
 
