@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentDefInfo, AgentDefInput, ToolsAllowList } from '../types'
 import {
   createAgentDef,
   deleteAgentDef,
+  fetchDefaultAgent,
+  setDefaultAgent,
   updateAgentDef,
   useAgentDefs,
   useConfiguredProviders,
@@ -109,6 +111,14 @@ export function AgentsView() {
   const { agents, loaded, error, refresh } = useAgentDefs()
   const { providers, loaded: providersLoaded } = useConfiguredProviders()
 
+  // The configured default agent id (re-fetched after every mutation so the
+  // "Set as default" / "Clear default" control reflects the latest state).
+  const [defaultAgentId, setDefaultAgentId] = useState<string | null>(null)
+  const refreshDefault = useCallback(async () => {
+    setDefaultAgentId(await fetchDefaultAgent())
+  }, [])
+  useEffect(() => { void refreshDefault() }, [refreshDefault])
+
   // `editing` is the id of the def being edited, or `null` when no editor
   // is open. `creating` is true when the "New agent" form is open.
   const [editing, setEditing] = useState<string | null>(null)
@@ -118,6 +128,7 @@ export function AgentsView() {
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
+  const [settingDefault, setSettingDefault] = useState(false)
 
   // Ref holding the latest `agents` list so the seed effect can read it
   // without re-running on every poll tick. The seed must fire only when the
@@ -293,7 +304,7 @@ export function AgentsView() {
                   >
                     {a.displayName || a.id}
                   </span>
-                  {a.isDefault && (
+                  {defaultAgentId === a.id && (
                     <span
                       className="pill"
                       style={{
@@ -348,7 +359,7 @@ export function AgentsView() {
               <span className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
                 {creating ? 'New agent' : (selected?.displayName || selected?.id || 'Agent')}
               </span>
-              {selected?.isDefault && (
+              {defaultAgentId === selected?.id && (
                 <span
                   className="pill"
                   style={{ background: 'var(--bg-elevated)', color: 'var(--text-faint)', fontSize: 11, padding: '0 6px' }}
@@ -470,6 +481,30 @@ export function AgentsView() {
                 >
                   Cancel
                 </button>
+                {!creating && selected && confirmingDelete !== selected.id && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
+                    disabled={settingDefault}
+                    aria-label={defaultAgentId === selected.id ? 'Clear default agent' : 'Set as default agent'}
+                    title={defaultAgentId === selected.id ? 'Clear default' : 'Set as default'}
+                    onClick={async () => {
+                      setSettingDefault(true)
+                      const target = defaultAgentId === selected.id ? null : selected.id
+                      const ok = await setDefaultAgent(target)
+                      setSettingDefault(false)
+                      if (ok) {
+                        await refreshDefault()
+                        refresh()
+                      } else {
+                        setFormError('Could not change the default — the backend may be unreachable.')
+                      }
+                    }}
+                    data-testid={defaultAgentId === selected.id ? 'clear-default-agent' : 'set-default-agent'}
+                  >
+                    {defaultAgentId === selected.id ? 'Clear default' : 'Set as default'}
+                  </button>
+                )}
                 {!creating && selected && confirmingDelete !== selected.id && (
                   <button
                     type="button"

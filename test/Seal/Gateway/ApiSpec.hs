@@ -32,6 +32,7 @@ import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
+import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
@@ -164,7 +165,7 @@ mkDepsFor paths = do
     , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
-    , adDefaultAgent    = Nothing
+    , adDefaultAgent    = pure Nothing
     }
 
 spec :: Spec
@@ -1110,7 +1111,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
-                , adDefaultAgent    = Just "zoe"
+                , adDefaultAgent    = pure (Just "zoe")
                 }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1137,6 +1138,135 @@ spec = describe "Seal.Gateway.API" $ do
                 _     -> expectationFailure "zoe missing"
     case dev of (d:_) -> isDefaultOf d `shouldBe` Just False
                 _     -> expectationFailure "dev missing"
+
+  -- ── Default-agent endpoint ──────────────────────────────────────────
+  -- GET /api/agents/default returns the configured default; PUT sets it
+  -- (persisted to config.toml) or clears it. The named agent must exist.
+
+  it "GET /api/agents/default returns 200 + {agent: null} when no default configured" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "agents", "default"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "agent" o `shouldBe` Just A.Null
+      _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/agents/default sets the default + persists to config.toml" $
+    withSystemTempDirectory "seal-default" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let repo = openConfigRepo cfgRoot
+      backends <- newBackends cfgRoot repo
+      tabsH <- newTabsHandle
+      reg <- newHarnessRegistry
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle (fakePaths { spState = tmp })
+      let now = UTCTime (fromGregorian 2026 7 1) 0
+          adb = bAgentDefs backends
+          zoeId = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
+          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+      adbUpdate adb zoe
+      let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = do
+                c <- loadFileConfig (cfgRoot </> "config.toml")
+                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+            }
+          app = apiApp deps
+      req <- testPut ["api", "agents", "default"]
+        (A.encode (A.object [ "agent" .= ("zoe" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "agent" o `shouldBe` Just (A.String "zoe")
+        _ -> expectationFailure "expected JSON object"
+      -- The default landed on disk.
+      eCfg <- loadFileConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> fcDefaultAgent cfg `shouldBe` Just "zoe"
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- A follow-up GET /api/agents reflects the new default (zoe isDefault=true).
+      (_, bodyList) <- runAppBody app (testRequest methodGet ["api", "agents"])
+      case A.decode bodyList :: Maybe [A.Value] of
+        Just xs -> do
+          let isDefaultOf v = case v of
+                A.Object o -> case lookupK "isDefault" o of Just (A.Bool b) -> Just b; _ -> Nothing
+                _ -> Nothing
+              nameOf v = case v of
+                A.Object o -> case lookupK "name" o of Just (A.String n) -> Just n; _ -> Nothing
+                _ -> Nothing
+          case filter (\v -> nameOf v == Just "zoe") xs of
+            (z:_) -> isDefaultOf z `shouldBe` Just True
+            _     -> expectationFailure "zoe missing from list"
+        Nothing -> expectationFailure "expected a list"
+
+  it "PUT /api/agents/default with agent=null clears the default" $
+    withSystemTempDirectory "seal-default" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let repo = openConfigRepo cfgRoot
+      backends <- newBackends cfgRoot repo
+      tabsH <- newTabsHandle
+      reg <- newHarnessRegistry
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle (fakePaths { spState = tmp })
+      let adb = bAgentDefs backends
+          cfgPath = cfgRoot </> "config.toml"
+      -- Seed config.toml with a default already set.
+      saveFileConfig cfgPath defaultFileConfig { fcDefaultAgent = Just "zoe" }
+      let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = cfgPath, srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = do
+                c <- loadFileConfig cfgPath
+                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+            }
+          app = apiApp deps
+      req <- testPut ["api", "agents", "default"]
+        (A.encode (A.object [ "agent" .= (Nothing :: Maybe T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "agent" o `shouldBe` Just A.Null
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadFileConfig cfgPath
+      case eCfg of
+        Right cfg -> fcDefaultAgent cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/agents/default returns 404 when the named agent doesn't exist" $ do
+    app <- mkApp
+    req <- testPut ["api", "agents", "default"]
+      (A.encode (A.object [ "agent" .= ("ghost" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/agents/default returns 400 on a malformed agent id" $ do
+    app <- mkApp
+    req <- testPut ["api", "agents", "default"]
+      (A.encode (A.object [ "agent" .= ("bad id!" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
 
   -- ── Agent CRUD ───────────────────────────────────────────────────────
   -- GET /api/agents now returns the full def (provider/model/system/tools)
@@ -1169,7 +1299,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1254,7 +1384,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1304,7 +1434,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1353,7 +1483,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1383,7 +1513,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -1465,7 +1595,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -1513,7 +1643,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -1560,7 +1690,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -1601,7 +1731,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adProviders       = pure knownProviders
           , adUiState         = uiState
           , adSend            = Nothing
-          , adDefaultAgent    = Nothing
+          , adDefaultAgent    = pure Nothing
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -1643,7 +1773,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adProviders       = pure [OllamaProvider]
                 , adUiState         = uiState
                 , adSend            = Nothing
-                , adDefaultAgent    = Nothing
+                , adDefaultAgent    = pure Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -1827,7 +1957,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
-            , adDefaultAgent    = Nothing
+            , adDefaultAgent    = pure Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -1910,7 +2040,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
-            , adDefaultAgent    = Nothing
+            , adDefaultAgent    = pure Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).

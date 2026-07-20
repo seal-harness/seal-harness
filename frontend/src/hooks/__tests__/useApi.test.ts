@@ -296,6 +296,8 @@ import {
   createAgentDef,
   updateAgentDef,
   deleteAgentDef,
+  fetchDefaultAgent,
+  setDefaultAgent,
   useAgentDefs,
 } from '../useApi'
 
@@ -369,6 +371,50 @@ describe('Agent CRUD', () => {
   it('deleteAgentDef returns false on a network error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network') }))
     const ok = await deleteAgentDef('gone')
+    expect(ok).toBe(false)
+  })
+})
+
+describe('Default agent', () => {
+  it('fetchDefaultAgent GETs /api/agents/default and returns the id', async () => {
+    setNextResponse({ agent: 'planner' })
+    const res = await fetchDefaultAgent()
+    expect(res).toBe('planner')
+    expect(fetchCalls.some((c) => c.url === '/api/agents/default')).toBe(true)
+  })
+
+  it('fetchDefaultAgent returns null when agent is null', async () => {
+    setNextResponse({ agent: null })
+    const res = await fetchDefaultAgent()
+    expect(res).toBeNull()
+  })
+
+  it('fetchDefaultAgent returns null on a non-ok response', async () => {
+    setNextResponse({ error: 'nope' }, 500)
+    const res = await fetchDefaultAgent()
+    expect(res).toBeNull()
+  })
+
+  it('setDefaultAgent PUTs /api/agents/default with the agent body', async () => {
+    setNextResponse({ agent: 'planner' })
+    const ok = await setDefaultAgent('planner')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/agents/default' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ agent: 'planner' })
+  })
+
+  it('setDefaultAgent sends null when clearing', async () => {
+    setNextResponse({ agent: null })
+    const ok = await setDefaultAgent(null)
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/agents/default' && c.init?.method === 'PUT')
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ agent: null })
+  })
+
+  it('setDefaultAgent returns false on a 404 (agent not found)', async () => {
+    setNextResponse({ error: 'agent not found' }, 404)
+    const ok = await setDefaultAgent('ghost')
     expect(ok).toBe(false)
   })
 })

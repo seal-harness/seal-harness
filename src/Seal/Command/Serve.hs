@@ -196,7 +196,7 @@ runServeMain autonomy = do
             configuredProviders mh cfg
         , adUiState         = uiState
         , adSend            = Just sendDeps
-        , adDefaultAgent    = fcDefaultAgent cfg
+        , adDefaultAgent    = fcDefaultAgent <$> loadCfg
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

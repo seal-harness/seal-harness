@@ -8,15 +8,20 @@ import type { AgentDefInfo } from '../../types'
 const createAgentDef = vi.fn(async (_input: unknown): Promise<AgentDefInfo | null> => null)
 const updateAgentDef = vi.fn(async (_id: string, _input: unknown): Promise<AgentDefInfo | null> => null)
 const deleteAgentDef = vi.fn(async (_id: string): Promise<boolean> => false)
+const fetchDefaultAgent = vi.fn(async (): Promise<string | null> => null)
+const setDefaultAgent = vi.fn(async (_agent: string | null): Promise<boolean> => false)
 
 let agentDefsState: AgentDefInfo[] = []
 let agentDefsError = false
 let agentDefsLoaded = true
+let defaultAgentIdState: string | null = null
 
 vi.mock('../../hooks/useApi', () => ({
   createAgentDef: (input: unknown) => createAgentDef(input),
   updateAgentDef: (id: string, input: unknown) => updateAgentDef(id, input),
   deleteAgentDef: (id: string) => deleteAgentDef(id),
+  fetchDefaultAgent: () => fetchDefaultAgent(),
+  setDefaultAgent: (agent: string | null) => setDefaultAgent(agent),
   useAgentDefs: () => ({
     agents: agentDefsState,
     loaded: agentDefsLoaded,
@@ -52,12 +57,19 @@ beforeEach(() => {
   agentDefsState = []
   agentDefsError = false
   agentDefsLoaded = true
+  defaultAgentIdState = null
   createAgentDef.mockReset()
   updateAgentDef.mockReset()
   deleteAgentDef.mockReset()
+  fetchDefaultAgent.mockReset()
+  setDefaultAgent.mockReset()
   createAgentDef.mockResolvedValue(null)
   updateAgentDef.mockResolvedValue(null)
   deleteAgentDef.mockResolvedValue(false)
+  // fetchDefaultAgent returns the current defaultAgentIdState; the component
+  // calls it on mount + after every setDefaultAgent.
+  fetchDefaultAgent.mockImplementation(async () => defaultAgentIdState)
+  setDefaultAgent.mockResolvedValue(true)
 })
 
 afterEach(() => {
@@ -74,18 +86,19 @@ describe('AgentsView', () => {
     expect(screen.getByText(/Select an agent to edit/i)).toBeTruthy()
   })
 
-  it('renders a row per agent with id + provider + model', () => {
+  it('renders a row per agent with id + provider + model', async () => {
+    defaultAgentIdState = 'coder'
     agentDefsState = [
       makeAgent({ id: 'planner', displayName: 'Planner', provider: 'anthropic', model: 'claude-sonnet-4' }),
-      makeAgent({ id: 'coder', displayName: 'Coder', provider: 'ollama', model: 'llama3.2', isDefault: true }),
+      makeAgent({ id: 'coder', displayName: 'Coder', provider: 'ollama', model: 'llama3.2' }),
     ]
     render(<AgentsView />)
     expect(screen.getByTestId('agent-row-planner')).toBeTruthy()
     expect(screen.getByTestId('agent-row-coder')).toBeTruthy()
     expect(screen.getByText('Planner')).toBeTruthy()
     expect(screen.getByText('Coder')).toBeTruthy()
-    // the default pill
-    expect(screen.getByText('default')).toBeTruthy()
+    // the default pill (after the fetch resolves)
+    await waitFor(() => expect(screen.getByText('default')).toBeTruthy())
   })
 
   it('shows the load error banner when error=true', () => {
@@ -231,5 +244,55 @@ describe('AgentsView', () => {
     await waitFor(() => expect(updateAgentDef).toHaveBeenCalledTimes(1))
     const body = updateAgentDef.mock.calls[0]![1] as { new_id?: string }
     expect(body.new_id).toBeUndefined()
+  })
+
+  // ── Default-agent control ────────────────────────────────────────────
+
+  it('shows "Set as default" when the edited agent is not the default', () => {
+    defaultAgentIdState = null
+    agentDefsState = [makeAgent({ id: 'planner' })]
+    render(<AgentsView />)
+    fireEvent.click(screen.getByTestId('agent-row-planner'))
+    expect(screen.getByTestId('set-default-agent')).toBeTruthy()
+    expect(screen.getByLabelText('Set as default agent')).toBeTruthy()
+  })
+
+  it('shows "Clear default" when the edited agent IS the default', async () => {
+    defaultAgentIdState = 'planner'
+    agentDefsState = [makeAgent({ id: 'planner' })]
+    render(<AgentsView />)
+    fireEvent.click(screen.getByTestId('agent-row-planner'))
+    await waitFor(() => expect(screen.getByTestId('clear-default-agent')).toBeTruthy())
+    expect(screen.getByLabelText('Clear default agent')).toBeTruthy()
+  })
+
+  it('clicking "Set as default" PUTs the agent id', async () => {
+    defaultAgentIdState = null
+    agentDefsState = [makeAgent({ id: 'planner' })]
+    render(<AgentsView />)
+    fireEvent.click(screen.getByTestId('agent-row-planner'))
+    fireEvent.click(screen.getByLabelText('Set as default agent'))
+    await waitFor(() => expect(setDefaultAgent).toHaveBeenCalledWith('planner'))
+  })
+
+  it('clicking "Clear default" PUTs null', async () => {
+    defaultAgentIdState = 'planner'
+    agentDefsState = [makeAgent({ id: 'planner' })]
+    render(<AgentsView />)
+    fireEvent.click(screen.getByTestId('agent-row-planner'))
+    await waitFor(() => expect(screen.getByTestId('clear-default-agent')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('Clear default agent'))
+    await waitFor(() => expect(setDefaultAgent).toHaveBeenCalledWith(null))
+  })
+
+  it('renders a "default" pill on the row that is the configured default', async () => {
+    defaultAgentIdState = 'planner'
+    agentDefsState = [
+      makeAgent({ id: 'planner', displayName: 'Planner' }),
+      makeAgent({ id: 'coder', displayName: 'Coder' }),
+    ]
+    render(<AgentsView />)
+    // Only one "default" pill in the list pane (after the fetch resolves).
+    await waitFor(() => expect(screen.getAllByText('default')).toHaveLength(1))
   })
 })

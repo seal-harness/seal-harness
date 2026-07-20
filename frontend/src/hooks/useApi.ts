@@ -434,9 +434,14 @@ export function useAgents() {
   const [agents, setAgents] = useState<AgentInfo[]>([])
 
   useEffect(() => {
-    fetchJson<AgentInfo[]>('/api/agents').then((data) => {
-      if (Array.isArray(data)) setAgents(data)
-    })
+    const load = () => {
+      fetchJson<AgentInfo[]>('/api/agents').then((data) => {
+        if (Array.isArray(data)) setAgents(data)
+      })
+    }
+    load()
+    const id = setInterval(load, POLL_INTERVAL)
+    return () => clearInterval(id)
   }, [])
 
   return { agents }
@@ -883,4 +888,35 @@ export function useSkills() {
   }, [])
 
   return { skills, loaded, error, refresh }
+}
+
+// ── Default agent ────────────────────────────────────────────────────────
+
+/** Fetch the configured default agent id. Returns null when no default is
+ *  set or the request fails. */
+export async function fetchDefaultAgent(): Promise<string | null> {
+  try {
+    const res = await fetch('/api/agents/default')
+    if (!res.ok) return null
+    const data = (await res.json()) as { agent?: string | null }
+    return data.agent ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Set or clear the default agent. Persists to config.toml. Pass null/empty
+ *  to clear. Returns true on success, false on failure (including a 404
+ *  when the named agent doesn't exist). */
+export async function setDefaultAgent(agent: string | null): Promise<boolean> {
+  try {
+    const res = await fetch('/api/agents/default', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
 }

@@ -18,6 +18,7 @@ import {
   setSessionDescription,
   setSessionAgent,
   setSessionPrompt,
+  fetchDefaultAgent,
   closeTab,
   dismissTab,
   acknowledgeTab,
@@ -239,12 +240,21 @@ export default function App() {
   // next render once `agents` is available.
   useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
 
-  // Initialize selectedAgent from the default agent once agents load.
+  // Initialize selectedAgent from the default agent once agents load. We
+  // consult GET /api/agents/default directly (not the polled list's
+  // isDefault flag) so a just-changed default is reflected immediately —
+  // the polled list may still carry the stale isDefault for up to
+  // POLL_INTERVAL after a PUT /api/agents/default.
   useEffect(() => {
-    if (selectedAgent === null && agents.length > 0) {
-      const def = agents.find((a) => a.isDefault)
+    if (selectedAgent !== null || agents.length === 0) return
+    let cancelled = false
+    void (async () => {
+      const defId = await fetchDefaultAgent()
+      if (cancelled) return
+      const def = defId ? agents.find((a) => a.name === defId) : undefined
       setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
-    }
+    })()
+    return () => { cancelled = true }
   }, [agents, selectedAgent])
 
   // Apply an agent change for the focused session: update local state AND
@@ -551,11 +561,17 @@ export default function App() {
       // system prompt would never be injected on the first turn. The
       // user can still override via the SessionSetup dropdown.
       if (res.session_id) {
-        const def = agents.find((a) => a.isDefault)
-        if (def) void setSessionAgent(res.session_id, def.name)
+        const sid = res.session_id
+        // Consult GET /api/agents/default directly so a just-changed
+        // default is honored even when the polled `agents` list still
+        // carries the stale isDefault flag.
+        void (async () => {
+          const defId = await fetchDefaultAgent()
+          if (defId) void setSessionAgent(sid, defId)
+        })()
       }
     }
-  }, [syncPath, agents])
+  }, [syncPath])
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)

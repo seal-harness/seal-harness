@@ -40,7 +40,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), mkSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (defaultFileConfig, loadFileConfig)
+import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, updateFileConfig)
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
@@ -76,7 +76,7 @@ data ApiDeps = ApiDeps
   , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider list (T11)
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
-  , adDefaultAgent    :: Maybe Text            -- ^ the configured @default_agent@ id (for /api/agents isDefault)
+  , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
   }
 
 -- | The REST API as a WAI Application.
@@ -214,7 +214,20 @@ apiApp deps req respond =
     -- 'mkAgentDefId'. The display name lives in the def's frontmatter.
     (m', ["api", "agents"]) | m' == methodGet -> do
       defs <- adbList (adAgentDefs deps)
-      respond (jsonLBS status200 (A.encode (map (agentInfoJson (adDefaultAgent deps)) defs)))
+      mDef <- adDefaultAgent deps
+      respond (jsonLBS status200 (A.encode (map (agentInfoJson mDef) defs)))
+    -- GET /api/agents/default -> the configured default agent id (or null).
+    -- Must precede the /api/agents/:id routes so "default" isn't captured
+    -- as an agent id.
+    (m', ["api", "agents", "default"]) | m' == methodGet ->
+      respond =<< handleAgentGetDefault deps
+    -- PUT /api/agents/default -> set the default agent. Body:
+    -- {"agent":"<id>"} to set, {"agent":null} (or empty) to clear. Persists
+    -- to config.toml so the change survives restarts. 400 on a malformed
+    -- id; 404 when the named agent doesn't exist.
+    (m', ["api", "agents", "default"]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleAgentSetDefault deps body
     -- GET /api/agents/:id -> a single agent def by id. 404 when absent or
     -- the id fails 'mkAgentDefId'.
     (m', ["api", "agents", aid]) | m' == methodGet ->
@@ -581,7 +594,9 @@ handleAgentGet deps aidTxt =
       m <- adbRead (adAgentDefs deps) aid
       case m of
         Nothing -> pure (errJson status404 "agent not found")
-        Just d  -> pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+        Just d  -> do
+          mDef <- adDefaultAgent deps
+          pure (jsonOk (agentInfoJson mDef d))
 
 -- | Handle POST /api/agents. The body carries @id@, optional @name@
 -- (defaults to the id), @provider@, @model@, @system@, @tools@. Provenance
@@ -598,7 +613,8 @@ handleAgentCreate deps body =
       Right aid -> do
         d <- stampAgentDef deps aid v Nothing
         adbUpdate (adAgentDefs deps) d
-        pure (jsonCreated (agentInfoJson (adDefaultAgent deps) d))
+        mDef <- adDefaultAgent deps
+        pure (jsonCreated (agentInfoJson mDef d))
 
 -- | Handle PUT /api/agents/:id. The path id is authoritative for finding
 -- the existing def; the body may carry a @new_id@ field to RENAME the def
@@ -623,11 +639,13 @@ handleAgentUpdate deps aidTxt body =
               d <- stampAgentDef deps newId v (Just existing)
               adbUpdate (adAgentDefs deps) d
               adbDelete (adAgentDefs deps) aid
-              pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+              mDef <- adDefaultAgent deps
+              pure (jsonOk (agentInfoJson mDef d))
             _ -> do
               d <- stampAgentDef deps aid v (Just existing)
               adbUpdate (adAgentDefs deps) d
-              pure (jsonOk (agentInfoJson (adDefaultAgent deps) d))
+              mDef <- adDefaultAgent deps
+              pure (jsonOk (agentInfoJson mDef d))
 
 -- | Parse an optional @new_id@ field from a JSON body for rename-on-PUT.
 -- Returns 'Nothing' when the field is absent or @null@; @Just (Left err)@
@@ -652,6 +670,57 @@ handleAgentDelete deps aidTxt =
     Right aid -> do
       adbDelete (adAgentDefs deps) aid
       pure noContent
+
+-- | Handle GET /api/agents/default. Returns 200 + {"agent": "<id>"} or
+-- {"agent": null} when no default is configured.
+handleAgentGetDefault :: ApiDeps -> IO Response
+handleAgentGetDefault deps = do
+  mDef <- adDefaultAgent deps
+  pure (jsonOk (A.object [ "agent" .= mDef ]))
+
+-- | Handle PUT /api/agents/default. Body: {"agent":"<id>"} to set,
+-- {"agent":null} or {} to clear. Persists to config.toml via
+-- 'updateFileConfig' so the change survives restarts. The named agent
+-- must exist (404 otherwise) so users can't set a default to a def that
+-- isn't on disk. 400 on a malformed id or invalid JSON.
+handleAgentSetDefault :: ApiDeps -> BL.ByteString -> IO Response
+handleAgentSetDefault deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseDefaultAgentBody v of
+      DefaultClear -> do
+        let cfgPath = srConfigPath (adSessionRuntime deps)
+        eRes <- updateFileConfig cfgPath (\cfg -> cfg { fcDefaultAgent = Nothing })
+        case eRes of
+          Left e  -> pure (errJson status500 ("config write failed: " <> e))
+          Right _ -> pure (jsonOk (A.object [ "agent" .= (Nothing :: Maybe Text) ]))
+      DefaultSet aidTxt -> case mkAgentDefId aidTxt of
+        Left e -> pure (errJson status400 ("invalid agent id: " <> e))
+        Right aid -> do
+          m <- adbRead (adAgentDefs deps) aid
+          case m of
+            Nothing -> pure (errJson status404 "agent not found")
+            Just _ -> do
+              let cfgPath = srConfigPath (adSessionRuntime deps)
+                  val = agentDefIdText aid
+              eRes <- updateFileConfig cfgPath (\cfg -> cfg { fcDefaultAgent = Just val })
+              case eRes of
+                Left e  -> pure (errJson status500 ("config write failed: " <> e))
+                Right _ -> pure (jsonOk (A.object [ "agent" .= val ]))
+      DefaultInvalid -> pure (errJson status400 "expected 'agent' to be a string or null")
+
+-- | Parse the @agent@ field from a PUT /api/agents/default body.
+data DefaultAgentBinding = DefaultClear | DefaultSet Text | DefaultInvalid
+parseDefaultAgentBody :: A.Value -> DefaultAgentBinding
+parseDefaultAgentBody (A.Object o) =
+  case KeyMap.lookup (Key.fromText "agent") o of
+    Nothing              -> DefaultClear
+    Just A.Null          -> DefaultClear
+    Just (A.String t)
+      | T.null (T.strip t) -> DefaultClear
+      | otherwise         -> DefaultSet t
+    Just _               -> DefaultInvalid
+parseDefaultAgentBody _ = DefaultClear
 
 -- | Build an 'AgentDef' from a JSON body + the authoritative id. When
 -- @mExisting@ is 'Just', provenance (@created_at@ / @session@) is preserved
