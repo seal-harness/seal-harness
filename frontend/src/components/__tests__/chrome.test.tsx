@@ -33,15 +33,40 @@ describe('ActivityDot', () => {
 })
 
 describe('TopBar', () => {
-  it('renders the brand name "Seal Harness" + the task title', () => {
-    render(<TopBar taskTitle="my task" />)
+  it('renders the brand name "Seal Harness"', () => {
+    render(<TopBar section="sessions" onSectionChange={() => {}} />)
     expect(screen.getByText('Seal Harness')).toBeTruthy()
-    expect(screen.getByText('my task')).toBeTruthy()
   })
 
   it('does NOT render any reference product name', () => {
-    const { container } = render(<TopBar taskTitle="t" />)
+    const { container } = render(<TopBar section="sessions" onSectionChange={() => {}} />)
     expect(container.textContent).not.toMatch(/pureclaw/i)
+  })
+
+  it('renders a top-level menu button per section', () => {
+    render(<TopBar section="sessions" onSectionChange={() => {}} />)
+    expect(screen.getByTestId('section-sessions')).toBeTruthy()
+    expect(screen.getByTestId('section-agents')).toBeTruthy()
+    expect(screen.getByTestId('section-skills')).toBeTruthy()
+  })
+
+  it('marks the active section with aria-current=page', () => {
+    render(<TopBar section="agents" onSectionChange={() => {}} />)
+    const agents = screen.getByTestId('section-agents')
+    expect(agents.getAttribute('aria-current')).toBe('page')
+    expect(screen.getByTestId('section-sessions').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('fires onSectionChange with the chosen section', () => {
+    let picked: string | null = null
+    render(
+      <TopBar
+        section="sessions"
+        onSectionChange={(s) => { picked = s }}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('section-skills'))
+    expect(picked).toBe('skills')
   })
 })
 

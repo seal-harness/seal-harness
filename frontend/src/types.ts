@@ -182,6 +182,74 @@ export interface ProviderInfo {
   defaultModel?: string
 }
 
+// ── Agent CRUD (full def) ──────────────────────────────────────────────
+
+/** The opcode-allow-list wire shape: the string "all" or an array of
+ *  opcode-name strings. Mirrors the backend's 'AllowList OpName' JSON
+ *  encoding. */
+export type ToolsAllowList = 'all' | string[]
+
+/** The full agent definition returned by GET /api/agents (now widened to
+ *  include every field) and GET /api/agents/:id, and accepted by POST
+ *  /api/agents + PUT /api/agents/:id. `id` and `name` are both present:
+ *  `id` is the canonical AgentDefId (used to address the def), `name` is
+ *  the legacy wire field that the SessionSetup dropdown echoes back as
+ *  body.agent (also the AgentDefId text), and `displayName` is the
+ *  human-readable name from the def's frontmatter. */
+export interface AgentDefInfo {
+  id: string
+  name: string
+  isDefault: boolean
+  displayName: string
+  provider: string
+  model: string
+  system: string | null
+  tools: ToolsAllowList
+  created_at: string
+  updated_at: string
+  session: string
+}
+
+/** The body for POST /api/agents + PUT /api/agents/:id. The `id` is
+ *  required for POST (the caller picks it); PUT takes the id from the
+ *  path. To RENAME an existing def on PUT, send `new_id` with the new
+ *  AgentDefId — the backend deletes the old id and writes the new one
+ *  (provenance preserved). Provenance fields (created_at / updated_at /
+ *  session) are stamped server-side and never sent by the client. */
+export interface AgentDefInput {
+  id?: string
+  new_id?: string
+  name?: string
+  provider?: string
+  model?: string
+  system?: string | null
+  tools?: ToolsAllowList
+}
+
+// ── Skill CRUD ─────────────────────────────────────────────────────────
+
+/** The full skill returned by GET /api/skills / GET /api/skills/:id, and
+ *  accepted by POST /api/skills + PUT /api/skills/:id. Mirrors the
+ *  backend's 'Skill' JSON (snake_case keys match the wire). */
+export interface SkillInfo {
+  id: string
+  description: string
+  body: string
+  created_at: string
+  updated_at: string
+  session: string
+}
+
+/** The body for POST /api/skills + PUT /api/skills/:id. The `id` is
+ *  required for POST; PUT takes the id from the path. To RENAME an
+ *  existing skill on PUT, send `new_id` with the new SkillId. */
+export interface SkillInput {
+  id?: string
+  new_id?: string
+  description?: string
+  body?: string
+}
+
 // ── Transcript ─────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {

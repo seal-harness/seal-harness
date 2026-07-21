@@ -11,11 +11,13 @@ import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
 import Network.HTTP.Client (defaultManagerSettings, newManager)
-import Network.HTTP.Types (methodGet, methodPost, methodPut, statusCode)
+import Network.HTTP.Types (methodDelete, methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
@@ -30,6 +32,8 @@ import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Skill (skillCommandSpec)
+import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
@@ -50,6 +54,8 @@ import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
+import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
+import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.Tabs (newTabsHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
@@ -101,6 +107,10 @@ testPost = testWithBody methodPost
 testPut :: [T.Text] -> BL.ByteString -> IO Request
 testPut = testWithBody methodPut
 
+-- | Build a DELETE request (no body).
+testDelete :: [T.Text] -> IO Request
+testDelete path = pure (defaultRequest { requestMethod = methodDelete, pathInfo = path })
+
 -- | Build a request with a given method + a JSON body.
 testWithBody :: BC.ByteString -> [T.Text] -> BL.ByteString -> IO Request
 testWithBody mth path body = do
@@ -142,6 +152,7 @@ mkDepsFor paths = do
   tabsH <- newTabsHandle
   reg   <- newHarnessRegistry
   adb   <- noneBackend
+  skills <- Skill.noneBackend
   activeRef <- newIORef fakeMeta
   uiState <- newUiStateHandle paths
   let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
@@ -151,10 +162,11 @@ mkDepsFor paths = do
     , adHarnessRegistry = reg
     , adAdoptConsent    = Just CcWeb
     , adAgentDefs       = adb
+    , adSkills          = skills
     , adProviders       = pure knownProviders
     , adUiState         = uiState
     , adSend            = Nothing
-    , adDefaultAgent    = Nothing
+    , adDefaultAgent    = pure Nothing
     }
 
 spec :: Spec
@@ -1079,6 +1091,7 @@ spec = describe "Seal.Gateway.API" $ do
           tabsH <- newTabsHandle
           reg   <- newHarnessRegistry
           adb   <- noneBackend
+          skills <- Skill.noneBackend
           activeRef <- newIORef fakeMeta
           uiState <- newUiStateHandle mkPaths
           let now = UTCTime (fromGregorian 2026 7 1) 0
@@ -1095,10 +1108,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adHarnessRegistry = reg
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
+                , adSkills          = skills
                 , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
-                , adDefaultAgent    = Just "zoe"
+                , adDefaultAgent    = pure (Just "zoe")
                 }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1126,6 +1140,614 @@ spec = describe "Seal.Gateway.API" $ do
     case dev of (d:_) -> isDefaultOf d `shouldBe` Just False
                 _     -> expectationFailure "dev missing"
 
+  -- ── Default-agent endpoint ──────────────────────────────────────────
+  -- GET /api/agents/default returns the configured default; PUT sets it
+  -- (persisted to config.toml) or clears it. The named agent must exist.
+
+  it "GET /api/agents/default returns 200 + {agent: null} when no default configured" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "agents", "default"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "agent" o `shouldBe` Just A.Null
+      _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/agents/default sets the default + persists to config.toml" $
+    withSystemTempDirectory "seal-default" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let repo = openConfigRepo cfgRoot
+      backends <- newBackends cfgRoot repo
+      tabsH <- newTabsHandle
+      reg <- newHarnessRegistry
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle (fakePaths { spState = tmp })
+      let now = UTCTime (fromGregorian 2026 7 1) 0
+          adb = bAgentDefs backends
+          zoeId = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
+          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+      adbUpdate adb zoe
+      let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = do
+                c <- loadFileConfig (cfgRoot </> "config.toml")
+                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+            }
+          app = apiApp deps
+      req <- testPut ["api", "agents", "default"]
+        (A.encode (A.object [ "agent" .= ("zoe" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "agent" o `shouldBe` Just (A.String "zoe")
+        _ -> expectationFailure "expected JSON object"
+      -- The default landed on disk.
+      eCfg <- loadFileConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> fcDefaultAgent cfg `shouldBe` Just "zoe"
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- A follow-up GET /api/agents reflects the new default (zoe isDefault=true).
+      (_, bodyList) <- runAppBody app (testRequest methodGet ["api", "agents"])
+      case A.decode bodyList :: Maybe [A.Value] of
+        Just xs -> do
+          let isDefaultOf v = case v of
+                A.Object o -> case lookupK "isDefault" o of Just (A.Bool b) -> Just b; _ -> Nothing
+                _ -> Nothing
+              nameOf v = case v of
+                A.Object o -> case lookupK "name" o of Just (A.String n) -> Just n; _ -> Nothing
+                _ -> Nothing
+          case filter (\v -> nameOf v == Just "zoe") xs of
+            (z:_) -> isDefaultOf z `shouldBe` Just True
+            _     -> expectationFailure "zoe missing from list"
+        Nothing -> expectationFailure "expected a list"
+
+  it "PUT /api/agents/default with agent=null clears the default" $
+    withSystemTempDirectory "seal-default" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let repo = openConfigRepo cfgRoot
+      backends <- newBackends cfgRoot repo
+      tabsH <- newTabsHandle
+      reg <- newHarnessRegistry
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle (fakePaths { spState = tmp })
+      let adb = bAgentDefs backends
+          cfgPath = cfgRoot </> "config.toml"
+      -- Seed config.toml with a default already set.
+      saveFileConfig cfgPath defaultFileConfig { fcDefaultAgent = Just "zoe" }
+      let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = cfgPath, srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = do
+                c <- loadFileConfig cfgPath
+                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+            }
+          app = apiApp deps
+      req <- testPut ["api", "agents", "default"]
+        (A.encode (A.object [ "agent" .= (Nothing :: Maybe T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "agent" o `shouldBe` Just A.Null
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadFileConfig cfgPath
+      case eCfg of
+        Right cfg -> fcDefaultAgent cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "PUT /api/agents/default returns 404 when the named agent doesn't exist" $ do
+    app <- mkApp
+    req <- testPut ["api", "agents", "default"]
+      (A.encode (A.object [ "agent" .= ("ghost" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/agents/default returns 400 on a malformed agent id" $ do
+    app <- mkApp
+    req <- testPut ["api", "agents", "default"]
+      (A.encode (A.object [ "agent" .= ("bad id!" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  -- ── Agent CRUD ───────────────────────────────────────────────────────
+  -- GET /api/agents now returns the full def (provider/model/system/tools)
+  -- so the Agents UI can render + edit every field. POST creates, PUT
+  -- updates (preserving created_at), GET one fetches, DELETE is idempotent.
+
+  it "GET /api/agents returns the full def (provider/model/system/tools)" $ do
+    -- Seed a def directly through the backend so the test is independent
+    -- of POST. mkDepsFor uses the in-memory noneBackend; reach in via a
+    -- second app built with the seeded backend.
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        aid = case mkAgentDefId "full" of Right x -> x; Left _ -> error "aid"
+        d = AgentDef aid "Full Name" "anthropic" (ModelId "claude-sonnet-4") (Just "be terse")
+            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) now now (SessionId "manual")
+    adbUpdate adb d
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app' = apiApp deps
+    (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
+    let arr = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode agents body: " ++ show body)
+    length arr `shouldBe` 1
+    case arr of
+      (A.Object o : _) -> do
+        lookupK "id" o `shouldBe` Just (A.String "full")
+        lookupK "displayName" o `shouldBe` Just (A.String "Full Name")
+        lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        lookupK "model" o `shouldBe` Just (A.String "claude-sonnet-4")
+        lookupK "system" o `shouldBe` Just (A.String "be terse")
+        -- tools is an array of opcode names (AllowOnly)
+        case lookupK "tools" o of
+          Just (A.Array xs) -> length xs `shouldBe` 2
+          _ -> expectationFailure "expected tools array"
+      _ -> expectationFailure "first agent not an object"
+
+  it "POST /api/agents creates a def and GET /api/agents/:id returns it" $ do
+    app <- mkApp
+    req <- testPost ["api", "agents"]
+      (A.encode (A.object
+        [ "id" .= ("planner" :: T.Text)
+        , "name" .= ("Planner" :: T.Text)
+        , "provider" .= ("ollama" :: T.Text)
+        , "model" .= ("llama3.2" :: T.Text)
+        , "system" .= ("You plan tasks." :: T.Text)
+        , "tools" .= (["FILE_READ", "ASK_HUMAN"] :: [T.Text])
+        ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 201
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "planner")
+      _ -> expectationFailure "expected JSON object"
+    -- Fetch it back via GET /api/agents/planner
+    -- The noneBackend in mkApp is fresh each call, so POST + GET must share
+    -- the SAME app. Use the first app for the GET.
+    (_, body2) <- runAppBody app (testRequest methodGet ["api", "agents", "planner"])
+    case A.decode body2 :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "id" o `shouldBe` Just (A.String "planner")
+        lookupK "provider" o `shouldBe` Just (A.String "ollama")
+        lookupK "system" o `shouldBe` Just (A.String "You plan tasks.")
+      _ -> expectationFailure "expected JSON object for GET one"
+
+  it "POST /api/agents rejects a malformed id with 400" $ do
+    app <- mkApp
+    req <- testPost ["api", "agents"]
+      (A.encode (A.object [ "id" .= ("bad id!" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/agents rejects a missing id with 400" $ do
+    app <- mkApp
+    req <- testPost ["api", "agents"] (A.encode (A.object [ "name" .= ("no id" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "PUT /api/agents/:id updates an existing def and preserves created_at" $ do
+    -- Build a seeded backend + app, then PUT a change and verify created_at
+    -- is preserved while updated_at advances.
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
+        aid = case mkAgentDefId "eddy" of Right x -> x; Left _ -> error "aid"
+        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (SessionId "manual")
+    adbUpdate adb seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testPut ["api", "agents", "eddy"]
+      (A.encode (A.object
+        [ "name" .= ("Eddy 2" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "system" .= ("be nice" :: T.Text)
+        ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "displayName" o `shouldBe` Just (A.String "Eddy 2")
+        lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+        case lookupK "created_at" o of
+          Just (A.String t) -> t `shouldSatisfy` ("2026-01-01" `T.isInfixOf`)
+          _ -> expectationFailure "expected created_at string"
+      _ -> expectationFailure "expected JSON object for PUT"
+
+  it "PUT /api/agents/:id on a missing def returns 404" $ do
+    app <- mkApp
+    req <- testPut ["api", "agents", "ghost"]
+      (A.encode (A.object [ "name" .= ("Ghost" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/agents/:id with new_id renames the def (old id gone, new id present)" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
+        oldId = case mkAgentDefId "alpha" of Right x -> x; Left _ -> error "aid"
+        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (SessionId "manual")
+    adbUpdate adb seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testPut ["api", "agents", "alpha"]
+      (A.encode (A.object [ "new_id" .= ("beta" :: T.Text), "name" .= ("Beta" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "id" o `shouldBe` Just (A.String "beta")
+        lookupK "displayName" o `shouldBe` Just (A.String "Beta")
+        -- created_at preserved from the seed
+        case lookupK "created_at" o of
+          Just (A.String t) -> t `shouldSatisfy` ("2026-01-01" `T.isInfixOf`)
+          _ -> expectationFailure "expected created_at string"
+      _ -> expectationFailure "expected JSON object for rename"
+    -- The old id is gone.
+    (_, bodyOld) <- runAppBody app (testRequest methodGet ["api", "agents", "alpha"])
+    case A.decode bodyOld :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected 404 object for old id"
+    -- The new id is readable.
+    (_, bodyNew) <- runAppBody app (testRequest methodGet ["api", "agents", "beta"])
+    case A.decode bodyNew :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "beta")
+      _ -> expectationFailure "expected JSON object for new id"
+
+  it "PUT /api/agents/:id with a malformed new_id returns 400" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        aid = case mkAgentDefId "keep" of Right x -> x; Left _ -> error "aid"
+        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+    adbUpdate adb seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testPut ["api", "agents", "keep"]
+      (A.encode (A.object [ "new_id" .= ("bad id!" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "DELETE /api/agents/:id returns 204 and the def is gone" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        aid = case mkAgentDefId "delme" of Right x -> x; Left _ -> error "aid"
+        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+    adbUpdate adb seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testDelete ["api", "agents", "delme"]
+    status <- runAppStatus app req
+    status `shouldBe` 204
+    -- Subsequent GET returns 404.
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "agents", "delme"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected JSON object for GET after delete"
+
+  it "DELETE /api/agents/:id is idempotent (204 for missing def)" $ do
+    app <- mkApp
+    req <- testDelete ["api", "agents", "never-existed"]
+    status <- runAppStatus app req
+    status `shouldBe` 204
+
+  it "DELETE /api/agents/:id rejects a malformed id with 400" $ do
+    app <- mkApp
+    req <- testDelete ["api", "agents", "bad id!"]
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  -- ── Skill CRUD ───────────────────────────────────────────────────────
+
+  it "GET /api/skills returns 200 with a JSON array" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "skills"])
+    status `shouldBe` 200
+
+  it "POST /api/skills creates a skill and GET /api/skills/:id returns it" $ do
+    app <- mkApp
+    req <- testPost ["api", "skills"]
+      (A.encode (A.object
+        [ "id" .= ("coding" :: T.Text)
+        , "description" .= ("Coding skill" :: T.Text)
+        , "body" .= ("## Coding\n\nWrite code carefully." :: T.Text)
+        ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 201
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "id" o `shouldBe` Just (A.String "coding")
+        lookupK "description" o `shouldBe` Just (A.String "Coding skill")
+        lookupK "body" o `shouldBe` Just (A.String "## Coding\n\nWrite code carefully.")
+      _ -> expectationFailure "expected JSON object for POST skill"
+    -- GET it back (same app — the in-memory backend is shared).
+    (_, body2) <- runAppBody app (testRequest methodGet ["api", "skills", "coding"])
+    case A.decode body2 :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "coding")
+      _ -> expectationFailure "expected JSON object for GET skill one"
+
+  it "GET /api/skills/:id on a missing skill returns 404" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "skills", "ghost"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected JSON object for missing skill"
+
+  it "PUT /api/skills/:id updates an existing skill and preserves created_at" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
+        sid = case mkSkillId "writer" of Right x -> x; Left _ -> error "sid"
+        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (SessionId "manual")
+    Skill.sbCreate skills seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testPut ["api", "skills", "writer"]
+      (A.encode (A.object
+        [ "description" .= ("Writer 2" :: T.Text)
+        , "body" .= ("## Writer\n\nUpdated body." :: T.Text)
+        ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "description" o `shouldBe` Just (A.String "Writer 2")
+        lookupK "body" o `shouldBe` Just (A.String "## Writer\n\nUpdated body.")
+        case lookupK "created_at" o of
+          Just (A.String t) -> t `shouldSatisfy` ("2026-01-01" `T.isInfixOf`)
+          _ -> expectationFailure "expected created_at string"
+      _ -> expectationFailure "expected JSON object for PUT skill"
+
+  it "PUT /api/skills/:id on a missing skill returns 404" $ do
+    app <- mkApp
+    req <- testPut ["api", "skills", "ghost"]
+      (A.encode (A.object [ "description" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "PUT /api/skills/:id with new_id renames the skill (old id gone, new id present)" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
+        sid = case mkSkillId "alpha" of Right x -> x; Left _ -> error "sid"
+        seed = Skill sid "Alpha" "body" oldCreated oldCreated (SessionId "manual")
+    Skill.sbCreate skills seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testPut ["api", "skills", "alpha"]
+      (A.encode (A.object [ "new_id" .= ("beta" :: T.Text), "description" .= ("Beta" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        lookupK "id" o `shouldBe` Just (A.String "beta")
+        lookupK "description" o `shouldBe` Just (A.String "Beta")
+        case lookupK "created_at" o of
+          Just (A.String t) -> t `shouldSatisfy` ("2026-01-01" `T.isInfixOf`)
+          _ -> expectationFailure "expected created_at string"
+      _ -> expectationFailure "expected JSON object for skill rename"
+    -- Old id gone, new id readable.
+    (_, bodyOld) <- runAppBody app (testRequest methodGet ["api", "skills", "alpha"])
+    case A.decode bodyOld :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected 404 object for old skill id"
+    (_, bodyNew) <- runAppBody app (testRequest methodGet ["api", "skills", "beta"])
+    case A.decode bodyNew :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "beta")
+      _ -> expectationFailure "expected JSON object for new skill id"
+
+  it "DELETE /api/skills/:id returns 204 and the skill is gone" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        sid = case mkSkillId "gone" of Right x -> x; Left _ -> error "sid"
+        seed = Skill sid "Gone" "body" now now (SessionId "manual")
+    Skill.sbCreate skills seed
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    req <- testDelete ["api", "skills", "gone"]
+    status <- runAppStatus app req
+    status `shouldBe` 204
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "skills", "gone"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+      _ -> expectationFailure "expected JSON object for GET after skill delete"
+
+  it "DELETE /api/skills/:id is idempotent (204 for missing skill)" $ do
+    app <- mkApp
+    req <- testDelete ["api", "skills", "never-existed"]
+    status <- runAppStatus app req
+    status `shouldBe` 204
+
+  it "GET /api/skills lists all skills sorted by id" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        mkS n = case mkSkillId n of
+          Right sid -> Skill sid n "body" now now (SessionId "manual")
+          Left _    -> error "sid"
+    Skill.sbCreate skills (mkS "zeta")
+    Skill.sbCreate skills (mkS "alpha")
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          }
+        app = apiApp deps
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
+    case A.decode body :: Maybe [A.Value] of
+      Just xs -> do
+        length xs `shouldBe` 2
+        let idOf v = case v of
+              A.Object o -> case lookupK "id" o of
+                Just (A.String t) -> t
+                _ -> ""
+              _ -> ""
+            ids = map idOf xs
+        ids `shouldBe` ["alpha", "zeta"]
+      Nothing -> expectationFailure "expected a skills array"
+
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers"])
@@ -1138,6 +1760,7 @@ spec = describe "Seal.Gateway.API" $ do
           tabsH <- newTabsHandle
           reg   <- newHarnessRegistry
           adb   <- noneBackend
+          skills <- Skill.noneBackend
           activeRef <- newIORef fakeMeta
           uiState <- newUiStateHandle mkPaths
           let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
@@ -1147,10 +1770,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adHarnessRegistry = reg
                 , adAdoptConsent    = Just CcWeb
                 , adAgentDefs       = adb
+                , adSkills          = skills
                 , adProviders       = pure [OllamaProvider]
                 , adUiState         = uiState
                 , adSend            = Nothing
-                , adDefaultAgent    = Nothing
+                , adDefaultAgent    = pure Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -1300,6 +1924,7 @@ spec = describe "Seal.Gateway.API" $ do
       tabsH <- newTabsHandle
       reg   <- newHarnessRegistry
       adb   <- noneBackend
+      skills <- Skill.noneBackend
       activeRef <- newIORef fakeMeta
       uiState <- newUiStateHandle (fakePaths { spState = tmp })
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
@@ -1329,10 +1954,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
+            , adSkills          = skills
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
-            , adDefaultAgent    = Nothing
+            , adDefaultAgent    = pure Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -1411,10 +2037,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg
             , adAdoptConsent    = Just CcWeb
             , adAgentDefs       = adb
+            , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Just sendDeps
-            , adDefaultAgent    = Nothing
+            , adDefaultAgent    = pure Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -1454,3 +2081,99 @@ spec = describe "Seal.Gateway.API" $ do
           -- (the frontend's block payload encodes it).
           T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
             `shouldBe` True
+  -- ── Regression: benign slash commands must not navigate ─────────────
+  -- The web gateway is multi-session: srActive is a process-global ref
+  -- that may point at a DIFFERENT session than the one a request targets.
+  -- A benign slash command (e.g. /skill list) must NOT cause the
+  -- frontend to navigate away. The SendSlash outcome's session_id must
+  -- be null/absent when the slash command didn't actually swap the
+  -- active session during this call. See the runSlash
+  -- newSessionIdIfChangedFrom fix in Seal.Gateway.Send.
+  it "regression: /skill list on a non-active session returns no session_id" $
+    withSystemTempDirectory "seal-slash" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      tmuxR <- mkRealTmuxRunner
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
+      let paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+          -- Two sessions on disk: the "active" one and the "request" one.
+          -- The request will target the non-active one.
+          activeSidTxt = "20260720-214230-238"
+          requestSidTxt = "20260720-214349-258"
+          activeSid = case mkSessionId activeSidTxt of Right s -> s; Left _ -> error "active sid"
+          requestSid = case mkSessionId requestSidTxt of Right s -> s; Left _ -> error "request sid"
+          activeMeta = fakeMeta { smId = activeSid }
+          requestMeta = fakeMeta { smId = requestSid }
+      -- Persist the request session's meta so handleSend's loadSessionMeta finds it.
+      saveSessionMeta paths requestMeta
+      -- The process-global active ref points at the OTHER session.
+      activeRef <- newIORef activeMeta
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) ]
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = registry
+            , sdResolve    = \_ -> pure (Left "unused")
+            , sdAutonomy   = Policy.Full
+            , sdBroker     = Nothing
+            , sdHarnessRegistry = reg
+            , sdTmuxRunner  = tmuxR
+            , sdHttpManager = Nothing
+            , sdAskReply    = askReply
+            , sdApprovals   = approvals
+            , sdReplies     = error "sdReplies: unused on the slash path"
+            , sdLocks       = error "sdLocks: unused on the slash path"
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = bAgentDefs backends
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = error "adUiState: unused on the slash path"
+            , adSend            = Just sendDeps
+            , adDefaultAgent    = pure Nothing
+            }
+          app = apiApp deps
+      -- Send /skill list to the REQUEST session (not the active one).
+      sendReq <- testPost ["api", "sessions", requestSidTxt, "send"]
+        (A.encode (A.object [ "message" .= ("/skill list" :: T.Text) ]))
+      (status, body) <- runAppBody app sendReq
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          -- kind must be "slash"
+          case KeyMap.lookup (Key.fromText "kind") o of
+            Just (A.String k) -> k `shouldBe` "slash"
+            _ -> expectationFailure "expected kind: slash"
+          -- session_id must be absent or null — the slash command did NOT
+          -- swap the active session, so the frontend must NOT navigate.
+          case KeyMap.lookup (Key.fromText "session_id") o of
+            Nothing         -> pure ()
+            Just A.Null     -> pure ()
+            Just other      -> expectationFailure ("expected no session_id, got: " <> show other)
+        _ -> expectationFailure "expected JSON object"

@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { TopBar } from './components/TopBar'
+import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
 import { ChatArea, transcriptToMessages, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { NewSessionComposer } from './components/NewSessionComposer'
+import { AgentsView } from './components/AgentsView'
+import { SkillsView } from './components/SkillsView'
 import {
   useTranscript,
   useSendMessage,
@@ -16,6 +18,7 @@ import {
   setSessionDescription,
   setSessionAgent,
   setSessionPrompt,
+  fetchDefaultAgent,
   closeTab,
   dismissTab,
   acknowledgeTab,
@@ -48,11 +51,28 @@ function selectedIdFromPath(): string | null {
   return null
 }
 
+/** Parse the top-level section from the URL path. `/agents` → 'agents',
+ *  `/skills` → 'skills'; everything else (including the root and the
+ *  session/tab/harness routes) → 'sessions'. */
+function sectionFromPath(): TopSection {
+  if (typeof window === 'undefined') return 'sessions'
+  const path = window.location.pathname
+  if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
+  if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
+  return 'sessions'
+}
+
 /** Convert a selectedId back to a URL path. */
 function pathFromSelectedId(selectedId: string | null): string {
   if (!selectedId) return '/'
   const [type, ...rest] = selectedId.split(':')
   return `/${type}/${rest.join(':')}`
+}
+
+/** Convert a top-level section to a URL path. */
+function pathFromSection(section: TopSection): string {
+  if (section === 'sessions') return '/'
+  return `/${section}`
 }
 
 /** Extract the focused session id from a selection. `session:<id>` → that
@@ -152,6 +172,7 @@ export default function App() {
   const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
+  const [section, setSection] = useState<TopSection>(sectionFromPath)
   const [selectedId, setSelectedId] = useState<string | null>(selectedIdFromPath)
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
   const [customPromptFile, setCustomPromptFile] = useState<{ name: string; content: string } | null>(null)
@@ -219,12 +240,21 @@ export default function App() {
   // next render once `agents` is available.
   useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
 
-  // Initialize selectedAgent from the default agent once agents load.
+  // Initialize selectedAgent from the default agent once agents load. We
+  // consult GET /api/agents/default directly (not the polled list's
+  // isDefault flag) so a just-changed default is reflected immediately —
+  // the polled list may still carry the stale isDefault for up to
+  // POLL_INTERVAL after a PUT /api/agents/default.
   useEffect(() => {
-    if (selectedAgent === null && agents.length > 0) {
-      const def = agents.find((a) => a.isDefault)
+    if (selectedAgent !== null || agents.length === 0) return
+    let cancelled = false
+    void (async () => {
+      const defId = await fetchDefaultAgent()
+      if (cancelled) return
+      const def = defId ? agents.find((a) => a.name === defId) : undefined
       setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
-    }
+    })()
+    return () => { cancelled = true }
   }, [agents, selectedAgent])
 
   // Apply an agent change for the focused session: update local state AND
@@ -275,9 +305,23 @@ export default function App() {
     }
   }, [])
 
+  const syncSection = useCallback((s: TopSection) => {
+    if (typeof window !== 'undefined') {
+      window.history.pushState(null, '', pathFromSection(s))
+    }
+  }, [])
+
+  const handleSectionChange = useCallback((s: TopSection) => {
+    setSection(s)
+    syncSection(s)
+  }, [syncSection])
+
   useEffect(() => {
     if (typeof window === 'undefined') return
-    const onPopState = () => setSelectedId(selectedIdFromPath())
+    const onPopState = () => {
+      setSection(sectionFromPath())
+      setSelectedId(selectedIdFromPath())
+    }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
   }, [])
@@ -517,11 +561,17 @@ export default function App() {
       // system prompt would never be injected on the first turn. The
       // user can still override via the SessionSetup dropdown.
       if (res.session_id) {
-        const def = agents.find((a) => a.isDefault)
-        if (def) void setSessionAgent(res.session_id, def.name)
+        const sid = res.session_id
+        // Consult GET /api/agents/default directly so a just-changed
+        // default is honored even when the polled `agents` list still
+        // carries the stale isDefault flag.
+        void (async () => {
+          const defId = await fetchDefaultAgent()
+          if (defId) void setSessionAgent(sid, defId)
+        })()
       }
     }
-  }, [syncPath, agents])
+  }, [syncPath])
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)
@@ -611,8 +661,6 @@ export default function App() {
     ? deriveAgent(selectedId, tabs, sessions, archivedSessions, tabSessions)
     : null
 
-  const taskTitle = displayAgent?.name ?? 'Seal Harness'
-
   const selectedSession = useMemo(() => {
     const base = sessions.find((s) => s.id === currentSessionId)
       ?? archivedSessions.find((s) => s.id === currentSessionId)
@@ -643,90 +691,98 @@ export default function App() {
   }, [currentSessionId])
 
   // ── Render ────────────────────────────────────────────────────────────
+  // The top-level section switches the entire body. "Sessions" is the
+  // existing sessions/tabs/chat UI; "Agents" + "Skills" are the CRUD views.
   return (
     <>
-      <TopBar taskTitle={taskTitle} />
-      <div className="flex flex-1 min-h-0">
-        <Sidebar
-          tabs={tabs}
-          sessions={sessions}
-          archivedSessions={archivedSessions}
-          tabSessions={tabSessions}
-          selectedId={selectedId}
-          sessionActivity={sessionActivity}
-          onSelectTab={handleSelectTab}
-          onSelectSession={handleSelectSession}
-          onNewTab={handleNewTab}
-          onNewSession={handleNewBareSession}
-          onArchiveSession={handleArchiveSession}
-          onUnarchiveSession={handleUnarchiveSession}
-          onCloseTab={handleCloseTab}
-          onArchiveTab={handleArchiveTab}
-          onDismissTab={handleDismissTab}
-          onAcknowledgeTab={handleAcknowledgeTab}
-          onReleaseTab={handleReleaseTab}
-        />
-        {composerOpen ? (
-          <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-base)' }}>
-            <NewTabComposer
-              spec={composerSpec}
-              onSubmit={handleComposerSubmit}
-              onCancel={handleComposerCancel}
-              branchFrom={branchFrom}
-            />
-          </div>
-        ) : newSessionComposerOpen ? (
-          <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-base)' }}>
-            <NewSessionComposer
-              spec={composerSpec}
-              onSubmit={handleNewSessionComposerSubmit}
-              onCancel={handleNewSessionComposerCancel}
-            />
-          </div>
-        ) : selectedHarnessTab ? (
-          <HarnessControls
-            tab={selectedHarnessTab}
-            session={
-              sessions.find((s) => s.id === selectedHarnessTab.session_id)
-              ?? archivedSessions.find((s) => s.id === selectedHarnessTab.session_id)
-              ?? null
-            }
-            onOpenSession={handleSelectSession}
-            onRelease={handleReleaseTab}
-            onDestroy={handleDestroyHarness}
-          />
-        ) : (
-          <ChatArea
-            selectedAgent={displayAgent ?? DEFAULT_AGENT}
-            selectedSession={selectedSession}
-            onSetDescription={handleSetDescription}
-            messages={messages}
-            loading={loading}
-            onSend={currentSessionId ? handleSend : undefined}
-            sending={sending}
-            tokensUsed={tokensUsed}
-            sessionStart={selectedSession?.createdAt ?? null}
-            agents={agents}
-            currentAgent={selectedAgent}
-            onAgentChange={handleAgentChange}
-            customPromptFile={customPromptFile}
-            onCustomPromptFile={handleCustomPromptFile}
-            newTabFocusTick={newTabFocusTick}
+      <TopBar section={section} onSectionChange={handleSectionChange} />
+      {section === 'agents' ? (
+        <AgentsView />
+      ) : section === 'skills' ? (
+        <SkillsView />
+      ) : (
+        <div className="flex flex-1 min-h-0">
+          <Sidebar
+            tabs={tabs}
+            sessions={sessions}
+            archivedSessions={archivedSessions}
+            tabSessions={tabSessions}
             selectedId={selectedId}
-            onBranch={selectedSession?.runtime.startsWith('session:') ? handleBranch : undefined}
-            currentModel={modelDropdownValue}
-            availableModels={[...transcriptModels]}
-            onModelChange={modelDropdownValue !== null ? setModelOverride : undefined}
-            pendingQuestions={pendingQuestions}
-            onAnswerQuestion={(qid, ans) => {
-              if (currentSessionId) void answerQuestion(currentSessionId, qid, ans)
-            }}
-            onCancelQuestion={(qid) => {
-              if (currentSessionId) void cancelQuestion(currentSessionId, qid)
-            }}
+            sessionActivity={sessionActivity}
+            onSelectTab={handleSelectTab}
+            onSelectSession={handleSelectSession}
+            onNewTab={handleNewTab}
+            onNewSession={handleNewBareSession}
+            onArchiveSession={handleArchiveSession}
+            onUnarchiveSession={handleUnarchiveSession}
+            onCloseTab={handleCloseTab}
+            onArchiveTab={handleArchiveTab}
+            onDismissTab={handleDismissTab}
+            onAcknowledgeTab={handleAcknowledgeTab}
+            onReleaseTab={handleReleaseTab}
           />
-        )}
-      </div>
+          {composerOpen ? (
+            <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-base)' }}>
+              <NewTabComposer
+                spec={composerSpec}
+                onSubmit={handleComposerSubmit}
+                onCancel={handleComposerCancel}
+                branchFrom={branchFrom}
+              />
+            </div>
+          ) : newSessionComposerOpen ? (
+            <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-base)' }}>
+              <NewSessionComposer
+                spec={composerSpec}
+                onSubmit={handleNewSessionComposerSubmit}
+                onCancel={handleNewSessionComposerCancel}
+              />
+            </div>
+          ) : selectedHarnessTab ? (
+            <HarnessControls
+              tab={selectedHarnessTab}
+              session={
+                sessions.find((s) => s.id === selectedHarnessTab.session_id)
+                ?? archivedSessions.find((s) => s.id === selectedHarnessTab.session_id)
+                ?? null
+              }
+              onOpenSession={handleSelectSession}
+              onRelease={handleReleaseTab}
+              onDestroy={handleDestroyHarness}
+            />
+          ) : (
+            <ChatArea
+              selectedAgent={displayAgent ?? DEFAULT_AGENT}
+              selectedSession={selectedSession}
+              onSetDescription={handleSetDescription}
+              messages={messages}
+              loading={loading}
+              onSend={currentSessionId ? handleSend : undefined}
+              sending={sending}
+              tokensUsed={tokensUsed}
+              sessionStart={selectedSession?.createdAt ?? null}
+              agents={agents}
+              currentAgent={selectedAgent}
+              onAgentChange={handleAgentChange}
+              customPromptFile={customPromptFile}
+              onCustomPromptFile={handleCustomPromptFile}
+              newTabFocusTick={newTabFocusTick}
+              selectedId={selectedId}
+              onBranch={selectedSession?.runtime.startsWith('session:') ? handleBranch : undefined}
+              currentModel={modelDropdownValue}
+              availableModels={[...transcriptModels]}
+              onModelChange={modelDropdownValue !== null ? setModelOverride : undefined}
+              pendingQuestions={pendingQuestions}
+              onAnswerQuestion={(qid, ans) => {
+                if (currentSessionId) void answerQuestion(currentSessionId, qid, ans)
+              }}
+              onCancelQuestion={(qid) => {
+                if (currentSessionId) void cancelQuestion(currentSessionId, qid)
+              }}
+            />
+          )}
+        </div>
+      )}
     </>
   )
 }

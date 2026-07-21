@@ -1,10 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type {
+  AgentDefInfo,
+  AgentDefInput,
   AgentInfo,
   DiscoverableWindow,
   HarnessInfo,
   ProviderInfo,
   SessionInfo,
+  SkillInfo,
+  SkillInput,
   TabInfo,
   TabOrigin,
   TabStatus,
@@ -430,9 +434,14 @@ export function useAgents() {
   const [agents, setAgents] = useState<AgentInfo[]>([])
 
   useEffect(() => {
-    fetchJson<AgentInfo[]>('/api/agents').then((data) => {
-      if (Array.isArray(data)) setAgents(data)
-    })
+    const load = () => {
+      fetchJson<AgentInfo[]>('/api/agents').then((data) => {
+        if (Array.isArray(data)) setAgents(data)
+      })
+    }
+    load()
+    const id = setInterval(load, POLL_INTERVAL)
+    return () => clearInterval(id)
   }, [])
 
   return { agents }
@@ -695,6 +704,216 @@ export async function addCustomModel(model: string): Promise<boolean> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+// ── Agent CRUD ──────────────────────────────────────────────────────────
+
+/** Fetch all agent defs (the full def, including provider/model/system/
+ *  tools/timestamps). Returns null on any failure. */
+export async function fetchAgentDefs(): Promise<AgentDefInfo[] | null> {
+  return fetchJson<AgentDefInfo[]>('/api/agents')
+}
+
+/** Fetch a single agent def by id. Returns null on any failure (including
+ *  404). */
+export async function fetchAgentDef(id: string): Promise<AgentDefInfo | null> {
+  return fetchJson<AgentDefInfo>(`/api/agents/${encodeURIComponent(id)}`)
+}
+
+/** Create a new agent def. The body must include `id`; the remaining
+ *  fields are optional. Returns the created def on success, null on
+ *  failure. */
+export async function createAgentDef(input: AgentDefInput): Promise<AgentDefInfo | null> {
+  try {
+    const res = await fetch('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as AgentDefInfo
+  } catch {
+    return null
+  }
+}
+
+/** Replace an existing agent def. The id is taken from the path; the body
+ *  may omit `id`. Returns the updated def on success, null on failure. */
+export async function updateAgentDef(id: string, input: AgentDefInput): Promise<AgentDefInfo | null> {
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as AgentDefInfo
+  } catch {
+    return null
+  }
+}
+
+/** Delete an agent def by id. Returns true when the backend accepted the
+ *  delete (204 — idempotent, so a missing def also returns true). */
+export async function deleteAgentDef(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of agent defs. Re-fetches on the poll interval so CRUD
+ *  changes from other tabs surface automatically. The `refresh` action
+ *  forces an immediate re-fetch so callers see their own mutations
+ *  instantly. */
+export function useAgentDefs() {
+  const [agents, setAgents] = useState<AgentDefInfo[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchAgentDefs().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setAgents(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  useEffect(() => {
+    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
+    return () => clearInterval(id)
+  }, [])
+
+  return { agents, loaded, error, refresh }
+}
+
+// ── Skill CRUD ──────────────────────────────────────────────────────────
+
+/** Fetch all skills. Returns null on any failure. */
+export async function fetchSkills(): Promise<SkillInfo[] | null> {
+  return fetchJson<SkillInfo[]>('/api/skills')
+}
+
+/** Fetch a single skill by id. Returns null on any failure (including 404). */
+export async function fetchSkill(id: string): Promise<SkillInfo | null> {
+  return fetchJson<SkillInfo>(`/api/skills/${encodeURIComponent(id)}`)
+}
+
+/** Create a new skill. The body must include `id`, `description`, and
+ *  `body`. Returns the created skill on success, null on failure. */
+export async function createSkill(input: SkillInput): Promise<SkillInfo | null> {
+  try {
+    const res = await fetch('/api/skills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as SkillInfo
+  } catch {
+    return null
+  }
+}
+
+/** Replace an existing skill. The id is taken from the path; the body may
+ *  omit `id`. Returns the updated skill on success, null on failure. */
+export async function updateSkill(id: string, input: SkillInput): Promise<SkillInfo | null> {
+  try {
+    const res = await fetch(`/api/skills/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as SkillInfo
+  } catch {
+    return null
+  }
+}
+
+/** Delete a skill by id. Returns true when the backend accepted the delete
+ *  (204 — idempotent). */
+export async function deleteSkill(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/skills/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of skills. Mirrors `useAgentDefs`. */
+export function useSkills() {
+  const [skills, setSkills] = useState<SkillInfo[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchSkills().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setSkills(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  useEffect(() => {
+    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
+    return () => clearInterval(id)
+  }, [])
+
+  return { skills, loaded, error, refresh }
+}
+
+// ── Default agent ────────────────────────────────────────────────────────
+
+/** Fetch the configured default agent id. Returns null when no default is
+ *  set or the request fails. */
+export async function fetchDefaultAgent(): Promise<string | null> {
+  try {
+    const res = await fetch('/api/agents/default')
+    if (!res.ok) return null
+    const data = (await res.json()) as { agent?: string | null }
+    return data.agent ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Set or clear the default agent. Persists to config.toml. Pass null/empty
+ *  to clear. Returns true on success, false on failure (including a 404
+ *  when the named agent doesn't exist). */
+export async function setDefaultAgent(agent: string | null): Promise<boolean> {
+  try {
+    const res = await fetch('/api/agents/default', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent }),
     })
     return res.ok
   } catch {

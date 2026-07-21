@@ -187,6 +187,7 @@ runServeMain autonomy = do
         , adHarnessRegistry = reg
         , adAdoptConsent    = Just CcWeb
         , adAgentDefs       = bAgentDefs backends
+        , adSkills          = bSkills backends
         , adProviders       = do
             -- The configured-provider list is computed on each request so
             -- newly-added credentials are reflected without a restart. The
@@ -195,7 +196,7 @@ runServeMain autonomy = do
             configuredProviders mh cfg
         , adUiState         = uiState
         , adSend            = Just sendDeps
-        , adDefaultAgent    = fcDefaultAgent cfg
+        , adDefaultAgent    = fcDefaultAgent <$> loadCfg
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from
