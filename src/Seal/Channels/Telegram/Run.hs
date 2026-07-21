@@ -27,7 +27,6 @@ import Seal.Command.Channel
   , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (Registry, mkRegistry)
-import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
@@ -133,7 +132,6 @@ runTelegramMain autonomy = do
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
         , tabCommandSpec tabsH

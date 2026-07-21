@@ -151,7 +151,7 @@ runServeMain autonomy = do
         , providerCommandSpec pr
         , sessionCommandSpec sr
         , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends)
+        , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , tabCommandSpec tabsH
         , tabsCommandSpec tabsH

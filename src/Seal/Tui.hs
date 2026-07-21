@@ -17,7 +17,6 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
-import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
@@ -158,7 +157,6 @@ runTui autonomy = do
         , providerCommandSpec pr
         , sessionCommandSpec sr
         , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends)
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
         , tabCommandSpec tabsH
