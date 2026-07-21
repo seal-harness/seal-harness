@@ -97,7 +97,7 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Dispatch (dispatch)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
@@ -587,7 +587,11 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    case res of
+      Right r -> recordSkillLoadResult tHandle callOpName val r
+      Left _  -> pure ()
+    pure res
 
 -- | Build the ISA registry for a channel turn. Mirrors
 -- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set

@@ -19,6 +19,7 @@
 module Seal.ISA.Dispatch
   ( DispatchError (..)
   , dispatch
+  , recordSkillLoadResult
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -95,3 +96,42 @@ mkInvocationEntry name input = do
     , erCorrelation = Nothing
     , erMeta = Map.fromList [("op", object ["name" .= name]), ("input", input)]
     }
+
+-- | Record a second 'EKHarness' entry carrying the opcode's 'orRecorded'
+-- value as @result@ in @erMeta@. Called by the 'CallDispatcher' sites
+-- (webCallDispatcher, channelCallDispatcher, CLI callDispatcher) after
+-- 'dispatch' returns a successful 'Right' for the 'SKILL_LOAD' opcode.
+-- The invocation entry (recorded by 'dispatch' before the opcode runs)
+-- carries only @op.name@ + @input@; this result entry adds the
+-- @orRecorded@ payload (which for 'SKILL_LOAD' includes the skill id,
+-- description, body, updated_at, and session) so the frontend can render
+-- the skill body in a collapsible tool-call box without duplicating it
+-- in the transient slash bubble.
+--
+-- Only fires for 'SKILL_LOAD' (the v1 user-surfacing opcode). Other
+-- opcodes' 'orRecorded' is not surfaced to the frontend via this path.
+-- Error results ('orIsError' = True) are NOT recorded here — the error
+-- text is rendered via 'ccSend' to the slash bubble instead.
+recordSkillLoadResult :: TwoFileHandle -> OpName -> Value -> OpResult -> IO ()
+recordSkillLoadResult h (OpName nm) input result
+  | nm == "SKILL_LOAD" && not (orIsError result) = do
+      now <- getCurrentTime
+      let entry = EntryRecord
+            { erId = ""
+            , erTimestamp = now
+            , erKind = EKHarness
+            , erConvLen = 0
+            , erEnvelope = Nothing
+            , erUsage = Nothing
+            , erStop = Nothing
+            , erDurationMs = Nothing
+            , erHarness = Nothing
+            , erCorrelation = Nothing
+            , erMeta = Map.fromList
+                [ ("op", object ["name" .= OpName nm])
+                , ("input", input)
+                , ("result", orRecorded result)
+                ]
+            }
+      tfwRecordAndAck h (TwoFileWrite [] entry)
+  | otherwise = pure ()

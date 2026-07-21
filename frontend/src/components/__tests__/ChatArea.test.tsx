@@ -457,6 +457,38 @@ describe('transcriptToMessages', () => {
     expect(call0.toolCall.result).toBe('file_a.txt')
     expect(call1.toolCall.result).toBe('Linux')
   })
+
+  it('renders a SKILL_LOAD harness result entry as a collapsible tool-call box', () => {
+    // The backend's recordSkillLoadResult records a second EKHarness entry
+    // after SKILL_LOAD runs, carrying op.name + input + result (with the
+    // skill body) in the payload. transcriptToMessages should synthesize a
+    // ToolCallBlock-shaped message from it so the frontend renders the
+    // skill body in a collapsible box (collapsed by default showing
+    // "SKILL_LOAD" + the skill id; expanded shows the body).
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'skillload-1',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SKILL_LOAD' },
+          input: { id: 'greet' },
+          result: { id: 'greet', description: 'greeting skill', body: 'say hello warmly' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // One message with one toolCall block.
+    expect(msgs.length).toBe(1)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('SKILL_LOAD')
+    expect(tcBlock!.toolCall!.input).toEqual({ id: 'greet' })
+    expect(tcBlock!.toolCall!.result).toBe('say hello warmly')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+  })
 })
 
 // ── ChatArea rendering ──────────────────────────────────────────────────────

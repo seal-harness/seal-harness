@@ -58,7 +58,7 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 #endif
@@ -564,7 +564,11 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           let startWiring = cliStartWiring sid
               isaReg = cliIsaReg sid startWiring caps
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          case res of
+            Right r -> recordSkillLoadResult tHandle callOpName val r
+            Left _  -> pure ()
+          pure res
       plainHandler t = do
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->

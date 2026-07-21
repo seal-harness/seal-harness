@@ -73,7 +73,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -538,7 +538,11 @@ webCallDispatcher deps callOpName val = do
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    case res of
+      Right r -> recordSkillLoadResult tHandle callOpName val r
+      Left _  -> pure ()
+    pure res
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the CLI's
 -- 'mintAgentSession'). Each start gets its own timestamped id.
