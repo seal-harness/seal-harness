@@ -112,7 +112,7 @@ import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import qualified Seal.Security.Policy as Policy
@@ -563,7 +563,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , memoryRecallOp defaultPageParams (bMemory backends)
       , memoryDeleteOp (bMemory backends)
       , skillWriteOp (bSkills backends) sid
-      , skillReadOp (bSkills backends)
+      , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
       , agentDefWriteOp (bAgentDefs backends) sid
@@ -693,7 +693,7 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
             , memoryRecallOp defaultPageParams (bMemory (cdBackends deps))
             , memoryDeleteOp (bMemory (cdBackends deps))
             , skillWriteOp (bSkills (cdBackends deps)) childSid
-            , skillReadOp (bSkills (cdBackends deps))
+            , skillLoadOp (bSkills (cdBackends deps))
             , skillListOp (bSkills (cdBackends deps))
             , skillDeleteOp (bSkills (cdBackends deps))
             , agentDefReadOp (bAgentDefs (cdBackends deps))

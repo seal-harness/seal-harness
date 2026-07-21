@@ -70,7 +70,7 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -386,7 +386,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , memoryRecallOp defaultPageParams memoryBackend
               , memoryDeleteOp memoryBackend
               , skillWriteOp skillBackend childSid
-              , skillReadOp skillBackend
+              , skillLoadOp skillBackend
               , skillListOp skillBackend
               , skillDeleteOp skillBackend
               , agentDefReadOp agentDefBackend
@@ -459,7 +459,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , memoryRecallOp defaultPageParams memoryBackend
               , memoryDeleteOp memoryBackend
               , skillWriteOp skillBackend sid
-              , skillReadOp skillBackend
+              , skillLoadOp skillBackend
               , skillListOp skillBackend
               , skillDeleteOp skillBackend
               , agentDefWriteOp agentDefBackend sid

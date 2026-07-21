@@ -63,7 +63,7 @@ import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -339,7 +339,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , memoryRecallOp defaultPageParams (bMemory backends)
       , memoryDeleteOp (bMemory backends)
       , skillWriteOp (bSkills backends) sid
-      , skillReadOp (bSkills backends)
+      , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
       , agentDefWriteOp (bAgentDefs backends) sid
@@ -622,7 +622,7 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
             , memoryRecallOp defaultPageParams (bMemory (sdBackends deps))
             , memoryDeleteOp (bMemory (sdBackends deps))
             , skillWriteOp (bSkills (sdBackends deps)) childSid
-            , skillReadOp (bSkills (sdBackends deps))
+            , skillLoadOp (bSkills (sdBackends deps))
             , skillListOp (bSkills (sdBackends deps))
             , skillDeleteOp (bSkills (sdBackends deps))
             , agentDefReadOp (bAgentDefs (sdBackends deps))

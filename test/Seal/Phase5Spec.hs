@@ -40,7 +40,7 @@ import Seal.ISA.Ops.Agent
 import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Registry qualified as ISA
 import Seal.Memory.Backend qualified as Mem
 import Seal.Providers.Class
@@ -127,7 +127,7 @@ buildRegistry cfgRoot workerRan sid = do
     , memoryRecallOp defaultPageParams memBackend
     , memoryDeleteOp memBackend
     , skillWriteOp skillBackend sid
-    , skillReadOp skillBackend
+    , skillLoadOp skillBackend
     , skillListOp skillBackend
     , skillDeleteOp skillBackend
     , agentDefWriteOp defBackend sid

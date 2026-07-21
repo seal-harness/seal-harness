@@ -369,7 +369,7 @@ backend identically to direct application.
 
 ## M3 — Skills group
 
-**Goal:** `SKILL_LIST`, `SKILL_READ`, `SKILL_CREATE`, `SKILL_UPDATE` — Audited
+**Goal:** `SKILL_LIST`, `SKILL_LOAD`, `SKILL_CREATE`, `SKILL_UPDATE` — Audited
 opcodes over a skill store materialized from the Audited log. A *skill* is a
 named Markdown bundle (name + description + body) the agent can read into a
 prompt or update.
@@ -389,7 +389,7 @@ prompt or update.
   (A SQLite backend can be added later by reusing the M2 pattern; M3 ships
   Markdown only to keep the milestone tight.)
 - Create: `src/Seal/ISA/Ops/Skills.hs` — four Audited opcodes. Input schemas:
-  `SKILL_CREATE {id, description, body}`, `SKILL_READ {id}`, `SKILL_UPDATE {id,
+  `SKILL_CREATE {id, description, body}`, `SKILL_LOAD {id}`, `SKILL_UPDATE {id,
   description?, body?}`, `SKILL_LIST {}`. `opAuthorize` validates `SkillId`.
 - Modify: `src/Seal/ISA/Registry.hs`, `src/Seal/Channel/Cli.hs` — register +
   wire.

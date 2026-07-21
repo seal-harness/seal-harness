@@ -66,12 +66,12 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
           skSession s `shouldBe` sampleSession
         Nothing -> expectationFailure "skill not found after update"
 
-  describe "SKILL_READ" $ do
+  describe "SKILL_LOAD" $ do
     it "returns the skill body" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("say hi" :: Text)]))
-      let read' = skillReadOp backend
+      let read' = skillLoadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("s1" :: Text)]))
       orIsError r `shouldBe` False
       case orParts r of
@@ -80,13 +80,13 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
 
     it "errors when the skill does not exist" $ do
       backend <- noneBackend
-      let read' = skillReadOp backend
+      let read' = skillLoadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("nope" :: Text)]))
       orIsError r `shouldBe` True
 
     it "rejects an invalid id" $ do
       backend <- noneBackend
-      let read' = skillReadOp backend
+      let read' = skillLoadOp backend
       r <- runTestApp (opRun read' localBackend (object ["id" .= ("bad/id" :: Text)]))
       orIsError r `shouldBe` True
 
