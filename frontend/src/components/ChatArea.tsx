@@ -1312,6 +1312,37 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     if (e.direction === 'request') {
       const parsed = tryParseJson(e.payload)
       if (parsed) {
+        // SKILL_LOAD result entries (EKHarness with op.name="SKILL_LOAD"
+        // and a "result" key in the payload, recorded by the backend's
+        // recordSkillLoadResult after the opcode runs). Render as a
+        // collapsible ToolCallBlock — collapsed by default showing
+        // "SKILL_LOAD" + the skill id; expanded shows the skill body.
+        // This is the /skill load user-command surface: the slash bubble
+        // shows only the echo line ($ /skill load <id>); the skill body
+        // lives in this transcript entry so it persists across reloads.
+        const opName = (parsed.op as { name?: string } | undefined)?.name
+        if (opName === 'SKILL_LOAD' && parsed.result) {
+          const input = parsed.input as { id?: string } | undefined
+          const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
+          const body = result?.body ?? ''
+          const tc: ToolCallInfo = {
+            id: 'skillload-' + e.id,
+            name: 'SKILL_LOAD',
+            input: input ?? {},
+            result: body,
+            resultIsError: false,
+          }
+          messages.push({
+            id: e.id + '-skillload',
+            entryId: e.id,
+            agentName: 'Skill',
+            agentStatus: 'completed',
+            timestamp: ts,
+            blocks: [{ id: 'tc-skillload-' + e.id, toolCall: tc }],
+            rawJson,
+          })
+          continue
+        }
         // Approval-evidence entries (EKHarness with an "approval" key in
         // the payload). Render as a distinct "approval" row so the user
         // sees the confirmation decision in the transcript.

@@ -110,16 +110,12 @@ spec = describe "Seal.Command.Skill" $ do
       sent `shouldBe` ["invalid skill id: \"bad/id\""]
 
   describe "/skill load" $ do
-    it "renders the body and an echo header line on a valid id" $ do
+    it "echoes only the header line on a successful load (body goes to transcript)" $ do
       (fc, _) <- makeFakeCaps []
       let dispatcher = fakeLoadDispatcher ["# greet\n\ngreeting skill\n\n---\n\nsay hi"] False
       runSkillWith [] dispatcher ["load", "greet"] fc
       sent <- getSent fc
-      case sent of
-        (echo : rest) -> do
-          echo `shouldBe` "$ /skill load greet"
-          T.unlines rest `shouldSatisfy` ("say hi" `T.isInfixOf`)
-        _ -> expectationFailure "expected at least the echo line"
+      sent `shouldBe` ["$ /skill load greet"]
 
     it "reports skill not found when the dispatcher returns an error result" $ do
       (fc, _) <- makeFakeCaps []

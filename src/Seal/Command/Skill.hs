@@ -28,6 +28,7 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Core.Types (OpName (..))
+import Seal.ISA.Opcode (OpResult (..))
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
 
@@ -90,10 +91,19 @@ infoCmd backend raw = CommandAction $ \caps ->
 
 -- | @/skill load <id>@ — dispatch the 'SKILL_LOAD' opcode with @{"id": <id>}@
 -- via the channel-supplied 'CallDispatcher'. Mirrors @/call@'s pattern:
--- echo a header line first (so the "Command output" bubble is self-contained),
--- then render the dispatcher's 'OpResult' (on 'Right') or 'DispatchError'
--- (on 'Left'). The dispatcher records the 'EKHarness' audit entry under
--- the active session's transcript before the opcode runs.
+-- echo a header line first (so the "Command output" bubble is self-contained).
+--
+-- On success, the skill body is NOT rendered via 'ccSend' — the dispatcher
+-- records a second 'EKHarness' entry to the transcript carrying the
+-- @orRecorded@ value (which includes the body), and the frontend renders
+-- that entry as a collapsible tool-call box. This keeps the slash bubble
+-- to just the echo line and avoids duplicating the body in the "command
+-- output — not saved" transient bubble.
+--
+-- On error (dispatch 'Left' or 'Right' with the error flag set), the error
+-- text IS rendered via 'ccSend' so the user sees it in the slash bubble —
+-- error paths produce no transcript body entry, so the slash bubble is
+-- the only surface for the error message.
 loadCmd :: CallDispatcher -> Text -> CommandAction
 loadCmd dispatcher raw = CommandAction $ \caps -> do
   ccSend caps ("$ /skill load " <> raw)
@@ -104,7 +114,9 @@ loadCmd dispatcher raw = CommandAction $ \caps -> do
       res <- dispatcher (OpName "SKILL_LOAD") input
       case res of
         Left e  -> ccSend caps (renderDispatchError e)
-        Right r -> mapM_ (ccSend caps) (renderOpResult r)
+        Right r
+          | orIsError r -> mapM_ (ccSend caps) (renderOpResult r)
+          | otherwise   -> pure ()
 
 -- | One line per skill for @/skill list@.
 renderSkillLine :: Skill -> Text
