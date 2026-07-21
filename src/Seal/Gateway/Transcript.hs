@@ -12,14 +12,16 @@ module Seal.Gateway.Transcript
   ( readTranscriptEntries
   , firstUserMessageSnippet
   , showIso
+  , reconEntryToFrontend
   ) where
 
-import Data.Aeson (Value, object, (.=))
+import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -269,6 +271,30 @@ trpToFrontend blk =
            _ -> object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
     _ -> object ["type" .= ("text" :: Text), "text" .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]
 
+-- | The set of opcode names whose 'EKHarness' entries should surface to
+-- the web frontend SPA as distinct harness entries (not be dropped by
+-- 'reconEntryToFrontend'). v1: @SKILL_LOAD@ so /skill load invocations
+-- appear in the transcript as identifiable skill-load events (per the
+-- user's "properly identified as a skill load operation" requirement).
+-- Approval-bearing entries always surface regardless of this whitelist.
+-- A 'Set' rather than a list to make the shared-state surface
+-- discoverable (see the design doc's §8 risk 2).
+userSurfacingOps :: Set.Set Text
+userSurfacingOps = Set.fromList ["SKILL_LOAD"]
+
+-- | Predicate: does a harness payload's @op.name@ fall in
+-- 'userSurfacingOps'? Returns 'False' for payloads with no @op@ key, a
+-- non-object @op@, or no @name@ field — those are dropped by the filter
+-- (matching the pre-v1 behavior for non-approval harness entries).
+isUserSurfacingOp :: KeyMap.KeyMap Value -> Bool
+isUserSurfacingOp o =
+  case KeyMap.lookup (Key.fromText "op") o of
+    Just (Object opObj) ->
+      case KeyMap.lookup (Key.fromText "name") opObj of
+        Just (String n) -> n `Set.member` userSurfacingOps
+        _               -> False
+    _ -> False
+
 -- | Map a reconstructed 'TranscriptEntry' (from 'reconstruct') to the
 -- frontend's TranscriptEntry JSON shape.
 reconEntryToFrontend :: Int -> TranscriptEntry -> Maybe A.Value
@@ -277,12 +303,16 @@ reconEntryToFrontend idx te =
     A.Null -> Nothing
     -- Drop harness entries (opcode invocations from the dispatcher) that
     -- carry a "harness" key in the payload — UNLESS they also carry an
-    -- "approval" key, which marks them as approval-evidence entries that
+    -- "approval" key (which marks them as approval-evidence entries that
     -- should surface so the user sees the confirmation decision in the
-    -- transcript.
+    -- transcript), OR their op.name is in 'userSurfacingOps' (which marks
+    -- them as user-surfacing opcode invocations like /skill load that
+    -- should appear as distinct harness entries, not be folded into the
+    -- surrounding user/assistant bubbles).
     A.Object o
       | KeyMap.member (Key.fromText "harness") o,
-        not (KeyMap.member (Key.fromText "approval") o) -> Nothing
+        not (KeyMap.member (Key.fromText "approval") o),
+        not (isUserSurfacingOp o) -> Nothing
     payloadVal -> Just $
       let dirStr = case teDirection te of
             Request  -> "request" :: Text

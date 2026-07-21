@@ -84,6 +84,20 @@ harnessEntry convLen = EntryRecord
   , erMeta = Map.fromList [("op", object ["name" .= String "FILE_READ"])]
   }
 
+-- | A 'EKHarness' entry for a SKILL_LOAD invocation (no approval key).
+-- Used to verify 'harnessPayload' includes @op@ in the base payload even
+-- when there is no approval metadata (the v1 surface for /skill load).
+skillLoadHarnessEntry :: Int -> EntryRecord
+skillLoadHarnessEntry convLen = (harnessEntry convLen)
+  { erMeta = Map.fromList
+      [ ( "op"
+        , object [ "name" .= String "SKILL_LOAD"
+                 , "input" .= object ["id" .= String "greet"]
+                 ]
+        )
+      ]
+  }
+
 -- | Pull a field out of a 'TranscriptEntry' payload (assumed to be an object).
 payloadField :: String -> TranscriptEntry -> Maybe Value
 payloadField k te =
@@ -220,6 +234,23 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
           Just (A.Array arr) -> length arr `shouldBe` 2
           other -> expectationFailure ("expected a 2-element content array, got " ++ show other)
       other -> expectationFailure ("expected 6 entries, got " ++ show (length other))
+
+  -- v1 /skill load: a SKILL_LOAD EKHarness entry has no approval key.
+  -- harnessPayload must still include "op" in the base payload so the
+  -- frontend filter (reconEntryToFrontend) can whitelist it. Before the
+  -- fix, "op" was only included in the approval branch.
+  it "harnessPayload includes op in the base payload (no approval key)" $ do
+    let conv = [ Message User [CbText "load the greet skill"] ]
+        entries = [ skillLoadHarnessEntry 0 ]
+    case reconstruct conv entries of
+      [te] -> do
+        case payloadField "op" te of
+          Just (Object opObj) ->
+            case KeyMap.lookup (Key.fromString "name") opObj of
+              Just (String n) -> n `shouldBe` "SKILL_LOAD"
+              other -> expectationFailure ("expected op.name=SKILL_LOAD, got " ++ show other)
+          other -> expectationFailure ("expected op object in payload, got " ++ show other)
+      other -> expectationFailure ("expected 1 entry, got " ++ show (length other))
 
 isJustArray :: Maybe Value -> Bool
 isJustArray (Just (Array _)) = True

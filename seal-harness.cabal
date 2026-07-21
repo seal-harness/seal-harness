@@ -264,6 +264,7 @@ test-suite tests
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
+        Seal.Gateway.TranscriptSpec
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
         Seal.Harness.ReconcileSpec

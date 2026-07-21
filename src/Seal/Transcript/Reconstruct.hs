@@ -139,22 +139,28 @@ responsePayload mEnv msgs e = object
   ]
 
 -- | A harness turn's payload: the conversation lines added since the prior
--- turn (the harness's input/output as messages), plus the harness name.
--- When the entry carries approval metadata (erMeta has an "approval" key),
--- the payload includes the approval info so the frontend can render it.
+-- turn (the harness's input/output as messages), plus the harness name and
+-- the opcode metadata. The @op@ field is always included in the base
+-- payload (v1: so the frontend filter 'Seal.Gateway.Transcript.reconEntryToFrontend'
+-- can whitelist @op.name == "SKILL_LOAD"@ and surface /skill load
+-- invocations as distinct harness entries). When the entry carries
+-- approval metadata (erMeta has an "approval" key), the payload also
+-- includes the approval info so the frontend can render the confirmation
+-- decision.
 harnessPayload :: [Message] -> EntryRecord -> Value
 harnessPayload msgs e =
   let base = object
         [ "messages" .= msgs
         , "harness"  .= erHarness e
+        , "op"       .= (Map.lookup "op" (erMeta e) :: Maybe Value)
         ]
   in case Map.lookup "approval" (erMeta e) of
        Nothing -> base
        Just approvalVal -> object
          [ "messages" .= msgs
          , "harness"  .= erHarness e
+         , "op"       .= (Map.lookup "op" (erMeta e) :: Maybe Value)
          , "approval" .= approvalVal
-         , "op" .= (Map.lookup "op" (erMeta e) :: Maybe Value)
          ]
 
 -- | Lift an 'EntryRecord' into a 'TranscriptEntry' with the given direction
