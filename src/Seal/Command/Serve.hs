@@ -38,7 +38,7 @@ import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
+import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
@@ -228,8 +228,13 @@ runServeMain autonomy = do
   -- so the agent loop is identical to the standalone modes.
   forkSignalListener chanDeps cfg registry
   forkTelegramListener chanDeps cfg registry
-  -- Run the HTTP gateway (blocks)
-  runGateway gwCfg deps
+  -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
+  -- mode=remote (design V6: prevents network access to the unauthenticated
+  -- updateRuntimeConfig caller).
+  let isRemote = case scUntrustedExec secCfg of
+        Just uefc -> uefcMode uefc == "remote"
+        Nothing   -> False
+  runGateway gwCfg isRemote deps
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
