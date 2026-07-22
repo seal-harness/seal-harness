@@ -208,15 +208,18 @@ spec = describe "Seal.Config.Security" $ do
 
 -- | Generator for arbitrary SecurityConfig values (for the QuickCheck property).
 genSecurityConfig :: Gen SecurityConfig
-genSecurityConfig = SecurityConfig
-  <$> pure Nothing   -- scVaultPath
-  <*> pure Nothing   -- scVaultRecipient
-  <*> pure Nothing   -- scVaultIdentity
-  <*> pure Nothing   -- scVaultUnlock
-  <*> pure Nothing   -- scVaultKeyType
-  <*> oneof
+genSecurityConfig = do
+  uefc <- oneof
        [ pure Nothing
        , Just <$> (UntrustedExecFileConfig
            <$> elements ["local", "remote"]
            <*> pure Nothing)
        ]
+  pure SecurityConfig
+    { scVaultPath      = Nothing
+    , scVaultRecipient = Nothing
+    , scVaultIdentity  = Nothing
+    , scVaultUnlock    = Nothing
+    , scVaultKeyType   = Nothing
+    , scUntrustedExec  = uefc
+    }

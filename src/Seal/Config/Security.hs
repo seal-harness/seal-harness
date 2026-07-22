@@ -193,9 +193,7 @@ updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
 -- — fail-closed is at call time (spec §7 row 1), not at config resolution.
 untrustedExecConfigFromSecurity :: SecurityConfig -> Maybe UntrustedExecConfig
 untrustedExecConfigFromSecurity cfg =
-  case scUntrustedExec cfg of
-    Nothing -> Nothing
-    Just uec -> resolveByMode uec
+  resolveByMode =<< scUntrustedExec cfg
 
 resolveByMode :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
 resolveByMode uec =
