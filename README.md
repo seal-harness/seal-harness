@@ -230,7 +230,7 @@ logged in session transcript AND in a unified cross-session append-only log).
 | Group | Key Opcodes | Trust |
 |---|---|---|
 | **Memory** | `MEMORY_WRITE`, `MEMORY_RECALL`, `MEMORY_DELETE` | Audited |
-| **Skills** | `SKILL_WRITE`, `SKILL_READ`, `SKILL_LIST`, `SKILL_DELETE` | Audited |
+| **Skills** | `SKILL_WRITE`, `SKILL_LOAD`, `SKILL_LIST`, `SKILL_DELETE` | Audited |
 | **Agents** | `AGENT_DEF_WRITE`, `AGENT_DEF_READ`, `AGENT_DEF_LIST`, `AGENT_DEF_DELETE`, `AGENT_INSTANCES`, `AGENT_START`, `AGENT_STATUS`, `AGENT_STOP` | Audited |
 | **Config** | `CONFIG_VIEW`, `CONFIG_UPDATE`, `TARGET_SET`, `PROVIDER_LIST` | Audited |
 | **Secrets** | `SECRET_SAVE`, `SECRET_GET`, `SECRET_LIST`, `SECRET_DELETE`, `VAULT_STATUS` | Audited |

@@ -43,6 +43,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
+import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
@@ -57,7 +58,7 @@ import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 #endif
@@ -70,7 +71,7 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Secret (secretGetOp)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -386,7 +387,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , memoryRecallOp defaultPageParams memoryBackend
               , memoryDeleteOp memoryBackend
               , skillWriteOp skillBackend childSid
-              , skillReadOp skillBackend
+              , skillLoadOp skillBackend
               , skillListOp skillBackend
               , skillDeleteOp skillBackend
               , agentDefReadOp agentDefBackend
@@ -459,7 +460,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , memoryRecallOp defaultPageParams memoryBackend
               , memoryDeleteOp memoryBackend
               , skillWriteOp skillBackend sid
-              , skillReadOp skillBackend
+              , skillLoadOp skillBackend
               , skillListOp skillBackend
               , skillDeleteOp skillBackend
               , agentDefWriteOp agentDefBackend sid
@@ -545,7 +546,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
               runApp appEnv (runTurn env prompt)))
-      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher])
+      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
       -- The /call dispatcher: dispatch an opcode against the active
       -- session's ISA registry + transcript under Full autonomy (the
       -- operator is the approver by typing /call). Returns the
@@ -563,7 +564,11 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           let startWiring = cliStartWiring sid
               isaReg = cliIsaReg sid startWiring caps
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          case res of
+            Right r -> recordSkillLoadResult tHandle callOpName val r
+            Left _  -> pure ()
+          pure res
       plainHandler t = do
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->

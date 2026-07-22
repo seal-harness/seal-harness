@@ -1,0 +1,16 @@
+# Active Plan
+<!-- approved: 2026-07-07 -->
+<!-- gate-iterations: 5 -->
+<!-- user-approved: true -->
+<!-- status: completed -->
+
+Phase 4 — Untrusted opcode breadth + isolation. COMPLETE.
+Full plan at: docs/superpowers/plans/2026-07-07-phase-4-untrusted-opcodes.md
+
+All 8 sub-phases (4a–4h) complete. 23 tasks committed.
+
+Test suite: 1075 examples, 0 failures, 6 pending. hlint clean. Hardened build green.
+All 11 new opcodes landed + GADT capability scoping + compile-fail fixture +
+runtime config + remote SSH executor + remote-only-untrusted Cabal flag.
+
+Next: resume Phase 7b (paused) or Phase 8 (Channels).

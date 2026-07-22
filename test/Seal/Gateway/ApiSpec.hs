@@ -38,7 +38,7 @@ import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson)
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -2125,7 +2125,7 @@ spec = describe "Seal.Gateway.API" $ do
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
-          registry = mkRegistry [ skillCommandSpec (bSkills backends) ]
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps) ]
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt

@@ -12,6 +12,7 @@ import qualified Seal.Gateway.ApiSpec
 import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
+import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
@@ -58,6 +59,7 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.ClassSpec
+import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
 import qualified Seal.Channels.Signal.RunSpec
@@ -135,6 +137,7 @@ main = hspec $ do
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
+  Seal.Gateway.TranscriptSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
@@ -181,6 +184,7 @@ main = hspec $ do
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec
   Seal.Channels.ClassSpec.spec
+  Seal.Channels.LoopSpec.spec
   Seal.Channels.SignalSpec.spec
   Seal.Channels.TelegramSpec.spec
   Seal.Channels.Telegram.CommandsSpec.spec

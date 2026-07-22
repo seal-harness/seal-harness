@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The Skills opcode group: SKILL_WRITE, SKILL_READ, SKILL_LIST, SKILL_DELETE.
+-- | The Skills opcode group: SKILL_WRITE, SKILL_LOAD, SKILL_LIST, SKILL_DELETE.
 -- All Audited — the dispatcher writes both the session transcript and the
 -- Audited log; the opcodes mutate the in-memory/Markdown backend (the
 -- materialized view). 'orRecorded' carries the secret-free 'SkillId' + op name
@@ -14,7 +14,7 @@
 -- into a single opcode, eliminating one failure path.
 module Seal.ISA.Ops.Skills
   ( skillWriteOp
-  , skillReadOp
+  , skillLoadOp
   , skillListOp
   , skillDeleteOp
   ) where
@@ -134,17 +134,17 @@ skillWriteOp backend session = TrustedOpcode
   where
     checkId t = either (Left . ("invalid skill id: " <>)) (const (Right ())) (mkSkillId t)
 
--- | SKILL_READ: return one skill by id. Audited — the agent reading its own
+-- | SKILL_LOAD: return one skill by id. Audited — the agent reading its own
 -- skills is an evolutionary event worth logging, with secret-free metadata.
 -- The skill body is returned to the model (agent-visible) and recorded in full.
-skillReadOp :: SkillBackend -> Opcode
-skillReadOp backend = TrustedOpcode
-  { toName = OpName "SKILL_READ"
+skillLoadOp :: SkillBackend -> Opcode
+skillLoadOp backend = TrustedOpcode
+  { toName = OpName "SKILL_LOAD"
   , toTrust = Trusted
-  , toDesc = "Read one agent skill by id into the prompt."
-  , toInSchema = singleStringSchema "id" "The skill id to read."
+  , toDesc = "Load one agent skill by id into the current session."
+  , toInSchema = singleStringSchema "id" "The skill id to load."
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "SKILL_READ requires {id:string}") checkId . idField
+  , toAuthorize = maybe (Left "SKILL_LOAD requires {id:string}") checkId . idField
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of

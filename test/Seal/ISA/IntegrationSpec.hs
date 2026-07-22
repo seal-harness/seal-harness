@@ -516,17 +516,17 @@ spec = describe "Seal.ISA.Integration" $ do
             []     -> expectationFailure "expected at least one skill"
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
-  describe "SKILL_READ" $ do
-    it "\"Show me the 'greeting' skill.\" -> SKILL_READ -> skill body returned" $ do
+  describe "SKILL_LOAD" $ do
+    it "\"Show me the 'greeting' skill.\" -> SKILL_LOAD -> skill body returned" $ do
       backend <- SkillBackend.noneBackend
       _ <- runTestApp (dispatchOne (Registry.mkRegistry [skillWriteOp backend sid])
                           (OpName "SKILL_WRITE")
                           (object [ "id" .= ("greeting" :: Text)
                                   , "description" .= ("say hello" :: Text)
                                   , "body" .= ("say hello warmly" :: Text) ]))
-      let op = skillReadOp backend
+      let op = skillLoadOp backend
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOne reg (OpName "SKILL_READ")
+      r <- runTestApp (dispatchOne reg (OpName "SKILL_LOAD")
                         (object ["id" .= ("greeting" :: Text)]))
       case r of
         Right res -> do

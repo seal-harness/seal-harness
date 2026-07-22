@@ -7,7 +7,7 @@
 -- @on_demand_schemas@ config flag is set, so sessions that keep full
 -- schemas inline never see them.
 --
--- 'OPCODE_DESCRIBE' mirrors the 'SKILL_READ' pattern: take an opcode
+-- 'OPCODE_DESCRIBE' mirrors the 'SKILL_LOAD' pattern: take an opcode
 -- name, render name + description + input schema + output schema as
 -- Markdown-ish text the model can read into its context before calling
 -- the tool. 'OPCODE_LIST' mirrors 'SKILL_LIST': a cheap name +

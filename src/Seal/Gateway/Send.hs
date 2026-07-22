@@ -63,7 +63,7 @@ import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -73,7 +73,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -339,7 +339,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , memoryRecallOp defaultPageParams (bMemory backends)
       , memoryDeleteOp (bMemory backends)
       , skillWriteOp (bSkills backends) sid
-      , skillReadOp (bSkills backends)
+      , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
       , agentDefWriteOp (bAgentDefs backends) sid
@@ -538,7 +538,11 @@ webCallDispatcher deps callOpName val = do
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    case res of
+      Right r -> recordSkillLoadResult tHandle callOpName val r
+      Left _  -> pure ()
+    pure res
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the CLI's
 -- 'mintAgentSession'). Each start gets its own timestamped id.
@@ -622,7 +626,7 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
             , memoryRecallOp defaultPageParams (bMemory (sdBackends deps))
             , memoryDeleteOp (bMemory (sdBackends deps))
             , skillWriteOp (bSkills (sdBackends deps)) childSid
-            , skillReadOp (bSkills (sdBackends deps))
+            , skillLoadOp (bSkills (sdBackends deps))
             , skillListOp (bSkills (sdBackends deps))
             , skillDeleteOp (bSkills (sdBackends deps))
             , agentDefReadOp (bAgentDefs (sdBackends deps))

@@ -39,6 +39,7 @@ module Seal.Channels.Loop
   , plainTurn
   , buildIsaRegistry
   , mkBgRunner
+  , channelCallDispatcher
   ) where
 
 import Control.Concurrent (forkIO)
@@ -72,7 +73,9 @@ import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
   ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, newCursorStore )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
+import Seal.Command.Call (CallDispatcher, callCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
   ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
@@ -94,12 +97,13 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, AgentStartWiring (..) )
-import Seal.ISA.Opcode (opName)
+import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
@@ -112,7 +116,7 @@ import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillReadOp, skillWriteOp )
+  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import qualified Seal.Security.Policy as Policy
@@ -132,7 +136,7 @@ import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs )
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
-import Seal.Tools.Exec.Types (ExecBackend (..))
+import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -240,7 +244,12 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
     -- any /bg dispatch.
     bgConvSid <- newIORef (error "bgConvSid: set before first dispatch" :: SessionId)
     let bgRunner = mkBgRunner deps h askReply bgConvSid
-        registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner])
+        callDispatcher = channelCallDispatcher deps h askReply bgConvSid
+        registryWithBg = mkRegistry (registrySpecs registry <>
+          [ backgroundCommandSpec bgRunner
+          , callCommandSpec callDispatcher
+          , skillCommandSpec (bSkills (cdBackends deps)) callDispatcher
+          ])
     loop h registryWithBg bgConvSid
   where
     loop h reg bgConvSid = do
@@ -538,6 +547,52 @@ mkBgRunner deps h askReply bgConvSid = BgRunner $ \prompt -> do
   saveSessionMeta (cdPaths deps) meta
   void (forkIO (runTurnOnSession deps h askReply convSid meta Nothing prompt))
 
+-- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.
+-- Dispatches an opcode against the active session's ISA registry + transcript
+-- under 'Full' autonomy semantics (the operator is the approver by typing the
+-- command). Reads the session id from the supplied 'IORef' fresh on each
+-- invocation — the 'runChannelLoop' body writes the cursor-resolved 'sid' to
+-- this IORef every turn at Loop.hs:266, so the dispatcher always sees the
+-- active session.
+--
+-- Constructed inside 'runChannelLoop' at Loop.hs:243 in the @let@-block
+-- where 'bgConvSid' (the IORef) and 'askReply' (the 'AskReplyStore' param)
+-- are in scope, and baked into 'registryWithBg' alongside
+-- 'backgroundCommandSpec', 'callCommandSpec', and 'skillCommandSpec' so
+-- @/call@ and @/skill load@ dispatch against the same per-session registry
+-- + transcript. Mirrors 'webCallDispatcher' at
+-- 'Seal.Gateway.Send.hs:516-541'.
+channelCallDispatcher
+  :: ChannelDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> CallDispatcher
+channelCallDispatcher deps h askReply sidRef callOpName val = do
+  sid <- readIORef sidRef
+  let paths = cdPaths deps
+      sessionDirPath = sessionDir paths sid
+  createDirectoryIfMissing True sessionDirPath
+  withTwoFileTranscript sessionDirPath $ \tHandle -> do
+    wsRoot <- WorkspaceRoot <$> getCurrentDirectory
+    appEnv <- mkEnv defaultConfig
+    eCfg <- loadFileConfig (prConfigPath (cdProvider deps))
+    let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+        execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+        defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
+        caps = mkHandleCaps h askReply sid
+        onDemand = either (const False) onDemandSchemas eCfg
+        startWiring = channelStartWiring
+          deps paths sid caps execBackend appEnv eCfg
+          wsRoot operatorCeiling isaReg
+        isaReg = buildIsaRegistry
+          (cdVault deps) (cdBackends deps) wsRoot sid operatorCeiling
+          execBackend (cdAutonomy deps) startWiring
+          (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
+          caps onDemand
+    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    case res of
+      Right r -> recordSkillLoadResult tHandle callOpName val r
+      Left _  -> pure ()
+    pure res
+
 -- | Build the ISA registry for a channel turn. Mirrors
 -- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set
 -- as the web and CLI paths.
@@ -563,7 +618,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , memoryRecallOp defaultPageParams (bMemory backends)
       , memoryDeleteOp (bMemory backends)
       , skillWriteOp (bSkills backends) sid
-      , skillReadOp (bSkills backends)
+      , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
       , agentDefWriteOp (bAgentDefs backends) sid
@@ -693,7 +748,7 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
             , memoryRecallOp defaultPageParams (bMemory (cdBackends deps))
             , memoryDeleteOp (bMemory (cdBackends deps))
             , skillWriteOp (bSkills (cdBackends deps)) childSid
-            , skillReadOp (bSkills (cdBackends deps))
+            , skillLoadOp (bSkills (cdBackends deps))
             , skillListOp (bSkills (cdBackends deps))
             , skillDeleteOp (bSkills (cdBackends deps))
             , agentDefReadOp (bAgentDefs (cdBackends deps))
