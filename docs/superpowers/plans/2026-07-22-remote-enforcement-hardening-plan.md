@@ -123,7 +123,9 @@ path (per Architect reviewer Q1 and Designer reviewer Q1). The vault runtime
 **Tests (RED first):**
 - `test/Seal/Config/SecuritySpec.hs` — **NEW** (mirrors `FileSpec.hs`):
   parse `security.toml` with `[untrusted_execution]` + `[vault]` sections;
-  absent file → `defaultSecurityConfig`; round-trip; malformed → `Left`.
+  absent file → `defaultSecurityConfig`; round-trip; malformed TOML → parser
+  `Left` (the boot-fail-open wrapper is tested in W2's `MigrateSpec`/
+  `SecuritySpec` boot-behavior section — see W2 DoD #8).
 - `test/Seal/Config/FileSpec.hs` — move the `"untrusted_execution section"`
   describe block (lines 244-332) to `SecuritySpec.hs`; delete the round-trip
   test for `[untrusted_execution]` in `FileSpec` (the field is no longer in
@@ -181,7 +183,12 @@ path (per Architect reviewer Q1 and Designer reviewer Q1). The vault runtime
    sections are cleaned up with a warning (design §9.2 precedence).
 7. The security config is loaded ONCE at boot, NOT re-loaded per session
    (the session-start seams `Loop.hs:498` etc. load `RuntimeConfig` only).
-8. `make check` passes.
+8. **Malformed `security.toml` (exists but unparseable) → boot proceeds**
+   (fail-open for boot per design §9.2): `loadSecurityConfig` catches the
+   parse error, logs a stderr error, returns `defaultSecurityConfig` (which
+   has no remote → untrusted opcodes fail-closed at call time on hardened
+   build; defaults to `mode=local` on default build). Boot does NOT abort.
+9. `make check` passes.
 
 **Rollback / downgrade note:** Migration removes `[untrusted_execution]`/
 `vault_*` from `config.toml`. An operator who downgrades to an older `seal`
@@ -203,6 +210,11 @@ operator who needs to downgrade must manually copy values from
   exists + config.toml clean → no-op; (4) neither → no-op; (5) write failure →
   fail-open + error logged. Plus: idempotency (run twice), corrupted legacy
   input preserved, migration marker comment written to `config.toml`.
+- `test/Seal/Config/SecuritySpec.hs` (boot-behavior section) — **malformed
+  `security.toml` boot-fail-open** (design §9.2): a `security.toml` with
+  invalid TOML → `loadSecurityConfig` catches the parse error, logs to
+  stderr, returns `defaultSecurityConfig`; boot does not abort; on a hardened
+  build untrusted opcodes fail-closed at call time (no remote configured).
 - `test/Seal/Config/SecuritySpec.hs` — file-mode 0600 assertion;
   `security.toml` path is `~/.seal/security.toml` (not inside `config/`);
   absent + no legacy → `defaultSecurityConfig`.
