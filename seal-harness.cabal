@@ -334,6 +334,7 @@ test-suite tests
         Seal.Command.NewSpec
         Seal.Config.FileSpec
         Seal.Config.SecuritySpec
+        Seal.Config.SecurityScopingFailSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec

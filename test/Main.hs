@@ -54,6 +54,7 @@ import qualified Seal.Command.TabSpec
 import qualified Seal.Command.NewSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.SecuritySpec
+import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.Vault.BackendSpec
 import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
@@ -180,6 +181,7 @@ main = hspec $ do
   Seal.Command.NewSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Config.SecuritySpec.spec
+  Seal.Config.SecurityScopingFailSpec.spec
   Seal.Vault.BackendSpec.spec
   Seal.Vault.CommandsSpec.spec
   Seal.IngestSpec.spec

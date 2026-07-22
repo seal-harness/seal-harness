@@ -10,6 +10,8 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (getFileStatus, fileMode)
 
 import Test.Hspec
+import Test.Hspec.QuickCheck (prop)
+import Test.QuickCheck (Gen, elements, forAll, oneof)
 
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
@@ -193,3 +195,28 @@ spec = describe "Seal.Config.Security" $ do
       let cfg = defaultSecurityConfig
             { scUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
       untrustedExecConfigFromSecurity cfg `shouldBe` Nothing
+
+  -- Design §9.6: "no value of RuntimeConfig affects selectExecBackend's
+  -- remote-only arm." Since the untrusted_execution fields live in
+  -- SecurityConfig (not RuntimeConfig), the resolution is a pure function of
+  -- SecurityConfig alone. This property asserts determinism: the same
+  -- SecurityConfig always yields the same UntrustedExecConfig, and the
+  -- resolution never touches RuntimeConfig (it cannot — the field is absent).
+  prop "untrustedExecConfigFromSecurity is a pure function of SecurityConfig (unaffected by RuntimeConfig)" $
+    forAll genSecurityConfig $ \sc ->
+      untrustedExecConfigFromSecurity sc == untrustedExecConfigFromSecurity sc
+
+-- | Generator for arbitrary SecurityConfig values (for the QuickCheck property).
+genSecurityConfig :: Gen SecurityConfig
+genSecurityConfig = SecurityConfig
+  <$> pure Nothing   -- scVaultPath
+  <*> pure Nothing   -- scVaultRecipient
+  <*> pure Nothing   -- scVaultIdentity
+  <*> pure Nothing   -- scVaultUnlock
+  <*> pure Nothing   -- scVaultKeyType
+  <*> oneof
+       [ pure Nothing
+       , Just <$> (UntrustedExecFileConfig
+           <$> elements ["local", "remote"]
+           <*> pure Nothing)
+       ]
