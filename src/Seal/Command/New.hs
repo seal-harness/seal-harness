@@ -34,7 +34,7 @@ import Seal.Channel.Cli (Backends (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
-import Seal.Config.File (FileConfig)
+import Seal.Config.File (RuntimeConfig)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
@@ -57,7 +57,7 @@ import Seal.Session.Store
 -- in one callback.
 data NewDeps = NewDeps
   { ndPaths        :: SealPaths
-  , ndCfg          :: IO FileConfig
+  , ndCfg          :: IO RuntimeConfig
   , ndAgentDefs    :: Backends
   , ndChannelLabel :: Text
   , ndOldMeta      :: IO SessionMeta

@@ -19,12 +19,14 @@ import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Command.Spec (mkRegistry)
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
+import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
   , configFilePath
   , ensureSealDirs
   , getSealPaths
+  , securityFilePath
   , vaultFilePath
   )
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -42,9 +44,9 @@ import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 -- | Open the vault if both recipient and identity are configured.
 -- Failures print a warning and return 'Nothing' so the TUI still starts;
 -- vault commands will direct the user to run @\/vault setup@.
-tryOpenVault :: SealPaths -> FileConfig -> IO (Maybe VaultHandle)
+tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe VaultHandle)
 tryOpenVault paths cfg =
-  case (fcVaultRecipient cfg, fcVaultIdentity cfg) of
+  case (scVaultRecipient cfg, scVaultIdentity cfg) of
     (Just _, Just _) ->
       resolveEncryptor cfg >>= \case
         Left err -> do
@@ -56,9 +58,9 @@ tryOpenVault paths cfg =
           -- same expression so all three stay in sync.
           let vcfg = VaultConfig
                 { vcPath    = maybe (vaultFilePath paths) T.unpack
-                                    (fcVaultPath cfg)
-                , vcKeyType = fromMaybe "x25519" (fcVaultKeyType cfg)
-                , vcUnlock  = parseUnlockMode (fcVaultUnlock cfg)
+                                    (scVaultPath cfg)
+                , vcKeyType = fromMaybe "x25519" (scVaultKeyType cfg)
+                , vcUnlock  = parseUnlockMode (scVaultUnlock cfg)
                 }
           Just <$> openVault vcfg enc
     _ -> pure Nothing
@@ -70,12 +72,17 @@ runTui autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
-  cfg <- loadFileConfig cfgPath >>= \case
+  cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
       putStrLn ("Warning: could not load config: " <> T.unpack err)
-      pure defaultFileConfig
+      pure defaultRuntimeConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths cfg
+  secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
+    Left err -> do
+      putStrLn ("Warning: could not load security config: " <> T.unpack err)
+      pure defaultSecurityConfig
+    Right c  -> pure c
+  mHandle <- tryOpenVault paths secCfg
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths

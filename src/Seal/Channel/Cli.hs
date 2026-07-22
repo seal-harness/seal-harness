@@ -11,7 +11,7 @@ module Seal.Channel.Cli
   , resolveDefProvider
   , mkSessionAgentEnv
   , debugRequestsPath
-  , execBackendFromFile
+  , execBackendFromSecurity
   , Backends (..)
   , newBackends
   ) where
@@ -47,10 +47,11 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
-import Seal.Config.File (FileConfig, defaultFileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile, onDemandSchemas,
-                          fcDebugSessionTranscript, fcDelegation)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath)
+import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
+                          defaultRetrievalMaxScanBytes, onDemandSchemas,
+                          rcDebugSessionTranscript, rcDelegation)
+import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -185,7 +186,7 @@ resolveSessionProvider pr meta =
   case parseProvider (smProvider meta) of
     Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
     Just kp -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
           model   = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
@@ -198,7 +199,7 @@ resolveDefProvider pr providerLabel model =
   case parseProvider providerLabel of
     Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel))
     Just kp -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
@@ -234,17 +235,17 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
 -- 'CompletionRequest' in full (including the complete message history) exactly
 -- as sent to the LLM, so we can debug whether the two-file storage format is
 -- correctly feeding the session history to the provider.
-debugRequestsPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugRequestsPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
 debugRequestsPath paths sid eCfg =
   case eCfg of
-    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
 
 -- | Resolve the on-demand-schemas flag from the loaded config. 'True' when
 -- @on_demand_schemas@ is set in the config file; 'False' on load error or
 -- when the key is absent (matching the default behavior).
-onDemandFromCfg :: Either a FileConfig -> Bool
+onDemandFromCfg :: Either a RuntimeConfig -> Bool
 onDemandFromCfg eCfg =
   case eCfg of
     Right cfg -> onDemandSchemas cfg
@@ -291,19 +292,15 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
   -- on bytes scanned per FILE_READ). Falls back to the 128 KiB default when
   -- the [retrieval] section is absent. Loaded once at startup; a config
   -- change takes effect on the next session.
-  eCfg <- loadFileConfig (prConfigPath pr)
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Resolve the untrusted-execution backend (Phase 4 4b-T3). Absent
-      -- section or mode=local → the local executor (wired to wsRoot);
-      -- mode=remote → the SSH executor (if fully configured) or fail-closed
-      -- (the dispatcher surfaces the structured error at call time). The
-      -- remote executor itself lands in 4g; until then mode=remote without
-      -- a real SSH executor falls back to the local executor's placeholder
-      -- (the opcode fail-closes via 'ExecNotImplemented' if it actually
-      -- needs the remote). 4b-T3 wires the LOCAL arm to the real
-      -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
-      execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromFile
+      -- Resolve the untrusted-execution backend from the SecurityConfig
+      -- (loaded from security.toml, not config.toml). The security config
+      -- is agent-immutable (design §4 E): the exec backend cannot be
+      -- flipped by a future CONFIG_UPDATE opcode.
+      execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
+      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromSecurity
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
@@ -427,8 +424,8 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               }
             mkWorker = mkDelegateWorker delegateDeps
             delegationCfg = do
-              eCfg' <- loadFileConfig (prConfigPath pr)
-              pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+              eCfg' <- loadRuntimeConfig (prConfigPath pr)
+              pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
         in AgentStartWiring
           { aswDefBackend = agentDefBackend
           , aswRuntime = agentRuntime
@@ -518,7 +515,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
     -- built per-invocation (its own sid, its own transcript bracket) —
     -- unchanged by the per-turn refactor.
       bgRunner = BgRunner $ \prompt -> do
-        cfg <- fromRight defaultFileConfig <$> loadFileConfig (prConfigPath pr)
+        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
         (mAgent, mProv, mModel) <- resolveDefaultAgent agentDefBackend cfg
         let (cfgProv, cfgModel) = defaultSessionSelection cfg
             provider = fromMaybe cfgProv mProv
@@ -658,15 +655,15 @@ handleTabCommand caps tabsH = \case
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
 
--- | Resolve the untrusted-execution 'ExecBackend' from the 'FileConfig'.
+-- | Resolve the untrusted-execution 'ExecBackend' from the 'SecurityConfig'.
 -- Absent section / mode=local → 'EbLocal' (the real local executor wired
 -- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
 -- (the SSH executor; the opcodes run remotely). mode=remote + remote
 -- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
 -- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
-execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
-execBackendFromFile _wsRoot cfg =
-  case untrustedExecConfigFromFile cfg of
+execBackendFromSecurity :: WorkspaceRoot -> SecurityConfig -> ExecBackend
+execBackendFromSecurity _wsRoot cfg =
+  case untrustedExecConfigFromSecurity cfg of
     Nothing -> defaultBackend
     Just uec ->
       case uecRemote uec of

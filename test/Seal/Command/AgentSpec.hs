@@ -15,7 +15,7 @@ import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Agent (agentCommandSpec, renderAgentInfo, renderAgentLine)
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
-import Seal.Config.File (FileConfig (..), loadFileConfig)
+import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.FakeCaps (FakeCaps (..), getSent, makeFakeCaps)
@@ -129,8 +129,8 @@ spec = describe "Seal.Command.Agent" $ do
         sent <- getSent fc
         sent `shouldBe` ["default agent set to: worker"]
         -- persisted to config.toml
-        eCfg <- loadFileConfig cfgPath
-        fcDefaultAgent <$> eCfg `shouldBe` Right (Just "worker")
+        eCfg <- loadRuntimeConfig cfgPath
+        rcDefaultAgent <$> eCfg `shouldBe` Right (Just "worker")
 
     it "default with an unknown def refuses and does not persist" $ do
       withSystemTempDirectory "seal-agent" $ \root -> do
@@ -139,8 +139,8 @@ spec = describe "Seal.Command.Agent" $ do
         runAgentWith [] ["default", "nope"] fc cfgPath
         sent <- getSent fc
         sent `shouldBe` ["agent def not found: nope"]
-        eCfg <- loadFileConfig cfgPath
-        fcDefaultAgent <$> eCfg `shouldBe` Right Nothing
+        eCfg <- loadRuntimeConfig cfgPath
+        rcDefaultAgent <$> eCfg `shouldBe` Right Nothing
 
     it "default rejects an invalid id" $ do
       withSystemTempDirectory "seal-agent" $ \root -> do

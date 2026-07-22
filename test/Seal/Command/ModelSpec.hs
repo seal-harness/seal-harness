@@ -16,7 +16,7 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Config.File
-  (ProviderConfig (..), loadFileConfig, providerDefaultModel, updateFileConfig, upsertProvider)
+  (ProviderConfig (..), loadRuntimeConfig, providerDefaultModel, updateRuntimeConfig, upsertProvider)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Security.Vault (VaultHandle)
@@ -111,7 +111,7 @@ spec = describe "Seal.Command.Model" $ do
       sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
       (fc, caps) <- makeFakeCaps []
       runModel pr sr ["default", "ollama", "glm-5.2:cloud"] caps
-      Right cfg <- loadFileConfig (srConfigPath sr)
+      Right cfg <- loadRuntimeConfig (srConfigPath sr)
       providerDefaultModel cfg "ollama" `shouldBe` Just "glm-5.2:cloud"
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("glm-5.2:cloud" `T.isInfixOf`)
@@ -119,7 +119,7 @@ spec = describe "Seal.Command.Model" $ do
   it "use without a model uses the provider's default" $
     withSystemTempDirectory "seal-model" $ \root -> do
       sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
-      _ <- updateFileConfig (srConfigPath sr)
+      _ <- updateRuntimeConfig (srConfigPath sr)
              (upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" }))
       (_, caps) <- makeFakeCaps []
       runModel pr sr ["use", "ollama"] caps
@@ -138,7 +138,7 @@ spec = describe "Seal.Command.Model" $ do
   it "list shows a configured section default" $
     withSystemTempDirectory "seal-model" $ \root -> do
       sr <- mkSR root; pr <- mkPR (srConfigPath sr) Nothing
-      _ <- updateFileConfig (srConfigPath sr)
+      _ <- updateRuntimeConfig (srConfigPath sr)
              (upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" }))
       (fc, caps) <- makeFakeCaps []
       runModel pr sr ["list"] caps

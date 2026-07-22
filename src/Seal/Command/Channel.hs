@@ -7,7 +7,7 @@
 -- The Telegram wizard prompts for a BotFather token, validates it via the
 -- Bot API @getMe@ endpoint, and writes the @[telegram]@ section. Mirrors
 -- PureClaw's @\/channel signal@ wizard; adapted to Seal's 'ChannelCaps' +
--- 'FileConfig' + 'SealPaths' shape.
+-- 'RuntimeConfig' + 'SealPaths' shape.
 module Seal.Command.Channel
   ( channelCommandSpec
   , ChannelRuntime (..)
@@ -53,8 +53,8 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig,
-                         saveFileConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig,
+                         saveRuntimeConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Security.Vault qualified as Vault
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
@@ -322,16 +322,16 @@ writeSignalConfig :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
 writeSignalConfig rt caps phoneNumber = do
   let cfgPath = crConfigPath rt
   createDirectoryIfMissing True (takeDirectory cfgPath)
-  existing <- loadFileConfig cfgPath
-  let baseCfg = fromRight defaultFileConfig existing
+  existing <- loadRuntimeConfig cfgPath
+  let baseCfg = fromRight defaultRuntimeConfig existing
       updated = baseCfg
-        { fcSignal = Just SignalConfig
+        { rcSignal = Just SignalConfig
             { scAccount        = Just phoneNumber
             , scTextChunkLimit = Just defaultSignalChunkLimit
             , scAllowFrom      = AllowAll
             }
         }
-  saveFileConfig cfgPath updated
+  saveRuntimeConfig cfgPath updated
   ccSend caps $ T.intercalate "\n"
     [ ""
     , "Signal configured!"
@@ -411,16 +411,16 @@ writeTelegramConfig :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
 writeTelegramConfig rt caps username = do
   let cfgPath = crConfigPath rt
   createDirectoryIfMissing True (takeDirectory cfgPath)
-  existing <- loadFileConfig cfgPath
-  let baseCfg = fromRight defaultFileConfig existing
+  existing <- loadRuntimeConfig cfgPath
+  let baseCfg = fromRight defaultRuntimeConfig existing
       updated = baseCfg
-        { fcTelegram = Just TelegramConfig
+        { rcTelegram = Just TelegramConfig
             { tcToken         = Nothing  -- token lives in the vault, not config
             , tcTextChunkLimit = Just defaultTelegramChunkLimit
             , tcAllowFrom      = AllowAll
             }
         }
-  saveFileConfig cfgPath updated
+  saveRuntimeConfig cfgPath updated
   ccSend caps $ T.intercalate "\n"
     [ ""
     , "Telegram configured!"

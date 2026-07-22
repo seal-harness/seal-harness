@@ -40,14 +40,15 @@ import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), execBackendFromFile, mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), execBackendFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
-  ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
-  , onDemandSchemas, fcDelegation, fcDebugSessionTranscript )
-import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir, sessionRequestsPath)
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  , onDemandSchemas, rcDelegation, rcDebugSessionTranscript )
+import Seal.Config.Security (loadSecurityConfig)
+import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -194,10 +195,10 @@ sendOutcomeJson = \case
 -- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
 -- otherwise @Nothing@. The debug file records each 'CompletionRequest' in
 -- full (including the complete message history) exactly as sent to the LLM.
-debugPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
 debugPath paths sid eCfg =
   case eCfg of
-    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
 
@@ -271,9 +272,10 @@ plainTurn deps meta t = do
         (withTwoFileTranscript sessionDirPath (\tHandle -> do
           wsroot <- WorkspaceRoot <$> getCurrentDirectory
           appEnv <- mkEnv defaultConfig
-          eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+          eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+          eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-              execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
+              execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsroot) eSecCfg
               defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
               agentDefBackend = bAgentDefs (sdBackends deps)
               caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
@@ -481,9 +483,10 @@ plainTurnWithCaps deps meta caps t = do
       Right <$> withTwoFileTranscript sessionDirPath (\tHandle -> do
         wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
-        eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+        eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+        eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+            execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
             defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
             agentDefBackend = bAgentDefs (sdBackends deps)
         mSystem <- resolveSystemPrompt agentDefBackend meta
@@ -523,9 +526,10 @@ webCallDispatcher deps callOpName val = do
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
     wsRoot <- WorkspaceRoot <$> getCurrentDirectory
     appEnv <- mkEnv defaultConfig
-    eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+    eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+    eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+        execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
         defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     let onDemand = either (const False) onDemandSchemas eCfg
@@ -559,14 +563,14 @@ webMintSession fallback = do
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int -> AgentStartWiring
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> AgentStartWiring
 webStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling =
   AgentStartWiring
     { aswDefBackend = bAgentDefs (sdBackends deps)
     , aswRuntime = bRuntime (sdBackends deps)
     , aswConfig = do
-        eCfg' <- loadFileConfig (prConfigPath (sdProvider deps))
-        pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+        eCfg' <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+        pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
     , aswPauseFlag = bSpawnPauseFlag (sdBackends deps)
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
@@ -584,7 +588,7 @@ webStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operator
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int
   -> AgentWorkerBuilder
 webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCeiling =
   mkDelegateWorker DelegationWorkerDeps

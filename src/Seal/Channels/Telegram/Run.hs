@@ -31,9 +31,11 @@ import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
-  ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath )
+  ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths
+  , securityFilePath, vaultFilePath )
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (UserId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -81,12 +83,17 @@ runTelegramMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
   let cfgPath = configFilePath paths
-  cfg <- loadFileConfig cfgPath >>= \case
+  cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
       hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
-      pure defaultFileConfig
+      pure defaultRuntimeConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths cfg
+  secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
+    Left err -> do
+      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      pure defaultSecurityConfig
+    Right c  -> pure c
+  mHandle <- tryOpenVault paths secCfg
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -124,8 +131,8 @@ runTelegramMain autonomy = do
   harnessReg <- Seal.Harness.Registry.newHarnessRegistry
   tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
   let loadCfg = do
-        lc <- loadFileConfig cfgPath
-        pure (either (const defaultFileConfig) id lc)
+        lc <- loadRuntimeConfig cfgPath
+        pure (either (const defaultRuntimeConfig) id lc)
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg
@@ -148,15 +155,15 @@ runTelegramMain autonomy = do
       pure $ case r of
         Right bs -> Just (TE.decodeUtf8 bs)
         Left _   -> Nothing
-  case resolveTelegramConfig (fcTelegram cfg) mVaultToken of
+  case resolveTelegramConfig (rcTelegram cfg) mVaultToken of
     Left err -> hPutStrLn stderr ("seal telegram: " <> T.unpack err)
     Right resolved -> runTelegram chanDeps registry emptyChain resolved askReply
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone.
-tryOpenVault :: SealPaths -> FileConfig -> IO (Maybe Vault.VaultHandle)
+tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe Vault.VaultHandle)
 tryOpenVault paths cfg =
-  case (fcVaultRecipient cfg, fcVaultIdentity cfg) of
+  case (scVaultRecipient cfg, scVaultIdentity cfg) of
     (Just _, Just _) ->
       resolveEncryptor cfg >>= \case
         Left err -> do
@@ -164,9 +171,9 @@ tryOpenVault paths cfg =
           pure Nothing
         Right enc -> do
           let vcfg = Vault.VaultConfig
-                { Vault.vcPath    = maybe (vaultFilePath paths) T.unpack (fcVaultPath cfg)
-                , Vault.vcKeyType = fromMaybe "x25519" (fcVaultKeyType cfg)
-                , Vault.vcUnlock  = parseUnlockMode (fcVaultUnlock cfg)
+                { Vault.vcPath    = maybe (vaultFilePath paths) T.unpack (scVaultPath cfg)
+                , Vault.vcKeyType = fromMaybe "x25519" (scVaultKeyType cfg)
+                , Vault.vcUnlock  = parseUnlockMode (scVaultUnlock cfg)
                 }
           Just <$> Vault.openVault vcfg enc
     _ -> pure Nothing

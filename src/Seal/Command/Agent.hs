@@ -28,7 +28,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
-import Seal.Config.File (FileConfig (..), loadFileConfig, updateFileConfig)
+import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Core.Types (ModelId (..), OpName (..))
 import Seal.Security.Policy (AllowList (..))
 
@@ -91,8 +91,8 @@ defaultCmd :: AgentDefBackend -> FilePath -> Maybe Text -> CommandAction
 defaultCmd backend cfgPath mArg = CommandAction $ \caps ->
   case mArg of
     Nothing -> do
-      eCfg <- loadFileConfig cfgPath
-      let cur = either (const Nothing) fcDefaultAgent eCfg
+      eCfg <- loadRuntimeConfig cfgPath
+      let cur = either (const Nothing) rcDefaultAgent eCfg
       case cur of
         Nothing -> ccSend caps "no default agent set. Use /agent default <id> to set one."
         Just a  -> ccSend caps ("default agent: " <> a)
@@ -104,8 +104,8 @@ defaultCmd backend cfgPath mArg = CommandAction $ \caps ->
           case mDef of
             Nothing -> ccSend caps ("agent def not found: " <> agentDefIdText aid)
             Just _ -> do
-              res <- updateFileConfig cfgPath
-                       (\fc -> fc { fcDefaultAgent = Just (agentDefIdText aid) })
+              res <- updateRuntimeConfig cfgPath
+                       (\fc -> fc { rcDefaultAgent = Just (agentDefIdText aid) })
               case res of
                 Left e   -> ccSend caps e
                 Right () -> ccSend caps ("default agent set to: " <> agentDefIdText aid)

@@ -38,7 +38,7 @@ import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
-import Seal.Config.File (FileConfig (..), providerDefaultModel)
+import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
 import Seal.Config.Paths
   ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
@@ -118,12 +118,12 @@ listSessions paths = do
 -- | The provider label + model a new session should start with: the configured
 -- defaults, falling back to the configured provider's own default model (or
 -- Anthropic when no provider is configured).
-defaultSessionSelection :: FileConfig -> (Text, Text)
+defaultSessionSelection :: RuntimeConfig -> (Text, Text)
 defaultSessionSelection cfg =
   ( provLabel
-  , fromMaybe fallbackModel (fcDefaultModel cfg) )
+  , fromMaybe fallbackModel (rcDefaultModel cfg) )
   where
-    provLabel = fromMaybe "anthropic" (fcDefaultProvider cfg)
+    provLabel = fromMaybe "anthropic" (rcDefaultProvider cfg)
     ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
 
 -- | Resolve the default agent for a new session. Returns 'Nothing' if
@@ -132,9 +132,9 @@ defaultSessionSelection cfg =
 -- bound 'AgentDefId' and the def's provider/model overrides (non-empty
 -- values that should replace the config defaults).
 resolveDefaultAgent
-  :: AgentDefBackend -> FileConfig -> IO (Maybe AgentDefId, Maybe Text, Maybe Text)
+  :: AgentDefBackend -> RuntimeConfig -> IO (Maybe AgentDefId, Maybe Text, Maybe Text)
 resolveDefaultAgent backend cfg =
-  case fcDefaultAgent cfg of
+  case rcDefaultAgent cfg of
     Nothing -> pure (Nothing, Nothing, Nothing)
     Just raw ->
       case mkAgentDefId raw of
@@ -156,7 +156,7 @@ resolveDefaultAgent backend cfg =
 -- If @default_agent@ is set and the def exists, its id is persisted in
 -- 'smAgent' and its non-empty provider/model override the config defaults
 -- (PureClaw @resolveOverride@ precedence: frontmatter > config > default).
-initSession :: SealPaths -> FileConfig -> AgentDefBackend -> IO SessionMeta
+initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
 initSession paths cfg backend = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
@@ -169,7 +169,7 @@ initSession paths cfg backend = do
 -- active-session ref has a valid meta (provider/model fallbacks) without
 -- polluting the sessions list. The session is persisted only when the user
 -- actually sends the first message (which writes the transcript).
-initSessionMeta :: SealPaths -> FileConfig -> AgentDefBackend -> IO SessionMeta
+initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
 initSessionMeta paths cfg backend = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg

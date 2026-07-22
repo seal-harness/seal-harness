@@ -67,7 +67,7 @@ import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), execBackendFromFile, mkSessionAgentEnv
+  ( Backends (..), execBackendFromSecurity, mkSessionAgentEnv
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
@@ -78,9 +78,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
-  ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
-  , onDemandSchemas, fcDelegation )
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  , onDemandSchemas, rcDelegation )
+import Seal.Config.Security (loadSecurityConfig)
+import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -173,7 +174,7 @@ data ChannelDeps = ChannelDeps
   , cdLocks       :: SessionLocks
     -- ^ Per-session write locks. Serializes concurrent turns on the same
     -- session to prevent transcript corruption.
-  , cdConfig      :: IO FileConfig
+  , cdConfig      :: IO RuntimeConfig
     -- ^ Load the current config (re-read per turn so config changes take
     -- effect without a restart). Used for default provider/model/agent
     -- when creating a new session for a conversation.
@@ -186,7 +187,7 @@ newChannelDeps
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
-  -> ApprovalCache -> IO FileConfig
+  -> ApprovalCache -> IO RuntimeConfig
   -> IO ChannelDeps
 newChannelDeps paths vault provider backends autonomy broker
                harnessReg tmux httpMgr approvals loadCfg = do
@@ -495,9 +496,10 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
         withTwoFileTranscript sessionDirPath $ \tHandle -> do
           wsroot <- WorkspaceRoot <$> getCurrentDirectory
           appEnv <- mkEnv defaultConfig
-          eCfg <- loadFileConfig (prConfigPath pr)
+          eCfg <- loadRuntimeConfig (prConfigPath pr)
+          eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-              execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
+              execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsroot) eSecCfg
               defaultExecBackend = EbLocal (mkLocalExecHandle wsroot)
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
@@ -572,9 +574,10 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
     wsRoot <- WorkspaceRoot <$> getCurrentDirectory
     appEnv <- mkEnv defaultConfig
-    eCfg <- loadFileConfig (prConfigPath (cdProvider deps))
+    eCfg <- loadRuntimeConfig (prConfigPath (cdProvider deps))
+    eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
+        execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
         defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
         caps = mkHandleCaps h askReply sid
         onDemand = either (const False) onDemandSchemas eCfg
@@ -679,14 +682,14 @@ channelMintSession fallback = do
 -- captures the final text response as the summary.
 channelStartWiring
   :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int -> ISA.Registry -> AgentStartWiring
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> ISA.Registry -> AgentStartWiring
 channelStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling _isaReg =
   AgentStartWiring
     { aswDefBackend = bAgentDefs (cdBackends deps)
     , aswRuntime = bRuntime (cdBackends deps)
     , aswConfig = do
-        eCfg' <- loadFileConfig (prConfigPath (cdProvider deps))
-        pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+        eCfg' <- loadRuntimeConfig (prConfigPath (cdProvider deps))
+        pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
     , aswPauseFlag = bSpawnPauseFlag (cdBackends deps)
     , aswParentActivity = Just (bParentActivity (cdBackends deps))
     , aswMintSession = channelMintSession parentSid
@@ -704,7 +707,7 @@ channelStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot oper
 -- IORef; the worker reads it after the run and returns it as the summary.
 channelMkWorker
   :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int
   -> AgentWorkerBuilder
 channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCeiling =
   mkDelegateWorker DelegationWorkerDeps

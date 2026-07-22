@@ -104,6 +104,7 @@ library
         Seal.Command.Channel
         Seal.Config.File
         Seal.Config.Paths
+        Seal.Config.Security
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
@@ -332,6 +333,7 @@ test-suite tests
         Seal.Command.TabSpec
         Seal.Command.NewSpec
         Seal.Config.FileSpec
+        Seal.Config.SecuritySpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec

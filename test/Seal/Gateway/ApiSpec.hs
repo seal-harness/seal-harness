@@ -33,7 +33,7 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
@@ -1180,8 +1180,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
-                c <- loadFileConfig (cfgRoot </> "config.toml")
-                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+                c <- loadRuntimeConfig (cfgRoot </> "config.toml")
+                pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1192,9 +1192,9 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> lookupK "agent" o `shouldBe` Just (A.String "zoe")
         _ -> expectationFailure "expected JSON object"
       -- The default landed on disk.
-      eCfg <- loadFileConfig (cfgRoot </> "config.toml")
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
       case eCfg of
-        Right cfg -> fcDefaultAgent cfg `shouldBe` Just "zoe"
+        Right cfg -> rcDefaultAgent cfg `shouldBe` Just "zoe"
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
       -- A follow-up GET /api/agents reflects the new default (zoe isDefault=true).
       (_, bodyList) <- runAppBody app (testRequest methodGet ["api", "agents"])
@@ -1225,7 +1225,7 @@ spec = describe "Seal.Gateway.API" $ do
       let adb = bAgentDefs backends
           cfgPath = cfgRoot </> "config.toml"
       -- Seed config.toml with a default already set.
-      saveFileConfig cfgPath defaultFileConfig { fcDefaultAgent = Just "zoe" }
+      saveRuntimeConfig cfgPath defaultRuntimeConfig { rcDefaultAgent = Just "zoe" }
       let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
           sr = SessionRuntime { srPaths = paths, srConfigPath = cfgPath, srActive = activeRef }
           deps = ApiDeps
@@ -1239,8 +1239,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
-                c <- loadFileConfig cfgPath
-                pure (case c of Right cfg -> fcDefaultAgent cfg; Left _ -> Nothing)
+                c <- loadRuntimeConfig cfgPath
+                pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1250,9 +1250,9 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode body :: Maybe A.Value of
         Just (A.Object o) -> lookupK "agent" o `shouldBe` Just A.Null
         _ -> expectationFailure "expected JSON object"
-      eCfg <- loadFileConfig cfgPath
+      eCfg <- loadRuntimeConfig cfgPath
       case eCfg of
-        Right cfg -> fcDefaultAgent cfg `shouldBe` Nothing
+        Right cfg -> rcDefaultAgent cfg `shouldBe` Nothing
         Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
 
   it "PUT /api/agents/default returns 404 when the named agent doesn't exist" $ do
@@ -1992,7 +1992,7 @@ spec = describe "Seal.Gateway.API" $ do
       -- A fake provider that returns one canned assistant reply.
       providerRef <- newIORef
         [ CompletionResponse [CbText "Hello from the fake provider"] StopEnd (Usage 0 0) ]
-      -- A real ProviderRuntime whose config path is nonexistent (loadFileConfig
+      -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
       -- fails -> defaults: 128KiB ceiling + fail-closed exec). The vault ref
       -- holds Nothing so resolveSessionProvider would fail — but sdResolve is
       -- stubbed, so the vault is never consulted.

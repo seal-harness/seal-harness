@@ -29,8 +29,8 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
-  ( FileConfig (..), ProviderConfig (..), defaultFileConfig, loadFileConfig
-  , providerBaseUrl, providerDefaultModel, updateFileConfig, upsertProvider )
+  ( RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig
+  , providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
@@ -147,9 +147,9 @@ unknownProviderMsg lbl =
 -- section has no default model yet, seed its @[providers.<label>]@
 -- @default_model@. Never touches the global @default_model@ key, so a
 -- later @/model default@ isn't shadowed by a stale global value.
-seedProviderDefaults :: KnownProvider -> FileConfig -> FileConfig
+seedProviderDefaults :: KnownProvider -> RuntimeConfig -> RuntimeConfig
 seedProviderDefaults kp fc0 =
-  let fc1 = fc0 { fcDefaultProvider = fcDefaultProvider fc0 <|> Just (providerLabel kp) }
+  let fc1 = fc0 { rcDefaultProvider = rcDefaultProvider fc0 <|> Just (providerLabel kp) }
       lbl = providerLabel kp
   in if isJust (providerDefaultModel fc1 lbl)
        then fc1
@@ -167,7 +167,7 @@ addCmd pr lbl = CommandAction $ \caps ->
           case res of
             Left e   -> ccSend caps (vaultErrText e)
             Right () -> do
-              _ <- updateFileConfig (prConfigPath pr) (seedProviderDefaults kp)
+              _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
               ccSend caps ("Stored API key for " <> providerLabel kp <> ".")
 
 -- | Ollama onboarding: prompt for the base URL (blank keeps the default),
@@ -186,7 +186,7 @@ addOllama pr caps vh kp = do
   case keyRes of
     Left e   -> ccSend caps (vaultErrText e)
     Right () -> do
-      _ <- updateFileConfig (prConfigPath pr) (seedAll mUrl)
+      _ <- updateRuntimeConfig (prConfigPath pr) (seedAll mUrl)
       ccSend caps "Configured ollama."
   where
     seedAll mUrl fc =
@@ -205,12 +205,12 @@ defaultCmd :: ProviderRuntime -> Text -> CommandAction
 defaultCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp -> do
     let plabel = providerLabel kp
-    res <- updateFileConfig (prConfigPath pr)
-             (\fc -> fc { fcDefaultProvider = Just plabel })
+    res <- updateRuntimeConfig (prConfigPath pr)
+             (\fc -> fc { rcDefaultProvider = Just plabel })
     case res of
       Left e   -> ccSend caps e
       Right () -> do
-        eCfg <- loadFileConfig (prConfigPath pr)
+        eCfg <- loadRuntimeConfig (prConfigPath pr)
         let ModelId m = resolveDefaultModel
                           (either (const Nothing) (`providerDefaultModel` plabel) eCfg)
                           plabel
@@ -220,9 +220,9 @@ defaultCmd pr lbl = CommandAction $ \caps ->
 listCmd :: ProviderRuntime -> CommandAction
 listCmd pr = CommandAction $ \caps ->
   withVaultHandle pr caps $ \vh -> do
-    eCfg <- loadFileConfig (prConfigPath pr)
-    let cfg = fromRight defaultFileConfig eCfg
-        def = fcDefaultProvider cfg
+    eCfg <- loadRuntimeConfig (prConfigPath pr)
+    let cfg = fromRight defaultRuntimeConfig eCfg
+        def = rcDefaultProvider cfg
     configured <- configuredProviders (Just vh) cfg
     if null configured
       then ccSend caps "no providers configured — run /provider add <provider>"
@@ -273,7 +273,7 @@ loginCmd pr lbl = CommandAction $ \caps ->
             case res of
               Left e   -> ccSend caps (vaultErrText e)
               Right () -> do
-                _ <- updateFileConfig (prConfigPath pr) (seedProviderDefaults kp)
+                _ <- updateRuntimeConfig (prConfigPath pr) (seedProviderDefaults kp)
                 ccSend caps ("Logged in to " <> providerLabel kp <> " via OAuth.")
 
 -- | Best-effort browser open; failure is silently ignored (headless-friendly).
@@ -287,7 +287,7 @@ testCmd :: ProviderRuntime -> Text -> CommandAction
 testCmd pr lbl = CommandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let canonLbl = providerLabel kp
           model = case eCfg of
             Right c -> resolveDefaultModel (providerDefaultModel c canonLbl) canonLbl
@@ -311,7 +311,7 @@ removeCmd pr lbl = CommandAction $ \caps ->
         (Left e, _) -> ccSend caps (vaultErrText e)
         (_, Left e) -> ccSend caps (vaultErrText e)
         _           -> do
-          _ <- updateFileConfig (prConfigPath pr) (clearDefault kp)
+          _ <- updateRuntimeConfig (prConfigPath pr) (clearDefault kp)
           ccSend caps ("Removed credentials for " <> providerLabel kp <> ".")
   where
     -- | Delete a key; a missing key is not an error.
@@ -321,8 +321,8 @@ removeCmd pr lbl = CommandAction $ \caps ->
         Left (VaultKeyNotFound _) -> Right ()
         other                     -> other
     clearDefault kp fc
-      | fcDefaultProvider fc == Just (providerLabel kp) =
-          fc { fcDefaultProvider = Nothing, fcDefaultModel = Nothing }
+      | rcDefaultProvider fc == Just (providerLabel kp) =
+          fc { rcDefaultProvider = Nothing, rcDefaultModel = Nothing }
       | otherwise = fc
 
 modelText :: ModelId -> Text

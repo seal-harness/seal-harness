@@ -25,8 +25,9 @@ import Seal.Command.Spec
   , CommandName (..)
   , CommandSpec (..)
   )
-import Seal.Config.File (FileConfig (..), loadFileConfig, updateFileConfig)
-import Seal.Config.Paths (SealPaths, vaultFilePath)
+import Seal.Config.Security
+  ( SecurityConfig (..), loadSecurityConfig, updateSecurityConfig )
+import Seal.Config.Paths (SealPaths, securityFilePath, vaultFilePath)
 import Seal.Security.Vault
   ( VaultConfig (..)
   , VaultHandle (..)
@@ -142,13 +143,14 @@ handleResult _    (Right a) k = k a
 
 setupCmd :: VaultRuntime -> CommandAction
 setupCmd rt = CommandAction $ \caps -> do
-  -- Snapshot old config BEFORE any modifications so rekeyExisting can use it.
-  oldCfg <- loadFileConfig (vrConfigPath rt)
+  -- Snapshot old security config BEFORE any modifications so rekeyExisting can use it.
+  let secPath = securityFilePath (vrPaths rt)
+  oldCfg <- loadSecurityConfig secPath
   let vaultPath = case oldCfg of
         Left _    -> vaultFilePath (vrPaths rt)
-        Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath cfg)
+        Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath cfg)
       hasKey = case oldCfg of
-        Right cfg -> isJust (fcVaultRecipient cfg) && isJust (fcVaultIdentity cfg)
+        Right cfg -> isJust (scVaultRecipient cfg) && isJust (scVaultIdentity cfg)
         Left _    -> False
   vaultExists <- doesFileExist vaultPath
   -- An existing vault WITH a recorded key means re-running setup rotates that
@@ -175,7 +177,7 @@ setupCmd rt = CommandAction $ \caps -> do
 -- always written to a fresh identity file (see 'freshKeyName' in
 -- "Seal.Vault.Backend"), so a rotation never overwrites the key the current
 -- vault still depends on.
-runSetup :: VaultRuntime -> ChannelCaps -> Either Text FileConfig -> IO ()
+runSetup :: VaultRuntime -> ChannelCaps -> Either Text SecurityConfig -> IO ()
 runSetup rt caps oldCfg = do
   plugins <- detectAgePlugins
   let hasYubi = "yubikey" `elem` plugins
@@ -212,7 +214,7 @@ runSetup rt caps oldCfg = do
           -- tryOpenVault in Seal.Tui uses the same expression to stay in sync.
           let vaultPath = case oldCfg of
                 Left _    -> vaultFilePath (vrPaths rt)
-                Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath cfg)
+                Right cfg -> maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath cfg)
               vaultCfg = VaultConfig
                 { vcPath   = vaultPath
                 , vcKeyType = rkKeyType rk
@@ -222,10 +224,10 @@ runSetup rt caps oldCfg = do
           initResult <- vhInit h
           case initResult of
             Right () -> do
-              ur <- updateFileConfig (vrConfigPath rt) $ \fc -> fc
-                { fcVaultRecipient = Just (rkRecipient rk)
-                , fcVaultIdentity  = Just (rkIdentity  rk)
-                , fcVaultKeyType   = Just (rkKeyType   rk)
+              ur <- updateSecurityConfig (securityFilePath (vrPaths rt)) $ \sc -> sc
+                { scVaultRecipient = Just (rkRecipient rk)
+                , scVaultIdentity  = Just (rkIdentity  rk)
+                , scVaultKeyType   = Just (rkKeyType   rk)
                 }
               case ur of
                 Left err -> ccSend caps ("Config write failed: " <> err)
@@ -245,7 +247,7 @@ rekeyExisting
   -> ChannelCaps
   -> VaultEncryptor
   -> ResolvedKey
-  -> Either Text FileConfig
+  -> Either Text SecurityConfig
   -> IO ()
 rekeyExisting rt caps newEnc rk eCfg = do
   case eCfg of
@@ -254,8 +256,8 @@ rekeyExisting rt caps newEnc rk eCfg = do
     Right oldCfg ->
       -- Honor vault_path from config if set; fall back to the default path.
       -- tryOpenVault in Seal.Tui uses the same expression to stay in sync.
-      let vaultPath = maybe (vaultFilePath (vrPaths rt)) T.unpack (fcVaultPath oldCfg)
-      in case (fcVaultRecipient oldCfg, fcVaultIdentity oldCfg) of
+      let vaultPath = maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath oldCfg)
+      in case (scVaultRecipient oldCfg, scVaultIdentity oldCfg) of
         (Nothing, Nothing) ->
           -- Vault file exists but config has no key: a previous setup was
           -- interrupted before the config was written.  Tell the user to
@@ -273,7 +275,7 @@ rekeyExisting rt caps newEnc rk eCfg = do
             Right oldEnc -> do
               let oldVaultCfg = VaultConfig
                     { vcPath    = vaultPath
-                    , vcKeyType = fromMaybe "unknown" (fcVaultKeyType oldCfg)
+                    , vcKeyType = fromMaybe "unknown" (scVaultKeyType oldCfg)
                     , vcUnlock  = UnlockOnDemand
                     }
               oldH <- openVault oldVaultCfg oldEnc
@@ -284,16 +286,16 @@ rekeyExisting rt caps newEnc rk eCfg = do
               rekeyResult <- vhRekey oldH newEnc (rkKeyType rk) confirmRekey
               case rekeyResult of
                 Right () -> do
-                  ur <- updateFileConfig (vrConfigPath rt) $ \fc -> fc
-                    { fcVaultRecipient = Just (rkRecipient rk)
-                    , fcVaultIdentity  = Just (rkIdentity  rk)
-                    , fcVaultKeyType   = Just (rkKeyType   rk)
+                  ur <- updateSecurityConfig (securityFilePath (vrPaths rt)) $ \sc -> sc
+                    { scVaultRecipient = Just (rkRecipient rk)
+                    , scVaultIdentity  = Just (rkIdentity  rk)
+                    , scVaultKeyType   = Just (rkKeyType   rk)
                     }
                   case ur of
                     Left err -> ccSend caps
                       (  "ERROR: vault was re-encrypted with the new key, but saving the"
                       <> " config failed (" <> err <> "). The vault on disk now uses the"
-                      <> " NEW key, but config.toml still names the OLD key. Do NOT re-run"
+                      <> " NEW key, but security.toml still names the OLD key. Do NOT re-run"
                       <> " '/vault setup' — that would attempt to decrypt with the old key"
                       <> " and fail. Instead, manually edit config.toml to set"
                       <> " vault_recipient, vault_identity, and vault_key_type to the"

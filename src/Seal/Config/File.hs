@@ -1,30 +1,33 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
--- | Load and save @config\/config.toml@. Absent file decodes as
--- 'defaultFileConfig'. Writes are atomic (write @.tmp@, rename). All vault
--- config fields are optional — a missing TOML key decodes as 'Nothing' and
--- a 'Nothing' value is omitted from the encoded output.
+-- | Load and save @config\/config.toml@ — the agent/operator-tunable runtime
+-- configuration ('RuntimeConfig'). Absent file decodes as
+-- 'defaultRuntimeConfig'. Writes are atomic (write @.tmp@, rename).
+--
+-- The security-critical, boot-only fields (vault settings + @untrusted_execution@)
+-- have moved to 'Seal.Config.Security.SecurityConfig' (loaded from
+-- @~\/.seal\/security.toml@). This split means a future @CONFIG_UPDATE@ opcode
+-- (which operates on 'RuntimeConfig') and the HTTP Gateway's
+-- @updateRuntimeConfig@ caller physically cannot express a change to the
+-- security-critical fields — it is a compile error (design §4 Approach E).
 module Seal.Config.File
-  ( FileConfig (..)
+  ( RuntimeConfig (..)
   , ProviderConfig (..)
   , RetrievalConfig (..)
-  , UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..)
   , DelegationFileConfig (..)
-  , defaultFileConfig
+  , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
   , defaultDelegationConfig
   , emptyProviderConfig
-  , loadFileConfig
+  , loadRuntimeConfig
   , providerBaseUrl
   , providerDefaultModel
   , retrievalMaxScanBytes
   , onDemandSchemas
-  , saveFileConfig
-  , updateFileConfig
+  , saveRuntimeConfig
+  , updateRuntimeConfig
   , upsertProvider
-  , untrustedExecConfigFromFile
   ) where
 
 import Data.HashMap.Strict qualified as HashMap
@@ -43,52 +46,36 @@ import Toml.Type.Key (pattern (:||))
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
-import Seal.Tools.Exec.Types
-  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 
--- | All user-editable vault settings persisted in @config\/config.toml@.
--- Every field is optional; a missing key decodes as 'Nothing'.
-data FileConfig = FileConfig
-  { fcVaultPath :: Maybe Text
-    -- ^ Absolute path to the vault file (default: @~\/.seal\/config\/vault\/vault.age@).
-  , fcVaultRecipient :: Maybe Text
-    -- ^ age public key: @age1…@ or @age1yubikey1…@.
-  , fcVaultIdentity :: Maybe Text
-    -- ^ Path to the identity file under @keys\/@, or a user-supplied path.
-  , fcVaultUnlock :: Maybe Text
-    -- ^ @\"startup\"@ | @\"on_demand\"@ | @\"per_access\"@.
-  , fcVaultKeyType :: Maybe Text
-    -- ^ Display label: @\"x25519\"@ | @\"yubikey\"@ | @\"user\"@.
-  , fcDefaultProvider :: Maybe Text
+-- | The agent/operator-tunable runtime configuration persisted in
+-- @config\/config.toml@. Every field is optional; a missing key decodes as
+-- 'Nothing'. Security-critical boot-only fields (vault, untrusted_execution)
+-- live in 'Seal.Config.Security.SecurityConfig' (loaded from
+-- @security.toml@) and are NOT present here.
+data RuntimeConfig = RuntimeConfig
+  { rcDefaultProvider :: Maybe Text
     -- ^ Provider id used for new sessions (e.g. @\"anthropic\"@).
-  , fcDefaultModel :: Maybe Text
+  , rcDefaultModel :: Maybe Text
     -- ^ Model id used for new sessions (e.g. @\"claude-opus-4-8\"@).
-  , fcDefaultAgent :: Maybe Text
+  , rcDefaultAgent :: Maybe Text
     -- ^ Agent def id used by default for agent-driven flows (set via
     -- @\/agent default@). 'Nothing' means no default agent is selected.
-  , fcProviders :: Map Text ProviderConfig
+  , rcProviders :: Map Text ProviderConfig
     -- ^ Per-provider config sections (@[providers.<label>]@).
-  , fcRetrieval :: Maybe RetrievalConfig
+  , rcRetrieval :: Maybe RetrievalConfig
     -- ^ Optional @[retrieval]@ section (Dynamic Retrieval tuning). Absent
     -- means 'defaultRetrievalConfig' applies at resolution time.
-  , fcSignal :: Maybe SignalConfig
+  , rcSignal :: Maybe SignalConfig
     -- ^ Optional @[signal]@ section (Signal channel config). Absent means
     -- the Signal channel is not configured.
-  , fcTelegram :: Maybe TelegramConfig
+  , rcTelegram :: Maybe TelegramConfig
     -- ^ Optional @[telegram]@ section (Telegram channel config). Absent
     -- means the Telegram channel is not configured.
-  , fcGateway :: Maybe PartialGatewayConfig
+  , rcGateway :: Maybe PartialGatewayConfig
     -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
     -- gateway is not configured. Each field inside is optional too; the
     -- call site merges with 'Seal.Gateway.Config.withGatewayDefaults'.
-  , fcUntrustedExec :: Maybe UntrustedExecFileConfig
-    -- ^ Optional @[untrusted_execution]@ section (Phase 4 remote-only
-    -- untrusted execution, spec §3 Layer A). Absent means @mode=local@
-    -- (default). @mode=remote@ fail-closes at call time when the remote
-    -- block is absent or unreachable (boot still succeeds).
-  , fcDebugSessionTranscript :: Maybe Bool
+  , rcDebugSessionTranscript :: Maybe Bool
     -- ^ Optional @debug_session_transcript@ flag. When @true@, every
     -- 'CompletionRequest' sent to the LLM is also appended (redundantly,
     -- in full) to a @requests.jsonl@ file alongside the session's
@@ -98,7 +85,7 @@ data FileConfig = FileConfig
     -- debug whether the two-file storage format is correctly feeding the
     -- session history to the LLM. Absent (the default) means the file is
     -- not written.
-  , fcOnDemandSchemas :: Maybe Bool
+  , rcOnDemandSchemas :: Maybe Bool
     -- ^ Optional @on_demand_schemas@ flag. When @true@, the full
     -- @input_schema@ JSON for every opcode is replaced with a minimal
     -- stub (@{\"type\":\"object\"}@) in the @tools@ field of each
@@ -108,7 +95,7 @@ data FileConfig = FileConfig
     -- on-demand before calling it. Absent (the default) preserves the
     -- existing behavior: full schemas are sent inline and the describe
     -- opcodes are not registered.
-  , fcDelegation :: Maybe DelegationFileConfig
+  , rcDelegation :: Maybe DelegationFileConfig
     -- ^ Optional @[delegation]@ section (subagent spawning tunables).
     -- Absent means 'defaultDelegationConfig' applies at resolution time.
   } deriving stock (Eq, Show)
@@ -126,31 +113,6 @@ newtype RetrievalConfig = RetrievalConfig
   { rcMaxScanBytes :: Maybe Int
     -- ^ Operator-configured upper bound on bytes scanned per 'FILE_READ'
     -- (and future retrieval opcodes). Absent → 'defaultRetrievalMaxScanBytes'.
-  } deriving stock (Eq, Show)
-
--- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
--- @\"local\"@ (default) or @\"remote\"@ (fail-closed). The optional
--- @[untrusted_execution.remote]@ sub-table carries the SSH coordinates;
--- absent under @mode=local@ (no remote needed), and @mode=remote@ parses
--- OK without it (fail-closed is at call time, not parse time — spec §7
--- row 1).
-data UntrustedExecFileConfig = UntrustedExecFileConfig
-  { uefcMode   :: Text
-    -- ^ @\"local\"@ | @\"remote\"@
-  , uefcRemote :: Maybe UntrustedExecRemoteFileConfig
-  } deriving stock (Eq, Show)
-
--- | The @[untrusted_execution.remote]@ sub-table (spec §5). Every field is
--- optional at the TOML layer; the call site validates that the required
--- fields (@host@/@user@/@known_hosts@/@workspace@) are present when
--- @mode=remote@ (absent ⇒ fail-closed at call time).
-data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
-  { uerfcHost       :: Maybe Text
-  , uerfcUser       :: Maybe Text
-  , uerfcPort       :: Maybe Int
-  , uerfcIdentity   :: Maybe FilePath
-  , uerfcKnownHosts :: Maybe FilePath
-  , uerfcWorkspace  :: Maybe Text
   } deriving stock (Eq, Show)
 
 -- | The @[delegation]@ section (subagent spawning tunables). Every field is
@@ -185,25 +147,19 @@ emptyProviderConfig :: ProviderConfig
 emptyProviderConfig = ProviderConfig Nothing Nothing
 
 -- | Starting state: all fields absent, before @\/vault setup@ is run.
-defaultFileConfig :: FileConfig
-defaultFileConfig = FileConfig
-  { fcVaultPath      = Nothing
-  , fcVaultRecipient = Nothing
-  , fcVaultIdentity  = Nothing
-  , fcVaultUnlock    = Nothing
-  , fcVaultKeyType   = Nothing
-  , fcDefaultProvider = Nothing
-  , fcDefaultModel    = Nothing
-  , fcDefaultAgent    = Nothing
-  , fcProviders       = Map.empty
-  , fcRetrieval       = Nothing
-  , fcSignal          = Nothing
-  , fcTelegram        = Nothing
-  , fcGateway         = Nothing
-  , fcUntrustedExec   = Nothing
-  , fcDebugSessionTranscript = Nothing
-  , fcOnDemandSchemas = Nothing
-  , fcDelegation      = Nothing
+defaultRuntimeConfig :: RuntimeConfig
+defaultRuntimeConfig = RuntimeConfig
+  { rcDefaultProvider = Nothing
+  , rcDefaultModel    = Nothing
+  , rcDefaultAgent    = Nothing
+  , rcProviders       = Map.empty
+  , rcRetrieval       = Nothing
+  , rcSignal          = Nothing
+  , rcTelegram        = Nothing
+  , rcGateway         = Nothing
+  , rcDebugSessionTranscript = Nothing
+  , rcOnDemandSchemas = Nothing
+  , rcDelegation      = Nothing
   }
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -237,28 +193,22 @@ defaultRetrievalMaxScanBytes = 131072   -- 128 KiB
 -- Codec
 -- ---------------------------------------------------------------------------
 
--- | Bidirectional tomland codec for 'FileConfig'.
+-- | Bidirectional tomland codec for 'RuntimeConfig'.
 -- 'Toml.dioptional' wraps each key: absent → 'Nothing' on decode,
 -- 'Nothing' → key omitted on encode.
-fileConfigCodec :: Toml.TomlCodec FileConfig
-fileConfigCodec = FileConfig
-  <$> Toml.dioptional (Toml.text "vault_path")     .= fcVaultPath
-  <*> Toml.dioptional (Toml.text "vault_recipient") .= fcVaultRecipient
-  <*> Toml.dioptional (Toml.text "vault_identity")  .= fcVaultIdentity
-  <*> Toml.dioptional (Toml.text "vault_unlock")    .= fcVaultUnlock
-  <*> Toml.dioptional (Toml.text "vault_key_type")  .= fcVaultKeyType
-  <*> Toml.dioptional (Toml.text "default_provider") .= fcDefaultProvider
-  <*> Toml.dioptional (Toml.text "default_model")    .= fcDefaultModel
-  <*> Toml.dioptional (Toml.text "default_agent")    .= fcDefaultAgent
-  <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= fcProviders
-  <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= fcRetrieval
-  <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= fcSignal
-  <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= fcTelegram
-  <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= fcGateway
-  <*> Toml.dioptional (Toml.table untrustedExecConfigCodec "untrusted_execution") .= fcUntrustedExec
-  <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= fcDebugSessionTranscript
-  <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= fcOnDemandSchemas
-  <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= fcDelegation
+runtimeConfigCodec :: Toml.TomlCodec RuntimeConfig
+runtimeConfigCodec = RuntimeConfig
+  <$> Toml.dioptional (Toml.text "default_provider") .= rcDefaultProvider
+  <*> Toml.dioptional (Toml.text "default_model")    .= rcDefaultModel
+  <*> Toml.dioptional (Toml.text "default_agent")    .= rcDefaultAgent
+  <*> Toml.tableMap Toml._KeyText (Toml.table providerConfigCodec) "providers" .= rcProviders
+  <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= rcRetrieval
+  <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= rcSignal
+  <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= rcTelegram
+  <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= rcGateway
+  <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
+  <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= rcOnDemandSchemas
+  <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= rcDelegation
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -270,23 +220,6 @@ providerConfigCodec = ProviderConfig
 retrievalConfigCodec :: Toml.TomlCodec RetrievalConfig
 retrievalConfigCodec = RetrievalConfig
   <$> Toml.dioptional (Toml.int "max_scan_bytes") .= rcMaxScanBytes
-
--- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
-untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
-untrustedExecConfigCodec = UntrustedExecFileConfig
-  <$> Toml.text "mode" .= uefcMode
-  <*> Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec "remote") .= uefcRemote
-
--- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
--- sub-table. Every field is optional at the TOML layer.
-untrustedExecRemoteConfigCodec :: Toml.TomlCodec UntrustedExecRemoteFileConfig
-untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
-  <$> Toml.dioptional (Toml.text "host")        .= uerfcHost
-  <*> Toml.dioptional (Toml.text "user")        .= uerfcUser
-  <*> Toml.dioptional (Toml.int "port")         .= uerfcPort
-  <*> Toml.dioptional (Toml.string "identity")  .= uerfcIdentity
-  <*> Toml.dioptional (Toml.string "known_hosts") .= uerfcKnownHosts
-  <*> Toml.dioptional (Toml.text "workspace")   .= uerfcWorkspace
 
 -- | Bidirectional tomland codec for the @[delegation]@ section. Every field
 -- is optional at the TOML layer. 'dfcChildTimeoutSeconds' uses 'Toml.double'
@@ -318,7 +251,7 @@ delegationConfigCodec = DelegationFileConfig
 --
 -- This walks the parsed AST once before decoding and makes that node
 -- explicit — without disturbing anything else — so both styles decode
--- correctly. Round-tripped files (written by 'saveFileConfig') already have
+-- correctly. Round-tripped files (written by 'saveRuntimeConfig') already have
 -- an explicit node and pass through unchanged.
 normalizeProvidersTable :: Toml.TOML -> Toml.TOML
 normalizeProvidersTable t =
@@ -344,109 +277,69 @@ normalizeProvidersTable t =
 
 -- | Load the config file at @path@.
 --
--- * File absent  → @Right 'defaultFileConfig'@
+-- * File absent  → @Right 'defaultRuntimeConfig'@
 -- * Parse error  → @Left@ with the rendered tomland diagnostics
-loadFileConfig :: FilePath -> IO (Either Text FileConfig)
-loadFileConfig path = do
+loadRuntimeConfig :: FilePath -> IO (Either Text RuntimeConfig)
+loadRuntimeConfig path = do
   exists <- doesFileExist path
   if not exists
-    then pure (Right defaultFileConfig)
+    then pure (Right defaultRuntimeConfig)
     else do
       contents <- TIO.readFile path
       pure $ case Toml.parse contents of
         Left err   -> Left (Toml.unTomlParseError err)
-        Right toml -> case Toml.runTomlCodec fileConfigCodec (normalizeProvidersTable toml) of
+        Right toml -> case Toml.runTomlCodec runtimeConfigCodec (normalizeProvidersTable toml) of
           Success cfg  -> Right cfg
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
 -- | Save @cfg@ to @path@ atomically: write @path.tmp@, rename over @path@.
 -- The file is not chmod-restricted (config.toml is not secret material;
--- unlike vault.age which is handled by Phase 1's atomic write with 0600).
-saveFileConfig :: FilePath -> FileConfig -> IO ()
-saveFileConfig path cfg = do
-  let encoded = Toml.encode fileConfigCodec cfg
+-- unlike vault.age / security.toml which are handled with 0600).
+saveRuntimeConfig :: FilePath -> RuntimeConfig -> IO ()
+saveRuntimeConfig path cfg = do
+  let encoded = Toml.encode runtimeConfigCodec cfg
       tmp     = path <> ".tmp"
   TIO.writeFile tmp encoded
   renameFile tmp path
 
 -- | Load the config at @path@, apply @f@, save. Propagates any load
--- error as @Left Text@ without writing.
-updateFileConfig :: FilePath -> (FileConfig -> FileConfig) -> IO (Either Text ())
-updateFileConfig path f = do
-  result <- loadFileConfig path
+-- error as @Left Text@ without writing. The update function operates on
+-- 'RuntimeConfig' only — it physically cannot touch security-critical
+-- fields (vault, untrusted_execution) because they live in
+-- 'Seal.Config.Security.SecurityConfig', a different type (design §4 E).
+updateRuntimeConfig :: FilePath -> (RuntimeConfig -> RuntimeConfig) -> IO (Either Text ())
+updateRuntimeConfig path f = do
+  result <- loadRuntimeConfig path
   case result of
     Left err  -> pure (Left err)
-    Right cfg -> saveFileConfig path (f cfg) >> pure (Right ())
+    Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
 
 -- | The configured default model for provider @lbl@, if any.
-providerDefaultModel :: FileConfig -> Text -> Maybe Text
-providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (fcProviders cfg)
+providerDefaultModel :: RuntimeConfig -> Text -> Maybe Text
+providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (rcProviders cfg)
 
 -- | The configured base URL for provider @lbl@, if any.
-providerBaseUrl :: FileConfig -> Text -> Maybe Text
-providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (fcProviders cfg)
+providerBaseUrl :: RuntimeConfig -> Text -> Maybe Text
+providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (rcProviders cfg)
 
 -- | The resolved operator ceiling on bytes scanned per retrieval. Falls back
 -- to 'defaultRetrievalMaxScanBytes' (128 KiB) when the @[retrieval]@ section
 -- or its @max_scan_bytes@ key is absent. This is the hard upper bound the
 -- model's per-call @max_scan_bytes@ request is clamped down to.
-retrievalMaxScanBytes :: FileConfig -> Int
+retrievalMaxScanBytes :: RuntimeConfig -> Int
 retrievalMaxScanBytes cfg =
-  fromMaybe defaultRetrievalMaxScanBytes (fcRetrieval cfg >>= rcMaxScanBytes)
+  fromMaybe defaultRetrievalMaxScanBytes (rcRetrieval cfg >>= rcMaxScanBytes)
 
 -- | The resolved on-demand-schemas flag. 'True' means the registry should
 -- emit stub @input_schema@s and register the @OPCODE_DESCRIBE@ /
 -- @OPCODE_LIST@ opcodes so the model can fetch full schemas on demand.
 -- Absent (the default) is 'False' — full schemas are sent inline, matching
 -- the pre-flag behavior.
-onDemandSchemas :: FileConfig -> Bool
-onDemandSchemas cfg = fromMaybe False (fcOnDemandSchemas cfg)
+onDemandSchemas :: RuntimeConfig -> Bool
+onDemandSchemas cfg = fromMaybe False (rcOnDemandSchemas cfg)
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).
-upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> FileConfig -> FileConfig
+upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
-  cfg { fcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (fcProviders cfg) }
-
--- | Resolve the 'FileConfig'\'s @[untrusted_execution]@ section to the
--- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
--- 'Nothing' when the section is absent OR @mode=local@ (the default —
--- no remote needed, the local executor is wired by the call site in
--- 4b-T3). Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
--- with the remote 'SshConfig' if the remote block is fully present
--- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
--- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
--- — fail-closed is at call time (spec §7 row 1), not at config resolution.
-untrustedExecConfigFromFile :: FileConfig -> Maybe UntrustedExecConfig
-untrustedExecConfigFromFile cfg = do
-  uec <- fcUntrustedExec cfg
-  let modeText = uefcMode uec
-      mode = if modeText == "remote" then UemRemote else UemLocal
-  case mode of
-    UemLocal  -> Nothing
-    UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemote uec))
-  where
-    -- Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
-    -- All four required fields (host/user/known_hosts/workspace) must be
-    -- present; any missing → fail-closed at call time (Nothing).
-    resolveRemote uec = do
-      r <- uefcRemote uec
-      host <- uerfcHost r
-      user <- uerfcUser r
-      let port = fromMaybe 22 (uerfcPort r)
-          identity = uerfcIdentity r
-      knownHosts <- uerfcKnownHosts r
-      workspace <- uerfcWorkspace r
-      case ( mkSshHost host
-           , mkSshUser user
-           , mkRemotePath workspace
-           ) of
-        (Right h, Right u, Right w) -> Just SshConfig
-          { scHost       = h
-          , scUser       = u
-          , scPort       = port
-          , scIdentity   = identity
-          , scKnownHosts = knownHosts
-          , scWorkspace  = w
-          }
-        _ -> Nothing
+  cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }

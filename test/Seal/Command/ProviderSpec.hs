@@ -15,7 +15,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
-import Seal.Config.File (FileConfig (..), loadFileConfig, providerBaseUrl, providerDefaultModel)
+import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig, providerBaseUrl, providerDefaultModel)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class
@@ -84,8 +84,8 @@ spec = do
         (fc, caps) <- makeFakeCaps ["sk-secret"]
         runProv pr ["add", "anthropic"] caps
         vhGet vh "ANTHROPIC_API_KEY" >>= (`shouldBe` Right ("sk-secret" :: ByteString))
-        Right cfg <- loadFileConfig cfgPath
-        fcDefaultProvider cfg `shouldBe` Just "anthropic"
+        Right cfg <- loadRuntimeConfig cfgPath
+        rcDefaultProvider cfg `shouldBe` Just "anthropic"
         providerDefaultModel cfg "anthropic" `shouldBe` Just "claude-opus-4-8"
         sent <- getSent fc
         sent `shouldSatisfy` any ("Stored API key" `T.isInfixOf`)
@@ -114,8 +114,8 @@ spec = do
         (fc, caps) <- makeFakeCaps []
         runProv pr ["remove", "anthropic"] caps
         vhGet vh "ANTHROPIC_API_KEY" >>= (`shouldSatisfy` either (const True) (const False))
-        Right cfg <- loadFileConfig cfgPath
-        fcDefaultProvider cfg `shouldBe` Nothing
+        Right cfg <- loadRuntimeConfig cfgPath
+        rcDefaultProvider cfg `shouldBe` Nothing
         sent <- getSent fc
         sent `shouldSatisfy` any ("Removed" `T.isInfixOf`)
 
@@ -209,7 +209,7 @@ spec = do
         (_, caps) <- makeFakeCaps ["https://ollama.com", "k-cloud"]
         runProv pr ["add", "ollama"] caps
         vhGet vh "OLLAMA_API_KEY" >>= (`shouldBe` Right ("k-cloud" :: ByteString))
-        Right cfg <- loadFileConfig cfgPath
+        Right cfg <- loadRuntimeConfig cfgPath
         providerBaseUrl cfg "ollama" `shouldBe` Just "https://ollama.com"
         providerDefaultModel cfg "ollama" `shouldBe` Just "llama3.2"
 
@@ -240,8 +240,8 @@ spec = do
         pr <- mkPR cfgPath Nothing            -- no vault: config-only command
         (fc, caps) <- makeFakeCaps []
         runProv pr ["default", "ollama"] caps
-        Right cfg <- loadFileConfig cfgPath
-        fcDefaultProvider cfg `shouldBe` Just "ollama"
+        Right cfg <- loadRuntimeConfig cfgPath
+        rcDefaultProvider cfg `shouldBe` Just "ollama"
         sent <- getSent fc
         -- confirmation names the provider and its resolved default model
         T.unlines sent `shouldSatisfy` ("ollama" `T.isInfixOf`)
@@ -256,8 +256,8 @@ spec = do
         runProv pr ["add", "anthropic"] addCaps   -- seeds default_provider = anthropic
         (_, caps) <- makeFakeCaps []
         runProv pr ["default", "ollama"] caps      -- must override, not <|>-keep
-        Right cfg <- loadFileConfig cfgPath
-        fcDefaultProvider cfg `shouldBe` Just "ollama"
+        Right cfg <- loadRuntimeConfig cfgPath
+        rcDefaultProvider cfg `shouldBe` Just "ollama"
 
     it "default rejects an unknown provider" $
       withSystemTempDirectory "seal-prov" $ \dir -> do

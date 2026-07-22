@@ -4,7 +4,7 @@
 -- Telegram Bot API). Lives in its own module so "Seal.Config.File" can add
 -- the section without a cycle: this module exports the codec;
 -- Seal.Config.File imports it and wires the @[telegram]@ table. Resolution
--- takes the section directly (not the whole 'FileConfig') to keep the
+-- takes the section directly (not the whole 'RuntimeConfig') to keep the
 -- modules acyclic. Mirrors "Seal.Signal.Config".
 module Seal.Telegram.Config
   ( TelegramToken (..)

@@ -12,7 +12,7 @@ import Test.QuickCheck
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Config.File
-  ( FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig )
+  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig )
 import Seal.Telegram.Config
   ( TelegramConfig (..), defaultTelegramChunkLimit
   , defaultTelegramConfig, mkTelegramToken, resolveTelegramConfig
@@ -75,8 +75,8 @@ spec = do
     it "round-trips a section with all three fields" $
       withSystemTempDirectory "seal-telegram-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg = defaultFileConfig
-                    { fcTelegram = Just defaultTelegramConfig
+            cfg = defaultRuntimeConfig
+                    { rcTelegram = Just defaultTelegramConfig
                         { tcToken = Just "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
                         , tcTextChunkLimit = Just 500
                         , tcAllowFrom = AllowOnly (Set.fromList
@@ -85,20 +85,20 @@ spec = do
                             ])
                         }
                     }
-        saveFileConfig path cfg
-        result <- loadFileConfig path
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
         case result of
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
           Right loaded -> do
-            fcTelegram loaded `shouldBe` fcTelegram cfg
+            rcTelegram loaded `shouldBe` rcTelegram cfg
 
     it "absent section decodes as Nothing" $
       withSystemTempDirectory "seal-telegram-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-        saveFileConfig path defaultFileConfig
-        result <- loadFileConfig path
+        saveRuntimeConfig path defaultRuntimeConfig
+        result <- loadRuntimeConfig path
         case result of
-          Right loaded -> fcTelegram loaded `shouldBe` Nothing
+          Right loaded -> rcTelegram loaded `shouldBe` Nothing
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
 
 -- ---------------------------------------------------------------------------

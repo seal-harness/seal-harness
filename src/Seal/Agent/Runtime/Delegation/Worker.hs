@@ -103,7 +103,7 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdResolveProvider :: AgentDef -> IO (Either Text (SomeProvider, ModelId))
     -- ^ Resolve the child's provider+model from the def, applying any
     -- delegation.provider/model/base_url override (the wiring layer reads
-    -- the override from the FileConfig and threads it here).
+    -- the override from the RuntimeConfig and threads it here).
   , dwdChildRegistry
       :: AgentDef -> SessionId -> ChannelCaps -> IO Registry
     -- ^ Build the child's narrowed ISA registry. The wiring layer is

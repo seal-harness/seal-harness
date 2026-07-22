@@ -5,6 +5,7 @@ module Seal.Config.Paths
   , ensureSealDirs
   , configFilePath
   , vaultFilePath
+  , securityFilePath
   , sessionsRoot
   , sessionDir
   , sessionMetaPath
@@ -87,6 +88,14 @@ configFilePath paths = spConfig paths </> "config.toml"
 -- @\<config\>\/vault\/vault.age@.
 vaultFilePath :: SealPaths -> FilePath
 vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
+
+-- | Absolute path to the security config file: @\<home\>\/security.toml@.
+-- This is a SIBLING of @config\/@ (NOT inside it) so the git-versioned config
+-- repo cannot resurrect a lower-security version (design V8). The file holds
+-- the boot-only, agent-immutable 'SecurityConfig' (untrusted_execution +
+-- vault settings). Mode 0600, owned by the harness user.
+securityFilePath :: SealPaths -> FilePath
+securityFilePath paths = spHome paths </> "security.toml"
 
 -- | Root directory holding one subdirectory per session: @\<state\>\/sessions@.
 sessionsRoot :: SealPaths -> FilePath

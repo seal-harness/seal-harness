@@ -4,7 +4,7 @@
 -- its own module so "Seal.Config.File" can add the section without a cycle:
 -- this module exports the codec; Seal.Config.File imports it and wires the
 -- @[signal]@ table. Resolution takes the section directly (not the whole
--- 'FileConfig') to keep the modules acyclic.
+-- 'RuntimeConfig') to keep the modules acyclic.
 module Seal.Signal.Config
   ( SignalAccount (..)
   , mkSignalAccount
