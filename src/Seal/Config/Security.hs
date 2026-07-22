@@ -23,10 +23,12 @@ module Seal.Config.Security
   , untrustedExecConfigFromSecurity
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Files (setFileMode)
 import Validation (Validation (..))
 
@@ -159,13 +161,19 @@ saveSecurityConfig path cfg = do
   setFileMode tmp 0o600
   renameFile tmp path
 
+-- | Process-wide lock serializing security config writes (design V7).
+{-# NOINLINE securityWriteLock #-}
+securityWriteLock :: MVar ()
+securityWriteLock = unsafePerformIO (newMVar ())
+
 -- | Load the security config at @path@, apply @f@, save. Propagates any load
 -- error as @Left Text@ without writing. This is the admin/boot path (e.g.
 -- @\/vault setup@); it is NEVER called by an opcode or the HTTP Gateway
 -- (those operate on 'RuntimeConfig' and physically cannot reach
--- 'SecurityConfig' — design §4 E).
+-- 'SecurityConfig' — design §4 E). Serialized behind 'securityWriteLock'
+-- to prevent lost-update races (design V7).
 updateSecurityConfig :: FilePath -> (SecurityConfig -> SecurityConfig) -> IO (Either Text ())
-updateSecurityConfig path f = do
+updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
   result <- loadSecurityConfig path
   case result of
     Left err  -> pure (Left err)

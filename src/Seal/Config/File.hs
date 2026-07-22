@@ -30,6 +30,7 @@ module Seal.Config.File
   , upsertProvider
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.HashMap.Strict qualified as HashMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -37,6 +38,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
+import System.IO.Unsafe (unsafePerformIO)
 import Validation (Validation (..))
 
 import Toml ((.=))
@@ -302,13 +304,25 @@ saveRuntimeConfig path cfg = do
   TIO.writeFile tmp encoded
   renameFile tmp path
 
+-- | Process-wide lock serializing config writes to prevent lost-update
+-- races (design V7). Multiple concurrent 'updateRuntimeConfig' callers
+-- (e.g. Gateway PUT + a future CONFIG_UPDATE, or two sessions) can silently
+-- clobber each other without this lock. The MVar is initialized once via
+-- 'unsafePerformIO' — idiomatic for a process-wide lock (mirrors
+-- 'Seal.Security.Vault.stWriteLock').
+{-# NOINLINE configWriteLock #-}
+configWriteLock :: MVar ()
+configWriteLock = unsafePerformIO (newMVar ())
+
 -- | Load the config at @path@, apply @f@, save. Propagates any load
 -- error as @Left Text@ without writing. The update function operates on
 -- 'RuntimeConfig' only — it physically cannot touch security-critical
 -- fields (vault, untrusted_execution) because they live in
 -- 'Seal.Config.Security.SecurityConfig', a different type (design §4 E).
+-- The load-modify-save is serialized behind 'configWriteLock' to prevent
+-- lost-update races (design V7).
 updateRuntimeConfig :: FilePath -> (RuntimeConfig -> RuntimeConfig) -> IO (Either Text ())
-updateRuntimeConfig path f = do
+updateRuntimeConfig path f = withMVar configWriteLock $ \_ -> do
   result <- loadRuntimeConfig path
   case result of
     Left err  -> pure (Left err)
