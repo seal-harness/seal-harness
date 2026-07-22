@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | The security-critical, boot-only configuration that lives in
 -- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
@@ -134,6 +135,8 @@ untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
 -- ---------------------------------------------------------------------------
 
 -- | Load the security config file at @path@.
+
+-- | Load the security config file at @path@.
 --
 -- * File absent  → @Right 'defaultSecurityConfig'@
 -- * Parse error  → @Left@ with the rendered tomland diagnostics
@@ -189,35 +192,47 @@ updateSecurityConfig path f = withMVar securityWriteLock $ \_ -> do
 -- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
 -- — fail-closed is at call time (spec §7 row 1), not at config resolution.
 untrustedExecConfigFromSecurity :: SecurityConfig -> Maybe UntrustedExecConfig
-untrustedExecConfigFromSecurity cfg = do
-  uec <- scUntrustedExec cfg
-  let modeText = uefcMode uec
-      mode = if modeText == "remote" then UemRemote else UemLocal
-  case mode of
-    UemLocal  -> Nothing
-    UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemote uec))
-  where
-    -- Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
-    -- All four required fields (host/user/known_hosts/workspace) must be
-    -- present; any missing → fail-closed at call time (Nothing).
-    resolveRemote uec = do
-      r <- uefcRemote uec
-      host <- uerfcHost r
-      user <- uerfcUser r
-      let port = fromMaybe 22 (uerfcPort r)
-          identity = uerfcIdentity r
-      knownHosts <- uerfcKnownHosts r
-      workspace <- uerfcWorkspace r
-      case ( mkSshHost host
-           , mkSshUser user
-           , mkRemotePath workspace
-           ) of
-        (Right h, Right u, Right w) -> Just SshConfig
-          { scHost       = h
-          , scUser       = u
-          , scPort       = port
-          , scIdentity   = identity
-          , scKnownHosts = knownHosts
-          , scWorkspace  = w
-          }
-        _ -> Nothing
+untrustedExecConfigFromSecurity cfg =
+  case scUntrustedExec cfg of
+    Nothing -> Nothing
+    Just uec -> resolveByMode uec
+
+resolveByMode :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
+resolveByMode uec =
+  let mode = if uefcMode uec == "remote" then UemRemote else UemLocal
+  in case mode of
+       UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
+       UemLocal  -> localModeResult uec
+
+-- | Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
+-- Shared by both the UemRemote branch and the hardened-build localModeResult.
+resolveRemoteSsh :: UntrustedExecFileConfig -> Maybe SshConfig
+resolveRemoteSsh uec = uefcRemote uec >>= \r ->
+  uerfcHost r >>= \host ->
+  uerfcUser r >>= \user ->
+  uerfcKnownHosts r >>= \knownHosts ->
+  uerfcWorkspace r >>= \workspace ->
+  let port = fromMaybe 22 (uerfcPort r)
+      identity = uerfcIdentity r
+  in case ( mkSshHost host
+          , mkSshUser user
+          , mkRemotePath workspace
+          ) of
+       (Right h, Right u, Right w) -> Just SshConfig
+         { scHost       = h
+         , scUser       = u
+         , scPort       = port
+         , scIdentity   = identity
+         , scKnownHosts = knownHosts
+         , scWorkspace  = w
+         }
+       _ -> Nothing
+
+#if defined(REMOTE_ONLY_UNTRUSTED)
+localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
+localModeResult uec =
+  Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
+#else
+localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
+localModeResult _ = Nothing
+#endif
