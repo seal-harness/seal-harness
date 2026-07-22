@@ -103,6 +103,7 @@ library
         Seal.Command.Spec
         Seal.Command.Channel
         Seal.Config.File
+        Seal.Config.Migrate
         Seal.Config.Paths
         Seal.Config.Security
         Seal.Git.Repo
@@ -333,6 +334,7 @@ test-suite tests
         Seal.Command.TabSpec
         Seal.Command.NewSpec
         Seal.Config.FileSpec
+        Seal.Config.MigrateSpec
         Seal.Config.SecuritySpec
         Seal.Config.SecurityScopingFailSpec
         Seal.Config.PathsSpec

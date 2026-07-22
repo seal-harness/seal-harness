@@ -38,6 +38,7 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
@@ -230,6 +231,7 @@ runSignalMain :: Seal.Security.Policy.AutonomyLevel -> IO ()
 runSignalMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
+  migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

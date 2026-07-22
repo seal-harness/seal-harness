@@ -37,6 +37,7 @@ import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
@@ -70,6 +71,7 @@ runServeMain :: AutonomyLevel -> IO ()
 runServeMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
+  migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

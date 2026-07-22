@@ -32,6 +32,7 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths
@@ -82,6 +83,7 @@ runTelegramMain :: AutonomyLevel -> IO ()
 runTelegramMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
+  migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do

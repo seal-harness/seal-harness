@@ -20,6 +20,7 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -71,6 +72,7 @@ runTui :: AutonomyLevel -> IO ()
 runTui autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
+  migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
