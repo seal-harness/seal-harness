@@ -25,7 +25,7 @@ import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -46,6 +46,7 @@ import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  , WebConfig (..), rcWeb
   , onDemandSchemas, rcDelegation, rcDebugSessionTranscript )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath)
@@ -286,7 +287,7 @@ plainTurn deps meta t = do
                 wsroot operatorCeiling
               isaReg = buildWebRegistry
                 (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
-                (sdAutonomy deps) startWiring
+                (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                 caps onDemand
               env = mkSessionAgentEnv
@@ -322,6 +323,7 @@ plainTurn deps meta t = do
 buildWebRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
+  -> Maybe WebConfig
   -> AgentStartWiring
   -> HarnessRegistry
   -> TmuxRunner
@@ -329,7 +331,7 @@ buildWebRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy
+buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -380,21 +382,20 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     binAllowList = Nothing
-    -- Fail-closed defaults for the provider-pluggable opcodes. These surface
-    -- as available tools to the LLM; the opcodes return a structured error
-    -- until a real provider is configured (operator-supplied via config in a
-    -- follow-up). Empty allow-lists mean all domains are permitted at the
-    -- gate; the fail-closed run path is what enforces the boundary today.
+    -- Web tool config resolved from the @[web]@ section of config.toml.
+    -- Absent section → fail-closed (empty endpoint, all domains allowed,
+    -- operatorCeiling for fetch bytes). SSRF protection is always enforced
+    -- (in the opcode, via Seal.Web.UrlSafety), regardless of allow-list.
     webSearchCfg = WebSearchConfig
       { wscManager   = httpManager
-      , wscEndpoint  = ""
-      , wscAllowList = []
+      , wscEndpoint  = unwrapOpt wcSearchEndpoint webCfg ""
+      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey   = Nothing
       }
     webFetchCfg = WebFetchConfig
       { wfcManager   = httpManager
-      , wfcAllowList = []
-      , wfcMaxBytes  = operatorCeiling
+      , wfcAllowList = unwrapOpt wcFetchAllowList webCfg []
+      , wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling
       , wfcAuthKey   = Nothing
       }
     -- Fixed tmux session/window idents for HARNESS_START. The 6b wiring that
@@ -496,7 +497,7 @@ plainTurnWithCaps deps meta caps t = do
               wsRoot operatorCeiling
             isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              (sdAutonomy deps) startWiring
+              (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
             env = mkSessionAgentEnv
@@ -538,7 +539,7 @@ webCallDispatcher deps callOpName val = do
           wsRoot operatorCeiling
         isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              (sdAutonomy deps) startWiring
+              (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -557,6 +558,14 @@ webMintSession fallback = do
     Right s  -> pure s
     -- unreachable: formatSessionId only emits digits and dashes
     Left _e  -> pure fallback
+
+-- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
+-- the default when the config section or the field is absent.
+unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
+unwrapOpt field webCfg def =
+  case webCfg of
+    Nothing   -> def
+    Just cfg  -> fromMaybe def (field cfg)
 
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
 -- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +

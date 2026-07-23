@@ -34,7 +34,7 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths, agentSessionDir)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (withTwoFileTranscript)
 import Seal.ISA.Opcode (localBackend)

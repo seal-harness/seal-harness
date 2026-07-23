@@ -36,7 +36,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Types (ModelId (..), SessionId (..), mkSessionId, ToolCallId (..), OpName (..))
+import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -74,7 +74,7 @@ instance Provider ScriptProvider where
 
 fakePaths :: SealPaths
 fakePaths = SealPaths
-  { spHome = "", spState = "", spConfig = "", spKeys = "" }
+  { spHome = "", spState = "", spConfig = "", spKeys = "" , spCache = ""}
 
 fakeMeta :: SessionMeta
 fakeMeta =
@@ -1097,8 +1097,8 @@ spec = describe "Seal.Gateway.API" $ do
           let now = UTCTime (fromGregorian 2026 7 1) 0
           let zoeId  = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
               devId  = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "dev"
-              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
-              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (mkSystemSessionId "manual")
+              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll now now (mkSystemSessionId "manual")
           adbUpdate adb mkZoe
           adbUpdate adb mkDev
           let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
@@ -1165,7 +1165,7 @@ spec = describe "Seal.Gateway.API" $ do
       let now = UTCTime (fromGregorian 2026 7 1) 0
           adb = bAgentDefs backends
           zoeId = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
-          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll now now (mkSystemSessionId "manual")
       adbUpdate adb zoe
       let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
           sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
@@ -1287,7 +1287,7 @@ spec = describe "Seal.Gateway.API" $ do
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "full" of Right x -> x; Left _ -> error "aid"
         d = AgentDef aid "Full Name" "anthropic" (ModelId "claude-sonnet-4") (Just "be terse")
-            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) now now (SessionId "manual")
+            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) now now (mkSystemSessionId "manual")
     adbUpdate adb d
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1372,7 +1372,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         aid = case mkAgentDefId "eddy" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (SessionId "manual")
+        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1422,7 +1422,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         oldId = case mkAgentDefId "alpha" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (SessionId "manual")
+        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1471,7 +1471,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "keep" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1501,7 +1501,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "delme" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll now now (SessionId "manual")
+        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1583,7 +1583,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "writer" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (SessionId "manual")
+        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1631,7 +1631,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "alpha" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Alpha" "body" oldCreated oldCreated (SessionId "manual")
+        seed = Skill sid "Alpha" "body" oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1678,7 +1678,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         sid = case mkSkillId "gone" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Gone" "body" now now (SessionId "manual")
+        seed = Skill sid "Gone" "body" now now (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1717,7 +1717,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         mkS n = case mkSkillId n of
-          Right sid -> Skill sid n "body" now now (SessionId "manual")
+          Right sid -> Skill sid n "body" now now (mkSystemSessionId "manual")
           Left _    -> error "sid"
     Skill.sbCreate skills (mkS "zeta")
     Skill.sbCreate skills (mkS "alpha")
@@ -2002,7 +2002,7 @@ spec = describe "Seal.Gateway.API" $ do
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           paths = SealPaths
-            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
@@ -2106,7 +2106,7 @@ spec = describe "Seal.Gateway.API" $ do
       askReply <- newAskReplyStore 0
       approvals <- newApprovalCache
       let paths = SealPaths
-            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" }
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           -- Two sessions on disk: the "active" one and the "request" one.
           -- The request will target the non-active one.
           activeSidTxt = "20260720-214230-238"

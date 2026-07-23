@@ -32,7 +32,7 @@ mkSR :: FilePath -> IO SessionRuntime
 mkSR root = do
   let sid = fromRight (error "invalid session id") (mkSessionId "20260701-120000-002")
       m0 = SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing aTime aTime
-      paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys")
+      paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
   ref <- newIORef m0
   pure SessionRuntime { srPaths = paths, srConfigPath = root </> "config.toml", srActive = ref }
 
@@ -41,7 +41,7 @@ mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
-  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath
+  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
   pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
 

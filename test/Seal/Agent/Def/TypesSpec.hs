@@ -9,7 +9,7 @@ import Test.Hspec
 import Test.QuickCheck
 
 import Seal.Agent.Def.Types
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), mkSystemSessionId)
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.Arbitrary ()
 
@@ -32,7 +32,7 @@ sampleDef = AgentDef
   , adTools = AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
-  , adSession = SessionId "s1"
+  , adSession = mkSystemSessionId "s1"
   }
 
 spec :: Spec

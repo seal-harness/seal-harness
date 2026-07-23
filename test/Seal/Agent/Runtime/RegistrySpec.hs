@@ -9,7 +9,7 @@ import Test.Hspec
 import Seal.Agent.Def.Types (AgentDefId (..), mkAgentDefId)
 import Seal.Agent.Runtime.Delegation (SubagentId (..))
 import Seal.Agent.Runtime.Registry
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (SessionId, mkSystemSessionId)
 
 sampleDefId :: AgentDefId
 sampleDefId = case mkAgentDefId "a1" of
@@ -17,7 +17,7 @@ sampleDefId = case mkAgentDefId "a1" of
   Left _    -> AgentDefId "fallback"
 
 sampleSession :: SessionId
-sampleSession = SessionId "s1"
+sampleSession = mkSystemSessionId "s1"
 
 sampleSubagentId :: SubagentId
 sampleSubagentId = SubagentId "sa-a1-00000001"

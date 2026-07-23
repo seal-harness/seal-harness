@@ -7,7 +7,7 @@ import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 import Test.QuickCheck
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (mkSystemSessionId)
 import Seal.Skills.Types
 import Seal.TestHelpers.Arbitrary ()
 
@@ -27,7 +27,7 @@ sampleSkill = Skill
   , skBody = "say hello"
   , skCreatedAt = sampleTime
   , skUpdatedAt = sampleTime
-  , skSession = SessionId "s1"
+  , skSession = mkSystemSessionId "s1"
   }
 
 spec :: Spec

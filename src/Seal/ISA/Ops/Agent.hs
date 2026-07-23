@@ -70,7 +70,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
   , interruptAgent, listAgents, stopAgent )
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), TrustLevel (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..))

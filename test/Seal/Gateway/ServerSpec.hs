@@ -28,7 +28,7 @@ import Seal.Gateway.API (ApiDeps (..))
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
-fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "" }
+fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
 
 fakeMeta :: SessionMeta
 fakeMeta =

@@ -37,7 +37,7 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
@@ -746,7 +746,7 @@ stampAgentDef _deps aid v mExisting = do
         _                                  -> Nothing
       tools       = maybe AllowAll allowListFromValue (lookupVal "tools")
       createdAt   = maybe now adCreatedAt mExisting
-      session     = maybe (SessionId "web") adSession mExisting
+      session     = maybe (mkSystemSessionId "web") adSession mExisting
   pure AgentDef
     { adId        = aid
     , adName      = nm
@@ -868,7 +868,7 @@ stampSkill sid v mExisting = do
       description = fromMaybe "" (lookupStr "description")
       body        = fromMaybe "" (lookupStr "body")
       createdAt   = maybe now skCreatedAt mExisting
-      session     = maybe (SessionId "web") skSession mExisting
+      session     = maybe (mkSystemSessionId "web") skSession mExisting
   pure Skill
     { skId          = sid
     , skDescription = description

@@ -9,7 +9,7 @@ import Data.Text.Encoding qualified as TE
 import Test.Hspec
 
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Memory
 import Seal.Memory.Backend
@@ -23,7 +23,7 @@ runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
 sampleSession :: SessionId
-sampleSession = SessionId "s1"
+sampleSession = mkSystemSessionId "s1"
 
 sampleMemoryId :: MemoryId
 sampleMemoryId = case mkMemoryId "m1" of
@@ -54,7 +54,7 @@ spec = describe "Seal.ISA.Ops.Memory" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (memoryWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("m1" :: Text), "content" .= ("old" :: Text)]))
-      let op = memoryWriteOp backend (SessionId "s2")
+      let op = memoryWriteOp backend (mkSystemSessionId "s2")
       r <- runTestApp (opRun op localBackend (object ["id" .= ("m1" :: Text), "content" .= ("new" :: Text)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "updated"]

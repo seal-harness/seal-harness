@@ -11,7 +11,8 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.File
-  ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), defaultRuntimeConfig
+  ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
+  , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
   , updateRuntimeConfig, upsertProvider )
@@ -33,6 +34,8 @@ spec = describe "Seal.Config.File" $ do
         , rcDebugSessionTranscript = Nothing
         , rcOnDemandSchemas = Nothing
         , rcDelegation      = Nothing
+        , rcWeb             = Nothing
+        , rcWorkdir          = Nothing
         }
 
   describe "loadRuntimeConfig" $ do
@@ -81,6 +84,20 @@ spec = describe "Seal.Config.File" $ do
               , rcDebugSessionTranscript = Nothing
               , rcOnDemandSchemas = Nothing
               , rcDelegation      = Nothing
+              , rcWeb             = Nothing
+              , rcWorkdir         = Nothing
+              }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
+        result `shouldBe` Right cfg
+
+    it "round-trips a [workdir] section" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        let cfg = defaultRuntimeConfig
+              { rcWorkdir = Just WorkdirConfig
+                  { wdcCleanupOnExit = Just True
+                  }
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path

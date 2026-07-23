@@ -77,7 +77,7 @@ import Toml ((.=))
 import Toml qualified
 
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText, isValidAgentDefId)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Security.Policy (AllowList (..))
 import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList, splitFrontmatterRaw)
@@ -140,7 +140,6 @@ encodeAgentDef d = encodeDoc fm body
       , ("updated_at", isoTime (adUpdatedAt d))
       , ("session", sessionIdText (adSession d))
       ]
-    sessionIdText (SessionId t) = t
 
 -- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkAgentDefId'.
@@ -159,7 +158,7 @@ decodeAgentDef content =
         , adTools = decodeTools fm
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , adSession = SessionId (fromMaybe "unknown" (fmLookup "session" fm))
+        , adSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Write one def to disk (atomic) and auto-commit.
@@ -343,7 +342,7 @@ loadDirAgentDef agentsDir aid = do
         , adTools = decodeDirTools (dacTools cfg)
         , adCreatedAt = mtime
         , adUpdatedAt = mtime
-        , adSession = SessionId "manual"
+        , adSession = mkSystemSessionId "manual"
         })
 
 -- | Read and parse the @AGENTS.md@ frontmatter inside an agent directory.

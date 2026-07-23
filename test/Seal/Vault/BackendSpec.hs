@@ -146,6 +146,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             result <- setupLocalAgeKey paths "mykey"
             case result of
@@ -173,6 +174,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             result <- setupLocalAgeKey paths "../escape"
             result `shouldSatisfy` isLeft
@@ -192,6 +194,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             -- Provide scripted caps for the TTY-fallback path; the happy path
             -- (captured stdout) does not consume these, but if the plugin

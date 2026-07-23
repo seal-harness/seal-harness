@@ -22,6 +22,7 @@ spec = describe "Seal.Config.Migrate" $ do
         , spConfig = tmp </> "config"
         , spState  = tmp </> "state"
         , spKeys   = tmp </> "keys"
+        , spCache  = tmp </> "cache"
         }
 
   describe "Case 1: security.toml absent, config.toml has legacy fields" $ do

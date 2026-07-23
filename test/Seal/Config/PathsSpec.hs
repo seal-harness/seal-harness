@@ -16,6 +16,7 @@ import Seal.Config.Paths
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionEntriesPath, sessionRequestsPath
   , agentSessionDir
+  , workdirsRoot, sessionWorkdir
   )
 import Seal.Core.Types (mkSessionId)
 
@@ -39,7 +40,7 @@ spec = describe "Seal.Config.Paths" $ do
         result `shouldBe` expected
 
   describe "getSealPaths" $ do
-    it "derives config, state, and keys sub-paths from home" $
+    it "derives config, state, keys, and cache sub-paths from home" $
       withSystemTempDirectory "seal-home" $ \tmp ->
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
@@ -47,15 +48,17 @@ spec = describe "Seal.Config.Paths" $ do
           spConfig paths `shouldBe` tmp </> "config"
           spState  paths `shouldBe` tmp </> "state"
           spKeys   paths `shouldBe` tmp </> "keys"
+          spCache  paths `shouldBe` tmp </> "cache"
 
   describe "ensureSealDirs" $ do
-    it "creates config and state directories" $
+    it "creates config, state, and cache directories" $
       withSystemTempDirectory "seal-home" $ \tmp ->
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           ensureSealDirs paths
           doesDirectoryExist (spConfig paths) `shouldReturn` True
           doesDirectoryExist (spState  paths) `shouldReturn` True
+          doesDirectoryExist (spCache  paths) `shouldReturn` True
 
     it "creates the vault's parent directory (so the atomic write succeeds)" $
       withSystemTempDirectory "seal-home" $ \tmp ->
@@ -99,7 +102,7 @@ spec = describe "Seal.Config.Paths" $ do
     it "derives sessions root, dir, meta and transcript paths under state/" $ do
       let paths = SealPaths
             { spHome = "/h", spConfig = "/h/config"
-            , spState = "/h/state", spKeys = "/h/keys" }
+            , spState = "/h/state", spKeys = "/h/keys", spCache = "/h/cache" }
           sid = fromRight (error "Invalid session ID") (mkSessionId (pack "20260701-120000-042"))
       sessionsRoot paths          `shouldBe` "/h/state/sessions"
       sessionDir paths sid        `shouldBe` "/h/state/sessions/20260701-120000-042"
@@ -113,11 +116,25 @@ spec = describe "Seal.Config.Paths" $ do
     it "nests a sub-agent transcript dir under the parent session dir" $ do
       let paths = SealPaths
             { spHome = "/h", spConfig = "/h/config"
-            , spState = "/h/state", spKeys = "/h/keys" }
+            , spState = "/h/state", spKeys = "/h/keys", spCache = "/h/cache" }
           parent = fromRight (error "Invalid parent id") (mkSessionId (pack "20260701-120000-042"))
           child  = fromRight (error "Invalid child id")  (mkSessionId (pack "20260701-120001-999"))
       agentSessionDir paths parent child
         `shouldBe` "/h/state/sessions/20260701-120000-042/agents/20260701-120001-999"
+
+  describe "workdir paths" $ do
+    it "workdirsRoot is under cache/" $ do
+      let paths = SealPaths
+            { spHome = "/h", spConfig = "/h/config"
+            , spState = "/h/state", spKeys = "/h/keys", spCache = "/h/cache" }
+      workdirsRoot paths `shouldBe` "/h/cache/workdirs"
+
+    it "sessionWorkdir is cache/workdirs/<sid>" $ do
+      let paths = SealPaths
+            { spHome = "/h", spConfig = "/h/config"
+            , spState = "/h/state", spKeys = "/h/keys", spCache = "/h/cache" }
+          sid = fromRight (error "Invalid session ID") (mkSessionId (pack "20260701-120000-042"))
+      sessionWorkdir paths sid `shouldBe` "/h/cache/workdirs/20260701-120000-042"
 
 -- | Run an action with SEAL_HOME set to the given path, restoring the
 -- previous value (or unsetting) on exit, even if the action throws.

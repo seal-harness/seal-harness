@@ -79,7 +79,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, rcDelegation )
+  , onDemandSchemas, rcDelegation, WebConfig (..), rcWeb )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
@@ -510,6 +510,7 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                 wsroot operatorCeiling isaReg
               isaReg = buildIsaRegistry
                 rt backends wsroot sid operatorCeiling autonomy
+                (either (const Nothing) rcWeb eCfg)
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
                 (cdHttpManager deps) handleCaps onDemand
@@ -585,7 +586,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           wsRoot operatorCeiling isaReg
         isaReg = buildIsaRegistry
           (cdVault deps) (cdBackends deps) wsRoot sid operatorCeiling
-          (cdAutonomy deps) startWiring
+          (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -601,6 +602,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
 buildIsaRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
+  -> Maybe WebConfig
   -> AgentStartWiring
   -> HarnessRegistry
   -> TmuxRunner
@@ -608,7 +610,7 @@ buildIsaRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
   -> ISA.Registry
-buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy
+buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -652,14 +654,14 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy
     binAllowList = Nothing
     webSearchCfg = WebSearchConfig
       { wscManager   = httpManager
-      , wscEndpoint  = ""
-      , wscAllowList = []
+      , wscEndpoint  = unwrapOpt wcSearchEndpoint webCfg ""
+      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey   = Nothing
       }
     webFetchCfg = WebFetchConfig
       { wfcManager   = httpManager
-      , wfcAllowList = []
-      , wfcMaxBytes  = operatorCeiling
+      , wfcAllowList = unwrapOpt wcFetchAllowList webCfg []
+      , wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling
       , wfcAuthKey   = Nothing
       }
     harnessSession = either (error "unreachable: seal is a valid TmuxIdent") id (mkTmuxIdent "seal")
@@ -675,6 +677,14 @@ channelMintSession fallback = do
 
 -- | Build the 'AgentStartWiring' for a channel turn. The wiring closes over
 -- the per-turn 'ChannelDeps' + parent session id + 'ChannelCaps' +
+-- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
+-- the default when the config section or the field is absent.
+unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
+unwrapOpt field webCfg def =
+  case webCfg of
+    Nothing   -> def
+    Just cfg  -> fromMaybe def (field cfg)
+
 -- 'UntrustedIO' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
 -- child's narrowed registry). The worker-builder is 'channelMkWorker'
 -- (below), which runs 'runTurn' with the goal as the first user message and
@@ -772,12 +782,17 @@ channelMkWorker deps paths parentSid _caps untrustedIO appEnv eCfg wsRoot operat
       where
         securityPolicy = Policy.SecurityPolicy Policy.AllowAll (cdAutonomy deps)
         binAllowList = Nothing
+        childWebCfg = either (const Nothing) rcWeb eCfg
         webFetchCfg = WebFetchConfig
-          { wfcManager = cdHttpManager deps, wfcAllowList = []
-          , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }
+          { wfcManager = cdHttpManager deps
+          , wfcAllowList = unwrapOpt wcFetchAllowList childWebCfg []
+          , wfcMaxBytes = unwrapOpt wcMaxFetchBytes childWebCfg operatorCeiling
+          , wfcAuthKey = Nothing }
         webSearchCfg = WebSearchConfig
-          { wscManager = cdHttpManager deps, wscEndpoint = ""
-          , wscAllowList = [], wscAuthKey = Nothing }
+          { wscManager = cdHttpManager deps
+          , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
+          , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
+          , wscAuthKey = Nothing }
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing

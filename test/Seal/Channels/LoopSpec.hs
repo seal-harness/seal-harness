@@ -67,6 +67,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let paths = SealPaths
           { spHome = cfgRoot, spState = cfgRoot </> "state"
           , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+          , spCache = cfgRoot </> "cache"
           }
         vaultRt = VaultRuntime
           { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"

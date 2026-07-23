@@ -26,7 +26,7 @@ import Seal.Agent.Runtime.Registry
   ( newAgentRuntime )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
@@ -67,7 +67,7 @@ runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
 sampleSession :: SessionId
-sampleSession = SessionId "s1"
+sampleSession = mkSystemSessionId "s1"
 
 -- | The script for the capstone turn: the model emits four tool calls in one
 -- response (MEMORY_WRITE, MEMORY_RECALL, SKILL_WRITE, AGENT_DEF_WRITE), then

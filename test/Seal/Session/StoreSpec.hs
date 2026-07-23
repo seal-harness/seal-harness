@@ -28,7 +28,7 @@ import Seal.Session.Store
 mkPaths :: FilePath -> SealPaths
 mkPaths root = SealPaths
   { spHome = root, spConfig = root </> "config"
-  , spState = root </> "state", spKeys = root </> "keys" }
+  , spState = root </> "state", spKeys = root </> "keys" , spCache = ""}
 
 aTime :: UTCTime
 aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)

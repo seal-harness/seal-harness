@@ -14,6 +14,8 @@ module Seal.Config.Paths
   , sessionEntriesPath
   , sessionRequestsPath
   , agentSessionDir
+  , workdirsRoot
+  , sessionWorkdir
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -23,7 +25,7 @@ import System.Posix.Files (setFileMode)
 
 import Data.Text qualified as T
 
-import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
 
 -- | All paths derived from the seal home directory.
 --
@@ -35,6 +37,7 @@ data SealPaths = SealPaths
   , spConfig :: FilePath   -- ^ @\<home\>\/config@
   , spState  :: FilePath   -- ^ @\<home\>\/state@
   , spKeys   :: FilePath   -- ^ @\<home\>\/keys@
+  , spCache  :: FilePath   -- ^ @\<home\>\/cache@ (per-session workdirs)
   } deriving stock (Eq, Show)
 
 -- | Resolve the seal home directory.
@@ -60,6 +63,7 @@ getSealPaths = do
     , spConfig = home </> "config"
     , spState  = home </> "state"
     , spKeys   = home </> "keys"
+    , spCache  = home </> "cache"
     }
 
 -- | Create the seal directory tree, setting restrictive permissions on the
@@ -74,6 +78,7 @@ ensureSealDirs :: SealPaths -> IO ()
 ensureSealDirs paths = do
   createDirectoryIfMissing True (spConfig paths)
   createDirectoryIfMissing True (spState  paths)
+  createDirectoryIfMissing True (spCache  paths)
   createDirectoryIfMissing True (spKeys   paths)
   -- The vault lives in a subdirectory of config/ ('vaultFilePath'); create it
   -- so the atomic vault write has an existing parent for its .tmp file.
@@ -138,4 +143,19 @@ sessionRequestsPath paths sid = sessionDir paths sid </> "requests.jsonl"
 agentSessionDir :: SealPaths -> SessionId -> SessionId -> FilePath
 agentSessionDir paths parentSid childSid =
   sessionDir paths parentSid </> "agents" </> T.unpack (sessionIdText childSid)
+
+-- | Root for per-session working directories: @\<cache\>\/workdirs@.
+workdirsRoot :: SealPaths -> FilePath
+workdirsRoot paths = spCache paths </> "workdirs"
+
+-- | One session's working directory: @\<cache\>\/workdirs\/\<session-id\>@.
+-- Asserts 'isValidSessionId' as defense-in-depth (the constructor is
+-- locked down, but this catches any future raw-constructor leak before
+-- the path reaches mkdir or rm -rf).
+sessionWorkdir :: SealPaths -> SessionId -> FilePath
+sessionWorkdir paths sid
+  | isValidSessionId (sessionIdText sid) =
+      workdirsRoot paths </> T.unpack (sessionIdText sid)
+  | otherwise =
+      error ("sessionWorkdir: invalid session id: " <> T.unpack (sessionIdText sid))
 

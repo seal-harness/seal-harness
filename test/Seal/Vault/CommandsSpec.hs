@@ -44,6 +44,7 @@ withTestEnv inputs k =
           , spConfig = tmpDir </> "config"
           , spState  = tmpDir </> "state"
           , spKeys   = tmpDir </> "keys"
+          , spCache  = tmpDir </> "cache"
           }
     createDirectoryIfMissing True vaultDir
     let vaultCfg = VaultConfig
@@ -105,7 +106,7 @@ spec = describe "Seal.Vault.Commands" $ do
     it "list sends 'vault not configured' when handle is Nothing" $ do
       withSystemTempDirectory "seal-cmd-uncfg" $ \tmpDir -> do
         let paths = SealPaths tmpDir (tmpDir </> "config")
-                               (tmpDir </> "state") (tmpDir </> "keys")
+                               (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         ref <- newIORef Nothing
         let rt = VaultRuntime paths (tmpDir </> "config.toml") ref
         (fc, caps) <- makeFakeCaps []
@@ -116,7 +117,7 @@ spec = describe "Seal.Vault.Commands" $ do
     it "status sends 'vault not configured' when handle is Nothing" $ do
       withSystemTempDirectory "seal-cmd-uncfg" $ \tmpDir -> do
         let paths = SealPaths tmpDir (tmpDir </> "config")
-                               (tmpDir </> "state") (tmpDir </> "keys")
+                               (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         ref <- newIORef Nothing
         let rt = VaultRuntime paths (tmpDir </> "config.toml") ref
         (fc, caps) <- makeFakeCaps []
@@ -210,7 +211,7 @@ spec = describe "Seal.Vault.Commands" $ do
         let vaultDir  = tmpDir </> "config" </> "vault"
             vaultPath = vaultDir </> "vault.age"
             paths     = SealPaths tmpDir (tmpDir </> "config")
-                                   (tmpDir </> "state") (tmpDir </> "keys")
+                                   (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig vaultPath "mock" UnlockStartup
         h <- openVault vaultCfg mkMockEncryptor
@@ -270,7 +271,7 @@ spec = describe "Seal.Vault.Commands" $ do
           withSystemTempDirectory "seal-cmd-setup" $ \tmpDir -> do
             let vaultDir = tmpDir </> "config" </> "vault"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") (tmpDir </> "keys")
+                                      (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
                 cfgPath  = tmpDir </> "config" </> "config.toml"
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
@@ -296,7 +297,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -356,7 +357,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -384,7 +385,7 @@ spec = describe "Seal.Vault.Commands" $ do
             let customVaultDir  = tmpDir </> "custom-vault-dir"
                 customVaultPath = customVaultDir </> "custom.age"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") (tmpDir </> "keys")
+                                      (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
                 cfgPath  = tmpDir </> "config" </> "config.toml"
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True (tmpDir </> "keys")
@@ -418,7 +419,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -461,7 +462,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -523,7 +524,7 @@ spec = describe "Seal.Vault.Commands" $ do
         let vaultDir  = tmpDir </> "config" </> "vault"
             vaultPath = vaultDir </> "vault.age"
             paths     = SealPaths tmpDir (tmpDir </> "config")
-                                   (tmpDir </> "state") (tmpDir </> "keys")
+                                   (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig vaultPath "mock" UnlockStartup
         h <- openVault vaultCfg mkMockEncryptor

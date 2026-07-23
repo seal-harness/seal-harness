@@ -35,7 +35,7 @@ mkPR cfgPath mvh = do
   ref <- newIORef mvh
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
-  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath   -- unused by /provider
+  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath   -- unused by /provider
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
   pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
 

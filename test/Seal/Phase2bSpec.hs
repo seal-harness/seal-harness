@@ -139,7 +139,7 @@ spec = describe "Seal.Phase2bSpec" $ do
     activeRef <- newIORef meta
     let sr = SessionRuntime
           { srPaths = SealPaths
-              { spHome = "", spState = "", spConfig = "", spKeys = "" }
+              { spHome = "", spState = "", spConfig = "", spKeys = "" , spCache = ""}
           , srConfigPath = ""
           , srActive = activeRef
           }

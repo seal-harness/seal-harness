@@ -97,7 +97,7 @@ spec = do
       let pr = ProviderRuntime
                  { prConfigPath = "/nonexistent/config.toml"
                  , prVault = VaultRuntime
-                     { vrPaths = SealPaths "/x" "/x" "/x" "/x"
+                     { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
                  , prCallCounter = cntRef }
@@ -113,7 +113,7 @@ spec = do
       let pr = ProviderRuntime
                  { prConfigPath = "/x/config.toml"
                  , prVault = VaultRuntime
-                     { vrPaths = SealPaths "/x" "/x" "/x" "/x"
+                     { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
                  , prCallCounter = cntRef }

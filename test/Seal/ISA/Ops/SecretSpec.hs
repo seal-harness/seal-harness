@@ -37,6 +37,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
             , spConfig = tmpDir </> "config"
             , spState  = tmpDir </> "state"
             , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
             }
       createDirectoryIfMissing True vaultDir
       let vaultCfg = VaultConfig
@@ -71,6 +72,7 @@ spec = describe "Seal.ISA.Ops.Secret" $ do
             , spConfig = tmpDir </> "config"
             , spState  = tmpDir </> "state"
             , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
             }
       createDirectoryIfMissing True vaultDir
       let vaultCfg = VaultConfig

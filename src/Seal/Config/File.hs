@@ -15,10 +15,13 @@ module Seal.Config.File
   , ProviderConfig (..)
   , RetrievalConfig (..)
   , DelegationFileConfig (..)
+  , WebConfig (..)
+  , WorkdirConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
   , defaultDelegationConfig
+  , defaultWebConfig
   , emptyProviderConfig
   , loadRuntimeConfig
   , providerBaseUrl
@@ -100,6 +103,15 @@ data RuntimeConfig = RuntimeConfig
   , rcDelegation :: Maybe DelegationFileConfig
     -- ^ Optional @[delegation]@ section (subagent spawning tunables).
     -- Absent means 'defaultDelegationConfig' applies at resolution time.
+  , rcWeb :: Maybe WebConfig
+    -- ^ Optional @[web]@ section (web tool config: search endpoint +
+    -- fetch/search allow-lists + max fetch bytes). Absent means the web
+    -- tools are fail-closed (no endpoint configured).
+  , rcWorkdir :: Maybe WorkdirConfig
+    -- ^ Optional @[workdir]@ section (per-session workdir lifecycle).
+    -- Absent means defaults apply (persist, no chroot — chroot is
+    -- deferred). Per-session workdirs are always on regardless of this
+    -- section; this config only controls cleanup-on-exit.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -148,6 +160,26 @@ data DelegationFileConfig = DelegationFileConfig
 emptyProviderConfig :: ProviderConfig
 emptyProviderConfig = ProviderConfig Nothing Nothing
 
+-- | The @[web]@ section: web tool configuration. Every field is optional;
+-- a missing key decodes as 'Nothing' and the resolved default applies at
+-- the call site.
+data WebConfig = WebConfig
+  { wcSearchEndpoint  :: Maybe Text
+    -- ^ The search API endpoint URL (e.g.
+    -- @https://api.tavily.com/search@). Absent → WEB_SEARCH is
+    -- fail-closed (returns \"no search endpoint configured\").
+  , wcSearchAllowList :: Maybe [Text]
+    -- ^ Allowed domains for WEB_SEARCH results (empty = all allowed).
+    -- Currently advisory (the search endpoint is operator-trusted); future
+    -- filtering of result URLs would use this.
+  , wcFetchAllowList  :: Maybe [Text]
+    -- ^ Allowed domains for WEB_FETCH (empty = all allowed, subject to
+    -- SSRF protection). Absent → all domains allowed.
+  , wcMaxFetchBytes   :: Maybe Int
+    -- ^ Operator-configured byte ceiling for WEB_FETCH. Absent →
+    -- 'defaultRetrievalMaxScanBytes' (128 KiB).
+  } deriving stock (Eq, Show)
+
 -- | Starting state: all fields absent, before @\/vault setup@ is run.
 defaultRuntimeConfig :: RuntimeConfig
 defaultRuntimeConfig = RuntimeConfig
@@ -162,7 +194,26 @@ defaultRuntimeConfig = RuntimeConfig
   , rcDebugSessionTranscript = Nothing
   , rcOnDemandSchemas = Nothing
   , rcDelegation      = Nothing
+  , rcWeb             = Nothing
+  , rcWorkdir          = Nothing
   }
+
+-- | 'WebConfig' with all fields absent (operator did not set them).
+defaultWebConfig :: WebConfig
+defaultWebConfig = WebConfig
+  { wcSearchEndpoint  = Nothing
+  , wcSearchAllowList = Nothing
+  , wcFetchAllowList  = Nothing
+  , wcMaxFetchBytes   = Nothing
+  }
+
+-- | The @[workdir]@ section: per-session workdir lifecycle. Every field
+-- is optional; a missing key decodes as 'Nothing' and the default applies.
+data WorkdirConfig = WorkdirConfig
+  { wdcCleanupOnExit :: Maybe Bool
+    -- ^ Remove the workdir when the session ends. Absent = false
+    -- (persist for inspection).
+  } deriving stock (Eq, Show)
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
 defaultRetrievalConfig :: RetrievalConfig
@@ -211,6 +262,8 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
   <*> Toml.dioptional (Toml.bool "on_demand_schemas") .= rcOnDemandSchemas
   <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= rcDelegation
+  <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb
+  <*> Toml.dioptional (Toml.table workdirConfigCodec "workdir") .= rcWorkdir
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -238,6 +291,25 @@ delegationConfigCodec = DelegationFileConfig
   <*> Toml.dioptional (Toml.text   "api_key")                  .= dfcApiKey
   <*> Toml.dioptional (Toml.text   "api_mode")                 .= dfcApiMode
   <*> Toml.dioptional (Toml.bool   "subagent_auto_approve")    .= dfcSubagentAutoApprove
+
+-- | Bidirectional tomland codec for the @[web]@ section. Every field is
+-- optional. The allow-lists use an array-of-strings TOML key.
+webConfigCodec :: Toml.TomlCodec WebConfig
+webConfigCodec = WebConfig
+  <$> Toml.dioptional (Toml.text  "search_endpoint")   .= wcSearchEndpoint
+  <*> Toml.dioptional (arrayOfText "search_allow_list") .= wcSearchAllowList
+  <*> Toml.dioptional (arrayOfText "fetch_allow_list")  .= wcFetchAllowList
+  <*> Toml.dioptional (Toml.int    "max_fetch_bytes")   .= wcMaxFetchBytes
+
+-- | TOML codec for an array-of-text. tomland doesn't export a direct
+-- @[_Text]@ codec, so we use 'Toml.arrayOf' with 'Toml._Text'.
+arrayOfText :: Toml.Key -> Toml.TomlCodec [Text]
+arrayOfText = Toml.arrayOf Toml._Text
+
+-- | Bidirectional tomland codec for the @[workdir]@ section.
+workdirConfigCodec :: Toml.TomlCodec WorkdirConfig
+workdirConfigCodec = WorkdirConfig
+  <$> Toml.dioptional (Toml.bool "cleanup_on_exit") .= wdcCleanupOnExit
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization

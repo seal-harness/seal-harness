@@ -43,7 +43,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..),
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
@@ -726,14 +726,14 @@ spec = describe "Seal.ISA.Integration" $ do
                                   , "name" .= ("g" :: Text)
                                   , "provider" .= ("ollama" :: Text)
                                   , "model" .= ("llama3" :: Text) ]))
-      let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (SessionId "child")))
+      let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           wiring = AgentStartWiring
             { aswDefBackend = backend
             , aswRuntime = rt
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = worker
             }
@@ -802,6 +802,7 @@ spec = describe "Seal.ISA.Integration" $ do
               , spConfig = tmpDir </> "config"
               , spState = tmpDir </> "state"
               , spKeys = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
               }
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig
