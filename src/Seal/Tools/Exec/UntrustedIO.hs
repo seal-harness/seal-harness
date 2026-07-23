@@ -247,18 +247,22 @@ mkLocalUntrustedIO wsRoot = UntrustedIO
         Right sh -> do
           res <- uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing
           pure (const (Right ()) =<< res)
-  , uioSearchFiles = \pat mPath _limit ->
-      case mkShellCommand (buildRgCmd pat mPath) of
-        Left _   -> pure (Left (UeExec ExecNotImplemented))
-        Right sh -> uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing
+  , uioSearchFiles = \pat mPath _limit -> do
+      let mRel = maybe "" (T.unpack . getRemotePath) mPath
+      case mkSafePathRemote wsRoot mRel of
+        Left pe  -> pure (Left (UePath pe))
+        Right sp -> case mkShellCommand (buildRgCmd pat (Just sp)) of
+          Left _   -> pure (Left (UeExec ExecNotImplemented))
+          Right sh -> uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing
   }
 
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
--- optional workspace-relative path (defaults to @.@).
-buildRgCmd :: SearchPattern -> Maybe RemotePath -> Text
-buildRgCmd pat mPath =
+-- optional workspace-relative path (anchored to the workspace root, not
+-- the remote user's home CWD). Defaults to the workspace root itself.
+buildRgCmd :: SearchPattern -> Maybe SafePath -> Text
+buildRgCmd pat mSafePath =
   "rg -n -- " <> textSearchPattern pat <> " "
-  <> maybe "." getRemotePath mPath
+  <> T.pack (shellQuote (maybe "." getSafePath mSafePath))
 
 -- | Read at most @maxBytes@ from a local file. Returns the bytes read and
 -- a 'Bool' indicating whether the file was truncated (the file is larger
@@ -430,10 +434,12 @@ mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
    , uioProcessKill = \pid -> do
        res <- runRemoteShellText runner sshCfg ("kill " <> T.pack (show pid))
        pure (const (Right ()) =<< res)
-  , uioSearchFiles = \pat mPath _limit ->
-      let cmd = buildRgCmd pat mPath
-      in runRemoteShellText runner sshCfg cmd
-  }
+   , uioSearchFiles = \pat mPath _limit ->
+       let mRel = maybe "" (T.unpack . getRemotePath) mPath
+       in case mkSafePathRemote (wsRootFromCfg sshCfg) mRel of
+            Left pe  -> pure (Left (UePath pe))
+            Right sp -> runRemoteShellText runner sshCfg (buildRgCmd pat (Just sp))
+   }
 
 -- | A stub remote executor that fails-closed on every method (preserving
 -- the pre-Phase-3 behavior). Used by the wiring site in @mode=remote@
