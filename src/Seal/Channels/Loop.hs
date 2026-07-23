@@ -120,7 +120,7 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Session.Workdir (ensureSessionWorkdir)
+import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -499,11 +499,11 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
           -- Per-session workdir: each session gets a fresh directory at
-          -- ~/.seal/cache/workdirs/<sid>. Idempotent (no-op if exists).
+          -- ~/.seal/cache/workdirs/<sid> (local) or
+          -- <scWorkspace>/workdirs/<sid> (remote). Handles both local
+          -- and remote via mkSessionUntrustedIO.
+          untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
           eWd <- ensureSessionWorkdir paths sid
-          untrustedIO <- case eWd of
-            Right wd -> pure $ either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity (WorkspaceRoot wd)) eSecCfg
-            Left _err -> pure mkRemoteUntrustedIOStub
           let wsroot = case eWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -583,10 +583,8 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (cdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+    untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
     eWd <- ensureSessionWorkdir paths sid
-    untrustedIO <- case eWd of
-      Right wd -> pure $ either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity (WorkspaceRoot wd)) eSecCfg
-      Left _err -> pure mkRemoteUntrustedIOStub
     let wsRoot = case eWd of
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"

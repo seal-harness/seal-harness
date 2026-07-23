@@ -95,7 +95,7 @@ import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Session.Workdir (ensureSessionWorkdir)
+import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
@@ -276,10 +276,8 @@ plainTurn deps meta t = do
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
             let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+            untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
             eWd <- ensureSessionWorkdir paths sid
-            untrustedIO <- case eWd of
-              Right wd -> pure $ either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity (WorkspaceRoot wd)) eSecCfg
-              Left _err -> pure mkRemoteUntrustedIOStub
             let wsroot = case eWd of
                   Right wd -> WorkspaceRoot wd
                   Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -491,14 +489,12 @@ plainTurnWithCaps deps meta caps t = do
         eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
         eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+        untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
         eWd <- ensureSessionWorkdir paths sid
         let wsRoot = case eWd of
               Right wd -> WorkspaceRoot wd
               Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-            mkSessionUio _sId = pure $
-              either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity wsRoot) eSecCfg
-        untrustedIO <- mkSessionUio sid
-        let agentDefBackend = bAgentDefs (sdBackends deps)
+            agentDefBackend = bAgentDefs (sdBackends deps)
         mSystem <- resolveSystemPrompt agentDefBackend meta
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
@@ -538,14 +534,12 @@ webCallDispatcher deps callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+    untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
     eWd <- ensureSessionWorkdir paths sid
     let wsRoot = case eWd of
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-        mkSessionUio _sId = pure $
-          either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity wsRoot) eSecCfg
-    untrustedIO <- mkSessionUio sid
-    let caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     let onDemand = either (const False) onDemandSchemas eCfg
         startWiring = webStartWiring
           deps paths sid caps untrustedIO appEnv eCfg

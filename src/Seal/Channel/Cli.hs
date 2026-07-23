@@ -100,7 +100,7 @@ import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
-import Seal.Session.Workdir (ensureSessionWorkdir)
+import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
@@ -289,37 +289,15 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
-  -- Per-session workdir: each session gets a fresh working directory at
-  -- ~/.seal/cache/workdirs/<sid>. The untrusted opcodes' WorkspaceRoot is
-  -- this directory (not the cwd). The workdir is created idempotently at
-  -- session start; on failure the session does NOT fall back to cwd (that
-  -- would reintroduce the cross-session clobber bug).
-  let sessionWsRoot :: SessionId -> IO WorkspaceRoot
-      sessionWsRoot sid = do
-        eWd <- ensureSessionWorkdir paths sid
-        case eWd of
-          Right wd -> pure (WorkspaceRoot wd)
-          Left err -> do
-            ccSend caps ("ERROR: could not create session workdir: " <> T.pack (show err))
-            -- Fail-closed: use a non-existent path so opcodes fail cleanly
-            -- rather than falling back to the cwd (which would clobber).
-            pure (WorkspaceRoot "/nonexistent-workdir-fail-closed")
   appEnv <- mkEnv defaultConfig
-  -- Resolve the operator-configured retrieval ceiling (the hard upper bound
-  -- on bytes scanned per FILE_READ). Falls back to the 128 KiB default when
-  -- the [retrieval] section is absent. Loaded once at startup; a config
-  -- change takes effect on the next session.
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Per-session untrusted IO: rebuilt with the session's workdir as the
-      -- WorkspaceRoot. The workdir is created at session start; the
-      -- UntrustedIO is constructed from the security config + workdir.
-      -- For the startup/default (no session), use the fail-closed stub.
+      -- Per-session untrusted IO: creates the workdir (local or remote)
+      -- and constructs the handle. Handles both mode=local and
+      -- mode=remote via mkSessionUntrustedIO.
       mkSessionUio :: SessionId -> IO UntrustedIO
-      mkSessionUio sid = do
-        wsRoot <- sessionWsRoot sid
-        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity wsRoot) eSecCfg)
+      mkSessionUio = either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch

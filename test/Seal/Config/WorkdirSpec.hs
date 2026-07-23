@@ -2,6 +2,7 @@
 module Seal.Config.WorkdirSpec (spec) where
 
 import Data.Either (isRight)
+import Data.Text qualified as T
 import System.Directory
   ( doesDirectoryExist, doesFileExist, createDirectoryIfMissing )
 import System.FilePath ((</>))
@@ -12,7 +13,11 @@ import Test.Hspec
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSystemSessionId)
 import Seal.Session.Workdir
-  ( WorkdirError (..), ensureSessionWorkdir, cleanupSessionWorkdir )
+  ( WorkdirError (..), ensureSessionWorkdir, cleanupSessionWorkdir
+  , remoteSessionWorkdirPath, ensureRemoteSessionWorkdir )
+import Seal.Tools.Exec.Remote (mkFakeRemoteRunner)
+import Seal.Tools.Exec.Types
+  ( SshConfig (..), ExecError (..), mkSshHost, mkSshUser, mkRemotePath )
 
 spec :: Spec
 spec = describe "Seal.Session.Workdir" $ do
@@ -116,3 +121,42 @@ spec = describe "Seal.Session.Workdir" $ do
             sid = mkSystemSessionId "test-007"
         res <- cleanupSessionWorkdir paths sid
         res `shouldSatisfy` isRight
+
+  describe "remoteSessionWorkdirPath" $ do
+
+    it "produces <scWorkspace>/workdirs/<sid>" $ do
+      let sid = mkSystemSessionId "test-remote-001"
+          remoteWd = remoteSessionWorkdirPath sshCfg sid
+      remoteWd `shouldBe` "/srv/agent-workspace/workdirs/test-remote-001"
+
+  describe "ensureRemoteSessionWorkdir" $ do
+
+    it "returns the remote workdir path on success" $ do
+      let sid = mkSystemSessionId "test-remote-004"
+          runner = mkFakeRemoteRunner (Right "")
+      res <- ensureRemoteSessionWorkdir sshCfg runner sid
+      case res of
+        Right path -> T.isSuffixOf "/workdirs/test-remote-004" path `shouldBe` True
+        Left err   -> expectationFailure ("expected Right, got " <> show err)
+
+    it "fails on SSH error (WdRemoteMkdirFailed)" $ do
+      let sid = mkSystemSessionId "test-remote-005"
+          runner = mkFakeRemoteRunner (Left ExecRemoteUnreachable)
+      res <- ensureRemoteSessionWorkdir sshCfg runner sid
+      res `shouldSatisfy` \case
+        Left (WdRemoteMkdirFailed _) -> True
+        _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Fixtures
+-- ---------------------------------------------------------------------------
+
+sshCfg :: SshConfig
+sshCfg = SshConfig
+  { scHost       = either (error "fixture") id (mkSshHost "exec.internal")
+  , scUser       = either (error "fixture") id (mkSshUser "agent")
+  , scPort       = 22
+  , scIdentity   = Nothing
+  , scKnownHosts = "/home/agent/.ssh/known_hosts"
+  , scWorkspace  = either (error "fixture") id (mkRemotePath "/srv/agent-workspace")
+  }
