@@ -364,9 +364,13 @@ mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
       let rel = T.unpack (getRemotePath rp)
       in case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
            Left pe  -> pure (Left (UePath pe))
-           Right _  -> do
-             -- ssh ... -- head -c <scanBytes> <relpath>  (bounded read)
-             let cmd = T.pack ("head -c " <> show scanBytes <> " " <> shellQuote rel)
+           Right sp -> do
+             -- ssh ... -- head -c <scanBytes> <abspath>  (bounded read).
+             -- The SafePath is the workspace-anchored absolute path on the
+             -- remote machine; the SSH command reads from that path, not
+             -- the remote user's home CWD.
+             let absPath = getSafePath sp
+                 cmd = T.pack ("head -c " <> show scanBytes <> " " <> shellQuote absPath)
              res <- runRemoteShellText runner sshCfg cmd
              pure (Right . lineWindowFromText =<< res)
   , uioWriteFile = \rp content mode _ceiling' -> do
@@ -374,10 +378,12 @@ mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
           byteCount = BS.length (TE.encodeUtf8 content)
       case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
         Left pe  -> pure (Left (UePath pe))
-        Right _  -> do
-          -- ssh ... -- tee [-a] <relpath>   with content on stdin
-          let teeFlag = case mode of WMWrite -> "" ; WMAppend -> "-a "
-              cmd  = T.pack ("tee " <> teeFlag <> shellQuote rel)
+        Right sp -> do
+          -- ssh ... -- tee [-a] <abspath>   with content on stdin.
+          -- The SafePath is the workspace-anchored absolute path.
+          let absPath  = getSafePath sp
+              teeFlag = case mode of WMWrite -> "" ; WMAppend -> "-a "
+              cmd  = T.pack ("tee " <> teeFlag <> shellQuote absPath)
               argv = sshExecArgv sshCfg cmd
           res <- runRemoteStdin runner argv (TE.encodeUtf8 content)
           pure (either (Left . UeExec) (const (Right byteCount)) res)
@@ -385,21 +391,23 @@ mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
       let rel = T.unpack (getRemotePath rp)
       case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
         Left pe  -> pure (Left (UePath pe))
-        Right _  -> do
+        Right sp -> do
+          let absPath = getSafePath sp
           -- Read remote (cat) → apply diff in-process → write remote via
           -- a single SSH exec with stdin. The patched content is piped to
           -- a remote sh -c that writes the temp + mv (atomic).
-          let readCmd = T.pack ("cat " <> shellQuote rel)
+          let readCmd = T.pack ("cat " <> shellQuote absPath)
           rRead <- runRemoteShellText runner sshCfg readCmd
           case rRead of
             Left e       -> pure (Left e)
             Right oldTxt -> case applyUnifiedDiff oldTxt patch of
               Left applyErr -> pure (Left (UeIo applyErr))
               Right newContent -> do
-                let remoteSh = T.pack
-                      ("sh -c 'cat > " <> shellQuote (rel <> ".seal-patch-tmp")
-                       <> " && mv " <> shellQuote (rel <> ".seal-patch-tmp")
-                       <> " " <> shellQuote rel <> "'")
+                let tmpPath = absPath <> ".seal-patch-tmp"
+                    remoteSh = T.pack
+                      ("sh -c 'cat > " <> shellQuote tmpPath
+                       <> " && mv " <> shellQuote tmpPath
+                       <> " " <> shellQuote absPath <> "'")
                     argv = sshExecArgv sshCfg remoteSh
                 res <- runRemoteStdin runner argv (TE.encodeUtf8 newContent)
                 pure (either (Left . UeExec) (const (Right ())) res)

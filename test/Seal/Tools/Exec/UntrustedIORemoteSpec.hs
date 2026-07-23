@@ -69,7 +69,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
         [(argv, mStdin)] -> do
           -- The argv is the fixed SSH argv with @tee <path>@ after @--@.
           argv `shouldSatisfy` elem "--"
-          argv `shouldSatisfy` elem "tee 'pangram.txt'"
+          argv `shouldSatisfy` elem "tee '/srv/agent-workspace/pangram.txt'"
           -- The content is on stdin, NOT in the argv.
           mStdin `shouldBe` Just "The quick brown fox"
           argv `shouldNotSatisfy` elem "The quick brown fox"
@@ -99,7 +99,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       _ <- uioWriteFile uio rp "more" WMAppend 65536
       recorded <- readIORef calls
       case recorded of
-        [(argv, _)] -> argv `shouldSatisfy` elem "tee -a 'log.txt'"
+        [(argv, _)] -> argv `shouldSatisfy` elem "tee -a '/srv/agent-workspace/log.txt'"
         _           -> expectationFailure "expected one call"
 
     it "content with shell metacharacters is safe (on stdin, not argv)" $ do
@@ -145,7 +145,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       length recorded `shouldBe` 1
       case recorded of
         [(argv, mStdin)] -> do
-          argv `shouldSatisfy` elem "head -c 1024 'doc.txt'"
+          argv `shouldSatisfy` elem "head -c 1024 '/srv/agent-workspace/doc.txt'"
           mStdin `shouldBe` Nothing
         _ -> expectationFailure "expected one call"
       -- The result is a LineWindow carrying the remote content.
