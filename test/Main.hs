@@ -26,6 +26,7 @@ import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
+import qualified Seal.Web.UrlSafetySpec
 import qualified Seal.Web.BrowserSpec
 import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
@@ -155,6 +156,7 @@ main = hspec $ do
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
+  Seal.Web.UrlSafetySpec.spec
   Seal.Web.BrowserSpec.spec
   Seal.Media.ImageSpec.spec
   Seal.Media.TtsSpec.spec

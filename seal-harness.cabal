@@ -128,6 +128,7 @@ library
         Seal.Tools.Exec.UntrustedIO
         Seal.Web.Search
         Seal.Web.Fetch
+        Seal.Web.UrlSafety
         Seal.Web.Browser
         Seal.Web.UiState
         Seal.Media.Image
@@ -203,6 +204,7 @@ library
       , http-client
       , http-client-tls
       , http-types
+      , network
       , tomland
       , process
       , unix
@@ -353,6 +355,7 @@ test-suite tests
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
         Seal.Tools.Exec.UntrustedIORemoteSpec
+        Seal.Web.UrlSafetySpec
         Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec
