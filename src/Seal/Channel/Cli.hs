@@ -35,7 +35,7 @@ import System.Console.Haskeline
   , noCompletion
   , runInputT
   )
-import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
@@ -61,11 +61,11 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO )
+import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
+#else
+import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
-import Seal.Tools.Exec.UntrustedIO
-  ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
@@ -100,6 +100,7 @@ import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
+import Seal.Session.Workdir (ensureSessionWorkdir)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
@@ -288,7 +289,21 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
-  wsRoot <- WorkspaceRoot <$> getCurrentDirectory
+  -- Per-session workdir: each session gets a fresh working directory at
+  -- ~/.seal/cache/workdirs/<sid>. The untrusted opcodes' WorkspaceRoot is
+  -- this directory (not the cwd). The workdir is created idempotently at
+  -- session start; on failure the session does NOT fall back to cwd (that
+  -- would reintroduce the cross-session clobber bug).
+  let sessionWsRoot :: SessionId -> IO WorkspaceRoot
+      sessionWsRoot sid = do
+        eWd <- ensureSessionWorkdir paths sid
+        case eWd of
+          Right wd -> pure (WorkspaceRoot wd)
+          Left err -> do
+            ccSend caps ("ERROR: could not create session workdir: " <> T.pack (show err))
+            -- Fail-closed: use a non-existent path so opcodes fail cleanly
+            -- rather than falling back to the cwd (which would clobber).
+            pure (WorkspaceRoot "/nonexistent-workdir-fail-closed")
   appEnv <- mkEnv defaultConfig
   -- Resolve the operator-configured retrieval ceiling (the hard upper bound
   -- on bytes scanned per FILE_READ). Falls back to the 128 KiB default when
@@ -297,15 +312,14 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Resolve the untrusted-execution capability handle from the
-      -- SecurityConfig (loaded from security.toml, not config.toml). The
-      -- security config is agent-immutable (design §4 E): the exec backend
-      -- cannot be flipped by a future CONFIG_UPDATE opcode. Local mode →
-      -- 'mkLocalUntrustedIO'; remote mode → 'mkRemoteUntrustedIO' (the real
-      -- SSH arm) or the fail-closed stub when the remote block is
-      -- missing/incomplete.
-      untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsRoot) eSecCfg
-      defaultUntrustedIO = mkRemoteUntrustedIOStub  -- fail-closed default
+      -- Per-session untrusted IO: rebuilt with the session's workdir as the
+      -- WorkspaceRoot. The workdir is created at session start; the
+      -- UntrustedIO is constructed from the security config + workdir.
+      -- For the startup/default (no session), use the fail-closed stub.
+      mkSessionUio :: SessionId -> IO UntrustedIO
+      mkSessionUio sid = do
+        wsRoot <- sessionWsRoot sid
+        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity wsRoot) eSecCfg)
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
@@ -380,10 +394,14 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
              (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
              (Nothing, Nothing)                -> Nothing
       cliChildRegistryBuilder _def childSid childCaps = do
+        eChildWd <- ensureSessionWorkdir paths childSid
+        let childWsRoot = case eChildWd of
+              Right wd -> WorkspaceRoot wd
+              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         let childBaseOps =
               [ showHumanOp childCaps
               , askHumanOp childCaps
-              , fileReadOp wsRoot operatorCeiling
+              , fileReadOp childWsRoot operatorCeiling
               , secretGetOp rt
               , memoryWriteOp memoryBackend childSid
               , memoryRecallOp defaultPageParams memoryBackend
@@ -397,12 +415,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
               -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
               -- AGENT_INTERRUPT
-              , shellExecOp wsRoot cliSecurityPolicy
-              , binExecOp wsRoot cliSecurityPolicy binAllowList
-              , processManageOp wsRoot cliSecurityPolicy
-              , fileWriteOp wsRoot operatorCeiling
-              , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling
+              , shellExecOp childWsRoot cliSecurityPolicy
+              , binExecOp childWsRoot cliSecurityPolicy binAllowList
+              , processManageOp childWsRoot cliSecurityPolicy
+              , fileWriteOp childWsRoot operatorCeiling
+              , filePatchOp childWsRoot
+              , searchFilesOp childWsRoot cliSecurityPolicy operatorCeiling
               ]
         pure (ISA.mkRegistry
                 (filterBlocklisted childBaseOps opName
@@ -417,7 +435,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               { dwdPaths = paths
               , dwdParentSid = sid
               , dwdAppEnv = appEnv
-              , dwdUntrustedIO = untrustedIO
+              , dwdMkUntrustedIO = mkSessionUio
               , dwdAutonomy = autonomy
               , dwdApprovals = approvals
               , dwdOnDemand = onDemand
@@ -448,7 +466,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
       -- describe/list ops close over the registry they belong to (let-knot).
       -- `tHandle` is NOT closed over here — the dispatcher threads it at call
       -- time.
-      cliIsaReg sid startWiring caps' =
+      cliIsaReg sid startWiring caps' wsRoot =
         let reg = ISA.mkRegistry
               (baseOps reg ++ if onDemand
                                 then [opcodeDescribeOp reg, opcodeListOp reg]
@@ -500,8 +518,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          let startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps
+          eWd <- ensureSessionWorkdir paths sid
+          let wsRoot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps wsRoot
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
@@ -538,14 +560,19 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                 , ccPromptSecret = ccPromptSecret caps
                 }
               bgStartWiring = cliStartWiring bgSid
-              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps
+          eBgWd <- ensureSessionWorkdir paths bgSid
+          let bgWsRoot = case eBgWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot
           tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
             Left err -> ccSend caps ("bg failed: " <> err)
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta
-              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle untrustedIO
+              bgUio <- mkSessionUio bgSid
+              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
@@ -563,19 +590,25 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          let startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps
+          eWd <- ensureSessionWorkdir paths sid
+          let wsRoot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps wsRoot
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
+          callUio <- mkSessionUio sid
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
           case res of
             Right r -> recordSkillLoadResult tHandle callOpName val r
             Left _  -> pure ()
           pure res
       plainHandler t = do
         meta <- readIORef (srActive sr)
-        withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->
+        withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
+          uio <- mkSessionUio sid
           handlePlain
-            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand)
             appEnv t
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)

@@ -53,7 +53,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
-import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 
@@ -120,6 +120,7 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Session.Workdir (ensureSessionWorkdir)
 import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -136,7 +137,7 @@ import Seal.Tabs
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs )
-import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -493,13 +494,19 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
       _guard <- replySubscribe (cdReplies deps) h sid
       withSessionLock (cdLocks deps) sid $ do
         withTwoFileTranscript sessionDirPath $ \tHandle -> do
-          wsroot <- WorkspaceRoot <$> getCurrentDirectory
           appEnv <- mkEnv defaultConfig
           eCfg <- loadRuntimeConfig (prConfigPath pr)
           eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-              untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsroot) eSecCfg
-              defaultUntrustedIO = mkLocalUntrustedIO wsroot
+          -- Per-session workdir: each session gets a fresh directory at
+          -- ~/.seal/cache/workdirs/<sid>. Idempotent (no-op if exists).
+          eWd <- ensureSessionWorkdir paths sid
+          untrustedIO <- case eWd of
+            Right wd -> pure $ either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity (WorkspaceRoot wd)) eSecCfg
+            Left _err -> pure mkRemoteUntrustedIOStub
+          let wsroot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
@@ -572,13 +579,17 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
       sessionDirPath = sessionDir paths sid
   createDirectoryIfMissing True sessionDirPath
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    wsRoot <- WorkspaceRoot <$> getCurrentDirectory
     appEnv <- mkEnv defaultConfig
     eCfg <- loadRuntimeConfig (prConfigPath (cdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsRoot) eSecCfg
-        defaultUntrustedIO = mkRemoteUntrustedIOStub
+    eWd <- ensureSessionWorkdir paths sid
+    untrustedIO <- case eWd of
+      Right wd -> pure $ either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity (WorkspaceRoot wd)) eSecCfg
+      Left _err -> pure mkRemoteUntrustedIOStub
+    let wsRoot = case eWd of
+          Right wd -> WorkspaceRoot wd
+          Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = mkHandleCaps h askReply sid
         onDemand = either (const False) onDemandSchemas eCfg
         startWiring = channelStartWiring
@@ -718,12 +729,18 @@ channelMkWorker
   :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int
   -> AgentWorkerBuilder
-channelMkWorker deps paths parentSid _caps untrustedIO appEnv eCfg wsRoot operatorCeiling =
+channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdUntrustedIO = untrustedIO
+    , dwdMkUntrustedIO = \childSid -> do
+        eChildWd <- ensureSessionWorkdir paths childSid
+        let childWsRoot = case eChildWd of
+              Right wd -> WorkspaceRoot wd
+              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+        eSecCfg <- loadSecurityConfig (securityFilePath paths)
+        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity childWsRoot) eSecCfg)
     , dwdAutonomy = cdAutonomy deps
     , dwdApprovals = cdApprovals deps
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -752,6 +769,10 @@ channelMkWorker deps paths parentSid _caps untrustedIO appEnv eCfg wsRoot operat
            (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
            (Nothing, Nothing)                -> Nothing
     buildChildRegistry _def childSid childCaps = do
+      eChildWd <- ensureSessionWorkdir paths childSid
+      let childWsRoot = case eChildWd of
+            Right wd -> WorkspaceRoot wd
+            Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
       let childBaseOps =
             [ showHumanOp childCaps
             , askHumanOp childCaps
@@ -768,13 +789,13 @@ channelMkWorker deps paths parentSid _caps untrustedIO appEnv eCfg wsRoot operat
             -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
             -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
             -- AGENT_INTERRUPT
-            , searchFilesOp wsRoot securityPolicy operatorCeiling
-            , fileReadOp wsRoot operatorCeiling
-            , fileWriteOp wsRoot operatorCeiling
-            , filePatchOp wsRoot
-            , shellExecOp wsRoot securityPolicy
-            , binExecOp wsRoot securityPolicy binAllowList
-            , processManageOp wsRoot securityPolicy
+            , searchFilesOp childWsRoot securityPolicy operatorCeiling
+            , fileReadOp childWsRoot operatorCeiling
+            , fileWriteOp childWsRoot operatorCeiling
+            , filePatchOp childWsRoot
+            , shellExecOp childWsRoot securityPolicy
+            , binExecOp childWsRoot securityPolicy binAllowList
+            , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
             , webSearchOp webSearchCfg
             ]

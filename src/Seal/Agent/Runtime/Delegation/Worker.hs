@@ -94,7 +94,11 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdAppEnv       :: Env
     -- ^ The top-level app env (katip logging, config) — re-used for the
     -- child's 'runApp'.
-  , dwdUntrustedIO  :: UntrustedIO
+  , dwdMkUntrustedIO :: SessionId -> IO UntrustedIO
+    -- ^ Construct the child's 'UntrustedIO' capability handle from the
+    -- child's session id. The wiring layer creates the child's workdir
+    -- (per-session isolation) and resolves the security config into the
+    -- handle. Called at child-start time (after the child's sid is minted).
   , dwdAutonomy     :: AutonomyLevel
   , dwdApprovals    :: ApprovalCache
   , dwdOnDemand     :: Bool
@@ -145,6 +149,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , ccPromptSecret = \_ -> pure ""
               }
         childReg <- dwdChildRegistry deps def childSid capturingCaps
+        childUio <- dwdMkUntrustedIO deps childSid
         let env = AgentEnv
               { aeProvider   = prov
               , aeProviderLabel = providerLabel def
@@ -153,7 +158,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeRegistry   = childReg
               , aeTranscript = childTHandle
               , aeBackend    = localBackend
-              , aeUntrustedIO = dwdUntrustedIO deps
+              , aeUntrustedIO = childUio
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 12
