@@ -14,7 +14,7 @@ import Options.Applicative
 import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channels.Signal.Run (runSignalLoop)
@@ -133,7 +133,7 @@ spec = do
                   , aeRegistry = isaReg
                   , aeTranscript = tHandle
                   , aeBackend = localBackend
-                  , aeExecBackend = EbLocal mkLocalExecHandlePlaceholder
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
                   , aeCaps = handleCaps
                   , aeSession = sid
                   , aeMaxTurns = 4

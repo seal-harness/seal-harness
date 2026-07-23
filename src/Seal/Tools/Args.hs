@@ -23,6 +23,9 @@ module Seal.Tools.Args
   , BinArg (..)
   , mkBinArg
   , textBinArg
+  , SearchPattern (..)
+  , mkSearchPattern
+  , textSearchPattern
   ) where
 
 import Data.Char (isControl)
@@ -101,3 +104,23 @@ mkBinArg t
 
 textBinArg :: BinArg -> Text
 textBinArg (BinArg t) = t
+
+-- | A search pattern passed to a search tool (e.g. @rg@). Smart-constructed:
+-- rejects empty and leading-dash (option-injection defense at the search
+-- tool's argv boundary). NUL/newlines rejected so the pattern cannot break
+-- out of its single argv token. The validated newtype is what the
+-- 'UntrustedIO' search methods accept; the caller never passes raw 'Text'.
+newtype SearchPattern = SearchPattern Text
+  deriving stock (Eq, Show)
+
+mkSearchPattern :: Text -> Either Text SearchPattern
+mkSearchPattern t
+  | T.null t          = Left "search pattern is empty"
+  | T.head t == '-'   = Left "search pattern must not start with '-' (option injection)"
+  | T.any isArgBad t  = Left "search pattern contains NUL, newline, or control char"
+  | otherwise         = Right (SearchPattern t)
+  where
+    isArgBad c = c == '\0' || c == '\n' || isControl c
+
+textSearchPattern :: SearchPattern -> Text
+textSearchPattern (SearchPattern t) = t

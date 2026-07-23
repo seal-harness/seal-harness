@@ -14,9 +14,9 @@ import Seal.ISA.Ops.Bin
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Tools.Args
-import Seal.Tools.Exec.Local (mkLocalExecHandleFromFns)
-import Seal.Tools.Exec.Types (ExecBackend (..))
+import Seal.Tools.Args (textBinArg, textBinName)
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
@@ -24,14 +24,14 @@ import Seal.Types.Env
 runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
--- | A fake backend that records the program invocation and returns canned output.
-fakeBackend :: IORef [Text] -> Text -> ExecBackend
-fakeBackend seen canned = EbLocal (mkLocalExecHandleFromFns shellFn binFn)
-  where
-    shellFn _ _ = pure (Right "")
-    binFn bin args = do
+-- | A fake 'UntrustedIO' that records the binary invocation and returns
+-- canned output. Other methods are the fail-closed stub.
+fakeUio :: IORef [Text] -> Text -> UntrustedIO
+fakeUio seen canned = mkRemoteUntrustedIOStub
+  { uioBinExec = \bin args -> do
       modifyIORef' seen (++ [textBinName bin <> " " <> T.intercalate " " (map textBinArg args)])
       pure (Right canned)
+  }
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Bin" $ do
@@ -40,10 +40,10 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "runs a binary via an allow-listed name" $ do
       seen <- newIORef []
-      let backend = fakeBackend seen "42\n"
+      let uio = fakeUio seen "42\n"
           allowList = Just (Set.fromList ["python3", "node"])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList backend
-      r <- runTestApp (uoRun op undefined backend (object
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
+      r <- runTestApp (uoRun op uio (object
         [ "binary" .= ("python3" :: String)
         , "args" .= (["-c", "print(42)"] :: [String])
         ]))
@@ -53,49 +53,49 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "binary not in allow-list -> Denied" $ do
       let allowList = Just (Set.fromList ["python3"])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList undefined
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
       uoAuthorize op (object
         [ "binary" .= ("rm" :: String)
         , "args" .= (["-rf", "/"] :: [String])
         ]) `shouldBe` Left "BIN_EXEC: binary \"rm\" not in the allow-list"
 
     it "missing binary field -> error" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just Set.empty) undefined
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just Set.empty)
       uoAuthorize op (object ["args" .= (["x"] :: [String])])
         `shouldBe` Left "BIN_EXEC requires {binary:string, args:[string]}"
 
     it "args field is optional (defaults to [])" $ do
       seen <- newIORef []
-      let backend = fakeBackend seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing backend
-      r <- runTestApp (uoRun op undefined backend (object
+      let uio = fakeUio seen "ok\n"
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (uoRun op uio (object
         [ "binary" .= ("ls" :: String)
         ]))
       orIsError r `shouldBe` False
       readIORef seen `shouldReturn` ["ls "]
 
     it "binary with NUL -> Denied (validated BinName rejects NUL)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing undefined
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       uoAuthorize op (object
         [ "binary" .= ("ev\0il" :: String)
         ]) `shouldBe` Left "BIN_EXEC: invalid binary name"
 
     it "arg with NUL -> Denied (validated BinArg rejects NUL)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing undefined
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "args" .= ["ok\0bad" :: String]
         ]) `shouldBe` Left "BIN_EXEC: invalid arg"
 
     it "leading-dash arg is permitted (flag, not option injection)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just (Set.fromList ["ls"])) undefined
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just (Set.fromList ["ls"]))
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "args" .= (["-l", "-a"] :: [String])
         ]) `shouldBe` Right ()
 
     it "Nothing allow-list permits any binary (autonomy permitting)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing undefined
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       uoAuthorize op (object
         [ "binary" .= ("rm" :: String)
         , "args" .= (["-rf", "/"] :: [String])
@@ -103,9 +103,9 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "orRecorded captures the binary + arg count (secret-free, not the args)" $ do
       seen <- newIORef []
-      let backend = fakeBackend seen ""
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing backend
-      r <- runTestApp (uoRun op undefined backend (object
+      let uio = fakeUio seen ""
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (uoRun op uio (object
         [ "binary" .= ("node" :: String)
         , "args" .= (["-e", "console.log('hi')"] :: [String])
         ]))

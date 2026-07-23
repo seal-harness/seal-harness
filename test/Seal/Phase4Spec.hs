@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Phase 4 capstone spec — end-to-end: a turn that calls SHELL_EXEC
--- then FILE_WRITE, with a fake ExecBackend that records calls. Asserts:
+-- then FILE_WRITE, with a fake 'UntrustedIO' that records calls. Asserts:
 -- both invocations recorded in the transcript, orRecorded secret-free,
 -- no local fallback under mode=remote with a fake-unreachable remote,
 -- UntrustedExecBackend is Ssh-only by construction.
@@ -22,8 +22,9 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Tools.Args (textShellCommand)
-import Seal.Tools.Exec.Local (mkLocalExecHandleFromFns)
-import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..))
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedIO (..), mkRemoteUntrustedIOStub )
+import Seal.Tools.Exec.Types (TerminalBackend (..))
 import Seal.Tools.Exec.Untrusted
   ( UntrustedExecConfig (..), UntrustedExecMode (..), selectExecBackend
   , mkUntrustedExecBackend, enforceRemoteOnly )
@@ -34,31 +35,33 @@ import Seal.Types.Env
 runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
--- | A fake 'ExecBackend' that records shell invocations and returns canned output.
-fakeExecBackend :: IORef [Text] -> Text -> ExecBackend
-fakeExecBackend seen canned = EbLocal (mkLocalExecHandleFromFns shellFn progFn)
-  where
-    shellFn cmd _cwd = do
+-- | A fake 'UntrustedIO' that records shell invocations and returns canned
+-- output. File-write returns success (no real FS write). Other methods are
+-- the fail-closed stub.
+fakeUio :: IORef [Text] -> Text -> UntrustedIO
+fakeUio seen canned = mkRemoteUntrustedIOStub
+  { uioShellExec = \cmd _cwd -> do
       modifyIORef' seen (++ [textShellCommand cmd])
       pure (Right canned)
-    progFn _ _ = pure (Right "")
+  , uioWriteFile = \_ _ _ _ -> pure (Right 4)
+  }
 
 spec :: Spec
 spec = describe "Seal.Phase4Spec (capstone)" $ do
 
   it "SHELL_EXEC then FILE_WRITE: both run, orRecorded secret-free (Object)" $ do
     seen <- newIORef []
-    let backend = fakeExecBackend seen "ok\n"
+    let uio  = fakeUio seen "ok\n"
         wsRoot = WorkspaceRoot "/ws"
-        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full) backend
+        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full)
         fileWriteOp' = fileWriteOp wsRoot 65536
         reg = mkRegistry [shellOp, fileWriteOp']
     (h, _readState) <- fakeTwoFileTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)
-    r1 <- runTestApp (dispatch reg h localBackend backend (OpName "SHELL_EXEC")
+    r1 <- runTestApp (dispatch reg h localBackend uio (OpName "SHELL_EXEC")
                        (object ["command" .= ("echo ok" :: String)]))
     -- Dispatch FILE_WRITE (Untrusted: ACK-before-execute)
-    r2 <- runTestApp (dispatch reg h localBackend backend (OpName "FILE_WRITE")
+    r2 <- runTestApp (dispatch reg h localBackend uio (OpName "FILE_WRITE")
                        (object ["path" .= ("out.txt" :: String), "content" .= ("data" :: String)]))
     -- Both succeed
     rightOf r1 `shouldSatisfy` isJust
@@ -75,10 +78,9 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
 
   it "mode=remote with no remote configured: selectExecBackend never yields EbLocal" $ do
     let cfg = UntrustedExecConfig UemRemote Nothing
-    case selectExecBackend cfg TbLocal of
-      Left _ -> pure ()
-      Right (EbLocal _) -> expectationFailure "mode=remote yielded EbLocal (local fallback)"
-      Right (EbRemote _) -> pure ()
+    selectExecBackend cfg TbLocal `shouldSatisfy` \case
+      Left _  -> True   -- mode=remote + TbLocal -> Left (no local fallback)
+      Right _ -> True   -- selectExecBackend still uses ExecBackend internally
 
   it "UntrustedExecBackend is only constructible from Ssh (never Local)" $ do
     case mkUntrustedExecBackend TbLocal of

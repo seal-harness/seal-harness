@@ -175,7 +175,7 @@ runTurn env userText = do
       mConfirmed <- checkConfirmation name mOp input
       res <- case mConfirmed of
         Left denyMsg -> pure (Left (Denied denyMsg))
-        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeExecBackend env) name input
+        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUntrustedIO env) name input
       pure $ case res of
         Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
         Right r -> CbToolResult tcid (orParts r) (orIsError r)

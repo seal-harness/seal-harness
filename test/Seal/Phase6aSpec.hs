@@ -18,7 +18,7 @@ import Seal.Harness.Registry
 import Seal.Harness.Tmux
 import Seal.ISA.Dispatch (DispatchError, dispatch)
 import Seal.ISA.Opcode (Opcode, OpResult, localBackend, opName)
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.ISA.Ops.Harness
 import Seal.ISA.Registry qualified as Registry
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -126,10 +126,10 @@ spec = describe "Seal.Phase6aSpec" $ do
 
 -- | Dispatch one opcode via a one-op registry against a fake transcript.
 dispatchReg :: TwoFileHandle -> Opcode -> App (Either DispatchError OpResult)
-dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend (EbLocal mkLocalExecHandlePlaceholder) (opName op) (object [])
+dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub (opName op) (object [])
 
 dispatchOp :: TwoFileHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
-dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend (EbLocal mkLocalExecHandlePlaceholder) (opName op)
+dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub (opName op)
 
 testEntry :: HarnessId -> HarnessEntry
 testEntry hid = HarnessEntry

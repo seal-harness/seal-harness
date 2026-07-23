@@ -53,7 +53,7 @@ webFetchOp cfg = UntrustedOpcode
           | not (domainAllowed u (wfcAllowList cfg)) ->
               Left ("WEB_FETCH: domain not in allow-list: " <> hostOf u)
           | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let u = fromMaybe "" (urlField v)
       case wfcManager cfg of
         Nothing -> pure (OpResult

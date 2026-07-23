@@ -67,7 +67,7 @@ import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), execBackendFromSecurity, mkSessionAgentEnv
+  ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
@@ -136,8 +136,7 @@ import Seal.Tabs
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs )
-import Seal.Tools.Exec.Local (mkLocalExecHandle)
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -499,24 +498,24 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           eCfg <- loadRuntimeConfig (prConfigPath pr)
           eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-              execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsroot) eSecCfg
-              defaultExecBackend = EbLocal (mkLocalExecHandle wsroot)
+              untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsroot) eSecCfg
+              defaultUntrustedIO = mkLocalUntrustedIO wsroot
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
           let handleCaps = mkHandleCaps h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
-                deps paths sid handleCaps execBackend appEnv eCfg
+                deps paths sid handleCaps untrustedIO appEnv eCfg
                 wsroot operatorCeiling isaReg
               isaReg = buildIsaRegistry
-                rt backends wsroot sid operatorCeiling execBackend autonomy
+                rt backends wsroot sid operatorCeiling autonomy
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
                 (cdHttpManager deps) handleCaps onDemand
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+                       handleCaps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand)
@@ -577,20 +576,20 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (cdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
-        defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
+        untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsRoot) eSecCfg
+        defaultUntrustedIO = mkRemoteUntrustedIOStub
         caps = mkHandleCaps h askReply sid
         onDemand = either (const False) onDemandSchemas eCfg
         startWiring = channelStartWiring
-          deps paths sid caps execBackend appEnv eCfg
+          deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling isaReg
         isaReg = buildIsaRegistry
           (cdVault deps) (cdBackends deps) wsRoot sid operatorCeiling
-          execBackend (cdAutonomy deps) startWiring
+          (cdAutonomy deps) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> recordSkillLoadResult tHandle callOpName val r
       Left _  -> pure ()
@@ -601,7 +600,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
 -- as the web and CLI paths.
 buildIsaRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
-  -> ExecBackend -> Policy.AutonomyLevel
+  -> Policy.AutonomyLevel
   -> AgentStartWiring
   -> HarnessRegistry
   -> TmuxRunner
@@ -609,7 +608,7 @@ buildIsaRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
   -> ISA.Registry
-buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
+buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -633,13 +632,13 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-      , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+      , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy execBackend
-      , binExecOp wsRoot securityPolicy binAllowList execBackend
-      , processManageOp wsRoot securityPolicy execBackend
+      , shellExecOp wsRoot securityPolicy
+      , binExecOp wsRoot securityPolicy binAllowList
+      , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
       , harnessListOp harnessReg
@@ -676,14 +675,14 @@ channelMintSession fallback = do
 
 -- | Build the 'AgentStartWiring' for a channel turn. The wiring closes over
 -- the per-turn 'ChannelDeps' + parent session id + 'ChannelCaps' +
--- 'ExecBackend' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
+-- 'UntrustedIO' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
 -- child's narrowed registry). The worker-builder is 'channelMkWorker'
 -- (below), which runs 'runTurn' with the goal as the first user message and
 -- captures the final text response as the summary.
 channelStartWiring
-  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
+  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> ISA.Registry -> AgentStartWiring
-channelStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling _isaReg =
+channelStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling _isaReg =
   AgentStartWiring
     { aswDefBackend = bAgentDefs (cdBackends deps)
     , aswRuntime = bRuntime (cdBackends deps)
@@ -694,7 +693,7 @@ channelStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot oper
     , aswParentActivity = Just (bParentActivity (cdBackends deps))
     , aswMintSession = channelMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = channelMkWorker deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling
+    , aswWorker = channelMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling
     }
 
 -- | The AGENT_START worker-builder for inbox-driven channels. Resolves the
@@ -706,15 +705,15 @@ channelStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot oper
 -- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
 -- IORef; the worker reads it after the run and returns it as the summary.
 channelMkWorker
-  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
+  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int
   -> AgentWorkerBuilder
-channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCeiling =
+channelMkWorker deps paths parentSid _caps untrustedIO appEnv eCfg wsRoot operatorCeiling =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdExecBackend = execBackend
+    , dwdUntrustedIO = untrustedIO
     , dwdAutonomy = cdAutonomy deps
     , dwdApprovals = cdApprovals deps
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -759,13 +758,13 @@ channelMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operat
             -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
             -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
             -- AGENT_INTERRUPT
-            , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+            , searchFilesOp wsRoot securityPolicy operatorCeiling
             , fileReadOp wsRoot operatorCeiling
             , fileWriteOp wsRoot operatorCeiling
             , filePatchOp wsRoot
-            , shellExecOp wsRoot securityPolicy execBackend
-            , binExecOp wsRoot securityPolicy binAllowList execBackend
-            , processManageOp wsRoot securityPolicy execBackend
+            , shellExecOp wsRoot securityPolicy
+            , binExecOp wsRoot securityPolicy binAllowList
+            , processManageOp wsRoot securityPolicy
             , webFetchOp webFetchCfg
             , webSearchOp webSearchCfg
             ]

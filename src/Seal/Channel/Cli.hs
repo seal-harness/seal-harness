@@ -11,7 +11,7 @@ module Seal.Channel.Cli
   , resolveDefProvider
   , mkSessionAgentEnv
   , debugRequestsPath
-  , execBackendFromSecurity
+  , untrustedIOFromSecurity
   , Backends (..)
   , newBackends
   ) where
@@ -61,10 +61,12 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-import Seal.Tools.Exec.Local (mkLocalExecHandle)
+import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO )
 #endif
-import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
-import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Exec.UntrustedIO
+  ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -207,9 +209,9 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath autonomy approvals onEntry onDemand = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -217,7 +219,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
-  , aeExecBackend = execBackend
+  , aeUntrustedIO = untrustedIO
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
@@ -295,12 +297,15 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Resolve the untrusted-execution backend from the SecurityConfig
-      -- (loaded from security.toml, not config.toml). The security config
-      -- is agent-immutable (design §4 E): the exec backend cannot be
-      -- flipped by a future CONFIG_UPDATE opcode.
-      execBackend = either (const defaultExecBackend) (execBackendFromSecurity wsRoot) eSecCfg
-      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromSecurity
+      -- Resolve the untrusted-execution capability handle from the
+      -- SecurityConfig (loaded from security.toml, not config.toml). The
+      -- security config is agent-immutable (design §4 E): the exec backend
+      -- cannot be flipped by a future CONFIG_UPDATE opcode. Local mode →
+      -- 'mkLocalUntrustedIO'; remote mode → 'mkRemoteUntrustedIO' (the real
+      -- SSH arm) or the fail-closed stub when the remote block is
+      -- missing/incomplete.
+      untrustedIO = either (const defaultUntrustedIO) (untrustedIOFromSecurity wsRoot) eSecCfg
+      defaultUntrustedIO = mkRemoteUntrustedIOStub  -- fail-closed default
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
@@ -392,12 +397,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
               -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
               -- AGENT_INTERRUPT
-              , shellExecOp wsRoot cliSecurityPolicy execBackend
-              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-              , processManageOp wsRoot cliSecurityPolicy execBackend
+              , shellExecOp wsRoot cliSecurityPolicy
+              , binExecOp wsRoot cliSecurityPolicy binAllowList
+              , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling
               , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling
               ]
         pure (ISA.mkRegistry
                 (filterBlocklisted childBaseOps opName
@@ -412,7 +417,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               { dwdPaths = paths
               , dwdParentSid = sid
               , dwdAppEnv = appEnv
-              , dwdExecBackend = execBackend
+              , dwdUntrustedIO = untrustedIO
               , dwdAutonomy = autonomy
               , dwdApprovals = approvals
               , dwdOnDemand = onDemand
@@ -469,12 +474,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , agentStatusOp agentRuntime
               , agentStopOp agentRuntime
               , agentInterruptOp agentRuntime
-              , shellExecOp wsRoot cliSecurityPolicy execBackend
-              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-              , processManageOp wsRoot cliSecurityPolicy execBackend
+              , shellExecOp wsRoot cliSecurityPolicy
+              , binExecOp wsRoot cliSecurityPolicy binAllowList
+              , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling
               , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling
               ]
         in reg
       -- Resolve the bound agent's system prompt (re-read per turn; agent
@@ -540,7 +545,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
             Left err -> ccSend caps ("bg failed: " <> err)
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta
-              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
+              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle untrustedIO
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
@@ -561,7 +566,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           let startWiring = cliStartWiring sid
               isaReg = cliIsaReg sid startWiring caps
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
           case res of
             Right r -> recordSkillLoadResult tHandle callOpName val r
             Left _  -> pure ()
@@ -570,7 +575,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->
           handlePlain
-            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand)
             appEnv t
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
@@ -655,30 +660,32 @@ handleTabCommand caps tabsH = \case
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
 
--- | Resolve the untrusted-execution 'ExecBackend' from the 'SecurityConfig'.
--- Absent section / mode=local → 'EbLocal' (the real local executor wired
--- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
--- (the SSH executor; the opcodes run remotely). mode=remote + remote
--- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
--- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
-execBackendFromSecurity :: WorkspaceRoot -> SecurityConfig -> ExecBackend
-execBackendFromSecurity _wsRoot cfg =
+-- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
+-- 'SecurityConfig'. Absent section / mode=local → the local arm (real local
+-- executor wired to the workspace root). mode=remote + remote fully
+-- configured → the remote arm (the SSH executor; the opcodes run remotely
+-- via 'mkRemoteUntrustedIO'). mode=remote + remote absent/incomplete → the
+-- fail-closed stub so untrusted opcodes fail at call time (the
+-- 'UeExec ExecNotImplemented' error surfaces).
+untrustedIOFromSecurity :: WorkspaceRoot -> SecurityConfig -> UntrustedIO
+untrustedIOFromSecurity wsRoot cfg =
   case untrustedExecConfigFromSecurity cfg of
-    Nothing -> defaultBackend
+    Nothing -> defaultHandle
     Just uec ->
       case uecRemote uec of
-        Nothing -> failClosedBackend  -- mode=remote, no remote configured
+        Nothing -> mkRemoteUntrustedIOStub  -- mode=remote, no remote configured
         Just sshCfg ->
-          case selectExecBackend uec (TbSsh sshCfg) of
-            Right (EbRemote s) -> EbRemote s
-            _ -> failClosedBackend
+          -- The remote SSH arm. The RemoteRunner is the real
+          -- 'mkRealRemoteRunner' (System.Process-backed); the SSH argv +
+          -- host-key pinning are inherited from 'Seal.Tools.Exec.Remote'.
+          mkRemoteUntrustedIO sshCfg mkRealRemoteRunner
   where
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-    defaultBackend = EbLocal (mkLocalExecHandle _wsRoot)
+    defaultHandle = mkLocalUntrustedIO wsRoot
 #else
-    defaultBackend = failClosedBackend  -- local executor absent; fail-closed
+    defaultHandle = mkRemoteUntrustedIOStub  -- local executor absent; fail-closed
+    _ = wsRoot  -- keep wsRoot referenced under the flag (unused when local absent)
 #endif
-    failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed
 
 -- | The CLI security policy: allow all commands. The autonomy level is
 -- threaded separately via 'aeAutonomy' (the operator-selected @--yolo@ vs

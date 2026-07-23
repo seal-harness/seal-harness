@@ -15,7 +15,7 @@ import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
-import Seal.Tools.Exec.Types (ExecBackend)
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 
 data AgentEnv = AgentEnv
   { aeProvider :: SomeProvider
@@ -30,12 +30,14 @@ data AgentEnv = AgentEnv
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
-  , aeExecBackend :: ExecBackend
-    -- ^ The untrusted-execution backend (Local vs Remote SSH) threaded to
-    -- 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes. Trusted/Audited
-    -- opcodes ignore it (the GADT 'Opcode' has no 'ExecBackend' field for
-    -- them — type-level capability scoping, spec §4/§8). 4b-T3 wires this
-    -- from the runtime 'UntrustedExecConfig'; 4b-T1 threads it through.
+  , aeUntrustedIO :: UntrustedIO
+    -- ^ The untrusted-execution capability handle (local vs remote SSH),
+    -- threaded to 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes.
+    -- Backend (local FS vs SSH transport) is selected once at wiring
+    -- time via 'mkLocalUntrustedIO' or 'mkRemoteUntrustedIO'; the opcode
+    -- never sees the backend, only the capability. Trusted/Audited
+    -- opcodes ignore it (the GADT 'Opcode' has no 'UntrustedIO' field
+    -- for them — type-level capability scoping, spec §4/§8).
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int

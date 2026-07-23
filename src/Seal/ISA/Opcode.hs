@@ -1,16 +1,21 @@
 {-# LANGUAGE RankNTypes #-}
 {-# OPTIONS_GHC -Wno-partial-fields #-}
 -- | The ISA as data: an 'Opcode' is a GADT-style sum keyed by trust level.
--- A 'TrustedOpcode' carries 'toRun' (no 'ExecBackend'); an 'UntrustedOpcode'
--- carries 'uoRun' (which threads an 'ExecBackend'). This split makes the
--- capability-scoping guarantee type-level (spec §4 line 129, §8): a Trusted
--- opcode that shells out literally cannot be constructed — it has no
--- 'ExecBackend' in scope. The compile-fail fixture
--- ('Seal.Tools.Exec.CapabilityScopingFail') asserts this.
+-- A 'TrustedOpcode' carries 'toRun' (no untrusted capability); an
+-- 'UntrustedOpcode' carries 'uoRun' (which threads an 'UntrustedIO' — the
+-- unified capability handle for all side-effecting IO an untrusted opcode
+-- can perform). This split makes the capability-scoping guarantee
+-- type-level (spec §4 line 129, §8): a Trusted opcode that shells out
+-- literally cannot be constructed — it has no 'UntrustedIO' in scope. The
+-- compile-fail fixture ('Seal.Tools.Exec.CapabilityScopingFail') asserts
+-- this.
 --
--- Untrusted opcodes run their effects through 'BackendExec' (the seam
--- Phase 4 swaps a remote executor into) PLUS the threaded 'ExecBackend'
--- (Local vs Remote SSH); Trusted opcodes use 'BackendExec' alone.
+-- Trusted opcodes use 'BackendExec' for their own non-untrusted IO (e.g.
+-- memory/skill file writes under @config/@); Untrusted opcodes use
+-- 'UntrustedIO' for ALL their side-effecting IO (files, commands, process
+-- management, search). The 'UntrustedIO' is the single seam — backend
+-- (local vs remote SSH) is selected once at wiring time; the opcode never
+-- sees the backend, only the capability.
 module Seal.ISA.Opcode
   ( OpResult (..)
   , Opcode (..)
@@ -33,7 +38,7 @@ import Data.Text (Text)
 import Seal.Core.Types
 import Seal.Providers.Class (ToolResultPart)
 import Seal.Types.App
-import Seal.Tools.Exec.Types (ExecBackend)
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 
 data OpResult = OpResult
   { orParts :: [ToolResultPart]  -- ^ what the model sees (may include secret values)
@@ -57,7 +62,7 @@ localBackend = BackendExec liftIO
 -- | The opcode sum. 'TrustedOpcode' covers both 'Trusted' and 'Audited'
 -- (Audited is treated as Trusted by the dispatcher — record async, then
 -- run; the 'toTrust' field carries the distinction for 'opTrust').
--- 'UntrustedOpcode' is always 'Untrusted' and carries the 'ExecBackend'
+-- 'UntrustedOpcode' is always 'Untrusted' and carries the 'UntrustedIO'
 -- its 'uoRun' threads. The field-name prefixes (@to@ / @uo@) keep the two
 -- constructors' record namespaces disjoint (Haskell requires this when
 -- constructors share a type but have different fields).
@@ -77,7 +82,7 @@ data Opcode
       , uoInSchema   :: Value
       , uoOutSchema  :: Value
       , uoAuthorize  :: Value -> Either Text ()
-      , uoRun        :: BackendExec -> ExecBackend -> Value -> App OpResult
+      , uoRun        :: UntrustedIO -> Value -> App OpResult
       }
 
 -- | Accessor: the opcode's name (works for both constructors).

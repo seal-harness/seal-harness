@@ -125,6 +125,7 @@ library
         Seal.Tools.Exec.Remote
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
+        Seal.Tools.Exec.UntrustedIO
         Seal.Web.Search
         Seal.Web.Fetch
         Seal.Web.Browser
@@ -351,6 +352,7 @@ test-suite tests
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
+        Seal.Tools.Exec.UntrustedIORemoteSpec
         Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec

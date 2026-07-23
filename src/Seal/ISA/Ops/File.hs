@@ -1,34 +1,36 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeApplications  #-}
 -- | FILE_READ (Untrusted): read a workspace file, confined by SafePath.
 -- FILE_WRITE (Untrusted): write/append a workspace file, confined by
 -- SafePath, bounded by the operator-configured max write size.
 -- This is the opcode module that exercises the ACK-before-execute path in
--- the dispatcher.
+-- the dispatcher. All side-effecting IO is funnelled through the
+-- 'UntrustedIO' capability handle; this module never imports
+-- 'System.Process', 'System.Directory', or 'System.Posix'.
 module Seal.ISA.Ops.File
   ( fileReadOp
   , fileWriteOp
   , filePatchOp
   ) where
 
-import Control.Exception (try)
 import Control.Applicative ((<|>))
+import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString qualified as BS
-import Data.Char (isDigit)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (renameFile)
 
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types
 import Seal.ISA.Opcode
 import Seal.Providers.Class
 import Seal.Security.Path
-import Seal.Text.LineFile
+import Seal.Text.LineFile (lwLines, lwTotal, lwTruncated, lwEnd, lwHasMore, renderWindow, windowLines)
+import Seal.Tools.Exec.UntrustedIO
+import Seal.Tools.Exec.Types (mkRemotePath)
 
 -- | Local schema for FILE_READ: required @path@ plus optional integer @offset@,
 -- @limit@, and @max_scan_bytes@. (A shared single-string schema helper cannot
@@ -104,7 +106,8 @@ scanBytesField v =
 
 -- | FILE_READ opcode: reads a UTF-8 text file at a workspace-relative path,
 -- confined by 'mkSafePath', returning a bounded window of lines. Trust level
--- is 'Untrusted'; all IO is funnelled through the 'BackendExec' seam.
+-- is 'Untrusted'; all IO is funnelled through the 'UntrustedIO' capability
+-- handle.
 --
 -- The @operatorCeiling@ argument is the operator-configured upper bound on
 -- bytes scanned per call (resolved from the @[retrieval]@ config section by
@@ -116,49 +119,54 @@ scanBytesField v =
 -- max_scan_bytes (secret-free metadata); file contents flow only to 'orParts'
 -- (model-visible).
 fileReadOp :: WorkspaceRoot -> Int -> Opcode
-fileReadOp root operatorCeiling = UntrustedOpcode
+fileReadOp _root operatorCeiling = UntrustedOpcode
   { uoName = OpName "FILE_READ"
   , uoDesc = "Read a UTF-8 text file from the workspace (path is workspace-relative)."
   , uoInSchema = fileReadSchema
   , uoOutSchema = object []
   , uoAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField
-  , uoRun = \backend _execBackend v -> do
+  , uoRun = \uio v -> do
       let rel       = maybe "" T.unpack (pathField v)
           offset    = offsetField v
           mLimit    = limitField v
           scanBytes = clampScanBytes operatorCeiling (scanBytesField v)
-      mSafe <- runLocal backend (mkSafePath root rel)
-      -- Uniform orRecorded shape in both branches: path + offset + limit +
-      -- resolved max_scan_bytes, all non-secret request metadata.
       let recorded = object
             [ "path" .= rel
             , "offset" .= offset
             , "limit" .= mLimit
             , "max_scan_bytes" .= scanBytes
             ]
-      case mSafe of
-        Left err ->
+      case mkRemotePath (T.pack rel) of
+        Left _ ->
+          -- An empty/invalid path: surface as an error (the authorize gate
+          -- already rejects a missing path, but a malformed one falls here).
           pure $ OpResult
-            [TrpText (T.pack (show err))]
+            [TrpText "FILE_READ: invalid path"]
             True
             recorded
-        Right safe -> do
-          -- Bounded read via the LineFile seam. Wrapped in try to catch
-          -- IOErrors (e.g. file deleted or permissions revoked between
-          -- mkSafePath and the read, or the path is a directory). Memory
-          -- stays bounded (scanBytes <= operatorCeiling).
-          eWin <- runLocal backend $
-            try @IOError (readLineWindow defaultPageParams offset mLimit scanBytes safe)
-          case eWin of
-            Left ioErr ->
+        Right rp -> do
+          res <- liftIO (uioReadFile uio rp scanBytes)
+          case res of
+            Left err ->
               pure $ OpResult
-                [TrpText (T.pack (show ioErr))]
+                [TrpText (renderUntrustedErr err)]
                 True
                 recorded
-            Right win ->
+            Right fullWin -> do
+              -- Apply the offset/limit windowing purely (the capability
+              -- returned a dynamic-page-sized window; the opcode re-windows
+              -- to the requested offset/limit). Preserve the total + truncated
+              -- flags from the capability's bounded read (so the footer
+              -- reflects the true file size + byte ceiling).
+              let win = windowLines defaultPageParams offset mLimit (lwLines fullWin)
+                  win' = win { lwTotal     = lwTotal fullWin
+                             , lwHasMore   = lwEnd win < lwTotal fullWin
+                                          || lwTruncated fullWin
+                             , lwTruncated = lwTruncated fullWin
+                             }
               pure $ OpResult
-                [TrpText (renderWindow win)]
+                [TrpText (renderWindow win')]
                 False
                 recorded
   }
@@ -185,7 +193,7 @@ clampScanBytes operatorCeiling mReq =
 -- 'orRecorded' captures the path + mode + byte count (NOT the content —
 -- content may be large; the transcript records metadata only).
 fileWriteOp :: WorkspaceRoot -> Int -> Opcode
-fileWriteOp root operatorWriteCeiling = UntrustedOpcode
+fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
   { uoName = OpName "FILE_WRITE"
   , uoDesc = "Write or append to a workspace file (path is workspace-relative, bounded)."
   , uoInSchema = fileWriteSchema
@@ -193,16 +201,16 @@ fileWriteOp root operatorWriteCeiling = UntrustedOpcode
   , uoAuthorize =
       maybe (Left "FILE_WRITE requires {path:string, content:string}") (const (Right ()))
         . pathField
-  , uoRun = \backend _execBackend v -> do
+  , uoRun = \uio v -> do
       let rel     = maybe "" T.unpack (pathField v)
-          content = maybe "" T.unpack (contentField v)
+          content = fromMaybe "" (contentField v)
           mode    = case modeField v of
-            Just m | m == "append" -> (m :: Text)
-            _                      -> "write"  -- default
-          byteCount = BS.length (TE.encodeUtf8 (T.pack content))
+            Just m | m == "append" -> WMAppend
+            _                     -> WMWrite
+          byteCount = BS.length (TE.encodeUtf8 content)  -- capability re-measures; this is the recorded estimate
           recorded = object
             [ "path" .= rel
-            , "mode" .= mode
+            , "mode" .= (case mode of WMAppend -> ("append" :: Text); WMWrite -> "write")
             , "bytes" .= byteCount
             ]
       if byteCount > operatorWriteCeiling
@@ -211,30 +219,25 @@ fileWriteOp root operatorWriteCeiling = UntrustedOpcode
                     <> T.pack (show operatorWriteCeiling) <> " bytes)")]
           True
           recorded
-        else do
-          mSafe <- runLocal backend (mkSafePathForWrite root rel)
-          case mSafe of
-            Left err ->
-              pure $ OpResult
-                [TrpText (T.pack (show err))]
-                True
-                recorded
-            Right safe -> do
-              eUnit <- runLocal backend $ try @IOError $
-                case mode :: Text of
-                  m | m == "append" -> BS.appendFile (getSafePath safe) (TE.encodeUtf8 (T.pack content))
-                  _                 -> BS.writeFile  (getSafePath safe) (TE.encodeUtf8 (T.pack content))
-              case eUnit of
-                Left ioErr ->
-                  pure $ OpResult
-                    [TrpText (T.pack (show ioErr))]
-                    True
-                    recorded
-                Right _ ->
-                  pure $ OpResult
-                    [TrpText ("wrote " <> T.pack (show byteCount) <> " bytes to " <> T.pack rel)]
-                    False
-                    recorded
+        else case mkRemotePath (T.pack rel) of
+          Left _ ->
+            pure $ OpResult
+              [TrpText "FILE_WRITE: invalid path"]
+              True
+              recorded
+          Right rp -> do
+            res <- liftIO (uioWriteFile uio rp content mode operatorWriteCeiling)
+            pure $ case res of
+              Left err ->
+                OpResult
+                  [TrpText (renderUntrustedErr err)]
+                  True
+                  recorded
+              Right n ->
+                OpResult
+                  [TrpText ("wrote " <> T.pack (show n) <> " bytes to " <> T.pack rel)]
+                  False
+                  recorded
   }
 
 fileWriteSchema :: Value
@@ -277,7 +280,7 @@ modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe T
 -- path + patch line count + applied flag (NOT the patch body — it may be
 -- large; the transcript records metadata only).
 filePatchOp :: WorkspaceRoot -> Opcode
-filePatchOp root = UntrustedOpcode
+filePatchOp _root = UntrustedOpcode
   { uoName = OpName "FILE_PATCH"
   , uoDesc = "Apply a unified diff to a workspace file (SafePath-confined, atomic write). \
              \Input fields are {path: string, patch: string} — the patch field is named \
@@ -294,44 +297,28 @@ filePatchOp root = UntrustedOpcode
         (_, Just p)
           | T.null p      -> Left "FILE_PATCH requires a non-empty patch"
           | otherwise     -> Right ()
-  , uoRun = \backend _execBackend v -> do
+  , uoRun = \uio v -> do
       let rel   = maybe "" T.unpack (pathField v)
-          patch = maybe "" T.unpack (patchField v)
-          recorded = object [ "path" .= rel, "patch_lines" .= length (T.lines (T.pack patch)) ]
-      mSafe <- runLocal backend (mkSafePath root rel)
-      case mSafe of
-        Left err ->
-          pure $ OpResult [TrpText (T.pack (show err))] True recorded
-        Right safe -> do
+          patch = fromMaybe "" (patchField v)
+          recorded = object [ "path" .= rel, "patch_lines" .= length (T.lines patch) ]
+      case mkRemotePath (T.pack rel) of
+        Left _ -> pure $ OpResult [TrpText "FILE_PATCH: invalid path"] True recorded
+        Right rp -> do
           -- Defense-in-depth: a non-empty patch must reach the applier. The
           -- authorize gate already rejects an empty/missing 'patch', but if
-          -- the opcode is ever invoked with the gate bypassed (e.g. Full
-          -- autonomy doesn't skip authorize, but a future caller might),
-          -- refuse to silently no-op here rather than rewrite the file with
-          -- its own contents and report success.
-          case patch of
-            "" -> pure $ OpResult
-                    [TrpText "FILE_PATCH requires a non-empty patch"] True recorded
-            _  -> do
-              -- Read the existing file, apply the diff, write atomically.
-              eContent <- runLocal backend $ try @IOError (BS.readFile (getSafePath safe))
-              case eContent of
-                Left ioErr ->
-                  pure $ OpResult [TrpText ("FILE_PATCH: read failed: " <> T.pack (show ioErr))] True recorded
-                Right content -> do
-                  case applyUnifiedDiff (TE.decodeUtf8Lenient content) (T.pack patch) of
-                    Left applyErr ->
-                      pure $ OpResult [TrpText ("FILE_PATCH: apply failed: " <> applyErr)] True recorded
-                    Right newContent -> do
-                      eUnit <- runLocal backend $ try @IOError $ do
-                        let tmpPath = getSafePath safe <> ".seal-patch-tmp"
-                        BS.writeFile tmpPath (TE.encodeUtf8 newContent)
-                        renameFile tmpPath (getSafePath safe)
-                      case eUnit of
-                        Left ioErr ->
-                          pure $ OpResult [TrpText ("FILE_PATCH: write failed: " <> T.pack (show ioErr))] True recorded
-                        Right _ ->
-                          pure $ OpResult [TrpText ("patched " <> T.pack rel)] False recorded
+          -- the opcode is ever invoked with the gate bypassed, refuse to
+          -- silently no-op here rather than rewrite the file with its own
+          -- contents and report success.
+          if T.null patch
+            then pure $ OpResult
+                   [TrpText "FILE_PATCH requires a non-empty patch"] True recorded
+            else do
+              res <- liftIO (uioPatchFile uio rp patch)
+              pure $ case res of
+                Left err ->
+                  OpResult [TrpText ("FILE_PATCH: " <> renderUntrustedErr err)] True recorded
+                Right _  ->
+                  OpResult [TrpText ("patched " <> T.pack rel)] False recorded
   }
 
 filePatchSchema :: Value
@@ -360,99 +347,3 @@ patchField :: Value -> Maybe Text
 -- avoids a round-trip through OPCODE_DESCRIBE just to learn the field name.
 patchField v = parseMaybe (withObject "in" (.: "patch")) v
            <|> parseMaybe (withObject "in" (.: "diff")) v
-
--- | Apply a minimal unified diff to the original content. Returns
--- @Left errMsg@ if the patch is malformed or the context doesn't match;
--- @Right newContent@ on success. This is a simplified hunk applier: it
--- parses @@ -start,len +start,len @@ headers and applies context/removed/
--- added lines. Does NOT handle binary patches or rename-only hunks.
-applyUnifiedDiff :: Text -> Text -> Either Text Text
-applyUnifiedDiff original patch =
-  let origLines = T.lines original
-      patchLines = T.lines patch
-  in go origLines patchLines
-  where
-    go origLines [] = Right (T.intercalate "\n" origLines <> "\n")
-    go origLines (h : rest)
-      | T.isPrefixOf "@@ " h = applyHunk origLines h rest
-      | T.isPrefixOf "--- " h = go origLines rest  -- skip file header
-      | T.isPrefixOf "+++ " h = go origLines rest  -- skip file header
-      | T.null h = go origLines rest               -- skip blank lines
-      | otherwise = Left ("unexpected line in patch: " <> h)
-    -- Apply a single hunk: parse the @@ -a,b +c,d @@ header, then the
-    -- context/removed/added lines (until the next @@ or end).
-    applyHunk origLines header rest =
-      case parseHunkHeader header of
-        Left err -> Left err
-        Right (oldStart, _oldLen, _newStart, _newLen) ->
-          -- The hunk body is the lines after the header until the next @@ or end.
-          let (hunkLines, remainingPatch) = span isHunkLine rest
-              idx = max 0 (oldStart - 1)
-              (before, atAndAfter) = splitAt idx origLines
-          in case applyHunkLines atAndAfter hunkLines of
-               Left err -> Left err
-               Right patched ->
-                 let newOrig = before ++ patched
-                 in go newOrig remainingPatch
-    isHunkLine l =
-      T.null l
-      || T.isPrefixOf " " l
-      || T.isPrefixOf "-" l
-      || T.isPrefixOf "+" l
-      || T.isPrefixOf "\\" l  -- "\ No newline at end of file"
-    -- Apply the hunk lines against the original lines: context (space)
-    -- lines are kept (match the original); removed (-) lines must match and
-    -- are dropped; added (+) lines are inserted.
-    applyHunkLines orig [] = Right orig
-    applyHunkLines (o : os) (h : hs)
-      | T.isPrefixOf " " h = keep o (applyHunkLines os hs)   -- context: keep original
-      | T.isPrefixOf "-" h = applyHunkLines os hs           -- removed: drop original
-      | T.isPrefixOf "+" h = keep (T.drop 1 h) (applyHunkLines (o : os) hs)  -- added: insert before current
-      | T.isPrefixOf "\\" h = applyHunkLines (o : os) hs    -- no-newline marker: skip
-      | T.null h = applyHunkLines (o : os) hs               -- blank line in hunk
-      | otherwise = Left ("unexpected hunk line: " <> h)
-      where keep x acc = (x :) <$> acc
-    applyHunkLines [] (h : hs)
-      | T.isPrefixOf "+" h = keep (T.drop 1 h) (applyHunkLines [] hs)  -- added at end: insert
-      | T.isPrefixOf " " h = Left ("hunk context line past end of file: " <> h)
-      | T.isPrefixOf "-" h = Left ("hunk removed line past end of file: " <> h)
-      | T.isPrefixOf "\\" h = applyHunkLines [] hs
-      | T.null h = applyHunkLines [] hs
-      | otherwise = Left ("unexpected hunk line at end: " <> h)
-      where keep x acc = (x :) <$> acc
-    -- Parse @@ -oldStart[,oldLen] +newStart[,newLen] @@ <rest...>
-    -- The ,oldLen / ,newLen are optional: when omitted, the length is 1
-    -- (this is the short form @git diff@ emits for single-line hunks, e.g.
-    -- @@@ -1 +1 @@@). The lengths are currently unused by the applier — we
-    -- only need the start line numbers — but both forms must parse so the
-    -- model's natural @git diff@-style output isn't rejected as malformed.
-    parseHunkHeader h =
-      case T.stripPrefix "@@ -" h of
-        Nothing -> Left ("malformed hunk header: " <> h)
-        Just rest0 ->
-          let (oldStartStr, afterOld) = breakNum rest0
-              afterPlus0 = T.dropWhile (/= '+') afterOld
-              afterPlus  = T.drop 1 afterPlus0  -- drop the +
-              (newStartStr, _) = breakNum afterPlus
-              oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int
-              newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
-          in case (oldStart, newStart) of
-               (Just os_, Just ns_) -> Right (os_, Nothing, ns_, Nothing)
-               _ -> Left ("malformed hunk header numbers: " <> h)
-      where
-        -- | Take leading digits (the start), then skip an optional @,len@
-        -- suffix, returning the start-numeric string and the remainder
-        -- starting at the next token (the space before @+@). Examples:
-        --
-        --   breakNum "1 +1 @@ "   == ("1", " +1 @@ ")
-        --   breakNum "1,2 +1 @@ " == ("1", " +1 @@ ")
-        breakNum :: Text -> (Text, Text)
-        breakNum s =
-          let (digits, rest) = T.span isDigit s
-          in case T.uncons rest of
-               Just (',', rest') -> (digits, T.dropWhile isDigit rest')
-               _                 -> (digits, rest)
-        readMaybe :: String -> Maybe Int
-        readMaybe s = case reads s :: [(Int, String)] of
-          [(n, _)] -> Just n
-          _        -> Nothing

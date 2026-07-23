@@ -1,9 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | SEARCH_FILES (Untrusted): search workspace files for a pattern. Runs
--- @rg -n -- <pattern> <path>@ via the 'ExecBackend' (fixed argv, no shell
--- interpreter — the validated 'SearchPattern' newtype guards against
--- option injection). 'SafePath'-confined. Bounded result count
--- (operator-configured ceiling; the model can narrow via @max_results@).
+-- @rg -n -- <pattern> <path>@ via the 'UntrustedIO' capability (fixed
+-- argv, no shell interpreter — the validated 'SearchPattern' newtype
+-- guards against option injection). 'SafePath'-confined. Bounded result
+-- count (operator-configured ceiling; the model can narrow via
+-- @max_results@). This module never imports 'System.Process'.
 module Seal.ISA.Ops.Search
   ( searchFilesOp
   ) where
@@ -20,17 +21,17 @@ import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
-import Seal.Tools.Args (mkShellCommand)
-import Seal.Tools.Exec.Types (ExecBackend (..), ExecError (..), LocalExecHandle (..))
-import Seal.Types.App
+import Seal.Tools.Args (mkSearchPattern)
+import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioSearchFiles)
+import Seal.Tools.Exec.Types (mkRemotePath)
 
 -- | SEARCH_FILES opcode. Input: @{ pattern: Text, path?: Text, max_results?:
 -- Int }@. The pattern must not start with @-@ (option injection). The
 -- @path@ defaults to @.@ (the workspace root). The result count is bounded
 -- by the operator-configured @maxResults@ ceiling; the model's
 -- @max_results@ request can only narrow it.
-searchFilesOp :: WorkspaceRoot -> SecurityPolicy -> Int -> ExecBackend -> Opcode
-searchFilesOp _wsRoot policy maxResults _backend = UntrustedOpcode
+searchFilesOp :: WorkspaceRoot -> SecurityPolicy -> Int -> Opcode
+searchFilesOp _wsRoot policy maxResults = UntrustedOpcode
   { uoName = OpName "SEARCH_FILES"
   , uoDesc = "Search workspace files for a pattern (rg, SafePath-confined, bounded)."
   , uoInSchema = searchFilesSchema
@@ -44,34 +45,27 @@ searchFilesOp _wsRoot policy maxResults _backend = UntrustedOpcode
           | otherwise -> case spAutonomy policy of
               Deny -> Left "SEARCH_FILES denied by autonomy policy"
               _   -> Right ()
-  , uoRun = \_back execBackend v -> do
+  , uoRun = \uio v -> do
       let pat    = fromMaybe "" (patternField v)
           pth    = fromMaybe "." (pathField v)
           limit  = clampResults maxResults (resultsField v)
-          cmd    = "rg -n -- " <> pat <> " " <> pth
-      res <- runSearch execBackend cmd
-      case res of
-        Left e -> pure (OpResult [TrpText (T.pack (show e))] True (object ["pattern" .= pat, "path" .= pth]))
-        Right out -> do
-          let ls = take limit (T.lines out)
-              count = length ls
-          pure (OpResult [TrpText (T.intercalate "\n" ls)] False
-                 (object ["pattern" .= pat, "path" .= pth, "result_count" .= count]))
-  }
-
-runSearch :: ExecBackend -> Text -> App (Either ExecError Text)
-runSearch execBackend cmdText =
-  case mkShellCommand cmdText of
-    Left _err -> pure (Left ExecNotImplemented)
-    Right cmd ->
-      case execBackend of
-        EbLocal lh -> do
-          res <- liftIO (lehExecShell lh cmd Nothing)
+      case mkSearchPattern pat of
+        Left err -> pure (OpResult [TrpText ("SEARCH_FILES: " <> err)] True
+                           (object ["pattern" .= pat, "path" .= pth]))
+        Right pat' -> do
+          let mPath = case mkRemotePath pth of
+                Right rp -> Just rp
+                Left _   -> Nothing
+          res <- liftIO (uioSearchFiles uio pat' mPath limit)
           case res of
-            Left e  -> pure (Left e)
-            Right out -> pure (Right out)
-        EbRemote _ssh ->
-          pure (Left ExecNotImplemented)
+            Left err -> pure (OpResult [TrpText (renderUntrustedErr err)] True
+                              (object ["pattern" .= pat, "path" .= pth]))
+            Right out -> do
+              let ls = take limit (T.lines out)
+                  count = length ls
+              pure (OpResult [TrpText (T.intercalate "\n" ls)] False
+                     (object ["pattern" .= pat, "path" .= pth, "result_count" .= count]))
+  }
 
 searchFilesSchema :: Value
 searchFilesSchema =

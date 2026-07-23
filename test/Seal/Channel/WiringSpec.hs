@@ -5,7 +5,7 @@ import Data.IORef
 import Test.Hspec
 
 import Seal.Agent.Env
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Channel.Cli
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
@@ -46,7 +46,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           (ISA.mkRegistry [])
           h
           localBackend
-          (EbLocal mkLocalExecHandlePlaceholder)
+          mkRemoteUntrustedIOStub
           caps
           (either (error "sid") id (mkSessionId "cli"))
           4
