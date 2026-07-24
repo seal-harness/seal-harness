@@ -17,6 +17,7 @@ module Seal.Config.File
   , DelegationFileConfig (..)
   , WebConfig (..)
   , WorkdirConfig (..)
+  , SkillsConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
@@ -28,6 +29,8 @@ module Seal.Config.File
   , providerDefaultModel
   , retrievalMaxScanBytes
   , onDemandSchemas
+  , defaultAutoloadSkill
+  , resolvedAutoloadSkill
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
@@ -39,6 +42,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist, renameFile)
 import System.IO.Unsafe (unsafePerformIO)
@@ -112,6 +116,11 @@ data RuntimeConfig = RuntimeConfig
     -- Absent means defaults apply (persist, no chroot — chroot is
     -- deferred). Per-session workdirs are always on regardless of this
     -- section; this config only controls cleanup-on-exit.
+  , rcSkills :: Maybe SkillsConfig
+    -- ^ Optional @[skills]@ section (skill auto-injection at session
+    -- start). Absent means the built-in default applies: the
+    -- @seal-usage@ skill is auto-injected into the system prompt. Set
+    -- @[skills] autoload = ""@ to disable auto-injection explicitly.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -196,6 +205,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcDelegation      = Nothing
   , rcWeb             = Nothing
   , rcWorkdir          = Nothing
+  , rcSkills           = Nothing
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -213,6 +223,17 @@ data WorkdirConfig = WorkdirConfig
   { wdcCleanupOnExit :: Maybe Bool
     -- ^ Remove the workdir when the session ends. Absent = false
     -- (persist for inspection).
+  } deriving stock (Eq, Show)
+
+-- | The @[skills]@ section: skill auto-injection at session start. Every
+-- field is optional; a missing key decodes as 'Nothing' and the resolved
+-- default applies at the call site.
+newtype SkillsConfig = SkillsConfig
+  { scAutoload :: Maybe Text
+    -- ^ The skill id to auto-inject into the system prompt at session
+    -- start. Absent (the default) means @\"seal-usage\"@ is injected. An
+    -- empty string (@\"\"@) explicitly disables auto-injection. Any other
+    -- value overrides the injected skill id.
   } deriving stock (Eq, Show)
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -264,6 +285,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table delegationConfigCodec "delegation") .= rcDelegation
   <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb
   <*> Toml.dioptional (Toml.table workdirConfigCodec "workdir") .= rcWorkdir
+  <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
@@ -310,6 +332,11 @@ arrayOfText = Toml.arrayOf Toml._Text
 workdirConfigCodec :: Toml.TomlCodec WorkdirConfig
 workdirConfigCodec = WorkdirConfig
   <$> Toml.dioptional (Toml.bool "cleanup_on_exit") .= wdcCleanupOnExit
+
+-- | Bidirectional tomland codec for the @[skills]@ section.
+skillsConfigCodec :: Toml.TomlCodec SkillsConfig
+skillsConfigCodec = SkillsConfig
+  <$> Toml.dioptional (Toml.text "autoload") .= scAutoload
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization
@@ -423,6 +450,23 @@ retrievalMaxScanBytes cfg =
 -- the pre-flag behavior.
 onDemandSchemas :: RuntimeConfig -> Bool
 onDemandSchemas cfg = fromMaybe False (rcOnDemandSchemas cfg)
+
+-- | The compiled-in default skill id auto-injected at session start when
+-- neither the @[skills]@ section nor its @autoload@ key is present. An
+-- operator sets @[skills] autoload = ""@ to explicitly disable
+-- auto-injection.
+defaultAutoloadSkill :: Text
+defaultAutoloadSkill = "seal-usage"
+
+-- | Resolve the skill id to auto-inject at session start. Returns 'Nothing'
+-- to disable auto-injection. Absent @[skills]@ section or @autoload@ key
+-- resolves to the built-in default (@"seal-usage"@); an explicit empty
+-- string disables.
+resolvedAutoloadSkill :: RuntimeConfig -> Maybe Text
+resolvedAutoloadSkill cfg =
+  case rcSkills cfg >>= scAutoload of
+    Nothing -> Just defaultAutoloadSkill
+    Just t  -> if T.null t then Nothing else Just t
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).

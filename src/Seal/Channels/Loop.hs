@@ -79,7 +79,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, rcDelegation, WebConfig (..), rcWeb )
+  , onDemandSchemas, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
@@ -121,6 +121,7 @@ import Seal.ISA.Ops.Skills
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
+import Seal.Skills.Autoload (injectAutoloadSkill)
 import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -510,6 +511,8 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
+          let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+          mSystem' <- injectAutoloadSkill (bSkills backends) autoloadId mSystem
           let handleCaps = mkHandleCaps h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
@@ -523,7 +526,7 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                 (cdHttpManager deps) handleCaps onDemand
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                       handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle untrustedIO
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand)
@@ -758,14 +761,16 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             ModelId m | T.null m -> smModel parent
                       | otherwise -> m
       resolveDefProvider (cdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt def task =
+    childSystemPrompt def task = do
       let base = adSystem def
           ctx  = ctContext task
-      in case (base, ctx) of
-           (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-           (Just b, _)                       -> Just b
-           (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-           (Nothing, Nothing)                -> Nothing
+          basePrompt = case (base, ctx) of
+            (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+            (Just b, _)                       -> Just b
+            (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+            (Nothing, Nothing)                -> Nothing
+          autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+      injectAutoloadSkill (bSkills (cdBackends deps)) autoloadId basePrompt
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
       let childWsRoot = case eChildWd of

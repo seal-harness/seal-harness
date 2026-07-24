@@ -29,20 +29,38 @@ ln -s "$(pwd)/config/skills/seal-usage.md" ~/.seal/config/skills/seal-usage.md
 
 ## How to use it
 
-The agent loads it on demand:
+The skill is **auto-injected by default**. At session start, the harness
+loads the configured skill id (default `seal-usage`) from
+`~/.seal/config/skills/` and appends it to the resolved system prompt, so
+the model is oriented to its per-session workspace from turn one — no
+`SKILL_LOAD` needed. This applies to all channels (CLI, web, Signal,
+Telegram) and to sub-agent child sessions.
 
-```
-SKILL_LOAD { "id": "seal-usage" }
+### Disabling or overriding
+
+In `config.toml`:
+
+```toml
+# Disable auto-injection entirely (empty string)
+[skills]
+autoload = ""
+
+# Override with a different skill id
+[skills]
+autoload = "my-custom-orientation"
 ```
 
-Or the operator can fold the contract into an agent's `adSystem` prompt so
-it's present from turn 1 (no auto-load mechanism exists yet — see the
-follow-up epic in the brainstorm doc).
+Absent `[skills]` section or `autoload` key → the built-in default
+`seal-usage` is injected.
+
+### Manual loading (still supported)
+
+The agent can still `SKILL_LOAD seal-usage` on demand; auto-injection is
+additive (it appends to whatever the bound agent's `adSystem` already
+says).
 
 ## What's NOT here
 
-- **Auto-load at session start** — not yet implemented; this is the
-  follow-up epic's first work unit.
 - **`working-directory` arg on `BIN_EXEC`/`SHELL_EXEC`** — follow-up.
 - **`CLONE_REPO` opcode + `/clone` slash command** — follow-up.
 - **chroot per session (hard boundary)** — follow-up, hardest item.

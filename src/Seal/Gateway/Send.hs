@@ -47,7 +47,7 @@ import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
   , WebConfig (..), rcWeb
-  , onDemandSchemas, rcDelegation, rcDebugSessionTranscript )
+  , onDemandSchemas, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
@@ -66,6 +66,8 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
+import Seal.Skills.Autoload (injectAutoloadSkill)
+import Seal.Skills.Backend (SkillBackend)
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -241,14 +243,24 @@ loadSessionMeta paths sid = do
 -- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
 -- Session setup screen's "Use a one-off agent file" upload) takes
 -- precedence over the bound agent's 'adSystem'. Returns 'Nothing' when
--- neither is set.
-resolveSystemPrompt :: AgentDefBackend -> SessionMeta -> IO (Maybe Text)
-resolveSystemPrompt agentDefBackend meta =
-  case smSystemOverride meta of
+-- neither is set. The auto-loaded skill (default @seal-usage@, the
+-- fresh-workdir contract) is appended so the model is oriented to its
+-- per-session workspace from turn one. Disabled by setting
+-- @[skills] autoload = ""@ in @config.toml@.
+resolveSystemPrompt
+  :: AgentDefBackend
+  -> SkillBackend
+  -> Maybe Text
+  -- ^ The resolved auto-load skill id ('Nothing' disables injection).
+  -> SessionMeta
+  -> IO (Maybe Text)
+resolveSystemPrompt agentDefBackend skillBackend autoloadId meta = do
+  base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
            Nothing  -> pure Nothing
            Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
+  injectAutoloadSkill skillBackend autoloadId base
 
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
@@ -283,7 +295,8 @@ plainTurn deps meta t = do
                   Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
                 agentDefBackend = bAgentDefs (sdBackends deps)
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-            mSystem <- resolveSystemPrompt agentDefBackend meta
+            let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+            mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
@@ -495,7 +508,8 @@ plainTurnWithCaps deps meta caps t = do
               Right wd -> WorkspaceRoot wd
               Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
             agentDefBackend = bAgentDefs (sdBackends deps)
-        mSystem <- resolveSystemPrompt agentDefBackend meta
+        let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+        mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
@@ -635,14 +649,16 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             ModelId m | T.null m -> smModel active
                       | otherwise -> m
       resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt def task =
+    childSystemPrompt def task = do
       let base = adSystem def
           ctx  = ctContext task
-      in case (base, ctx) of
-           (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-           (Just b, _)                       -> Just b
-           (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-           (Nothing, Nothing)                -> Nothing
+          basePrompt = case (base, ctx) of
+            (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+            (Just b, _)                       -> Just b
+            (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+            (Nothing, Nothing)                -> Nothing
+      let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+      injectAutoloadSkill (bSkills (sdBackends deps)) autoloadId basePrompt
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
       let childWsRoot = case eChildWd of

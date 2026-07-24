@@ -12,10 +12,12 @@ import Test.Hspec
 
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
+  , SkillsConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
-  , updateRuntimeConfig, upsertProvider )
+  , updateRuntimeConfig, upsertProvider
+  , defaultAutoloadSkill, resolvedAutoloadSkill )
 
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
@@ -36,6 +38,7 @@ spec = describe "Seal.Config.File" $ do
         , rcDelegation      = Nothing
         , rcWeb             = Nothing
         , rcWorkdir          = Nothing
+        , rcSkills           = Nothing
         }
 
   describe "loadRuntimeConfig" $ do
@@ -86,6 +89,7 @@ spec = describe "Seal.Config.File" $ do
               , rcDelegation      = Nothing
               , rcWeb             = Nothing
               , rcWorkdir         = Nothing
+              , rcSkills          = Nothing
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
@@ -102,6 +106,46 @@ spec = describe "Seal.Config.File" $ do
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
         result `shouldBe` Right cfg
+
+    it "round-trips a [skills] section" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        let cfg = defaultRuntimeConfig
+              { rcSkills = Just SkillsConfig
+                  { scAutoload = Just "custom-skill"
+                  }
+              }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
+        result `shouldBe` Right cfg
+
+    it "round-trips [skills] autoload = \"\" (disabled)" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        let cfg = defaultRuntimeConfig
+              { rcSkills = Just SkillsConfig
+                  { scAutoload = Just ""
+                  }
+              }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
+        result `shouldBe` Right cfg
+
+    describe "resolvedAutoloadSkill" $ do
+      it "defaults to seal-usage when [skills] is absent" $
+        resolvedAutoloadSkill defaultRuntimeConfig `shouldBe` Just defaultAutoloadSkill
+
+      it "defaults to seal-usage when autoload key is absent" $
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing } })
+          `shouldBe` Just defaultAutoloadSkill
+
+      it "returns the custom id when autoload is set" $
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "custom" } })
+          `shouldBe` Just "custom"
+
+      it "returns Nothing when autoload is explicitly empty (disabled)" $
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "" } })
+          `shouldBe` (Nothing :: Maybe T.Text)
 
     it "round-trips defaultRuntimeConfig (all Nothing)" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do

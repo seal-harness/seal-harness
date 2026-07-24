@@ -184,14 +184,25 @@ data from the skill.
 ## 5. First deliverable scope (this branch)
 
 - [x] Brainstorm + direction (this doc).
-- [ ] `seal-usage` skill file (markdown, YAML frontmatter, body describing
+- [x] `seal-usage` skill file (markdown, YAML frontmatter, body describing
       the fresh-workdir contract + clone-into-`.` idiom + what NOT to do).
-- [ ] README/docs note pointing operators at the skill and how to load it
+- [x] README/docs note pointing operators at the skill and how to load it
       (`SKILL_LOAD seal-usage` or wire into `adSystem`).
-- [ ] Commit on `feat/seal-usage-skill`.
+- [x] **Auto-injection at session start** (was the follow-up epic's first
+      work unit; promoted into the first deliverable). New `[skills]`
+      config section with `autoload` key (default `"seal-usage"`, empty
+      string disables). New `Seal.Skills.Autoload` module
+      (`injectAutoloadSkill`) appends the skill body to the resolved
+      system prompt at all 3 main session wiring sites (CLI
+      `resolveSystem`, Channels `plainTurn`, Gateway
+      `resolveSystemPrompt`) and all 3 child system-prompt builders (CLI,
+      Channels, Gateway — `dwdChildSystemPrompt` changed to `IO`). Tests
+      for config round-trip + resolution + injection.
+- [x] Commit on `feat/seal-usage-skill` (then cherry-picked onto
+      `fix/search-files-pattern-word-split`).
 
-**Out of scope for this branch:** auto-load mechanism, `working-directory`
-arg, `CLONE_REPO`, chroot — all follow-up epic.
+**Out of scope for this branch:** `working-directory` arg, `CLONE_REPO`,
+chroot — all follow-up epic.
 
 ## 6. Changelog
 
