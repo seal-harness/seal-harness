@@ -12,6 +12,7 @@ module Seal.Skills.Backend
   ( SkillBackend (..)
   , noneBackend
   , markdownSkillBackend
+  , unionSkillBackend
   , encodeSkill
   , decodeSkill
   ) where
@@ -21,22 +22,17 @@ import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
-import Data.Text (Text)
+import Data.Maybe (catMaybes)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import Data.Time (UTCTime (..))
-import Data.Time.Calendar (fromGregorian)
-import Data.Time.Clock (secondsToDiffTime)
-import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
-import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
-import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup)
+import Seal.Skills.Builtins (builtinSkillMap)
+import Seal.Skills.Codec (decodeSkill, encodeSkill)
+import Seal.Skills.Types (Skill (..), SkillId (..), skillIdText)
 
 -- | The skill store capability. Each operation is IO (the Markdown backend
 -- writes to disk + git); 'sbList' returns all skills sorted by id.
@@ -79,39 +75,49 @@ markdownSkillBackend dir repo = pure SkillBackend
     , sbDelete = deleteSkill dir repo
     }
 
+-- | A read-layer union of a user 'SkillBackend' (the on-disk
+-- @~/.seal/config/skills/@ store) and the embedded built-in skills
+-- ('Seal.Skills.Builtins.builtinSkills'). Reads check the user layer first
+-- and fall back to the built-in; listing merges both, with the user copy
+-- winning on id collisions (so a user override shadows the built-in).
+-- Writes ('sbCreate'/'sbUpdate'/'sbDelete') go to the user layer only —
+-- built-ins are immutable from the model's perspective.
+--
+-- This is what makes Seal self-contained: the @seal-usage@ orientation
+-- skill is always present (shipped in the binary), and a user can override
+-- it by dropping @~/.seal/config/skills/seal-usage.md@. After a Seal
+-- upgrade, the user diffs their override against the new built-in (visible
+-- via @sbList@) and merges manually — no forced overwrites, no staleness.
+unionSkillBackend :: SkillBackend -> SkillBackend
+unionSkillBackend user = SkillBackend
+    { sbCreate = sbCreate user
+    , sbRead   = \sid -> do
+        mUser <- sbRead user sid
+        case mUser of
+          Just s  -> pure (Just s)
+          Nothing -> pure (Map.lookup sid builtinSkillMap)
+    , sbList   = do
+        userSkills <- sbList user
+        -- User skills keyed by id; built-in entries fill in the ids the
+        -- user hasn't overridden. Sorted by id for deterministic output.
+        let userMap = Map.fromList [(skId s, s) | s <- userSkills]
+            merged = Map.union userMap builtinSkillMap
+        pure (Map.elems merged)
+    , sbUpdate = sbUpdate user
+    , sbDelete = sbDelete user
+    }
+
 -- | The filename for a skill: @\<id\>.md@.
 skillFile :: FilePath -> SkillId -> FilePath
 skillFile dir sid = dir </> T.unpack (skillIdText sid) <.> "md"
 
 -- | Encode a 'Skill' as a Markdown document (frontmatter + body).
-encodeSkill :: Skill -> Text
-encodeSkill s = encodeDoc fm (skBody s)
-  where
-    fm = Map.fromList
-      [ ("id", skillIdText (skId s))
-      , ("description", skDescription s)
-      , ("created_at", isoTime (skCreatedAt s))
-      , ("updated_at", isoTime (skUpdatedAt s))
-      , ("session", sessionIdText (skSession s))
-      ]
+-- Re-exported from 'Seal.Skills.Codec' for backward compatibility.
+-- (See 'Seal.Skills.Codec' for the implementation.)
 
--- | Decode a Markdown document into a 'Skill'. Returns 'Nothing' if the id
--- field is missing or fails 'mkSkillId'. Timestamps default to epoch 0 when
--- absent or unparseable (the file was hand-edited without them).
-decodeSkill :: Text -> Maybe Skill
-decodeSkill content =
-  case decodeDoc content of
-    (fm, body) -> do
-      sidT <- fmLookup "id" fm
-      sid  <- either (const Nothing) Just (mkSkillId sidT)
-      Just Skill
-        { skId = sid
-        , skDescription = fromMaybe "" (fmLookup "description" fm)
-        , skBody = body
-        , skCreatedAt = parseTime (fmLookup "created_at" fm)
-        , skUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , skSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
-        }
+-- | Decode a Markdown document into a 'Skill'.
+-- Re-exported from 'Seal.Skills.Codec' for backward compatibility.
+-- (See 'Seal.Skills.Codec' for the implementation.)
 
 -- | Write one skill to disk (atomic) and auto-commit.
 writeSkill :: FilePath -> ConfigRepo -> Skill -> IO ()
@@ -160,17 +166,3 @@ deleteSkill dir repo sid = do
       let rel = "skills" </> (T.unpack (skillIdText sid) <.> "md")
       _ <- gitCommitAll repo rel ("seal: SKILL delete " <> skillIdText sid)
       pure ()
-
--- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
-isoTime :: UTCTime -> Text
-isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
-
--- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
--- when absent or unparseable (hand-edited files).
-parseTime :: Maybe Text -> UTCTime
-parseTime Nothing    = epochZero
-parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
-
--- | The epoch fallback for missing/unparseable timestamps.
-epochZero :: UTCTime
-epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)

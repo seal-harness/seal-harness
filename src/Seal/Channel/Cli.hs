@@ -157,7 +157,7 @@ newBackends cfgRoot repo = do
   parentAct   <- newParentActivity
   Backends
     <$> Mem.markdownMemoryBackend memoryDir repo
-    <*> Skill.markdownSkillBackend skillsDir repo
+    <*> (Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo)
     <*> Def.markdownAgentDefBackend agentsDir repo
     <*> pure rt
     <*> pure (pure defaultDelegationConfig)  -- overridden at call sites that have a config path

@@ -18,14 +18,22 @@ Full brainstorm and direction: `docs/2026-07-24-workdir-escape-brainstorm.md`.
 
 ## Where it lives
 
-`config/skills/seal-usage.md` — versioned with the repo so it ships with Seal
-Harness. Seal's skill backend reads from `~/.seal/config/skills/`, so to make
-it agent-loadable today, symlink or copy it:
+The skill source lives at `config/skills/seal-usage.md` in the repo, and
+is **embedded into the Seal binary at compile time** via `file-embed`
+(`Seal.Skills.Builtins`). It is always present — no manual install step.
+The skill backend used in production
+(`Seal.Skills.Backend.unionSkillBackend`) is a read-layer union of the
+user's on-disk skills (`~/.seal/config/skills/`) over the embedded
+built-ins: reads check the user layer first and fall back to the built-in;
+listing merges both (user wins on id collisions).
 
-```bash
-mkdir -p ~/.seal/config/skills
-ln -s "$(pwd)/config/skills/seal-usage.md" ~/.seal/config/skills/seal-usage.md
-```
+**To override:** drop `~/.seal/config/skills/seal-usage.md`. After a Seal
+upgrade, diff your override against the new built-in (visible via
+`/skill list` or `SKILL_LIST` — both surface built-ins) and merge
+manually. No forced overwrites, no staleness.
+
+**To add more built-in skills:** add a tuple to `builtinSources` in
+`Seal.Skills.Builtins` and the markdown source under `config/skills/`.
 
 ## How to use it
 

@@ -122,10 +122,9 @@ reference — you should still pass relative paths to file opcodes.
 
 ## Operator-facing note
 
-Operators: this skill is safe to load in any session. It does not change
-any state; it only teaches the model the workdir contract. To make it
-loadable, place this file at `~/.seal/config/skills/seal-usage.md` (or
-symlink the repo copy into `~/.seal/config/skills/`) and the agent can
-`SKILL_LOAD seal-usage` at any time. To make it load automatically at
-session start, see the follow-up epic for the auto-load mechanism (not yet
-implemented).
+Operators: this skill is **shipped embedded in the Seal binary** and
+auto-injected at session start by default — no install step needed. It is
+always present in the skill list (`SKILL_LIST` / `/skill list`). To override
+it, drop a same-id file at `~/.seal/config/skills/seal-usage.md`; the union
+backend prefers your copy. Disable auto-injection for all sessions by
+setting `[skills] autoload = ""` in `config.toml`.
