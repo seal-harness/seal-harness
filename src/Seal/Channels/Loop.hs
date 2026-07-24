@@ -43,6 +43,7 @@ module Seal.Channels.Loop
   ) where
 
 import Control.Concurrent (forkIO)
+import Control.Exception (catch, fromException)
 import Control.Monad (void)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
@@ -93,7 +94,7 @@ import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, askHuman, deliverNextAnswer )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
@@ -532,6 +533,12 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                        onDemand)
                       { aeMessageSource = mSrc }
           runApp appEnv (runTurn env t)
+            `catch` \e -> do
+              let msg = case fromException e of
+                    Just (TranscriptError te) ->
+                      "transcript error: " <> te
+                    Nothing -> T.pack (show e)
+              hPutStrLn stderr ("[channel] turn failed: " <> T.unpack msg)
           broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints

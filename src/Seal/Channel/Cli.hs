@@ -17,6 +17,7 @@ module Seal.Channel.Cli
   ) where
 
 import Control.Concurrent (forkIO)
+import Control.Exception (catch, fromException)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
@@ -56,7 +57,7 @@ import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
-  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
+  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript, TranscriptError (..) )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
@@ -179,8 +180,17 @@ interpretDisposition caps plainHandler = \case
 
 -- | Drive one plain-text turn through the agent loop. The seam the wiring test
 -- asserts against: a 'PlainMessage' becomes @runApp env (runTurn agentEnv t)@.
+-- Catches exceptions (including 'TranscriptError' from a dead writer daemon)
+-- so the TUI reports the error instead of crashing.
 handlePlain :: AgentEnv -> Env -> Text -> IO ()
-handlePlain agentEnv env t = runApp env (runTurn agentEnv t)
+handlePlain agentEnv env t =
+  runApp env (runTurn agentEnv t)
+    `catch` \e -> do
+      let msg = case fromException e of
+            Just (TranscriptError te) ->
+              "transcript error: " <> te
+            Nothing -> T.pack (show e)
+      ccSend (aeCaps agentEnv) ("turn failed: " <> msg)
 
 -- | Resolve the active session's provider from the vault, or explain why not.
 -- Key bytes never surface: 'resolveProvider' returns an opaque 'SomeProvider'.

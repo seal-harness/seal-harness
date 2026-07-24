@@ -28,12 +28,17 @@ module Seal.Handles.Transcript
   , fakeTwoFileTranscript
   , TwoFileHandle (..)
   , TwoFileWrite (..)
+  , TranscriptError (..)
+  , defaultAckTimeoutUs
   ) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (bracket)
+  ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
+  , orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry, takeTMVar
+  , tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
+import Control.Exception (bracket, catch, Exception, SomeException, throwIO)
 import Control.Monad (void)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
@@ -48,6 +53,7 @@ import Data.Word (Word8)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 import System.Posix.IO
   ( OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags
   , fdWriteBuf, openFd )
@@ -62,6 +68,15 @@ import Seal.Transcript.Entries
   ( EntryRecord (..), encodeEntryRecordRaw )
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
+
+-- | Exception raised by 'tfwRecordAndAck' when the single-writer daemon has
+-- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
+-- leaves the ACK 'TMVar' empty and the caller blocks forever — the
+-- root-cause of session @20260724-113851-844@ silently hanging mid-dispatch.
+newtype TranscriptError = TranscriptError T.Text
+  deriving newtype (Eq, Show)
+
+instance Exception TranscriptError
 
 -- | Handle to the legacy single-file transcript writer. All fields are
 -- functions so the type is uniform between the real (file-backed) and fake
@@ -197,7 +212,19 @@ data TwoFileHandle = TwoFileHandle
   -- so the writer knows which 'CbToolResult's may carry secrets. Results from
   -- opcodes NOT in this set (e.g. SHELL_EXEC, FILE_READ) pass through verbatim.
   , tfwCloseTranscript :: IO ()
+  , tfwIsAlive :: IO Bool
+  -- ^ Is the single-writer daemon still running? Returns 'False' after a
+  -- write error killed it. Callers that depend on durability (the dispatch
+  -- ACK-before-execute gate) should check this before trusting a prior write.
   }
+
+-- | Default ACK timeout (30 seconds). If the daemon does not acknowledge a
+-- write within this window, 'tfwRecordAndAck' raises 'TranscriptError' instead
+-- of hanging forever. Tuned generously — normal writes complete in
+-- milliseconds; 30s is a fail-safe for a stuck/dead daemon, not a performance
+-- bound.
+defaultAckTimeoutUs :: Int
+defaultAckTimeoutUs = 30_000_000
 
 -- | The daemon's accumulated state: the conversation lines written so far (so
 -- the diff can be computed without re-reading the file each turn) and the
@@ -231,6 +258,7 @@ data TwoFileItem
 withTwoFileTranscript :: FilePath -> (TwoFileHandle -> IO a) -> IO a
 withTwoFileTranscript dir action = do
   q <- newTQueueIO
+  aliveRef <- newTVarIO True
   let convPath     = dir </> "conversation.jsonl"
       entriesPath  = dir </> "entries.jsonl"
       flags = defaultFileFlags
@@ -293,12 +321,54 @@ withTwoFileTranscript dir action = do
     $ \(convFd, entriesFd) -> do
         secretOpsRef <- newIORef Set.empty
         let st0 = TwoFileState convFd entriesFd existingConv secretOpsRef
-        void $ forkIO (void (daemon st0))
+            -- The daemon with an exception handler: if writeOne throws, mark
+            -- the daemon dead, fail every queued ACK (so callers blocked on
+            -- takeTMVar unblock immediately), and log to stderr. The daemon
+            -- then exits — no further writes are attempted.
+            safeDaemon st =
+              daemon st `catch` \e -> do
+                atomically (writeTVar aliveRef False)
+                hPutStrLn stderr ("[transcript] writer daemon died: " <> show (e :: SomeException))
+                -- Drain remaining queue items WITHOUT filling their ACK slots
+                -- (the writes never completed). Callers blocked on takeTMVar
+                -- unblock via the aliveRef check in ackWrite's orElse. Shutdown
+                -- items still get their done signal so the bracket cleanup
+                -- completes.
+                let drainRemaining = do
+                      item <- atomically (tryReadTQueue q)
+                      case item of
+                        Nothing -> pure ()
+                        Just (TFWWrite _ _mack) -> drainRemaining
+                        Just (TFWShutdown done) -> do
+                          atomically (putTMVar done ())
+                drainRemaining
+                pure st
+        void $ forkIO (void (safeDaemon st0))
         let enqueue w = atomically (writeTQueue q (TFWWrite w Nothing))
             ackWrite w = do
-              tv <- newEmptyTMVarIO
-              atomically (writeTQueue q (TFWWrite w (Just tv)))
-              atomically (takeTMVar tv)
+              alive <- readTVarIO aliveRef
+              if not alive
+                then throwIO (TranscriptError "transcript writer daemon is dead")
+                else do
+                  tv <- newEmptyTMVarIO
+                  timeoutVar <- newEmptyTMVarIO
+                  atomically (writeTQueue q (TFWWrite w (Just tv)))
+                  void $ forkIO $ do
+                    threadDelay defaultAckTimeoutUs
+                    void $ atomically (tryPutTMVar timeoutVar ())
+                  mResult <- atomically $
+                    (Right <$> takeTMVar tv)
+                      `orElse` (Left <$> takeTMVar timeoutVar)
+                      `orElse` (do
+                         stillAlive <- readTVar aliveRef
+                         if stillAlive then retry else pure (Left ()))
+                  case mResult of
+                    Right () -> pure ()
+                    Left ()  -> do
+                      stillAlive <- readTVarIO aliveRef
+                      if stillAlive
+                        then throwIO (TranscriptError "transcript write timed out (daemon stuck)")
+                        else throwIO (TranscriptError "transcript writer daemon died during write")
         action TwoFileHandle
           { tfwRecordAndAck = ackWrite
           , tfwRecordAsync  = enqueue
@@ -306,6 +376,7 @@ withTwoFileTranscript dir action = do
           , tfwReadEntries     = readEntries entriesPath
           , tfwSetSecretOps    = writeIORef secretOpsRef
           , tfwCloseTranscript = pure ()
+          , tfwIsAlive = readTVarIO aliveRef
           }
 
 -- | Read back the entries file, skipping malformed lines.
@@ -342,6 +413,7 @@ fakeTwoFileTranscript = do
         , tfwReadEntries     = readMVar entriesRef
         , tfwSetSecretOps    = writeIORef secretOpsRef
         , tfwCloseTranscript = pure ()
+        , tfwIsAlive = pure True
         }
     , do cs <- readMVar convRef
          es <- readMVar entriesRef

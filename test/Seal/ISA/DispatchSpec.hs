@@ -30,6 +30,7 @@ probe ref tl =
       , tfwReadEntries     = pure []
       , tfwSetSecretOps    = \_ -> pure ()
       , tfwCloseTranscript = pure ()
+      , tfwIsAlive         = pure True
       }
   , mkProbeOpcode ref tl
   )

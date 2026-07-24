@@ -19,6 +19,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
+import Control.Exception (catch, fromException, SomeException)
 import Control.Monad (when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
@@ -34,6 +35,7 @@ import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
+import System.IO (hPutStrLn, stderr)
 
 import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
@@ -57,7 +59,7 @@ import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
@@ -218,9 +220,12 @@ handleSend deps sid rawText = do
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        er <- plainTurn deps meta t
+        er <- plainTurn deps meta t `catch` \e -> do
+          let msg = T.pack (show (e :: SomeException))
+          hPutStrLn stderr ("[send] plainTurn threw: " <> T.unpack msg)
+          pure (Left ("internal error: " <> msg))
         case er of
-          Left err -> pure (SendError 400 err)
+          Left err -> pure (SendError 500 err)
           Right () -> pure SendAssistant
       Right (SlashCommand _) -> runSlash deps meta rawText
       Right NewSession       -> runSlash deps meta rawText
@@ -312,14 +317,21 @@ plainTurn deps meta t = do
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-            result <- runApp appEnv (runTurn env t)
+            result <- (Right <$> runApp appEnv (runTurn env t))
+              `catch` \e -> do
+                let msg = case fromException e of
+                      Just (TranscriptError te) ->
+                        "transcript error: " <> te
+                      Nothing -> T.pack (show e)
+                hPutStrLn stderr ("[send] turn failed: " <> T.unpack msg)
+                pure (Left msg)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
             pure result))
       -- Fan out the reply to chat channels subscribed to this session.
       -- The web frontend already received entries via the WS broker above;
       -- only chat channels need the explicit chSend.
       fanoutLastReply (sdReplies deps) paths sid
-      pure (Right turnResult)
+      pure turnResult
 
 -- | Build the ISA registry for a web turn. Mirrors
 -- 'Seal.Channels.Signal.Run.buildRegistry' but includes AGENT_START (the
@@ -497,7 +509,7 @@ plainTurnWithCaps deps meta caps t = do
           sid = smId meta
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
-      Right <$> withTwoFileTranscript sessionDirPath (\tHandle -> do
+      withTwoFileTranscript sessionDirPath (\tHandle -> do
         appEnv <- mkEnv defaultConfig
         eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
         eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
@@ -525,7 +537,14 @@ plainTurnWithCaps deps meta caps t = do
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
               onDemand
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        result <- runApp appEnv (runTurn env t)
+        result <- (Right <$> runApp appEnv (runTurn env t))
+          `catch` \e -> do
+            let msg = case fromException e of
+                  Just (TranscriptError te) ->
+                    "transcript error: " <> te
+                  Nothing -> T.pack (show e)
+            hPutStrLn stderr ("[send] turn (withCaps) failed: " <> T.unpack msg)
+            pure (Left msg)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
         pure result)
 
