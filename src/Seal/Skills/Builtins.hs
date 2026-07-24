@@ -30,6 +30,7 @@ import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
+import Language.Haskell.TH.Syntax (qAddDependentFile)
 
 import Seal.Skills.Codec (decodeSkill)
 import Seal.Skills.Types (Skill (..), SkillId)
@@ -46,11 +47,18 @@ builtinStamp = UTCTime (fromGregorian 2026 7 24) (secondsToDiffTime 0)
 -- is the skill id (must match the @id:@ frontmatter inside the file); the
 -- path is repo-relative under @config/skills@.
 --
--- 'embedFile' produces a 'ByteString' expression splice; we decode to
--- 'Text' once at startup (the sources are small, UTF-8, fixed).
+-- Each 'embedFile' splice is paired with a 'qAddDependentFile' call so
+-- GHC recompiles this module when an embedded source changes (plain
+-- 'embedFile' alone does not register the file as a build dependency, so
+-- editing the markdown would not trigger a rebuild — a subtle footgun
+-- we close here).
 builtinRaw :: [(Text, Text)]
 builtinRaw =
-  [ ("seal-usage", TE.decodeUtf8 $(embedFile "config/skills/seal-usage.md"))
+  [ ( "seal-usage"
+    , TE.decodeUtf8 $(do
+          qAddDependentFile "config/skills/seal-usage.md"
+          embedFile "config/skills/seal-usage.md")
+    )
   ]
 
 -- | The decoded built-in skills, with provenance stamped to 'builtinStamp'

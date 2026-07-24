@@ -64,9 +64,10 @@ SHELL_EXEC { "command": "git clone … /Users/zoe/some-place" }
 
 ### Running commands
 
-Prefer one command per `SHELL_EXEC`. If you need to work in a subdirectory of
-your workspace, `cd` into the *relative* subpath inside the clone — never to
-an absolute or home path:
+Prefer `BIN_EXEC` unless `SHELL_EXEC` is absolutely necessary. If you do use
+`SHELL_EXEC` and need to work in a subdirectory of your workspace, `cd`
+into the *relative* subpath inside the clone — never to an absolute or
+home path:
 
 ```
 # After cloning seal-harness into your workdir:
