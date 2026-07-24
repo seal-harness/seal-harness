@@ -95,11 +95,30 @@ runTurn env userText = do
   go (aeMaxTurns env) turn0
   where
     go :: Int -> [Message] -> App ()
-    go 0 _ = liftIO $ do
+    go 0 msgs = liftIO $ do
       logMaxTurns (aeLogPath env)
-      ccSend (aeCaps env)
-        ("(stopped: reached the " <> T.pack (show (aeMaxTurns env))
-         <> "-turn limit for this message. Ask again to continue, or raise `max_turns` in config.toml.)")
+      let stopMsg = "(stopped: reached the " <> T.pack (show (aeMaxTurns env))
+            <> "-turn limit for this message. Ask again to continue, "
+            <> "or raise `max_turns` in config.toml.)"
+          assistantMsg = Message Assistant [CbText stopMsg]
+          conv = msgs <> [assistantMsg]
+      now <- getCurrentTime
+      let entry = EntryRecord
+            { erId = ""
+            , erTimestamp = now
+            , erKind = EKResponse
+            , erConvLen = length conv
+            , erEnvelope = Nothing
+            , erUsage = Nothing
+            , erStop = Nothing
+            , erDurationMs = Nothing
+            , erHarness = Nothing
+            , erCorrelation = Nothing
+            , erMeta = Map.empty
+            }
+      tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+      aeOnEntry env
+      ccSend (aeCaps env) stopMsg
     go n msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
