@@ -114,9 +114,11 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- responsible for applying 'delegationBlocklist' to the def's
     -- @adTools@ allow-list and constructing the registry. The caps + sid
     -- are passed in so the registry can close over them (ASK_HUMAN etc.).
-  , dwdChildSystemPrompt :: AgentDef -> ChildTask -> Maybe Text
+  , dwdChildSystemPrompt :: AgentDef -> ChildTask -> IO (Maybe Text)
     -- ^ Build the child's system prompt from the def's @adSystem@ + the
-    -- task's @ctContext@. 'Nothing' means no system prompt.
+    -- task's @ctContext@. Runs in 'IO' so the wiring layer can load the
+    -- auto-injected skill (default @seal-usage@) from the skill backend and
+    -- append it. 'Nothing' means no system prompt.
   , dwdOnEntry :: IO ()
     -- ^ The on-entry hook for the child's transcript (live broadcast).
     -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
@@ -150,11 +152,12 @@ mkDelegateWorker deps def childSid task _hooks = do
               }
         childReg <- dwdChildRegistry deps def childSid capturingCaps
         childUio <- dwdMkUntrustedIO deps childSid
+        childSystem <- dwdChildSystemPrompt deps def task
         let env = AgentEnv
               { aeProvider   = prov
               , aeProviderLabel = providerLabel def
               , aeModel      = model
-              , aeSystem     = dwdChildSystemPrompt deps def task
+              , aeSystem     = childSystem
               , aeRegistry   = childReg
               , aeTranscript = childTHandle
               , aeBackend    = localBackend

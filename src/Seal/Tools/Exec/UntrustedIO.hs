@@ -37,6 +37,8 @@ module Seal.Tools.Exec.UntrustedIO
   , mkRemoteUntrustedIOStub
   , applyUnifiedDiff
   , lineWindowFromText
+  , buildRgCmd
+  , shellQuote
   ) where
 
 import Control.Exception (IOException, try)
@@ -165,7 +167,16 @@ renderUntrustedErr = \case
 -- commands run via @/bin/sh -c@ (shell) or @proc@ (bin). Absent under
 -- @-f remote-only-untrusted@.
 mkLocalUntrustedIO :: WorkspaceRoot -> UntrustedIO
-mkLocalUntrustedIO wsRoot = UntrustedIO
+mkLocalUntrustedIO wsRoot =
+  -- The workdir root itself, resolved once as the SafePath for @.@. This
+  -- is the single source of truth for the \"untrusted opcodes share one
+  -- workspace root\" invariant: 'uioShellExec' / 'uioBinExec' default to
+  -- it when the caller omits a cwd, so every opcode agrees on the same
+  -- root without any opcode needing to remember to pass it.
+  let wsRootPath = case mkSafePathRemote wsRoot "." of
+        Right sp -> getSafePath sp
+        Left _   -> "/nonexistent-workdir-fail-closed"
+  in UntrustedIO
   { uioReadFile = \rp scanBytes -> do
       let rel = T.unpack (getRemotePath rp)
       eSafe <- mkSafePath wsRoot rel
@@ -230,13 +241,13 @@ mkLocalUntrustedIO wsRoot = UntrustedIO
   , uioShellExec = \cmd mCwd ->
       let argv = ["/bin/sh", "-c", T.unpack (textShellCommand cmd)]
       in case mCwd of
-           Nothing -> runLocalFixedArgv False argv Nothing
+           Nothing -> runLocalFixedArgv False argv (Just wsRootPath)
            Just rp -> case mkSafePathRemote wsRoot (T.unpack (getRemotePath rp)) of
              Left pe  -> pure (Left (UePath pe))
              Right sp -> runLocalFixedArgv False argv (Just (getSafePath sp))
   , uioBinExec = \bin bargs ->
       let argv = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-      in runLocalFixedArgv True argv Nothing
+      in runLocalFixedArgv True argv (Just wsRootPath)
   , uioProcessList =
       case mkShellCommand "ps -o pid=,cmd=" of
         Left _   -> pure (Left (UeExec ExecNotImplemented))
@@ -259,10 +270,13 @@ mkLocalUntrustedIO wsRoot = UntrustedIO
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
 -- optional workspace-relative path (anchored to the workspace root, not
 -- the remote user's home CWD). Defaults to the workspace root itself.
+-- Both the pattern and the path are 'shellQuote'-d so a pattern
+-- containing spaces (e.g. @Recent Sessions@) or a single quote is passed
+-- to @rg@ as a single argv token, not word-split by the shell.
 buildRgCmd :: SearchPattern -> Maybe SafePath -> Text
 buildRgCmd pat mSafePath =
-  "rg -n -- " <> textSearchPattern pat <> " "
-  <> T.pack (shellQuote (maybe "." getSafePath mSafePath))
+  T.pack ("rg -n -- " <> shellQuote (T.unpack (textSearchPattern pat))
+          <> " " <> shellQuote (maybe "." getSafePath mSafePath))
 
 -- | Read at most @maxBytes@ from a local file. Returns the bytes read and
 -- a 'Bool' indicating whether the file was truncated (the file is larger
@@ -363,7 +377,17 @@ mkRemoteUntrustedIO = mkRemoteUntrustedIOFromRunner
 -- constructor). Provided for the wiring site, which threads the runner
 -- explicitly.
 mkRemoteUntrustedIOFromRunner :: SshConfig -> RemoteRunner -> UntrustedIO
-mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
+mkRemoteUntrustedIOFromRunner sshCfg runner =
+  -- The workdir root itself, resolved once as the SafePath for @.@. This
+  -- is the single source of truth for the \"untrusted opcodes share one
+  -- workspace root\" invariant on the remote arm: 'uioShellExec' /
+  -- 'uioBinExec' default to it when the caller omits a cwd, so every
+  -- opcode agrees on the same root (the remote @scWorkspace@), not the
+  -- remote user's home or wherever the SSH server drops it.
+  let wsRootPath = case mkSafePathRemote (wsRootFromCfg sshCfg) "." of
+        Right sp -> getSafePath sp
+        Left _   -> "/nonexistent-workdir-fail-closed"
+  in UntrustedIO
   { uioReadFile = \rp scanBytes ->
       let rel = T.unpack (getRemotePath rp)
       in case mkSafePathRemote (wsRootFromCfg sshCfg) rel of
@@ -416,18 +440,22 @@ mkRemoteUntrustedIOFromRunner sshCfg runner = UntrustedIO
                 res <- runRemoteStdin runner argv (TE.encodeUtf8 newContent)
                 pure (either (Left . UeExec) (const (Right ())) res)
   , uioShellExec = \cmd mCwd ->
-      case mCwd of
-        Nothing -> runRemoteShellText runner sshCfg (textShellCommand cmd)
+      let prefixCd p = "cd " <> shellQuote p <> " && "
+      in case mCwd of
+        Nothing -> runRemoteShellText runner sshCfg
+                     (T.pack (prefixCd wsRootPath
+                              <> T.unpack (textShellCommand cmd)))
         Just rp ->
           case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of
             Left pe  -> pure (Left (UePath pe))
-            Right _  ->
-              let cdCmd = "cd " <> shellQuote (T.unpack (getRemotePath rp))
+            Right sp ->
+              let cdCmd = "cd " <> shellQuote (getSafePath sp)
                           <> " && " <> T.unpack (textShellCommand cmd)
               in runRemoteShellText runner sshCfg (T.pack cdCmd)
   , uioBinExec = \bin bargs ->
       let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-          cmd   = T.intercalate " " (map (T.pack . shellQuote) argv')
+          cmd   = T.pack ("cd " <> shellQuote wsRootPath <> " && "
+                          <> T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
       in runRemoteShellText runner sshCfg cmd
   , uioProcessList =
       runRemoteShellText runner sshCfg "ps -o pid=,cmd="
@@ -465,9 +493,18 @@ wsRootFromCfg cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))
 
 -- | Single-quote a 'String' for the remote shell (the path is already
 -- SafePath-validated, but quoting is defense-in-depth against any
--- metacharacters the validator permits, e.g. spaces).
+-- metacharacters the validator permits, e.g. spaces). Embedded single
+-- quotes are escaped with the standard @'\''@ idiom so a value containing
+-- a quote cannot break out of its single-quoted argv token — e.g.
+-- @foo'bar@ becomes @'foo'\''bar'@, which the shell parses back to the
+-- literal @foo'bar@ as a single token. Applied uniformly to all remote
+-- paths and search patterns.
 shellQuote :: String -> String
-shellQuote s = "'" <> s <> "'"
+shellQuote s = "'" <> go s <> "'"
+  where
+    go []         = []
+    go ('\'':rest) = "'\\''" <> go rest
+    go (c:rest)    = c : go rest
 
 -- | Smart-construct a 'ShellCommand', lifting a parse failure into an
 -- 'UntrustedErr' (defensive — the inputs are already validated, so this

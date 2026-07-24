@@ -49,7 +49,7 @@ import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, onDemandSchemas,
-                          rcDebugSessionTranscript, rcDelegation)
+                          rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
@@ -85,6 +85,7 @@ import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.Memory.Backend qualified as Mem
+import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend qualified as Skill
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
@@ -156,7 +157,7 @@ newBackends cfgRoot repo = do
   parentAct   <- newParentActivity
   Backends
     <$> Mem.markdownMemoryBackend memoryDir repo
-    <*> Skill.markdownSkillBackend skillsDir repo
+    <*> (Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo)
     <*> Def.markdownAgentDefBackend agentsDir repo
     <*> pure rt
     <*> pure (pure defaultDelegationConfig)  -- overridden at call sites that have a config path
@@ -363,14 +364,16 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               ModelId m | T.null m -> smModel active
                         | otherwise -> m
         resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-      cliChildSystemPrompt def task =
+      cliChildSystemPrompt def task = do
         let base = adSystem def
             ctx  = ctContext task
-        in case (base, ctx) of
-             (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-             (Just b, _)                       -> Just b
-             (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-             (Nothing, Nothing)                -> Nothing
+            basePrompt = case (base, ctx) of
+              (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
+              (Just b, _)                       -> Just b
+              (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
+              (Nothing, Nothing)                -> Nothing
+        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
+        injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) basePrompt
       cliChildRegistryBuilder _def childSid childCaps = do
         eChildWd <- ensureSessionWorkdir paths childSid
         let childWsRoot = case eChildWd of
@@ -480,10 +483,16 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         in reg
       -- Resolve the bound agent's system prompt (re-read per turn; agent
       -- dirs are small). Nothing when no agent is bound or the def has no
-      -- system prompt.
-      resolveSystem meta = case smAgent meta of
-        Nothing  -> pure Nothing
-        Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+      -- system prompt. The auto-loaded skill (default @seal-usage@, the
+      -- fresh-workdir contract) is appended so the model is oriented to its
+      -- per-session workspace from turn one. Disabled by setting
+      -- @[skills] autoload = ""@ in @config.toml@.
+      resolveSystem meta = do
+        base <- case smAgent meta of
+          Nothing  -> pure Nothing
+          Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
+        injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) base
       -- The per-turn body: open the transcript for `sid`, build the ISA
       -- registry, run a turn under a `withTwoFileTranscript` bracket.
       -- Mirrors `runTurnOnSession` from `Seal.Channels.Loop`. Used by

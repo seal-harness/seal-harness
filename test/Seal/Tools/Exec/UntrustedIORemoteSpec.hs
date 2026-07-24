@@ -32,7 +32,7 @@ import System.Directory (doesFileExist)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Tools.Args (mkShellCommand)
+import Seal.Tools.Args (mkSearchPattern, mkShellCommand)
 import Seal.Tools.Exec.Remote
   ( mkFakeRemoteRunner, mkFakeRemoteRunnerRecording
   )
@@ -42,7 +42,7 @@ import Seal.Tools.Exec.Types
   )
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), UntrustedErr (..), WriteMode (..)
-  , mkRemoteUntrustedIO, renderUntrustedErr
+  , buildRgCmd, mkRemoteUntrustedIO, renderUntrustedErr, shellQuote
   )
 
 -- | A canned 'Right ""' result — the fake runner records the call and
@@ -175,10 +175,25 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       -- The command reached the SSH runner (not ExecNotImplemented).
       recorded `shouldNotBe` []
       res `shouldSatisfy` \case Right _ -> True; Left _ -> False
-      -- The argv contains the command after @--@.
+      -- The argv contains the command after @--@. With no caller-supplied
+      -- cwd, the arm defaults to the workspace root (the one-root
+      -- invariant): the command string is `cd '<wsroot>' && echo ok`.
       case recorded of
-        [(argv, _)] -> argv `shouldSatisfy` elem "echo ok"
+        [(argv, _)] ->
+          argv `shouldSatisfy` elem "cd '/srv/agent-workspace' && echo ok"
         _           -> expectationFailure "expected one call"
+
+    it "defaults cwd to the workspace root when the caller omits it" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls (Right "")
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "pwd")
+      _ <- uioShellExec uio cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          argv `shouldSatisfy` elem "cd '/srv/agent-workspace' && pwd"
+        _ -> expectationFailure "expected one call"
 
     it "rejects a @..@ cwd before any SSH call" $ do
       calls <- newIORef []
@@ -224,6 +239,62 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
           -- And the @--@ separator is present (option-injection defense).
           argv `shouldSatisfy` elem "--"
         _ -> expectationFailure "expected one call"
+
+  describe "uioSearchFiles (SEARCH_FILES on remote)" $ do
+
+    it "passes a multi-word pattern to rg as a single quoted argv token" $ do
+      -- Regression: buildRgCmd previously interpolated the pattern raw, so
+      -- a pattern like "Recent Sessions" was word-split by the shell into
+      -- two argv tokens (rg treated "Sessions" as the path) — producing
+      -- "rg: Sessions: No such file or directory".
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls (Right "hit\n")
+          uio    = mkRemoteUntrustedIO sshCfg runner
+          rp     = mkRemotePathOrDie "src"
+      pat <- either (const (error "fixture")) pure (mkSearchPattern "Recent Sessions")
+      _ <- uioSearchFiles uio pat (Just rp) 100
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          -- The whole command string after `--` is one quoted token:
+          -- `rg -n -- 'Recent Sessions' '/srv/agent-workspace/src'`
+          argv `shouldSatisfy` elem "rg -n -- 'Recent Sessions' '/srv/agent-workspace/src'"
+        _ -> expectationFailure "expected exactly one recorded call"
+
+    it "escapes an embedded single quote in the pattern (no argv breakout)" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls (Right "")
+          uio    = mkRemoteUntrustedIO sshCfg runner
+          rp     = mkRemotePathOrDie "."
+      pat <- either (const (error "fixture")) pure (mkSearchPattern "foo'bar")
+      _ <- uioSearchFiles uio pat (Just rp) 100
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          argv `shouldSatisfy` elem "rg -n -- 'foo'\\''bar' '/srv/agent-workspace'"
+        _ -> expectationFailure "expected exactly one recorded call"
+
+  describe "shellQuote (embedded single-quote hardening)" $ do
+
+    it "wraps a plain string in single quotes" $
+      shellQuote "hello" `shouldBe` "'hello'"
+
+    it "escapes an embedded single quote with the '\\'' idiom" $ do
+      shellQuote "foo'bar" `shouldBe` "'foo'\\''bar'"
+      shellQuote "a'b'c" `shouldBe` "'a'\\''b'\\''c'"
+
+    it "preserves spaces as a single token" $
+      shellQuote "Recent Sessions" `shouldBe` "'Recent Sessions'"
+
+  describe "buildRgCmd" $ do
+
+    it "quotes a multi-word pattern so it is not word-split" $ do
+      pat <- either (const (error "fixture")) pure (mkSearchPattern "Recent Sessions")
+      buildRgCmd pat Nothing `shouldBe` "rg -n -- 'Recent Sessions' '.'"
+
+    it "quotes the path argument" $ do
+      pat <- either (const (error "fixture")) pure (mkSearchPattern "TODO")
+      buildRgCmd pat Nothing `shouldBe` "rg -n -- 'TODO' '.'"
 
 -- ---------------------------------------------------------------------------
 -- Fixtures

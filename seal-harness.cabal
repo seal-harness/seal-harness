@@ -173,7 +173,10 @@ library
         Seal.Memory.Types
         Seal.Memory.Backend
         Seal.Skills.Types
+        Seal.Skills.Codec
         Seal.Skills.Backend
+        Seal.Skills.Autoload
+        Seal.Skills.Builtins
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -193,6 +196,7 @@ library
       , directory
       , exceptions
       , filepath
+      , file-embed
       , haskeline
       , katip
       , lens
@@ -200,6 +204,7 @@ library
       , mtl
       , optparse-applicative
       , stm
+      , template-haskell
       , text
       , time
       , http-client
@@ -295,6 +300,8 @@ test-suite tests
         Seal.Memory.BackendSpec
         Seal.Skills.TypesSpec
         Seal.Skills.BackendSpec
+        Seal.Skills.AutoloadSpec
+        Seal.Skills.BuiltinsSpec
         Seal.Agent.Def.TypesSpec
         Seal.Agent.Def.BackendSpec
         Seal.Agent.Runtime.RegistrySpec
