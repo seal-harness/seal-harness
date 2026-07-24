@@ -10,8 +10,10 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, fromJust)
 import Data.Text (Text)
+import Data.Text qualified as T
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -49,6 +51,13 @@ instance Provider ScriptProvider where
     case rs of
       (x:xs) -> writeIORef ref xs >> pure (Right x)
       [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+
+-- | A provider that always fails with a fixed error message.
+newtype FailingProvider = FailingProvider Text
+
+instance Provider FailingProvider where
+  listModels _ = pure (Right [])
+  complete (FailingProvider err) _ = pure (Left err)
 
 runTestApp :: App a -> IO a
 runTestApp act = do
@@ -97,6 +106,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 Nothing
                 (pure ())
                 False
+                Nothing
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
@@ -130,6 +140,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 Nothing
                 (pure ())
                 False
+                Nothing
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
     -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)
@@ -182,6 +193,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       Nothing
                       (pure ())
                       False
+                      Nothing
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- The on-disk conversation.jsonl must contain exactly 4 lines:
@@ -232,6 +244,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (Just reqPath)
                       (pure ())
                       False
+                      Nothing
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- requests.jsonl has one line per provider call. Each line is the full
@@ -292,6 +305,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (Just reqPath)
                       (pure ())
                       False
+                      Nothing
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- Read back the two-file format + the debug requests file.
@@ -366,7 +380,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
 
@@ -387,7 +401,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` False
 
@@ -408,7 +422,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False Nothing
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
       readIORef prompts `shouldReturn` ([] :: [Text])
@@ -441,7 +455,113 @@ spec = describe "Seal.Agent.Loop" $ do
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
                   mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
       runTestApp (runTurn env "ping")
       readIORef ran `shouldReturn` 1
       readIORef prompts `shouldReturn` ([] :: [Text])
+
+  -- ── Session log (seal.log) ──────────────────────────────────────────────
+
+  it "logs turn start and end to seal.log when aeLogPath is set" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
+                  mkRemoteUntrustedIOStub caps
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
+                  Nothing (pure ()) False logPath
+      runTestApp (runTurn env "hi")
+      doesFileExist (fromJust logPath) `shouldReturn` True
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[TURN]"
+      content `shouldContain` "start"
+      content `shouldContain` "end"
+
+  it "logs provider errors to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+      (h, _) <- fakeTwoFileTranscript
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  (SomeProvider (FailingProvider "connection refused"))
+                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
+                  mkRemoteUntrustedIOStub caps
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
+                  Nothing (pure ()) False logPath
+      runTestApp (runTurn env "hi")
+      doesFileExist (fromJust logPath) `shouldReturn` True
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[ERROR]"
+      content `shouldContain` "provider error"
+      content `shouldContain` "connection refused"
+      -- The turn start should also be logged (the error happens after start).
+      content `shouldContain` "start"
+
+  it "does NOT write seal.log when aeLogPath is Nothing" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      let env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
+                  mkRemoteUntrustedIOStub caps
+                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
+                  Nothing (pure ()) False Nothing
+      runTestApp (runTurn env "hi")
+      doesFileExist (logDir </> "seal.log") `shouldReturn` False
+
+  it "logs the max-turns stop to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          -- A tool-use loop that never terminates: each response calls PING,
+          -- so the loop runs until aeMaxTurns is hit.
+          stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                     (const (Right ()))
+                     (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
+          script = replicate 20 (CompletionResponse
+                                   [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+                                   StopToolUse (Usage 0 0))
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  (SomeProvider (ScriptProvider ref))
+                  "ollama" (ModelId "m") Nothing (mkRegistry [stubOp]) h localBackend
+                  mkRemoteUntrustedIOStub caps
+                  (either (error "sid") id (mkSessionId "s1")) 2 Nothing Full approvals
+                  Nothing (pure ()) False logPath
+      runTestApp (runTurn env "loop")
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "[WARN]"
+      content `shouldContain` "too many tool turns"
+      -- The user-visible message (via ccSend) includes the limit + guidance.
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("2-turn limit" `T.isInfixOf`)
+      sentMsgs `shouldSatisfy` any ("max_turns" `T.isInfixOf`)

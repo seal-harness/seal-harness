@@ -131,10 +131,11 @@ spec = do
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th mkRemoteUntrustedIOStub
-                  Nothing Full approvals (pure ()) False
+                  Nothing Full approvals (pure ()) False Nothing 90
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing
+      aeMaxTurns env `shouldBe` 90
       -- The untrusted-execution capability is threaded into the env.
       aeUntrustedIO env `seq` pure ()  -- type-level check: the field exists
 

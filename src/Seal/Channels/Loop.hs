@@ -79,10 +79,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
-  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir)
+import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir, sessionLogPath)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -130,6 +130,7 @@ import Seal.Session.Lock
   ( ReplyRegistry, newReplyRegistry, replySubscribe
   , SessionLocks, newSessionLocks, withSessionLock )
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Log (logTurnError)
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, newSessionMeta
   , resolveDefaultAgent, saveSessionMeta )
@@ -530,7 +531,9 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                        handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle untrustedIO
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                       onDemand)
+                       onDemand
+                       (Just (sessionLogPath paths sid))
+                       (either (const defaultMaxTurns) maxTurnsConfig eCfg))
                       { aeMessageSource = mSrc }
           runApp appEnv (runTurn env t)
             `catch` \e -> do
@@ -538,6 +541,7 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                     Just (TranscriptError te) ->
                       "transcript error: " <> te
                     Nothing -> T.pack (show e)
+              logTurnError (Just (sessionLogPath paths sid)) msg
               hPutStrLn stderr ("[channel] turn failed: " <> T.unpack msg)
           broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
 
