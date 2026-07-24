@@ -47,9 +47,9 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
-  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , WebConfig (..), rcWeb
-  , onDemandSchemas, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
@@ -318,7 +318,7 @@ plainTurn deps meta t = do
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
-                  (Just (sessionLogPath paths sid))
+                  (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- (Right <$> runApp appEnv (runTurn env t))
               `catch` \e -> do
@@ -541,7 +541,7 @@ plainTurnWithCaps deps meta caps t = do
               (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
               onDemand
-              (Just (sessionLogPath paths sid))
+              (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- (Right <$> runApp appEnv (runTurn env t))
           `catch` \e -> do

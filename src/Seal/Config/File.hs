@@ -21,6 +21,7 @@ module Seal.Config.File
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
+  , defaultMaxTurns
   , defaultDelegationConfig
   , defaultWebConfig
   , emptyProviderConfig
@@ -28,6 +29,7 @@ module Seal.Config.File
   , providerBaseUrl
   , providerDefaultModel
   , retrievalMaxScanBytes
+  , maxTurnsConfig
   , onDemandSchemas
   , defaultAutoloadSkill
   , resolvedAutoloadSkill
@@ -121,6 +123,11 @@ data RuntimeConfig = RuntimeConfig
     -- start). Absent means the built-in default applies: the
     -- @seal-usage@ skill is auto-injected into the system prompt. Set
     -- @[skills] autoload = ""@ to disable auto-injection explicitly.
+  , rcMaxTurns :: Maybe Int
+    -- ^ Optional top-level @max_turns@ key: the maximum number of
+    -- tool-use iterations per turn before the loop stops. Absent →
+    -- 'defaultMaxTurns' (90). Values < 1 are clamped to 1 at resolution
+    -- time. Mirrors Hermes' default.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -206,6 +213,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcWeb             = Nothing
   , rcWorkdir          = Nothing
   , rcSkills           = Nothing
+  , rcMaxTurns         = Nothing
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -263,6 +271,21 @@ defaultDelegationConfig = DelegationFileConfig
 defaultRetrievalMaxScanBytes :: Int
 defaultRetrievalMaxScanBytes = 131072   -- 128 KiB
 
+-- | The compiled-in default for the maximum tool-use iterations per turn.
+-- Used when the @max_turns@ key is absent (or the whole config is absent).
+-- Mirrors Hermes' default (90).
+defaultMaxTurns :: Int
+defaultMaxTurns = 90
+
+-- | Resolve the per-turn max-iterations bound from the loaded config. Absent
+-- or non-positive values fall back to 'defaultMaxTurns'; values below 1 are
+-- clamped to 1 (one tool call before the stop).
+maxTurnsConfig :: RuntimeConfig -> Int
+maxTurnsConfig cfg = case rcMaxTurns cfg of
+  Nothing      -> defaultMaxTurns
+  Just n | n < 1 -> 1
+  Just n       -> n
+
 -- ---------------------------------------------------------------------------
 -- Codec
 -- ---------------------------------------------------------------------------
@@ -286,6 +309,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb
   <*> Toml.dioptional (Toml.table workdirConfigCodec "workdir") .= rcWorkdir
   <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
+  <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig

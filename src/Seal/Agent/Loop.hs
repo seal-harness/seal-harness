@@ -97,7 +97,9 @@ runTurn env userText = do
     go :: Int -> [Message] -> App ()
     go 0 _ = liftIO $ do
       logMaxTurns (aeLogPath env)
-      ccSend (aeCaps env) "(stopped: too many tool turns)"
+      ccSend (aeCaps env)
+        ("(stopped: reached the " <> T.pack (show (aeMaxTurns env))
+         <> "-turn limit for this message. Ask again to continue, or raise `max_turns` in config.toml.)")
     go n msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime

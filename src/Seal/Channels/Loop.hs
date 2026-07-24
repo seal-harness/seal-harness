@@ -79,8 +79,8 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Config.File
-  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir, sessionLogPath)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
@@ -532,7 +532,8 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand
-                       (Just (sessionLogPath paths sid)))
+                       (Just (sessionLogPath paths sid))
+                       (either (const defaultMaxTurns) maxTurnsConfig eCfg))
                       { aeMessageSource = mSrc }
           runApp appEnv (runTurn env t)
             `catch` \e -> do

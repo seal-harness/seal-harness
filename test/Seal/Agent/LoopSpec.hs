@@ -12,6 +12,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Maybe (mapMaybe, fromJust)
 import Data.Text (Text)
+import Data.Text qualified as T
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -560,3 +561,7 @@ spec = describe "Seal.Agent.Loop" $ do
       content <- readFile (fromJust logPath)
       content `shouldContain` "[WARN]"
       content `shouldContain` "too many tool turns"
+      -- The user-visible message (via ccSend) includes the limit + guidance.
+      sentMsgs <- readIORef sent
+      sentMsgs `shouldSatisfy` any ("2-turn limit" `T.isInfixOf`)
+      sentMsgs `shouldSatisfy` any ("max_turns" `T.isInfixOf`)

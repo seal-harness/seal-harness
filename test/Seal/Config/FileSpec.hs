@@ -17,7 +17,7 @@ import Seal.Config.File
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
   , updateRuntimeConfig, upsertProvider
-  , defaultAutoloadSkill, resolvedAutoloadSkill )
+  , defaultAutoloadSkill, resolvedAutoloadSkill, maxTurnsConfig )
 
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
@@ -39,6 +39,7 @@ spec = describe "Seal.Config.File" $ do
         , rcWeb             = Nothing
         , rcWorkdir          = Nothing
         , rcSkills           = Nothing
+        , rcMaxTurns         = Nothing
         }
 
   describe "loadRuntimeConfig" $ do
@@ -90,6 +91,7 @@ spec = describe "Seal.Config.File" $ do
               , rcWeb             = Nothing
               , rcWorkdir         = Nothing
               , rcSkills          = Nothing
+              , rcMaxTurns        = Nothing
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
@@ -130,6 +132,27 @@ spec = describe "Seal.Config.File" $ do
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path
         result `shouldBe` Right cfg
+
+    it "round-trips max_turns" $
+      withSystemTempDirectory "seal-config-test" $ \dir -> do
+        let path = dir </> "config.toml"
+        let cfg = defaultRuntimeConfig { rcMaxTurns = Just 120 }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
+        result `shouldBe` Right cfg
+
+  describe "maxTurnsConfig" $ do
+    it "defaults to 90 when max_turns is absent" $
+      maxTurnsConfig defaultRuntimeConfig `shouldBe` 90
+
+    it "returns the configured value when set" $
+      maxTurnsConfig (defaultRuntimeConfig { rcMaxTurns = Just 30 }) `shouldBe` 30
+
+    it "clamps values below 1 to 1" $
+      maxTurnsConfig (defaultRuntimeConfig { rcMaxTurns = Just 0 }) `shouldBe` 1
+
+    it "clamps negative values to 1" $
+      maxTurnsConfig (defaultRuntimeConfig { rcMaxTurns = Just (-5) }) `shouldBe` 1
 
     describe "resolvedAutoloadSkill" $ do
       it "defaults to seal-usage when [skills] is absent" $
