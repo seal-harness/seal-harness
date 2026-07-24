@@ -10,6 +10,8 @@ module Seal.Session.Store
   , newSessionMeta
   , saveSessionMeta
   , listSessions
+  , listArchivedSessions
+  , updateSessionArchived
   , defaultSessionSelection
   , resolveDefaultAgent
   , initSession
@@ -19,7 +21,7 @@ module Seal.Session.Store
   , SessionRuntime (..)
   ) where
 
-import Control.Monad (filterM, forM)
+import Control.Monad (filterM, forM, unless, when)
 import Data.Aeson (decode, encode)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef)
@@ -32,7 +34,8 @@ import Data.Text qualified as T
 import Data.Time
   ( UTCTime (..), defaultTimeLocale, diffTimeToPicoseconds, formatTime, getCurrentTime )
 import System.Directory
-  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, renameFile )
+  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+  , listDirectory, removeFile, renameFile )
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 
@@ -40,7 +43,7 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
 import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
 import Seal.Config.Paths
-  ( SealPaths, sessionDir, sessionMetaPath, sessionsRoot )
+  ( SealPaths, sessionArchivedMarkerPath, sessionDir, sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
@@ -98,8 +101,11 @@ saveSessionMeta paths meta = do
   setFileMode tmp 0o600
   renameFile tmp path
 
--- | All sessions, newest 'smLastActive' first. Corrupt/undecodable session.json
--- files are silently skipped (a partial write never breaks the list).
+-- | All non-archived sessions, newest 'smLastActive' first. Corrupt/undecodable
+-- session.json files are silently skipped (a partial write never breaks the
+-- list). A session is archived when an @archived@ marker file exists in its
+-- session directory (see 'sessionArchivedMarkerPath'); archived sessions are
+-- returned by 'listArchivedSessions' instead.
 listSessions :: SealPaths -> IO [SessionMeta]
 listSessions paths = do
   let root = sessionsRoot paths
@@ -111,9 +117,53 @@ listSessions paths = do
       dirs    <- filterM (doesDirectoryExist . (root </>)) entries
       metas   <- forM dirs $ \e -> do
         let mp = root </> e </> "session.json"
+            marker = root </> e </> "archived"
         ok <- doesFileExist mp
-        if not ok then pure Nothing else decode <$> BL.readFile mp
+        archived <- doesFileExist marker
+        if not ok || archived then pure Nothing else decode <$> BL.readFile mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
+
+-- | All archived sessions (those with an @archived@ marker file), newest
+-- 'smLastActive' first. Corrupt/undecodable session.json files are silently
+-- skipped. The marker file's presence is the source of truth; a missing
+-- session.json with a marker is also skipped (defensive against a stale
+-- marker left by an out-of-band delete).
+listArchivedSessions :: SealPaths -> IO [SessionMeta]
+listArchivedSessions paths = do
+  let root = sessionsRoot paths
+  exists <- doesDirectoryExist root
+  if not exists
+    then pure []
+    else do
+      entries <- listDirectory root
+      dirs    <- filterM (doesDirectoryExist . (root </>)) entries
+      metas   <- forM dirs $ \e -> do
+        let mp = root </> e </> "session.json"
+            marker = root </> e </> "archived"
+        ok <- doesFileExist mp
+        archived <- doesFileExist marker
+        if not ok || not archived then pure Nothing else decode <$> BL.readFile mp
+      pure (sortOn (Down . smLastActive) (catMaybes metas))
+
+-- | Set or clear the archived flag on a session by creating/removing the
+-- @archived@ marker file. Returns 'False' when the session's @session.json@
+-- can't be found (the caller surfaces a 404); 'True' on success. The
+-- transcript and session.json are never touched — archiving is a pure UI
+-- hint. Idempotent: archiving an already-archived session (or unarchiving a
+-- non-archived one) is a no-op success.
+updateSessionArchived :: SealPaths -> SessionId -> Bool -> IO Bool
+updateSessionArchived paths sid archived = do
+  let mp = sessionMetaPath paths sid
+      marker = sessionArchivedMarkerPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      markerExists <- doesFileExist marker
+      if archived
+        then unless markerExists (writeFile marker "")
+        else when markerExists (removeFile marker)
+      pure True
 
 -- | The provider label + model a new session should start with: the configured
 -- defaults, falling back to the configured provider's own default model (or
