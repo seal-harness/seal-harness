@@ -52,7 +52,7 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
                           defaultRetrievalMaxScanBytes, onDemandSchemas,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, securityFilePath)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -112,6 +112,7 @@ import Seal.Handles.AskReply
   , newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Log (logTurnError)
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, formatSessionId
   , newSession, resolveDefaultAgent, saveSessionMeta )
@@ -190,6 +191,7 @@ handlePlain agentEnv env t =
             Just (TranscriptError te) ->
               "transcript error: " <> te
             Nothing -> T.pack (show e)
+      logTurnError (aeLogPath agentEnv) msg
       ccSend (aeCaps agentEnv) ("turn failed: " <> msg)
 
 -- | Resolve the active session's provider from the vault, or explain why not.
@@ -222,8 +224,9 @@ resolveDefProvider pr providerLabel model =
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
-  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand = AgentEnv
+  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
+  -> Maybe FilePath -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -241,6 +244,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeDebugRequestsPath = debugReqPath
   , aeOnEntry    = onEntry
   , aeOnDemandSchemas = onDemand
+  , aeLogPath    = logPath
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -571,6 +575,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               bgUio <- mkSessionUio bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
+                    (Just (sessionLogPath paths bgSid))
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
       -- The /call dispatcher: dispatch an opcode against the active
@@ -606,7 +611,8 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           uio <- mkSessionUio sid
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
-               (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand)
+               (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
+               (Just (sessionLogPath paths sid)))
             appEnv t
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where

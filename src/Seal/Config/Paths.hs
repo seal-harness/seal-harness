@@ -13,6 +13,7 @@ module Seal.Config.Paths
   , sessionConversationPath
   , sessionEntriesPath
   , sessionRequestsPath
+  , sessionLogPath
   , agentSessionDir
   , workdirsRoot
   , sessionWorkdir
@@ -132,6 +133,15 @@ sessionEntriesPath paths sid = sessionDir paths sid </> "entries.jsonl"
 -- @debug_session_transcript@ config flag is set.
 sessionRequestsPath :: SealPaths -> SessionId -> FilePath
 sessionRequestsPath paths sid = sessionDir paths sid </> "requests.jsonl"
+
+-- | The session's diagnostic log: @\<sessionDir\>\/seal.log@. Records turn
+-- lifecycle events (start/end/duration) and failures (exceptions, provider
+-- errors) that are NOT already captured in @entries.jsonl@ or
+-- @conversation.jsonl@. Best-effort: a write error is swallowed (the log
+-- must never break the agent loop). Append-only, one line per event, with
+-- an ISO-8601 timestamp prefix.
+sessionLogPath :: SealPaths -> SessionId -> FilePath
+sessionLogPath paths sid = sessionDir paths sid </> "seal.log"
 
 -- | Directory for a sub-agent's transcript, nested under its parent session:
 -- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent

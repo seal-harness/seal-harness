@@ -51,7 +51,7 @@ import Seal.Config.File
   , WebConfig (..), rcWeb
   , onDemandSchemas, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath)
+import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -61,6 +61,7 @@ import Seal.Handles.AskReply
   , approvalScopeText )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
+import Seal.Session.Log (logTurnError)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -222,6 +223,7 @@ handleSend deps sid rawText = do
       Right (Plain t) -> do
         er <- plainTurn deps meta t `catch` \e -> do
           let msg = T.pack (show (e :: SomeException))
+          logTurnError (Just (sessionLogPath (sdPaths deps) (smId meta))) msg
           hPutStrLn stderr ("[send] plainTurn threw: " <> T.unpack msg)
           pure (Left ("internal error: " <> msg))
         case er of
@@ -316,6 +318,7 @@ plainTurn deps meta t = do
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
+                  (Just (sessionLogPath paths sid))
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- (Right <$> runApp appEnv (runTurn env t))
               `catch` \e -> do
@@ -323,6 +326,8 @@ plainTurn deps meta t = do
                       Just (TranscriptError te) ->
                         "transcript error: " <> te
                       Nothing -> T.pack (show e)
+                let logPath = Just (sessionLogPath paths sid)
+                logTurnError logPath msg
                 hPutStrLn stderr ("[send] turn failed: " <> T.unpack msg)
                 pure (Left msg)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
@@ -536,6 +541,7 @@ plainTurnWithCaps deps meta caps t = do
               (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
               onDemand
+              (Just (sessionLogPath paths sid))
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- (Right <$> runApp appEnv (runTurn env t))
           `catch` \e -> do
@@ -543,6 +549,7 @@ plainTurnWithCaps deps meta caps t = do
                   Just (TranscriptError te) ->
                     "transcript error: " <> te
                   Nothing -> T.pack (show e)
+            logTurnError (Just (sessionLogPath paths sid)) msg
             hPutStrLn stderr ("[send] turn (withCaps) failed: " <> T.unpack msg)
             pure (Left msg)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)

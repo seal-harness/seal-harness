@@ -16,7 +16,7 @@ import Data.ByteString.Lazy.Char8 qualified as BLC
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (getCurrentTime)
+import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import qualified System.IO as IO
 
 import Seal.Agent.Env (AgentEnv (..))
@@ -33,6 +33,8 @@ import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
+import Seal.Session.Log
+  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
@@ -93,8 +95,12 @@ runTurn env userText = do
   go (aeMaxTurns env) turn0
   where
     go :: Int -> [Message] -> App ()
-    go 0 _ = liftIO (ccSend (aeCaps env) "(stopped: too many tool turns)")
+    go 0 _ = liftIO $ do
+      logMaxTurns (aeLogPath env)
+      ccSend (aeCaps env) "(stopped: too many tool turns)"
     go n msgs = do
+      liftIO (logTurnStart (aeLogPath env) n)
+      tStart <- liftIO getCurrentTime
       let req = CompletionRequest
                   { crModel = aeModel env
                   , crSystem = aeSystem env
@@ -106,8 +112,9 @@ runTurn env userText = do
       liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
       eresp <- liftIO (providerComplete (aeProvider env) req)
       case eresp of
-        Left err ->
-          liftIO (ccSend (aeCaps env) ("provider error: " <> err))
+        Left err -> liftIO $ do
+          logProviderError (aeLogPath env) err
+          ccSend (aeCaps env) ("provider error: " <> err)
         Right resp -> do
           -- Record the provider response. Safe because CompletionResponse only
           -- contains CbText and CbToolUse blocks (model output + tool-call
@@ -136,11 +143,13 @@ runTurn env userText = do
             aeOnEntry env
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
-            then liftIO $
-                   let ModelId m = aeModel env
-                       prefix    = aeProviderLabel env <> "/" <> m <> "> "
-                   in ccSend (aeCaps env)
-                        (prefix <> T.intercalate "\n" [t | CbText t <- rsContent resp])
+            then liftIO $ do
+              tEnd <- getCurrentTime
+              logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd)
+              let ModelId m = aeModel env
+                  prefix    = aeProviderLabel env <> "/" <> m <> "> "
+              ccSend (aeCaps env)
+                   (prefix <> T.intercalate "\n" [t | CbText t <- rsContent resp])
             else do
               results <- mapM dispatchOne toolUses
               let assistantMsg = Message Assistant (rsContent resp)
@@ -167,6 +176,8 @@ runTurn env userText = do
                       }
                 tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv2 entry2)
                 aeOnEntry env
+              tEnd <- liftIO getCurrentTime
+              liftIO (logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd))
               go (n - 1) (msgs <> [assistantMsg, resultMsg])
 
     dispatchOne :: ContentBlock -> App ContentBlock
@@ -286,3 +297,8 @@ appendDebugRequest (Just path) req =
   let line = BL.toStrict (A.encode req) <> "\n"
   in IO.withFile path IO.AppendMode (`BS.hPutStr` line)
      `catch` \(_ :: SomeException) -> pure ()
+
+-- | Compute the millisecond difference between two 'UTCTime' timestamps
+-- (for turn-duration logging).
+msDiff :: UTCTime -> UTCTime -> Integer
+msDiff start end = round (realToFrac (diffUTCTime end start) * 1000 :: Double)

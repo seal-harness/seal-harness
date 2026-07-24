@@ -171,6 +171,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeDebugRequestsPath = Nothing
               , aeOnEntry    = dwdOnEntry deps
               , aeOnDemandSchemas = dwdOnDemand deps
+              , aeLogPath    = Nothing
               }
         runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
           `catch` \e -> writeIORef summaryRef

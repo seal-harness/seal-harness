@@ -84,4 +84,11 @@ data AgentEnv = AgentEnv
     -- @OPCODE_LIST@ opcodes so the model can fetch full schemas on demand.
     -- 'False' (the default) sends full schemas inline, matching the
     -- pre-flag behavior.
+  , aeLogPath :: Maybe FilePath
+    -- ^ When 'Just', turn lifecycle events (start/end/duration) and failures
+    -- (exceptions, provider errors) are appended to this per-session log file
+    -- (@\<sessionDir\>\/seal.log@). Best-effort: a write error is swallowed.
+    -- Records ONLY events not already in @entries.jsonl@ / @conversation.jsonl@.
+    -- 'Nothing' disables per-session logging (the default for tests / fake
+    -- transcripts).
   }

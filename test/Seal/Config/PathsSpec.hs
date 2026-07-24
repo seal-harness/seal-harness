@@ -15,6 +15,7 @@ import Seal.Config.Paths
   , configFilePath, vaultFilePath
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionEntriesPath, sessionRequestsPath
+  , sessionLogPath
   , agentSessionDir
   , workdirsRoot, sessionWorkdir
   )
@@ -111,6 +112,7 @@ spec = describe "Seal.Config.Paths" $ do
       sessionConversationPath paths sid `shouldBe` "/h/state/sessions/20260701-120000-042/conversation.jsonl"
       sessionEntriesPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/entries.jsonl"
       sessionRequestsPath paths sid    `shouldBe` "/h/state/sessions/20260701-120000-042/requests.jsonl"
+      sessionLogPath paths sid         `shouldBe` "/h/state/sessions/20260701-120000-042/seal.log"
 
   describe "agentSessionDir" $ do
     it "nests a sub-agent transcript dir under the parent session dir" $ do

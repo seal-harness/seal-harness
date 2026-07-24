@@ -16,6 +16,7 @@ import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
+import qualified Seal.Session.LogSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
@@ -147,6 +148,7 @@ main = hspec $ do
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
+  Seal.Session.LogSpec.spec
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec

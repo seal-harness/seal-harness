@@ -143,6 +143,7 @@ spec = do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
                   }
             in runApp appEnv (runTurn agentEnv body)
           plainHandler h mSrc body = case mSrc of

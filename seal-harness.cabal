@@ -112,6 +112,7 @@ library
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
+        Seal.Session.Log
         Seal.Signal.Config
         Seal.Telegram.Config
         Seal.Security.Command
@@ -359,6 +360,7 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
+        Seal.Session.LogSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
