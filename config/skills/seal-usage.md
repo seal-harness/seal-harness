@@ -24,7 +24,9 @@ haven't.
 **Your current working directory IS your workspace. Stay in it.**
 
 - `SHELL_EXEC` and `BIN_EXEC` already default their cwd to your workdir when
-  you omit the `cwd` argument. You do not need to `cd` anywhere.
+  you omit the `cwd` argument. You do not need to `cd` anywhere. `BIN_EXEC`
+  takes no `cwd`; it always runs in your workdir. `SHELL_EXEC` accepts an
+  optional workspace-relative `cwd`.
 - `FILE_READ`, `FILE_WRITE`, `FILE_PATCH`, and `SEARCH_FILES` are all
   confined to your workdir. Relative paths resolve there.
 - `pwd` (with no `cwd` arg) returns your workdir. Run it once to see where
@@ -34,15 +36,22 @@ haven't.
 
 ### Cloning a repo
 
-**Correct** — the clone lands inside your workdir:
+**Correct** — the clone lands inside your workdir. `git` is a single
+binary, so `BIN_EXEC` is the right opcode (no shell needed):
 
 ```
-SHELL_EXEC { "command": "git clone https://github.com/seal-harness/seal-harness.git" }
+BIN_EXEC { "binary": "git", "args": ["clone", "https://github.com/seal-harness/seal-harness.git"] }
 ```
 
-Then `ls` to see it, `cd seal-harness` *inside the clone* if you need to run
-something there. The clone is a subdirectory of your workspace — that's
-where it belongs.
+Then list the workdir to see it, and run `git` subcommands in the clone
+via `BIN_EXEC` with the clone as an argument:
+
+```
+BIN_EXEC { "binary": "ls" }
+BIN_EXEC { "binary": "git", "args": ["-C", "seal-harness", "log", "--oneline", "-5"] }
+```
+
+The clone is a subdirectory of your workspace — that's where it belongs.
 
 **Wrong** — this escapes your workspace and the clone is invisible to every
 file opcode:
@@ -59,24 +68,36 @@ will then fail — your file opcodes look in your workdir, not in `~`.
 
 ```
 SHELL_EXEC { "command": "cd /tmp && git clone …" }
-SHELL_EXEC { "command": "git clone … /Users/zoe/some-place" }
+SHELL_EXEC { "command": "git clone … /Users/alice/some-place" }
 ```
 
 ### Running commands
 
-Prefer `BIN_EXEC` unless `SHELL_EXEC` is absolutely necessary. If you do use
-`SHELL_EXEC` and need to work in a subdirectory of your workspace, `cd`
-into the *relative* subpath inside the clone — never to an absolute or
-home path:
+Prefer `BIN_EXEC` unless `SHELL_EXEC` is absolutely necessary. `BIN_EXEC`
+runs a named binary with argv tokens and no shell interpreter — narrower,
+safer, and immune to shell-injection. Use it for anything that's a single
+binary plus arguments: `git`, `ls`, `pwd`, `cabal`, `make`, `rg`, etc.
 
 ```
-# After cloning seal-harness into your workdir:
-SHELL_EXEC { "command": "cd seal-harness && cabal build all" }
+BIN_EXEC { "binary": "pwd" }
+BIN_EXEC { "binary": "ls", "args": ["seal-harness"] }
+BIN_EXEC { "binary": "cabal", "args": ["build", "all"] }
 ```
 
-That's fine: `seal-harness` is relative, inside your workdir. The cwd resets
-to your workdir on the next `SHELL_EXEC`, so `cd` inside one call does not
-leak across calls.
+Use `SHELL_EXEC` only when you genuinely need shell features: pipes,
+redirects, `&&` chaining, globbing, or environment expansion. `SHELL_EXEC`
+takes an optional `cwd` (workspace-relative, SafePath-confined) — use it to
+run a command inside a subdirectory of your workspace instead of chaining
+`cd ... && ...`:
+
+```
+# After cloning seal-harness into your workdir — build inside the clone:
+SHELL_EXEC { "command": "cabal build all", "cwd": "seal-harness" }
+```
+
+That's fine: `seal-harness` is relative, inside your workdir. The cwd
+resets to your workdir on the next call, so a `cwd` does not leak across
+calls. Never use an absolute or home path as `cwd`.
 
 ### Why this matters
 
@@ -96,6 +117,7 @@ leak across calls.
 - [ ] Am I using a relative path (or no path — cwd defaults to the workdir)?
 - [ ] Did I avoid `cd ~`, `cd $HOME`, `cd /abs/...`?
 - [ ] Did I avoid chaining `cd <absolute> && …`?
+- [ ] Can this be a `BIN_EXEC` instead of `SHELL_EXEC`? (single binary + args → yes)
 - [ ] If I need to clone, am I cloning with **no destination path** (so it
       lands in my workdir as a subdirectory)?
 
@@ -108,7 +130,7 @@ re-run the work inside your workdir.
 You don't need to know the path ahead of time. Just run:
 
 ```
-SHELL_EXEC { "command": "pwd" }
+BIN_EXEC { "binary": "pwd" }
 ```
 
 The returned path is your workdir for this session. Use it only for
