@@ -37,6 +37,8 @@ module Seal.Tools.Exec.UntrustedIO
   , mkRemoteUntrustedIOStub
   , applyUnifiedDiff
   , lineWindowFromText
+  , buildRgCmd
+  , shellQuote
   ) where
 
 import Control.Exception (IOException, try)
@@ -259,10 +261,13 @@ mkLocalUntrustedIO wsRoot = UntrustedIO
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
 -- optional workspace-relative path (anchored to the workspace root, not
 -- the remote user's home CWD). Defaults to the workspace root itself.
+-- Both the pattern and the path are 'shellQuote'-d so a pattern
+-- containing spaces (e.g. @Recent Sessions@) or a single quote is passed
+-- to @rg@ as a single argv token, not word-split by the shell.
 buildRgCmd :: SearchPattern -> Maybe SafePath -> Text
 buildRgCmd pat mSafePath =
-  "rg -n -- " <> textSearchPattern pat <> " "
-  <> T.pack (shellQuote (maybe "." getSafePath mSafePath))
+  T.pack ("rg -n -- " <> shellQuote (T.unpack (textSearchPattern pat))
+          <> " " <> shellQuote (maybe "." getSafePath mSafePath))
 
 -- | Read at most @maxBytes@ from a local file. Returns the bytes read and
 -- a 'Bool' indicating whether the file was truncated (the file is larger
@@ -465,9 +470,18 @@ wsRootFromCfg cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))
 
 -- | Single-quote a 'String' for the remote shell (the path is already
 -- SafePath-validated, but quoting is defense-in-depth against any
--- metacharacters the validator permits, e.g. spaces).
+-- metacharacters the validator permits, e.g. spaces). Embedded single
+-- quotes are escaped with the standard @'\''@ idiom so a value containing
+-- a quote cannot break out of its single-quoted argv token — e.g.
+-- @foo'bar@ becomes @'foo'\''bar'@, which the shell parses back to the
+-- literal @foo'bar@ as a single token. Applied uniformly to all remote
+-- paths and search patterns.
 shellQuote :: String -> String
-shellQuote s = "'" <> s <> "'"
+shellQuote s = "'" <> go s <> "'"
+  where
+    go []         = []
+    go ('\'':rest) = "'\\''" <> go rest
+    go (c:rest)    = c : go rest
 
 -- | Smart-construct a 'ShellCommand', lifting a parse failure into an
 -- 'UntrustedErr' (defensive — the inputs are already validated, so this
