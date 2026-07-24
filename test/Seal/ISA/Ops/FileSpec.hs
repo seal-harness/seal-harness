@@ -109,6 +109,85 @@ spec = describe "Seal.ISA.Ops.File" $ do
         , "max_scan_bytes" .= (maxScanBytes :: Int)
         ]
 
+  -- Regression: models in the wild emit `offset` as a JSON string (e.g.
+  -- "72") even though the schema declares integer. The field parsers must
+  -- coerce a numeric string instead of silently falling back to 0 (which
+  -- returns the first window again, trapping the model in a loop). See
+  -- session 20260724-133418-292.
+  it "offset as a numeric string is coerced (not dropped to 0)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      let ls = ["l" <> showN i | i <- [1..30 :: Int]]
+          body = unlinesStr ls
+      BS.writeFile (root </> "p.txt") body
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("p.txt" :: String)
+              , "offset" .= ("5" :: String)
+              , "limit" .= (3 :: Int)
+              ]))
+      orIsError r `shouldBe` False
+      orRecorded r `shouldBe` object
+        [ "path" .= ("p.txt" :: String)
+        , "offset" .= (5 :: Int)
+        , "limit" .= (Just 3 :: Maybe Int)
+        , "max_scan_bytes" .= (maxScanBytes :: Int)
+        ]
+      -- The window should start at offset 5 (line "l6") and have 3 lines.
+      orParts r `shouldBe` [TrpText
+        "l6\nl7\nl8\n\n[lines 6-8 of 30; 22 more - read with offset=8 for the next window]"]
+
+  it "limit as a numeric string is coerced (not dropped to default)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      let ls = ["l" <> showN i | i <- [1..30 :: Int]]
+          body = unlinesStr ls
+      BS.writeFile (root </> "p.txt") body
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("p.txt" :: String)
+              , "limit" .= ("3" :: String)
+              ]))
+      orIsError r `shouldBe` False
+      orRecorded r `shouldBe` object
+        [ "path" .= ("p.txt" :: String)
+        , "offset" .= (0 :: Int)
+        , "limit" .= (Just 3 :: Maybe Int)
+        , "max_scan_bytes" .= (maxScanBytes :: Int)
+        ]
+      orParts r `shouldBe` [TrpText
+        "l1\nl2\nl3\n\n[lines 1-3 of 30; 27 more - read with offset=3 for the next window]"]
+
+  it "max_scan_bytes as a numeric string is coerced (not dropped to default)" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello"
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("a.txt" :: String)
+              , "max_scan_bytes" .= ("16" :: String)
+              ]))
+      orIsError r `shouldBe` False
+      orRecorded r `shouldBe` object
+        [ "path" .= ("a.txt" :: String)
+        , "offset" .= (0 :: Int)
+        , "limit" .= (Nothing :: Maybe Int)
+        , "max_scan_bytes" .= (16 :: Int)
+        ]
+
+  it "offset as a non-numeric string still falls back to 0" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      BS.writeFile (root </> "a.txt") "hello"
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("a.txt" :: String)
+              , "offset" .= ("banana" :: String)
+              ]))
+      orIsError r `shouldBe` False
+      orRecorded r `shouldBe` object
+        [ "path" .= ("a.txt" :: String)
+        , "offset" .= (0 :: Int)
+        , "limit" .= (Nothing :: Maybe Int)
+        , "max_scan_bytes" .= (maxScanBytes :: Int)
+        ]
+
   it "max_scan_bytes request below operator ceiling narrows the scan (clamp down)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       -- 10 lines of "x\n" = 20 bytes. Operator ceiling = maxScanBytes (large);

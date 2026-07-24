@@ -22,6 +22,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR (decimal)
 
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types
@@ -76,33 +77,50 @@ fileReadSchema =
 pathField :: Value -> Maybe Text
 pathField = parseMaybe (withObject "in" (.: "path"))
 
+-- | Leniently parse an optional integer field that the model may emit as a
+-- JSON number OR as a numeric string (e.g. @"72"@). Returns 'Nothing' when
+-- the field is missing, malformed, non-numeric, or negative — the caller
+-- then applies its own default. The pager's clamp is the second line of
+-- defense. A strictly-typed @.:?@ parse would silently drop a numeric
+-- string to the default, trapping the model in a re-read loop (see session
+-- 20260724-133418-292: @offset="72"@ returned the first window again).
+intField :: Text -> Value -> Maybe Int
+intField key v =
+  case parseMaybe (withObject "in" (.:? fromText key)) v :: Maybe (Maybe Int) of
+    Just (Just n) | n >= 0 -> Just n
+    Just{}                 -> Nothing      -- negative number, or absent
+    Nothing                ->               -- present but not a JSON number; try numeric string
+      parseMaybe (withObject "in" (.: fromText key)) v >>= textToInt
+
+-- | Parse a 'Text' as a non-negative decimal integer. Rejects negatives,
+-- leading '+', whitespace, and trailing garbage (the model's value must be
+-- a clean integer).
+textToInt :: Text -> Maybe Int
+textToInt t =
+  case TR.decimal t of
+    Right (n, rest) | T.null rest && n >= 0 -> Just n
+    _                                      -> Nothing
+
 -- | Leniently parse the optional @offset@ integer field. Missing, malformed,
 -- or negative values fall back to the default (0); the pager's clamp is the
 -- second line of defense.
 offsetField :: Value -> Int
-offsetField v =
-  case parseMaybe (withObject "in" (.:? "offset")) v :: Maybe (Maybe Int) of
-    Just (Just n) | n >= 0 -> n
-    _                      -> 0
+offsetField v = fromMaybe 0 (intField "offset" v)
 
 -- | Leniently parse the optional @limit@ integer field. Missing, malformed, or
 -- negative values fall back to the pager-computed default; the pager's clamp is
 -- the second line of defense.
 limitField :: Value -> Maybe Int
-limitField v =
-  case parseMaybe (withObject "in" (.:? "limit")) v :: Maybe (Maybe Int) of
-    Just (Just n) | n >= 0 -> Just n
-    _                      -> Nothing
+limitField = intField "limit"
 
 -- | Leniently parse the optional @max_scan_bytes@ integer field. Missing,
--- malformed, or negative values fall back to the operator-configured ceiling;
--- the clamp in 'opRun' is the second line of defense. Returns 'Nothing' when
--- the model did not supply a usable value.
+-- malformed, or non-positive values fall back to the operator-configured
+-- ceiling; the clamp in 'opRun' is the second line of defense. Returns
+-- 'Nothing' when the model did not supply a usable value.
 scanBytesField :: Value -> Maybe Int
-scanBytesField v =
-  case parseMaybe (withObject "in" (.:? "max_scan_bytes")) v :: Maybe (Maybe Int) of
-    Just (Just n) | n >= 1 -> Just n
-    _                      -> Nothing
+scanBytesField v = case intField "max_scan_bytes" v of
+  Just n | n >= 1 -> Just n
+  _               -> Nothing
 
 -- | FILE_READ opcode: reads a UTF-8 text file at a workspace-relative path,
 -- confined by 'mkSafePath', returning a bounded window of lines. Trust level
