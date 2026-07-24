@@ -5,6 +5,7 @@ module Seal.Security.Path
   , PathError (..)
   , mkSafePath
   , mkSafePathForWrite
+  , mkSafePathRemote
   , KeysRoot (..)
   , ensureKeysRoot
   , SafeKeyPath
@@ -147,6 +148,37 @@ mkSafePathForWrite (WorkspaceRoot root) requested = do
           if not parentExists
             then pure $ Left $ PathDoesNotExist canonParent
             else pure $ Right $ SafePath lexicalPath
+
+-- ---------------------------------------------------------------------------
+-- Remote path confinement (lexical-only — no local FS canonicalization)
+-- ---------------------------------------------------------------------------
+
+-- | Lexically validate a workspace-relative path for the REMOTE untrusted
+-- executor. This is the remote-safe counterpart of 'mkSafePath'/'mkSafePathForWrite':
+-- it performs ONLY the lexical confinement steps (blocked-name check +
+-- '..'/@.@ collapse + component-wise containment under the root) and skips
+-- the local-FS 'canonicalizePath' (the file lives on the remote machine;
+-- the harness cannot canonicalize it locally). The validated 'SafePath' is
+-- the lexically-resolved path anchored under the (remote) workspace root.
+--
+-- Use this for all remote-arm 'UntrustedIO' file methods. The returned
+-- 'SafePath' is what gets passed to the SSH call as a single argv element
+-- after @--@, so no shell on the remote ever interprets it as a flag.
+--
+-- Pure: no IO, no symlink resolution. Symlink confinement on the remote is
+-- the remote OS's responsibility (the workspace root is the agent's
+-- confined directory; the SSH user has no access outside it by policy).
+mkSafePathRemote :: WorkspaceRoot -> FilePath -> Either PathError SafePath
+mkSafePathRemote (WorkspaceRoot root) requested =
+  if any (`elem` blockedNames) (splitDirectories requested)
+    then Left $ PathIsBlocked $ T.pack $ "path touches a blocked location: " <> requested
+    else
+      let joined      = if isAbsolute requested then requested else root </> requested
+          rootDirs    = splitDirectories root
+          lexicalDirs = lexicalCollapse (splitDirectories joined)
+      in if not (rootDirs `isPrefixOf` lexicalDirs)
+           then Left $ PathEscapesWorkspace (joinPath lexicalDirs)
+           else Right $ SafePath (joinPath lexicalDirs)
 
 -- ---------------------------------------------------------------------------
 -- Key-material confinement

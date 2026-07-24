@@ -27,7 +27,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 
-import Seal.Config.File (FileConfig, providerBaseUrl)
+import Seal.Config.File (RuntimeConfig, providerBaseUrl)
 import Seal.Core.Types (ModelId (..), ProviderId (..))
 import Seal.Providers.Anthropic
   ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
@@ -171,7 +171,7 @@ vaultErrText = \case
 -- A missing vault ('Nothing') means no provider has credentials, so only a
 -- keyless local Ollama would survive the filter (and only when its base URL
 -- is the default local URL).
-configuredProviders :: Maybe VaultHandle -> FileConfig -> IO [KnownProvider]
+configuredProviders :: Maybe VaultHandle -> RuntimeConfig -> IO [KnownProvider]
 configuredProviders mvh cfg = filterM isConfigured knownProviders
   where
     isConfigured kp = case kp of

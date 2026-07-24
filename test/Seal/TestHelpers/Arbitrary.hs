@@ -8,15 +8,15 @@
 -- errors when multiple spec modules are compiled into the same test binary.
 module Seal.TestHelpers.Arbitrary () where
 
-import Data.Either (fromRight)
 import Data.Aeson (Value (..))
+import Data.Either (fromRight)
 import Data.Set qualified as Set
 import Data.Text (Text, pack)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.QuickCheck
 
 import Seal.Core.Paging (PageParams (..))
-import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), SessionId (..), ToolCallId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), SessionId, mkSessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Providers.Class
   ( CompletionResponse (..), ContentBlock (..), Message (..)
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
@@ -42,6 +42,15 @@ instance Arbitrary ModelId where
 -- | 'Data.Text.Text' wrapper around an arbitrary 'String'. Generates a small
 -- alphabet of printable characters; no newlines (so a generated value is a
 -- single line).
+-- | A safe 'SessionId' generator producing valid ids ([A-Za-z0-9_-]+,
+-- non-empty, no leading dot). Uses 'mkSessionId' (not the raw
+-- constructor, which is locked down).
+genSessionId :: Gen SessionId
+genSessionId = do
+  c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+  cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+  pure (fromRight (mkSystemSessionId "x") (mkSessionId (pack (c : cs))))
+
 instance Arbitrary Text where
   arbitrary = pack <$> listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> " .,!?"++"-_"))
 
@@ -123,7 +132,7 @@ instance Arbitrary MemoryEntry where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
-    <*> (SessionId <$> arbitrary)
+    <*> genSessionId
 
 -- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
 instance Arbitrary SkillId where
@@ -139,7 +148,7 @@ instance Arbitrary Skill where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
-    <*> (SessionId <$> arbitrary)
+    <*> genSessionId
 
 -- | An 'AgentDefId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
 instance Arbitrary AgentDefId where
@@ -166,4 +175,4 @@ instance Arbitrary AgentDef where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
-    <*> (SessionId <$> arbitrary)
+    <*> genSessionId

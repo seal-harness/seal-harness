@@ -18,7 +18,7 @@ import Seal.Channel.Cli (newBackends)
 import Seal.Channels.Loop (channelCallDispatcher, newChannelDeps)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Core.Types (OpName (..), mkSessionId)
-import Seal.Config.File (defaultFileConfig)
+import Seal.Config.File (defaultRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -67,6 +67,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     let paths = SealPaths
           { spHome = cfgRoot, spState = cfgRoot </> "state"
           , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+          , spCache = cfgRoot </> "cache"
           }
         vaultRt = VaultRuntime
           { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"
@@ -82,7 +83,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultFileConfig)
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig)
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
     sidRef <- newIORef sid

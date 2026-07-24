@@ -19,7 +19,7 @@ stubUntrustedOp :: OpName -> Opcode
 stubUntrustedOp n = UntrustedOpcode
   { uoName = n, uoDesc = "desc", uoInSchema = object [], uoOutSchema = object []
   , uoAuthorize = const (Right ())
-  , uoRun = \_ _ _ -> pure (OpResult [] False Null) }
+  , uoRun = \_ _ -> pure (OpResult [] False Null) }
 
 spec :: Spec
 spec = describe "Seal.ISA.Registry" $ do

@@ -7,7 +7,6 @@ module Seal.Gateway.Server
   , runGateway
   ) where
 
-import Control.Monad (when)
 import Data.ByteString.Char8 qualified as BC
 import Data.Text qualified as T
 import Network.HTTP.Types (status200, status404)
@@ -60,18 +59,32 @@ contentTypeFor ext = case ext of
   _       -> "application/octet-stream"
 
 -- | Run the gateway. Prints a startup banner with the bind address + the
--- served static dir, then emits a non-loopback warning if the host isn't
--- 127.0.0.1/::1/localhost (the full slash-command surface — including local
--- code execution — is reachable by anything that can reach the address).
-runGateway :: GatewayConfig -> ApiDeps -> IO ()
-runGateway cfg deps = do
+-- served static dir. When the host is non-loopback:
+--   - If @failClosedOnNonLoopback@ is True (mode=remote), REFUSES to start
+--     (design V6: a non-loopback gateway is a config-tamper surface — the
+--     unauthenticated @updateRuntimeConfig@ caller is reachable by anything
+--     that can reach the address).
+--   - Otherwise, warns (the full slash-command surface is reachable).
+runGateway :: GatewayConfig -> Bool -> ApiDeps -> IO ()
+runGateway cfg failClosedOnNonLoopback deps = do
   let host = gcHost cfg
       port = gcPort cfg
   hPutStrLn stderr "Seal Harness gateway"
   hPutStrLn stderr ("  URL:      http://" <> T.unpack host <> ":" <> show port)
-  when (host /= "127.0.0.1" && host /= "::1" && host /= "localhost") $
-    hPutStrLn stderr ("Warning: binding to " <> T.unpack host
-                      <> " — the full slash-command surface is reachable by anything that can reach this address")
-  let mStaticDir = fmap T.unpack (gcStaticDir cfg)
-      app = gatewayApp deps mStaticDir
-  run port app
+  if host /= "127.0.0.1" && host /= "::1" && host /= "localhost"
+    then
+      if failClosedOnNonLoopback
+        then do
+          hPutStrLn stderr ("ERROR: refusing to start gateway on non-loopback address " <> T.unpack host
+                            <> " in remote-only mode — bind 127.0.0.1 or disable remote-only")
+          pure ()  -- do NOT call run; exit without serving
+        else do
+          hPutStrLn stderr ("Warning: binding to " <> T.unpack host
+                            <> " — the full slash-command surface is reachable by anything that can reach this address")
+          let mStaticDir = fmap T.unpack (gcStaticDir cfg)
+              app = gatewayApp deps mStaticDir
+          run port app
+    else do
+      let mStaticDir = fmap T.unpack (gcStaticDir cfg)
+          app = gatewayApp deps mStaticDir
+      run port app

@@ -40,7 +40,7 @@ textToSpeechOp _prov = UntrustedOpcode
         Nothing -> Left "TEXT_TO_SPEECH requires {text:string}"
         Just t | T.null t -> Left "TEXT_TO_SPEECH: text is empty"
                | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let t = fromMaybe "" (textField v)
           recorded = object [ "text" .= t ]
       pure (OpResult [TrpText "TEXT_TO_SPEECH: no TTS provider configured"] True recorded)

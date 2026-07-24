@@ -11,7 +11,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (fileMode, getFileStatus)
 import Test.Hspec
 
-import Seal.Config.File (FileConfig (..), defaultFileConfig)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Security.Vault (UnlockMode (..))
 import Seal.Security.Vault.Age (VaultError (..))
@@ -83,33 +83,33 @@ spec = describe "Seal.Vault.Backend" $ do
 
   describe "resolveEncryptor" $ do
     it "returns Left VaultBackendError when recipient is missing" $ do
-      result <- resolveEncryptor defaultFileConfig
+      result <- resolveEncryptor defaultSecurityConfig
       case result of
         Left (VaultBackendError _) -> pure ()
         Left other -> expectationFailure $ "expected VaultBackendError, got: " ++ show other
         Right _ -> expectationFailure "expected Left VaultBackendError but got Right"
 
     it "returns Left VaultBackendError when identity is missing" $ do
-      let fc = defaultFileConfig { fcVaultRecipient = Just "age1abc" }
-      result <- resolveEncryptor fc
+      let sc = defaultSecurityConfig { scVaultRecipient = Just "age1abc" }
+      result <- resolveEncryptor sc
       case result of
         Left (VaultBackendError _) -> pure ()
         Left other -> expectationFailure $ "expected VaultBackendError, got: " ++ show other
         Right _ -> expectationFailure "expected Left VaultBackendError but got Right"
 
     it "returns Left VaultBackendError when recipient is missing but identity is present" $ do
-      let fc = defaultFileConfig { fcVaultIdentity = Just "/path/to/id" }
-      result <- resolveEncryptor fc
+      let sc = defaultSecurityConfig { scVaultIdentity = Just "/path/to/id" }
+      result <- resolveEncryptor sc
       case result of
         Left (VaultBackendError _) -> pure ()
         _ -> expectationFailure "expected Left VaultBackendError"
 
     it "returns Right VaultEncryptor (or Left VaultBackendError if age absent) when both fields are set" $ do
-      let fc = defaultFileConfig
-            { fcVaultRecipient = Just "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqysq0"
-            , fcVaultIdentity  = Just "/nonexistent/test.identity"
+      let sc = defaultSecurityConfig
+            { scVaultRecipient = Just "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqysq0"
+            , scVaultIdentity  = Just "/nonexistent/test.identity"
             }
-      result <- resolveEncryptor fc
+      result <- resolveEncryptor sc
       case result of
         Right _                    -> pure ()  -- age binary present; encryptor built
         Left (VaultBackendError _) -> pure ()  -- age binary absent; acceptable
@@ -127,9 +127,9 @@ spec = describe "Seal.Vault.Backend" $ do
         }
 
     it "ccSend is not called (prompts only)" $ do
-      (fc, caps) <- makeFakeCaps ["age1xyz", "/tmp/k.identity"]
+      (sc, caps) <- makeFakeCaps ["age1xyz", "/tmp/k.identity"]
       _ <- setupUserSupplied caps
-      sent <- getSent fc
+      sent <- getSent sc
       sent `shouldBe` []
 
   describe "setupLocalAgeKey" $ do
@@ -146,6 +146,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             result <- setupLocalAgeKey paths "mykey"
             case result of
@@ -173,6 +174,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             result <- setupLocalAgeKey paths "../escape"
             result `shouldSatisfy` isLeft
@@ -192,6 +194,7 @@ spec = describe "Seal.Vault.Backend" $ do
                   , spConfig = tmpDir </> "config"
                   , spState  = tmpDir </> "state"
                   , spKeys   = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
                   }
             -- Provide scripted caps for the TTY-fallback path; the happy path
             -- (captured stdout) does not consume these, but if the plugin

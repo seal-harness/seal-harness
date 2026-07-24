@@ -37,10 +37,10 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
 import Seal.Core.AllowList (AllowList (..))
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, updateFileConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
@@ -458,8 +458,8 @@ handleSessionNew :: ApiDeps -> A.Value -> IO Response
 handleSessionNew deps v = do
   let paths = srPaths (adSessionRuntime deps)
       cfgPath = srConfigPath (adSessionRuntime deps)
-  eCfg <- loadFileConfig cfgPath
-  let cfg = fromRight defaultFileConfig eCfg
+  eCfg <- loadRuntimeConfig cfgPath
+  let cfg = fromRight defaultRuntimeConfig eCfg
   (mDefAgent, mDefProv, mDefModel) <- resolveDefaultAgent (adAgentDefs deps) cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe (fromMaybe cfgProv mDefProv) (lookupBodyStr "provider")
@@ -680,7 +680,7 @@ handleAgentGetDefault deps = do
 
 -- | Handle PUT /api/agents/default. Body: {"agent":"<id>"} to set,
 -- {"agent":null} or {} to clear. Persists to config.toml via
--- 'updateFileConfig' so the change survives restarts. The named agent
+-- 'updateRuntimeConfig' so the change survives restarts. The named agent
 -- must exist (404 otherwise) so users can't set a default to a def that
 -- isn't on disk. 400 on a malformed id or invalid JSON.
 handleAgentSetDefault :: ApiDeps -> BL.ByteString -> IO Response
@@ -690,7 +690,7 @@ handleAgentSetDefault deps body =
     Just v  -> case parseDefaultAgentBody v of
       DefaultClear -> do
         let cfgPath = srConfigPath (adSessionRuntime deps)
-        eRes <- updateFileConfig cfgPath (\cfg -> cfg { fcDefaultAgent = Nothing })
+        eRes <- updateRuntimeConfig cfgPath (\cfg -> cfg { rcDefaultAgent = Nothing })
         case eRes of
           Left e  -> pure (errJson status500 ("config write failed: " <> e))
           Right _ -> pure (jsonOk (A.object [ "agent" .= (Nothing :: Maybe Text) ]))
@@ -703,7 +703,7 @@ handleAgentSetDefault deps body =
             Just _ -> do
               let cfgPath = srConfigPath (adSessionRuntime deps)
                   val = agentDefIdText aid
-              eRes <- updateFileConfig cfgPath (\cfg -> cfg { fcDefaultAgent = Just val })
+              eRes <- updateRuntimeConfig cfgPath (\cfg -> cfg { rcDefaultAgent = Just val })
               case eRes of
                 Left e  -> pure (errJson status500 ("config write failed: " <> e))
                 Right _ -> pure (jsonOk (A.object [ "agent" .= val ]))
@@ -746,7 +746,7 @@ stampAgentDef _deps aid v mExisting = do
         _                                  -> Nothing
       tools       = maybe AllowAll allowListFromValue (lookupVal "tools")
       createdAt   = maybe now adCreatedAt mExisting
-      session     = maybe (SessionId "web") adSession mExisting
+      session     = maybe (mkSystemSessionId "web") adSession mExisting
   pure AgentDef
     { adId        = aid
     , adName      = nm
@@ -868,7 +868,7 @@ stampSkill sid v mExisting = do
       description = fromMaybe "" (lookupStr "description")
       body        = fromMaybe "" (lookupStr "body")
       createdAt   = maybe now skCreatedAt mExisting
-      session     = maybe (SessionId "web") skSession mExisting
+      session     = maybe (mkSystemSessionId "web") skSession mExisting
   pure Skill
     { skId          = sid
     , skDescription = description

@@ -38,7 +38,7 @@ import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId, memoryIdText)
 import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList)
@@ -94,7 +94,6 @@ encodeMemory e = encodeDoc fm (meContent e)
       , ("updated_at", isoTime (meUpdatedAt e))
       , ("session", sessionIdText (meSession e))
       ]
-    sessionIdText (SessionId t) = t
 
 -- | Decode a Markdown document into a 'MemoryEntry'. Returns 'Nothing' if the
 -- id field is missing or fails 'mkMemoryId'.
@@ -110,7 +109,7 @@ decodeMemory content =
         , meTags = fromMaybe [] (fmLookupList "tags" fm)
         , meCreatedAt = parseTime (fmLookup "created_at" fm)
         , meUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , meSession = SessionId (fromMaybe "unknown" (fmLookup "session" fm))
+        , meSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Write one memory to disk (atomic) and auto-commit.

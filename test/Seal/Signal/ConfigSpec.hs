@@ -11,7 +11,7 @@ import Test.QuickCheck
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Config.File
-  ( FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig )
+  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig )
 import Seal.Signal.Config
   ( SignalConfig (..), defaultSignalChunkLimit
   , defaultSignalConfig, mkSignalAccount, resolveSignalConfig
@@ -72,8 +72,8 @@ spec = do
     it "round-trips a section with all three fields" $
       withSystemTempDirectory "seal-signal-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-            cfg = defaultFileConfig
-                    { fcSignal = Just defaultSignalConfig
+            cfg = defaultRuntimeConfig
+                    { rcSignal = Just defaultSignalConfig
                         { scAccount = Just "+15551234567"
                         , scTextChunkLimit = Just 100
                         , scAllowFrom = AllowOnly (Set.fromList
@@ -82,20 +82,20 @@ spec = do
                             ])
                         }
                     }
-        saveFileConfig path cfg
-        result <- loadFileConfig path
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
         case result of
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
           Right loaded -> do
-            fcSignal loaded `shouldBe` fcSignal cfg
+            rcSignal loaded `shouldBe` rcSignal cfg
 
     it "absent section decodes as Nothing" $
       withSystemTempDirectory "seal-signal-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-        saveFileConfig path defaultFileConfig
-        result <- loadFileConfig path
+        saveRuntimeConfig path defaultRuntimeConfig
+        result <- loadRuntimeConfig path
         case result of
-          Right loaded -> fcSignal loaded `shouldBe` Nothing
+          Right loaded -> rcSignal loaded `shouldBe` Nothing
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
 
 -- ---------------------------------------------------------------------------

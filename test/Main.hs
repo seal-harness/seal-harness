@@ -19,12 +19,15 @@ import qualified Seal.Session.StoreSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
+import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
+import qualified Seal.Web.UrlSafetySpec
+import qualified Seal.Config.WorkdirSpec
 import qualified Seal.Web.BrowserSpec
 import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
@@ -53,6 +56,9 @@ import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
 import qualified Seal.Command.NewSpec
 import qualified Seal.Config.FileSpec
+import qualified Seal.Config.MigrateSpec
+import qualified Seal.Config.SecuritySpec
+import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.Vault.BackendSpec
 import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
@@ -144,12 +150,15 @@ main = hspec $ do
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
+  Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
+  Seal.Web.UrlSafetySpec.spec
+  Seal.Config.WorkdirSpec.spec
   Seal.Web.BrowserSpec.spec
   Seal.Media.ImageSpec.spec
   Seal.Media.TtsSpec.spec
@@ -178,6 +187,9 @@ main = hspec $ do
   Seal.Command.TabSpec.spec
   Seal.Command.NewSpec.spec
   Seal.Config.FileSpec.spec
+  Seal.Config.MigrateSpec.spec
+  Seal.Config.SecuritySpec.spec
+  Seal.Config.SecurityScopingFailSpec.spec
   Seal.Vault.BackendSpec.spec
   Seal.Vault.CommandsSpec.spec
   Seal.IngestSpec.spec

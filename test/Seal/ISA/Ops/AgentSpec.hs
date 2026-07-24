@@ -17,7 +17,7 @@ import Seal.Agent.Runtime.Delegation
   , defaultDelegationConfig, dcChildTimeoutSeconds
   , newSpawnPauseFlag, setSpawnPaused )
 import Seal.Agent.Runtime.Registry
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Agent
 import Seal.Providers.Class (ToolResultPart (..))
@@ -29,7 +29,7 @@ runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
 sampleSession :: SessionId
-sampleSession = SessionId "s1"
+sampleSession = mkSystemSessionId "s1"
 
 sampleDefId :: AgentDefId
 sampleDefId = case mkAgentDefId "a1" of
@@ -42,7 +42,7 @@ sampleDefId = case mkAgentDefId "a1" of
 recordingWorker :: IORef Int -> Del.AgentWorkerBuilder
 recordingWorker ref _ _ _ _ = do
   modifyIORef' ref (+1)
-  pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (SessionId "child")))
+  pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
 
 -- | A worker that simulates a def-not-found resolution error (returns an
 -- error outcome).
@@ -83,7 +83,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("a1" :: Text), "name" .= ("old" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
-      let op = agentDefWriteOp backend (SessionId "s2")
+      let op = agentDefWriteOp backend (mkSystemSessionId "s2")
       r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("new" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "updated"]
@@ -168,7 +168,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
             }
@@ -192,7 +192,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
             }
@@ -217,7 +217,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
             }
@@ -237,7 +237,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswConfig = pure defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
             }
@@ -262,7 +262,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
             }

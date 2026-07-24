@@ -16,7 +16,7 @@ import qualified Seal.Core.Types
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Config.File
-  (ProviderConfig (..), defaultFileConfig, upsertProvider, FileConfig (..))
+  (ProviderConfig (..), defaultRuntimeConfig, upsertProvider, RuntimeConfig (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Core.Types (isValidSessionId, sessionIdText)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -28,7 +28,7 @@ import Seal.Session.Store
 mkPaths :: FilePath -> SealPaths
 mkPaths root = SealPaths
   { spHome = root, spConfig = root </> "config"
-  , spState = root </> "state", spKeys = root </> "keys" }
+  , spState = root </> "state", spKeys = root </> "keys" , spCache = ""}
 
 aTime :: UTCTime
 aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
@@ -80,26 +80,26 @@ spec = describe "Seal.Session.Store" $ do
 
   describe "defaultSessionSelection" $ do
     it "uses the parsed provider's default model when no model is configured" $ do
-      let cfg = defaultFileConfig { fcDefaultProvider = Just "ollama" }
+      let cfg = defaultRuntimeConfig { rcDefaultProvider = Just "ollama" }
       defaultSessionSelection cfg `shouldBe` ("ollama", "llama3.2")
 
     it "keeps an explicitly configured model" $ do
-      let cfg = defaultFileConfig
-                  { fcDefaultProvider = Just "ollama"
-                  , fcDefaultModel    = Just "qwen3" }
+      let cfg = defaultRuntimeConfig
+                  { rcDefaultProvider = Just "ollama"
+                  , rcDefaultModel    = Just "qwen3" }
       defaultSessionSelection cfg `shouldBe` ("ollama", "qwen3")
 
     it "falls back to anthropic + its model when nothing is configured" $
-      defaultSessionSelection defaultFileConfig `shouldBe` ("anthropic", "claude-opus-4-8")
+      defaultSessionSelection defaultRuntimeConfig `shouldBe` ("anthropic", "claude-opus-4-8")
 
     it "uses the provider's configured section default when set" $ do
       let cfg = upsertProvider "ollama" (\p -> p { pcDefaultModel = Just "glm-5.2:cloud" })
-                  (defaultFileConfig { fcDefaultProvider = Just "ollama" })
+                  (defaultRuntimeConfig { rcDefaultProvider = Just "ollama" })
       defaultSessionSelection cfg `shouldBe` ("ollama", "glm-5.2:cloud")
 
     it "still lets a global default_model win when present" $ do
-      let cfg = (defaultFileConfig { fcDefaultProvider = Just "ollama"
-                                   , fcDefaultModel = Just "override" })
+      let cfg = (defaultRuntimeConfig { rcDefaultProvider = Just "ollama"
+                                   , rcDefaultModel = Just "override" })
       defaultSessionSelection cfg `shouldBe` ("ollama", "override")
 
   describe "initSession" $ do
@@ -107,7 +107,7 @@ spec = describe "Seal.Session.Store" $ do
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
         backend <- Def.noneBackend
-        m <- initSession paths defaultFileConfig backend
+        m <- initSession paths defaultRuntimeConfig backend
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
         smChannel m  `shouldBe` "cli"
@@ -125,7 +125,7 @@ spec = describe "Seal.Session.Store" $ do
         writeFile (agentsDir </> "worker.md")
           "---\nid: worker\nname: worker\nprovider: ollama\nmodel: llama3\ntools: all\ncreated_at: 2026-07-01T00:00:00Z\nupdated_at: 2026-07-01T00:00:00Z\nsession: s1\n---\nbe brief\n"
         backend <- Def.markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
-        let cfg = defaultFileConfig { fcDefaultAgent = Just "worker" }
+        let cfg = defaultRuntimeConfig { rcDefaultAgent = Just "worker" }
         m <- initSession paths cfg backend
         smAgent m `shouldBe` Just aid
         smProvider m `shouldBe` "ollama"
@@ -135,7 +135,7 @@ spec = describe "Seal.Session.Store" $ do
       withSystemTempDirectory "seal-sess" $ \root -> do
         let paths = mkPaths root
         backend <- Def.noneBackend
-        let cfg = defaultFileConfig { fcDefaultAgent = Just "missing" }
+        let cfg = defaultRuntimeConfig { rcDefaultAgent = Just "missing" }
         m <- initSession paths cfg backend
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"

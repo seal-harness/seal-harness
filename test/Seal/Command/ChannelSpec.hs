@@ -19,8 +19,9 @@ import Seal.Command.Channel
   , channelCommandSpec )
 import Seal.Command.Spec
   ( Availability (..), CommandName (..), CommandSpec (..), runCommandAction )
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig,
-                          saveFileConfig)
+import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig,
+                             saveSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
 import Seal.Telegram.Config
@@ -133,9 +134,9 @@ sentBlock = T.intercalate "\n"
 -- | Load the signal section from a config file, failing the test if absent.
 signalSection :: FilePath -> IO (Maybe SignalConfig)
 signalSection cfgPath = do
-  eCfg <- loadFileConfig cfgPath
+  eCfg <- loadRuntimeConfig cfgPath
   case eCfg of
-    Right cfg -> pure (fcSignal cfg)
+    Right cfg -> pure (rcSignal cfg)
     Left _    -> expectationFailure "config failed to load" >> pure Nothing
 
 -- | Unwrap a 'Just' produced by 'signalSection' after an 'isJust' assertion.
@@ -148,9 +149,9 @@ unsafeSig Nothing  = error "signalSection was Nothing despite isJust check"
 -- | Load the telegram section from a config file, failing the test if absent.
 telegramSection :: FilePath -> IO (Maybe TelegramConfig)
 telegramSection cfgPath = do
-  eCfg <- loadFileConfig cfgPath
+  eCfg <- loadRuntimeConfig cfgPath
   case eCfg of
-    Right cfg -> pure (fcTelegram cfg)
+    Right cfg -> pure (rcTelegram cfg)
     Left _    -> expectationFailure "config failed to load" >> pure Nothing
 
 -- | Unwrap a 'Just' produced by 'telegramSection' after an 'isJust'
@@ -299,12 +300,13 @@ spec = describe "Seal.Command.Channel" $ do
         scAccount sig `shouldBe` Just "+14045551234"
 
   describe "writeSignalConfig preserves existing config" $
-    it "keeps unrelated keys (vault_recipient) when adding [signal]" $
+    it "keeps security.toml (vault_recipient) untouched when adding [signal] to config.toml" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
+            secPath = tmp <> "/security.toml"
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
-        let seed = defaultFileConfig { fcVaultRecipient = Just "age1xxx" }
-        saveFileConfig cfgPath seed
+        -- Seed security.toml with a vault recipient (now lives there, not config.toml).
+        saveSecurityConfig secPath (defaultSecurityConfig { scVaultRecipient = Just "age1xxx" })
         cli <- mkMockCli
           (Right "0.13.0")
           (LinkSucceeded "sgnl://enc")
@@ -312,11 +314,15 @@ spec = describe "Seal.Command.Channel" $ do
           []
           (AccountsFound ["+15550000000"])
         _sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
-        eCfg <- loadFileConfig cfgPath
+        -- security.toml must be unchanged by the signal config write.
+        eSec <- loadSecurityConfig secPath
+        case eSec of
+          Right sc -> scVaultRecipient sc `shouldBe` Just "age1xxx"
+          Left _ -> expectationFailure "security.toml failed to load"
+        -- config.toml now has [signal].
+        eCfg <- loadRuntimeConfig cfgPath
         case eCfg of
-          Right cfg -> do
-            fcVaultRecipient cfg `shouldBe` Just "age1xxx"
-            fcSignal cfg `shouldSatisfy` isJust
+          Right cfg -> rcSignal cfg `shouldSatisfy` isJust
           Left _ -> expectationFailure "config failed to load"
 
   -- ---------------------------------------------------------------------
@@ -393,22 +399,24 @@ spec = describe "Seal.Command.Channel" $ do
         mTg `shouldBe` Nothing
 
   describe "/channel telegram — preserves existing config" $
-    it "keeps unrelated keys (vault_recipient) when adding [telegram]" $
+    it "keeps security.toml (vault_recipient) untouched when adding [telegram] to config.toml" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
+            secPath = tmp <> "/security.toml"
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
-        let seed = defaultFileConfig { fcVaultRecipient = Just "age1yyy" }
-        saveFileConfig cfgPath seed
+        saveSecurityConfig secPath (defaultSecurityConfig { scVaultRecipient = Just "age1yyy" })
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
                         (AccountsFailed "x")
         tgApi <- mkMockTgApi (GetMeOk "SealBot")
         (vault, _) <- mkMockVaultStore
         _sent <- runChannel cli tgApi vault ["telegram"] ["123456:ABC-DEF"] cfgPath
-        eCfg <- loadFileConfig cfgPath
+        eSec <- loadSecurityConfig secPath
+        case eSec of
+          Right sc -> scVaultRecipient sc `shouldBe` Just "age1yyy"
+          Left _ -> expectationFailure "security.toml failed to load"
+        eCfg <- loadRuntimeConfig cfgPath
         case eCfg of
-          Right cfg -> do
-            fcVaultRecipient cfg `shouldBe` Just "age1yyy"
-            fcTelegram cfg `shouldSatisfy` isJust
+          Right cfg -> rcTelegram cfg `shouldSatisfy` isJust
           Left _ -> expectationFailure "config failed to load"
 
   -- ---------------------------------------------------------------------

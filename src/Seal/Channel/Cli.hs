@@ -11,7 +11,7 @@ module Seal.Channel.Cli
   , resolveDefProvider
   , mkSessionAgentEnv
   , debugRequestsPath
-  , execBackendFromFile
+  , untrustedIOFromSecurity
   , Backends (..)
   , newBackends
   ) where
@@ -35,7 +35,7 @@ import System.Console.Haskeline
   , noCompletion
   , runInputT
   )
-import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
@@ -47,10 +47,11 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
-import Seal.Config.File (FileConfig, defaultFileConfig, loadFileConfig, providerBaseUrl, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes, untrustedExecConfigFromFile, onDemandSchemas,
-                          fcDebugSessionTranscript, fcDelegation)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath)
+import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
+                          defaultRetrievalMaxScanBytes, onDemandSchemas,
+                          rcDebugSessionTranscript, rcDelegation)
+import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -60,10 +61,12 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-import Seal.Tools.Exec.Local (mkLocalExecHandle)
+import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
+#else
+import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #endif
-import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..), mkLocalExecHandlePlaceholder)
-import Seal.Tools.Exec.Untrusted (selectExecBackend, UntrustedExecConfig (..))
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -97,6 +100,7 @@ import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
+import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
@@ -185,7 +189,7 @@ resolveSessionProvider pr meta =
   case parseProvider (smProvider meta) of
     Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
     Just kp -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
           model   = ModelId (smModel meta)
       mh <- readIORef (vrHandleRef (prVault pr))
@@ -198,7 +202,7 @@ resolveDefProvider pr providerLabel model =
   case parseProvider providerLabel of
     Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel))
     Just kp -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
@@ -206,9 +210,9 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> ExecBackend
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBackend debugReqPath autonomy approvals onEntry onDemand = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -216,7 +220,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
-  , aeExecBackend = execBackend
+  , aeUntrustedIO = untrustedIO
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = 12
@@ -234,17 +238,17 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle execBa
 -- 'CompletionRequest' in full (including the complete message history) exactly
 -- as sent to the LLM, so we can debug whether the two-file storage format is
 -- correctly feeding the session history to the provider.
-debugRequestsPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugRequestsPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
 debugRequestsPath paths sid eCfg =
   case eCfg of
-    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
 
 -- | Resolve the on-demand-schemas flag from the loaded config. 'True' when
 -- @on_demand_schemas@ is set in the config file; 'False' on load error or
 -- when the key is absent (matching the default behavior).
-onDemandFromCfg :: Either a FileConfig -> Bool
+onDemandFromCfg :: Either a RuntimeConfig -> Bool
 onDemandFromCfg eCfg =
   case eCfg of
     Right cfg -> onDemandSchemas cfg
@@ -285,25 +289,15 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
-  wsRoot <- WorkspaceRoot <$> getCurrentDirectory
   appEnv <- mkEnv defaultConfig
-  -- Resolve the operator-configured retrieval ceiling (the hard upper bound
-  -- on bytes scanned per FILE_READ). Falls back to the 128 KiB default when
-  -- the [retrieval] section is absent. Loaded once at startup; a config
-  -- change takes effect on the next session.
-  eCfg <- loadFileConfig (prConfigPath pr)
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Resolve the untrusted-execution backend (Phase 4 4b-T3). Absent
-      -- section or mode=local → the local executor (wired to wsRoot);
-      -- mode=remote → the SSH executor (if fully configured) or fail-closed
-      -- (the dispatcher surfaces the structured error at call time). The
-      -- remote executor itself lands in 4g; until then mode=remote without
-      -- a real SSH executor falls back to the local executor's placeholder
-      -- (the opcode fail-closes via 'ExecNotImplemented' if it actually
-      -- needs the remote). 4b-T3 wires the LOCAL arm to the real
-      -- 'mkLocalExecHandle wsRoot'; the remote arm is a placeholder until 4g.
-      execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-      defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default; real local executor wired by execBackendFromFile
+      -- Per-session untrusted IO: creates the workdir (local or remote)
+      -- and constructs the handle. Handles both mode=local and
+      -- mode=remote via mkSessionUntrustedIO.
+      mkSessionUio :: SessionId -> IO UntrustedIO
+      mkSessionUio = either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
@@ -378,10 +372,14 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
              (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
              (Nothing, Nothing)                -> Nothing
       cliChildRegistryBuilder _def childSid childCaps = do
+        eChildWd <- ensureSessionWorkdir paths childSid
+        let childWsRoot = case eChildWd of
+              Right wd -> WorkspaceRoot wd
+              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         let childBaseOps =
               [ showHumanOp childCaps
               , askHumanOp childCaps
-              , fileReadOp wsRoot operatorCeiling
+              , fileReadOp childWsRoot operatorCeiling
               , secretGetOp rt
               , memoryWriteOp memoryBackend childSid
               , memoryRecallOp defaultPageParams memoryBackend
@@ -395,12 +393,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
               -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
               -- AGENT_INTERRUPT
-              , shellExecOp wsRoot cliSecurityPolicy execBackend
-              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-              , processManageOp wsRoot cliSecurityPolicy execBackend
-              , fileWriteOp wsRoot operatorCeiling
-              , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              , shellExecOp childWsRoot cliSecurityPolicy
+              , binExecOp childWsRoot cliSecurityPolicy binAllowList
+              , processManageOp childWsRoot cliSecurityPolicy
+              , fileWriteOp childWsRoot operatorCeiling
+              , filePatchOp childWsRoot
+              , searchFilesOp childWsRoot cliSecurityPolicy operatorCeiling
               ]
         pure (ISA.mkRegistry
                 (filterBlocklisted childBaseOps opName
@@ -415,7 +413,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               { dwdPaths = paths
               , dwdParentSid = sid
               , dwdAppEnv = appEnv
-              , dwdExecBackend = execBackend
+              , dwdMkUntrustedIO = mkSessionUio
               , dwdAutonomy = autonomy
               , dwdApprovals = approvals
               , dwdOnDemand = onDemand
@@ -427,8 +425,8 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               }
             mkWorker = mkDelegateWorker delegateDeps
             delegationCfg = do
-              eCfg' <- loadFileConfig (prConfigPath pr)
-              pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+              eCfg' <- loadRuntimeConfig (prConfigPath pr)
+              pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
         in AgentStartWiring
           { aswDefBackend = agentDefBackend
           , aswRuntime = agentRuntime
@@ -446,7 +444,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
       -- describe/list ops close over the registry they belong to (let-knot).
       -- `tHandle` is NOT closed over here — the dispatcher threads it at call
       -- time.
-      cliIsaReg sid startWiring caps' =
+      cliIsaReg sid startWiring caps' wsRoot =
         let reg = ISA.mkRegistry
               (baseOps reg ++ if onDemand
                                 then [opcodeDescribeOp reg, opcodeListOp reg]
@@ -472,12 +470,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , agentStatusOp agentRuntime
               , agentStopOp agentRuntime
               , agentInterruptOp agentRuntime
-              , shellExecOp wsRoot cliSecurityPolicy execBackend
-              , binExecOp wsRoot cliSecurityPolicy binAllowList execBackend
-              , processManageOp wsRoot cliSecurityPolicy execBackend
+              , shellExecOp wsRoot cliSecurityPolicy
+              , binExecOp wsRoot cliSecurityPolicy binAllowList
+              , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling
               , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling execBackend
+              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling
               ]
         in reg
       -- Resolve the bound agent's system prompt (re-read per turn; agent
@@ -498,8 +496,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          let startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps
+          eWd <- ensureSessionWorkdir paths sid
+          let wsRoot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps wsRoot
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
@@ -518,7 +520,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
     -- built per-invocation (its own sid, its own transcript bracket) —
     -- unchanged by the per-turn refactor.
       bgRunner = BgRunner $ \prompt -> do
-        cfg <- fromRight defaultFileConfig <$> loadFileConfig (prConfigPath pr)
+        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
         (mAgent, mProv, mModel) <- resolveDefaultAgent agentDefBackend cfg
         let (cfgProv, cfgModel) = defaultSessionSelection cfg
             provider = fromMaybe cfgProv mProv
@@ -536,14 +538,19 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                 , ccPromptSecret = ccPromptSecret caps
                 }
               bgStartWiring = cliStartWiring bgSid
-              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps
+          eBgWd <- ensureSessionWorkdir paths bgSid
+          let bgWsRoot = case eBgWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot
           tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
             Left err -> ccSend caps ("bg failed: " <> err)
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta
-              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle execBackend
+              bgUio <- mkSessionUio bgSid
+              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
@@ -561,19 +568,25 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          let startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps
+          eWd <- ensureSessionWorkdir paths sid
+          let wsRoot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              startWiring = cliStartWiring sid
+              isaReg = cliIsaReg sid startWiring caps wsRoot
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+          callUio <- mkSessionUio sid
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
           case res of
             Right r -> recordSkillLoadResult tHandle callOpName val r
             Left _  -> pure ()
           pure res
       plainHandler t = do
         meta <- readIORef (srActive sr)
-        withCliTurn meta $ \sid tHandle isaReg prov model mSystem ->
+        withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
+          uio <- mkSessionUio sid
           handlePlain
-            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand)
             appEnv t
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
@@ -658,30 +671,32 @@ handleTabCommand caps tabsH = \case
       T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
         <> maybe "" ("  " <>) (tLabel t)
 
--- | Resolve the untrusted-execution 'ExecBackend' from the 'FileConfig'.
--- Absent section / mode=local → 'EbLocal' (the real local executor wired
--- to the workspace root). mode=remote + remote fully configured → 'EbRemote'
--- (the SSH executor; the opcodes run remotely). mode=remote + remote
--- absent/incomplete → 'EbLocal' with a no-op handle so untrusted opcodes
--- fail-closed at call time (the 'ExecNotImplemented' error surfaces).
-execBackendFromFile :: WorkspaceRoot -> FileConfig -> ExecBackend
-execBackendFromFile _wsRoot cfg =
-  case untrustedExecConfigFromFile cfg of
-    Nothing -> defaultBackend
+-- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
+-- 'SecurityConfig'. Absent section / mode=local → the local arm (real local
+-- executor wired to the workspace root). mode=remote + remote fully
+-- configured → the remote arm (the SSH executor; the opcodes run remotely
+-- via 'mkRemoteUntrustedIO'). mode=remote + remote absent/incomplete → the
+-- fail-closed stub so untrusted opcodes fail at call time (the
+-- 'UeExec ExecNotImplemented' error surfaces).
+untrustedIOFromSecurity :: WorkspaceRoot -> SecurityConfig -> UntrustedIO
+untrustedIOFromSecurity wsRoot cfg =
+  case untrustedExecConfigFromSecurity cfg of
+    Nothing -> defaultHandle
     Just uec ->
       case uecRemote uec of
-        Nothing -> failClosedBackend  -- mode=remote, no remote configured
+        Nothing -> mkRemoteUntrustedIOStub  -- mode=remote, no remote configured
         Just sshCfg ->
-          case selectExecBackend uec (TbSsh sshCfg) of
-            Right (EbRemote s) -> EbRemote s
-            _ -> failClosedBackend
+          -- The remote SSH arm. The RemoteRunner is the real
+          -- 'mkRealRemoteRunner' (System.Process-backed); the SSH argv +
+          -- host-key pinning are inherited from 'Seal.Tools.Exec.Remote'.
+          mkRemoteUntrustedIO sshCfg mkRealRemoteRunner
   where
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-    defaultBackend = EbLocal (mkLocalExecHandle _wsRoot)
+    defaultHandle = mkLocalUntrustedIO wsRoot
 #else
-    defaultBackend = failClosedBackend  -- local executor absent; fail-closed
+    defaultHandle = mkRemoteUntrustedIOStub  -- local executor absent; fail-closed
+    _ = wsRoot  -- keep wsRoot referenced under the flag (unused when local absent)
 #endif
-    failClosedBackend = EbLocal mkLocalExecHandlePlaceholder  -- no-op: opcodes fail-closed
 
 -- | The CLI security policy: allow all commands. The autonomy level is
 -- threaded separately via 'aeAutonomy' (the operator-selected @--yolo@ vs

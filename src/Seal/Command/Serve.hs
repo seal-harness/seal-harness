@@ -36,8 +36,10 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
 import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, vaultFilePath)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -69,13 +71,19 @@ runServeMain :: AutonomyLevel -> IO ()
 runServeMain autonomy = do
   paths <- getSealPaths
   ensureSealDirs paths
+  migrateSecurityConfig paths
   let cfgPath = configFilePath paths
-  cfg <- loadFileConfig cfgPath >>= \case
+  cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
       hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
-      pure defaultFileConfig
+      pure defaultRuntimeConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths cfg
+  secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
+    Left err -> do
+      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      pure defaultSecurityConfig
+    Right c  -> pure c
+  mHandle <- tryOpenVault paths secCfg
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -113,7 +121,7 @@ runServeMain autonomy = do
   -- Build the shared ChannelDeps early so the reply registry + write locks
   -- can be shared with the web send handler (SendDeps). The cursor store,
   -- reply registry, and write locks are created inside newChannelDeps.
-  let loadCfg = fromRight defaultFileConfig <$> loadFileConfig cfgPath
+  let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy (Just broker)
         reg tmuxR (Just mgr) approvals loadCfg
@@ -180,7 +188,7 @@ runServeMain autonomy = do
         , sdLocks       = cdLocks chanDeps
         }
   -- Build the gateway config (from the [gateway] section or the default)
-  let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (fcGateway cfg)
+  let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
       deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -196,7 +204,7 @@ runServeMain autonomy = do
             configuredProviders mh cfg
         , adUiState         = uiState
         , adSend            = Just sendDeps
-        , adDefaultAgent    = fcDefaultAgent <$> loadCfg
+        , adDefaultAgent    = rcDefaultAgent <$> loadCfg
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from
@@ -220,14 +228,19 @@ runServeMain autonomy = do
   -- so the agent loop is identical to the standalone modes.
   forkSignalListener chanDeps cfg registry
   forkTelegramListener chanDeps cfg registry
-  -- Run the HTTP gateway (blocks)
-  runGateway gwCfg deps
+  -- Run the HTTP gateway (blocks). Fail-closed on non-loopback when
+  -- mode=remote (design V6: prevents network access to the unauthenticated
+  -- updateRuntimeConfig caller).
+  let isRemote = case scUntrustedExec secCfg of
+        Just uefc -> uefcMode uefc == "remote"
+        Nothing   -> False
+  runGateway gwCfg isRemote deps
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
-tryOpenVault :: SealPaths -> FileConfig -> IO (Maybe VaultHandle)
+tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe VaultHandle)
 tryOpenVault paths fcfg =
-  case (fcVaultRecipient fcfg, fcVaultIdentity fcfg) of
+  case (scVaultRecipient fcfg, scVaultIdentity fcfg) of
     (Just _, Just _) ->
       resolveEncryptor fcfg >>= \case
         Left err -> do
@@ -235,9 +248,9 @@ tryOpenVault paths fcfg =
           pure Nothing
         Right enc -> do
           let vcfg = VaultConfig
-                { vcPath    = maybe (vaultFilePath paths) T.unpack (fcVaultPath fcfg)
-                , vcKeyType = fromMaybe "x25519" (fcVaultKeyType fcfg)
-                , vcUnlock  = parseUnlockMode (fcVaultUnlock fcfg)
+                { vcPath    = maybe (vaultFilePath paths) T.unpack (scVaultPath fcfg)
+                , vcKeyType = fromMaybe "x25519" (scVaultKeyType fcfg)
+                , vcUnlock  = parseUnlockMode (scVaultUnlock fcfg)
                 }
           Just <$> openVault vcfg enc
     _ -> pure Nothing
@@ -250,9 +263,9 @@ tryOpenVault paths fcfg =
 -- the config section, spawns the signal-cli transport, and runs the shared
 -- inbox-driven loop in a background thread. A missing/unresolved section
 -- is logged to stderr and skipped (not fatal — the gateway still starts).
-forkSignalListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkSignalListener :: ChannelDeps -> RuntimeConfig -> Registry -> IO ()
 forkSignalListener deps cfg registry =
-  case resolveSignalConfig (fcSignal cfg) Nothing of
+  case resolveSignalConfig (rcSignal cfg) Nothing of
     Left _ -> pure ()  -- not configured; skip silently
     Right (account, chunkLimit, allow) -> do
       let accountLabel = Seal.Signal.Config.signalAccountText account
@@ -272,7 +285,7 @@ forkSignalListener deps cfg registry =
 -- bot's slash-command menu with BotFather for auto-completion, and runs the
 -- shared inbox-driven loop in a background thread. A missing/unresolved
 -- section is logged to stderr and skipped.
-forkTelegramListener :: ChannelDeps -> FileConfig -> Registry -> IO ()
+forkTelegramListener :: ChannelDeps -> RuntimeConfig -> Registry -> IO ()
 forkTelegramListener deps cfg registry = do
   -- Read the bot token from the vault (the wizard stores it there).
   mh <- readIORef (vrHandleRef (cdVault deps))
@@ -283,9 +296,9 @@ forkTelegramListener deps cfg registry = do
       pure $ case r of
         Right bs -> Just (TE.decodeUtf8 bs)
         Left _   -> Nothing
-  case resolveTelegramConfig (fcTelegram cfg) mVaultToken of
+  case resolveTelegramConfig (rcTelegram cfg) mVaultToken of
     Left err
-      | isJust (fcTelegram cfg) ->
+      | isJust (rcTelegram cfg) ->
           -- The [telegram] section is present but unresolved (e.g. the vault
           -- is locked / missing the token). Surface it so the channel isn't
           -- silently dropped on startup.

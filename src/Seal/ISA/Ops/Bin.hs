@@ -1,12 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | BIN_EXEC (Untrusted): run a named binary with a list of argv
 -- arguments, via 'System.Process.proc' (RawCommand — no shell
--- interpreter). The binary name and args are validated 'BinName' /
--- 'BinArg' (reject empty, NUL). An optional operator-configured
--- allow-list (a 'Set' of permitted binary names) gates the binary;
--- when the allow-list is 'Nothing' the binary is permitted by the gate
--- (the autonomy policy still applies). All IO through the 'ExecBackend'
--- seam.
+-- interpreter) — on the local or remote backend, selected at wiring time
+-- via the 'UntrustedIO' capability. The binary name and args are
+-- validated 'BinName' / 'BinArg' (reject empty, NUL). An optional
+-- operator-configured allow-list (a 'Set' of permitted binary names)
+-- gates the binary; when the allow-list is 'Nothing' the binary is
+-- permitted by the gate (the autonomy policy still applies). All IO
+-- through the 'UntrustedIO' seam; this module never imports
+-- 'System.Process'.
 module Seal.ISA.Ops.Bin
   ( binExecOp
   ) where
@@ -18,16 +20,14 @@ import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Data.Text qualified as T
 
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
-import Seal.Tools.Args (BinName, BinArg, mkBinName, mkBinArg)
-import Seal.Tools.Exec.Types (ExecBackend (..), LocalExecHandle (..))
-import Seal.Types.App
+import Seal.Tools.Args (mkBinName, mkBinArg)
+import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioBinExec)
 
 -- | BIN_EXEC opcode. Input: @{ binary: BinName, args: [BinArg, ...] }@.
 -- The @args@ field is optional (defaults to @[]@); the @binary@ field is
@@ -38,9 +38,8 @@ binExecOp
   :: WorkspaceRoot
   -> SecurityPolicy
   -> Maybe (Set Text)
-  -> ExecBackend
   -> Opcode
-binExecOp _wsRoot policy mAllowList _backend = UntrustedOpcode
+binExecOp _wsRoot policy mAllowList = UntrustedOpcode
   { uoName = OpName "BIN_EXEC"
   , uoDesc = "Run a named binary with argv args (no shell, optional allow-list)."
   , uoInSchema = binExecSchema
@@ -60,7 +59,7 @@ binExecOp _wsRoot policy mAllowList _backend = UntrustedOpcode
                      Right _   -> case traverse mkBinArg <$> mArgsText of
                                     Just (Left _err) -> Left "BIN_EXEC: invalid arg"
                                     _                -> Right ()
-  , uoRun = \_back execBackend v -> do
+  , uoRun = \uio v -> do
       let mBin  = binaryField v
           mArgs = argsField v
           recorded = object
@@ -75,20 +74,12 @@ binExecOp _wsRoot policy mAllowList _backend = UntrustedOpcode
             Right bin ->
               case traverse mkBinArg (fromMaybe [] mArgs) of
                    Left err -> pure (OpResult [TrpText ("BIN_EXEC: invalid arg: " <> err)] True recorded)
-                   Right args -> runBin execBackend bin args recorded
+                   Right args -> do
+                     res <- liftIO (uioBinExec uio bin args)
+                     pure $ case res of
+                       Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                       Right out -> OpResult [TrpText out] False recorded
   }
-
--- | Run the binary with the args through the executor.
-runBin :: ExecBackend -> BinName -> [BinArg] -> Value -> App OpResult
-runBin execBackend bin args recorded =
-  case execBackend of
-    EbLocal lh -> do
-      res <- liftIO (lehExecBin lh bin args)
-      case res of
-        Left e   -> pure (OpResult [TrpText (T.pack (show e))] True recorded)
-        Right out -> pure (OpResult [TrpText out] False recorded)
-    EbRemote _ssh ->
-      pure (OpResult [TrpText "BIN_EXEC: remote SSH executor not yet wired (Phase 4 4g)"] True recorded)
 
 binExecSchema :: Value
 binExecSchema =

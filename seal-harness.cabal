@@ -103,12 +103,15 @@ library
         Seal.Command.Spec
         Seal.Command.Channel
         Seal.Config.File
+        Seal.Config.Migrate
         Seal.Config.Paths
+        Seal.Config.Security
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
         Seal.Session.Meta
         Seal.Session.Store
+        Seal.Session.Workdir
         Seal.Signal.Config
         Seal.Telegram.Config
         Seal.Security.Command
@@ -123,8 +126,10 @@ library
         Seal.Tools.Exec.Remote
         Seal.Tools.Exec.Types
         Seal.Tools.Exec.Untrusted
+        Seal.Tools.Exec.UntrustedIO
         Seal.Web.Search
         Seal.Web.Fetch
+        Seal.Web.UrlSafety
         Seal.Web.Browser
         Seal.Web.UiState
         Seal.Media.Image
@@ -200,6 +205,7 @@ library
       , http-client
       , http-client-tls
       , http-types
+      , network
       , tomland
       , process
       , unix
@@ -332,6 +338,9 @@ test-suite tests
         Seal.Command.TabSpec
         Seal.Command.NewSpec
         Seal.Config.FileSpec
+        Seal.Config.MigrateSpec
+        Seal.Config.SecuritySpec
+        Seal.Config.SecurityScopingFailSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec
@@ -346,6 +355,9 @@ test-suite tests
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
+        Seal.Tools.Exec.UntrustedIORemoteSpec
+        Seal.Web.UrlSafetySpec
+        Seal.Config.WorkdirSpec
         Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec

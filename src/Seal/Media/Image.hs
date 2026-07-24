@@ -45,7 +45,7 @@ imageGenerateOp _prov = UntrustedOpcode
         Nothing -> Left "IMAGE_GENERATE requires {prompt:string}"
         Just p | T.null p -> Left "IMAGE_GENERATE: prompt is empty"
                | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let p = fromMaybe "" (promptField v)
           recorded = object [ "prompt" .= p ]
       pure (OpResult [TrpText "IMAGE_GENERATE: no image provider configured"] True recorded)
@@ -63,7 +63,7 @@ imageDescribeOp _prov = UntrustedOpcode
         Nothing -> Left "IMAGE_DESCRIBE requires {image:string}"
         Just i | T.null i -> Left "IMAGE_DESCRIBE: image is empty"
                | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let i = fromMaybe "" (imageField v)
           recorded = object [ "image" .= i ]
       pure (OpResult [TrpText "IMAGE_DESCRIBE: no image provider configured"] True recorded)

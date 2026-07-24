@@ -34,19 +34,20 @@ import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
-import Seal.Tools.Exec.Types (ExecBackend)
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
 
--- | Dispatch an opcode invocation. The dispatcher threads an 'ExecBackend'
--- for Untrusted opcodes (the Local-vs-Remote-SSH selector); Trusted/Audited
--- opcodes ignore it (they have no 'ExecBackend' in scope — type-level
--- capability scoping, spec §4/§8).
+-- | Dispatch an opcode invocation. The dispatcher threads an 'UntrustedIO'
+-- for Untrusted opcodes (the unified capability handle for all their
+-- side-effecting IO — files, commands, process management, search);
+-- Trusted/Audited opcodes ignore it (they have no 'UntrustedIO' in scope —
+-- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> ExecBackend -> OpName -> Value
+  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend execBackend name input =
+dispatch reg h backend untrustedIO name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -57,7 +58,7 @@ dispatch reg h backend execBackend name input =
           case op of
             UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              Right <$> uoRun op backend execBackend input
+              Right <$> uoRun op untrustedIO input
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do

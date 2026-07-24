@@ -51,7 +51,7 @@ browserOpenOp _drv = UntrustedOpcode
         Nothing -> Left "BROWSER_OPEN requires {url:string}"
         Just u | T.null u -> Left "BROWSER_OPEN: url is empty"
                | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let u = fromMaybe "" (urlField v)
           recorded = object [ "url" .= u ]
       pure (OpResult [TrpText "BROWSER_OPEN: no browser driver configured"] True recorded)
@@ -69,7 +69,7 @@ browserClickOp _drv = UntrustedOpcode
         Nothing -> Left "BROWSER_CLICK requires {selector:string}"
         Just s | T.null s -> Left "BROWSER_CLICK: selector is empty"
                | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let s = fromMaybe "" (selectorField v)
           recorded = object [ "selector" .= s ]
       pure (OpResult [TrpText "BROWSER_CLICK: no browser driver configured"] True recorded)
@@ -83,7 +83,7 @@ browserReadOp _drv = UntrustedOpcode
   , uoInSchema = browserSchema "selector" "The CSS selector to read (or empty for the whole page)."
   , uoOutSchema = object []
   , uoAuthorize = \_v -> Right ()  -- selector is optional (empty = whole page)
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let s = fromMaybe "" (selectorField v)
           recorded = object [ "selector" .= s ]
       pure (OpResult [TrpText "BROWSER_READ: no browser driver configured"] True recorded)

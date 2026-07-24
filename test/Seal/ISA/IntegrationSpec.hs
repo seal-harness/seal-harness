@@ -43,7 +43,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..), ToolCallId (..),
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..),
                         mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
@@ -84,9 +84,8 @@ import Seal.Skills.Backend qualified as SkillBackend
 import Seal.Skills.Types (skBody)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Args (textShellCommand)
-import Seal.Tools.Exec.Local (mkLocalExecHandleFromFns)
-import Seal.Tools.Exec.Types (ExecBackend (..), ExecError (..),
-                              mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedIO (..), mkLocalUntrustedIO, mkRemoteUntrustedIOStub )
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -124,19 +123,19 @@ recordCaps sent = ChannelCaps
 
 -- | Dispatch a single opcode through the full integration seam (authorize →
 -- ACK/async transcript record → run). Each call gets a fresh in-memory
--- transcript, so tests are isolated. Uses the placeholder 'ExecBackend'
--- (fail-closed); tests that need a fake executor use 'dispatchOneWith'.
+-- transcript, so tests are isolated. Uses the fail-closed 'UntrustedIO'
+-- stub; tests that need a fake executor use 'dispatchOneWith'.
 dispatchOne :: Registry.Registry -> OpName -> Value
             -> App (Either DispatchError OpResult)
-dispatchOne reg = dispatchOneWith reg (EbLocal mkLocalExecHandlePlaceholder)
+dispatchOne reg = dispatchOneWith reg mkRemoteUntrustedIOStub
 
--- | Like 'dispatchOne' but with an explicit 'ExecBackend' (for Untrusted
+-- | Like 'dispatchOne' but with an explicit 'UntrustedIO' (for Untrusted
 -- opcodes that need a fake executor returning canned output).
-dispatchOneWith :: Registry.Registry -> ExecBackend -> OpName -> Value
+dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
                -> App (Either DispatchError OpResult)
-dispatchOneWith reg execBackend name input = do
+dispatchOneWith reg uio name input = do
   (h, _) <- liftIO fakeTwoFileTranscript
-  dispatch reg h localBackend execBackend name input
+  dispatch reg h localBackend uio name input
 
 right :: Show e => Either e a -> a
 right (Right x) = x
@@ -145,23 +144,23 @@ right (Left e)  = error ("expected Right, got Left: " <> show e)
 sid :: SessionId
 sid = either (error "sid") id (mkSessionId "s1")
 
--- | A fake 'ExecBackend' that returns canned stdout and writes the recorded
--- command into the given IORef. For tests that don't inspect the recorded
--- command, pass a throwaway IORef (created with @newIORef []@).
-fakeBackend :: IORef [Text] -> Text -> ExecBackend
-fakeBackend seen canned =
-  EbLocal (mkLocalExecHandleFromFns shellFn progFn)
-  where
-    shellFn cmd _cwd = do
+-- | A fake 'UntrustedIO' that returns canned stdout for shell/bin/search
+-- and writes the recorded command into the given IORef. File ops succeed
+-- (no real FS write). Other methods are the fail-closed stub.
+fakeUio :: IORef [Text] -> Text -> UntrustedIO
+fakeUio seen canned = mkRemoteUntrustedIOStub
+  { uioShellExec = \cmd _cwd -> do
       modifyIORef' seen (++ [textShellCommand cmd])
       pure (Right canned)
-    progFn _ _ = pure (Right canned)
+  , uioBinExec = \_ _ -> pure (Right canned)
+  , uioProcessList = pure (Right canned)
+  , uioSearchFiles = \_ _ _ -> do
+      pure (Right canned)
+  }
 
--- | A fail-closed 'ExecBackend' (every call returns 'ExecNotImplemented').
-failBackend :: ExecBackend
-failBackend = EbLocal (mkLocalExecHandleFromFns
-                       (\_ _ -> pure (Left ExecNotImplemented))
-                       (\_ _ -> pure (Left ExecNotImplemented)))
+-- | A fail-closed 'UntrustedIO' (every method returns 'UeExec ExecNotImplemented').
+failUio :: UntrustedIO
+failUio = mkRemoteUntrustedIOStub
 
 -- | A fake 'TmuxRunner' that records argv and returns scripted stdout (LIFO).
 mkFakeRunner :: [Text] -> IO (TmuxRunner, IO [[String]])
@@ -197,7 +196,7 @@ spec = describe "Seal.ISA.Integration" $ do
         BS.writeFile (root </> "notes.txt") "hello world"
         let op = fileReadOp (WorkspaceRoot root) maxScanBytes
             reg = Registry.mkRegistry [op]
-        r <- runTestApp (dispatchOne reg (OpName "FILE_READ")
+        r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_READ")
                           (object ["path" .= ("notes.txt" :: Text)]))
         case r of
           Right res -> do
@@ -227,7 +226,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    (EbLocal mkLocalExecHandlePlaceholder) caps sid 8 Nothing Full approvals Nothing (pure ()) False
+                    mkRemoteUntrustedIOStub caps sid 8 Nothing Full approvals Nothing (pure ()) False
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)
@@ -240,7 +239,7 @@ spec = describe "Seal.ISA.Integration" $ do
       withSystemTempDirectory "seal-int" $ \root -> do
         let op = fileWriteOp (WorkspaceRoot root) 65536
             reg = Registry.mkRegistry [op]
-        r <- runTestApp (dispatchOne reg (OpName "FILE_WRITE")
+        r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_WRITE")
                           (object [ "path" .= ("todo.txt" :: Text)
                                   , "content" .= ("buy milk" :: Text) ]))
         case r of
@@ -260,7 +259,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let op = filePatchOp (WorkspaceRoot root)
             reg = Registry.mkRegistry [op]
             patch = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
-        r <- runTestApp (dispatchOne reg (OpName "FILE_PATCH")
+        r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_PATCH")
                           (object [ "path" .= ("code.txt" :: Text)
                                   , "patch" .= (patch :: Text) ]))
         case r of
@@ -276,7 +275,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let op = filePatchOp (WorkspaceRoot root)
             reg = Registry.mkRegistry [op]
             wrongDiff = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
-        r <- runTestApp (dispatchOne reg (OpName "FILE_PATCH")
+        r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_PATCH")
                           (object [ "path" .= ("code.txt" :: Text)
                                   , "diff" .= (wrongDiff :: Text) ]))
         case r of
@@ -292,10 +291,10 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "SHELL_EXEC" $ do
     it "\"Run 'echo hello' in the shell.\" -> SHELL_EXEC -> stdout returned" $ do
       seen <- newIORef []
-      let backend = fakeBackend seen "hello\n"
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) backend
+      let uio = fakeUio seen "hello\n"
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg backend (OpName "SHELL_EXEC")
+      r <- runTestApp (dispatchOneWith reg uio (OpName "SHELL_EXEC")
                         (object ["command" .= ("echo hello" :: Text)]))
       case r of
         Right res -> do
@@ -306,9 +305,9 @@ spec = describe "Seal.ISA.Integration" $ do
 
     it "\"Run a command.\" -> SHELL_EXEC under a Deny policy -> Denied at the gate" $ do
       let op = shellExecOp (WorkspaceRoot "/ws")
-                          (SecurityPolicy (AllowOnly mempty) Deny) failBackend
+                          (SecurityPolicy (AllowOnly mempty) Deny)
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg failBackend (OpName "SHELL_EXEC")
+      r <- runTestApp (dispatchOneWith reg failUio (OpName "SHELL_EXEC")
                         (object ["command" .= ("rm -rf /" :: Text)]))
       r `shouldBe` Left (Denied "SHELL_EXEC denied by autonomy policy")
 
@@ -318,11 +317,11 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "BIN_EXEC" $ do
     it "\"Run this Python script: print('hi').\" -> BIN_EXEC -> binary output" $ do
       seen <- newIORef ([] :: [Text])
-      let backend = fakeBackend seen "hi\n"
+      let uio = fakeUio seen "hi\n"
           allowList = Just (Set.fromList ["python3" :: Text])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList backend
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg backend (OpName "BIN_EXEC")
+      r <- runTestApp (dispatchOneWith reg uio (OpName "BIN_EXEC")
                         (object [ "binary" .= ("python3" :: Text)
                                 , "args" .= (["-c", "print('hi')"] :: [Text]) ]))
       case r of
@@ -332,9 +331,9 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Run rm.\" -> BIN_EXEC with non-allow-listed binary -> Denied" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just mempty) failBackend
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just mempty)
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg failBackend (OpName "BIN_EXEC")
+      r <- runTestApp (dispatchOneWith reg failUio (OpName "BIN_EXEC")
                         (object [ "binary" .= ("rm" :: Text)
                                 , "args" .= (["-rf", "/"] :: [Text]) ]))
       r `shouldBe` Left (Denied "BIN_EXEC: binary \"rm\" not in the allow-list")
@@ -345,10 +344,10 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "PROCESS_MANAGE" $ do
     it "\"List the running processes.\" -> PROCESS_MANAGE action=list -> ps output returned" $ do
       seen <- newIORef ([] :: [Text])
-      let backend = fakeBackend seen "  1 /sbin/init\n 42 /bin/bash\n"
-          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) backend
+      let uio = fakeUio seen "  1 /sbin/init\n 42 /bin/bash\n"
+          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg backend (OpName "PROCESS_MANAGE")
+      r <- runTestApp (dispatchOneWith reg uio (OpName "PROCESS_MANAGE")
                         (object ["action" .= ("list" :: Text)]))
       case r of
         Right res -> do
@@ -359,9 +358,9 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Kill process -1.\" -> PROCESS_MANAGE pid=-1 -> Denied (validated PID)" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) failBackend
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg failBackend (OpName "PROCESS_MANAGE")
+      r <- runTestApp (dispatchOneWith reg failUio (OpName "PROCESS_MANAGE")
                         (object [ "action" .= ("kill" :: Text)
                                 , "pid" .= (-1 :: Int) ]))
       r `shouldBe` Left (Denied "PROCESS_MANAGE: pid must be a positive integer")
@@ -372,10 +371,10 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "SEARCH_FILES" $ do
     it "\"Find every occurrence of 'TODO' under src/.\" -> SEARCH_FILES -> matches returned" $ do
       seen <- newIORef ([] :: [Text])
-      let backend = fakeBackend seen "src/Foo.hs:1:TODO fix\nsrc/Bar.hs:3:TODO later\n"
-          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 backend
+      let uio = fakeUio seen "src/Foo.hs:1:TODO fix\nsrc/Bar.hs:3:TODO later\n"
+          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg backend (OpName "SEARCH_FILES")
+      r <- runTestApp (dispatchOneWith reg uio (OpName "SEARCH_FILES")
                         (object [ "pattern" .= ("TODO" :: Text)
                                 , "path" .= ("src" :: Text) ]))
       case r of
@@ -387,9 +386,9 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Search for '-x'.\" -> SEARCH_FILES pattern starting with - -> Denied (option injection)" $ do
-      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 failBackend
+      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
           reg = Registry.mkRegistry [op]
-      r <- runTestApp (dispatchOneWith reg failBackend (OpName "SEARCH_FILES")
+      r <- runTestApp (dispatchOneWith reg failUio (OpName "SEARCH_FILES")
                         (object ["pattern" .= ("-x" :: Text)]))
       r `shouldBe` Left (Denied "SEARCH_FILES: pattern must not start with '-' (option injection)")
 
@@ -727,14 +726,14 @@ spec = describe "Seal.ISA.Integration" $ do
                                   , "name" .= ("g" :: Text)
                                   , "provider" .= ("ollama" :: Text)
                                   , "model" .= ("llama3" :: Text) ]))
-      let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (SessionId "child")))
+      let worker _ _ _ _ = do modifyIORef' ran (+ 1); pure (ChildWorkerOutcome (Just "hi") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
           wiring = AgentStartWiring
             { aswDefBackend = backend
             , aswRuntime = rt
             , aswConfig = pure defaultDelegationConfig
             , aswPauseFlag = pauseFlag
             , aswParentActivity = Nothing
-            , aswMintSession = pure (SessionId "fresh")
+            , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = worker
             }
@@ -803,6 +802,7 @@ spec = describe "Seal.ISA.Integration" $ do
               , spConfig = tmpDir </> "config"
               , spState = tmpDir </> "state"
               , spKeys = tmpDir </> "keys"
+            , spCache  = tmpDir </> "cache"
               }
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig

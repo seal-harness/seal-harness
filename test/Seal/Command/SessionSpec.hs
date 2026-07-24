@@ -35,7 +35,7 @@ meta idText =
 mkSR :: FilePath -> SessionMeta -> IO SessionRuntime
 mkSR root active = do
   ref <- newIORef active
-  let paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys")
+  let paths = SealPaths root (root </> "config") (root </> "state") (root </> "keys") (root </> "cache")
   pure SessionRuntime { srPaths = paths, srConfigPath = root </> "config.toml", srActive = ref }
 
 -- | A 'ProviderRuntime' good enough to build a 'CommandSpec' for the help
@@ -45,7 +45,7 @@ mkPR cfgPath = do
   ref <- newIORef Nothing
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
-  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath
+  let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
   pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
 

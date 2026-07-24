@@ -1,8 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | WEB_FETCH (Untrusted): fetch a URL via @http-client@, bounded bytes,
--- domain allow-list, auth redaction. 'orRecorded' captures the URL + status +
--- byte count (NOT the body — the body may be large; the transcript records
--- metadata only).
+-- domain allow list, auth redaction, and SSRF defense (private/internal/
+-- metadata IPs blocked before the HTTP call). 'orRecorded' captures the
+-- URL + status + byte count (NOT the body — the body may be large; the
+-- transcript records metadata only).
 module Seal.Web.Fetch
   ( webFetchOp
   , WebFetchConfig (..)
@@ -26,6 +27,7 @@ import Network.HTTP.Types (statusCode)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Web.UrlSafety (isSafeUrl, renderUrlSafetyError)
 
 -- | The configuration for WEB_FETCH.
 data WebFetchConfig = WebFetchConfig
@@ -53,7 +55,7 @@ webFetchOp cfg = UntrustedOpcode
           | not (domainAllowed u (wfcAllowList cfg)) ->
               Left ("WEB_FETCH: domain not in allow-list: " <> hostOf u)
           | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let u = fromMaybe "" (urlField v)
       case wfcManager cfg of
         Nothing -> pure (OpResult
@@ -62,12 +64,25 @@ webFetchOp cfg = UntrustedOpcode
         Just mgr -> liftIO (doFetch mgr (wfcMaxBytes cfg) u)
   }
 
--- | Perform the HTTP fetch: parse the URL, execute the request, truncate the
--- response body to the byte ceiling, and return the decoded body + recorded
--- metadata. Errors (transport, non-2xx) surface as structured 'OpResult's
--- with @isError=True@.
+-- | Perform the HTTP fetch: SSRF check → parse the URL → execute the
+-- request → truncate the response body to the byte ceiling → return the
+-- decoded body + recorded metadata. Errors (SSRF, transport, non-2xx)
+-- surface as structured 'OpResult's with @isError=True@.
 doFetch :: Manager -> Int -> Text -> IO OpResult
 doFetch mgr maxBytes u = do
+  -- SSRF defense: block private/internal/metadata IPs BEFORE the HTTP call.
+  eSafe <- isSafeUrl u
+  case eSafe of
+    Left err -> pure (OpResult
+      [TrpText ("WEB_FETCH: blocked by SSRF protection: " <> renderUrlSafetyError err)]
+      True recordedErr)
+    Right () -> doFetchHttp mgr maxBytes u
+  where
+    recordedErr = object ["url" .= u, "status" .= (0 :: Int), "bytes" .= (0 :: Int)]
+
+-- | The HTTP fetch proper (SSRF check already passed).
+doFetchHttp :: Manager -> Int -> Text -> IO OpResult
+doFetchHttp mgr maxBytes u = do
   eReq <- try (parseRequest (T.unpack u))
   case eReq of
     Left (_ :: HttpException) ->

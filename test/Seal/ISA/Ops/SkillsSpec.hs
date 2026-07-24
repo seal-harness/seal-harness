@@ -8,7 +8,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Test.Hspec
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Skills
 import Seal.Providers.Class (ToolResultPart (..))
@@ -22,7 +22,7 @@ runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
 
 sampleSession :: SessionId
-sampleSession = SessionId "s1"
+sampleSession = mkSystemSessionId "s1"
 
 sampleSkillId :: SkillId
 sampleSkillId = case mkSkillId "s1" of
@@ -53,7 +53,7 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (skillWriteOp backend sampleSession) localBackend
                              (object ["id" .= ("s1" :: Text), "description" .= ("greet" :: Text), "body" .= ("old" :: Text)]))
-      let op = skillWriteOp backend (SessionId "s2")
+      let op = skillWriteOp backend (mkSystemSessionId "s2")
       r <- runTestApp (opRun op localBackend (object ["id" .= ("s1" :: Text), "description" .= ("greet2" :: Text), "body" .= ("new" :: Text)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "updated"]

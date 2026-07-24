@@ -19,8 +19,8 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
-  ( ProviderConfig (..), defaultFileConfig, loadFileConfig, providerBaseUrl
-  , providerDefaultModel, updateFileConfig, upsertProvider )
+  ( ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl
+  , providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
@@ -73,8 +73,8 @@ modelArg = T.pack <$> strArgument (metavar "MODEL" <> help "Model id")
 
 listCmd :: ProviderRuntime -> SessionRuntime -> Maybe Text -> CommandAction
 listCmd pr sr Nothing = CommandAction $ \caps -> do
-  eCfg <- loadFileConfig (prConfigPath pr)
-  let cfg = fromRight defaultFileConfig eCfg
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  let cfg = fromRight defaultRuntimeConfig eCfg
   mapM_ (ccSend caps . renderKnown cfg) knownProviders
   active <- readIORef (srActive sr)
   ccSend caps ("active: " <> smProvider active <> "/" <> smModel active)
@@ -87,7 +87,7 @@ listCmd pr _ (Just provLbl) = CommandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
-      eCfg <- loadFileConfig (prConfigPath pr)
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
       let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
       mh <- readIORef (vrHandleRef (prVault pr))
       eProv <- resolveProvider mh (prManager pr) baseUrl kp (defaultModelFor kp) (prCallCounter pr)
@@ -110,8 +110,8 @@ useCmd pr sr provLbl mModel = CommandAction $ \caps ->
       model <- case mModel of
         Just m  -> pure m
         Nothing -> do
-          eCfg <- loadFileConfig (prConfigPath pr)
-          let cfg = fromRight defaultFileConfig eCfg
+          eCfg <- loadRuntimeConfig (prConfigPath pr)
+          let cfg = fromRight defaultRuntimeConfig eCfg
               ModelId m = resolveDefaultModel (providerDefaultModel cfg (providerLabel kp)) (providerLabel kp)
           pure m
       m0 <- readIORef (srActive sr)
@@ -125,7 +125,7 @@ defaultCmd pr _ provLbl model = CommandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
-      res <- updateFileConfig (prConfigPath pr)
+      res <- updateRuntimeConfig (prConfigPath pr)
                (upsertProvider (providerLabel kp) (\p -> p { pcDefaultModel = Just model }))
       case res of
         Left e   -> ccSend caps e

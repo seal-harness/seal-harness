@@ -33,7 +33,7 @@ import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
 
 import Seal.Channel.Caps (ChannelCaps (..))
-import Seal.Config.File (FileConfig (..))
+import Seal.Config.Security (SecurityConfig (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Security.Path (ensureKeysRoot, getSafeKeyPath, mkSafeKeyPath)
 import Seal.Security.Vault (UnlockMode (..))
@@ -232,9 +232,9 @@ parseUnlockMode (Just "startup")    = UnlockStartup
 parseUnlockMode (Just "per_access") = UnlockPerAccess
 parseUnlockMode _                   = UnlockOnDemand
 
-resolveEncryptor :: FileConfig -> IO (Either VaultError VaultEncryptor)
+resolveEncryptor :: SecurityConfig -> IO (Either VaultError VaultEncryptor)
 resolveEncryptor fc =
-  case (fcVaultRecipient fc, fcVaultIdentity fc) of
+  case (scVaultRecipient fc, scVaultIdentity fc) of
     (Just r, Just i) ->
       mkAgeEncryptor (AgeRecipient r) (AgeIdentity i)
     (Nothing, _) ->

@@ -8,7 +8,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (mkSystemSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Memory.Backend
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId, memoryIdText)
@@ -29,7 +29,7 @@ mkEntry content = MemoryEntry
   , meTags = ["greeting", "demo"]
   , meCreatedAt = sampleTime
   , meUpdatedAt = sampleTime
-  , meSession = SessionId "s1"
+  , meSession = mkSystemSessionId "s1"
   }
 
 spec :: Spec

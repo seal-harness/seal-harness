@@ -9,8 +9,9 @@ module Seal.Core.Types
   , ModelId (..)
   , ToolCallId (..)
   , OpName (..)
-  , SessionId (..)
+  , SessionId
   , mkSessionId
+  , mkSystemSessionId
   , sessionIdText
   , isValidSessionId
   ) where
@@ -58,6 +59,16 @@ mkSessionId :: Text -> Either Text SessionId
 mkSessionId t
   | isValidSessionId t = Right (SessionId t)
   | otherwise          = Left ("invalid session id: " <> T.pack (show t))
+
+-- | Total constructor for known-safe system strings (e.g. @"web"@,
+-- @"manual"@). Calls 'isValidSessionId' internally and errors on
+-- failure — it does NOT bypass validation. Use only for compile-time-
+-- known literals; runtime-derived strings should use 'mkSessionId' (the
+-- 'Either'-returning variant).
+mkSystemSessionId :: Text -> SessionId
+mkSystemSessionId t
+  | isValidSessionId t = SessionId t
+  | otherwise          = error ("mkSystemSessionId: invalid session id: " <> T.unpack t)
 
 sessionIdText :: SessionId -> Text
 sessionIdText (SessionId t) = t

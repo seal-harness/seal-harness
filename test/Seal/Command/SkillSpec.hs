@@ -13,7 +13,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Skill (renderSkillInfo, renderSkillLine, skillCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
-import Seal.Core.Types (OpName (..), SessionId (..))
+import Seal.Core.Types (OpName (..), mkSystemSessionId)
 import Seal.ISA.Dispatch (DispatchError (..))
 import Seal.ISA.Opcode (OpResult (..))
 import Seal.Providers.Class (ToolResultPart (..))
@@ -29,7 +29,7 @@ mkSkill sid desc body =
   case mkSkillId sid of
     Right i  -> pure Skill
       { skId = i, skDescription = desc, skBody = body
-      , skCreatedAt = aTime, skUpdatedAt = aTime, skSession = SessionId "s1" }
+      , skCreatedAt = aTime, skUpdatedAt = aTime, skSession = mkSystemSessionId "s1" }
     Left e   -> error ("invalid skill id: " <> T.unpack e)
 
 -- | A canned 'Right' dispatcher that returns a fixed text body. Used for the

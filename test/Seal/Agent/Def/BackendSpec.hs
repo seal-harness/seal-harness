@@ -13,7 +13,7 @@ import Test.Hspec
 
 import Seal.Agent.Def.Backend
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), mkSystemSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.Arbitrary ()
@@ -36,7 +36,7 @@ mkDef name = AgentDef
   , adTools = AllowAll
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
-  , adSession = SessionId "s1"
+  , adSession = mkSystemSessionId "s1"
   }
 
 spec :: Spec
@@ -123,7 +123,7 @@ spec = describe "Seal.Agent.Def.Backend" $ do
             adProvider d `shouldBe` ""
             adModel d `shouldBe` ModelId ""
             adTools d `shouldBe` AllowAll
-            adSession d `shouldBe` SessionId "manual"
+            adSession d `shouldBe` mkSystemSessionId "manual"
             case adSystem d of
               Just prompt -> do
                 prompt `shouldSatisfy` ("--- SOUL ---" `T.isInfixOf`)
@@ -207,7 +207,7 @@ spec = describe "Seal.Agent.Def.Backend" $ do
                   , adTools = AllowAll
                   , adCreatedAt = sampleTime
                   , adUpdatedAt = sampleTime
-                  , adSession = SessionId "s1"
+                  , adSession = mkSystemSessionId "s1"
                   }
             backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
             adbUpdate backend flat

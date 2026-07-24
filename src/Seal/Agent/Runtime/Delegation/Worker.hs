@@ -34,14 +34,14 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths, agentSessionDir)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId (..))
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (withTwoFileTranscript)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
-import Seal.Tools.Exec.Types (ExecBackend)
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Env (Env)
 
@@ -94,7 +94,11 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdAppEnv       :: Env
     -- ^ The top-level app env (katip logging, config) — re-used for the
     -- child's 'runApp'.
-  , dwdExecBackend  :: ExecBackend
+  , dwdMkUntrustedIO :: SessionId -> IO UntrustedIO
+    -- ^ Construct the child's 'UntrustedIO' capability handle from the
+    -- child's session id. The wiring layer creates the child's workdir
+    -- (per-session isolation) and resolves the security config into the
+    -- handle. Called at child-start time (after the child's sid is minted).
   , dwdAutonomy     :: AutonomyLevel
   , dwdApprovals    :: ApprovalCache
   , dwdOnDemand     :: Bool
@@ -103,7 +107,7 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdResolveProvider :: AgentDef -> IO (Either Text (SomeProvider, ModelId))
     -- ^ Resolve the child's provider+model from the def, applying any
     -- delegation.provider/model/base_url override (the wiring layer reads
-    -- the override from the FileConfig and threads it here).
+    -- the override from the RuntimeConfig and threads it here).
   , dwdChildRegistry
       :: AgentDef -> SessionId -> ChannelCaps -> IO Registry
     -- ^ Build the child's narrowed ISA registry. The wiring layer is
@@ -145,6 +149,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , ccPromptSecret = \_ -> pure ""
               }
         childReg <- dwdChildRegistry deps def childSid capturingCaps
+        childUio <- dwdMkUntrustedIO deps childSid
         let env = AgentEnv
               { aeProvider   = prov
               , aeProviderLabel = providerLabel def
@@ -153,7 +158,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeRegistry   = childReg
               , aeTranscript = childTHandle
               , aeBackend    = localBackend
-              , aeExecBackend = dwdExecBackend deps
+              , aeUntrustedIO = childUio
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 12

@@ -6,7 +6,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
+import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
 import Seal.Gateway.Config
 
 spec :: Spec
@@ -49,12 +49,12 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcStaticDir = Just "/srv/seal"
               , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
               }
-            cfg = defaultFileConfig { fcGateway = Just partial }
-        saveFileConfig path cfg
-        result <- loadFileConfig path
+            cfg = defaultRuntimeConfig { rcGateway = Just partial }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
         case result of
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
-          Right loaded -> fcGateway loaded `shouldBe` Just partial
+          Right loaded -> rcGateway loaded `shouldBe` Just partial
 
     it "round-trips a [gateway] section with only some fields set (rest default)" $
       withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
@@ -67,23 +67,23 @@ spec = describe "Seal.Gateway.Config" $ do
               , pgcStaticDir = Nothing
               , pgcAllowedOrigins = []
               }
-            cfg = defaultFileConfig { fcGateway = Just partial }
-        saveFileConfig path cfg
-        result <- loadFileConfig path
+            cfg = defaultRuntimeConfig { rcGateway = Just partial }
+        saveRuntimeConfig path cfg
+        result <- loadRuntimeConfig path
         case result of
           Left err -> expectationFailure ("load failed: " <> T.unpack err)
           Right loaded -> do
-            fcGateway loaded `shouldBe` Just partial
+            rcGateway loaded `shouldBe` Just partial
             -- The merge fills in ws_port + allowed_origins from defaults.
-            let full = maybe defaultGatewayConfig withGatewayDefaults (fcGateway loaded)
+            let full = maybe defaultGatewayConfig withGatewayDefaults (rcGateway loaded)
             gcWsPort full `shouldBe` 8081
             gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]
 
     it "absent section decodes as Nothing" $
       withSystemTempDirectory "seal-gw-cfg" $ \dir -> do
         let path = dir </> "config.toml"
-        saveFileConfig path defaultFileConfig
-        result <- loadFileConfig path
+        saveRuntimeConfig path defaultRuntimeConfig
+        result <- loadRuntimeConfig path
         case result of
-          Right loaded -> fcGateway loaded `shouldBe` Nothing
+          Right loaded -> rcGateway loaded `shouldBe` Nothing
           Left err -> expectationFailure ("load failed: " <> T.unpack err)

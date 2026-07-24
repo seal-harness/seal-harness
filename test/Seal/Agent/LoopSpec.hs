@@ -35,7 +35,8 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Agent.Env
-import Seal.Tools.Exec.Types (ExecBackend (..), LocalExecHandle (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Agent.Loop
 
 -- | A provider that returns a scripted list of responses, one per call.
@@ -86,7 +87,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (mkRegistry [stubOp])
                 h
                 localBackend
-                (EbLocal mkLocalExecHandlePlaceholder)
+                mkRemoteUntrustedIOStub
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
@@ -119,7 +120,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 (mkRegistry [])
                 h
                 localBackend
-                (EbLocal mkLocalExecHandlePlaceholder)
+                mkRemoteUntrustedIOStub
                 caps
                 (either (error "sid") id (mkSessionId "s1"))
                 8
@@ -171,7 +172,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (mkRegistry [])
                       h
                       localBackend
-                      (EbLocal mkLocalExecHandlePlaceholder)
+                      mkRemoteUntrustedIOStub
                       caps
                       (either (error "sid") id (mkSessionId "s1"))
                       8
@@ -221,7 +222,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (mkRegistry [])
                       h
                       localBackend
-                      (EbLocal mkLocalExecHandlePlaceholder)
+                      mkRemoteUntrustedIOStub
                       caps
                       (either (error "sid") id (mkSessionId "s1"))
                       8
@@ -281,7 +282,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       (mkRegistry [])
                       h
                       localBackend
-                      (EbLocal mkLocalExecHandlePlaceholder)
+                      mkRemoteUntrustedIOStub
                       caps
                       (either (error "sid") id (mkSessionId "s1"))
                       8
@@ -330,18 +331,15 @@ spec = describe "Seal.Agent.Loop" $ do
   -- -----------------------------------------------------------------------
 
   describe "human-confirmation gate" $ do
-    let mkRecordBackend :: IO (IORef Bool, ExecBackend)
-        mkRecordBackend = do
+    let mkRecordUntrustedIO :: IO (IORef Bool, UntrustedIO)
+        mkRecordUntrustedIO = do
           ran <- newIORef False
-          let handle = LocalExecHandle
-                { lehExecShell = \_ _ -> do
-                    writeIORef ran True
-                    pure (Right "executed")
-                , lehExecBin = \_ _ -> do
+          let uio = mkRemoteUntrustedIOStub
+                { uioShellExec = \_ _ -> do
                     writeIORef ran True
                     pure (Right "executed")
                 }
-          pure (ran, EbLocal handle)
+          pure (ran, uio)
         shellScript :: [CompletionResponse]
         shellScript =
           [ CompletionResponse
@@ -355,20 +353,20 @@ spec = describe "Seal.Agent.Loop" $ do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
-      (ran, backend) <- mkRecordBackend
+      (ran, uio) <- mkRecordUntrustedIO
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "once")
                    (\_ -> pure "")
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
-          reg = mkRegistry [shellExecOp wsRoot policy backend]
+          reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
 
@@ -376,20 +374,20 @@ spec = describe "Seal.Agent.Loop" $ do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
-      (ran, backend) <- mkRecordBackend
+      (ran, uio) <- mkRecordUntrustedIO
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
                    (\_ -> pure "")
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
-          reg = mkRegistry [shellExecOp wsRoot policy backend]
+          reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` False
 
@@ -397,20 +395,20 @@ spec = describe "Seal.Agent.Loop" $ do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
-      (ran, backend) <- mkRecordBackend
+      (ran, uio) <- mkRecordUntrustedIO
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant")
                    (\_ -> pure "")
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Full
-          reg = mkRegistry [shellExecOp wsRoot policy backend]
+          reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  backend caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False
+                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
       readIORef prompts `shouldReturn` ([] :: [Text])
@@ -442,7 +440,7 @@ spec = describe "Seal.Agent.Loop" $ do
           env = AgentEnv
                   (SomeProvider (ScriptProvider ref))
                   "ollama" (ModelId "m") Nothing reg h localBackend
-                  (EbLocal mkLocalExecHandlePlaceholder) caps
+                  mkRemoteUntrustedIOStub caps
                   (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False
       runTestApp (runTurn env "ping")
       readIORef ran `shouldReturn` 1

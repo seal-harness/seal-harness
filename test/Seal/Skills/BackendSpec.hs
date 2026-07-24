@@ -8,7 +8,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (mkSystemSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Skills.Backend
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
@@ -29,7 +29,7 @@ mkSkill desc body = Skill
   , skBody = body
   , skCreatedAt = sampleTime
   , skUpdatedAt = sampleTime
-  , skSession = SessionId "s1"
+  , skSession = mkSystemSessionId "s1"
   }
 
 spec :: Spec

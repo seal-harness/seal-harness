@@ -25,14 +25,14 @@ import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
-import System.Directory (createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 
 import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
@@ -40,14 +40,16 @@ import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
-  ( Backends (..), execBackendFromFile, mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
-  ( FileConfig, defaultRetrievalMaxScanBytes, loadFileConfig, retrievalMaxScanBytes
-  , onDemandSchemas, fcDelegation, fcDebugSessionTranscript )
-import Seal.Config.Paths (SealPaths, sessionConversationPath, sessionDir, sessionRequestsPath)
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  , WebConfig (..), rcWeb
+  , onDemandSchemas, rcDelegation, rcDebugSessionTranscript )
+import Seal.Config.Security (loadSecurityConfig)
+import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -93,12 +95,13 @@ import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, SessionLocks, withSessionLock )
-import Seal.Tools.Exec.Types (ExecBackend (..), mkLocalExecHandlePlaceholder)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
@@ -194,10 +197,10 @@ sendOutcomeJson = \case
 -- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
 -- otherwise @Nothing@. The debug file records each 'CompletionRequest' in
 -- full (including the complete message history) exactly as sent to the LLM.
-debugPath :: SealPaths -> SessionId -> Either a FileConfig -> Maybe FilePath
+debugPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
 debugPath paths sid eCfg =
   case eCfg of
-    Right cfg | Just True <- fcDebugSessionTranscript cfg ->
+    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
       Just (sessionRequestsPath paths sid)
     _ -> Nothing
 
@@ -268,34 +271,37 @@ plainTurn deps meta t = do
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
       turnResult <- withSessionLock (sdLocks deps) sid
-        (withTwoFileTranscript sessionDirPath (\tHandle -> do
-          wsroot <- WorkspaceRoot <$> getCurrentDirectory
-          appEnv <- mkEnv defaultConfig
-          eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
-          let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-              execBackend = either (const defaultExecBackend) (execBackendFromFile wsroot) eCfg
-              defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder  -- fail-closed default
-              agentDefBackend = bAgentDefs (sdBackends deps)
-              caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-          mSystem <- resolveSystemPrompt agentDefBackend meta
-          let onDemand = either (const False) onDemandSchemas eCfg
-              startWiring = webStartWiring
-                deps paths sid caps execBackend appEnv eCfg
-                wsroot operatorCeiling
-              isaReg = buildWebRegistry
-                (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
-                execBackend (sdAutonomy deps) startWiring
-                (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-                caps onDemand
-              env = mkSessionAgentEnv
-                caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
-                (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-                (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                onDemand
-          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          result <- runApp appEnv (runTurn env t)
-          broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-          pure result))
+           (withTwoFileTranscript sessionDirPath (\tHandle -> do
+            appEnv <- mkEnv defaultConfig
+            eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+            eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
+            let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+            untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
+            eWd <- ensureSessionWorkdir paths sid
+            let wsroot = case eWd of
+                  Right wd -> WorkspaceRoot wd
+                  Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+                agentDefBackend = bAgentDefs (sdBackends deps)
+                caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+            mSystem <- resolveSystemPrompt agentDefBackend meta
+            let onDemand = either (const False) onDemandSchemas eCfg
+                startWiring = webStartWiring
+                  deps paths sid caps untrustedIO appEnv eCfg
+                  wsroot operatorCeiling
+                isaReg = buildWebRegistry
+                  (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
+                  (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
+                  (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+                  caps onDemand
+                env = mkSessionAgentEnv
+                  caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                  (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
+                  (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
+                  onDemand
+            tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+            result <- runApp appEnv (runTurn env t)
+            broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+            pure result))
       -- Fan out the reply to chat channels subscribed to this session.
       -- The web frontend already received entries via the WS broker above;
       -- only chat channels need the explicit chSend.
@@ -307,7 +313,7 @@ plainTurn deps meta t = do
 -- worker-builder is closed over per-turn values by the caller in
 -- 'plainTurn'). Includes the Untrusted execution opcodes (SHELL_EXEC,
 -- CODE_EXEC, PROCESS_MANAGE, FILE_WRITE, FILE_PATCH, SEARCH_FILES) wired
--- to the per-session 'ExecBackend' and a 'SecurityPolicy' derived from
+-- to the per-session 'UntrustedIO' and a 'SecurityPolicy' derived from
 -- the CLI autonomy level. The fail-closed provider-pluggable opcodes
 -- (WEB_SEARCH, WEB_FETCH, BROWSER_OPEN/CLICK/READ, IMAGE_GENERATE/
 -- DESCRIBE, TEXT_TO_SPEECH) are registered with their default fail-closed
@@ -319,7 +325,8 @@ plainTurn deps meta t = do
 -- per-call session/window/flavour from the input is a later phase.
 buildWebRegistry
   :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
-  -> ExecBackend -> Policy.AutonomyLevel
+  -> Policy.AutonomyLevel
+  -> Maybe WebConfig
   -> AgentStartWiring
   -> HarnessRegistry
   -> TmuxRunner
@@ -327,7 +334,7 @@ buildWebRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
+buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -351,13 +358,13 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-      , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
+      , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy execBackend
-      , binExecOp wsRoot securityPolicy binAllowList execBackend
-      , processManageOp wsRoot securityPolicy execBackend
+      , shellExecOp wsRoot securityPolicy
+      , binExecOp wsRoot securityPolicy binAllowList
+      , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
       , harnessListOp harnessReg
@@ -378,21 +385,20 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling execBackend autonomy
     reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     binAllowList = Nothing
-    -- Fail-closed defaults for the provider-pluggable opcodes. These surface
-    -- as available tools to the LLM; the opcodes return a structured error
-    -- until a real provider is configured (operator-supplied via config in a
-    -- follow-up). Empty allow-lists mean all domains are permitted at the
-    -- gate; the fail-closed run path is what enforces the boundary today.
+    -- Web tool config resolved from the @[web]@ section of config.toml.
+    -- Absent section → fail-closed (empty endpoint, all domains allowed,
+    -- operatorCeiling for fetch bytes). SSRF protection is always enforced
+    -- (in the opcode, via Seal.Web.UrlSafety), regardless of allow-list.
     webSearchCfg = WebSearchConfig
       { wscManager   = httpManager
-      , wscEndpoint  = ""
-      , wscAllowList = []
+      , wscEndpoint  = unwrapOpt wcSearchEndpoint webCfg ""
+      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey   = Nothing
       }
     webFetchCfg = WebFetchConfig
       { wfcManager   = httpManager
-      , wfcAllowList = []
-      , wfcMaxBytes  = operatorCeiling
+      , wfcAllowList = unwrapOpt wcFetchAllowList webCfg []
+      , wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling
       , wfcAuthKey   = Nothing
       }
     -- Fixed tmux session/window idents for HARNESS_START. The 6b wiring that
@@ -479,25 +485,28 @@ plainTurnWithCaps deps meta caps t = do
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
       Right <$> withTwoFileTranscript sessionDirPath (\tHandle -> do
-        wsRoot <- WorkspaceRoot <$> getCurrentDirectory
         appEnv <- mkEnv defaultConfig
-        eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+        eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+        eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-            defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
+        untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
+        eWd <- ensureSessionWorkdir paths sid
+        let wsRoot = case eWd of
+              Right wd -> WorkspaceRoot wd
+              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
             agentDefBackend = bAgentDefs (sdBackends deps)
         mSystem <- resolveSystemPrompt agentDefBackend meta
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
-              deps paths sid caps execBackend appEnv eCfg
+              deps paths sid caps untrustedIO appEnv eCfg
               wsRoot operatorCeiling
             isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-              execBackend (sdAutonomy deps) startWiring
+              (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
             env = mkSessionAgentEnv
-              caps prov (smProvider meta) model sid mSystem isaReg tHandle execBackend
+              caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
               (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
               onDemand
@@ -521,24 +530,27 @@ webCallDispatcher deps callOpName val = do
       sessionDirPath = sessionDir paths sid
   createDirectoryIfMissing True sessionDirPath
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    wsRoot <- WorkspaceRoot <$> getCurrentDirectory
     appEnv <- mkEnv defaultConfig
-    eCfg <- loadFileConfig (prConfigPath (sdProvider deps))
+    eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+    eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        execBackend = either (const defaultExecBackend) (execBackendFromFile wsRoot) eCfg
-        defaultExecBackend = EbLocal mkLocalExecHandlePlaceholder
+    untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
+    eWd <- ensureSessionWorkdir paths sid
+    let wsRoot = case eWd of
+          Right wd -> WorkspaceRoot wd
+          Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     let onDemand = either (const False) onDemandSchemas eCfg
         startWiring = webStartWiring
-          deps paths sid caps execBackend appEnv eCfg
+          deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling
         isaReg = buildWebRegistry
-          (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
-          execBackend (sdAutonomy deps) startWiring
+              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend execBackend callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> recordSkillLoadResult tHandle callOpName val r
       Left _  -> pure ()
@@ -554,24 +566,32 @@ webMintSession fallback = do
     -- unreachable: formatSessionId only emits digits and dashes
     Left _e  -> pure fallback
 
+-- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
+-- the default when the config section or the field is absent.
+unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
+unwrapOpt field webCfg def =
+  case webCfg of
+    Nothing   -> def
+    Just cfg  -> fromMaybe def (field cfg)
+
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
--- 'SendDeps' + parent session id + 'ChannelCaps' + 'ExecBackend' + 'Env' +
+-- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int -> AgentStartWiring
-webStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling =
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> AgentStartWiring
+webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling =
   AgentStartWiring
     { aswDefBackend = bAgentDefs (sdBackends deps)
     , aswRuntime = bRuntime (sdBackends deps)
     , aswConfig = do
-        eCfg' <- loadFileConfig (prConfigPath (sdProvider deps))
-        pure (fromFileConfig (either (const Nothing) fcDelegation eCfg'))
+        eCfg' <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+        pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
     , aswPauseFlag = bSpawnPauseFlag (sdBackends deps)
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = webMkWorker deps paths parentSid caps execBackend appEnv eCfg wsRoot operatorCeiling
+    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling
     }
 
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
@@ -583,15 +603,21 @@ webStartWiring deps paths parentSid caps execBackend appEnv eCfg wsRoot operator
 -- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> ExecBackend -> Env
-  -> Either a FileConfig -> WorkspaceRoot -> Int
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int
   -> AgentWorkerBuilder
-webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCeiling =
+webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdExecBackend = execBackend
+    , dwdMkUntrustedIO = \childSid -> do
+        eChildWd <- ensureSessionWorkdir paths childSid
+        let childWsRoot = case eChildWd of
+              Right wd -> WorkspaceRoot wd
+              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+        eSecCfg <- loadSecurityConfig (securityFilePath paths)
+        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity childWsRoot) eSecCfg)
     , dwdAutonomy = sdAutonomy deps
     , dwdApprovals = sdApprovals deps
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -618,6 +644,10 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
            (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
            (Nothing, Nothing)                -> Nothing
     buildChildRegistry _def childSid childCaps = do
+      eChildWd <- ensureSessionWorkdir paths childSid
+      let childWsRoot = case eChildWd of
+            Right wd -> WorkspaceRoot wd
+            Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
       let childBaseOps =
             [ showHumanOp childCaps
             , askHumanOp childCaps
@@ -634,13 +664,13 @@ webMkWorker deps paths parentSid _caps execBackend appEnv eCfg wsRoot operatorCe
             -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
             -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
             -- AGENT_INTERRUPT
-            , searchFilesOp wsRoot securityPolicy operatorCeiling execBackend
-            , fileReadOp wsRoot operatorCeiling
-            , fileWriteOp wsRoot operatorCeiling
-            , filePatchOp wsRoot
-            , shellExecOp wsRoot securityPolicy execBackend
-            , binExecOp wsRoot securityPolicy binAllowList execBackend
-            , processManageOp wsRoot securityPolicy execBackend
+            , searchFilesOp childWsRoot securityPolicy operatorCeiling
+            , fileReadOp childWsRoot operatorCeiling
+            , fileWriteOp childWsRoot operatorCeiling
+            , filePatchOp childWsRoot
+            , shellExecOp childWsRoot securityPolicy
+            , binExecOp childWsRoot securityPolicy binAllowList
+            , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
             , webSearchOp webSearchCfg
             ]

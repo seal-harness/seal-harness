@@ -36,7 +36,7 @@ import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
-fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "" }
+fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
 
 fakeMeta :: SessionMeta
 fakeMeta =

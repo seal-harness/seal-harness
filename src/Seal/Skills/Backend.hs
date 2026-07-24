@@ -33,7 +33,7 @@ import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup)
@@ -94,7 +94,6 @@ encodeSkill s = encodeDoc fm (skBody s)
       , ("updated_at", isoTime (skUpdatedAt s))
       , ("session", sessionIdText (skSession s))
       ]
-    sessionIdText (SessionId t) = t
 
 -- | Decode a Markdown document into a 'Skill'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkSkillId'. Timestamps default to epoch 0 when
@@ -111,7 +110,7 @@ decodeSkill content =
         , skBody = body
         , skCreatedAt = parseTime (fmLookup "created_at" fm)
         , skUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , skSession = SessionId (fromMaybe "unknown" (fmLookup "session" fm))
+        , skSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Write one skill to disk (atomic) and auto-commit.

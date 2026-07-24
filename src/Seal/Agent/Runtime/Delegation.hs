@@ -96,7 +96,7 @@ import System.Random (randomRIO)
 import System.Timeout (timeout)
 
 import Seal.Agent.Def.Types (AgentDef (..))
-import Seal.Core.Types (SessionId (..))
+import Seal.Core.Types (SessionId, sessionIdText)
 import qualified Seal.Config.File as ConfigFile
 
 -- ---------------------------------------------------------------------------
@@ -220,11 +220,6 @@ mkSubagentId defIdText = do
 
 subagentIdText :: SubagentId -> Text
 subagentIdText (SubagentId t) = t
-
--- | Extract the 'Text' from a 'SessionId' (local helper to avoid an import
--- cycle — 'Seal.Core.Types' exports this elsewhere, but we keep it local).
-sessionIdText :: SessionId -> Text
-sessionIdText (SessionId t) = t
 
 -- | Show an 'Int' as 8-char zero-padded lowercase hex.
 showHexI32 :: Int -> Text

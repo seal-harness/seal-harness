@@ -55,7 +55,7 @@ webSearchOp cfg = UntrustedOpcode
         Just q
           | T.null q -> Left "WEB_SEARCH: query is empty"
           | otherwise -> Right ()
-  , uoRun = \_back _execBackend v -> do
+  , uoRun = \_uio v -> do
       let q = fromMaybe "" (queryField v)
       case (wscManager cfg, wscEndpoint cfg) of
         (Nothing, _) -> pure (OpResult

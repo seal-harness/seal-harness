@@ -16,8 +16,8 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec (CommandSpec (..), CommandAction (..))
-import Seal.Config.File (FileConfig (..), defaultFileConfig, loadFileConfig, saveFileConfig)
-import Seal.Config.Paths (SealPaths (..), vaultFilePath)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, saveSecurityConfig)
+import Seal.Config.Paths (SealPaths (..), securityFilePath, vaultFilePath)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), VaultStatus (..), UnlockMode (..), openVault)
 import Seal.Security.Vault.Age (VaultError (..), mkMockEncryptor)
 import Seal.TestHelpers.FakeCaps (FakeCaps, makeFakeCaps, getSent)
@@ -44,6 +44,7 @@ withTestEnv inputs k =
           , spConfig = tmpDir </> "config"
           , spState  = tmpDir </> "state"
           , spKeys   = tmpDir </> "keys"
+          , spCache  = tmpDir </> "cache"
           }
     createDirectoryIfMissing True vaultDir
     let vaultCfg = VaultConfig
@@ -86,12 +87,12 @@ runVaultCmd_ rt caps args = do
     Right () -> pure ()
     Left msg -> expectationFailure $ "vault command parse failed: " ++ msg
 
--- | The vault identity path currently recorded in config (empty if absent).
-identityFromConfig :: FilePath -> IO FilePath
-identityFromConfig cfgPath = do
-  c <- loadFileConfig cfgPath
+-- | The vault identity path currently recorded in security config (empty if absent).
+identityFromConfig :: SealPaths -> IO FilePath
+identityFromConfig paths = do
+  c <- loadSecurityConfig (securityFilePath paths)
   pure $ case c of
-    Right fc -> maybe "" T.unpack (fcVaultIdentity fc)
+    Right sc -> maybe "" T.unpack (scVaultIdentity sc)
     Left _   -> ""
 
 -- ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ spec = describe "Seal.Vault.Commands" $ do
     it "list sends 'vault not configured' when handle is Nothing" $ do
       withSystemTempDirectory "seal-cmd-uncfg" $ \tmpDir -> do
         let paths = SealPaths tmpDir (tmpDir </> "config")
-                               (tmpDir </> "state") (tmpDir </> "keys")
+                               (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         ref <- newIORef Nothing
         let rt = VaultRuntime paths (tmpDir </> "config.toml") ref
         (fc, caps) <- makeFakeCaps []
@@ -116,7 +117,7 @@ spec = describe "Seal.Vault.Commands" $ do
     it "status sends 'vault not configured' when handle is Nothing" $ do
       withSystemTempDirectory "seal-cmd-uncfg" $ \tmpDir -> do
         let paths = SealPaths tmpDir (tmpDir </> "config")
-                               (tmpDir </> "state") (tmpDir </> "keys")
+                               (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         ref <- newIORef Nothing
         let rt = VaultRuntime paths (tmpDir </> "config.toml") ref
         (fc, caps) <- makeFakeCaps []
@@ -210,7 +211,7 @@ spec = describe "Seal.Vault.Commands" $ do
         let vaultDir  = tmpDir </> "config" </> "vault"
             vaultPath = vaultDir </> "vault.age"
             paths     = SealPaths tmpDir (tmpDir </> "config")
-                                   (tmpDir </> "state") (tmpDir </> "keys")
+                                   (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig vaultPath "mock" UnlockStartup
         h <- openVault vaultCfg mkMockEncryptor
@@ -270,7 +271,7 @@ spec = describe "Seal.Vault.Commands" $ do
           withSystemTempDirectory "seal-cmd-setup" $ \tmpDir -> do
             let vaultDir = tmpDir </> "config" </> "vault"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") (tmpDir </> "keys")
+                                      (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
                 cfgPath  = tmpDir </> "config" </> "config.toml"
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
@@ -296,7 +297,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -356,7 +357,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -373,7 +374,7 @@ spec = describe "Seal.Vault.Commands" $ do
             sent <- getSent fc
             sent `shouldSatisfy` any (T.isInfixOf "Delete that file")
 
-    it "setup creates vault at fcVaultPath when set in config.toml" $ do
+    it "setup creates vault at scVaultPath when set in security.toml" $ do
       ageExe       <- findExecutable "age"
       agekeygenExe <- findExecutable "age-keygen"
       case (ageExe, agekeygenExe) of
@@ -384,14 +385,14 @@ spec = describe "Seal.Vault.Commands" $ do
             let customVaultDir  = tmpDir </> "custom-vault-dir"
                 customVaultPath = customVaultDir </> "custom.age"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") (tmpDir </> "keys")
+                                      (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
                 cfgPath  = tmpDir </> "config" </> "config.toml"
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True (tmpDir </> "keys")
             createDirectoryIfMissing True customVaultDir
-            -- Pre-populate config with a custom vault_path.
-            saveFileConfig cfgPath
-              (defaultFileConfig { fcVaultPath = Just (T.pack customVaultPath) })
+            -- Pre-populate security.toml with a custom vault_path.
+            saveSecurityConfig (securityFilePath paths)
+              (defaultSecurityConfig { scVaultPath = Just (T.pack customVaultPath) })
             ref <- newIORef Nothing
             let rt = VaultRuntime paths cfgPath ref
             (fc, caps) <- makeFakeCaps ["1"]
@@ -418,7 +419,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -432,7 +433,7 @@ spec = describe "Seal.Vault.Commands" $ do
               Nothing -> expectationFailure "first setup did not populate vrHandleRef"
               Just h1 -> do
                 _ <- vhPut h1 "k" (TE.encodeUtf8 "v")
-                ident1 <- identityFromConfig cfgPath
+                ident1 <- identityFromConfig (vrPaths rt)
                 ident1 `shouldSatisfy` (not . null)
                 -- Second setup (local age) → rotation: "y" up front, backend "1".
                 (_, caps2) <- makeFakeCaps ["y", "1"]
@@ -440,7 +441,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 -- The OLD identity file is never overwritten.
                 doesFileExist ident1 `shouldReturn` True
                 -- Config now points at a fresh, different identity file.
-                ident2 <- identityFromConfig cfgPath
+                ident2 <- identityFromConfig (vrPaths rt)
                 ident2 `shouldNotBe` ident1
                 doesFileExist ident2 `shouldReturn` True
                 -- The pre-rotation secret survives the rotation.
@@ -461,7 +462,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 keysDir  = tmpDir </> "keys"
                 cfgPath  = tmpDir </> "config" </> "config.toml"
                 paths    = SealPaths tmpDir (tmpDir </> "config")
-                                      (tmpDir </> "state") keysDir
+                                      (tmpDir </> "state") keysDir (tmpDir </> "cache")
             createDirectoryIfMissing True vaultDir
             createDirectoryIfMissing True (tmpDir </> "config")
             createDirectoryIfMissing True keysDir
@@ -469,7 +470,7 @@ spec = describe "Seal.Vault.Commands" $ do
             let rt = VaultRuntime paths cfgPath ref
             (_, caps1) <- makeFakeCaps ["1"]
             runVaultCmd_ rt caps1 ["setup"]
-            ident1 <- identityFromConfig cfgPath
+            ident1 <- identityFromConfig (vrPaths rt)
             mh1 <- readIORef ref
             case mh1 of
               Nothing -> expectationFailure "first setup did not populate vrHandleRef"
@@ -481,7 +482,7 @@ spec = describe "Seal.Vault.Commands" $ do
                 sent2 <- getSent fc2
                 sent2 `shouldSatisfy` any (T.isInfixOf "cancelled")
                 -- Config key unchanged; the secret is still readable.
-                ident2 <- identityFromConfig cfgPath
+                ident2 <- identityFromConfig (vrPaths rt)
                 ident2 `shouldBe` ident1
                 vhGet h1 "k" `shouldReturn` Right (TE.encodeUtf8 "v")
 
@@ -523,7 +524,7 @@ spec = describe "Seal.Vault.Commands" $ do
         let vaultDir  = tmpDir </> "config" </> "vault"
             vaultPath = vaultDir </> "vault.age"
             paths     = SealPaths tmpDir (tmpDir </> "config")
-                                   (tmpDir </> "state") (tmpDir </> "keys")
+                                   (tmpDir </> "state") (tmpDir </> "keys") (tmpDir </> "cache")
         createDirectoryIfMissing True vaultDir
         let vaultCfg = VaultConfig vaultPath "mock" UnlockStartup
         h <- openVault vaultCfg mkMockEncryptor
