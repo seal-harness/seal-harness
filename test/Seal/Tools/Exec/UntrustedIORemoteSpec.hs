@@ -175,10 +175,25 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       -- The command reached the SSH runner (not ExecNotImplemented).
       recorded `shouldNotBe` []
       res `shouldSatisfy` \case Right _ -> True; Left _ -> False
-      -- The argv contains the command after @--@.
+      -- The argv contains the command after @--@. With no caller-supplied
+      -- cwd, the arm defaults to the workspace root (the one-root
+      -- invariant): the command string is `cd '<wsroot>' && echo ok`.
       case recorded of
-        [(argv, _)] -> argv `shouldSatisfy` elem "echo ok"
+        [(argv, _)] ->
+          argv `shouldSatisfy` elem "cd '/srv/agent-workspace' && echo ok"
         _           -> expectationFailure "expected one call"
+
+    it "defaults cwd to the workspace root when the caller omits it" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls (Right "")
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "pwd")
+      _ <- uioShellExec uio cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          argv `shouldSatisfy` elem "cd '/srv/agent-workspace' && pwd"
+        _ -> expectationFailure "expected one call"
 
     it "rejects a @..@ cwd before any SSH call" $ do
       calls <- newIORef []

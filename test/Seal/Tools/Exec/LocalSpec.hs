@@ -3,6 +3,7 @@ module Seal.Tools.Exec.LocalSpec (spec) where
 
 import Data.Either (isRight)
 import Data.Text qualified as T
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -10,6 +11,7 @@ import Seal.Tools.Args
   ( mkShellCommand, mkBinName, mkBinArg )
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 import Seal.Tools.Exec.Types (ExecError (..), LocalExecHandle (..))
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), mkLocalUntrustedIO)
 
 spec :: Spec
 spec = describe "Seal.Tools.Exec.Local" $ do
@@ -80,6 +82,30 @@ spec = describe "Seal.Tools.Exec.Local" $ do
         Right out -> out `shouldSatisfy` (not . T.null)
         Left ExecNotImplemented -> pendingWith "printf not on PATH"
         Left _ -> pendingWith "unexpected Left"
+
+  describe "mkLocalUntrustedIO (one-root invariant)" $ do
+
+    it "uioShellExec with no cwd runs in the workdir root, not the process cwd" $
+      withSystemTempDirectory "seal-wsroot" $ \wd -> do
+        -- Regression: uioShellExec previously passed cwd=Nothing, so the
+        -- subprocess inherited the harness process's cwd (the repo). The
+        -- one-root invariant: all untrusted opcodes share the workdir root,
+        -- so `pwd` must return the workdir, not the process cwd.
+        let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
+        cmd <- requireRight "fixture" (mkShellCommand "pwd")
+        res <- uioShellExec uio cmd Nothing
+        case res of
+          Right out -> T.strip out `shouldBe` T.pack wd
+          Left e    -> expectationFailure ("expected Right, got Left " ++ show e)
+
+    it "uioBinExec with no cwd runs in the workdir root, not the process cwd" $
+      withSystemTempDirectory "seal-wsroot" $ \wd -> do
+        let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
+        bin <- requireRight "fixture" (mkBinName "pwd")
+        res <- uioBinExec uio bin []
+        case res of
+          Right out -> T.strip out `shouldBe` T.pack wd
+          Left e    -> expectationFailure ("expected Right, got Left " ++ show e)
 
 requireRight :: String -> Either a b -> IO b
 requireRight _ (Right x) = pure x
