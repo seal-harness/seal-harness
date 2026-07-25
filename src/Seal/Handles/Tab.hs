@@ -28,7 +28,8 @@ maxTabIndex = 35
 -- | A validated tab index: 0..35 (the terse grammar maps 0-9a-z to 0..35).
 -- Smart-constructed; the predicate rejects <0 and >35.
 newtype TabIndex = TabIndex Int
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
 
 mkTabIndex :: Int -> Either Text TabIndex
 mkTabIndex n

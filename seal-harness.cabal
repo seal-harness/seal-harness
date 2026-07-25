@@ -291,6 +291,7 @@ test-suite tests
         Seal.Tabs.TypesSpec
         Seal.TabsSpec
         Seal.Tabs.PartitionSpec
+        Seal.Tabs.PersistSpec
         Seal.Tabs.RelaySpec
         Seal.Tabs.WizardSpec
         Seal.Routing.RouteSpec
