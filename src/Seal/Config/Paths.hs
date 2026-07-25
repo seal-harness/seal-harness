@@ -18,6 +18,7 @@ module Seal.Config.Paths
   , agentSessionDir
   , workdirsRoot
   , sessionWorkdir
+  , tabListPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -149,6 +150,13 @@ sessionRequestsPath paths sid = sessionDir paths sid </> "requests.jsonl"
 -- an ISO-8601 timestamp prefix.
 sessionLogPath :: SealPaths -> SessionId -> FilePath
 sessionLogPath paths sid = sessionDir paths sid </> "seal.log"
+
+-- | The persisted tab list: @\<state\>\/tabs.json@. Mirrors 'ui_state.json'
+-- (the frontend-owned recall file). Written atomically (0600) by
+-- 'Seal.Tabs.Persist.saveTabList' on every tab mutation; loaded at boot by
+-- 'loadTabList' so the tab list survives a @seal serve@ restart.
+tabListPath :: SealPaths -> FilePath
+tabListPath paths = spState paths </> "tabs.json"
 
 -- | Directory for a sub-agent's transcript, nested under its parent session:
 -- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent

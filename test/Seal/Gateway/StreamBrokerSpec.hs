@@ -53,3 +53,18 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     b <- readIORef refB
     length a `shouldBe` 1
     length b `shouldBe` 0  -- the over-cap subscriber was never added
+
+  it "BeListsSnapshot is the event the W6 broadcast triggers fire" $ do
+    -- Smoke test: the broker delivers a BeListsSnapshot to all subscribers
+    -- (the broadcastListsSnapshot helper in Seal.Gateway.Broadcast emits
+    -- these after every state change). This pins the contract the W6 API
+    -- triggers depend on.
+    broker <- newStreamBroker 10
+    ref <- newIORef ([] :: [BrokerEvent])
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+    let snap = object ["type" .= ("lists" :: T.Text), "tabs" .= ([] :: [T.Text])]
+    broadcastLists broker snap
+    events <- readIORef ref
+    case events of
+      [BeListsSnapshot _] -> pure ()
+      _                  -> expectationFailure ("expected exactly one BeListsSnapshot, got " <> show events)

@@ -7,11 +7,13 @@ module Seal.Command.Serve
   ) where
 
 import Control.Concurrent (forkIO)
+import Control.Monad (filterM)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
+import System.Directory (doesFileExist)
 import System.IO (hPutStrLn, stderr)
 
 import qualified Seal.Signal.Config
@@ -39,7 +41,7 @@ import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -49,6 +51,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
+import Seal.Handles.Tab (mkTabIndex)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -56,7 +59,8 @@ import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
-import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
+import Seal.Tabs (newPersistingTabsHandle, rebindTabH, seedTabsHandle, snapshotTabs)
+import Seal.Tabs.Persist (loadTabList)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Telegram.Config (resolveTelegramConfig)
@@ -102,7 +106,20 @@ runServeMain autonomy = do
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
   backends <- newBackends cfgRoot repo
-  tabsH   <- newTabsHandle
+  -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
+  -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
+  -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
+  -- re-resolves their liveness and marks missing windows 'orphaned'. No
+  -- broadcast at boot (no WS client connected yet); the first subscriber's
+  -- broadcast trigger refreshes the sidebar.
+  let tabsPath = tabListPath paths
+  tabsH <- newPersistingTabsHandle tabsPath
+  mPersisted <- loadTabList tabsPath
+  case mPersisted of
+    Nothing -> pure ()
+    Just tl -> do
+      kept <- filterM (sessionTabExists paths) (tlTabs tl)
+      seedTabsHandle tabsH (renumberTabs kept)
   reg     <- newHarnessRegistry
   tmuxR   <- mkRealTmuxRunner
   uiState <- newUiStateHandle paths
@@ -124,7 +141,7 @@ runServeMain autonomy = do
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg
+        reg tmuxR (Just mgr) approvals loadCfg tabsH
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -186,6 +203,7 @@ runServeMain autonomy = do
         , sdApprovals   = approvals
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
+        , sdTabsHandle  = tabsH
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
@@ -205,6 +223,7 @@ runServeMain autonomy = do
         , adUiState         = uiState
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
+        , adBroker          = Just broker
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from
@@ -259,6 +278,26 @@ tryOpenVault paths fcfg =
 -- Channel listener forking
 -- ---------------------------------------------------------------------------
 
+-- | Does the session.json backing a 'BoundSession' tab exist on disk? Used
+-- at boot to drop stale tabs (the session was deleted out-of-band). Harness
+-- tabs (BoundHarness) are always kept (the reconcile sweep handles them).
+sessionTabExists :: SealPaths -> Tab -> IO Bool
+sessionTabExists paths t = case tRef t of
+  BoundSession sid -> doesFileExist (sessionMetaPath paths sid)
+  BoundHarness _  -> pure True
+
+-- | Renumber a tab list so slots stay contiguous 0..n-1 after dropping stale
+-- tabs (I1: the tab list invariant). The TVar's smart constructors would
+-- do this via 'removeTab', but here we renumber in bulk after a boot-time
+-- filter, so the indices are recomputed from position.
+renumberTabs :: [Tab] -> TabList
+renumberTabs ts = TabList (zipWith renumber [0..] ts)
+  where
+    renumber n t = t { tIndex = mkIdx n }
+    mkIdx n = case mkTabIndex n of
+      Right i -> i
+      Left _  -> error ("renumberTabs: index out of range (unreachable, n=" <> show n <> ")")
+
 -- | Fork the Signal channel listener if @[signal]@ is configured. Resolves
 -- the config section, spawns the signal-cli transport, and runs the shared
 -- inbox-driven loop in a background thread. A missing/unresolved section
@@ -273,7 +312,7 @@ forkSignalListener deps cfg registry =
       case eTransport of
         Left err -> hPutStrLn stderr ("seal serve: signal channel skipped: " <> T.unpack err)
         Right transport -> do
-          tabsH <- newTabsHandle
+          let tabsH = cdTabs deps
           askReply <- newAskReplyStore 0
           let withCh = withSignalChannel (allow, chunkLimit) account transport
               plainHandler h = plainTurn deps h askReply
@@ -309,7 +348,7 @@ forkTelegramListener deps cfg registry = do
       transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr
       -- Register the bot's slash-command menu with BotFather.
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
-      tabsH <- newTabsHandle
+      let tabsH = cdTabs deps
       askReply <- newAskReplyStore 0
       let withCh = withTelegramChannel (allow, chunkLimit) transport
           plainHandler h = plainTurn deps h askReply

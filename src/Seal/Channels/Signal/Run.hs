@@ -290,7 +290,7 @@ runSignalMain autonomy = do
         pure (either (const defaultRuntimeConfig) id lc)
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg
+        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr

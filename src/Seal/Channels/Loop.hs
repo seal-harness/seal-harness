@@ -135,8 +135,8 @@ import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, newSessionMeta
   , resolveDefaultAgent, saveSessionMeta )
 import Seal.Tabs
-  ( TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, rebindTabH
-  , snapshotTabs )
+  ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
+  , renameTabH, rebindTabH, snapshotTabs )
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs )
@@ -177,6 +177,12 @@ data ChannelDeps = ChannelDeps
   , cdLocks       :: SessionLocks
     -- ^ Per-session write locks. Serializes concurrent turns on the same
     -- session to prevent transcript corruption.
+  , cdTabs        :: TabsHandle
+    -- ^ The shared, unified tab handle. Under @seal serve@, this is the SAME
+    -- handle as the web gateway's 'adTabsHandle', so a tab inserted by any
+    -- channel (Signal, Telegram) is visible in the web sidebar (W4
+    -- invariant 3). The standalone @seal signal@ / @seal telegram@ entry
+    -- points pass their own 'newTabsHandle' (no web surface to unify with).
   , cdConfig      :: IO RuntimeConfig
     -- ^ Load the current config (re-read per turn so config changes take
     -- effect without a restart). Used for default provider/model/agent
@@ -185,15 +191,16 @@ data ChannelDeps = ChannelDeps
 
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
 -- given config loader. Used by 'Seal.Command.Serve' and the standalone
--- entry points.
+-- entry points. The 'tabsH' is the shared/unified handle (W4).
 newChannelDeps
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
   -> ApprovalCache -> IO RuntimeConfig
+  -> TabsHandle
   -> IO ChannelDeps
 newChannelDeps paths vault provider backends autonomy broker
-               harnessReg tmux httpMgr approvals loadCfg = do
+               harnessReg tmux httpMgr approvals loadCfg tabsH = do
   cursors <- newCursorStore
   replies <- newReplyRegistry
   locks   <- newSessionLocks
@@ -211,6 +218,7 @@ newChannelDeps paths vault provider backends autonomy broker
     , cdCursors     = cursors
     , cdReplies     = replies
     , cdLocks       = locks
+    , cdTabs        = tabsH
     , cdConfig      = loadCfg
     }
 
@@ -543,7 +551,12 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                     Nothing -> T.pack (show e)
               logTurnError (Just (sessionLogPath paths sid)) msg
               hPutStrLn stderr ("[channel] turn failed: " <> T.unpack msg)
-          broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+      broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+      -- W3 invariant 2: auto-tab the session after a channel turn. Idempotent
+      -- (no-op if a tab already binds sid — e.g. createConversationSession
+      -- already inserted one on first message). Uses KindAi (channel/CLI
+      -- tab kind, wire "session:ai"). Sources sid from smId meta only.
+      ensureTabForSession (cdTabs deps) KindAi sid
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
 -- a fresh persisted session from the config defaults (channel label

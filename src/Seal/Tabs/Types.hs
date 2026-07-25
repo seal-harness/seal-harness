@@ -41,7 +41,8 @@ import Seal.Harness.Id (HarnessId)
 
 -- | A tab's reference to ground truth: a live session OR a harness.
 data TabRef = BoundSession SessionId | BoundHarness HarnessId
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
 
 -- | The liveness of a tab's backing ref.
 data TabStatus = Live | Dead
@@ -55,7 +56,8 @@ data Tab = Tab
   , tKind   :: TabKind
   , tLabel  :: Maybe Text     -- ^ optional user-set label
   , tStatus :: TabStatus
-  } deriving stock (Eq, Show)
+  } deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
 
 -- | The per-conversation routing key: ChannelKind × ConversationId.
 data ConversationKey = ConversationKey ChannelKind ConversationId
@@ -76,7 +78,8 @@ data CursorState = CursorState
 -- | The tab list. I1 (contiguous 0..n-1, removal compacts) + I2 (no two tabs
 -- share a 'TabRef') are enforced by the smart constructors. Hard 36-slot cap.
 newtype TabList = TabList { tlTabs :: [Tab] }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
 
 -- | Construct an empty 'TabList'.
 emptyTabList :: TabList

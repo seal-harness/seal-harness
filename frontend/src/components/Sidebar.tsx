@@ -263,10 +263,14 @@ export function Sidebar({
   const tabLabel = (tab: TabInfo): string =>
     tabDisplayLabel(tab, findSession(tab.session_id, sessions, archivedSessions, tabSessions))
 
-  // A running harness appears under "Running Harnesses" (its status/Destroy
-  // controls) AND, intentionally, its backing session is also listed under
-  // "Recent Sessions" so the user can jump straight to the conversation.
-  const recentSessions = sessions
+  // Defense-in-depth: the backend guarantees (via partitionSessions) no
+  // tab-backed session is in `sessions`, but a buggy WS frame could violate
+  // that — this filter drops any session that's also in `tabs[].session_id`
+  // so the sidebar never shows a duplicate. The backend is the source of
+  // truth; this is the safety net.
+  const recentSessions = sessions.filter(
+    (s) => !tabs.some((t) => t.session_id === s.id)
+  )
 
   return (
     <div

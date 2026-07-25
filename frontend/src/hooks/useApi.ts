@@ -181,6 +181,58 @@ export function useArchivedSessions() {
   return { sessions, error }
 }
 
+/** The partitioned lists snapshot from `GET /api/lists` — the REST fallback
+ *  for the WS `lists` frame (the frontend's primary source). Returns a
+ *  shape interchangeable with `useListsStream` so App.tsx can treat WS and
+ *  REST sources uniformly: `{ tabs, recentSessions, archivedSessions,
+ *  tabSessions }` + an `error` flag + a `refresh` action. Always active
+ *  (polls on mount regardless of WS state); App.tsx selects which source
+ *  to render. */
+export interface ListsPollResult {
+  tabs: TabInfo[]
+  recentSessions: SessionInfo[]
+  archivedSessions: SessionInfo[]
+  tabSessions: SessionInfo[]
+  error: boolean
+  refresh: () => void
+}
+
+interface ListsWire {
+  tabs: TabInfoWire[]
+  recentSessions: SessionInfo[]
+  archivedSessions: SessionInfo[]
+  tabSessions: SessionInfo[]
+}
+
+export function useListsPoll(): ListsPollResult {
+  const [tabs, setTabs] = useState<TabInfo[]>([])
+  const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
+  const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
+  const [tabSessions, setTabSessions] = useState<SessionInfo[]>([])
+  const [error, setError] = useState(false)
+
+  const poll = useCallback(async () => {
+    const data = await fetchJson<ListsWire>('/api/lists')
+    if (data && data.tabs) {
+      setTabs(data.tabs.map(mapTabInfo))
+      setRecentSessions(data.recentSessions ?? [])
+      setArchivedSessions(data.archivedSessions ?? [])
+      setTabSessions(data.tabSessions ?? [])
+      setError(false)
+    } else {
+      setError(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    poll()
+    const id = setInterval(poll, POLL_INTERVAL)
+    return () => clearInterval(id)
+  }, [poll])
+
+  return { tabs, recentSessions, archivedSessions, tabSessions, error, refresh: poll }
+}
+
 /** On-demand discovery of adoptable external tmux windows. Unlike the other
  *  list hooks this is NOT polled — discovery is an explicit, user-invoked
  *  action (bounded server-side by the adoption allow-list). `scan()` GETs

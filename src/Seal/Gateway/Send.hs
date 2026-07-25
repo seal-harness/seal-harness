@@ -13,6 +13,7 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , ensureTabForSession
   , handleAnswerDelivery
   , handleAskCancel
   , webCallDispatcher
@@ -60,8 +61,10 @@ import Seal.Handles.AskReply
   , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
+import Seal.Handles.Tab (TabKind (KindProvider))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Session.Log (logTurnError)
+import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -97,6 +100,7 @@ import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -169,6 +173,11 @@ data SendDeps = SendDeps
     -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
     -- lock before 'withTwoFileTranscript' so a web send and a channel
     -- message on the same tab serialize rather than race.
+  , sdTabsHandle :: TabsHandle
+    -- ^ The shared tab handle. 'handleSend' auto-tabs the session after a
+    -- successful turn (W2 invariant 2: any message sent to a session with
+    -- no active tab creates one). Sourced from server-validated 'SessionMeta'
+    -- only — never from raw client strings.
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -213,6 +222,12 @@ debugPath paths sid eCfg =
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
 -- -> 404; an unknown provider / vault error -> 400; an internal failure ->
 -- 500 (logged to stderr).
+--
+-- After a successful 'Plain'/'SlashCommand'/'NewSession' turn (any outcome
+-- that is NOT 'SendError'), auto-tabs the session via
+-- 'ensureTabForSession' (W2 invariant 2). The 'TabCommand'/'Focus'/'Inject'
+-- routes return 'SendSlash' but no message was sent — they are explicitly
+-- excluded from auto-tabbing.
 handleSend :: SendDeps -> SessionId -> Text -> IO SendOutcome
 handleSend deps sid rawText = do
   mMeta <- loadSessionMeta (sdPaths deps) sid
@@ -228,12 +243,42 @@ handleSend deps sid rawText = do
           pure (Left ("internal error: " <> msg))
         case er of
           Left err -> pure (SendError 500 err)
-          Right () -> pure SendAssistant
-      Right (SlashCommand _) -> runSlash deps meta rawText
-      Right NewSession       -> runSlash deps meta rawText
+          Right () -> do
+            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
+            pure SendAssistant
+      Right (SlashCommand _) -> do
+        r <- runSlash deps meta rawText
+        case r of
+          SendError _ _ -> pure r
+          _            -> do
+            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
+            pure r
+      Right NewSession -> do
+        r <- runSlash deps meta rawText
+        case r of
+          SendError _ _ -> pure r
+          _            -> do
+            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
+            pure r
       Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)" Nothing)
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
+
+-- | 'ensureTabForSession' is defined in 'Seal.Tabs' and re-exported here for
+-- the web send path. See its Haddock there for the contract (idempotent,
+-- race-safe, failure logged to stderr ids-only, sources SessionId only from
+-- server-validated contexts).
+
+-- | Push a fresh @lists@ snapshot to WS subscribers after a state change
+-- (W6 broadcast trigger). No-op when 'sdBroker' is 'Nothing' (tests).
+triggerBroadcast :: SendDeps -> IO ()
+triggerBroadcast deps =
+  case sdBroker deps of
+    Nothing     -> pure ()
+    Just broker -> broadcastListsSnapshot broker (sdTabsHandle deps) (sdPaths deps)
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.
