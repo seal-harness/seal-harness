@@ -33,7 +33,8 @@
 **New backend files:**
 - `src/Seal/Tabs/Partition.hs` — `partitionSessions` + `PartitionedSessions` record.
 - `src/Seal/Harness/Reconcile/Seam.hs` — `ReconcileRunner` record (test seam over `reconcileTick`).
-- `src/Seal/Gateway/ListsSnapshot.hs` — `ListsSnapshotWire` record + `buildListsSnapshot`.
+- `src/Seal/Gateway/SessionJson.hs` — `tabToJson` + `sessionInfoJsonWithSnippet` (moved OUT of `API.hs` so `ListsSnapshot.hs` can import them without creating a cycle with `API.hs`).
+- `src/Seal/Gateway/ListsSnapshot.hs` — `ListsSnapshotWire` record + `buildListsSnapshot` (takes `TabsHandle` + `SealPaths` directly — NOT `ApiDeps`, to avoid importing `API.hs`).
 - `test/Seal/Tabs/PartitionSpec.hs` — partition property tests.
 - `test/Seal/Tabs/PersistSpec.hs` — already exists; extended (if it doesn't, create).
 - `test/Seal/Gateway/ListsSnapshotSpec.hs` — snapshot builder tests.
@@ -44,7 +45,7 @@
 - `src/Seal/Config/Paths.hs` — add `tabListPath :: SealPaths -> FilePath` (the `tabs.json` path; new).
 - `src/Seal/Tabs.hs` — wrap mutations to persist (the wrapper holds an MVar + calls `saveTabList`); export the persisting constructor.
 - `src/Seal/Tabs/Persist.hs` — implement for real (atomic write, 0600, id-validation); signatures take a `FilePath`.
-- `src/Seal/Gateway/API.hs` — export `tabToJson` + `sessionInfoJsonWithSnippet` (add to the export list); `GET /api/lists`, `adBroker` in `ApiDeps`, broadcast triggers in handlers, `ListsSnapshotWire` import.
+- `src/Seal/Gateway/API.hs` — **move `tabToJson` + `sessionInfoJsonWithSnippet` to `Seal.Gateway.SessionJson`** (keep a re-export from `API.hs` for back-compat if desired, or update internal call sites to import from `SessionJson`); `GET /api/lists` (calls `buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps))`); `adBroker` in `ApiDeps`; broadcast triggers in handlers.
 - `src/Seal/Gateway/Send.hs` — `ensureTabForSession` + call in `handleSend` (gated by route); add `sdTabsHandle :: TabsHandle` to `SendDeps`.
 - `src/Seal/Gateway/StreamBroker.hs` — `debouncedBroadcast` helper (or co-locate in API.hs).
 - `src/Seal/Channels/Loop.hs` — `cdTabs :: TabsHandle` in `ChannelDeps`; auto-tab in `plainTurn`; `newChannelDeps` takes `tabsH`.
@@ -257,6 +258,8 @@ partitionSessions tl recent archived =
 
 ### Step 4: Implement `ListsSnapshotWire` + `buildListsSnapshot`
 
+- [ ] Create `src/Seal/Gateway/SessionJson.hs` — **move `tabToJson` and `sessionInfoJsonWithSnippet` here** from `src/Seal/Gateway/API.hs` (cut the definitions from `API.hs:1047,1112`, paste into `SessionJson.hs`, export both). Update `API.hs`'s internal call sites (lines 91, 100, 106) to `import Seal.Gateway.SessionJson (tabToJson, sessionInfoJsonWithSnippet)`. This breaks the would-be cycle: `ListsSnapshot.hs` imports `SessionJson` (lower-level), not `API.hs`.
+
 - [ ] Create `src/Seal/Gateway/ListsSnapshot.hs`:
 
 ```haskell
@@ -266,6 +269,10 @@ partitionSessions tl recent archived =
 -- endpoint. Carries the partitioned session lists (mutually exclusive by
 -- construction via 'partitionSessions'). The WS frame wraps this with
 -- @{"type": "lists", ...}@; the REST body is the bare record (no @type@).
+--
+-- Takes 'TabsHandle' + 'SealPaths' directly (NOT 'ApiDeps') so this module
+-- does NOT import 'Seal.Gateway.API' — avoids a source-level import cycle
+-- (API.hs imports this module for the /api/lists route).
 module Seal.Gateway.ListsSnapshot
   ( ListsSnapshotWire (..)
   , buildListsSnapshot
@@ -273,18 +280,14 @@ module Seal.Gateway.ListsSnapshot
 
 import Data.Aeson (ToJSON (..), object, (.=))
 import Data.Aeson qualified as A
-import Data.ByteString.Lazy qualified as BL
 import GHC.Generics (Generic)
 
-import Seal.Core.Types (sessionIdText)
-import Seal.Gateway.API (ApiDeps (..), sessionInfoJsonWithSnippet)
-import Seal.Handles.Tab (tabIndexToInt)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Config.Paths (SealPaths)
+import Seal.Gateway.SessionJson (sessionInfoJsonWithSnippet, tabToJson)
 import Seal.Session.Store (listArchivedSessions, listSessions)
-import Seal.Tabs (snapshotTabs)
+import Seal.Tabs (snapshotTabs, TabsHandle)
 import Seal.Tabs.Partition (PartitionedSessions (..), partitionSessions)
 import Seal.Tabs.Types (tlTabs)
-import Seal.Gateway.API (tabToJson)  -- verify export
 
 data ListsSnapshotWire = ListsSnapshotWire
   { lswTabs             :: [A.Value]
@@ -301,16 +304,18 @@ instance ToJSON ListsSnapshotWire where
     , "tabSessions"      .= lswTabSessions s
     ]
 
-buildListsSnapshot :: ApiDeps -> IO ListsSnapshotWire
-buildListsSnapshot deps = do
-  tl <- snapshotTabs (adTabsHandle deps)
+-- | Build the partitioned snapshot. Takes the components directly (not
+-- 'ApiDeps') so this module stays free of a cycle with 'Seal.Gateway.API'.
+buildListsSnapshot :: TabsHandle -> SealPaths -> IO ListsSnapshotWire
+buildListsSnapshot tabsH paths = do
+  tl <- snapshotTabs tabsH
   let tabsJson = map tabToJson (tlTabs tl)
-  recent  <- listSessions (srPaths (adSessionRuntime deps))
-  archived <- listArchivedSessions (srPaths (adSessionRuntime deps))
+  recent   <- listSessions paths
+  archived <- listArchivedSessions paths
   let PartitionedSessions{..} = partitionSessions tl recent archived
-  recentJson  <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) psRecentSessions
-  archivedJson <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) psArchivedSessions
-  tabbedJson  <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) psTabSessions
+  recentJson   <- mapM (sessionInfoJsonWithSnippet paths) psRecentSessions
+  archivedJson <- mapM (sessionInfoJsonWithSnippet paths) psArchivedSessions
+  tabbedJson   <- mapM (sessionInfoJsonWithSnippet paths) psTabSessions
   pure ListsSnapshotWire
     { lswTabs = tabsJson
     , lswRecentSessions = recentJson
@@ -319,18 +324,16 @@ buildListsSnapshot deps = do
     }
 ```
 
-(Verify `tabToJson` and `sessionInfoJsonWithSnippet` are exported from `Seal.Gateway.API` — read the export list. If not, export them.)
-
 - [ ] Run: `make test -- -m "/ListsSnapshot/"`
 - Expected: PASS.
 
 ### Step 5: Add `GET /api/lists` route + `adBroker` field to `ApiDeps`
 
 - [ ] Modify `src/Seal/Gateway/API.hs`:
-  - **Export `tabToJson` and `sessionInfoJsonWithSnippet`** from the module (add them to the export list at line 4-7). `ListsSnapshot.hs` imports both.
+  - **Move `tabToJson` and `sessionInfoJsonWithSnippet` to `Seal.Gateway.SessionJson`** (per Step 4) — update `API.hs` to import them from `SessionJson` for its own internal use (lines 91, 100, 106). Do NOT re-export from `API.hs` (keep the public API surface minimal; only `apiApp` + `ApiDeps` exported).
   - Add `adBroker :: Maybe StreamBroker` to the `ApiDeps` record (read-only in W1; used in W6).
-  - Add a route case: `(m', ["api", "lists"]) | m' == methodGet -> do snap <- buildListsSnapshot deps; respond (jsonLBS status200 (A.encode snap))`.
-  - Import `Seal.Gateway.ListsSnapshot` + `Seal.Gateway.StreamBroker` (the `StreamBroker` type for the field).
+  - Add a route case: `(m', ["api", "lists"]) | m' == methodGet -> do snap <- buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps)); respond (jsonLBS status200 (A.encode snap))`.
+  - Import `Seal.Gateway.ListsSnapshot` (for `buildListsSnapshot`) + `Seal.Gateway.StreamBroker` (the `StreamBroker` type for the field). **No cycle:** `ListsSnapshot.hs` imports `SessionJson.hs` (lower-level), not `API.hs`.
 
 - [ ] Extend `test/Seal/Gateway/ApiSpec.hs`:
   - `GET /api/lists` returns 200 with the four fields.
@@ -346,7 +349,7 @@ it "GET /api/lists partitions: tab-bound session in tabSessions only" $ do
 
 - [ ] **Update ALL `ApiDeps` construction sites** to set `adBroker` (per the Construction-site update checklist in File Structure): `test/Seal/Gateway/ApiSpec.hs` (every `ApiDeps` literal — grep for `ApiDeps`), `test/Seal/Gateway/ServerSpec.hs:53` (`mkDeps`), `test/Seal/Phase7aSpec.hs`, and `src/Seal/Command/Serve.hs`. For tests, pass `Nothing` for now (or a fake broker). For `Serve.hs`, pass `Just broker` (the existing `broker` from `newStreamBroker`).
 
-- [ ] **Add new test modules to `seal-harness.cabal` `other-modules`** (lines 268+): `Seal.Tabs.PartitionSpec`, `Seal.Gateway.ListsSnapshotSpec`, `Seal.Gateway.SendSpec`, `Seal.Tabs.PersistSpec` (if creating), `Seal.Command.ServeSpec` (added in W4). Without this, `make test` silently skips them (cabal's exitcode-stdio suite only runs listed modules).
+- [ ] **Add new test modules to `seal-harness.cabal` `other-modules`** (lines 268+): `Seal.Tabs.PartitionSpec`, `Seal.Gateway.ListsSnapshotSpec`, `Seal.Gateway.SendSpec`, `Seal.Tabs.PersistSpec` (if creating), `Seal.Command.ServeSpec` (added in W4). Without this, `make test` silently skips them (cabal's exitcode-stdio suite only runs listed modules). **Also add `Seal.Gateway.SessionJson` and `Seal.Gateway.ListsSnapshot` to the LIBRARY's exposed-modules** (or `other-modules` if the test imports them — read the cabal library stanza to confirm the right list). Without this, the library won't compile the new modules.
 
 - [ ] Run: `make test`
 - Expected: PASS (including the new `/api/lists` cases).
@@ -358,9 +361,11 @@ it "GET /api/lists partitions: tab-bound session in tabSessions only" $ do
 
 ```bash
 git add src/Seal/Tabs/Partition.hs src/Seal/Gateway/ListsSnapshot.hs \
+        src/Seal/Gateway/SessionJson.hs src/Seal/Gateway/API.hs \
         test/Seal/Tabs/PartitionSpec.hs test/Seal/Gateway/ListsSnapshotSpec.hs \
-        src/Seal/Gateway/API.hs test/Seal/Gateway/ApiSpec.hs \
-        src/Seal/Command/Serve.hs test/Seal/Phase7aSpec.hs
+        test/Seal/Gateway/ApiSpec.hs \
+        src/Seal/Command/Serve.hs test/Seal/Phase7aSpec.hs test/Seal/Gateway/ServerSpec.hs \
+        src/Seal/Config/Paths.hs seal-harness.cabal
 git commit -m "feat(gateway): partition sessions + GET /api/lists (W1)"
 ```
 
