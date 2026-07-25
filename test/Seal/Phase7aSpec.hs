@@ -70,6 +70,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
+          , adBroker = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -114,6 +115,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
+          , adBroker = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

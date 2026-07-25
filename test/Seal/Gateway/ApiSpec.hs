@@ -56,7 +56,9 @@ import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
-import Seal.Tabs (newTabsHandle)
+import Seal.Handles.Tab (TabKind (KindAi))
+import Seal.Tabs (newTabsHandle, insertTabH)
+import Seal.Tabs.Types (TabRef (BoundSession))
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -167,6 +169,7 @@ mkDepsFor paths = do
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
+    , adBroker          = Nothing
     }
 
 spec :: Spec
@@ -841,6 +844,103 @@ spec = describe "Seal.Gateway.API" $ do
         Just xs          -> error ("expected exactly 1 archived session, got " ++ show (length xs))
         Nothing          -> error "could not decode archived body"
 
+  it "GET /api/lists returns 200 with the partitioned shape (empty)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "lists"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "tabs" o `shouldBe` Just (A.Array mempty)
+          lookupK "recentSessions" o `shouldBe` Just (A.Array mempty)
+          lookupK "archivedSessions" o `shouldBe` Just (A.Array mempty)
+          lookupK "tabSessions" o `shouldBe` Just (A.Array mempty)
+        other -> error ("unexpected lists body: " ++ show other)
+
+  it "GET /api/lists partitions: a session with a tab appears in tabSessions, not recentSessions" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-061"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      -- Insert a tab binding this sid
+      _ <- insertTabH (adTabsHandle deps) (BoundSession sid) KindAi Nothing
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "lists"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          -- tabSessions contains the sid
+          case lookupK "tabSessions" o of
+            Just (A.Array xs) -> length xs `shouldBe` 1
+            other -> error ("unexpected tabSessions: " ++ show other)
+          -- recentSessions is empty (the only session is tab-bound)
+          lookupK "recentSessions" o `shouldBe` Just (A.Array mempty)
+          -- tabs has the one tab
+          case lookupK "tabs" o of
+            Just (A.Array xs) -> length xs `shouldBe` 1
+            other -> error ("unexpected tabs: " ++ show other)
+        other -> error ("unexpected lists body: " ++ show other)
+
+  it "GET /api/lists partitions: an archived session appears in archivedSessions" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-062"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      writeFile (sdir </> "archived") ""
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "lists"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          case lookupK "archivedSessions" o of
+            Just (A.Array xs) -> length xs `shouldBe` 1
+            other -> error ("unexpected archivedSessions: " ++ show other)
+          lookupK "recentSessions" o `shouldBe` Just (A.Array mempty)
+          lookupK "tabSessions" o `shouldBe` Just (A.Array mempty)
+        other -> error ("unexpected lists body: " ++ show other)
+
+  it "GET /api/lists partitions: an archived+tab-bound session appears in tabSessions (tab wins)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-063"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      writeFile (sdir </> "archived") ""
+      deps <- mkDepsFor paths
+      _ <- insertTabH (adTabsHandle deps) (BoundSession sid) KindAi Nothing
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "lists"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          case lookupK "tabSessions" o of
+            Just (A.Array xs) -> length xs `shouldBe` 1
+            other -> error ("unexpected tabSessions: " ++ show other)
+          -- NOT in archivedSessions (the tab wins)
+          lookupK "archivedSessions" o `shouldBe` Just (A.Array mempty)
+        other -> error ("unexpected lists body: " ++ show other)
+
   it "PUT /api/sessions/<sid>/archived with archived:false unarchives (removes marker, returns to /sessions)" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
@@ -1181,8 +1281,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adProviders       = pure knownProviders
                 , adUiState         = uiState
                 , adSend            = Nothing
-                , adDefaultAgent    = pure (Just "zoe")
-                }
+                 , adDefaultAgent    = pure (Just "zoe")
+                 , adBroker          = Nothing
+                 }
           pure (apiApp deps)
     app <- mkAppDefault
     (_, body) <- runAppBody app (testRequest methodGet ["api", "agents"])
@@ -1248,9 +1349,10 @@ spec = describe "Seal.Gateway.API" $ do
             , adProviders       = pure knownProviders
             , adUiState         = uiState
             , adSend            = Nothing
-            , adDefaultAgent    = do
+             , adDefaultAgent    = do
                 c <- loadRuntimeConfig (cfgRoot </> "config.toml")
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
+            , adBroker          = Nothing
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1310,6 +1412,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = do
                 c <- loadRuntimeConfig cfgPath
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
+            , adBroker          = Nothing
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1370,6 +1473,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1455,6 +1559,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1505,6 +1610,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1554,6 +1660,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1584,6 +1691,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -1666,6 +1774,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -1714,6 +1823,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -1761,6 +1871,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -1802,6 +1913,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -1844,6 +1956,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
+                , adBroker          = Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2028,6 +2141,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -2111,6 +2225,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -2226,6 +2341,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
