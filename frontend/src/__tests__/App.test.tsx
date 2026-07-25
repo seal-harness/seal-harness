@@ -293,4 +293,45 @@ describe('App — send + branch', () => {
     // The composer opens with the "Branch from here" header.
     expect(screen.getByText('Branch from here')).toBeTruthy()
   })
+
+  it('W7 partition: a session in both tabs[].session_id AND recentSessions (buggy /api/lists) renders under Active Tabs only', async () => {
+    // Simulate a backend that (incorrectly) returns the same session in both
+    // the tabs list AND recentSessions. The Sidebar's defense-in-depth
+    // filter must drop it from Recent Sessions so the sidebar shows it under
+    // Active Tabs only (the W7 partition invariant). The backend's
+    // partitionSessions guarantees mutual exclusion by construction; this
+    // test pins the frontend safety net.
+    const sess = makeSession({ id: 'dup-1', description: 'Dup Sess' })
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      let body: unknown = {}
+      if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+      else if (url === '/api/lists') {
+        // Buggy shape: the session appears in both tabs[].session_id AND
+        // recentSessions (a backend bug or a stale frame).
+        body = {
+          tabs: [{ index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'dup-1', ext_modified: false, stale: false, attach_command: null }],
+          recentSessions: [sess],
+          archivedSessions: [],
+          tabSessions: [],
+        }
+      } else if (url === '/api/tabs') body = []
+      else if (url === '/api/sessions') body = []
+      else if (url === '/api/sessions/archived') body = []
+      else if (url === '/api/harnesses') body = []
+      else if (url.includes('/transcript')) body = []
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    // Wait for /api/lists to populate. The session appears under Active Tabs.
+    // The sidebar's defense-in-depth filter drops it from Recent Sessions,
+    // so "Dup Sess" renders exactly once (under Active Tabs).
+    await waitFor(() => {
+      expect(screen.getAllByText('Dup Sess').length).toBe(1)
+    })
+  })
 })

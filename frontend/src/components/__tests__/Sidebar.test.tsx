@@ -447,7 +447,7 @@ describe('Sidebar', () => {
     expect(screen.getByLabelText('Unarchive')).toBeTruthy()
   })
 
-  it('resolves a tab label via the backing session (parity with Recent Sessions)', () => {
+  it('resolves a tab label via the backing session (session appears in Active Tabs only, NOT Recent Sessions)', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1', label: 'STALE-TAB-LABEL' })]
     const sessions = [makeSession({ id: 's1', description: 'session-desc' })]
     render(
@@ -472,9 +472,12 @@ describe('Sidebar', () => {
     // The tab label comes from the session's description, not the tab.label.
     expect(screen.getAllByText('session-desc').length).toBeGreaterThanOrEqual(1)
     expect(screen.queryByText('STALE-TAB-LABEL')).toBeNull()
-    // The session row also shows the same description — parity. Both the tab
-    // row and the Recent Sessions row render it (the headline parity invariant).
+    // W7 partition invariant: the session backing an open tab appears in
+    // Active Tabs ONLY — the Sidebar's defense-in-depth filter drops it
+    // from Recent Sessions so the sidebar never shows a duplicate. (The
+    // backend's partitionSessions guarantees mutual exclusion by
+    // construction; the frontend filter is the safety net.)
     const descEls = screen.getAllByText('session-desc')
-    expect(descEls.length).toBeGreaterThanOrEqual(2)
+    expect(descEls.length).toBe(1)
   })
 })

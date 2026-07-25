@@ -6,7 +6,6 @@ module Seal.Gateway.API
   , ApiDeps (..)
   ) where
 
-import Control.Applicative ((<|>))
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -41,12 +40,17 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
-import Seal.Config.Paths (SealPaths, sessionMetaPath)
+import Seal.Config.Paths (sessionMetaPath)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
-import Seal.Gateway.Transcript (firstUserMessageSnippet, readTranscriptEntries, showIso)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+import Seal.Gateway.SessionJson
+  ( sessionInfoJsonWithSnippet, tabToJson )
+import Seal.Gateway.StreamBroker (StreamBroker)
+import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -61,7 +65,7 @@ import Seal.Session.Store
   , listSessions, newSession, resolveDefaultAgent, updateSessionAgent
   , updateSessionArchived, updateSessionSystemOverride )
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
-import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
+import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
   , addCustomModel, getUiState, setLastOptions )
@@ -78,6 +82,7 @@ data ApiDeps = ApiDeps
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
+  , adBroker          :: Maybe StreamBroker      -- ^ the WS broker for pushing @lists@ frames (W6 broadcast triggers); 'Nothing' in tests without a broker
   }
 
 -- | The REST API as a WAI Application.
@@ -90,6 +95,14 @@ apiApp deps req respond =
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
       respond (jsonLBS status200 (A.encode tabsJson))
+    -- GET /api/lists -> the partitioned snapshot (tabs + recentSessions +
+    -- archivedSessions + tabSessions). Mutually exclusive by construction
+    -- via 'partitionSessions'. The bare 'ListsSnapshotWire' (no @type@
+    -- field — the WS @lists@ frame wraps it with @{"type": "lists", ...}@).
+    -- The frontend's primary source (WS) and REST fallback (this endpoint).
+    (m', ["api", "lists"]) | m' == methodGet -> do
+      snap <- buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps))
+      respond (jsonLBS status200 (A.encode snap))
     -- GET /api/sessions -> the recent, non-archived sessions. Archiving is a
     -- pure UI hint persisted as an @archived@ marker file in the session
     -- directory (the transcript + session.json stay on disk); 'listSessions'
@@ -378,6 +391,17 @@ collectBody req = go []
         then pure (BL.fromChunks (reverse acc))
         else go (chunk : acc)
 
+-- | Push a fresh @lists@ snapshot to every WS subscriber. Called after
+-- every state change that affects the sidebar partition (W6 broadcast
+-- trigger). No-op when 'adBroker' is 'Nothing' (tests without a broker).
+-- The WS envelope (@{"type": "lists", ...}@) is added by
+-- 'Seal.Gateway.Broadcast.broadcastListsSnapshot'.
+triggerBroadcast :: ApiDeps -> IO ()
+triggerBroadcast deps =
+  case adBroker deps of
+    Nothing      -> pure ()
+    Just broker  -> broadcastListsSnapshot broker (adTabsHandle deps) (srPaths (adSessionRuntime deps))
+
 -- | Parse the @message@ field from a POST /send body. Returns "" on a
 -- missing/invalid body so the agent loop receives an empty turn (the routing
 -- grammar treats empty input as 'Plain ""').
@@ -451,11 +475,13 @@ handleTabNew deps v =
       meta <- newSession paths provider model "web" mAgent
       let sid = smId meta
       res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+      triggerBroadcast deps
       pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
+      triggerBroadcast deps
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
 
@@ -480,6 +506,7 @@ handleSessionNew deps v = do
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
   meta <- newSession paths provider model "web" mAgent
+  triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
     objOf (A.Object o) = Just o
@@ -514,20 +541,24 @@ handleSessionRebindNew deps sidTxt =
               let newSid = smId meta
               snap <- snapshotTabs (adTabsHandle deps)
               case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-                []       -> pure (jsonOk (object
-                  [ "session_id" .= sessionIdText newSid
-                  , "tab_index" .= (Nothing :: Maybe Int)
-                  , "rebound" .= False
-                  ]))
+                []       -> do
+                  triggerBroadcast deps
+                  pure (jsonOk (object
+                    [ "session_id" .= sessionIdText newSid
+                    , "tab_index" .= (Nothing :: Maybe Int)
+                    , "rebound" .= False
+                    ]))
                 (tab : _) -> do
                   r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
                   case r of
                     Left e -> pure (errJson status400 ("tab rebind failed: " <> e))
-                    Right _ -> pure (jsonOk (object
-                      [ "session_id" .= sessionIdText newSid
-                      , "tab_index" .= tabIndexToInt (tIndex tab)
-                      , "rebound" .= True
-                      ]))
+                    Right _ -> do
+                      triggerBroadcast deps
+                      pure (jsonOk (object
+                        [ "session_id" .= sessionIdText newSid
+                        , "tab_index" .= tabIndexToInt (tIndex tab)
+                        , "rebound" .= True
+                        ]))
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
@@ -535,8 +566,8 @@ handleSessionRebindNew deps sidTxt =
 handleSessionArchived :: ApiDeps -> SessionId -> Bool -> IO Response
 handleSessionArchived deps sid archived = do
   ok <- updateSessionArchived (srPaths (adSessionRuntime deps)) sid archived
-  pure (if ok then jsonOk (object ["ok" .= True])
-              else errJson status404 "session not found")
+  if ok then triggerBroadcast deps >> pure (jsonOk (object ["ok" .= True]))
+        else pure (errJson status404 "session not found")
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is
@@ -991,14 +1022,14 @@ handleTabRemove deps idxTxt =
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> pure noContent
+        Right _ -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/tabs/:index/acknowledge + /release (no-op for T10).
 handleTabAck :: ApiDeps -> Text -> IO Response
-handleTabAck _deps idxTxt =
+handleTabAck deps idxTxt =
   case parseIndex idxTxt of
     Nothing   -> pure (errJson status400 "invalid tab index")
-    Just _idx -> pure noContent
+    Just _idx -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/tabs/:index/destroy (remove + delete from registry if
 -- harness; for T10 just remove).
@@ -1010,7 +1041,7 @@ handleTabDestroy deps idxTxt _body =
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> pure noContent
+        Right _ -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/adopt (consent-gated; the actual adoption wiring is
 -- Phase 6a's domain).
@@ -1042,77 +1073,6 @@ parseIndex t =
         Right idx -> Just idx
         Left _    -> Nothing
     _ -> Nothing
-
--- | One tab as JSON (the widened TabInfoWire shape the frontend expects).
-tabToJson :: Tab -> Value
-tabToJson t = object
-  [ "index" .= tabIndexToInt (tIndex t)
-  , "kind" .= tabKindWire (tKind t)
-  , "label" .= tLabel t
-  , "status" .= statusWire (tKind t) (tStatus t)
-  , "session_id" .= sessionWire (tRef t)
-  , "ext_modified" .= False
-  , "stale" .= False
-  , "origin" .= (Nothing :: Maybe Text)
-  , "attach_command" .= (Nothing :: Maybe Text)
-  ]
-
--- | Map a 'TabKind' to the frontend's wire vocab.
-tabKindWire :: TabKind -> Text
-tabKindWire k = case k of
-  KindHarness  -> "harness"
-  KindProvider -> "session:provider"
-  KindAi       -> "session:ai"
-  KindShell    -> "shell"
-  KindSsh      -> "shell:ssh"
-  KindTmux     -> "tmux"
-
--- | Map ('TabKind', 'TabStatus') to the frontend's status vocab.
-statusWire :: TabKind -> TabStatus -> Text
-statusWire _ Dead = "exited"
-statusWire KindHarness Live = "running"
-statusWire _ Live = "idle"
-
--- | Derive the @session_id@ wire field from a 'TabRef'.
-sessionWire :: TabRef -> Maybe Text
-sessionWire (BoundSession sid) = Just (sessionIdText sid)
-sessionWire (BoundHarness _)   = Nothing
-
--- | Map a 'SessionMeta' to the frontend's 'SessionInfo' JSON shape
--- (camelCase). The on-disk 'SessionMeta' uses snake_case; the gateway maps
--- to the frontend's shape without changing 'SessionMeta's instance.
--- Fields the backend doesn't track yet (@description@, @autoSummary@,
--- @channelUserId@) are returned as @null@. @firstMessageSnippet@ is derived
--- from the session's transcript (the first user message), so a session
--- has a readable title before the user sets an explicit description.
---
--- @agent@ is the display label for the session's active agent (used by
--- the sidebar / chat header). It prefers 'smAgentName' (set whenever an
--- agent is effective — either a bound 'smAgent' or a one-off uploaded
--- file's frontmatter id), falling back to 'smAgent'\'s id for
--- backwards-compat with old session.json files that predate smAgentName.
-sessionInfoJson :: Maybe Text -> SessionMeta -> Value
-sessionInfoJson mSnippet m = object
-  [ "id" .= sessionIdText (smId m)
-  , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
-  , "runtime" .= ("session:" <> smProvider m)
-  , "model" .= smModel m
-  , "lastActive" .= smLastActive m
-  , "createdAt" .= smCreatedAt m
-  , "description" .= (Nothing :: Maybe Text)
-  , "autoSummary" .= (Nothing :: Maybe Text)
-  , "firstMessageSnippet" .= mSnippet
-  , "channel" .= smChannel m
-  , "channelUserId" .= (Nothing :: Maybe Text)
-  ]
-
--- | Build the 'SessionInfo' JSON for a session, reading the first user
--- message snippet from the transcript so the session has a default title
--- before the user sets an explicit description.
-sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
-sessionInfoJsonWithSnippet paths m = do
-  mSnippet <- firstUserMessageSnippet paths (smId m)
-  pure (sessionInfoJson mSnippet m)
 
 -- | T11: handle GET /api/sessions/:id/transcript. Returns the session's
 -- transcript as the frontend's @TranscriptEntry@ shape

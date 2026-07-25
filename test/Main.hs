@@ -9,6 +9,7 @@ import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.SendSpec
 import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
 import qualified Seal.Gateway.StreamSpec
@@ -91,6 +92,8 @@ import qualified Seal.Harness.TmuxIOSpec
 import qualified Seal.Harness.DiscoverySpec
 import qualified Seal.Tabs.TypesSpec
 import qualified Seal.TabsSpec
+import qualified Seal.Tabs.PartitionSpec
+import qualified Seal.Tabs.PersistSpec
 import qualified Seal.Tabs.RelaySpec
 import qualified Seal.Tabs.WizardSpec
 import qualified Seal.Routing.RouteSpec
@@ -141,6 +144,7 @@ main = hspec $ do
   Seal.Core.PagingSpec.spec
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.ApiSpec.spec
+  Seal.Gateway.SendSpec.spec
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
@@ -223,6 +227,8 @@ main = hspec $ do
   Seal.Harness.DiscoverySpec.spec
   Seal.Tabs.TypesSpec.spec
   Seal.TabsSpec.spec
+  Seal.Tabs.PartitionSpec.spec
+  Seal.Tabs.PersistSpec.spec
   Seal.Tabs.RelaySpec.spec
   Seal.Tabs.WizardSpec.spec
   Seal.Routing.RouteSpec.spec

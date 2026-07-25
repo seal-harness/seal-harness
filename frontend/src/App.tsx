@@ -14,6 +14,7 @@ import {
   useTabs,
   useRecentSessions,
   useArchivedSessions,
+  useListsPoll,
   setSessionArchived,
   setSessionDescription,
   setSessionAgent,
@@ -158,17 +159,43 @@ const DEFAULT_AGENT: Agent = { id: 'seal', name: 'Seal Harness', status: 'idle',
 
 export default function App() {
   // ── List streams ──────────────────────────────────────────────────────
-  // The WS `lists` frame is the primary source; the polled hooks seed the
-  // initial render before the first WS frame lands (or whenever the WS is
-  // down). WS values take precedence whenever they are non-empty.
+  // 3-tier precedence (W7):
+  //   1. WS `lists` frame is primary. "WS live" means a `lists` frame has
+  //      arrived in this connection (tracked by `wsListsReceived`; reset on
+  //      reconnect). When live, all four fields come from the WS frame.
+  //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
+  //      always active (polls on mount regardless of WS state), selected
+  //      when WS is not live AND /api/lists is not in error.
+  //   3. Else (older server without /api/lists) the legacy three-poll
+  //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
+  //      final fallback.
   const wsLists = useListsStream()
+  const polledLists = useListsPoll()
   const polledTabs = useTabs()
   const polledRecent = useRecentSessions()
   const polledArchived = useArchivedSessions()
-  const tabs = wsLists.tabs.length > 0 ? wsLists.tabs : polledTabs.tabs
-  const rawSessions = wsLists.recentSessions.length > 0 ? wsLists.recentSessions : polledRecent.sessions
-  const archivedSessions = wsLists.archivedSessions.length > 0 ? wsLists.archivedSessions : polledArchived.sessions
-  const tabSessions = wsLists.tabSessions
+  // wsListsReceived flips true on the first WS lists frame, resets on
+  // reconnect (so a stale closed-frame state doesn't suppress the poll).
+  const [wsListsReceived, setWsListsReceived] = useState(false)
+  useEffect(() => {
+    if (wsLists.tabs.length > 0 || wsLists.recentSessions.length > 0) {
+      setWsListsReceived(true)
+    }
+  }, [wsLists.tabs.length, wsLists.recentSessions.length])
+  const wsLive = wsListsReceived
+  const usePollLists = !wsLive && !polledLists.error
+  const tabs = wsLive ? wsLists.tabs
+    : usePollLists ? polledLists.tabs
+    : polledTabs.tabs
+  const rawSessions = wsLive ? wsLists.recentSessions
+    : usePollLists ? polledLists.recentSessions
+    : polledRecent.sessions
+  const archivedSessions = wsLive ? wsLists.archivedSessions
+    : usePollLists ? polledLists.archivedSessions
+    : polledArchived.sessions
+  const tabSessions = wsLive ? wsLists.tabSessions
+    : usePollLists ? polledLists.tabSessions
+    : []
   const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
