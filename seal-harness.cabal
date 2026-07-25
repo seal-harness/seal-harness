@@ -141,6 +141,7 @@ library
         Seal.Gateway.Send
         Seal.Gateway.SessionJson
         Seal.Gateway.ListsSnapshot
+        Seal.Gateway.Broadcast
         Seal.Gateway.Server
          Seal.Gateway.Stream
          Seal.Gateway.StreamBroker

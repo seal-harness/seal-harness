@@ -100,6 +100,7 @@ import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -244,6 +245,7 @@ handleSend deps sid rawText = do
           Left err -> pure (SendError 500 err)
           Right () -> do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
             pure SendAssistant
       Right (SlashCommand _) -> do
         r <- runSlash deps meta rawText
@@ -251,6 +253,7 @@ handleSend deps sid rawText = do
           SendError _ _ -> pure r
           _            -> do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
             pure r
       Right NewSession -> do
         r <- runSlash deps meta rawText
@@ -258,6 +261,7 @@ handleSend deps sid rawText = do
           SendError _ _ -> pure r
           _            -> do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            triggerBroadcast deps
             pure r
       Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)" Nothing)
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
@@ -267,6 +271,14 @@ handleSend deps sid rawText = do
 -- the web send path. See its Haddock there for the contract (idempotent,
 -- race-safe, failure logged to stderr ids-only, sources SessionId only from
 -- server-validated contexts).
+
+-- | Push a fresh @lists@ snapshot to WS subscribers after a state change
+-- (W6 broadcast trigger). No-op when 'sdBroker' is 'Nothing' (tests).
+triggerBroadcast :: SendDeps -> IO ()
+triggerBroadcast deps =
+  case sdBroker deps of
+    Nothing     -> pure ()
+    Just broker -> broadcastListsSnapshot broker (sdTabsHandle deps) (sdPaths deps)
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.

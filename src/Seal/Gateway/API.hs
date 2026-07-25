@@ -45,6 +45,7 @@ import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
@@ -390,6 +391,17 @@ collectBody req = go []
         then pure (BL.fromChunks (reverse acc))
         else go (chunk : acc)
 
+-- | Push a fresh @lists@ snapshot to every WS subscriber. Called after
+-- every state change that affects the sidebar partition (W6 broadcast
+-- trigger). No-op when 'adBroker' is 'Nothing' (tests without a broker).
+-- The WS envelope (@{"type": "lists", ...}@) is added by
+-- 'Seal.Gateway.Broadcast.broadcastListsSnapshot'.
+triggerBroadcast :: ApiDeps -> IO ()
+triggerBroadcast deps =
+  case adBroker deps of
+    Nothing      -> pure ()
+    Just broker  -> broadcastListsSnapshot broker (adTabsHandle deps) (srPaths (adSessionRuntime deps))
+
 -- | Parse the @message@ field from a POST /send body. Returns "" on a
 -- missing/invalid body so the agent loop receives an empty turn (the routing
 -- grammar treats empty input as 'Plain ""').
@@ -463,11 +475,13 @@ handleTabNew deps v =
       meta <- newSession paths provider model "web" mAgent
       let sid = smId meta
       res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+      triggerBroadcast deps
       pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v
       res <- insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness label
+      triggerBroadcast deps
       pure (tabInsertResponse res Nothing "harness")
     Just _ -> pure (errJson status400 "unknown 'kind' field")
 
@@ -492,6 +506,7 @@ handleSessionNew deps v = do
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
   meta <- newSession paths provider model "web" mAgent
+  triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
     objOf (A.Object o) = Just o
@@ -526,20 +541,24 @@ handleSessionRebindNew deps sidTxt =
               let newSid = smId meta
               snap <- snapshotTabs (adTabsHandle deps)
               case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-                []       -> pure (jsonOk (object
-                  [ "session_id" .= sessionIdText newSid
-                  , "tab_index" .= (Nothing :: Maybe Int)
-                  , "rebound" .= False
-                  ]))
+                []       -> do
+                  triggerBroadcast deps
+                  pure (jsonOk (object
+                    [ "session_id" .= sessionIdText newSid
+                    , "tab_index" .= (Nothing :: Maybe Int)
+                    , "rebound" .= False
+                    ]))
                 (tab : _) -> do
                   r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
                   case r of
                     Left e -> pure (errJson status400 ("tab rebind failed: " <> e))
-                    Right _ -> pure (jsonOk (object
-                      [ "session_id" .= sessionIdText newSid
-                      , "tab_index" .= tabIndexToInt (tIndex tab)
-                      , "rebound" .= True
-                      ]))
+                    Right _ -> do
+                      triggerBroadcast deps
+                      pure (jsonOk (object
+                        [ "session_id" .= sessionIdText newSid
+                        , "tab_index" .= tabIndexToInt (tIndex tab)
+                        , "rebound" .= True
+                        ]))
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
@@ -547,8 +566,8 @@ handleSessionRebindNew deps sidTxt =
 handleSessionArchived :: ApiDeps -> SessionId -> Bool -> IO Response
 handleSessionArchived deps sid archived = do
   ok <- updateSessionArchived (srPaths (adSessionRuntime deps)) sid archived
-  pure (if ok then jsonOk (object ["ok" .= True])
-              else errJson status404 "session not found")
+  if ok then triggerBroadcast deps >> pure (jsonOk (object ["ok" .= True]))
+        else pure (errJson status404 "session not found")
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is
@@ -1003,14 +1022,14 @@ handleTabRemove deps idxTxt =
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> pure noContent
+        Right _ -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/tabs/:index/acknowledge + /release (no-op for T10).
 handleTabAck :: ApiDeps -> Text -> IO Response
-handleTabAck _deps idxTxt =
+handleTabAck deps idxTxt =
   case parseIndex idxTxt of
     Nothing   -> pure (errJson status400 "invalid tab index")
-    Just _idx -> pure noContent
+    Just _idx -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/tabs/:index/destroy (remove + delete from registry if
 -- harness; for T10 just remove).
@@ -1022,7 +1041,7 @@ handleTabDestroy deps idxTxt _body =
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> pure noContent
+        Right _ -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/adopt (consent-gated; the actual adoption wiring is
 -- Phase 6a's domain).
