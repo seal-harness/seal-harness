@@ -15,7 +15,7 @@ import Network.HTTP.Client (newManager, defaultManagerSettings)
 import Test.Hspec
 
 import Seal.Channel.Cli (newBackends)
-import Seal.Channels.Loop (channelCallDispatcher, newChannelDeps)
+import Seal.Channels.Loop (channelCallDispatcher, newChannelDeps, ChannelDeps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Core.Types (OpName (..), mkSessionId)
 import Seal.Config.File (defaultRuntimeConfig)
@@ -27,6 +27,9 @@ import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.ISA.Dispatch (DispatchError (..))
 import Seal.Security.Policy (AutonomyLevel (..))
+import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs)
+import Seal.Tabs.Types (TabRef (BoundSession), tlTabs)
+import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | A stub TmuxRunner that always succeeds with empty output.
@@ -82,8 +85,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           , prCallCounter = cntRef
           }
     approvals <- newApprovalCache
+    tabsH <- newTabsHandle
     deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig)
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
     sidRef <- newIORef sid
@@ -92,3 +96,38 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     case res of
       Left (OpNotFound (OpName n)) -> n `shouldBe` "BOGUS_OP"
       _ -> expectationFailure ("expected Left (OpNotFound ...), got: " <> show res)
+
+  it "newChannelDeps sets cdTabs to the passed TabsHandle (unified)" $ do
+    let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
+    ensureConfigRepo cfgRoot
+    let repo = openConfigRepo cfgRoot
+    backends <- newBackends cfgRoot repo
+    harnessReg <- newHarnessRegistry
+    let paths = SealPaths
+          { spHome = cfgRoot, spState = cfgRoot </> "state"
+          , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+          , spCache = cfgRoot </> "cache"
+          }
+        vaultRt = VaultRuntime
+          { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"
+          , vrHandleRef = error "vrHandleRef: stubbed — cdTabs test does not read the vault"
+          }
+    mgr <- newManager defaultManagerSettings
+    cntRef <- newIORef (0 :: Int)
+    let pr = ProviderRuntime
+          { prConfigPath = cfgRoot </> "config.toml"
+          , prVault = vaultRt
+          , prManager = mgr
+          , prCallCounter = cntRef
+          }
+    approvals <- newApprovalCache
+    tabsH <- newTabsHandle
+    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+    -- A tab inserted via the passed handle is visible through cdTabs —
+    -- proving cdTabs IS the passed handle (unified, not a forked copy).
+    -- (TabsHandle has no Eq instance, so we verify unification by behavior.)
+    let sid = either (error "sid") id (mkSessionId "cdtabs-test")
+    _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
+    snap <- snapshotTabs (cdTabs deps)
+    length (tlTabs snap) `shouldBe` 1

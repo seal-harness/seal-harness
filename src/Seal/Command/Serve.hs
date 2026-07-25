@@ -124,7 +124,7 @@ runServeMain autonomy = do
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg
+        reg tmuxR (Just mgr) approvals loadCfg tabsH
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -275,7 +275,7 @@ forkSignalListener deps cfg registry =
       case eTransport of
         Left err -> hPutStrLn stderr ("seal serve: signal channel skipped: " <> T.unpack err)
         Right transport -> do
-          tabsH <- newTabsHandle
+          let tabsH = cdTabs deps
           askReply <- newAskReplyStore 0
           let withCh = withSignalChannel (allow, chunkLimit) account transport
               plainHandler h = plainTurn deps h askReply
@@ -311,7 +311,7 @@ forkTelegramListener deps cfg registry = do
       transport <- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr
       -- Register the bot's slash-command menu with BotFather.
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
-      tabsH <- newTabsHandle
+      let tabsH = cdTabs deps
       askReply <- newAskReplyStore 0
       let withCh = withTelegramChannel (allow, chunkLimit) transport
           plainHandler h = plainTurn deps h askReply
