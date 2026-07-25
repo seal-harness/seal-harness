@@ -11,14 +11,18 @@ module Seal.Tabs
   , renameTabH
   , rebindTabH
   , focusTabH
+  , ensureTabForSession
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.Text (Text)
+import Data.Text qualified as T
+import System.IO (hPutStrLn, stderr)
 
+import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Handles.Tab (TabIndex, TabKind)
 import Seal.Tabs.Types
-  ( Tab (..), TabList (..), TabRef, emptyTabList, insertTab
+  ( Tab (..), TabList (..), TabRef (..), emptyTabList, insertTab
   , removeTab, renameTab, rebindTab, tabCount )
 
 -- | The live tab-list handle. Backed by a 'TVar' so concurrent tab commands
@@ -80,3 +84,24 @@ focusTabH (TabsHandle tv) idx = atomically $ do
   if tabCount tl > 0 && idx `elem` map tIndex (tlTabs tl)
     then pure (Right ())
     else pure (Left "tab index out of range")
+
+-- | Idempotent: if no tab binds @sid@, insert a @'BoundSession' sid@ tab of
+-- the given kind at the lowest free slot. Sources the 'SessionId' only from
+-- server-validated contexts (the caller passes @smId meta@ from a
+-- 'SessionMeta' loaded by 'loadSessionMeta' / minted by 'newSession' — never
+-- a raw client string). Failure (@Left "tab list full (36 slots)"@ or
+-- @Left "tab ref already bound"@ from a concurrent insert) is logged to
+-- stderr (ids + error only — no session content) and does NOT propagate;
+-- the tab is a UI affordance, not a correctness requirement. Shared by the
+-- web 'handleSend' (W2) and the channel/CLI 'plainTurn' paths (W3).
+ensureTabForSession :: TabsHandle -> TabKind -> SessionId -> IO ()
+ensureTabForSession tabsH kind sid = do
+  tl <- snapshotTabs tabsH
+  let alreadyBound = any (\t -> tRef t == BoundSession sid) (tlTabs tl)
+  if alreadyBound
+    then pure ()
+    else do
+      r <- insertTabH tabsH (BoundSession sid) kind Nothing
+      case r of
+        Left e -> hPutStrLn stderr ("[auto-tab] could not insert tab for " <> T.unpack (sessionIdText sid) <> ": " <> T.unpack e)
+        Right _ -> pure ()

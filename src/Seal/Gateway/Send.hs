@@ -64,8 +64,7 @@ import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, Transcri
 import Seal.Handles.Tab (TabKind (KindProvider))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Session.Log (logTurnError)
-import Seal.Tabs (TabsHandle, insertTabH, snapshotTabs)
-import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs)
+import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -264,25 +263,10 @@ handleSend deps sid rawText = do
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
 
--- | Idempotent: if no tab binds @sid@, insert a @'BoundSession' sid@ tab of
--- the given kind at the lowest free slot. Sources the 'SessionId' only from
--- server-validated contexts (the caller passes @smId meta@ from a
--- 'SessionMeta' loaded by 'loadSessionMeta' / minted by 'newSession' — never
--- a raw client string). Failure (@Left "tab list full (36 slots)"@ or
--- @Left "tab ref already bound"@ from a concurrent insert) is logged to
--- stderr (ids + error only — no session content) and does NOT propagate;
--- the tab is a UI affordance, not a correctness requirement.
-ensureTabForSession :: TabsHandle -> TabKind -> SessionId -> IO ()
-ensureTabForSession tabsH kind sid = do
-  tl <- snapshotTabs tabsH
-  let alreadyBound = any (\t -> tRef t == BoundSession sid) (tlTabs tl)
-  if alreadyBound
-    then pure ()
-    else do
-      r <- insertTabH tabsH (BoundSession sid) kind Nothing
-      case r of
-        Left e -> hPutStrLn stderr ("[auto-tab] could not insert tab for " <> T.unpack (sessionIdText sid) <> ": " <> T.unpack e)
-        Right _ -> pure ()
+-- | 'ensureTabForSession' is defined in 'Seal.Tabs' and re-exported here for
+-- the web send path. See its Haddock there for the contract (idempotent,
+-- race-safe, failure logged to stderr ids-only, sources SessionId only from
+-- server-validated contexts).
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.

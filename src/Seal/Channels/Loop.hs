@@ -135,8 +135,8 @@ import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, newSessionMeta
   , resolveDefaultAgent, saveSessionMeta )
 import Seal.Tabs
-  ( TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, rebindTabH
-  , snapshotTabs )
+  ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
+  , renameTabH, rebindTabH, snapshotTabs )
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs )
@@ -551,7 +551,12 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                     Nothing -> T.pack (show e)
               logTurnError (Just (sessionLogPath paths sid)) msg
               hPutStrLn stderr ("[channel] turn failed: " <> T.unpack msg)
-          broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+      broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+      -- W3 invariant 2: auto-tab the session after a channel turn. Idempotent
+      -- (no-op if a tab already binds sid — e.g. createConversationSession
+      -- already inserted one on first message). Uses KindAi (channel/CLI
+      -- tab kind, wire "session:ai"). Sources sid from smId meta only.
+      ensureTabForSession (cdTabs deps) KindAi sid
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
 -- a fresh persisted session from the config defaults (channel label

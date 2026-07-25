@@ -27,8 +27,8 @@ import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.ISA.Dispatch (DispatchError (..))
 import Seal.Security.Policy (AutonomyLevel (..))
-import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs)
-import Seal.Tabs.Types (TabRef (BoundSession), tlTabs)
+import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs, ensureTabForSession)
+import Seal.Tabs.Types (TabRef (BoundSession), Tab (tRef), tlTabs)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Vault.Commands (VaultRuntime (..))
 
@@ -131,3 +131,42 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
     snap <- snapshotTabs (cdTabs deps)
     length (tlTabs snap) `shouldBe` 1
+
+  it "ensureTabForSession is reachable via cdTabs (W3 channel auto-tab wiring)" $ do
+    -- The channel plainTurn path calls `ensureTabForSession (cdTabs deps)
+    -- KindAi sid` after a turn (Loop.hs). This test verifies the function is
+    -- reachable from a ChannelDeps context and inserts a KindAi tab via the
+    -- unified handle — the same call the production channel path makes.
+    let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
+    ensureConfigRepo cfgRoot
+    let repo = openConfigRepo cfgRoot
+    backends <- newBackends cfgRoot repo
+    harnessReg <- newHarnessRegistry
+    let paths = SealPaths
+          { spHome = cfgRoot, spState = cfgRoot </> "state"
+          , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+          , spCache = cfgRoot </> "cache"
+          }
+        vaultRt = VaultRuntime
+          { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"
+          , vrHandleRef = error "vrHandleRef: stubbed — W3 test does not read the vault"
+          }
+    mgr <- newManager defaultManagerSettings
+    cntRef <- newIORef (0 :: Int)
+    let pr = ProviderRuntime
+          { prConfigPath = cfgRoot </> "config.toml"
+          , prVault = vaultRt
+          , prManager = mgr
+          , prCallCounter = cntRef
+          }
+    approvals <- newApprovalCache
+    tabsH <- newTabsHandle
+    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+    let sid = either (error "sid") id (mkSessionId "w3-autotab")
+    -- Simulate the channel auto-tab call (production code: Loop.hs runTurnOnSession)
+    ensureTabForSession (cdTabs deps) KindAi sid
+    snap <- snapshotTabs (cdTabs deps)
+    case tlTabs snap of
+      [t] -> tRef t `shouldBe` BoundSession sid
+      _   -> expectationFailure ("expected exactly one auto-tab, got " <> show (tlTabs snap))
