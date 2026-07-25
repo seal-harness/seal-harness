@@ -14,6 +14,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -2365,3 +2366,150 @@ spec = describe "Seal.Gateway.API" $ do
             Just A.Null     -> pure ()
             Just other      -> expectationFailure ("expected no session_id, got: " <> show other)
         _ -> expectationFailure "expected JSON object"
+
+  -- ── Regression: /skill load must record the SKILL_LOAD transcript entry
+  -- on the REQUEST session, not the process-global active session ──────
+  -- webCallDispatcher reads srActive (the process-global active session
+  -- ref) to decide which session's transcript to record the SKILL_LOAD
+  -- result entry on. On a multi-session web gateway, the request's session
+  -- may differ from srActive. The entry MUST land on the request session
+  -- (the one the frontend is focused on / will re-seed from), otherwise
+  -- the skill-load tool-call box never appears in the UI. This test sends
+  -- /skill load to a non-active session and asserts the SKILL_LOAD entry
+  -- is present in THAT session's transcript (via GET /transcript).
+  it "regression: /skill load records the SKILL_LOAD entry on the request session" $
+    withSystemTempDirectory "seal-skill-load" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      tmuxR <- mkRealTmuxRunner
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
+      let paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
+          activeSidTxt = "20260720-214230-238"
+          requestSidTxt = "20260720-214349-258"
+          activeSid = case mkSessionId activeSidTxt of Right s -> s; Left _ -> error "active sid"
+          requestSid = case mkSessionId requestSidTxt of Right s -> s; Left _ -> error "request sid"
+          activeMeta = fakeMeta { smId = activeSid }
+          requestMeta = fakeMeta { smId = requestSid }
+      -- Persist BOTH sessions so the transcript seed read for either one
+      -- resolves (readTranscriptEntries falls back to the session.json
+      -- model/createdAt when reconstructing).
+      saveSessionMeta paths activeMeta
+      saveSessionMeta paths requestMeta
+      -- The process-global active ref points at the OTHER session.
+      activeRef <- newIORef activeMeta
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps) ]
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = registry
+            , sdResolve    = \_ -> pure (Left "unused")
+            , sdAutonomy   = Policy.Full
+            , sdBroker     = Nothing
+            , sdHarnessRegistry = reg
+            , sdTmuxRunner  = tmuxR
+            , sdHttpManager = Nothing
+            , sdAskReply    = askReply
+            , sdApprovals   = approvals
+            , sdReplies     = error "sdReplies: unused on the slash path"
+            , sdLocks       = error "sdLocks: unused on the slash path"
+            , sdTabsHandle  = tabsH
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = bAgentDefs backends
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = error "adUiState: unused on the slash path"
+            , adSend            = Just sendDeps
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            }
+          app = apiApp deps
+      -- Send /skill load seal-usage to the REQUEST session (not the active one).
+      sendReq <- testPost ["api", "sessions", requestSidTxt, "send"]
+        (A.encode (A.object [ "message" .= ("/skill load seal-usage" :: T.Text) ]))
+      (status, body) <- runAppBody app sendReq
+      status `shouldBe` 200
+      -- The slash response is the echo line (the body lives in the transcript).
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          case KeyMap.lookup (Key.fromText "kind") o of
+            Just (A.String k) -> k `shouldBe` "slash"
+            _ -> expectationFailure "expected kind: slash"
+        _ -> expectationFailure "expected JSON object"
+      -- Read the REQUEST session's transcript back via the GET endpoint and
+      -- assert it carries the SKILL_LOAD result entry (op.name = SKILL_LOAD
+      -- with a result.body). This is the surface the frontend renders as the
+      -- collapsible skill-load tool-call box.
+      transcriptReq <- pure (testRequest methodGet ["api", "sessions", requestSidTxt, "transcript"])
+      (tStatus, tBody) <- runAppBody app transcriptReq
+      tStatus `shouldBe` 200
+      let entries = case A.decode tBody :: Maybe A.Value of
+            Just (A.Array a) -> V.toList a
+            _                -> []
+      entries `shouldSatisfy` (not . null)
+      let hasSkillLoad = any hasSkillLoadResult entries
+      hasSkillLoad `shouldBe` True
+      -- And the ACTIVE session's transcript must NOT carry the entry (it
+      -- was not the target of the request).
+      activeTReq <- pure (testRequest methodGet ["api", "sessions", activeSidTxt, "transcript"])
+      (_aStatus, aBody) <- runAppBody app activeTReq
+      let activeEntries = case A.decode aBody :: Maybe A.Value of
+            Just (A.Array a) -> V.toList a
+            _                -> []
+      any hasSkillLoadResult activeEntries `shouldBe` False
+  where
+    -- | Predicate: a transcript-entry Value is a SKILL_LOAD result entry
+    -- (the frontend's ChatArea.tsx renders these as a collapsible
+    -- tool-call box). The frontend's @transcriptToMessages@ parses the
+    -- @payload@ field (the rewritten, frontend-facing shape) — NOT @raw@
+    -- — so the test asserts the @payload@ carries @op.name = "SKILL_LOAD"@
+    -- AND a @result@ object with a @body@ string. (Before the fix,
+    -- @rewritePayload@ dropped @input@/@result@ from Request-direction
+    -- harness entries, so @payload@ had only @op@ and the box never
+    -- rendered even though @raw@ carried the full payload.)
+    hasSkillLoadResult :: A.Value -> Bool
+    hasSkillLoadResult v =
+      case v of
+        A.Object o ->
+          case KeyMap.lookup (Key.fromText "payload") o of
+            Just (A.String payloadTxt) ->
+              case A.decode (BL.fromStrict (TE.encodeUtf8 payloadTxt)) :: Maybe A.Value of
+                Just (A.Object ro) ->
+                  case ( KeyMap.lookup (Key.fromText "op") ro
+                       , KeyMap.lookup (Key.fromText "result") ro ) of
+                    ( Just (A.Object op)
+                     , Just (A.Object res)
+                     ) ->
+                      case KeyMap.lookup (Key.fromText "name") op of
+                        Just (A.String n) -> n == "SKILL_LOAD" && KeyMap.member (Key.fromText "body") res
+                        _ -> False
+                    _ -> False
+                _ -> False
+            _ -> False
+        _ -> False

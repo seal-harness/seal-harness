@@ -14,7 +14,8 @@ module Seal.Gateway.StreamBroker
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Monad (when)
+import Control.Exception (SomeException, catch)
+import Control.Monad (when, filterM)
 import Data.Aeson (Value)
 
 import Seal.Core.Types (SessionId)
@@ -68,21 +69,40 @@ updateSubscriberSession ref sid = atomically (writeTVar ref sid)
 -- | Fan one event to every subscriber whose focused session matches. For
 -- 'BeListsSnapshot' (a broadcast to all), every subscriber receives it
 -- regardless of focus.
+--
+-- A subscriber whose 'subSend' throws (e.g. a closed WebSocket connection
+-- raising 'Network.WebSockets.ConnectionClosed') is silently dropped from
+-- the subscriber list and skipped for this event — a dead connection must
+-- never propagate an exception to the caller (e.g. a @seal serve@ request
+-- thread running 'triggerBroadcast' after a slash command). Without this,
+-- any slash command that triggers a lists broadcast 500s the HTTP response
+-- once the single WS subscriber's connection has dropped.
 broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
   subs <- readTVarIO (sbSubs broker)
-  case event of
-    BeListsSnapshot _ -> mapM_ (`subSend` event) subs
-    BeEntryRecorded sid _ -> mapM_ (\s -> do
+  live <- filterM (deliverTo event) subs
+  -- Drop any subscribers whose send threw (dead connections). The length
+  -- check avoids a needless STM write when everyone survived.
+  when (length live < length subs) $ atomically $ writeTVar (sbSubs broker) live
+  where
+    -- Decide whether this event targets the subscriber's focused session,
+    -- attempt the send, and return False (swallowing the exception) if the
+    -- send threw so the caller can prune the dead subscriber.
+    deliverTo ev s =
+      (do
+         ok <- shouldSend ev s
+         if ok then subSend s ev >> pure True else pure True)
+        `catch` \(_e :: SomeException) -> pure False
+    -- All-subscriber events vs session-filtered events.
+    shouldSend ev s = case ev of
+      BeListsSnapshot _  -> pure True
+      BeHarnessStatus _  -> pure True
+      BeEntryRecorded sid _ -> matchSession s sid
+      BeAsk sid _          -> matchSession s sid
+      BeAskResolved sid _  -> matchSession s sid
+    matchSession s sid = do
       subSid <- readTVarIO (subSessionRef s)
-      when (subSid == sid) (subSend s event)) subs
-    BeHarnessStatus _ -> mapM_ (`subSend` event) subs  -- harness status → all (the frontend's sidebar shows all harnesses)
-    BeAsk sid _ -> mapM_ (\s -> do
-      subSid <- readTVarIO (subSessionRef s)
-      when (subSid == sid) (subSend s event)) subs
-    BeAskResolved sid _ -> mapM_ (\s -> do
-      subSid <- readTVarIO (subSessionRef s)
-      when (subSid == sid) (subSend s event)) subs
+      pure (subSid == sid)
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()

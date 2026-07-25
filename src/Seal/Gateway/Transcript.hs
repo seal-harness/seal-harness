@@ -367,19 +367,28 @@ rewritePayload val dir =
           fields = case dir of
             Request ->
               passthrough (k "system")
-              <> passthrough (k "model")
-              <> passthrough (k "tools")
-              <> passthrough (k "toolChoice")
-              <> passthrough (k "maxTokens")
-              <> passthrough (k "approval")
-              <> passthrough (k "op")
-              <> rewriteMsgs
+               <> passthrough (k "model")
+               <> passthrough (k "tools")
+               <> passthrough (k "toolChoice")
+               <> passthrough (k "maxTokens")
+               <> passthrough (k "approval")
+               <> passthrough (k "op")
+               -- Harness/opcode-invocation entries (EKHarness) carry the
+               -- opcode's input + result under these keys (see
+               -- Seal.Transcript.Reconstruct.harnessPayload). The SKILL_LOAD
+               -- result entry is a Request-direction harness entry; without
+               -- passing @input@ + @result@ through, the frontend's
+               -- @transcriptToMessages@ sees @op.name = "SKILL_LOAD"@ but no
+               -- @result@, so the skill-load tool-call box never renders.
+               <> passthrough (k "input")
+               <> passthrough (k "result")
+               <> rewriteMsgs
             Response ->
               passthrough (k "model")
-              <> rewriteContent
-              <> usageFields
-              <> passthrough (k "stop")
-              <> passthrough (k "durationMs")
+               <> rewriteContent
+               <> usageFields
+               <> passthrough (k "stop")
+               <> passthrough (k "durationMs")
       in A.object fields
     _ -> val
 

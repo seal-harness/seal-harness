@@ -26,7 +26,7 @@ import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (readIORef)
+import Data.IORef (readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -248,7 +248,25 @@ handleSend deps sid rawText = do
             triggerBroadcast deps
             pure SendAssistant
       Right (SlashCommand _) -> do
+        -- The web gateway is multi-session: srActive is a process-global ref
+        -- that may point at a DIFFERENT session than this request targets.
+        -- Slash commands like /skill load and /call dispatch an opcode via
+        -- 'webCallDispatcher', which reads srActive to decide which
+        -- session's transcript to record the result entry on. Without
+        -- scoping srActive to the request's session for the duration of
+        -- the dispatch, a /skill load issued against session A while
+        -- srActive points at session B records the SKILL_LOAD entry on B
+        -- — so the frontend (focused on A) never sees the skill-load
+        -- tool-call box (it only appears after a reload re-seeds from B,
+        -- which the frontend isn't viewing). Bracket the dispatch so
+        -- srActive points at the request's session, then restore the
+        -- pre-call value. /new is routed to NewSession (below) and
+        -- intentionally keeps its swap, so this restore does NOT fight
+        -- /new.
+        activeBefore <- readIORef (srActive (sdSession deps))
+        writeIORef (srActive (sdSession deps)) meta
         r <- runSlash deps meta rawText
+        writeIORef (srActive (sdSession deps)) activeBefore
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -637,7 +655,15 @@ webCallDispatcher deps callOpName val = do
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
-      Right r -> recordSkillLoadResult tHandle callOpName val r
+      Right r -> do
+        recordSkillLoadResult tHandle callOpName val r
+        -- Broadcast the newly-recorded transcript entry (e.g. the
+        -- SKILL_LOAD result entry) so the web frontend's WS stream
+        -- receives it live. Without this, the skill-load tool-call box
+        -- only appears after a page reload re-fetches the transcript
+        -- seed. The regular turn path broadcasts in plainTurnWithCaps
+        -- (Send.hs:600); the dispatcher path must do the same.
+        broadcastNewEntries (sdBroker deps) paths sid (smModel meta) (smCreatedAt meta)
       Left _  -> pure ()
     pure res
 

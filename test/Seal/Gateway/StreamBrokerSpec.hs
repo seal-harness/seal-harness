@@ -4,6 +4,7 @@ module Seal.Gateway.StreamBrokerSpec (spec) where
 import Data.Aeson (object, (.=))
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text qualified as T
+import Control.Exception (Exception, throwIO)
 import Test.Hspec
 
 import Seal.Core.Types (mkSessionId, SessionId)
@@ -11,6 +12,14 @@ import Seal.Gateway.StreamBroker
 
 mkSid :: T.Text -> SessionId
 mkSid t = case mkSessionId t of Right s -> s; Left _ -> error "bad sid"
+
+-- | A controlled exception type so tests can simulate a dead connection
+-- (mirrors 'Network.WebSockets.ConnectionClosed' without pulling in the
+-- websockets dependency).
+data DeadConnection = DeadConnection
+  deriving stock (Show)
+
+instance Exception DeadConnection
 
 spec :: Spec
 spec = describe "Seal.Gateway.StreamBroker" $ do
@@ -68,3 +77,34 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     case events of
       [BeListsSnapshot _] -> pure ()
       _                  -> expectationFailure ("expected exactly one BeListsSnapshot, got " <> show events)
+
+  -- Regression: a subscriber whose send throws (e.g. a closed WebSocket
+  -- raising ConnectionClosed) must NOT propagate the exception to the
+  -- caller. Before the fix, any slash command that triggered a lists
+  -- broadcast 500ed the HTTP request once the single WS subscriber's
+  -- connection had dropped.
+  it "broadcast swallows a throwing subscriber and does not propagate" $ do
+    broker <- newStreamBroker 10
+    refHealthy <- newIORef ([] :: [BrokerEvent])
+    _ <- subscribe broker (mkSid "a") (\_e -> throwIO DeadConnection)
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refHealthy (e :))
+    let entry = object ["id" .= ("e1" :: T.Text)]
+    broadcast broker (BeEntryRecorded (mkSid "a") entry)
+    -- The healthy subscriber still received the event.
+    h <- readIORef refHealthy
+    length h `shouldBe` 1
+    -- The dead subscriber was pruned (no longer in the subscriber list).
+    count <- subscriberCount broker
+    count `shouldBe` 1
+
+  it "broadcast swallows a throwing subscriber for BeListsSnapshot (all-subscriber)" $ do
+    broker <- newStreamBroker 10
+    refHealthy <- newIORef ([] :: [BrokerEvent])
+    _ <- subscribe broker (mkSid "a") (\_e -> throwIO DeadConnection)
+    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refHealthy (e :))
+    let snap = object ["tabs" .= ([] :: [T.Text])]
+    broadcastLists broker snap
+    h <- readIORef refHealthy
+    length h `shouldBe` 1
+    count <- subscriberCount broker
+    count `shouldBe` 1
