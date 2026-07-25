@@ -248,6 +248,7 @@ test-suite tests
       , seal-harness
       , QuickCheck
       , aeson
+      , async
       , bytestring
       , containers
       , directory
@@ -276,6 +277,7 @@ test-suite tests
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.ApiSpec
+        Seal.Gateway.SendSpec
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec

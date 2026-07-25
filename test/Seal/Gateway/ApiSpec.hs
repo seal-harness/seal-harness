@@ -2129,6 +2129,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = error "sdApprovals: unused on the 404 path"
             , sdReplies     = error "sdReplies: unused on the 404 path"
             , sdLocks       = error "sdLocks: unused on the 404 path"
+            , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2213,6 +2214,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = approvals
             , sdReplies     = testReplies
             , sdLocks       = testLocks
+            , sdTabsHandle  = tabsH
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2329,6 +2331,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = approvals
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
+            , sdTabsHandle  = tabsH
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

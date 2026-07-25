@@ -186,6 +186,7 @@ runServeMain autonomy = do
         , sdApprovals   = approvals
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
+        , sdTabsHandle  = tabsH
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
