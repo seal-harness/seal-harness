@@ -5,6 +5,7 @@ import {
   useRecentSessions,
   useTabs,
   useArchivedSessions,
+  useListsPoll,
   useDiscoverableWindows,
   useTranscript,
   useSendMessage,
@@ -94,6 +95,45 @@ describe('useArchivedSessions', () => {
     const { result } = renderHook(() => useArchivedSessions())
     await waitFor(() => expect(result.current.sessions).toHaveLength(1))
     expect(result.current.sessions[0]!.id).toBe('old')
+  })
+})
+
+describe('useListsPoll', () => {
+  it('fetches GET /api/lists on mount and returns the four arrays + error=false', async () => {
+    const wire: TabInfoWire = { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 's1', ext_modified: false, stale: false, origin: undefined, attach_command: null }
+    const sess = { id: 's2', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null }
+    setNextResponse({ tabs: [wire], recentSessions: [sess], archivedSessions: [], tabSessions: [] })
+    const { result } = renderHook(() => useListsPoll())
+    await waitFor(() => expect(result.current.tabs).toHaveLength(1))
+    expect(result.current.tabs[0]!.index).toBe(0)
+    expect(result.current.recentSessions).toHaveLength(1)
+    expect(result.current.recentSessions[0]!.id).toBe('s2')
+    expect(result.current.archivedSessions).toHaveLength(0)
+    expect(result.current.tabSessions).toHaveLength(0)
+    expect(result.current.error).toBe(false)
+    expect(fetchCalls.some((c) => c.url === '/api/lists' && (c.init?.method ?? 'GET') === 'GET')).toBe(true)
+  })
+
+  it('maps TabInfoWire[] to TabInfo[] via mapTabInfo', async () => {
+    const wire: TabInfoWire = { index: 1, kind: 'session:provider', label: 'work', status: 'running', session_id: 's9', ext_modified: true, stale: false, origin: 'spawned', attach_command: 'tmux attach -t 1' }
+    setNextResponse({ tabs: [wire], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    const { result } = renderHook(() => useListsPoll())
+    await waitFor(() => expect(result.current.tabs).toHaveLength(1))
+    const t = result.current.tabs[0]!
+    expect(t.index).toBe(1)
+    expect(t.kind).toBe('session:provider')
+    expect(t.label).toBe('work')
+    expect(t.status).toBe('running')
+    expect(t.session_id).toBe('s9')
+    expect(t.extModified).toBe(true)
+    expect(t.origin).toBe('spawned')
+    expect(t.attachCommand).toBe('tmux attach -t 1')
+  })
+
+  it('on 404, sets error=true', async () => {
+    setNextResponse('not found', 404)
+    const { result } = renderHook(() => useListsPoll())
+    await waitFor(() => expect(result.current.error).toBe(true))
   })
 })
 

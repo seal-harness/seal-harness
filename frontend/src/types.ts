@@ -135,10 +135,12 @@ export function tabDisplayLabel(tab: TabInfo, session: SessionInfo | null | unde
 
 /** Find the session backing a tab id across the live (recents), archived, and
  *  active-tab lists. `tabSessions` carries the SessionInfo for sessions that
- *  back an open tab — those are deduped OUT of recents/archived by the backend
- *  and the tab snapshot is meta-free, so without consulting it an OPEN tab's
- *  session would resolve nowhere (no chat-header pencil, stale title). Returns
- *  undefined when the id is null/unknown. */
+ *  back an open tab — the backend's `partitionSessions` (Seal.Tabs.Partition)
+ *  dedups these OUT of recents/archived so the three lists are mutually
+ *  exclusive by construction, and the tab snapshot is meta-free, so without
+ *  consulting `tabSessions` an OPEN tab's session would resolve nowhere (no
+ *  chat-header pencil, stale title). Returns undefined when the id is
+ *  null/unknown. */
 export function findSession(
   id: string | null | undefined,
   sessions: SessionInfo[],
