@@ -91,6 +91,7 @@ import qualified Seal.Harness.TmuxIOSpec
 import qualified Seal.Harness.DiscoverySpec
 import qualified Seal.Tabs.TypesSpec
 import qualified Seal.TabsSpec
+import qualified Seal.Tabs.PartitionSpec
 import qualified Seal.Tabs.RelaySpec
 import qualified Seal.Tabs.WizardSpec
 import qualified Seal.Routing.RouteSpec
@@ -223,6 +224,7 @@ main = hspec $ do
   Seal.Harness.DiscoverySpec.spec
   Seal.Tabs.TypesSpec.spec
   Seal.TabsSpec.spec
+  Seal.Tabs.PartitionSpec.spec
   Seal.Tabs.RelaySpec.spec
   Seal.Tabs.WizardSpec.spec
   Seal.Routing.RouteSpec.spec

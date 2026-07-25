@@ -71,6 +71,7 @@ library
         Seal.Session.Lock
         Seal.Tabs
         Seal.Tabs.Persist
+        Seal.Tabs.Partition
         Seal.Tabs.Relay
         Seal.Tabs.Runtimes
         Seal.Tabs.Types
@@ -285,6 +286,7 @@ test-suite tests
         Seal.Harness.DiscoverySpec
         Seal.Tabs.TypesSpec
         Seal.TabsSpec
+        Seal.Tabs.PartitionSpec
         Seal.Tabs.RelaySpec
         Seal.Tabs.WizardSpec
         Seal.Routing.RouteSpec
