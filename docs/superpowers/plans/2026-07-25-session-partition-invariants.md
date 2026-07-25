@@ -112,7 +112,7 @@ Execution order: W1 → (W2, W4 in parallel) → W3 → (W5, W6 in parallel) →
 - Test: `test/Seal/Gateway/ApiSpec.hs` (extend with `/api/lists` cases)
 
 **Interfaces:**
-- Produces: `partitionSessions :: TabList -> [SessionMeta] -> [SessionMeta] -> PartitionedSessions`, `buildListsSnapshot :: ApiDeps -> IO ListsSnapshotWire`, `ListsSnapshotWire` record + `ToJSON`.
+- Produces: `partitionSessions :: TabList -> [SessionMeta] -> [SessionMeta] -> PartitionedSessions`, `buildListsSnapshot :: TabsHandle -> SealPaths -> IO ListsSnapshotWire`, `ListsSnapshotWire` record + `ToJSON`, `tabToJson`/`sessionInfoJsonWithSnippet` (moved to `Seal.Gateway.SessionJson`).
 
 ### Step 1: Write the failing partition test
 
@@ -808,16 +808,21 @@ describe "debouncedBroadcast" $ do
 -- | Coalesce broadcastLists calls within a 50ms window. The last call wins
 -- (a fresh buildListsSnapshot runs at the window edge). Bounds the broadcast
 -- rate when many triggers fire in quick succession (e.g. send + auto-tab).
+-- Lives in API.hs (has ApiDeps); calls buildListsSnapshot with the component
+-- accessors — NOT `buildListsSnapshot deps` (the old signature was changed to
+-- break the import cycle; the new signature is TabsHandle -> SealPaths -> IO ...).
 debouncedBroadcast :: ApiDeps -> IO ()
 debouncedBroadcast deps =
   case adBroker deps of
     Nothing -> pure ()
     Just broker -> do
       -- implement with a TVar (Maybe (IO ())) + a forkIO timer; on each call,
-      -- replace the pending action; the timer fires buildListsSnapshot + broadcastLists.
+      -- replace the pending action; the timer fires:
+      --   snap <- buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps))
+      --   broadcastLists broker (A.toJSON snap -- wrapped with {"type":"lists"} for the WS frame)
 ```
 
-(Implement the debounce with a `TVar (Maybe UTCTime)` + a single forkIO watcher, or an `MVar (Maybe (IO ()))` + a worker thread. Keep it simple.)
+(Implement the debounce with a `TVar (Maybe UTCTime)` + a single forkIO watcher, or an `MVar (Maybe (IO ()))` + a worker thread. Keep it simple. Note: the WS frame wraps `ListsSnapshotWire` with `{"type": "lists", ...}` — the REST `GET /api/lists` returns the bare record. The broadcast path must add the `type` envelope.)
 
 - [ ] Wire `debouncedBroadcast deps` into every state-change handler in `API.hs` (tab insert/remove/rebind/rename/acknowledge/release, archive/unarchive, session new/rebind-new).
 
