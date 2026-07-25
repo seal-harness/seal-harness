@@ -369,11 +369,13 @@ rewritePayload val dir =
               passthrough (k "system")
               <> passthrough (k "model")
               <> passthrough (k "tools")
-              <> passthrough (k "toolChoice")
+              <> passthrough (k "tools")
               <> passthrough (k "maxTokens")
               <> passthrough (k "approval")
               <> passthrough (k "op")
               <> rewriteMsgs
+              <> passthrough (k "input")
+              <> passthrough (k "result")
             Response ->
               passthrough (k "model")
               <> rewriteContent
