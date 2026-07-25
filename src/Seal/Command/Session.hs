@@ -17,6 +17,7 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Gateway.Transcript (firstUserMessageSnippet)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions)
 import Data.IORef (readIORef)
@@ -53,7 +54,10 @@ listCmd sr = CommandAction $ \caps -> do
   metas  <- listSessions (srPaths sr)
   if null metas
     then ccSend caps "no sessions yet"
-    else mapM_ (ccSend caps . renderSessionLine (smId active)) metas
+    else do
+      snippets <- mapM (firstUserMessageSnippet (srPaths sr) . smId) metas
+      mapM_ (ccSend caps . uncurry (renderSessionLine (smId active)))
+            (zip snippets metas)
 
 infoCmd :: SessionRuntime -> CommandAction
 infoCmd sr = CommandAction $ \caps -> do
@@ -61,12 +65,25 @@ infoCmd sr = CommandAction $ \caps -> do
   mapM_ (ccSend caps) (renderSessionInfo active)
 
 -- | One line per session for @/session list@, marking the active one.
-renderSessionLine :: SessionId -> SessionMeta -> Text
-renderSessionLine active m =
+-- Shows the session id, provider/model, the bound agent (if any), and the
+-- first user message snippet (if any) — the same title cascade the web
+-- frontend uses, minus the timestamp (which is redundant with the id).
+renderSessionLine :: SessionId -> Maybe Text -> SessionMeta -> Text
+renderSessionLine active mSnippet m =
   let mark = if smId m == active then "  (active)" else ""
+      agentLabel = case (smAgentName m, smAgent m) of
+        (Just name, _)   -> name
+        (Nothing, Just a) -> agentDefIdText a
+        (Nothing, Nothing) -> ""
+      agentPart = if T.null agentLabel then "" else "  " <> agentLabel
+      snippetPart = case mSnippet of
+        Just s  -> "  " <> s
+        Nothing -> ""
   in sessionIdText (smId m)
        <> "  " <> smProvider m <> "/" <> smModel m
-       <> "  " <> T.pack (show (smLastActive m)) <> mark
+       <> agentPart
+       <> snippetPart
+       <> mark
 
 -- | Multi-line detail for @/session info@.
 renderSessionInfo :: SessionMeta -> [Text]

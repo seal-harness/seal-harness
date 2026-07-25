@@ -60,10 +60,26 @@ spec = describe "Seal.Command.Session" $ do
   describe "pure renderers" $ do
     it "marks the active session" $ do
       let active = fromRight (error "invalid session id") (mkSessionId "20260701-120000-002")
-      renderSessionLine active (meta "20260701-120000-002")
+      renderSessionLine active Nothing (meta "20260701-120000-002")
         `shouldSatisfy` ("(active)" `T.isInfixOf`)
-      renderSessionLine active (meta "20260701-120000-001")
+      renderSessionLine active Nothing (meta "20260701-120000-001")
         `shouldSatisfy` (not . ("(active)" `T.isInfixOf`))
+
+    it "includes agent name when present" $ do
+      let active = fromRight (error "invalid session id") (mkSessionId "20260701-120000-001")
+          m = (meta "20260701-120000-002") { smAgentName = Just "zoe" }
+      renderSessionLine active Nothing m
+        `shouldSatisfy` ("zoe" `T.isInfixOf`)
+
+    it "includes first message snippet when present" $ do
+      let active = fromRight (error "invalid session id") (mkSessionId "20260701-120000-001")
+      renderSessionLine active (Just "Fix the login bug") (meta "20260701-120000-002")
+        `shouldSatisfy` ("Fix the login bug" `T.isInfixOf`)
+
+    it "does not include the timestamp" $ do
+      let active = fromRight (error "invalid session id") (mkSessionId "20260701-120000-001")
+          line = renderSessionLine active Nothing (meta "20260701-120000-002")
+      line `shouldSatisfy` (not . ("2026-07-01" `T.isInfixOf`))
 
     it "info includes id, provider and model" $ do
       let ls = T.unlines (renderSessionInfo (meta "20260701-120000-002"))
