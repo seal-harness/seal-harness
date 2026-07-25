@@ -225,15 +225,18 @@ data PartitionedSessions = PartitionedSessions
 -- else into 'psArchivedSessions'. Harness tabs (@BoundHarness@) carry no
 -- session and pull nothing into 'psTabSessions'. An archived + tab-bound
 -- session goes into 'psTabSessions' (the tab wins; the archive flag stays
--- on disk and resurfaces when the tab closes).
+-- on disk and resurfaces when the tab closes) — so we filter BOTH the
+-- recent and archived lists by @tabSids@, and the tab-bound entries from
+-- both are merged into 'psTabSessions'.
 partitionSessions :: TabList -> [SessionMeta] -> [SessionMeta] -> PartitionedSessions
 partitionSessions tl recent archived =
   let tabSids = Set.fromList [ sid | t <- tlTabs tl, BoundSession sid <- [tRef t] ]
-      (tabbed, recent') = partition (`belongsInTabs` tabSids) recent
+      (tabbedFromRecent, recent') = partition (`belongsInTabs` tabSids) recent
+      (tabbedFromArchived, archived') = partition (`belongsInTabs` tabSids) archived
   in PartitionedSessions
-       { psTabSessions = tabbed
+       { psTabSessions = tabbedFromRecent <> tabbedFromArchived
        , psRecentSessions = recent'
-       , psArchivedSessions = archived
+       , psArchivedSessions = archived'
        }
   where
     belongsInTabs s tabSids = smId s `Set.member` tabSids
