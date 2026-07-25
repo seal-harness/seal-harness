@@ -9,6 +9,7 @@ module Seal.Config.Paths
   , sessionsRoot
   , sessionDir
   , sessionMetaPath
+  , sessionArchivedMarkerPath
   , sessionTranscriptPath
   , sessionConversationPath
   , sessionEntriesPath
@@ -114,6 +115,12 @@ sessionDir paths sid = sessionsRoot paths </> T.unpack (sessionIdText sid)
 -- | The session's metadata file: @\<sessionDir\>\/session.json@.
 sessionMetaPath :: SealPaths -> SessionId -> FilePath
 sessionMetaPath paths sid = sessionDir paths sid </> "session.json"
+
+-- | The session's archived marker: @\<sessionDir\>\/archived@. An empty file
+-- whose presence marks the session as archived (a UI hint — the transcript
+-- and session.json stay on disk). Absent = not archived.
+sessionArchivedMarkerPath :: SealPaths -> SessionId -> FilePath
+sessionArchivedMarkerPath paths sid = sessionDir paths sid </> "archived"
 
 -- | The session's transcript: @\<sessionDir\>\/transcript.jsonl@.
 sessionTranscriptPath :: SealPaths -> SessionId -> FilePath

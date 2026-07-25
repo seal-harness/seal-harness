@@ -57,8 +57,9 @@ import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( SessionRuntime (..), defaultSessionSelection, listSessions, newSession
-  , resolveDefaultAgent, updateSessionAgent, updateSessionSystemOverride )
+  ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
+  , listSessions, newSession, resolveDefaultAgent, updateSessionAgent
+  , updateSessionArchived, updateSessionSystemOverride )
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..), tlTabs)
 import Seal.Web.UiState
@@ -89,18 +90,21 @@ apiApp deps req respond =
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
       respond (jsonLBS status200 (A.encode tabsJson))
-    -- T11: GET /api/sessions -> the recent, non-archived sessions. The
-    -- backend does not persist an @archived@ flag on 'SessionMeta' yet, so
-    -- this returns ALL sessions; @/api/sessions/archived@ returns @[]@ (the
-    -- archive flag is a UI hint the backend doesn't track yet).
+    -- GET /api/sessions -> the recent, non-archived sessions. Archiving is a
+    -- pure UI hint persisted as an @archived@ marker file in the session
+    -- directory (the transcript + session.json stay on disk); 'listSessions'
+    -- filters those out, and 'listArchivedSessions' returns them via
+    -- @/api/sessions/archived@.
     (m', ["api", "sessions"]) | m' == methodGet -> do
       metas <- listSessions (srPaths (adSessionRuntime deps))
       infos <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) metas
       respond (jsonLBS status200 (A.encode infos))
-    -- T11: archived sessions — the backend doesn't persist an archive flag,
-    -- so this is always @[]@ for now.
-    (m', ["api", "sessions", "archived"]) | m' == methodGet ->
-      respond (jsonLBS status200 (A.encode ([] :: [Value])))
+    -- GET /api/sessions/archived -> the archived sessions (those carrying an
+    -- @archived@ marker file). Same shape as /api/sessions.
+    (m', ["api", "sessions", "archived"]) | m' == methodGet -> do
+      metas <- listArchivedSessions (srPaths (adSessionRuntime deps))
+      infos <- mapM (sessionInfoJsonWithSnippet (srPaths (adSessionRuntime deps))) metas
+      respond (jsonLBS status200 (A.encode infos))
     -- T11: GET /api/sessions/:id/transcript -> the parsed @entries.jsonl@
     -- lines, as a JSON array. Missing file -> @[]@; unparseable lines are
     -- skipped.
@@ -128,10 +132,18 @@ apiApp deps req respond =
     (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
       _body <- collectBody req
       respond noContent
-    -- T11 STUB: PUT /api/sessions/:id/archived — 204 (no persistence yet).
-    (m', ["api", "sessions", _sid, "archived"]) | m' == methodPut -> do
-      _body <- collectBody req
-      respond noContent
+    -- PUT /api/sessions/:id/archived — set or clear the archive flag. Body:
+    -- {"archived": true|false}. Persists via 'updateSessionArchived' (a marker
+    -- file in the session directory). Returns 200 {ok:true} on success, 404
+    -- when the session has no session.json on disk, 400 on invalid JSON or a
+    -- missing/non-boolean @archived@ field.
+    (m', ["api", "sessions", sid, "archived"]) | m' == methodPut -> do
+      body <- collectBody req
+      case mkSessionId sid of
+        Left e  -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> case parseArchivedFlag body of
+          Nothing       -> respond (errJson status400 "missing or invalid 'archived' field")
+          Just archived -> respond =<< handleSessionArchived deps sId archived
     -- PUT /api/sessions/:id/prompt — set or clear an ad-hoc system prompt
     -- override for the session (the Session setup screen's "Use a one-off
     -- agent file" upload). Body: {"prompt":"<text>"} (empty/missing
@@ -516,6 +528,26 @@ handleSessionRebindNew deps sidTxt =
                       , "tab_index" .= tabIndexToInt (tIndex tab)
                       , "rebound" .= True
                       ]))
+
+-- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
+-- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
+-- the session has no @session.json@ on disk.
+handleSessionArchived :: ApiDeps -> SessionId -> Bool -> IO Response
+handleSessionArchived deps sid archived = do
+  ok <- updateSessionArchived (srPaths (adSessionRuntime deps)) sid archived
+  pure (if ok then jsonOk (object ["ok" .= True])
+              else errJson status404 "session not found")
+
+-- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
+-- body. Returns 'Nothing' when the body is invalid JSON or the field is
+-- missing/non-boolean.
+parseArchivedFlag :: BL.ByteString -> Maybe Bool
+parseArchivedFlag body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "archived") o of
+      Just (A.Bool b) -> Just b
+      _               -> Nothing
+    _ -> Nothing
 
 -- | Handle PUT /api/sessions/:id/prompt. Parses the @prompt@ field from
 -- the body (an empty/missing value clears the override), trims it, and

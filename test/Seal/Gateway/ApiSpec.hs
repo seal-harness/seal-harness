@@ -22,7 +22,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -452,7 +452,7 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> error "first session not an object"
       lookupK "firstMessageSnippet" o `shouldBe` Just A.Null
 
-  it "GET /api/sessions/archived returns 200 with []" $ do
+  it "GET /api/sessions/archived returns 200 with [] when none archived" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "sessions", "archived"])
     status `shouldBe` 200
@@ -804,12 +804,81 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 204
 
-  it "PUT /api/sessions/<sid>/archived returns 204" $ do
+  it "PUT /api/sessions/<sid>/archived returns 200 {ok:true} and moves the session to /archived" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-051"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      -- Archive
+      req <- testPut ["api", "sessions", sidTxt, "archived"]
+        (A.encode (A.object [ "archived" .= True ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "ok" o `shouldBe` Just (A.Bool True)
+        other -> error ("unexpected archived body: " ++ show other)
+      -- Marker file now exists on disk
+      doesFileExist (sdir </> "archived") >>= (`shouldBe` True)
+      -- /api/sessions no longer lists it
+      (status2, body2) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status2 `shouldBe` 200
+      case A.decode body2 :: Maybe [A.Value] of
+        Just xs -> xs `shouldBe` []
+        Nothing -> error "could not decode sessions body"
+      -- /api/sessions/archived now lists it
+      (status3, body3) <- runAppBody app (testRequest methodGet ["api", "sessions", "archived"])
+      status3 `shouldBe` 200
+      case A.decode body3 :: Maybe [A.Value] of
+        Just [A.Object o] -> lookupK "id" o `shouldBe` Just (A.String sidTxt)
+        Just xs          -> error ("expected exactly 1 archived session, got " ++ show (length xs))
+        Nothing          -> error "could not decode archived body"
+
+  it "PUT /api/sessions/<sid>/archived with archived:false unarchives (removes marker, returns to /sessions)" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-052"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      writeFile (sdir </> "archived") ""
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "archived"]
+        (A.encode (A.object [ "archived" .= False ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      doesFileExist (sdir </> "archived") >>= (`shouldBe` False)
+      -- /api/sessions lists it again
+      (_, body2) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      case A.decode body2 :: Maybe [A.Value] of
+        Just xs -> length xs `shouldBe` 1
+        Nothing -> error "could not decode sessions body"
+
+  it "PUT /api/sessions/<sid>/archived returns 404 when the session doesn't exist" $ do
     app <- mkApp
-    req <- testPut ["api", "sessions", "sess1", "archived"]
+    req <- testPut ["api", "sessions", "nonexistent", "archived"]
       (A.encode (A.object [ "archived" .= True ]))
     status <- runAppStatus app req
-    status `shouldBe` 204
+    status `shouldBe` 404
+
+  it "PUT /api/sessions/<sid>/archived returns 400 on a missing archived field" $ do
+    app <- mkApp
+    req <- testPut ["api", "sessions", "sess1", "archived"]
+      (A.encode (A.object [ "other" .= (1 :: Int) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
 
   it "PUT /api/sessions/<sid>/prompt returns 200 when the session exists" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
