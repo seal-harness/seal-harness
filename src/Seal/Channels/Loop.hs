@@ -455,11 +455,11 @@ broadcastTabs deps tabsH =
 mkTabCloseNotifier :: CursorStore -> ReplyRegistry -> TabCloseNotifier
 mkTabCloseNotifier cursors replies ref = case ref of
   BoundSession sid -> do
-    replyFanout replies sid msg
+    replyFanout replies sid (msg sid)
     cursorClearAll cursors ref
   BoundHarness _ -> pure ()
   where
-    msg = "tab closed; a new tab will be created on your next message"
+    msg sid = "tab closed (session " <> sessionIdText sid <> "); a new tab will be created on your next message"
 
 -- | Handle a parsed 'TabSlashCommand' over a channel (mutates the
 -- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.
