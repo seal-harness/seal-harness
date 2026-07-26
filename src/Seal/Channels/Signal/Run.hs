@@ -296,7 +296,7 @@ runSignalMain autonomy = do
   tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
   let loadCfg = do
         lc <- loadRuntimeConfig cfgPath
-        pure (either (const defaultRuntimeConfig) id lc)
+        pure (fromRight defaultRuntimeConfig lc)
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg tabsH

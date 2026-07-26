@@ -16,7 +16,6 @@ export function RunningHarnesses({
   tabLabel,
   onSelectTab,
   onCloseTab,
-  onArchiveTab,
   onDismiss,
   onAcknowledge,
   onRelease,
@@ -27,7 +26,6 @@ export function RunningHarnesses({
   tabLabel: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onCloseTab: (index: number) => void
-  onArchiveTab: (index: number) => void
   onDismiss: (index: number) => void
   onAcknowledge: (index: number) => void
   onRelease: (index: number) => void
@@ -68,7 +66,6 @@ export function RunningHarnesses({
             selected={selectedId === `tab:${tab.index}`}
             onSelect={() => onSelectTab(tab.index)}
             onClose={() => onCloseTab(tab.index)}
-            onArchive={() => onArchiveTab(tab.index)}
             onDismiss={() => onDismiss(tab.index)}
             onAcknowledge={() => onAcknowledge(tab.index)}
             onRelease={() => onRelease(tab.index)}

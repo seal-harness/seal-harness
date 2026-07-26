@@ -19,7 +19,7 @@ import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 
 -- | The TTS-provider interface.
-data TtsProvider = TtsProvider
+newtype TtsProvider = TtsProvider
   { tpSynthesize :: Text -> IO (Either Text Text)   -- ^ text → audio data (base64 or URL)
   }
 

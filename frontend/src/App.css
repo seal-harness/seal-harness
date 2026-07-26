@@ -736,6 +736,7 @@ body {
   flex-shrink: 0;
 }
 .session-row:hover .session-archive,
+.agent-row:hover .session-archive,
 .session-archive:focus-visible {
   display: inline-flex;
 }

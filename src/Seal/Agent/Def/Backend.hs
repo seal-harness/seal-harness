@@ -58,6 +58,7 @@ import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Either (fromRight)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -158,7 +159,7 @@ decodeAgentDef content =
         , adTools = decodeTools fm
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , adSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
+        , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Write one def to disk (atomic) and auto-commit.

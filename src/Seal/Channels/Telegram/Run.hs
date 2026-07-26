@@ -10,6 +10,7 @@ module Seal.Channels.Telegram.Run
   , runTelegramMain
   ) where
 
+import Data.Either (fromRight)
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
@@ -134,7 +135,7 @@ runTelegramMain autonomy = do
   tmuxR <- Seal.Harness.Tmux.mkRealTmuxRunner
   let loadCfg = do
         lc <- loadRuntimeConfig cfgPath
-        pure (either (const defaultRuntimeConfig) id lc)
+        pure (fromRight defaultRuntimeConfig lc)
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg tabsH

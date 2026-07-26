@@ -213,11 +213,11 @@ export function Sidebar({
   onUnarchiveSession,
   onCloseTab,
   onArchiveSession,
-  onArchiveTab,
   onDismissTab,
   onAcknowledgeTab,
   onReleaseTab,
 }: {
+  tabs: TabInfo[]
   sessions: SessionInfo[]
   archivedSessions: SessionInfo[]
   /** SessionInfo for sessions backing an OPEN tab (deduped out of `sessions`).
@@ -229,9 +229,9 @@ export function Sidebar({
   onSelectTab: (index: number) => void
   onSelectSession: (id: string) => void
   onNewTab: () => void
+  onUnarchiveSession: (id: string) => void
   onArchiveSession: (id: string) => void
   onCloseTab: (index: number) => void
-  onArchiveTab: (index: number) => void
   onDismissTab: (index: number) => void
   onAcknowledgeTab: (index: number) => void
   onReleaseTab: (index: number) => void
@@ -270,7 +270,6 @@ export function Sidebar({
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
-          onArchiveTab={onArchiveTab}
           onDismiss={onDismissTab}
           onAcknowledge={onAcknowledgeTab}
           onRelease={onReleaseTab}
@@ -283,7 +282,6 @@ export function Sidebar({
           tabLabel={tabLabel}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
-          onArchiveTab={onArchiveTab}
           onDismiss={onDismissTab}
           onAcknowledge={onAcknowledgeTab}
           onRelease={onReleaseTab}
@@ -295,7 +293,7 @@ export function Sidebar({
             session={s}
             selected={selectedId === `session:${s.id}`}
             onSelect={() => onSelectSession(s.id)}
-        ))}
+            onArchive={onArchiveSession}
             activity={sessionActivity?.[s.id]}
           />
         ))}

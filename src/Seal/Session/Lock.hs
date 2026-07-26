@@ -33,6 +33,7 @@ import Control.Concurrent.MVar
   ( MVar, newMVar, withMVar )
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (IOException, catch)
+import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -139,9 +140,8 @@ replyUnsubscribe (ReplyRegistry tv) guard sid = do
 replyFanout :: ReplyRegistry -> SessionId -> Text -> IO ()
 replyFanout (ReplyRegistry tv) sid text = do
   m <- readTVarIO tv
-  case Map.lookup sid m of
-    Nothing -> pure ()
-    Just sinks -> mapM_ (\sink -> safeSend (rsHandle sink) text) sinks
+  for_ (Map.lookup sid m) $ \sinks ->
+    mapM_ (\sink -> safeSend (rsHandle sink) text) sinks
   where
     safeSend h t = chSend h t `catch` \e ->
       hPutStrLn stderr ("reply fanout: send failed: " <> show (e :: IOException))

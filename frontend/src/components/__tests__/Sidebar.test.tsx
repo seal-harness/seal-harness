@@ -46,7 +46,6 @@ describe('ActiveTabs', () => {
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -56,7 +55,6 @@ describe('ActiveTabs', () => {
     expect(screen.getByText('Tab 0')).toBeTruthy()
     expect(screen.getByText('Tab 1')).toBeTruthy()
   })
-
   it('highlights the selected tab', () => {
     const tabs = [makeTab({ index: 0, label: 'Tab 0' })]
     render(
@@ -67,7 +65,6 @@ describe('ActiveTabs', () => {
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -76,7 +73,6 @@ describe('ActiveTabs', () => {
     const row = document.querySelector('.agent-row.selected')
     expect(row).toBeTruthy()
   })
-
   it('fires onNewTab when the + button is clicked', () => {
     const onNewTab = vi.fn()
     render(
@@ -87,7 +83,6 @@ describe('ActiveTabs', () => {
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -96,7 +91,6 @@ describe('ActiveTabs', () => {
     fireEvent.click(screen.getByLabelText('New tab'))
     expect(onNewTab).toHaveBeenCalled()
   })
-
   it('fires onSelectTab when a row is clicked', () => {
     const onSelectTab = vi.fn()
     const tabs = [makeTab({ index: 0, label: 'Tab 0' })]
@@ -108,7 +102,6 @@ describe('ActiveTabs', () => {
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -130,7 +123,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -138,7 +130,6 @@ describe('TabRow', () => {
     )
     expect(screen.getByText('spawned')).toBeTruthy()
   })
-
   it('renders the edited pill when extModified is true', () => {
     render(
       <TabRow
@@ -147,7 +138,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -155,7 +145,6 @@ describe('TabRow', () => {
     )
     expect(screen.getByText(/edited/)).toBeTruthy()
   })
-
   it('shows the Release button only for adopted harnesses', () => {
     const { rerender } = render(
       <TabRow
@@ -164,7 +153,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -179,7 +167,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -187,7 +174,6 @@ describe('TabRow', () => {
     )
     expect(screen.queryByLabelText('Release tab')).toBeNull()
   })
-
   it('shows the Dismiss button for exited/orphaned tabs', () => {
     const { rerender } = render(
       <TabRow
@@ -196,7 +182,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -210,7 +195,6 @@ describe('TabRow', () => {
         selected={false}
         onSelect={() => {}}
         onClose={() => {}}
-        onArchive={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -231,7 +215,6 @@ describe('RunningHarnesses', () => {
         tabLabel={() => 'x'}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -239,7 +222,6 @@ describe('RunningHarnesses', () => {
     )
     expect(container.firstChild).toBeNull()
   })
-
   it('renders the section + harness rows when tabs exist', () => {
     const tabs = [makeTab({ index: 0, kind: 'harness', label: 'cc' })]
     render(
@@ -249,7 +231,6 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -258,7 +239,6 @@ describe('RunningHarnesses', () => {
     expect(screen.getByTestId('running-harnesses-section')).toBeTruthy()
     expect(screen.getByText('cc')).toBeTruthy()
   })
-
   it('collapses + expands via the header click', () => {
     const tabs = [makeTab({ index: 0, kind: 'harness', label: 'cc' })]
     render(
@@ -268,7 +248,6 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismiss={() => {}}
         onAcknowledge={() => {}}
         onRelease={() => {}}
@@ -293,9 +272,9 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
+        onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
@@ -305,7 +284,6 @@ describe('Sidebar', () => {
     expect(screen.getByText('Recent Sessions')).toBeTruthy()
     expect(screen.getByLabelText('New tab')).toBeTruthy()
   })
-
   it('renders Active Tabs + Recent Sessions + Archived sections together', () => {
     const tabs = [makeTab({ index: 0, label: 'A tab' })]
     const sessions = [makeSession({ id: 's2', description: 'A session' })]
@@ -320,8 +298,8 @@ describe('Sidebar', () => {
         onSelectSession={() => {}}
         onNewTab={() => {}}
         onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
@@ -333,7 +311,6 @@ describe('Sidebar', () => {
     expect(screen.getByText('A session')).toBeTruthy()
     expect(screen.getByTestId('archived-section')).toBeTruthy()
   })
-
   it('renders the harness-kind tabs under Running Harnesses, not Active Tabs', () => {
     const tabs = [
       makeTab({ index: 0, kind: 'session:anthropic', label: 'provider tab' }),
@@ -350,7 +327,7 @@ describe('Sidebar', () => {
         onNewTab={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
-        onArchiveTab={() => {}}
+        onCloseTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
@@ -360,7 +337,6 @@ describe('Sidebar', () => {
     expect(screen.getByText('harness tab')).toBeTruthy()
     expect(screen.getByTestId('running-harnesses-section')).toBeTruthy()
   })
-
   it('fires onArchiveSession when the archive button on a session row is clicked', () => {
     const onArchiveSession = vi.fn()
     const sessions = [makeSession({ id: 's1', description: 'Sess' })]
@@ -376,7 +352,7 @@ describe('Sidebar', () => {
         onArchiveSession={onArchiveSession}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
+        onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
       />,
@@ -384,7 +360,6 @@ describe('Sidebar', () => {
     fireEvent.click(screen.getByLabelText('Archive session'))
     expect(onArchiveSession).toHaveBeenCalledWith('s1')
   })
-
   it('shows the Unarchive button for archived sessions', () => {
     const archived = [makeSession({ id: 'old', description: 'Old' })]
     render(
@@ -399,7 +374,6 @@ describe('Sidebar', () => {
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
@@ -410,12 +384,12 @@ describe('Sidebar', () => {
     expect(screen.getByText('Old')).toBeTruthy()
     expect(screen.getByLabelText('Unarchive')).toBeTruthy()
   })
-
   it('resolves a tab label via the backing session (session appears in Active Tabs only, NOT Recent Sessions)', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1', label: 'STALE-TAB-LABEL' })]
     const sessions = [makeSession({ id: 's1', description: 'session-desc' })]
     render(
       <Sidebar
+        tabs={tabs}
         sessions={sessions}
         archivedSessions={[]}
         selectedId={null}
@@ -425,7 +399,6 @@ describe('Sidebar', () => {
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
-        onArchiveTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
@@ -439,6 +412,7 @@ describe('Sidebar', () => {
     // from Recent Sessions so the sidebar never shows a duplicate. (The
     // backend's partitionSessions guarantees mutual exclusion by
     // construction; the frontend filter is the safety net.)
+    const descEls = screen.getAllByText('session-desc')
     expect(descEls.length).toBe(1)
   })
 })

@@ -28,7 +28,9 @@ import {
   cancelQuestion,
   type SendResult,
   type NewTabResponse,
+} from './hooks/useApi'
 import { useListsStream } from './hooks/useListsStream'
+import { useNewTabSpec } from './hooks/useNewTabSpec'
 import { useTranscriptStream, reconcileEntries } from './hooks/useTranscriptStream'
 import { useSessionActivityStream } from './hooks/useSessionActivityStream'
 import { streamClient } from './lib/streamClient'
@@ -180,18 +182,35 @@ export default function App() {
   }, [wsLists.tabs.length, wsLists.recentSessions.length])
   const wsLive = wsListsReceived
   const usePollLists = !wsLive && !polledLists.error
+  // Optimistic first-message-snippet overlay keyed by session id. Set on
+  // send so a freshly-created tab's label updates immediately (before the
+  // backend's next `lists` frame arrives with the persisted snippet).
+  // `sessionDisplayTitle` already prefers description > autoSummary >
+  // firstMessageSnippet, so this never overrides a user-set title or
+  // generated summary — it only fills the same slot the backend would.
+  const [snippetOverrides, setSnippetOverrides] = useState<Map<string, string>>(() => new Map())
   const tabs = wsLive ? wsLists.tabs
     : usePollLists ? polledLists.tabs
     : polledTabs.tabs
-  const rawSessions = wsLive ? wsLists.recentSessions
+  const rawSessions0 = wsLive ? wsLists.recentSessions
     : usePollLists ? polledLists.recentSessions
     : polledRecent.sessions
-  const archivedSessions = wsLive ? wsLists.archivedSessions
+  const archivedSessions0 = wsLive ? wsLists.archivedSessions
     : usePollLists ? polledLists.archivedSessions
     : polledArchived.sessions
-  const tabSessions = wsLive ? wsLists.tabSessions
+  const tabSessions0 = wsLive ? wsLists.tabSessions
     : usePollLists ? polledLists.tabSessions
     : []
+  const applySnippet = (list: SessionInfo[]): SessionInfo[] =>
+    snippetOverrides.size === 0 ? list : list.map((s) => {
+      const ov = snippetOverrides.get(s.id)
+      return ov && !s.description && !s.autoSummary
+        ? { ...s, firstMessageSnippet: ov }
+        : s
+    })
+  const rawSessions = applySnippet(rawSessions0)
+  const archivedSessions = applySnippet(archivedSessions0)
+  const tabSessions = applySnippet(tabSessions0)
   const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
@@ -213,6 +232,7 @@ export default function App() {
 
   // ── Composer state ────────────────────────────────────────────────────
   const [composerOpen, setComposerOpen] = useState(false)
+  const [branchFrom, setBranchFrom] = useState<string | undefined>(undefined)
   // `newTabFocusTick` is no longer needed (composer is a standalone pane),
   const [newTabFocusTick, setNewTabFocusTick] = useState(0)
 
@@ -491,6 +511,11 @@ export default function App() {
       ?? null
     setPendingMessageModel(sessionModel)
     setPendingMessage(message)
+    // Optimistically fill the session's first-message-snippet so the tab
+    // label updates immediately (before the backend's next `lists` frame).
+    // Truncated to 80 chars + ellipsis to match the backend's snippet shape.
+    const snippet = message.length > 80 ? message.slice(0, 80) + '…' : message
+    setSnippetOverrides((m) => { const n = new Map(m); n.set(currentSessionId, snippet); return n })
     const seq = ++seqRef.current
     const r = await send(message, modelOverride ?? lastTranscriptModel)
     handleSendResult(r, seq)
@@ -517,6 +542,15 @@ export default function App() {
     setCustomPromptFile(null)
     setBranchFrom(undefined)
     setComposerOpen(true)
+  }, [syncPath])
+
+  const handleBranch = useCallback((entryId: string) => {
+    setBranchFrom(entryId)
+    setComposerOpen(true)
+    setSelectedId(null)
+    setNewTabFocusTick((n) => n + 1)
+    syncPath(null)
+    setCustomPromptFile(null)
   }, [syncPath])
 
   // The NewTabComposer owns the createTab/adoptWindow call; App navigates to
@@ -589,19 +623,6 @@ export default function App() {
       syncPath(null)
     }
   }, [selectedId, syncPath])
-
-  const handleArchiveTab = useCallback(async (index: number) => {
-    const tab = tabs.find((t) => t.index === index)
-    if (!tab) return
-    await closeTab(index)
-    if (tab.session_id) {
-      await setSessionArchived(tab.session_id, true)
-    }
-    if (selectedId === `tab:${index}`) {
-      setSelectedId(null)
-      syncPath(null)
-    }
-  }, [tabs, selectedId, syncPath])
 
   const handleDismissTab = useCallback(async (index: number) => {
     await dismissTab(index)
@@ -696,7 +717,9 @@ export default function App() {
             onNewTab={handleNewTab}
             onUnarchiveSession={handleUnarchiveSession}
             onCloseTab={handleCloseTab}
+            onArchiveSession={handleArchiveSession}
             onDismissTab={handleDismissTab}
+            onAcknowledgeTab={handleAcknowledgeTab}
             onReleaseTab={handleReleaseTab}
           />
           {composerOpen ? (
