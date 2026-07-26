@@ -42,7 +42,27 @@ export function applyActivity(
       break
     case 'harness-status':
       if (prev.harness === event.status) return current
-      next = { ...prev, harness: event.status }
+      // A thinking → idle transition means a turn just finished and a new
+      // assistant reply landed. The backend's `entry` frames are filtered
+      // to the focused session's WS subscriber, so a non-focused tab never
+      // receives the entries — and the backend does not emit `entry-at`
+      // activity events. Without this signal, a non-focused tab would stay
+      // Idle Read forever (lastEntryAt null/old), never transitioning to
+      // Idle Unread when the thinking finishes. Treat the transition as an
+      // implicit "new entry": stamp lastEntryAt at now and bump unread so
+      // deriveTabStatusKind returns idle-unread. The focused-session clear
+      // below zeros the unread bump for the tab the user is watching.
+      if (prev.harness === 'thinking' && event.status === 'idle') {
+        const now = new Date().toISOString()
+        next = {
+          ...prev,
+          harness: event.status,
+          unread: prev.unread + 1,
+          lastEntryAt: now,
+        }
+      } else {
+        next = { ...prev, harness: event.status }
+      }
       break
     case 'reply-delivered':
       // A reply-delivered signal marks the session "seen" (the last
@@ -115,12 +135,13 @@ export function useSessionActivityStream(
     const unsub = sc.onActivity((sid, event) => {
       setSessions((prev) => {
         const next = applyActivity(prev, sid, event)
-        // Entries arriving for the currently-viewed session are not
-        // "unread" — the user is looking at them right now.
+        // Entries / thinking-finish signals arriving for the currently-viewed
+        // session are not "unread" — the user is looking at them right now.
+        const isFocused = focusedRef.current !== null && focusedRef.current === sid
         if (
-          event.kind === 'entry-at' &&
-          focusedRef.current !== null &&
-          focusedRef.current === sid
+          (event.kind === 'entry-at' ||
+            (event.kind === 'harness-status' && event.status === 'idle')) &&
+          isFocused
         ) {
           return clearUnread(next, sid)
         }

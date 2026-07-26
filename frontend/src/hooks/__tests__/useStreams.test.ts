@@ -160,6 +160,35 @@ describe('applyActivity', () => {
     expect(result).toBe(before)
   })
 
+  it('on thinking → idle, stamps lastEntryAt + bumps unread (non-focused tab gets a new reply)', () => {
+    // A non-focused thinking tab finishes its turn. The backend's entry
+    // frames only go to the focused session's WS subscriber, so without
+    // this signal the tab would stay Idle Read forever. The thinking→idle
+    // transition is the evidence a new assistant reply landed.
+    const before = { s1: { harness: 'thinking' as const, unread: 0, lastEntryAt: null, seenAt: null } }
+    const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
+    expect(result['s1']!.harness).toBe('idle')
+    expect(result['s1']!.unread).toBe(1)
+    expect(result['s1']!.lastEntryAt).not.toBeNull()
+  })
+
+  it('on thinking → idle, preserves an existing lastEntryAt only if newer (does not regress)', () => {
+    // The transition stamps now; an older lastEntryAt must not survive.
+    const oldTs = '2020-01-01T00:00:00.000Z'
+    const before = { s1: { harness: 'thinking' as const, unread: 2, lastEntryAt: oldTs, seenAt: null } }
+    const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
+    expect(result['s1']!.unread).toBe(3)
+    expect(result['s1']!.lastEntryAt).not.toBe(oldTs)
+  })
+
+  it('on idle → thinking, does NOT bump unread (turn start is not a new reply)', () => {
+    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null } }
+    const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'thinking' })
+    expect(result['s1']!.harness).toBe('thinking')
+    expect(result['s1']!.unread).toBe(0)
+    expect(result['s1']!.lastEntryAt).toBeNull()
+  })
+
   it('seeds a default state on session-created only when the session is new', () => {
     const result = applyActivity({}, 's1', { kind: 'session-created', session: { id: 's1', runtime: 'r', model: 'm', channel: 'cli', created_at: 't', last_active: 't' } })
     expect(result['s1']).toBeDefined()
@@ -248,5 +277,30 @@ describe('useSessionActivityStream', () => {
     rerender({ ids: ['s1', 's2'] })
     expect(result.current.sessions['s1']!.harness).toBe('idle')
     expect(result.current.sessions['s2']!.harness).toBe('thinking')
+  })
+
+  it('thinking → idle on a NON-focused session bumps unread (the reply is unseen)', async () => {
+    const c = fakeClient()
+    const { result } = renderHook(({ sid }: { sid: string | null }) => useSessionActivityStream(sid, c), { initialProps: { sid: 'focused-session' } })
+    // A different session s1 starts thinking.
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'thinking' }) })
+    expect(result.current.sessions['s1']!.harness).toBe('thinking')
+    expect(result.current.sessions['s1']!.unread).toBe(0)
+    // Thinking finishes → the tab transitions to idle-unread (the new reply
+    // landed and the user hasn't seen it because they're focused elsewhere).
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
+    expect(result.current.sessions['s1']!.harness).toBe('idle')
+    expect(result.current.sessions['s1']!.unread).toBe(1)
+    expect(result.current.sessions['s1']!.lastEntryAt).not.toBeNull()
+  })
+
+  it('thinking → idle on the FOCUSED session does NOT bump unread (the user is watching)', async () => {
+    const c = fakeClient()
+    const { result } = renderHook(({ sid }: { sid: string | null }) => useSessionActivityStream(sid, c), { initialProps: { sid: 's1' } })
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'thinking' }) })
+    // Thinking finishes while the user is focused on s1 → unread stays 0.
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
+    expect(result.current.sessions['s1']!.harness).toBe('idle')
+    expect(result.current.sessions['s1']!.unread).toBe(0)
   })
 })
