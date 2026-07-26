@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
 import { findSession, sessionDisplayTitle, sessionSubtitle, tabDisplayLabel } from '../types'
 import type { SessionActivityState } from '../types/stream'
-import { sortTabsForSidebar } from '../lib/tabStatus'
+import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
 import { ActiveTabs } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { ActivityDot } from './StatusDot'
@@ -86,7 +86,7 @@ function SessionRow({
 
   const displayName = sessionDisplayTitle(session)
   const ageBasis = activity?.lastEntryAt ?? session.lastActive
-  const age = formatAge(ageBasis)
+  const age = formatAge(ageBasis) || 'now'
 
   return (
     <div className={rowClasses} onClick={onSelect}>
@@ -190,17 +190,6 @@ function ArchivedSection({
   )
 }
 
-function formatAge(isoDate: string): string {
-  const diff = Date.now() - new Date(isoDate).getTime()
-  const mins = Math.floor(diff / 60000)
-  if (mins < 1) return 'now'
-  if (mins < 60) return `${mins}m`
-  const hours = Math.floor(mins / 60)
-  if (hours < 24) return `${hours}h`
-  const days = Math.floor(hours / 24)
-  return `${days}d`
-}
-
 export function Sidebar({
   tabs,
   sessions,
@@ -248,6 +237,17 @@ export function Sidebar({
   const tabLabel = (tab: TabInfo): string =>
     tabDisplayLabel(tab, findSession(tab.session_id, sessions, archivedSessions, tabSessions))
 
+  // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
+  // uses activity.lastEntryAt ?? session.lastActive. Tabs without a backing
+  // session (e.g. raw shell tabs) or any activity frame render no pill.
+  const tabAgeText = (tab: TabInfo): string => {
+    if (!tab.session_id) return ''
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    if (!session) return ''
+    const activity = sessionActivity?.[tab.session_id]
+    return formatAge(activity?.lastEntryAt ?? session.lastActive) || 'now'
+  }
+
   // Active Tabs sort: Idle Unread → Idle Read → Thinking, oldest
   // last-user-message first within each bucket. The activity state comes
   // from the per-session stream; the sort key is the backing session's
@@ -283,6 +283,7 @@ export function Sidebar({
           selectedId={selectedId}
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
+          tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -296,6 +297,7 @@ export function Sidebar({
           selectedId={selectedId}
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
+          tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}

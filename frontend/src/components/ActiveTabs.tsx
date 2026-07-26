@@ -74,6 +74,7 @@ export function TabRow({
   onAcknowledge,
   onRelease,
   activity,
+  ageText,
 }: {
   tab: TabInfo
   /** Resolved display label for this tab (session title, harness fallback,
@@ -87,6 +88,9 @@ export function TabRow({
   onAcknowledge: () => void
   onRelease: () => void
   activity?: SessionActivityState
+  /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
+   *  mirroring the Recent Sessions age pill. Empty string → no pill. */
+  ageText?: string
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
   // must not crash the render — fall back to a neutral glyph/label.
@@ -266,6 +270,7 @@ export function TabRow({
             </svg>
           </button>
         </span>
+        {ageText && <span className="pill token-count">{ageText}</span>}
       </div>
       <div
         className="text-xs ml-6 mt-0.5"
@@ -283,6 +288,7 @@ export function ActiveTabs({
   selectedId,
   sessionActivity,
   tabLabel,
+  tabAgeText,
   onSelectTab,
   onNewTab,
   onCloseTab,
@@ -297,6 +303,11 @@ export function ActiveTabs({
    *  else ellipsis). Centralized by the parent so all tab-label consumers
    *  agree. */
   tabLabel: (tab: TabInfo) => string
+  /** Resolve a tab to its coarse age pill text ("now"/"Nm"/"Nh"/"Nd"), or
+   *  empty string when no age basis is available (no pill rendered).
+   *  Centralized by the parent so Active Tabs and Running Harnesses agree
+   *  with the Recent Sessions age pill. */
+  tabAgeText: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
@@ -339,6 +350,7 @@ export function ActiveTabs({
           onAcknowledge={() => onAcknowledge(tab.index)}
           onRelease={() => onRelease(tab.index)}
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
+          ageText={tabAgeText(tab)}
         />
       ))}
     </>

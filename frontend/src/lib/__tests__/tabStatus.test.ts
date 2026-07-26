@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { deriveTabStatusKind, tabSortTimestamp, compareTabs, sortTabsForSidebar } from '../tabStatus'
+import { deriveTabStatusKind, tabSortTimestamp, compareTabs, sortTabsForSidebar, formatAge } from '../tabStatus'
 import type { SessionInfo, TabInfo } from '../../types'
 import type { SessionActivityState } from '../../types/stream'
 
@@ -160,6 +160,36 @@ describe('sortTabsForSidebar', () => {
     const snapshot = input.map((e) => e.tab.index)
     sortTabsForSidebar(input)
     expect(input.map((e) => e.tab.index)).toEqual(snapshot)
+  })
+})
+
+// ── formatAge ─────────────────────────────────────────────────────────
+
+describe('formatAge', () => {
+  it('returns "now" for a timestamp within the last minute', () => {
+    expect(formatAge(new Date().toISOString())).toBe('now')
+  })
+
+  it('returns "Nm" for minutes under an hour', () => {
+    const fiveMinAgo = new Date(Date.now() - 5 * 60000).toISOString()
+    expect(formatAge(fiveMinAgo)).toBe('5m')
+  })
+
+  it('returns "Nh" for hours under a day', () => {
+    const threeHourAgo = new Date(Date.now() - 3 * 3600000).toISOString()
+    expect(formatAge(threeHourAgo)).toBe('3h')
+  })
+
+  it('returns "Nd" for days', () => {
+    const twoDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString()
+    expect(formatAge(twoDaysAgo)).toBe('2d')
+  })
+
+  it('returns "" for a missing or unparseable timestamp', () => {
+    expect(formatAge(null)).toBe('')
+    expect(formatAge(undefined)).toBe('')
+    expect(formatAge('')).toBe('')
+    expect(formatAge('not-a-date')).toBe('')
   })
 })
 

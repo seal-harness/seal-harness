@@ -44,6 +44,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -63,6 +64,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId="tab:0"
         tabLabel={(t) => t.label ?? '…'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -81,6 +83,7 @@ describe('ActiveTabs', () => {
         tabs={[]}
         selectedId={null}
         tabLabel={() => 'x'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -100,6 +103,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabAgeText={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -214,6 +218,7 @@ describe('RunningHarnesses', () => {
         tabs={[]}
         selectedId={null}
         tabLabel={() => 'x'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -230,6 +235,7 @@ describe('RunningHarnesses', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -247,6 +253,7 @@ describe('RunningHarnesses', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -541,5 +548,100 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.getByTestId('status-exited')).toBeTruthy()
     expect(screen.queryByTestId('tab-kind-idle-read')).toBeNull()
     expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Exited')
+  })
+})
+
+// ── Tab age pill ───────────────────────────────────────────────────────
+
+describe('Sidebar — tab age pill', () => {
+  it('renders the age pill on an Active Tabs row from lastActive when there is no activity frame', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({ id: 's1', description: 'Tab Sess', lastActive: '2024-01-01T00:00:00.000Z' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The age pill is the .pill.token-count span on the tab row. lastActive
+    // is 2024-01-01 (many days ago), so the pill renders "Nd".
+    const tabRow = screen.getByText('Tab Sess').closest('.agent-row')
+    expect(tabRow).toBeTruthy()
+    const agePill = tabRow!.querySelector('.pill.token-count')
+    expect(agePill).toBeTruthy()
+    expect(agePill!.textContent).toMatch(/^\d+d$/)
+  })
+
+  it('prefers activity.lastEntryAt over session.lastActive for the age basis', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({ id: 's1', description: 'Tab Sess', lastActive: '2024-01-01T00:00:00.000Z' })]
+    const sessionActivity = {
+      s1: {
+        harness: 'idle' as const,
+        unread: 0,
+        // 5 minutes ago — should win over the days-old lastActive.
+        lastEntryAt: new Date(Date.now() - 5 * 60000).toISOString(),
+        seenAt: null,
+      },
+    }
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        sessionActivity={sessionActivity}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const tabRow = screen.getByText('Tab Sess').closest('.agent-row')
+    const agePill = tabRow!.querySelector('.pill.token-count')
+    expect(agePill).toBeTruthy()
+    expect(agePill!.textContent).toBe('5m')
+  })
+
+  it('renders no age pill when a tab has no backing session (raw shell tab)', () => {
+    const tabs = [makeTab({ index: 0, kind: 'shell:bash', session_id: null, label: 'raw shell' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    const tabRow = screen.getByText('raw shell').closest('.agent-row')
+    const agePill = tabRow!.querySelector('.pill.token-count')
+    expect(agePill).toBeNull()
   })
 })

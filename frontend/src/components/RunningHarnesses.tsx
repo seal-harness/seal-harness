@@ -14,6 +14,7 @@ export function RunningHarnesses({
   selectedId,
   sessionActivity,
   tabLabel,
+  tabAgeText,
   onSelectTab,
   onCloseTab,
   onDismiss,
@@ -24,6 +25,8 @@ export function RunningHarnesses({
   selectedId: string | null
   sessionActivity?: Record<string, SessionActivityState>
   tabLabel: (tab: TabInfo) => string
+  /** Resolve a tab to its coarse age pill text — see ActiveTabs.tabAgeText. */
+  tabAgeText: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onCloseTab: (index: number) => void
   onDismiss: (index: number) => void
@@ -70,6 +73,7 @@ export function RunningHarnesses({
             onAcknowledge={() => onAcknowledge(tab.index)}
             onRelease={() => onRelease(tab.index)}
             activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
+            ageText={tabAgeText(tab)}
           />
         ))}
     </div>

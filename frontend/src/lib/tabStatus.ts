@@ -31,6 +31,24 @@
 import type { SessionInfo, TabInfo } from '../types'
 import type { SessionActivityState } from '../types/stream'
 
+/** Format an ISO timestamp as a coarse "age" pill: "now" / "Nm" / "Nh" / "Nd".
+ *  Shared by the Recent Sessions rows and the Active Tabs age pill so both
+ *  surfaces agree on the rendering. Returns an empty string for a missing
+ *  or unparseable timestamp (the caller renders no pill in that case). */
+export function formatAge(isoDate: string | null | undefined): string {
+  if (!isoDate) return ''
+  const ms = Date.parse(isoDate)
+  if (Number.isNaN(ms)) return ''
+  const diff = Date.now() - ms
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'now'
+  if (mins < 60) return `${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h`
+  const days = Math.floor(hours / 24)
+  return `${days}d`
+}
+
 export type TabStatusKind = 'thinking' | 'idle-unread' | 'idle-read'
 
 /** The display order of the three buckets in the Active Tabs list. */
