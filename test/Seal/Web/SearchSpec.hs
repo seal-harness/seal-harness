@@ -3,9 +3,10 @@ module Seal.Web.SearchSpec (spec) where
 
 import Data.Aeson (object, (.=))
 import Data.Text qualified as T
+import Network.HTTP.Client.TLS (newTlsManager)
 import Test.Hspec
 
-import Seal.ISA.Opcode (uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), uoAuthorize)
 import Seal.Web.Search
 
 spec :: Spec
@@ -60,6 +61,18 @@ spec = describe "WEB_SEARCH" $ do
     encoded `shouldSatisfy` ("results" `T.isInfixOf`)
     encoded `shouldSatisfy` ("Title" `T.isInfixOf`)
     encoded `shouldSatisfy` ("example.com" `T.isInfixOf`)
+
+  -- Network-dependent: marked pending (xit) so CI never hits the network.
+  -- Run manually by changing to `it` to verify the Parallel MCP endpoint.
+  xit "Parallel MCP returns search results for a simple query" $ do
+    mgr <- newTlsManager
+    let cfg = defaultTestCfg
+          { wscManager = Just mgr
+          , wscEndpoint = ""  -- use the default MCP endpoint
+          , wscMaxResults = 5
+          }
+    result <- dispatchSearch mgr cfg "Haskell programming language"
+    orIsError result `shouldBe` False
 
   where
     defaultTestCfg :: WebSearchConfig
