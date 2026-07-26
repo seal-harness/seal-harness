@@ -4,7 +4,6 @@ import { Sidebar } from './components/Sidebar'
 import { ChatArea, transcriptToMessages, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
-import { NewSessionComposer } from './components/NewSessionComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
 import {
@@ -29,10 +28,7 @@ import {
   cancelQuestion,
   type SendResult,
   type NewTabResponse,
-  type NewBareSessionResponse,
-} from './hooks/useApi'
 import { useListsStream } from './hooks/useListsStream'
-import { useNewTabSpec } from './hooks/useNewTabSpec'
 import { useTranscriptStream, reconcileEntries } from './hooks/useTranscriptStream'
 import { useSessionActivityStream } from './hooks/useSessionActivityStream'
 import { streamClient } from './lib/streamClient'
@@ -217,14 +213,11 @@ export default function App() {
 
   // ── Composer state ────────────────────────────────────────────────────
   const [composerOpen, setComposerOpen] = useState(false)
-  const [newSessionComposerOpen, setNewSessionComposerOpen] = useState(false)
-  const [branchFrom, setBranchFrom] = useState<string | undefined>(undefined)
   // `newTabFocusTick` is no longer needed (composer is a standalone pane),
-  // but kept for ChatArea's selectedId refocus effect.
   const [newTabFocusTick, setNewTabFocusTick] = useState(0)
 
-  // The shared composer spec — used by both NewTabComposer and
-  // NewSessionComposer so the provider/model selection + persisted
+  // The shared composer spec — used by the NewTabComposer so the
+  // provider/model selection + persisted
   // last-options are consistent. Constructed unconditionally (the hook
   // loads providers/models on mount regardless of which composer opens).
   const composerSpec = useNewTabSpec()
@@ -526,44 +519,6 @@ export default function App() {
     setComposerOpen(true)
   }, [syncPath])
 
-  // The "Recent Sessions +" button opens the NewSessionComposer (mirrors
-  // how "Active Tabs +" opens the NewTabComposer). The composer owns the
-  // createBareSession call + model selection; App navigates to the new
-  // session on submit. Distinct from handleNewTab (which opens the
-  // NewTabComposer for tab creation).
-  const handleNewBareSession = useCallback(() => {
-    setSelectedId(null)
-    syncPath(null)
-    // The shared composerSpec's model-fetch effect only runs when kind ===
-    // 'provider'; force it so models load even if the user's last "new tab"
-    // used a harness kind. (The NewSessionComposer only renders the
-    // provider section, so this is invisible to the user.)
-    composerSpec.setKind('provider')
-    setNewSessionComposerOpen(true)
-  }, [syncPath, composerSpec])
-
-  // The NewSessionComposer owns the createBareSession call; App navigates
-  // to the newly-created session on success and closes the composer.
-  const handleNewSessionComposerSubmit = useCallback((res: NewBareSessionResponse) => {
-    setNewSessionComposerOpen(false)
-    const id = `session:${res.session_id}`
-    setSelectedId(id)
-    syncPath(id)
-  }, [syncPath])
-
-  const handleNewSessionComposerCancel = useCallback(() => {
-    setNewSessionComposerOpen(false)
-  }, [])
-
-  const handleBranch = useCallback((entryId: string) => {
-    setBranchFrom(entryId)
-    setComposerOpen(true)
-    setSelectedId(null)
-    setNewTabFocusTick((n) => n + 1)
-    syncPath(null)
-    setCustomPromptFile(null)
-  }, [syncPath])
-
   // The NewTabComposer owns the createTab/adoptWindow call; App navigates to
   // the newly-created tab on success (so the chat input wires up to the new
   // session) and closes the composer. The WS `lists` broadcast populates the
@@ -739,13 +694,9 @@ export default function App() {
             onSelectTab={handleSelectTab}
             onSelectSession={handleSelectSession}
             onNewTab={handleNewTab}
-            onNewSession={handleNewBareSession}
-            onArchiveSession={handleArchiveSession}
             onUnarchiveSession={handleUnarchiveSession}
             onCloseTab={handleCloseTab}
-            onArchiveTab={handleArchiveTab}
             onDismissTab={handleDismissTab}
-            onAcknowledgeTab={handleAcknowledgeTab}
             onReleaseTab={handleReleaseTab}
           />
           {composerOpen ? (
@@ -755,14 +706,6 @@ export default function App() {
                 onSubmit={handleComposerSubmit}
                 onCancel={handleComposerCancel}
                 branchFrom={branchFrom}
-              />
-            </div>
-          ) : newSessionComposerOpen ? (
-            <div className="flex-1 overflow-y-auto" style={{ background: 'var(--bg-base)' }}>
-              <NewSessionComposer
-                spec={composerSpec}
-                onSubmit={handleNewSessionComposerSubmit}
-                onCancel={handleNewSessionComposerCancel}
               />
             </div>
           ) : selectedHarnessTab ? (

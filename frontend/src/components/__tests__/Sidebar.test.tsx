@@ -293,8 +293,6 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
-        onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
         onArchiveTab={() => {}}
@@ -306,7 +304,6 @@ describe('Sidebar', () => {
     expect(screen.getByText('Active Tabs')).toBeTruthy()
     expect(screen.getByText('Recent Sessions')).toBeTruthy()
     expect(screen.getByLabelText('New tab')).toBeTruthy()
-    expect(screen.getByLabelText('New session')).toBeTruthy()
   })
 
   it('renders Active Tabs + Recent Sessions + Archived sections together', () => {
@@ -322,9 +319,7 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
         onArchiveSession={() => {}}
-        onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
         onArchiveTab={() => {}}
         onDismissTab={() => {}}
@@ -337,32 +332,6 @@ describe('Sidebar', () => {
     expect(screen.getByText('Recent Sessions')).toBeTruthy()
     expect(screen.getByText('A session')).toBeTruthy()
     expect(screen.getByTestId('archived-section')).toBeTruthy()
-  })
-
-  it('fires onNewSession when the Recent Sessions + (sparkle) button is clicked', () => {
-    const onNewSession = vi.fn()
-    const sessions = [makeSession({ id: 's1', description: 'Sess' })]
-    render(
-      <Sidebar
-        tabs={[]}
-        sessions={sessions}
-        archivedSessions={[]}
-        selectedId={null}
-        onSelectTab={() => {}}
-        onSelectSession={() => {}}
-        onNewTab={() => {}}
-        onNewSession={onNewSession}
-        onArchiveSession={() => {}}
-        onUnarchiveSession={() => {}}
-        onCloseTab={() => {}}
-        onArchiveTab={() => {}}
-        onDismissTab={() => {}}
-        onAcknowledgeTab={() => {}}
-        onReleaseTab={() => {}}
-      />,
-    )
-    fireEvent.click(screen.getByLabelText('New session'))
-    expect(onNewSession).toHaveBeenCalled()
   })
 
   it('renders the harness-kind tabs under Running Harnesses, not Active Tabs', () => {
@@ -379,10 +348,8 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
-        onCloseTab={() => {}}
         onArchiveTab={() => {}}
         onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
@@ -406,12 +373,10 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
         onArchiveSession={onArchiveSession}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
         onArchiveTab={() => {}}
-        onDismissTab={() => {}}
         onAcknowledgeTab={() => {}}
         onReleaseTab={() => {}}
       />,
@@ -431,7 +396,6 @@ describe('Sidebar', () => {
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -452,14 +416,12 @@ describe('Sidebar', () => {
     const sessions = [makeSession({ id: 's1', description: 'session-desc' })]
     render(
       <Sidebar
-        tabs={tabs}
         sessions={sessions}
         archivedSessions={[]}
         selectedId={null}
         onSelectTab={() => {}}
         onSelectSession={() => {}}
         onNewTab={() => {}}
-        onNewSession={() => {}}
         onArchiveSession={() => {}}
         onUnarchiveSession={() => {}}
         onCloseTab={() => {}}
@@ -477,7 +439,6 @@ describe('Sidebar', () => {
     // from Recent Sessions so the sidebar never shows a duplicate. (The
     // backend's partitionSessions guarantees mutual exclusion by
     // construction; the frontend filter is the safety net.)
-    const descEls = screen.getAllByText('session-desc')
     expect(descEls.length).toBe(1)
   })
 })
