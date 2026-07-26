@@ -200,10 +200,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tab list"
+        outcome <- handleSend sendDeps sid "/tabs list"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -260,7 +260,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-106"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
-        outcome <- handleSend sendDeps sid "/tab"
+        outcome <- handleSend sendDeps sid "/tabs"
         case outcome of
           SendSlash msg _ -> msg `shouldSatisfy` ("0" `T.isInfixOf`)
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -278,7 +278,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-120000-107"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tab"
+        outcome <- handleSend sendDeps sid "/tabs"
         case outcome of
           SendSlash "no current tab" _ -> pure ()
           other -> expectationFailure ("expected SendSlash 'no current tab', got " <> show other)

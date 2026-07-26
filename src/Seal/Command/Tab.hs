@@ -1,11 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The @/tab@ + @/tabs@ command family. Registered into the existing
--- @\/@-command registry so both the CLI TUI and the Signal channel gain
--- @\/tabs@ and @\/tab@ driving. Plus the terse-grammar synopsis entry for
--- @\/help@.
+-- | The @/tabs@ command family. Registered into the existing @\/@-command
+-- registry so both the CLI TUI and the chat channels gain @\/tabs@ driving.
+-- Plus the terse-grammar synopsis entry for @\/help@.
 module Seal.Command.Tab
   ( tabCommandSpec
-  , tabsCommandSpec
   , terseGrammarSpec
   ) where
 
@@ -30,24 +28,11 @@ import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
 tabCommandSpec :: TabsHandle -> CommandSpec
 tabCommandSpec h = CommandSpec
   { csName         = CommandName "tabs"
-  , csAliases      = [CommandName "tab"]  -- /tab <subcommand> is an alias for /tabs <subcommand>
+  , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"
   , csParserInfo   = tabParserInfo h
   , csAvailability = AlwaysAvailable
-  }
-
--- | The @/tab@ alias spec. Bare @/tab@ is intercepted by
--- 'Seal.Routing.Route' as 'CurrentTab' (same as @/tabs@), so this spec's
--- parser only runs for subcommands. (An explicit alias entry so @/help@
--- shows the distinct name; @/tabs@ already lists @tab@ as an alias, so
--- this is redundant but harmless — the registry's lookup-by-alias handles
--- both.)
-tabsCommandSpec :: TabsHandle -> CommandSpec
-tabsCommandSpec h = (tabCommandSpec h)
-  { csName     = CommandName "tab"
-  , csAliases  = []
-  , csSynopsis = "Show current tab, or manage tabs (alias for /tabs <subcommand>)"
   }
 
 -- | The terse-grammar synopsis entry for @/help@. A synthetic spec (no

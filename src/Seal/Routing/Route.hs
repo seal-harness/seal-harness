@@ -1,10 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Layer-1 terse-grammar routing front-end. @\/N@ switches focus to
--- tab N, @\/N payload@ injects into tab N, a bare @\/tab@ or @\/tabs@ shows
--- the current tab, @\/tab \u003cargs\u003e@ is a parse error (subcommands
--- live under @\/tabs \u003csubcommand\u003e@), @\/<other>…@ is deferred to the
--- @\/@-command registry, anything else is plain text to the focused tab.
--- The grammar is a first-class synopsis entry in @\/help@ so it's
+-- tab N, @\/N payload@ injects into tab N, a bare @\/tabs@ shows the current
+-- tab, @\/<other>…@ is deferred to the @\/@-command registry (including
+-- @\/tabs \u003csubcommand\u003e@), anything else is plain text to the focused
+-- tab. The grammar is a first-class synopsis entry in @\/help@ so it's
 -- discoverable.
 module Seal.Routing.Route
   ( ParseError (..)
@@ -43,10 +42,7 @@ data RoutingDecision
 -- * @\/N@          -> 'Focus' N (N is a single char 0-9a-z, at end-of-string
 --                   or followed by a space)
 -- * @\/N payload@  -> 'Inject' N payload
--- * @\/tab@        -> 'CurrentTab' (show the current tab)
--- * @\/tabs@       -> 'CurrentTab' (alias for @\/tab@)
--- * @\/tab \u003cargs\u003e@ -> 'ParseError' (subcommands live under @\/tabs@,
---                   which is dispatched via the registry as a 'SlashCommand')
+-- * @\/tabs@       -> 'CurrentTab' (show the current tab)
 -- * @\/new@        -> 'NewSession' (start a fresh session in the current tab)
 -- * @\/<other>…@   -> 'SlashCommand' (deferred to the registry — this is
 --                   multi-char commands like @\/vault@, @\/help@, @\/ping@,
@@ -66,20 +62,16 @@ route t
       in case T.uncons rest of
            Nothing -> Right (Plain "/")  -- a bare "/" — treat as plain
            Just (c, after)
-             | isTabChar c && (T.null after || T.head after == ' ') ->
-                 -- single-char /N or /N payload (the tab grammar)
-                 case tabIndexFromChar c of
-                   Left e -> Left (ParseError e)
-                   Right idx -> Right (focusOrInject idx after)
-              | T.isPrefixOf "tab" rest && (T.length rest == 3 || T.head (T.drop 3 rest) == ' ') ->
-                  if T.length rest == 3
-                    then Right CurrentTab
-                    else Left (ParseError "/tab shows the current tab; use /tabs <subcommand> (e.g. /tabs list, /tabs close N)")
-              | rest == "tabs" ->
+              | isTabChar c && (T.null after || T.head after == ' ') ->
+                  -- single-char /N or /N payload (the tab grammar)
+                  case tabIndexFromChar c of
+                    Left e -> Left (ParseError e)
+                    Right idx -> Right (focusOrInject idx after)
+               | rest == "tabs" ->
                   Right CurrentTab
-              | rest == "new" || T.isPrefixOf "new " rest ->
+               | rest == "new" || T.isPrefixOf "new " rest ->
                   Right NewSession
-              | otherwise ->
+               | otherwise ->
                   Right (SlashCommand rest)
   where
     isTabChar c = isDigit c || isAsciiLower c

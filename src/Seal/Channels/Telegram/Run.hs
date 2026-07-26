@@ -30,7 +30,7 @@ import Seal.Command.Spec (Registry, mkRegistry)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
-import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
+import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
@@ -144,7 +144,6 @@ runTelegramMain autonomy = do
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
         , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
         , terseGrammarSpec
         ]
   -- Read the bot token from the vault (the wizard stores it there, not in

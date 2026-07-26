@@ -271,11 +271,10 @@ handleSend deps sid rawText = do
         case r of
           SendError _ _ -> pure r
           _            -> do
-            -- /tabs and /tab own their tab lifecycle (close/resume mutate
-            -- the list); auto-tabbing the request's session afterward would
-            -- resurrect a tab that /tabs close just removed. Skip the
-            -- auto-tab for these commands; still broadcast so the frontend
-            -- reflects any mutation.
+            -- /tabs owns its tab lifecycle (close/resume mutate the list);
+            -- auto-tabbing the request's session afterward would resurrect
+            -- a tab that /tabs close just removed. Skip the auto-tab for
+            -- /tabs; still broadcast so the frontend reflects any mutation.
             unless (isTabCommand cmdName) $
               ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
@@ -303,15 +302,15 @@ renderWebTab t =
   T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
     <> maybe "" ("  " <>) (tLabel t)
 
--- | True for slash commands that own their tab lifecycle (@/tabs ...@,
--- @/tab@). Used to skip 'ensureTabForSession' on the web send path so a
+-- | True for slash commands that own their tab lifecycle (@/tabs ...@).
+-- Used to skip 'ensureTabForSession' on the web send path so a
 -- @/tabs close N@ that just removed a tab isn't immediately undone by the
 -- auto-tab. The head word is checked case-insensitively (the registry
 -- lookup is case-insensitive too).
 isTabCommand :: Text -> Bool
 isTabCommand cmdName =
   let headWord = T.takeWhile (/= ' ') (T.strip cmdName)
-  in T.toCaseFold headWord `elem` ["tab", "tabs"]
+  in T.toCaseFold headWord == "tabs"
 
 -- | 'ensureTabForSession' is defined in 'Seal.Tabs' and re-exported here for
 -- the web send path. See its Haddock there for the contract (idempotent,

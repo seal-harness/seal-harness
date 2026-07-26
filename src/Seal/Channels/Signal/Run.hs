@@ -36,7 +36,7 @@ import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
-import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
+import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
@@ -306,7 +306,6 @@ runSignalMain autonomy = do
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
         , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
         , terseGrammarSpec
         ]
   case resolveSignalConfig (rcSignal cfg) Nothing of

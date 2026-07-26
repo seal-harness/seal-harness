@@ -37,7 +37,7 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
-import Seal.Command.Tab (tabCommandSpec, tabsCommandSpec, terseGrammarSpec)
+import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
@@ -179,7 +179,6 @@ runServeMain autonomy = do
         , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , tabCommandSpec tabsH
-        , tabsCommandSpec tabsH
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
         , newCommandSpec newDeps

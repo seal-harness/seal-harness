@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Routing.RouteSpec (spec) where
 
-import Data.Either (isLeft)
 import Data.Text qualified as T
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
@@ -28,27 +27,8 @@ spec = describe "Seal.Routing.Route" $ do
     it "/1  multiple   spaces -> Inject 1 (preserved)" $
       route "/1  multiple   spaces" `shouldBe` Right (Inject (mk 1) " multiple   spaces")
 
-  describe "/tab commands" $ do
-    it "/tab -> CurrentTab" $ route "/tab" `shouldBe` Right CurrentTab
-    it "/tab list -> ParseError (subcommands live under /tabs)" $
-      route "/tab list" `shouldSatisfy` isLeft
-    it "/tab new -> ParseError" $ route "/tab new" `shouldSatisfy` isLeft
-    it "/tab new harness -> ParseError" $ route "/tab new harness" `shouldSatisfy` isLeft
-    it "/tab new ai -> ParseError" $ route "/tab new ai" `shouldSatisfy` isLeft
-    it "/tab close 2 -> ParseError" $ route "/tab close 2" `shouldSatisfy` isLeft
-    it "/tab close 2 --force -> ParseError" $ route "/tab close 2 --force" `shouldSatisfy` isLeft
-    it "/tab focus 3 -> ParseError" $ route "/tab focus 3" `shouldSatisfy` isLeft
-    it "/tab resume my-session -> ParseError" $
-      route "/tab resume my-session" `shouldSatisfy` isLeft
-    it "/tab rename 1 work -> ParseError" $
-      route "/tab rename 1 work" `shouldSatisfy` isLeft
-    it "/tab <args> ParseError mentions /tabs" $
-      case route "/tab close 0" of
-        Left (ParseError msg) -> msg `shouldSatisfy` ("/tabs" `T.isInfixOf`)
-        other                 -> expectationFailure ("expected ParseError, got " <> show other)
-
   describe "/tabs commands (bare = CurrentTab; subcommands deferred to the registry)" $ do
-    it "/tabs -> CurrentTab (alias for /tab)" $ route "/tabs" `shouldBe` Right CurrentTab
+    it "/tabs -> CurrentTab" $ route "/tabs" `shouldBe` Right CurrentTab
     it "/tabs list -> SlashCommand tabs list" $
       route "/tabs list" `shouldBe` Right (SlashCommand "tabs list")
     it "/tabs close 0 -> SlashCommand tabs close 0" $
