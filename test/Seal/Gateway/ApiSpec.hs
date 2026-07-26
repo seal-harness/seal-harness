@@ -12,14 +12,14 @@ import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust)
+import Data.Maybe (fromJust, isJust)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
 import Network.HTTP.Client (defaultManagerSettings, newManager)
-import Network.HTTP.Types (methodDelete, methodGet, methodPost, methodPut, statusCode)
+import Network.HTTP.Types (Header, methodDelete, methodGet, methodPost, methodPut, statusCode)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
@@ -149,6 +149,21 @@ runAppBody app req = do
           ResponseBuilder _ _ b -> BSB.toLazyByteString b
           _ -> BL.fromStrict BC.empty
     putMVar mv (st, body)
+    pure ResponseReceived)
+  takeMVar mv
+
+-- | Run the app against a test request, capturing the status code, body, and
+-- response headers. Used by tests that assert on headers (e.g. the
+-- @Server-Timing@ header on @GET /transcript@).
+runAppBodyHeaders :: Application -> Request -> IO (Int, BL.ByteString, [Header])
+runAppBodyHeaders app req = do
+  mv <- newEmptyMVar
+  _rr <- app req (\resp -> do
+    let st = statusCode (responseStatus resp)
+        (body, hdrs) = case resp of
+          ResponseBuilder _ hs b -> (BSB.toLazyByteString b, hs)
+          _ -> (BL.fromStrict BC.empty, [])
+    putMVar mv (st, body, hdrs)
     pure ResponseReceived)
   takeMVar mv
 
@@ -563,6 +578,44 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet ["api", "sessions", "sess1", "transcript"])
     status `shouldBe` 200
 
+  it "GET /api/sessions/<sid>/transcript emits a Server-Timing header (missing source)" $ do
+    app <- mkApp
+    (status, _body, hdrs) <- runAppBodyHeaders app
+      (testRequest methodGet ["api", "sessions", "sess1", "transcript"])
+    status `shouldBe` 200
+    -- The header must be present, name-cased correctly, and carry the
+    -- `missing` source desc so the frontend can distinguish an empty
+    -- response from a not-found session.
+    let timing = lookup "Server-Timing" hdrs
+    timing `shouldSatisfy` isJust
+    BC.unpack (fromJust timing) `shouldContain` "src;desc=\"missing\""
+    BC.unpack (fromJust timing) `shouldContain` "tt;dur=0;desc=\"total\""
+
+  it "GET /api/sessions/<sid>/transcript emits a Server-Timing header naming the source and entry count" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- Two-file format: write conversation.jsonl only (no entries.jsonl
+      -- sidecar) so the source is TSConvOnly.
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          conv = [ Message User [CbText "hi there"]
+                 , Message Assistant [CbText "hello back"]
+                 ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      app <- apiApp <$> mkDepsFor paths
+      (status, _body, hdrs) <- runAppBodyHeaders app
+        (testRequest methodGet ["api", "sessions", sidTxt, "transcript"])
+      status `shouldBe` 200
+      let timing = lookup "Server-Timing" hdrs
+      timing `shouldSatisfy` isJust
+      let t = BC.unpack (fromJust timing)
+      t `shouldContain` "src;desc=\"conv-only\""
+      t `shouldContain` "n;desc=\"2\""
+
   it "GET /api/sessions/<sid>/transcript rewrites conversation.jsonl blocks to Anthropic shape" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
       let paths = fakePaths { spState = stateDir }
@@ -602,12 +655,9 @@ spec = describe "Seal.Gateway.API" $ do
       -- frontend renders "(empty response)".
       let respEntry = arr !! 1
           o = case respEntry of { A.Object m -> m; _ -> error "not obj" }
-          payload = case lookupK "payload" o of
-            Just (A.String t) -> t
-            _ -> error "no payload"
-          parsed = case A.decode (BL.fromStrict (BC.pack (T.unpack payload))) :: Maybe A.Value of
+          parsed = case lookupK "payload" o of
             Just v -> v
-            Nothing -> error "payload not JSON"
+            Nothing -> error "no payload"
           contentBlocks = case parsed of
             A.Object m -> case lookupK "content" m of
               Just (A.Array a) -> a
@@ -662,12 +712,9 @@ spec = describe "Seal.Gateway.API" $ do
       -- fallback text block with raw JSON.
       let respEntry = arr !! 1
           ro = case respEntry of { A.Object m -> m; _ -> error "resp not obj" }
-          rpayload = case lookupK "payload" ro of
-            Just (A.String t) -> t
-            _ -> error "no resp payload"
-          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+          rparsed = case lookupK "payload" ro of
             Just v -> v
-            Nothing -> error "resp payload not JSON"
+            Nothing -> error "no resp payload"
           rcontent = case rparsed of
             A.Object m -> case lookupK "content" m of
               Just (A.Array a) -> a
@@ -684,12 +731,9 @@ spec = describe "Seal.Gateway.API" $ do
       -- message with raw JSON.
       let reqEntry = arr !! 2
           qo = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
-          qpayload = case lookupK "payload" qo of
-            Just (A.String t) -> t
-            _ -> error "no req payload"
-          qparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack qpayload))) :: Maybe A.Value of
+          qparsed = case lookupK "payload" qo of
             Just v -> v
-            Nothing -> error "req payload not JSON"
+            Nothing -> error "no req payload"
           qmsgs = case qparsed of
             A.Object m -> case lookupK "messages" m of
               Just (A.Array a) -> a
@@ -797,12 +841,9 @@ spec = describe "Seal.Gateway.API" $ do
             (x:_) -> x
             []    -> error "expected at least one entry"
           ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
-          rpayload = case lookupK "payload" ro of
-            Just (A.String t) -> t
-            _                 -> error "no req payload"
-          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+          rparsed = case lookupK "payload" ro of
             Just v -> v
-            Nothing -> error "req payload not JSON"
+            Nothing -> error "no req payload"
           systemField = case rparsed of
             A.Object m -> lookupK "system" m
             _          -> Nothing
@@ -835,12 +876,9 @@ spec = describe "Seal.Gateway.API" $ do
             (x:_) -> x
             []    -> error "expected at least one entry"
           ro = case reqEntry of { A.Object m -> m; _ -> error "req not obj" }
-          rpayload = case lookupK "payload" ro of
-            Just (A.String t) -> t
-            _                 -> error "no req payload"
-          rparsed = case A.decode (BL.fromStrict (BC.pack (T.unpack rpayload))) :: Maybe A.Value of
+          rparsed = case lookupK "payload" ro of
             Just v -> v
-            Nothing -> error "req payload not JSON"
+            Nothing -> error "no req payload"
           msgs = case rparsed of
             A.Object m -> case lookupK "messages" m of
               Just (A.Array a) -> a
@@ -2640,11 +2678,25 @@ spec = describe "Seal.Gateway.API" $ do
       case v of
         A.Object o ->
           case KeyMap.lookup (Key.fromText "payload") o of
+            -- The payload is now a JSON object (not a string) in the
+            -- reconstructed path, so we pattern-match directly.
+            Just (A.Object ro) ->
+              case ( KeyMap.lookup (Key.fromText "op") ro
+                   , KeyMap.lookup (Key.fromText "result") ro ) of
+                ( Just (A.Object op)
+                 , Just (A.Object res)
+                 ) ->
+                  case KeyMap.lookup (Key.fromText "name") op of
+                    Just (A.String n) -> n == "SKILL_LOAD" && KeyMap.member (Key.fromText "body") res
+                    _ -> False
+                _ -> False
+            -- Legacy path: payload may still be a string (teLineToFrontend
+            -- decodes it to an object, but defensively handle a string).
             Just (A.String payloadTxt) ->
               case A.decode (BL.fromStrict (TE.encodeUtf8 payloadTxt)) :: Maybe A.Value of
-                Just (A.Object ro) ->
-                  case ( KeyMap.lookup (Key.fromText "op") ro
-                       , KeyMap.lookup (Key.fromText "result") ro ) of
+                Just (A.Object ro') ->
+                  case ( KeyMap.lookup (Key.fromText "op") ro'
+                       , KeyMap.lookup (Key.fromText "result") ro' ) of
                     ( Just (A.Object op)
                      , Just (A.Object res)
                      ) ->

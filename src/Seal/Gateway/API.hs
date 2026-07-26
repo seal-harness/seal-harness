@@ -17,7 +17,7 @@ import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
-import Data.Time (getCurrentTime)
+import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 
 import Data.Text (Text)
@@ -50,7 +50,8 @@ import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Gateway.Transcript
+  (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry, snapshot)
@@ -1118,6 +1119,13 @@ tabRefAt h idx = do
 --      the session's @smCreatedAt@/@smModel@ from @session.json@.
 --
 -- Missing files -> @[]@; unparseable lines are skipped.
+--
+-- Emits a @Server-Timing@ header (per <https://www.w3.org/TR/server-timing/>)
+-- with per-phase durations (file-read / parse / reconstruct / rewrite / total)
+-- and the transcript source (legacy / conv+entries / conv-only / missing) +
+-- entry count. The frontend parses this via @performance.getEntriesByName@ or
+-- by reading the @Server-Timing@ response header directly to direct
+-- optimization work without needing a separate tracing harness.
 handleTranscript :: ApiDeps -> Text -> IO Response
 handleTranscript deps sidTxt =
   case mkSessionId sidTxt of
@@ -1125,8 +1133,22 @@ handleTranscript deps sidTxt =
     Right sid -> do
       let paths = srPaths (adSessionRuntime deps)
       active <- readIORef (srActive (adSessionRuntime deps))
-      entries <- readTranscriptEntries paths (smModel active) (showIso (smCreatedAt active)) sid
-      pure (jsonLBS status200 (A.encode entries))
+      tReadStart <- getCurrentTime
+      (entries, tt0) <- readTranscriptEntriesTimed paths (smModel active) (showIso (smCreatedAt active)) sid
+      tEncStart <- getCurrentTime
+      let body = A.encode entries
+      tEncEnd <- getCurrentTime
+      -- Fold the encode duration + the gap between read-complete and
+      -- encode-start (negligible) into the timings so the @en@ token
+      -- reflects the JSON-serialization cost and @tt@ reflects the full
+      -- read+encode cost. This is where the slow tab's time is hiding —
+      -- A.encode of a deeply-nested Value tree (web_fetch tool_result
+      -- carrying full page HTML) is pathologically slow on large strings.
+      let tt = setEncodeMs (msDiff tEncStart tEncEnd) (msDiff tReadStart tEncEnd) tt0
+          timingHeader = (mkHN "Server-Timing", renderServerTiming tt)
+      pure (responseLBS status200 (corsHeaders <> [jsonHeader, timingHeader]) body)
+  where
+    msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
 
 -- | Handle GET /api/sessions/:id/questions. Returns the session's pending
 -- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@), oldest

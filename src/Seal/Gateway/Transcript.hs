@@ -10,6 +10,11 @@
 -- reader for broadcasting).
 module Seal.Gateway.Transcript
   ( readTranscriptEntries
+  , readTranscriptEntriesTimed
+  , TranscriptSource (..)
+  , TranscriptTimings (..)
+  , renderServerTiming
+  , setEncodeMs
   , firstUserMessageSnippet
   , lastUserMessageAt
   , showIso
@@ -18,8 +23,10 @@ module Seal.Gateway.Transcript
 
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Key (Key)
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set qualified as Set
@@ -27,7 +34,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
-import Data.Time (UTCTime, defaultTimeLocale, formatTime)
+import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
 
@@ -38,6 +45,71 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+
+-- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
+-- so the @Server-Timing@ header can name the path the request took.
+data TranscriptSource
+  = TSMissing      -- ^ no transcript file exists
+  | TSLegacy       -- ^ legacy @transcript.jsonl@
+  | TSConvEntries  -- @conversation.jsonl@ + @entries.jsonl@ (reconstructed)
+  | TSConvOnly     -- @conversation.jsonl@ only (no entries sidecar)
+  deriving (Eq, Show)
+
+-- | Per-phase timings for a single 'readTranscriptEntries' call, in
+-- milliseconds. Phase durations are measured with 'getCurrentTime' (wall
+-- clock); for the small file sizes typical of a transcript, GHC's wall
+-- clock has enough resolution. Phases are exclusive of each other EXCEPT
+-- @ttTotal@, which spans the entire call. A phase that didn't run (e.g.
+-- @ttReconstruct@ when the legacy path was taken) is 0.
+data TranscriptTimings = TranscriptTimings
+  { ttSource       :: TranscriptSource
+  , ttEntryCount   :: Int           -- ^ number of frontend entries returned
+  , ttFileReadMs   :: Integer       -- ^ time spent in 'TIO.readFile' (conv + entries files combined)
+  , ttParseMs      :: Integer       -- ^ 'A.decode' of every line (both files combined)
+  , ttReconstructMs :: Integer      -- @'reconstruct' (two-file path only)
+  , ttRewriteMs    :: Integer        -- 'teLineToFrontend' / 'reconEntryToFrontend' / 'convLineToFrontend'
+  , ttEncodeMs     :: Integer        -- ^ 'A.encode' of the frontend [Value] (set by 'handleTranscript', 0 for the bare reader)
+  , ttTotalMs      :: Integer       -- ^ wall-clock total of the whole call
+  }
+
+-- | Format a 'TranscriptTimings' as a @Server-Timing@ header value per
+-- <https://www.w3.org/TR/server-timing/>. Each phase is a separate
+-- comma-separated token with a short name, a numeric @dur@ (milliseconds,
+-- 3-decimal precision in the spec but we emit integers), and a @desc@
+-- naming the phase. The frontend parses these via @performance.getEntriesByName@
+-- or by reading the @Server-Timing@ response header directly.
+--
+-- Example output:
+--   @tt;dur=42;desc="total", fr;dur=3;desc="file-read", pr;dur=18;desc="parse", rc;dur=12;desc="reconstruct", rw;dur=4;desc="rewrite", en;dur=8;desc="encode", src;desc="conv+entries", n;desc="127"@
+renderServerTiming :: TranscriptTimings -> BC.ByteString
+renderServerTiming t =
+  let phase name ms desc =
+        BC.pack name <> ";dur=" <> BC.pack (show ms) <> ";desc=\"" <> BC.pack desc <> "\""
+      tag name desc = BC.pack name <> ";desc=\"" <> BC.pack desc <> "\""
+      srcDesc = case ttSource t of
+        TSMissing      -> "missing"
+        TSLegacy       -> "legacy"
+        TSConvEntries  -> "conv+entries"
+        TSConvOnly     -> "conv-only"
+      parts =
+        [ phase "tt" (ttTotalMs t)       "total"
+        , phase "fr" (ttFileReadMs t)    "file-read"
+        , phase "pr" (ttParseMs t)        "parse"
+        , phase "rc" (ttReconstructMs t) "reconstruct"
+        , phase "rw" (ttRewriteMs t)      "rewrite"
+        , phase "en" (ttEncodeMs t)       "encode"
+        , tag  "src" srcDesc
+        , tag  "n"   (show (ttEntryCount t))
+        ]
+  in BC.intercalate ", " parts
+
+-- | Set the encode-phase duration + bump the total to span read+encode.
+-- 'handleTranscript' uses this after timing 'A.encode' so the @en@ token
+-- reflects the JSON-serialization cost (which dominates for transcripts
+-- carrying large web_fetch / shell-output tool_result blocks) and @tt@
+-- reflects the full read+encode cost.
+setEncodeMs :: Integer -> Integer -> TranscriptTimings -> TranscriptTimings
+setEncodeMs encodeMs totalMs tt = tt { ttEncodeMs = encodeMs, ttTotalMs = totalMs }
 
 -- | 'zipWith' + 'mapMaybe': apply a partial function across two lists
 -- in lockstep, dropping the elements for which the function returns
@@ -50,39 +122,118 @@ zipWithMaybe f (a : as) (b : bs) = case f a b of
   Nothing -> zipWithMaybe f as bs
 
 -- | Read a session's transcript as the frontend's TranscriptEntry JSON shape.
--- Returns @[]@ for a missing/invalid session.
+-- Returns @[]@ for a missing/invalid session. Discards timing information;
+-- see 'readTranscriptEntriesTimed' for the instrumented variant.
 readTranscriptEntries
   :: SealPaths -> Text -> String -> SessionId -> IO [Value]
-readTranscriptEntries paths model fallbackTs sid = do
+readTranscriptEntries paths model fallbackTs sid =
+  fst <$> readTranscriptEntriesTimed paths model fallbackTs sid
+
+-- | Instrumented variant of 'readTranscriptEntries': returns the frontend
+-- values alongside per-phase wall-clock timings. Used by the @/transcript@
+-- HTTP handler to emit a @Server-Timing@ header; other callers (broadcast,
+-- snippet helpers) can use the plain 'readTranscriptEntries' and ignore the
+-- overhead of timing capture.
+readTranscriptEntriesTimed
+  :: SealPaths -> Text -> String -> SessionId -> IO ([Value], TranscriptTimings)
+readTranscriptEntriesTimed paths model fallbackTs sid = do
+  tStart <- getCurrentTime
   let legacyPath = sessionTranscriptPath paths sid
       convPath   = sessionConversationPath paths sid
   legacyExists <- doesFileExist legacyPath
   convExists   <- doesFileExist convPath
   if legacyExists
     then do
+      tFr0 <- getCurrentTime
       raw <- TIO.readFile legacyPath
+      tFr1 <- getCurrentTime
+      tPr0 <- getCurrentTime
       let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                           (filter (not . T.null) (T.lines raw))
-      pure (map teLineToFrontend vals)
+      tPr1 <- getCurrentTime
+      tRw0 <- getCurrentTime
+      let frontend = map teLineToFrontend vals
+      tRw1 <- getCurrentTime
+      tEnd <- getCurrentTime
+      let tt = TranscriptTimings
+            { ttSource        = TSLegacy
+            , ttEntryCount    = length frontend
+            , ttFileReadMs    = ms tFr0 tFr1
+            , ttParseMs       = ms tPr0 tPr1
+            , ttReconstructMs = 0
+            , ttRewriteMs     = ms tRw0 tRw1
+            , ttEncodeMs      = 0
+            , ttTotalMs       = ms tStart tEnd
+            }
+      pure (frontend, tt)
     else if convExists
       then do
+        tFr0 <- getCurrentTime
         raw <- TIO.readFile convPath
+        tFr1 <- getCurrentTime
+        tPr0 <- getCurrentTime
         let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines raw)) :: [A.Value]
             msgs    = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines raw)) :: [Message]
+        tPr1 <- getCurrentTime
         entriesExist <- doesFileExist (sessionEntriesPath paths sid)
         if entriesExist
           then do
+            tFr2 <- getCurrentTime
             eraw <- TIO.readFile (sessionEntriesPath paths sid)
+            tFr3 <- getCurrentTime
+            tPr2 <- getCurrentTime
             let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines eraw)) :: [EntryRecord]
-                reconstructed = reconstruct msgs evs
+            tPr3 <- getCurrentTime
+            tRc0 <- getCurrentTime
+            let reconstructed = reconstruct msgs evs
                 frontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed
-            pure frontend
+            tRc1 <- getCurrentTime
+            tEnd <- getCurrentTime
+            let tt = TranscriptTimings
+                  { ttSource        = TSConvEntries
+                  , ttEntryCount    = length frontend
+                  , ttFileReadMs    = ms tFr0 tFr1 + ms tFr2 tFr3
+                  , ttParseMs       = ms tPr0 tPr1 + ms tPr2 tPr3
+                  , ttReconstructMs = ms tRc0 tRc1
+                  , ttRewriteMs     = 0  -- reconstruction includes rewrite
+                  , ttEncodeMs      = 0
+                  , ttTotalMs       = ms tStart tEnd
+                  }
+            pure (frontend, tt)
           else do
-            pure (zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals)
-      else pure []
+            tRw0 <- getCurrentTime
+            let frontend = zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals
+            tRw1 <- getCurrentTime
+            tEnd <- getCurrentTime
+            let tt = TranscriptTimings
+                  { ttSource        = TSConvOnly
+                  , ttEntryCount    = length frontend
+                  , ttFileReadMs    = ms tFr0 tFr1
+                  , ttParseMs       = ms tPr0 tPr1
+                  , ttReconstructMs = 0
+                  , ttRewriteMs     = ms tRw0 tRw1
+                  , ttEncodeMs      = 0
+                  , ttTotalMs       = ms tStart tEnd
+                  }
+            pure (frontend, tt)
+      else do
+        tEnd <- getCurrentTime
+        let tt = TranscriptTimings
+              { ttSource        = TSMissing
+              , ttEntryCount    = 0
+              , ttFileReadMs    = 0
+              , ttParseMs       = 0
+              , ttReconstructMs = 0
+              , ttRewriteMs     = 0
+              , ttEncodeMs      = 0
+              , ttTotalMs       = ms tStart tEnd
+              }
+        pure ([], tt)
+  where
+    ms a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
 
 -- | Extract a short snippet of the first user message in a session's
 -- transcript, for use as the default session title when the user has not
@@ -158,12 +309,20 @@ teLineToFrontend rawLine =
       lookupT key = case KeyMap.lookup (k key) o of
         Just (A.String t) -> Just t
         _                 -> Nothing
-      payloadStr = maybe mempty A.encode (KeyMap.lookup (k "payload") o)
+      -- The on-disk `payload` field is a JSON string; decode it to a Value
+      -- so we can send it as a JSON object (not a string) in the wire
+      -- response. Falls back to the raw string when it's not valid JSON
+      -- (defensive against a malformed on-disk line).
+      payloadVal = case KeyMap.lookup (k "payload") o of
+        Just (A.String s) -> case A.decode (BL.fromStrict (TE.encodeUtf8 s)) of
+          Just v  -> v
+          Nothing -> A.String s
+        other -> fromMaybe A.Null other
   in object
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
      , "direction" .= lookupT "direction"
-     , "payload"   .= TE.decodeUtf8 (BL.toStrict payloadStr)
+     , "payload"   .= payloadVal
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
@@ -195,13 +354,13 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
         else A.object ["content" A..= content]
       entryId = T.pack (show idx)
       ts = fromMaybe fallbackTs (lookup idx (zip [0..] entryTimestamps))
-  in object
-     [ "id"        .= entryId
-     , "timestamp" .= T.pack ts
-     , "direction" .= direction
-     , "payload"   .= TE.decodeUtf8 (BL.toStrict (A.encode payloadJson))
-     , "harness"   .= (Nothing :: Maybe Text)
-     , "model"     .= model
+   in object
+      [ "id"        .= entryId
+      , "timestamp" .= T.pack ts
+      , "direction" .= direction
+      , "payload"   .= payloadJson
+      , "harness"   .= (Nothing :: Maybe Text)
+      , "model"     .= model
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
 
@@ -324,10 +483,28 @@ reconEntryToFrontend idx te =
          [ "id"        .= entryId
          , "timestamp" .= T.pack (showIso (teTimestamp te))
          , "direction" .= dirStr
-         , "payload"   .= TE.decodeUtf8 (BL.toStrict (A.encode payloadJson))
+         -- `payload` is a JSON OBJECT (not a string) so the frontend can
+         -- access its fields directly without a second JSON.parse pass.
+         -- The old format encoded payload as a JSON string
+         -- (TE.decodeUtf8 (A.encode payloadJson)), which forced the browser
+         -- to parse the outer JSON (un-escaping every `\"` in the payload
+         -- string), then call JSON.parse(payload) AGAIN to parse the inner
+         -- JSON — two full parse passes with O(n) escape processing in
+         -- between. For a 279KB body this took ~889ms; as an object it's a
+         -- single pass and should be <10ms.
+         , "payload"   .= payloadJson
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
-         , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode payloadVal))
+         -- The `raw` field is deliberately EMPTY for the reconstructed
+         -- (two-file) path. The pre-rewrite payload Value is the same
+         -- content as `payload` (just in GHC-Generics TaggedObject shape
+         -- vs the Anthropic shape the frontend parses), so shipping it
+         -- would double the wire payload for no information gain. The
+         -- legacy path (teLineToFrontend) still ships the verbatim
+         -- on-disk line because there the `raw` view is genuinely
+         -- distinct from `payload`. The frontend's "View raw JSON"
+         -- modal falls back to `payload` when `raw` is empty.
+         , "raw"       .= ("" :: Text)
          ]
 
 -- | Rewrite a reconstructed payload 'Value' from GHC-Generics
@@ -369,7 +546,17 @@ rewritePayload val dir =
             Request ->
               passthrough (k "system")
                <> passthrough (k "model")
-               <> passthrough (k "tools")
+               -- Replace the full tool definitions with names-only. The
+               -- full definitions (with input_schema, description, etc.) are
+               -- the same across every request turn and can be 11KB+ each;
+               -- shipping them in all 73 request entries of a 146-turn
+               -- session wastes ~840KB. The frontend's "Tools" collapsed
+               -- row only needs the names + count for its header, and the
+               -- expanded view's JSON is the names-only array (still useful
+               -- for seeing WHAT tools were available, just not the full
+               -- schemas). The frontend already deduplicates tools via
+               -- `seenTools` so only the first occurrence renders.
+               <> toolsNamesOnly o
                <> passthrough (k "toolChoice")
                <> passthrough (k "maxTokens")
                <> passthrough (k "approval")
@@ -392,6 +579,34 @@ rewritePayload val dir =
                <> passthrough (k "durationMs")
       in A.object fields
     _ -> val
+
+-- | Extract just the tool NAMES from a tools array, dropping the full
+-- definitions (description, input_schema, etc.) to keep the wire payload
+-- small. Returns @["tools" .= [...]]@ where each element is
+-- @{"name": "<toolName>"}@ — the shape the frontend's
+-- 'extractToolDefNames' parses. Returns @[]@ when the tools field is
+-- absent or not an array.
+toolsNamesOnly :: KeyMap.KeyMap Value -> [(Key, Value)]
+toolsNamesOnly o =
+  case KeyMap.lookup (Key.fromText "tools") o of
+    Just (A.Array arr) ->
+      let names = map toolName (V.toList arr)
+      in ["tools" .= A.Array (V.fromList names)]
+    _ -> []
+  where
+    -- Extract {name: "..."} from a tool definition Value. Handles both
+    -- the Anthropic shape ({name, description, input_schema}) and the
+    -- Ollama shape ({type:"function", function:{name, ...}}).
+    toolName v = case v of
+      A.Object td ->
+        case KeyMap.lookup (Key.fromText "name") td of
+          Just n -> A.object ["name" .= n]
+          Nothing -> case KeyMap.lookup (Key.fromText "function") td of
+            Just (A.Object fn) -> case KeyMap.lookup (Key.fromText "name") fn of
+              Just n -> A.object ["name" .= n]
+              Nothing -> A.object ["name" .= A.Null]
+            _ -> A.object ["name" .= A.Null]
+      _ -> A.object ["name" .= A.Null]
 
 -- | Rewrite one 'Message' (@{role, content: [...]}@, strip-prefix camelCase
 -- JSON) to the Anthropic-style shape (@{role, content: [...]}@) the frontend

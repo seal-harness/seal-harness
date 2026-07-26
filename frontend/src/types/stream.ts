@@ -191,6 +191,16 @@ export interface UseTranscriptStream {
   lastError: string | null
   /** Pending human-confirmation questions (Untrusted opcode gate or ASK_HUMAN). */
   pendingQuestions: import('../hooks/useApi').PendingQuestion[]
+  /** True until the first HTTP seed fetch completes. The WS stream hook is
+   *  now the SOLE source of transcript entries (the duplicate `useTranscript`
+   *  fetch was removed to avoid two concurrent 257KB fetches on every tab
+   *  click), so `loading` is derived from the seed-fetch state. */
+  loading: boolean
+  /** Force a re-seed. Bumps the internal `refreshCount` which re-runs the
+   *  HTTP seed fetch. Used as `useSendMessage`'s `onComplete` callback —
+   *  the WS stream usually delivers new entries live, but the re-seed
+   *  acts as a consistency check. */
+  refresh: () => void
 }
 
 export interface UseSessionActivityStream {

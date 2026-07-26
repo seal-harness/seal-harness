@@ -183,20 +183,25 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
                 other -> expectationFailure ("expected 'hi there' CbText block, got " ++ show other)
               other -> expectationFailure ("expected 1 element, got " ++ show other)
           other -> expectationFailure ("expected a content array, got " ++ show other)
-        -- The first request carries the full prefix at convLen=1: just the
-        -- first user message.
+        -- The first request carries the delta at convLen=1 with start=0:
+        -- just the first user message ("hello").
         case payloadField "messages" req1 of
           Just (A.Array arr) -> length arr `shouldBe` 1
           other -> expectationFailure ("expected a messages array, got " ++ show other)
-        -- The second request carries the FULL conversation prefix at
-        -- convLen=3 (user "hello" + assistant "hi there" + user "what is
-        -- 2+2?") — the complete message list the LLM was sent, including
-        -- the entire history. The "View raw JSON" modal must show this
-        -- full list, not just the new user message, so the user is not
-        -- misled into thinking the history was not sent.
+        -- The second request carries ONLY the new message added since the
+        -- prior turn (start=2, end=3): the user message "what is 2+2?".
+        -- The cumulative conversation history (the prior user+assistant
+        -- pair) is NOT re-embedded — that's the whole point of the
+        -- two-file delta format. Re-embedding the full prefix at every
+        -- request would be O(N²) in the conversation length (a 146-turn
+        -- session would ship ~5,000 redundant message copies, turning
+        -- 280KB on disk into ~18MB on the wire). The envelope still
+        -- reflects the effective state at this turn, so "View raw JSON"
+        -- shows what the provider was configured with; the messages
+        -- array shows what was newly sent.
         case payloadField "messages" req2 of
-          Just (A.Array arr) -> length arr `shouldBe` 3
-          other -> expectationFailure ("expected a 3-element messages array, got " ++ show other)
+          Just (A.Array arr) -> length arr `shouldBe` 1
+          other -> expectationFailure ("expected a 1-element messages array, got " ++ show other)
       other -> expectationFailure ("expected 4 entries, got " ++ show (length other))
 
   -- Regression: an 'EKHarness' entry (an opcode invocation, e.g. FILE_READ)

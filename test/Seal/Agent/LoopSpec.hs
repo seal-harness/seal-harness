@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Agent.LoopSpec (spec) where
 
-import Control.Monad (zipWithM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -270,10 +269,16 @@ spec = describe "Seal.Agent.Loop" $ do
         _      -> expectationFailure "expected exactly two request lines"
 
   -- Verification: the reconstructed Request payloads (from conversation.jsonl
-  -- + entries.jsonl) must match the actual CompletionRequests sent to the LLM
-  -- (captured in requests.jsonl via the debug flag). This is the contract
-  -- verification: the "View raw JSON" modal shows exactly what the provider
-  -- received — the full conversation history, not just the latest message.
+  -- + entries.jsonl) carry ONLY the new messages added at each turn (the
+  -- delta), NOT the cumulative conversation history. This is the contract
+  -- of the two-file delta format: the on-disk conversation.jsonl already
+  -- stores each message exactly once, and re-embedding the full history into
+  -- every request entry would be O(N²) in the conversation length. The
+  -- separate debug requests.jsonl file (captured via the debug flag) still
+  -- records the full CompletionRequest sent to the provider (the complete
+  -- history, for provider-replay debugging); the reconstructed transcript
+  -- entries are the user-facing view, which shows what was newly sent at
+  -- each turn.
   it "reconstructed request payloads match the requests.jsonl debug file" $
     withSystemTempDirectory "seal-loop-recon" $ \dir -> do
       approvals <- newApprovalCache
@@ -327,6 +332,9 @@ spec = describe "Seal.Agent.Loop" $ do
               _ -> 0
           reconMsgCounts = map extractMsgCount reqEntries
           -- Decode the debug requests.jsonl lines and extract message counts.
+          -- The debug file captures the FULL CompletionRequest (with the
+          -- complete conversation history) — that's what the provider
+          -- received on the wire.
           decodeReq bs = case A.eitherDecodeStrict bs :: Either String CompletionRequest of
             Right r  -> r
             Left _   -> error "failed to decode request line"
@@ -335,10 +343,18 @@ spec = describe "Seal.Agent.Loop" $ do
       -- The number of reconstructed Request entries must match the number of
       -- debug requests (one per provider call).
       length reconMsgCounts `shouldBe` length debugMsgCounts
-      -- Each reconstructed request's message count must match the
-      -- corresponding debug request's message count — the full conversation
-      -- history, not just the latest message.
-      zipWithM_ shouldBe reconMsgCounts debugMsgCounts
+      -- Each reconstructed request carries ONLY the delta (the new messages
+      -- added at that turn), NOT the cumulative history. Turn 1 adds 1
+      -- message ("hi"); turn 2 adds 1 message ("how are you"). The debug
+      -- file captures the full history (1, then 2) — the reconstructed
+      -- entries carry the deltas (1, 1).
+      reconMsgCounts `shouldBe` [1, 1]
+      -- The debug file captures the FULL CompletionRequest (with the
+      -- complete conversation history) — that's what the provider
+      -- received on the wire. Turn 1 sends 1 message ("hi"); turn 2
+      -- sends 3 messages (user "hi" + assistant "hi back" + user "how
+      -- are you").
+      debugMsgCounts `shouldBe` [1, 3]
 
   -- -----------------------------------------------------------------------
   -- Human-confirmation gate (Supervised autonomy)

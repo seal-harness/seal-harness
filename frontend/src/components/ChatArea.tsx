@@ -1,11 +1,13 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { Profiler, memo } from 'react'
 import type { Agent, AgentInfo, Message, MessageContent, CodeSpan, ToolCallInfo, ToolDefsBlock, SessionInfo, TranscriptEntry } from '../types'
 import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
 import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
+import * as perf from '../lib/perf'
 
 /** Click-to-edit chat-header title. Displays the cascade
  *  (description → autoSummary → snippet → agent name → id prefix);
@@ -276,6 +278,17 @@ function BranchButton({ onClick, disabled }: { onClick: () => void; disabled?: b
 // untouched so we never coerce `"42"` into `42`. Depth-guarded against
 // pathologically nested payloads.
 function expandEmbeddedJson(value: unknown, depth = 0): unknown {
+  if (depth === 0) {
+    // Top-level entry point — measure the full walk.
+    const done = perf.begin('expandEmbeddedJson')
+    const result = expandEmbeddedJsonImpl(value, 0)
+    done({ meta: { depth: 0 } })
+    return result
+  }
+  return expandEmbeddedJsonImpl(value, depth)
+}
+
+function expandEmbeddedJsonImpl(value: unknown, depth = 0): unknown {
   if (depth > 8) return value
   if (typeof value === 'string') {
     const trimmed = value.trim()
@@ -355,8 +368,17 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
 
   const closeBtnRef = useRef<HTMLButtonElement>(null)
   const titleId = useRef(`raw-json-title-${Math.random().toString(36).slice(2, 10)}`).current
-  const pretty = prettyJsonOrRaw(body)
-  const parsed = tryParse(body)
+
+  // Parse + pretty-print ONCE on mount (not on every render). The body
+  // string doesn't change during the modal's lifetime, so memoizing avoids
+  // re-parsing a multi-MB payload every time the user switches tabs or
+  // triggers any re-render.
+  const { pretty, parsed } = useMemo(() => {
+    const done = perf.begin('rawJsonModal.parse')
+    const result = { pretty: prettyJsonOrRaw(body), parsed: tryParse(body) }
+    done({ meta: { bodyBytes: body.length } })
+    return result
+  }, [body])
 
   const [tab, setTab] = useState<JsonTab>('formatted')
 
@@ -430,7 +452,9 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
         {tab === 'formatted' ? (
           parsed.ok ? (
             <div className="raw-json-body raw-json-body-tree">
-              <JsonTree value={expandEmbeddedJson(parsed.value)} />
+              <Profiler id="JsonTree" onRender={onJsonTreeRender}>
+                <JsonTree value={expandEmbeddedJson(parsed.value)} />
+              </Profiler>
             </div>
           ) : (
             <div
@@ -852,7 +876,17 @@ function TypingIndicator() {
   )
 }
 
-function ChatMessage({
+// React Profiler callback for individual ChatMessage rows.
+function onChatMessageRender(
+  _id: string,
+  _phase: 'mount' | 'update' | 'nested-update',
+  actualDuration: number,
+): void {
+  if (!perf.isEnabled()) return
+  perf.record('render.ChatMessage', { durMs: Math.round(actualDuration * 100) / 100 })
+}
+
+const ChatMessage = memo(function ChatMessage({
   message,
   onBranch,
   sending,
@@ -979,7 +1013,7 @@ function ChatMessage({
       )}
     </div>
   )
-}
+})
 
 function SessionSetup({
   agents,
@@ -1140,9 +1174,10 @@ interface ToolResultRecord {
  *  assistant turns that include prior tool_result messages in their content),
  *  so we scan both. */
 function buildToolResultIndex(entries: TranscriptEntry[]): Map<string, ToolResultRecord> {
+  const done = perf.begin('buildToolResultIndex')
   const map = new Map<string, ToolResultRecord>()
   for (const e of entries) {
-    const parsed = tryParseJson(e.payload)
+    const parsed = tryParsePayload(e.payload)
     if (!parsed) continue
     // Request entries: tool_result blocks live inside messages[].content[]
     const msgs = parsed.messages as Array<{ role: string; content: unknown }> | undefined
@@ -1177,6 +1212,7 @@ function buildToolResultIndex(entries: TranscriptEntry[]): Map<string, ToolResul
       }
     }
   }
+  done({ count: entries.length })
   return map
 }
 
@@ -1223,6 +1259,25 @@ function tryParseJson(s: string): Record<string, unknown> | null {
   } catch {
     return null
   }
+}
+
+/** Parse a `TranscriptEntry.payload` value into a record. Handles both shapes:
+ *  - the new object shape (reconstructed path sends `payload` as a JSON
+ *    object, so it's already parsed — just cast),
+ *  - the legacy string shape (the old `teLineToFrontend` path and WS stream
+ *    entries still encode `payload` as a JSON string, so we `JSON.parse` it).
+ *  Returns `null` for an unparseable string or a non-object value. */
+function tryParsePayload(p: TranscriptEntry['payload']): Record<string, unknown> | null {
+  if (typeof p === 'string') return tryParseJson(p)
+  if (p != null && typeof p === 'object') return p as Record<string, unknown>
+  return null
+}
+
+/** The string length of a `payload` value — used for token estimation when
+ *  the payload can't be parsed. Handles both the string and object shapes. */
+function payloadStrLen(p: TranscriptEntry['payload']): number {
+  if (typeof p === 'string') return p.length
+  try { return JSON.stringify(p).length } catch { return 0 }
 }
 
 function extractTextFromContent(content: Array<{ type: string; text?: string }> | undefined): string | null {
@@ -1300,6 +1355,7 @@ function extractToolDefNames(tools: unknown[]): string[] {
  *  on-disk transcript line (`raw`) is carried through to the "View raw JSON
  *  (message)" modal so Seal always makes EVERYTHING visible to the user. */
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
+  const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
   const seenSystemPrompts = new Set<string>()
   const seenTools = new Set<string>()
@@ -1307,10 +1363,15 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
 
   for (const e of entries) {
     const ts = formatTimestamp(e.timestamp)
-    const rawJson = e.raw
+    // The "View raw JSON" modal uses `rawJson`. For the reconstructed path,
+    // `raw` is empty — fall back to the `payload` so the modal still works.
+    // `payload` is now an object (for the reconstructed path) or a string
+    // (for the legacy path); the modal calls `JSON.parse(body)` so we need
+    // a string. When `payload` is an object, stringify it for the modal.
+    const rawJson = e.raw || (typeof e.payload === 'string' ? e.payload : JSON.stringify(e.payload, null, 2))
 
     if (e.direction === 'request') {
-      const parsed = tryParseJson(e.payload)
+      const parsed = tryParsePayload(e.payload)
       if (parsed) {
         // SKILL_LOAD result entries (EKHarness with op.name="SKILL_LOAD"
         // and a "result" key in the payload, recorded by the backend's
@@ -1446,13 +1507,13 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           agentName: 'You',
           agentStatus: 'completed',
           timestamp: ts,
-          blocks: [{ id: 'raw-' + e.id, text: e.payload }],
+          blocks: [{ id: 'raw-' + e.id, text: typeof e.payload === 'string' ? e.payload : JSON.stringify(e.payload) }],
           rawJson,
         })
       }
     } else {
       // Response
-      const parsed = tryParseJson(e.payload)
+      const parsed = tryParsePayload(e.payload)
       if (parsed) {
         const content = parsed.content as Array<{ type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }> | undefined
         const textParts = extractTextFromContent(content)
@@ -1488,7 +1549,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           agentName: e.harness ?? e.model ?? 'Assistant',
           agentStatus: 'completed',
           timestamp: ts,
-          blocks: [{ id: 'raw-' + e.id, text: e.payload }],
+          blocks: [{ id: 'raw-' + e.id, text: typeof e.payload === 'string' ? e.payload : JSON.stringify(e.payload) }],
           rawJson,
           streaming: e.streaming,
         })
@@ -1496,6 +1557,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     }
   }
 
+  done({ count: entries.length })
   return messages
 }
 
@@ -1515,9 +1577,9 @@ export function computeTokensUsed(entries: TranscriptEntry[]): number {
   let estimatedTokens = 0
 
   for (const e of entries) {
-    const parsed = tryParseJson(e.payload)
+    const parsed = tryParsePayload(e.payload)
     if (!parsed) {
-      estimatedTokens += Math.ceil(e.payload.length / 4)
+      estimatedTokens += Math.ceil(payloadStrLen(e.payload) / 4)
       continue
     }
     if (e.direction === 'response') {
@@ -1548,7 +1610,7 @@ export function computeTokensUsed(entries: TranscriptEntry[]): number {
   let lastRequestTextLen = 0
   for (let i = entries.length - 1; i >= 0; i--) {
     if (entries[i]!.direction === 'request') {
-      lastRequestTextLen = entries[i]!.payload.length
+      lastRequestTextLen = payloadStrLen(entries[i]!.payload)
       break
     }
   }
@@ -1561,6 +1623,40 @@ export function providerFromRuntime(runtime: string | undefined): string | null 
   if (!runtime) return null
   const m = runtime.match(/^session:(.+)$/)
   return m ? m[1]! : null
+}
+
+// React Profiler callback for the message list. Records the actual render
+// duration (and entry count via the `transcriptMessages` perf sample, which
+// fires immediately before render) so the overlay can show "render took X ms
+// for N messages". The Profiler's `actualDuration` is the committed render
+// time; `baseDuration` is the last render without memoization. We record both.
+function onMessageListRender(
+  _id: string,
+  _phase: 'mount' | 'update' | 'nested-update',
+  actualDuration: number,
+  baseDuration: number,
+): void {
+  if (!perf.isEnabled()) return
+  perf.record('render.ChatArea.messageList', {
+    durMs: Math.round(actualDuration * 100) / 100,
+    meta: { baseDuration: Math.round(baseDuration * 100) / 100, phase: _phase },
+  })
+}
+
+// React Profiler callback for the JsonTree (the "View raw JSON" modal's
+// formatted view). A deeply-nested payload produces hundreds of DOM nodes;
+// this measures the tree's render cost.
+function onJsonTreeRender(
+  _id: string,
+  _phase: 'mount' | 'update' | 'nested-update',
+  actualDuration: number,
+  baseDuration: number,
+): void {
+  if (!perf.isEnabled()) return
+  perf.record('render.JsonTree', {
+    durMs: Math.round(actualDuration * 100) / 100,
+    meta: { baseDuration: Math.round(baseDuration * 100) / 100, phase: _phase },
+  })
 }
 
 // ── Main ChatArea component ──────────────────────────────────────────────
@@ -1706,6 +1802,29 @@ export function ChatArea({
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
   }, [hasFragment])
+
+  // Measure the time from the start of the message-list render phase to the
+  // point the browser has painted the committed DOM. React's <Profiler> is a
+  // no-op in production builds, so we use a render-phase timestamp (captured
+  // during render) + a useLayoutEffect (fires after DOM commit, before paint)
+  // + a requestAnimationFrame (fires after paint) to measure the full
+  // render→commit→paint cycle. This works in both dev and prod builds.
+  const renderStartRef = useRef(0)
+  renderStartRef.current = perf.isEnabled() ? performance.now() : 0
+  useLayoutEffect(() => {
+    if (!perf.isEnabled() || renderStartRef.current === 0) return
+    const t0 = renderStartRef.current
+    const commitDone = perf.begin('render.ChatArea.commit')
+    // useLayoutEffect fires after DOM commit but before paint. Measure the
+    // commit phase (render→commit).
+    perf.record('render.ChatArea.commit', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'commit', n: messages.length } })
+    // Use rAF to measure the full render→paint cycle (the browser's
+    // style+layout+paint after commit).
+    requestAnimationFrame(() => {
+      perf.record('render.ChatArea.paint', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'paint', n: messages.length } })
+      commitDone()
+    })
+  }, [messages])
 
   useEffect(() => {
     if (hasFragment) return
@@ -1872,17 +1991,20 @@ export function ChatArea({
           ) : messages.length === 0 ? (
             <div className="text-sm" style={{ color: 'var(--text-muted)' }}>No messages yet. Select a session to view its transcript.</div>
           ) : (
-            messages.map((msg) => (
-              <ChatMessage
-                key={msg.id}
-                message={msg}
-                onBranch={onBranch}
-                sending={sending}
-                pendingQuestions={pendingQuestions}
-                onAnswer={onAnswerQuestion}
-                onCancel={onCancelQuestion}
-              />
-            ))
+            <Profiler id="ChatArea.messageList" onRender={onMessageListRender}>
+              {messages.map((msg) => (
+                <Profiler key={msg.id} id="ChatMessage" onRender={onChatMessageRender}>
+                  <ChatMessage
+                    message={msg}
+                    onBranch={onBranch}
+                    sending={sending}
+                    pendingQuestions={pendingQuestions}
+                    onAnswer={onAnswerQuestion}
+                    onCancel={onCancelQuestion}
+                  />
+                </Profiler>
+              ))}
+            </Profiler>
           )}
           <div ref={messagesEndRef} />
         </div>

@@ -30,6 +30,7 @@ module Seal.Transcript.Reconstruct
 import Data.Aeson (Value (..), object, (.=))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
+import Data.Text (Text)
 
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (Message (..), ToolChoice (..))
@@ -47,6 +48,18 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 -- The first request's envelope is the initial envelope passed in (there is no
 -- prior to delta against, so the first request's full envelope is the
 -- baseline). Subsequent requests fold deltas on top.
+--
+-- Both 'EKRequest' and 'EKResponse' entries carry ONLY the NEW messages added
+-- since the prior turn (@conv[start:end]@), NOT the cumulative conversation
+-- prefix. This is the whole point of the two-file delta format: the on-disk
+-- @conversation.jsonl@ already stores each message exactly once, and
+-- re-embedding the full history into every request entry would be O(N²) in
+-- the conversation length (a 146-turn session would ship ~5,000 redundant
+-- message copies, turning 280KB on disk into ~18MB on the wire). The frontend
+-- extracts only the last message of each request for display, so the chat
+-- view is unaffected; the "View raw JSON" modal shows the delta payload (the
+-- new messages + the effective envelope), which is what the user actually
+-- wants to inspect when debugging a single turn.
 reconstruct :: [Message] -> [EntryRecord] -> [TranscriptEntry]
 reconstruct conv = go 0 Nothing
   where
@@ -54,15 +67,6 @@ reconstruct conv = go 0 Nothing
     -- messages begin (i.e. the prior response's convLen, or 0 for the first
     -- turn). @mEnv@ is the effective envelope at the most recent request (used
     -- to reconstruct response payloads, which carry the request's model).
-    --
-    -- For 'EKRequest' entries, the payload carries the FULL conversation
-    -- prefix @conv[0:end]@ — every message the LLM was sent, including the
-    -- entire history — so the "View raw JSON" modal shows exactly what the
-    -- provider received. The frontend extracts only the last message for
-    -- display, so the chat view is unaffected. For 'EKResponse' entries, the
-    -- payload carries only the NEW assistant content @conv[start:end]@ (the
-    -- lines added since the prior turn), since responses don't re-send
-    -- history.
     go :: Int -> Maybe Envelope -> [EntryRecord] -> [TranscriptEntry]
     go _ _       [] = []
     go start mEnv (e : es) =
@@ -70,11 +74,20 @@ reconstruct conv = go 0 Nothing
         EKRequest ->
           let env = effectiveAt e mEnv
               end = erConvLen e
-              -- erConvLen is ABSOLUTE (the total conversation length at this
-              -- point). The request payload carries the full prefix
-              -- conv[0:end] — the complete message list the LLM received.
-              msgs = take end conv
-              payload = requestPayload env msgs
+              -- Delta-only: the NEW messages added since the prior turn
+              -- (conv[start:end]), NOT the cumulative prefix.
+              msgs = take (end - start) (drop start conv)
+              -- Only include the system prompt when it CHANGED from the
+              -- prior effective envelope. The frontend deduplicates system
+              -- prompts via `seenSystemPrompts`, so shipping the same
+              -- 15KB system prompt in all 73 request entries of a 146-turn
+              -- session wastes ~1.1MB. Omitting it when unchanged lets the
+              -- frontend skip the system row for that entry (it only
+              -- renders the first occurrence of each unique prompt).
+              sys = if envSystem env /= (envSystem =<< mEnv)
+                      then envSystem env
+                      else Nothing
+              payload = requestPayload env sys msgs
               entry = toEntry e Request payload
           in entry : go end (Just env) es
         EKResponse ->
@@ -114,17 +127,23 @@ reconstruct conv = go 0 Nothing
 
 -- | Build the old 'Request' payload: a 'CompletionRequest'-shaped JSON object
 -- carrying the model, system, tools, toolChoice, maxTokens, and the message
--- prefix in effect at this turn. Mirrors the old 'ToJSON CompletionRequest'
--- encoding so a "view raw" reproduces the bytes the old format stored.
-requestPayload :: Envelope -> [Message] -> Value
-requestPayload env msgs = object
+-- prefix in effect at this turn. The @sys@ argument is the system prompt to
+-- include — 'Nothing' means "omit the system field" (used when the prompt is
+-- unchanged from the prior request, so the frontend skips the redundant
+-- system row). Mirrors the old 'ToJSON CompletionRequest' encoding so a
+-- "view raw" reproduces the bytes the old format stored.
+requestPayload :: Envelope -> Maybe Text -> [Message] -> Value
+requestPayload env sys msgs = object $
   [ "model"      .= envModel env
-  , "system"     .= envSystem env
   , "messages"   .= msgs
   , "tools"      .= envTools env
   , "toolChoice" .= envToolChoice env
   , "maxTokens"  .= envMaxTokens env
-  ]
+  ] <> systemField
+  where
+    systemField = case sys of
+      Nothing -> []  -- unchanged from prior; omit so frontend skips
+      Just s  -> ["system" .= s]
 
 -- | Build the old 'Response' payload: the assistant content blocks (drawn
 -- from the conversation lines added since the prior turn) plus the usage /

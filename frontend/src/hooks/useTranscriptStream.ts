@@ -7,18 +7,34 @@
  * ascending. Status + lastError reflect the underlying stream client.
  */
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { TranscriptEntry } from '../types'
 import type { StreamClient, StreamStatus, UseTranscriptStream } from '../types/stream'
 import { streamClient } from '../lib/streamClient'
 import { fetchPendingQuestions, type PendingQuestion } from './useApi'
+import * as perf from '../lib/perf'
 
 async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]> {
+  const done = perf.begin('transcript.seed')
+  const ttfbDone = perf.begin('transcript.seed.ttfb')
+  const textDone = perf.begin('transcript.seed.readBody')
+  const parseDone = perf.begin('transcript.seed.jsonParse')
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
-    if (!res.ok) return []
-    return (await res.json()) as TranscriptEntry[]
+    await perf.recordFetch('transcript.seed', res)
+    ttfbDone({ meta: { sessionId, status: res.status } })
+    if (!res.ok) {
+      done(); textDone(); parseDone()
+      return []
+    }
+    const text = await res.text()
+    textDone({ meta: { sessionId, bytes: text.length } })
+    const data = JSON.parse(text) as TranscriptEntry[]
+    parseDone({ count: data.length, meta: { sessionId, bytes: text.length } })
+    done({ count: data.length, meta: { sessionId, bytes: text.length } })
+    return data
   } catch {
+    done(); ttfbDone(); textDone(); parseDone()
     return []
   }
 }
@@ -32,12 +48,14 @@ export function reconcileEntries(
   existing: TranscriptEntry[],
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
+  const done = perf.begin('reconcileEntries')
   for (let i = 0; i < existing.length; i++) {
     if (existing[i]!.id === incoming.id) {
       // Replace in place (stable timestamp keeps sort order intact; streaming
       // entry-update entries carry their original timestamp throughout).
       const next = existing.slice()
       next[i] = incoming
+      done({ count: existing.length, meta: { mode: 'replace' } })
       return next
     }
   }
@@ -52,6 +70,7 @@ export function reconcileEntries(
   }
   const next = existing.slice()
   next.splice(insertAt, 0, incoming)
+  done({ count: existing.length, meta: { mode: 'insert' } })
   return next
 }
 
@@ -64,6 +83,11 @@ export function useTranscriptStream(
   const [status, setStatus] = useState<StreamStatus>(sc.status)
   const [lastError, setLastError] = useState<string | null>(sc.lastError())
   const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([])
+  const [loading, setLoading] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+  const loadedSessionRef = useRef<string | null>(null)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
   // Initial HTTP GET seed + focus the session. Set live focus eagerly BEFORE
   // the seed fetch (so live events during the GET round-trip aren't dropped),
@@ -74,13 +98,24 @@ export function useTranscriptStream(
     if (sessionId === null) {
       setEntries([])
       setPendingQuestions([])
+      setLoading(false)
+      loadedSessionRef.current = null
       return
     }
     sc.focus(sessionId)
     let cancelled = false
+    // Only show "Loading transcript..." on the FIRST load for a session —
+    // NOT on refresh-after-send (which fires `refresh` via `useSendMessage`'s
+    // `onComplete`). At refresh time the WS stream has already delivered the
+    // new entries live, so setting `loading=true` would flash "Loading
+    // transcript..." and clear the visible entries for the round-trip.
+    const isFirstLoad = loadedSessionRef.current !== sessionId
+    if (isFirstLoad) setLoading(true)
     fetchTranscriptSeed(sessionId).then((seed) => {
       if (cancelled) return
       setEntries(seed)
+      setLoading(false)
+      loadedSessionRef.current = sessionId
       const lastId = seed.length > 0 ? seed[seed.length - 1]!.id : undefined
       if (lastId !== undefined) {
         sc.focus(sessionId, lastId)
@@ -93,7 +128,7 @@ export function useTranscriptStream(
     return () => {
       cancelled = true
     }
-  }, [sessionId, sc])
+  }, [sessionId, sc, refreshCount])
 
   // WS entry subscription (focused session only).
   useEffect(() => {
@@ -134,5 +169,5 @@ export function useTranscriptStream(
     return unsub
   }, [sc])
 
-  return { entries, status, lastError, pendingQuestions }
+  return { entries, status, lastError, pendingQuestions, loading, refresh }
 }

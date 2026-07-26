@@ -263,14 +263,22 @@ export interface TranscriptEntry {
   id: string
   timestamp: string
   direction: 'request' | 'response'
-  payload: string
+  /** The transcript entry's payload as a JSON object. The backend sends this
+   *  as a JSON object (not a string) so the frontend can access its fields
+   *  directly without a second `JSON.parse` pass. The legacy path
+   *  (`teLineToFrontend`) still encodes `payload` as a JSON string for
+   *  backward compatibility; the reconstructed path (`reconEntryToFrontend`)
+   *  sends it as an object. `transcriptToMessages` handles both shapes via
+   *  `tryParsePayload`. */
+  payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
   /** The full, verbatim on-disk transcript.jsonl line for this entry — all 9
    *  `_te_*` fields including `_te_metadata`, byte-faithful to disk. Surfaced in
    *  the "View raw JSON (message)" modal. Required, never optional, per the
    *  governing principle: Seal always makes EVERYTHING visible to the user;
-   *  raw views must never silently hide fields. */
+   *  raw views must never silently hide fields. Empty string for the
+   *  reconstructed (two-file) path — the modal falls back to `payload`. */
   raw: string
   /** Set to `true` when this entry was delivered via an `entry-update` event,
    *  indicating the entry is still being streamed and may be updated further.

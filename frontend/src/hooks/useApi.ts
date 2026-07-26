@@ -14,6 +14,7 @@ import type {
   TabStatus,
   TranscriptEntry,
 } from '../types'
+import * as perf from '../lib/perf'
 
 const POLL_INTERVAL = 3000
 
@@ -295,12 +296,14 @@ export function useTranscript(sessionId: string | null) {
       setLoading(true)
     }
 
+    const done = perf.begin('transcript.httpSeed')
     fetchJson<TranscriptEntry[]>(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
       .then((data) => {
-        if (cancelled) return
+        if (cancelled) { done(); return }
         setEntries(data ?? [])
         setLoading(false)
         loadedSessionRef.current = sessionId
+        done({ count: data?.length, meta: { sessionId, hook: 'useTranscript' } })
       })
 
     return () => { cancelled = true }

@@ -6,8 +6,8 @@ import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
+import { PerfOverlay } from './components/PerfOverlay'
 import {
-  useTranscript,
   useSendMessage,
   useAgents,
   useTabs,
@@ -31,10 +31,10 @@ import {
 } from './hooks/useApi'
 import { useListsStream } from './hooks/useListsStream'
 import { useNewTabSpec } from './hooks/useNewTabSpec'
-import { useTranscriptStream, reconcileEntries } from './hooks/useTranscriptStream'
+import { useTranscriptStream } from './hooks/useTranscriptStream'
 import { useSessionActivityStream } from './hooks/useSessionActivityStream'
 import { streamClient } from './lib/streamClient'
-import type { Agent, AgentStatus, Message, SessionInfo, TabInfo, TranscriptEntry } from './types'
+import type { Agent, AgentStatus, Message, SessionInfo, TabInfo } from './types'
 import { findSession, tabDisplayLabel } from './types'
 
 // ── URL ↔ selectionId helpers ───────────────────────────────────────────
@@ -253,15 +253,14 @@ export default function App() {
   const currentSessionId = sessionIdFromSelection(selectedId, tabs)
 
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
-  const { entries: httpEntries, loading, refresh } = useTranscript(currentSessionId)
-  const { entries: streamEntries, pendingQuestions } = useTranscriptStream(currentSessionId)
+  // `useTranscriptStream` is the SOLE source of transcript entries. It
+  // performs the HTTP seed fetch + the WS subscription + the merge, so we
+  // do NOT also call `useTranscript` (which would fire a DUPLICATE 257KB
+  // fetch on every tab click). The `loading` flag and `refresh` action
+  // are exposed by the stream hook.
+  const { entries: streamEntries, pendingQuestions, loading, refresh } = useTranscriptStream(currentSessionId)
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
-  const entries = useMemo(() => {
-    if (streamEntries.length === 0) return httpEntries
-    let merged: TranscriptEntry[] = httpEntries
-    for (const e of streamEntries) merged = reconcileEntries(merged, e)
-    return merged
-  }, [httpEntries, streamEntries])
+  const entries = streamEntries
 
   const { send, sending } = useSendMessage(currentSessionId, refresh)
 
@@ -830,6 +829,7 @@ export default function App() {
           )}
         </div>
       )}
+      <PerfOverlay />
     </>
   )
 }
