@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
 import { findSession, sessionDisplayTitle, sessionSubtitle, tabDisplayLabel } from '../types'
 import type { SessionActivityState } from '../types/stream'
+import { sortTabsForSidebar } from '../lib/tabStatus'
 import { ActiveTabs } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { ActivityDot } from './StatusDot'
@@ -247,6 +248,21 @@ export function Sidebar({
   const tabLabel = (tab: TabInfo): string =>
     tabDisplayLabel(tab, findSession(tab.session_id, sessions, archivedSessions, tabSessions))
 
+  // Active Tabs sort: Idle Unread → Idle Read → Thinking, oldest
+  // last-user-message first within each bucket. The activity state comes
+  // from the per-session stream; the sort key is the backing session's
+  // lastUserMessageAt (falls back to lastActive/createdAt).
+  const sortedOtherTabs = useMemo(
+    () => sortTabsForSidebar(
+      otherTabs.map((tab) => ({
+        tab,
+        session: findSession(tab.session_id, sessions, archivedSessions, tabSessions),
+        activity: tab.session_id ? sessionActivity?.[tab.session_id] : undefined,
+      })),
+    ),
+    [otherTabs, sessions, archivedSessions, tabSessions, sessionActivity],
+  )
+
   // Defense-in-depth: the backend guarantees (via partitionSessions) no
   // tab-backed session is in `sessions`, but a buggy WS frame could violate
   // that — this filter drops any session that's also in `tabs[].session_id`
@@ -263,7 +279,7 @@ export function Sidebar({
     >
       <div className="flex-1 overflow-y-auto sidebar-scroll py-1 min-h-0">
         <ActiveTabs
-          tabs={otherTabs}
+          tabs={sortedOtherTabs}
           selectedId={selectedId}
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}

@@ -11,6 +11,7 @@
 module Seal.Gateway.Transcript
   ( readTranscriptEntries
   , firstUserMessageSnippet
+  , lastUserMessageAt
   , showIso
   , reconEntryToFrontend
   ) where
@@ -418,3 +419,41 @@ rewriteMessage msg =
 -- | ISO-8601 with milliseconds + Z (the frontend's expected timestamp shape).
 showIso :: UTCTime -> String
 showIso = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%3QZ"
+
+-- | The ISO timestamp of the most recent @request@-direction entry in a
+-- session's transcript (the last time the USER sent a message), or 'Nothing'
+-- when the session has no transcript or no user message. Used by the sidebar
+-- to sort tabs by last-user-message time (oldest first within each status
+-- bucket). Reads the same transcript paths as 'firstUserMessageSnippet';
+-- returns the timestamp as an ISO string (matching the frontend's
+-- TranscriptEntry.timestamp shape).
+lastUserMessageAt :: SealPaths -> SessionId -> IO (Maybe Text)
+lastUserMessageAt paths sid = do
+  -- model + fallbackTs are only used for synthesized conversation.jsonl
+  -- entries that lack an entries.jsonl sidecar; the empty model + a
+  -- neutral fallback keep that path consistent without affecting the
+  -- entries.jsonl path (which carries real timestamps).
+  entries <- readTranscriptEntries paths "" "" sid
+  pure (lastRequestTimestamp entries)
+  where
+    -- Walk the frontend-shaped entries in reverse, return the first
+    -- (i.e. most recent) @request@-direction entry's timestamp.
+    lastRequestTimestamp :: [A.Value] -> Maybe Text
+    lastRequestTimestamp vals =
+      case reverse vals of
+        [] -> Nothing
+        xs -> go xs
+      where
+        k = Key.fromText
+        isBlank (A.String t) = T.null t
+        isBlank _ = True
+        go [] = Nothing
+        go (v : rest) =
+          case v of
+            A.Object o ->
+              case ( KeyMap.lookup (k "direction") o
+                   , KeyMap.lookup (k "timestamp") o ) of
+                (Just (A.String d), Just (A.String t))
+                  | d == "request" && not (isBlank (A.String t)) -> Just t
+                _ -> go rest
+            _ -> go rest

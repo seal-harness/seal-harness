@@ -67,7 +67,7 @@ describe('useHarnesses', () => {
 
 describe('useRecentSessions', () => {
   it('fetches GET /api/sessions on mount', async () => {
-    setNextResponse([{ id: 's1', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null }])
+    setNextResponse([{ id: 's1', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null, lastUserMessageAt: null }])
     const { result } = renderHook(() => useRecentSessions())
     await waitFor(() => expect(result.current.sessions).toHaveLength(1))
     expect(result.current.sessions[0]!.id).toBe('s1')
@@ -101,7 +101,7 @@ describe('useArchivedSessions', () => {
 describe('useListsPoll', () => {
   it('fetches GET /api/lists on mount and returns the four arrays + error=false', async () => {
     const wire: TabInfoWire = { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 's1', ext_modified: false, stale: false, origin: undefined, attach_command: null }
-    const sess = { id: 's2', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null }
+    const sess = { id: 's2', agent: null, runtime: 'session:anthropic', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: 'cli', channelUserId: null, lastUserMessageAt: null }
     setNextResponse({ tabs: [wire], recentSessions: [sess], archivedSessions: [], tabSessions: [] })
     const { result } = renderHook(() => useListsPoll())
     await waitFor(() => expect(result.current.tabs).toHaveLength(1))

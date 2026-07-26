@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import type { TabInfo, TabStatus } from '../types'
 import type { SessionActivityState } from '../types/stream'
+import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import { ActivityDot } from './StatusDot'
 
 const statusIcon: Record<TabStatus, { char: string; color: string }> = {
@@ -15,6 +16,20 @@ const statusLabel: Record<TabStatus, string> = {
   idle: 'Idle',
   exited: 'Exited',
   orphaned: 'Orphaned',
+}
+
+/** Glyph + human label for the 3-state LLM-thinking indicator overlaid on
+ *  live (non-dead) tabs. Distinct from the harness-liveness `tab.status`. */
+const kindIcon: Record<TabStatusKind, { char: string; color: string }> = {
+  'thinking':    { char: '●', color: 'var(--accent-primary)' },
+  'idle-unread': { char: '●', color: 'var(--accent-secondary)' },
+  'idle-read':   { char: '○', color: 'var(--text-muted)' },
+}
+
+const kindLabel: Record<TabStatusKind, string> = {
+  'thinking':    'Thinking',
+  'idle-unread': 'Idle Unread',
+  'idle-read':   'Idle Read',
 }
 
 /** Fallback glyph for a status string the frontend does not recognize (a
@@ -77,12 +92,18 @@ export function TabRow({
   // must not crash the render — fall back to a neutral glyph/label.
   const icon = statusIcon[tab.status] ?? FALLBACK_ICON
   const isRawShell = tab.kind.startsWith('shell:')
-  const isThinking = activity?.harness === 'thinking'
   // Exited = harness process died (window still present) → offer a reserved
   // Restart + Dismiss. Orphaned = no live window → greyed row + Dismiss.
   const isExited = tab.status === 'exited'
   const isOrphaned = tab.status === 'orphaned'
   const isDead = isExited || isOrphaned
+  // 3-state LLM-thinking indicator for live tabs. Derived from the
+  // per-session activity stream (Thinking / Idle Unread / Idle Read). Dead
+  // tabs keep the harness-liveness glyph and do NOT participate in the
+  // 3-state indicator (their liveness is "gone", not "idle").
+  const kind = deriveTabStatusKind(activity)
+  const isThinking = kind === 'thinking'
+  const kindGlyph = kindIcon[kind]
   // Adopted harnesses can be Released — Seal stops managing them without
   // killing the underlying tmux window. Distinct from Close/Dismiss, and
   // only offered on adopted rows.
@@ -107,14 +128,22 @@ export function TabRow({
         >
           {tab.index}
         </span>
-        {isThinking ? (
+        {isThinking && !isDead ? (
           <ActivityDot activity="thinking" />
-        ) : (
+        ) : isDead ? (
           <span
             data-testid={`status-${tab.status}`}
             style={{ color: icon.color, fontSize: 10, lineHeight: 1 }}
           >
             {icon.char}
+          </span>
+        ) : (
+          <span
+            data-testid={`tab-kind-${kind}`}
+            style={{ color: kindGlyph.color, fontSize: 10, lineHeight: 1 }}
+            aria-label={kindLabel[kind]}
+          >
+            {kindGlyph.char}
           </span>
         )}
         <span
@@ -241,8 +270,9 @@ export function TabRow({
       <div
         className="text-xs ml-6 mt-0.5"
         style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
+        data-testid={`tab-status-label-${tab.index}`}
       >
-        {statusLabel[tab.status] ?? tab.status}
+        {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
       </div>
     </div>
   )

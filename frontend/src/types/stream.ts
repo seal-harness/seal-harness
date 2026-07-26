@@ -48,6 +48,7 @@ export type ActivityEvent =
   | { kind: 'entry-at'; timestamp: string }
   | { kind: 'harness-status'; status: HarnessActivity }
   | { kind: 'session-created'; session: StreamSessionMeta }
+  | { kind: 'reply-delivered'; timestamp: string }
 
 export interface ActivityEnvelope {
   type: 'activity'
@@ -87,6 +88,12 @@ export interface ListsEvent {
   archivedSessions: SessionInfo[]
   /** Sessions backing an open tab. Deduped out of `recentSessions` above. */
   tabSessions: SessionInfo[]
+  /** Session ids the backend reports are currently in a @thinking@ turn
+   *  (the broker's in-memory set). Used by the frontend to hydrate the
+   *  sidebar on (re)connect/refresh so a mid-turn tab does not blank to
+   *  Idle before the next harness-status event arrives. Tolerant of
+   *  older servers that omit the field. */
+  thinkingSessionIds?: string[]
 }
 
 /** A pending human-confirmation question from an Untrusted opcode (SHELL_EXEC,
@@ -139,6 +146,7 @@ export interface ListsSnapshot {
   recentSessions: SessionInfo[]
   archivedSessions: SessionInfo[]
   tabSessions: SessionInfo[]
+  thinkingSessionIds?: string[]
 }
 
 export interface StreamClient {
@@ -168,6 +176,13 @@ export interface SessionActivityState {
   unread: number
   /** ISO timestamp of most recent entry, or null. */
   lastEntryAt: string | null
+  /** ISO timestamp the session was last "seen" by the user: either the
+   *  user focused the session in the web UI, or the backend reported the
+   *  last assistant reply was delivered to a subscribed chat channel
+   *  (Signal/Telegram/CLI). The tab status indicator uses this to
+   *  distinguish Idle Unread (LLM idle, last assistant entry newer than
+   *  seenAt) from Idle Read. null until the first seen signal arrives. */
+  seenAt: string | null
 }
 
 export interface UseTranscriptStream {

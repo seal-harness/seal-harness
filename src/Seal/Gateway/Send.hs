@@ -20,7 +20,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (catch, fromException, SomeException)
+import Control.Exception (catch, fromException, finally, SomeException)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
@@ -101,7 +101,7 @@ import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -110,7 +110,7 @@ import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPol
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Session.Lock
-  ( ReplyRegistry, replyFanout, SessionLocks, withSessionLock )
+  ( ReplyRegistry, replyFanout, replySubscriberCount, SessionLocks, withSessionLock )
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
@@ -379,6 +379,10 @@ plainTurn deps meta t = do
           sid = smId meta
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
+      -- Signal the turn start so the web sidebar transitions the tab to
+      -- Thinking. Paired with the idle signal below (run on every exit
+      -- path of the lock bracket via 'finally').
+      broadcastHarnessStatus (sdBroker deps) sid "thinking"
       turnResult <- withSessionLock (sdLocks deps) sid
            (withTwoFileTranscript sessionDirPath (\tHandle -> do
             appEnv <- mkEnv defaultConfig
@@ -422,10 +426,16 @@ plainTurn deps meta t = do
                 pure (Left msg)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
             pure result))
+      -- Signal the turn end so the web sidebar transitions the tab back to
+      -- Idle. Runs on every exit path (success + lock/transcript failure)
+      -- via 'finally' so a turn that dies mid-way does not leave the tab
+      -- stuck in Thinking. The reply fanout below then fires the
+      -- reply-delivered signal for any chat-channel subscribers.
+      finally (pure ()) (broadcastHarnessStatus (sdBroker deps) sid "idle")
       -- Fan out the reply to chat channels subscribed to this session.
       -- The web frontend already received entries via the WS broker above;
       -- only chat channels need the explicit chSend.
-      fanoutLastReply (sdReplies deps) paths sid
+      fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid
       pure turnResult
 
 -- | Build the ISA registry for a web turn. Mirrors
@@ -921,8 +931,12 @@ handleAskCancel deps sid qidTxt =
 -- already received entries via the WS broker; only chat channels need the
 -- explicit 'chSend'. Reads @conversation.jsonl@ directly (the two-file
 -- format), parsing the last 'Assistant' message's text content blocks.
-fanoutLastReply :: ReplyRegistry -> SealPaths -> SessionId -> IO ()
-fanoutLastReply replies paths sid = do
+-- When the fan-out reaches ≥1 subscribed chat channel, emits a
+-- @reply-delivered@ activity signal so the web sidebar marks the tab as
+-- Idle Read (the last assistant message was delivered to a channel the
+-- user is expected to see).
+fanoutLastReply :: ReplyRegistry -> Maybe StreamBroker -> SealPaths -> SessionId -> IO ()
+fanoutLastReply replies mBroker paths sid = do
   let convPath = sessionConversationPath paths sid
   exists <- doesFileExist convPath
   if not exists
@@ -931,8 +945,12 @@ fanoutLastReply replies paths sid = do
       raw <- TIO.readFile convPath
       let lines' = filter (not . T.null) (T.lines raw)
           msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
-      for_ (lastAssistantText msgs) $ \reply ->
+      for_ (lastAssistantText msgs) $ \reply -> do
         replyFanout replies sid reply
+        -- If ≥1 chat channel is subscribed, the reply was delivered to a
+        -- channel the user is expected to read — mark the session seen.
+        count <- replySubscriberCount replies sid
+        when (count > 0) (broadcastReplyDelivered mBroker sid)
 
 -- | Extract the concatenated text content of the last 'Assistant' message
 -- in a list. Tool-use blocks are skipped (only 'CbText' is extracted).

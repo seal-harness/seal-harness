@@ -22,6 +22,7 @@ const DEFAULT_STATE: SessionActivityState = {
   harness: null,
   unread: 0,
   lastEntryAt: null,
+  seenAt: null,
 }
 
 export function applyActivity(
@@ -43,6 +44,16 @@ export function applyActivity(
       if (prev.harness === event.status) return current
       next = { ...prev, harness: event.status }
       break
+    case 'reply-delivered':
+      // A reply-delivered signal marks the session "seen" (the last
+      // assistant reply was delivered to ≥1 chat channel the user is
+      // expected to read). Advances seenAt only forward so a stale
+      // out-of-order frame never regresses it.
+      next = {
+        ...prev,
+        seenAt: maxIso(prev.seenAt, event.timestamp),
+      }
+      break
     case 'session-created':
       // session-created seeds an entry but otherwise leaves the counters alone
       // (the entry itself surfaces as entry-at later).
@@ -58,6 +69,11 @@ export function applyActivity(
 export function useSessionActivityStream(
   focusedSessionId: string | null,
   client?: StreamClient,
+  /** The backend's current thinking-session set (from the lists snapshot),
+   *  used to hydrate the sidebar on (re)connect/refresh so a mid-turn tab
+   *  does not blank to Idle before the next harness-status event arrives.
+   *  Pass `[]` (or omit) when the caller has no snapshot yet. */
+  thinkingSessionIds: string[] = [],
 ): UseSessionActivityStream {
   const sc = client ?? streamClient()
   const [sessions, setSessions] = useState<Record<string, SessionActivityState>>({})
@@ -70,6 +86,30 @@ export function useSessionActivityStream(
   useEffect(() => {
     focusedRef.current = focusedSessionId
   }, [focusedSessionId])
+
+  // Hydrate from the lists snapshot's thinking set. Merges idempotently:
+  // sessions IN the set get harness='thinking' (only if not already seen
+  // newer); sessions NOT in the set are left alone (a live harness-status
+  // event is authoritative; we only seed, never override). Runs whenever
+  // the snapshot's thinking set changes (e.g. on (re)connect/refresh).
+  useEffect(() => {
+    if (thinkingSessionIds.length === 0) return
+    setSessions((prev) => {
+      let next = prev
+      for (const sid of thinkingSessionIds) {
+        const existing = next[sid]
+        // Only seed thinking when there is no state yet OR the harness
+        // field is null (we don't override a definitive idle from a live
+        // event, and we don't touch the seen/unread counters).
+        if (existing === undefined) {
+          next = { ...next, [sid]: { ...DEFAULT_STATE, harness: 'thinking' } }
+        } else if (existing.harness === null) {
+          next = { ...next, [sid]: { ...existing, harness: 'thinking' } }
+        }
+      }
+      return next
+    })
+  }, [thinkingSessionIds])
 
   useEffect(() => {
     const unsub = sc.onActivity((sid, event) => {
@@ -108,12 +148,52 @@ export function useSessionActivityStream(
   return { sessions, status, lastError }
 }
 
-/** Clear the unread counter for a session (e.g. when the user selects it). */
+/** Clear the unread counter for a session and mark it seen at the given
+ *  timestamp (e.g. when the user selects it). `seenAt` advances only
+ *  forward so an out-of-order focus never regresses it. */
 export function clearUnread(
   current: Record<string, SessionActivityState>,
   sessionId: string,
+  seenAt: string = new Date().toISOString(),
 ): Record<string, SessionActivityState> {
   const prev = current[sessionId]
-  if (prev === undefined || prev.unread === 0) return current
-  return { ...current, [sessionId]: { ...prev, unread: 0 } }
+  if (prev === undefined) {
+    return { ...current, [sessionId]: { ...DEFAULT_STATE, seenAt } }
+  }
+  if (prev.unread === 0 && (prev.seenAt !== null && !isNewer(seenAt, prev.seenAt))) {
+    return current
+  }
+  return {
+    ...current,
+    [sessionId]: {
+      ...prev,
+      unread: 0,
+      seenAt: maxIso(prev.seenAt, seenAt),
+    },
+  }
+}
+
+/** Compare two ISO timestamps. Returns the newer one, or the non-null
+ *  one when only one is present, or null when both are null. Treats an
+ *  unparseable timestamp as older than anything (defensive against a
+ *  malformed backend payload). */
+function maxIso(a: string | null, b: string | null): string | null {
+  if (a === null) return b
+  if (b === null) return a
+  return isNewer(b, a) ? b : a
+}
+
+/** True if `t` is strictly newer than `than`. Defensive: an unparseable
+ *  `t` is treated as NOT newer (so a malformed frame never regresses
+ *  `seenAt` forward). */
+function isNewer(t: string, than: string): boolean {
+  const tMs = parseIsoMs(t)
+  const thanMs = parseIsoMs(than)
+  if (tMs === null || thanMs === null) return false
+  return tMs > thanMs
+}
+
+function parseIsoMs(t: string): number | null {
+  const ms = Date.parse(t)
+  return Number.isNaN(ms) ? null : ms
 }

@@ -90,7 +90,7 @@ import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
@@ -551,6 +551,9 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
       -- this channel). The guard is stored so we can unsubscribe later
       -- (e.g. when the conversation focuses a different tab).
       _guard <- replySubscribe (cdReplies deps) h sid
+      -- Signal the turn start so the web sidebar transitions the tab to
+      -- Thinking. Paired with the idle signal after the lock bracket.
+      broadcastHarnessStatus (cdBroker deps) sid "thinking"
       withSessionLock (cdLocks deps) sid $ do
         withTwoFileTranscript sessionDirPath $ \tHandle -> do
           appEnv <- mkEnv defaultConfig
@@ -600,6 +603,13 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
               logTurnError (Just (sessionLogPath paths sid)) msg
               hPutStrLn stderr ("[channel] turn failed: " <> T.unpack msg)
       broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+      -- Signal the turn end so the web sidebar transitions the tab back
+      -- to Idle, AND mark the session "seen" because the channel's reply
+      -- was delivered to this channel handle (subscribed above) during
+      -- the turn. The reply-delivered signal lets the sidebar drop a
+      -- channel-originated tab to Idle Read.
+      broadcastHarnessStatus (cdBroker deps) sid "idle"
+      broadcastReplyDelivered (cdBroker deps) sid
       -- W3 invariant 2: auto-tab the session after a channel turn. Idempotent
       -- (no-op if a tab already binds sid — e.g. createConversationSession
       -- already inserted one on first message). Uses KindAi (channel/CLI

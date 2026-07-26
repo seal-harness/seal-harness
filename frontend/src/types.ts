@@ -52,6 +52,11 @@ export interface SessionInfo {
   /** Channel user id of the session origin, or null when the channel
    *  carries no user id (e.g. `seal tui` → the `cli` channel). */
   channelUserId: string | null
+  /** ISO timestamp of the most recent user (request-direction) message in
+   *  the session's transcript, or null when the session has no transcript
+   *  or no user message. Used by the sidebar to sort the Active Tabs list
+   *  (oldest last-user-message first within each status bucket). */
+  lastUserMessageAt: string | null
 }
 
 /** Cascade used to pick the display title for a session.

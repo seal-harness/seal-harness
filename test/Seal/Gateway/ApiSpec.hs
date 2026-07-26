@@ -41,6 +41,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher)
+import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -489,6 +490,69 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> error "first session not an object"
       lookupK "firstMessageSnippet" o `shouldBe` Just A.Null
 
+  it "GET /api/sessions surfaces lastUserMessageAt = the most recent request entry's timestamp" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      let convLine :: Message -> BL.ByteString
+          convLine m = A.encode m <> "\n"
+          -- Two user turns + one assistant turn so the LAST user message is
+          -- the SECOND request entry, not the first.
+          conv = [ Message User [CbText "first question"]
+                  , Message Assistant [CbText "first answer"]
+                  , Message User [CbText "second question"]
+                  ]
+      BC.writeFile (sdir </> "conversation.jsonl") (BL.toStrict (mconcat (map convLine conv)))
+      -- entries.jsonl: request / response / request. The most recent
+      -- request entry's timestamp (2026-07-01T12:00:05.000Z) is what
+      -- lastUserMessageAt must return.
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.100Z\",\"kind\":\"request\",\"convLen\":1}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:01.234Z\",\"kind\":\"response\",\"convLen\":2}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:05.000Z\",\"kind\":\"request\",\"convLen\":3}"
+        ]
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "lastUserMessageAt" o `shouldBe` Just (A.String "2026-07-01T12:00:05.000Z")
+
+  it "GET /api/sessions returns null lastUserMessageAt when no conversation exists" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "lastUserMessageAt" o `shouldBe` Just A.Null
+
   it "GET /api/sessions/archived returns 200 with [] when none archived" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "sessions", "archived"])
@@ -891,6 +955,34 @@ spec = describe "Seal.Gateway.API" $ do
           lookupK "recentSessions" o `shouldBe` Just (A.Array mempty)
           lookupK "archivedSessions" o `shouldBe` Just (A.Array mempty)
           lookupK "tabSessions" o `shouldBe` Just (A.Array mempty)
+          -- thinkingSessionIds is [] when the broker has no thinking
+          -- turns in flight (and when adBroker is Nothing in tests).
+          lookupK "thinkingSessionIds" o `shouldBe` Just (A.Array mempty)
+        other -> error ("unexpected lists body: " ++ show other)
+
+  it "GET /api/lists surfaces thinkingSessionIds from the broker's in-memory thinking set" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+      deps <- mkDepsFor paths
+      -- Build a real broker and mark two sessions as thinking so the
+      -- snapshot hydrates the sidebar on a mid-turn refresh.
+      broker <- newStreamBroker 64
+      let sidA = case mkSessionId "20260701-120000-aaa" of Right s -> s; Left _ -> error "sidA"
+          sidB = case mkSessionId "20260701-120000-bbb" of Right s -> s; Left _ -> error "sidB"
+      setThinking broker sidA True
+      setThinking broker sidB True
+      let app = apiApp deps { adBroker = Just broker }
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "lists"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          case lookupK "thinkingSessionIds" o of
+            Just (A.Array xs) ->
+              -- The set is serialized as a sorted JSON array of session-id
+              -- texts (Set.toList is ordered by SessionId, which matches
+              -- the text order for these same-prefix ids).
+              length xs `shouldBe` 2
+            other -> error ("unexpected thinkingSessionIds: " ++ show other)
         other -> error ("unexpected lists body: " ++ show other)
 
   it "GET /api/lists partitions: a session with a tab appears in tabSessions, not recentSessions" $

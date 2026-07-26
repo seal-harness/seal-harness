@@ -78,6 +78,23 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
       [BeListsSnapshot _] -> pure ()
       _                  -> expectationFailure ("expected exactly one BeListsSnapshot, got " <> show events)
 
+  it "BeActivity is delivered to ALL subscribers (sidebar needs every tab's status, not just the focused session's)" $ do
+    broker <- newStreamBroker 10
+    refA <- newIORef ([] :: [BrokerEvent])
+    refB <- newIORef ([] :: [BrokerEvent])
+    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    let payload = object ["kind" .= ("harness-status" :: T.Text), "status" .= ("thinking" :: T.Text)]
+    broadcast broker (BeActivity (mkSid "a") payload)
+    a <- readIORef refA
+    b <- readIORef refB
+    -- Both subscribers receive the activity even though only one is
+    -- focused on session "a" — the sidebar renders tab status for every
+    -- open tab (e.g. a Telegram-originated turn must surface to a web
+    -- client focused on a different session).
+    length a `shouldBe` 1
+    length b `shouldBe` 1
+
   -- Regression: a subscriber whose send throws (e.g. a closed WebSocket
   -- raising ConnectionClosed) must NOT propagate the exception to the
   -- caller. Before the fix, any slash command that triggered a lists

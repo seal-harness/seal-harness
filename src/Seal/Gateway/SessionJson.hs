@@ -20,7 +20,7 @@ import Data.Text (Text)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (sessionIdText)
-import Seal.Gateway.Transcript (firstUserMessageSnippet)
+import Seal.Gateway.Transcript (firstUserMessageSnippet, lastUserMessageAt)
 import Seal.Handles.Tab (TabKind (..), tabIndexToInt)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..))
@@ -75,8 +75,8 @@ sessionWire (BoundHarness _)   = Nothing
 -- agent is effective — either a bound 'smAgent' or a one-off uploaded
 -- file's frontmatter id), falling back to 'smAgent'\'s id for
 -- backwards-compat with old session.json files that predate smAgentName.
-sessionInfoJson :: Maybe Text -> SessionMeta -> Value
-sessionInfoJson mSnippet m = object
+sessionInfoJson :: Maybe Text -> Maybe Text -> SessionMeta -> Value
+sessionInfoJson mSnippet mLastUserMessageAt m = object
   [ "id" .= sessionIdText (smId m)
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
@@ -88,12 +88,15 @@ sessionInfoJson mSnippet m = object
   , "firstMessageSnippet" .= mSnippet
   , "channel" .= smChannel m
   , "channelUserId" .= (Nothing :: Maybe Text)
+  , "lastUserMessageAt" .= mLastUserMessageAt
   ]
 
 -- | Build the 'SessionInfo' JSON for a session, reading the first user
--- message snippet from the transcript so the session has a default title
--- before the user sets an explicit description.
+-- message snippet and the last user-message timestamp from the transcript
+-- so the session has a default title before the user sets an explicit
+-- description and the sidebar can sort tabs by last-user-message time.
 sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
 sessionInfoJsonWithSnippet paths m = do
   mSnippet <- firstUserMessageSnippet paths (smId m)
-  pure (sessionInfoJson mSnippet m)
+  mLastUserMessageAt <- lastUserMessageAt paths (smId m)
+  pure (sessionInfoJson mSnippet mLastUserMessageAt m)

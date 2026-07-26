@@ -11,12 +11,16 @@ module Seal.Gateway.StreamBroker
   , broadcast
   , broadcastLists
   , subscriberCount
+  , thinkingSessions
+  , setThinking
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (SomeException, catch)
 import Control.Monad (when, filterM)
 import Data.Aeson (Value)
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import Seal.Core.Types (SessionId)
 
@@ -27,6 +31,7 @@ data BrokerEvent
   | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
   | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
   | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
+  | BeActivity SessionId Value          -- ^ a per-session activity signal (harness-status / reply-delivered) the WS peer renders as an @activity@ envelope
   deriving stock (Eq, Show)
 
 -- | The per-subscriber state: the focused session (via an 'IORef' so the
@@ -37,15 +42,21 @@ data Subscriber = Subscriber
   , subSend    :: BrokerEvent -> IO ()
   }
 
--- | The in-process broker. STM-backed: a 'TVar' of subscribers + a global cap.
+-- | The in-process broker. STM-backed: a 'TVar' of subscribers + a global
+-- cap. Also tracks the set of sessions currently in a @thinking@ turn so
+-- a freshly-connected web client can hydrate its sidebar without waiting
+-- for the next harness-status event (which would only arrive at the next
+-- turn boundary — leaving a mid-turn refresh stuck on Idle).
 data StreamBroker = StreamBroker
   { sbSubs :: TVar [Subscriber]
   , sbCap :: Int
+  , sbThinking :: TVar (Set SessionId)
   }
 
--- | Build a new broker with the given global subscriber cap.
+-- | Build a new broker with the given subscriber cap.
 newStreamBroker :: Int -> IO StreamBroker
-newStreamBroker cap = StreamBroker <$> newTVarIO [] <*> pure cap
+newStreamBroker cap =
+  StreamBroker <$> newTVarIO [] <*> pure cap <*> newTVarIO Set.empty
 
 -- | Subscribe a new connection. If the global cap is exceeded, the subscribe
 -- is a no-op (the over-cap subscriber is never added — it should close).
@@ -94,9 +105,16 @@ broadcast broker event = do
          if ok then subSend s ev >> pure True else pure True)
         `catch` \(_e :: SomeException) -> pure False
     -- All-subscriber events vs session-filtered events.
+    -- BeActivity is ALL-subscriber: the sidebar renders tab status for
+    -- EVERY open tab, so a turn on a channel-originated session (e.g.
+    -- Telegram) must surface to a web client focused on a different
+    -- session. The activity envelope carries its own sessionId, so the
+    -- frontend's useSessionActivityStream keys it per-session without
+    -- relying on the broker's focus filter.
     shouldSend ev s = case ev of
       BeListsSnapshot _  -> pure True
       BeHarnessStatus _  -> pure True
+      BeActivity _ _      -> pure True
       BeEntryRecorded sid _ -> matchSession s sid
       BeAsk sid _          -> matchSession s sid
       BeAskResolved sid _  -> matchSession s sid
@@ -111,3 +129,17 @@ broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)
 -- | The current subscriber count (for diagnostics / the global cap check).
 subscriberCount :: StreamBroker -> IO Int
 subscriberCount broker = length <$> readTVarIO (sbSubs broker)
+
+-- | Read the set of sessions currently in a @thinking@ turn. Used by the
+-- lists-snapshot builders to hydrate a freshly-connected web client's
+-- sidebar (so a mid-turn refresh does not blank the thinking indicator).
+thinkingSessions :: StreamBroker -> IO (Set SessionId)
+thinkingSessions broker = readTVarIO (sbThinking broker)
+
+-- | Add ('True') or remove ('False') a session from the thinking set.
+-- Idempotent. Called by 'broadcastHarnessStatus' so the broker's
+-- in-memory state mirrors the events it fans out.
+setThinking :: StreamBroker -> SessionId -> Bool -> IO ()
+setThinking broker sid thinking =
+  atomically $ modifyTVar' (sbThinking broker)
+    (\s -> if thinking then Set.insert sid s else Set.delete sid s)
