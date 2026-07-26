@@ -14,7 +14,7 @@ function RecentSessionsHeader() {
   return (
     <div
       className="px-3 py-1.5 flex items-center"
-      style={{ color: 'var(--text-muted)' }}
+      style={{ color: 'var(--text-primary)' }}
     >
       <span
         className="text-xs font-semibold uppercase"
@@ -160,7 +160,7 @@ function ArchivedSection({
     >
       <div
         className="px-3 py-1.5 flex items-center justify-between cursor-pointer shrink-0"
-        style={{ color: 'var(--text-muted)' }}
+        style={{ color: 'var(--text-primary)' }}
         onClick={() => setExpanded(!expanded)}
       >
         <span

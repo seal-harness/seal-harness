@@ -50,7 +50,7 @@ export function RunningHarnesses({
     <div data-testid="running-harnesses-section">
       <div
         className="px-3 py-1.5 flex items-center justify-between cursor-pointer"
-        style={{ color: 'var(--text-muted)' }}
+        style={{ color: 'var(--text-primary)' }}
         onClick={() => setExpanded((e) => !e)}
       >
         <span className="text-xs font-semibold uppercase" style={{ letterSpacing: '0.08em' }}>

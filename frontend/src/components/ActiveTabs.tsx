@@ -152,7 +152,7 @@ export function TabRow({
         )}
         <span
           className="text-sm font-medium truncate mr-auto"
-          style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
+          style={{ color: 'var(--text-muted)', letterSpacing: 'var(--tracking-tight)' }}
           title={label}
         >
           {label}
@@ -319,7 +319,7 @@ export function ActiveTabs({
     <>
       <div
         className="px-3 py-1.5 flex items-center justify-between"
-        style={{ color: 'var(--text-muted)' }}
+        style={{ color: 'var(--text-primary)' }}
       >
         <span
           className="text-xs font-semibold uppercase"
