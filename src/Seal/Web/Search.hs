@@ -207,7 +207,10 @@ searchParallelMcp mgr _cfg q = do
             , "method"  .= ("tools/call" :: Text)
             , "params"  .= A.object
                 [ "name"      .= ("web_search" :: Text)
-                , "arguments" .= A.object ["query" .= q]
+                , "arguments" .= A.object
+                    [ "objective"      .= q
+                    , "search_queries" .= [q]
+                    ]
                 ]
             , "id"      .= (1 :: Int)
             ]

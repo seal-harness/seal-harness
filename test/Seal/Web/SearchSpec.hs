@@ -7,6 +7,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Test.Hspec
 
 import Seal.ISA.Opcode (OpResult (..), uoAuthorize)
+import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Web.Search
 
 spec :: Spec
@@ -73,6 +74,10 @@ spec = describe "WEB_SEARCH" $ do
           }
     result <- dispatchSearch mgr cfg "Haskell programming language"
     orIsError result `shouldBe` False
+    -- A real result contains a "url" field; an empty results array would not.
+    case orParts result of
+      [TrpText t] | "\"url\"" `T.isInfixOf` t -> pure ()
+      _ -> expectationFailure ("expected non-empty results with a url, got: " <> show (orParts result))
 
   where
     defaultTestCfg :: WebSearchConfig
