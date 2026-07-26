@@ -26,6 +26,7 @@ module Seal.Session.Lock
   , replySubscribe
   , replyUnsubscribe
   , replyFanout
+  , replyMigrateAll
   ) where
 
 import Control.Concurrent.MVar
@@ -142,3 +143,20 @@ replyFanout (ReplyRegistry tv) sid text = do
   where
     safeSend h t = chSend h t `catch` \e ->
       hPutStrLn stderr ("reply fanout: send failed: " <> show (e :: IOException))
+
+-- | Migrate every 'ReplySink' subscribed to @oldSid@ to @newSid@. Used by
+-- @\/new@ when a tab is rebound to a fresh session: the channel handles
+-- subscribed to the old session should follow the rebind so future
+-- fan-outs (including tab-close notifications) reach them under the new
+-- session id. Single STM transaction — race-safe vs concurrent
+-- subscribe/unsubscribe/fan-out. Returns the count of migrated sinks.
+replyMigrateAll :: ReplyRegistry -> SessionId -> SessionId -> IO Int
+replyMigrateAll (ReplyRegistry tv) oldSid newSid = atomically $ do
+  m <- readTVar tv
+  let (matched, rest) = Map.partitionWithKey (\k _ -> k == oldSid) m
+      sinks = concat (Map.elems matched)
+      m' = if null sinks
+             then rest
+             else Map.insertWith (++) newSid sinks (Map.delete oldSid rest)
+  writeTVar tv m'
+  pure (length sinks)

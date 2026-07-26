@@ -130,7 +130,7 @@ import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
-  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
+  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout, replyMigrateAll
   , SessionLocks, newSessionLocks, withSessionLock )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Log (logTurnError)
@@ -399,6 +399,10 @@ handleNewSession deps h tabsH kind oldMeta = do
   -- has one session at a time; all channels focused on it follow the
   -- rebind to the new session.
   _count <- cursorMigrateAll (cdCursors deps) oldRef (BoundSession (smId newMeta))
+  -- Migrate reply subscriptions from the old session to the new one so
+  -- future fan-outs (including tab-close notifications) reach attached
+  -- channels under the new session id.
+  _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
   chSend h
     ("new session " <> sessionIdText (smId newMeta)
        <> " (" <> smProvider newMeta <> "/" <> smModel newMeta <> ")"
