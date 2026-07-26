@@ -17,7 +17,7 @@ import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -143,7 +143,7 @@ runTelegramMain autonomy = do
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH
+        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         ]
   -- Read the bot token from the vault (the wizard stores it there, not in

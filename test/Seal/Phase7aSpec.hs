@@ -20,6 +20,7 @@ import Network.WebSockets (ClientApp, runClient, receiveData)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend)
+import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
@@ -71,6 +72,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
+        , adTabCloseNotifier = noTabCloseNotifier
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -116,6 +118,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
+        , adTabCloseNotifier = noTabCloseNotifier
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

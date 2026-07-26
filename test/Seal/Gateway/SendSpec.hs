@@ -32,7 +32,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs)
 import Seal.Tabs.Types (TabRef (BoundSession), tlTabs, tRef, tabCount)
-import Seal.Command.Tab (tabCommandSpec)
+import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 sampleTime :: UTCTime
@@ -200,7 +200,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH noTabCloseNotifier] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
         outcome <- handleSend sendDeps sid "/tab list"
@@ -293,7 +293,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH noTabCloseNotifier] }
             sid = mkSid "20260701-120000-108"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing

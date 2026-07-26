@@ -15,6 +15,7 @@ module Seal.Channels.Cursor
   , cursorLookup
   , cursorSet
   , cursorClear
+  , cursorClearAll
   , cursorMigrateAll
   ) where
 
@@ -62,6 +63,16 @@ cursorClear :: CursorStore -> ConversationKey -> IO ()
 cursorClear (CursorStore tv) key = atomically $ do
   m <- readTVar tv
   writeTVar tv (Map.delete key m)
+
+-- | Clear every conversation whose cursor points at @ref@. Used when a tab
+-- is closed: the closed tab's 'TabRef' is stale, so any conversation still
+-- focused on it should drop the cursor (the next message will create a
+-- fresh tab). Single STM transaction — race-safe vs concurrent
+-- cursorLookup/cursorSet.
+cursorClearAll :: CursorStore -> TabRef -> IO ()
+cursorClearAll (CursorStore tv) ref = atomically $ do
+  m <- readTVar tv
+  writeTVar tv (Map.filter (/= ref) m)
 
 -- | Migrate every conversation whose cursor equals @oldRef@ to @newRef@.
 -- Used by @\/new@ on inbox channels: when a tab is rebound to a fresh

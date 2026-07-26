@@ -40,6 +40,7 @@ module Seal.Channels.Loop
   , buildIsaRegistry
   , mkBgRunner
   , channelCallDispatcher
+  , mkTabCloseNotifier
   ) where
 
 import Control.Concurrent (forkIO)
@@ -72,12 +73,13 @@ import Seal.Channel.Cli
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
-  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, newCursorStore )
+  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll, newCursorStore )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (CallDispatcher, callCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry, registrySpecs, runCommandAction)
+import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
@@ -128,7 +130,7 @@ import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
-  ( ReplyRegistry, newReplyRegistry, replySubscribe
+  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
   , SessionLocks, newSessionLocks, withSessionLock )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Log (logTurnError)
@@ -437,6 +439,23 @@ broadcastTabs deps tabsH =
   case cdBroker deps of
     Nothing     -> pure ()
     Just broker -> broadcastListsSnapshot broker tabsH (cdPaths deps)
+
+-- | Build a 'TabCloseNotifier' from the shared cursor store + reply
+-- registry. When a tab is closed, every conversation whose cursor points
+-- at the closed tab's 'TabRef' is notified via the reply fan-out (so the
+-- message lands on the channel handle the conversation last used), and the
+-- cursor is cleared so the next message creates a fresh tab. For
+-- 'BoundHarness' tabs there are no channel subscriptions, so this is a
+-- no-op. Used by the slash-command registry's @\/tab close@ and the REST
+-- @POST \/api\/tabs\/:index\/close@ path.
+mkTabCloseNotifier :: CursorStore -> ReplyRegistry -> TabCloseNotifier
+mkTabCloseNotifier cursors replies ref = case ref of
+  BoundSession sid -> do
+    replyFanout replies sid msg
+    cursorClearAll cursors ref
+  BoundHarness _ -> pure ()
+  where
+    msg = "tab closed; a new tab will be created on your next message"
 
 -- | Handle a parsed 'TabSlashCommand' over a channel (mutates the
 -- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.

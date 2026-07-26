@@ -58,6 +58,7 @@ import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.Handles.Tab (TabKind (KindAi))
+import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (BoundSession))
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -171,6 +172,7 @@ mkDepsFor paths = do
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
     , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
     }
 
 spec :: Spec
@@ -1284,6 +1286,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adSend            = Nothing
                  , adDefaultAgent    = pure (Just "zoe")
                  , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1354,6 +1357,7 @@ spec = describe "Seal.Gateway.API" $ do
                 c <- loadRuntimeConfig (cfgRoot </> "config.toml")
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1414,6 +1418,7 @@ spec = describe "Seal.Gateway.API" $ do
                 c <- loadRuntimeConfig cfgPath
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1475,6 +1480,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1561,6 +1567,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1612,6 +1619,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1662,6 +1670,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1693,6 +1702,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -1776,6 +1786,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -1825,6 +1836,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -1873,6 +1885,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -1915,6 +1928,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -1958,6 +1972,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
                 , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2144,6 +2159,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -2229,6 +2245,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -2346,6 +2363,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -2448,6 +2466,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

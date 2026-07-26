@@ -24,7 +24,7 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
@@ -178,7 +178,7 @@ runServeMain autonomy = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
         , agentCommandSpec (bAgentDefs backends) cfgPath
-        , tabCommandSpec tabsH
+        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
         , newCommandSpec newDeps
@@ -223,6 +223,7 @@ runServeMain autonomy = do
         , adSend            = Just sendDeps
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
         , adBroker          = Just broker
+        , adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

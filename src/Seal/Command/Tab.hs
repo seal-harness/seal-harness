@@ -4,6 +4,8 @@
 -- Plus the terse-grammar synopsis entry for @\/help@.
 module Seal.Command.Tab
   ( tabCommandSpec
+  , TabCloseNotifier
+  , noTabCloseNotifier
   , terseGrammarSpec
   ) where
 
@@ -16,22 +18,34 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Core.Types (mkSessionId, sessionIdText)
-import Seal.Handles.Tab (mkTabIndex, TabKind (..), tabIndexToChar)
+import Seal.Handles.Tab (mkTabIndex, TabIndex, TabKind (..), tabIndexToChar)
 import Seal.Routing.Route (terseSynopsis)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
+
+-- | A hook invoked after a tab is successfully closed. The 'TabRef' is the
+-- closed tab's backing ref (e.g. @BoundSession sid@). Wiring sites build
+-- this from the 'CursorStore' + 'ReplyRegistry' so conversations attached
+-- to the closed tab are notified. The no-op identity is 'noTabCloseNotifier'
+-- (used by tests + the standalone CLI which has no other channels).
+type TabCloseNotifier = TabRef -> IO ()
+
+-- | The identity 'TabCloseNotifier' — does nothing. Used when there are no
+-- other channels to notify (tests, standalone CLI).
+noTabCloseNotifier :: TabCloseNotifier
+noTabCloseNotifier _ = pure ()
 
 -- | The @/tab@ command spec. Bare @/tab@ is intercepted by
 -- 'Seal.Routing.Route' as 'CurrentTab' (show the focused tab) BEFORE the
 -- registry is consulted, so this spec's parser only runs when a subcommand
 -- is present (@/tab list@, @/tab new@, etc.).
-tabCommandSpec :: TabsHandle -> CommandSpec
-tabCommandSpec h = CommandSpec
+tabCommandSpec :: TabsHandle -> TabCloseNotifier -> CommandSpec
+tabCommandSpec h closeNotifier = CommandSpec
   { csName         = CommandName "tab"
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"
-  , csParserInfo   = tabParserInfo h
+  , csParserInfo   = tabParserInfo h closeNotifier
   , csAvailability = AlwaysAvailable
   }
 
@@ -48,19 +62,19 @@ terseGrammarSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
 
-tabParserInfo :: TabsHandle -> ParserInfo CommandAction
-tabParserInfo h =
-  info (tabParser h <**> helper)
+tabParserInfo :: TabsHandle -> TabCloseNotifier -> ParserInfo CommandAction
+tabParserInfo h closeNotifier =
+  info (tabParser h closeNotifier <**> helper)
     (  progDesc "Manage tabs"
     <> header   "tab — manage tabs (new/list/close/focus/resume/rename)"
     )
 
-tabParser :: TabsHandle -> Parser CommandAction
-tabParser h = hsubparser
+tabParser :: TabsHandle -> TabCloseNotifier -> Parser CommandAction
+tabParser h closeNotifier = hsubparser
   $  command "list"   (info (pure (listCmd h))   (progDesc "List all tabs"))
   <> command "new"    (info (newCmd h <$> optional kindArg)
                                  (progDesc "Create a new tab (default kind: ai)"))
-  <> command "close"  (info (closeCmd h <$> tabIndexArg <*> forceFlag)
+  <> command "close"  (info (closeCmd h closeNotifier <$> tabIndexArg <*> forceFlag)
                                  (progDesc "Close a tab by index (compacts the list)"))
   <> command "focus"  (info (focusCmd h <$> tabIndexArg)
                                  (progDesc "Focus a tab by index"))
@@ -92,16 +106,32 @@ newCmd h _mKind = CommandAction $ \caps -> do
       Right s -> s
       Left _  -> error "placeholder session id"
 
--- | The /tab close subcommand.
-closeCmd :: TabsHandle -> Int -> Bool -> CommandAction
-closeCmd h idx force = CommandAction $ \caps -> do
+-- | The /tab close subcommand. Snapshots the tab's 'TabRef' before removing
+-- it so the close notifier can tell attached channels which tab was closed.
+closeCmd :: TabsHandle -> TabCloseNotifier -> Int -> Bool -> CommandAction
+closeCmd h closeNotifier idx force = CommandAction $ \caps -> do
   case mkTabIndex idx of
     Left e  -> ccSend caps ("invalid index: " <> e)
     Right i -> do
+      mRef <- tabRefAtIndex h i
       r <- removeTabH h i
       case r of
         Left e  -> if force then ccSend caps ("force close: " <> e) else ccSend caps ("close failed: " <> e)
-        Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " closed")
+        Right _ -> do
+          ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " closed")
+          maybe (pure ()) closeNotifier mRef
+
+-- | Look up the 'TabRef' at a tab index ('Nothing' if out of range).
+tabRefAtIndex :: TabsHandle -> Seal.Handles.Tab.TabIndex -> IO (Maybe TabRef)
+tabRefAtIndex h i = do
+  tl <- snapshotTabs h
+  pure (tRef <$> lookupTab tl i)
+  where
+    lookupTab tl idx = go (tlTabs tl)
+      where
+        go [] = Nothing
+        go (t:rest) | tIndex t == idx = Just t
+                    | otherwise       = go rest
 
 -- | The /tab focus subcommand.
 focusCmd :: TabsHandle -> Int -> CommandAction

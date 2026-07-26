@@ -22,6 +22,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
+import Seal.Command.Tab (noTabCloseNotifier)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
@@ -62,6 +63,7 @@ mkDeps = do
     , adSend = Nothing
     , adDefaultAgent = pure Nothing
     , adBroker = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
     })
 
 spec :: Spec

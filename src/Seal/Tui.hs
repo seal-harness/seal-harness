@@ -17,7 +17,7 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
-import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
+import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
@@ -168,7 +168,7 @@ runTui autonomy = do
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH
+        , tabCommandSpec tabsH noTabCloseNotifier
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]

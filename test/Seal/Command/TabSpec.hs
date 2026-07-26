@@ -10,7 +10,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Parse (parseSlash, ParseOutcome (..))
 import Seal.Command.Spec (CommandAction(..), mkRegistry)
-import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
+import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec, TabCloseNotifier)
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Handles.Tab (tabIndexToChar, TabKind(..))
 import Seal.Tabs (insertTabH, newTabsHandle, snapshotTabs)
@@ -30,7 +30,7 @@ spec :: Spec
 spec = describe "Seal.Command.Tab" $ do
   it "/tab list on an empty handle replies 'no tabs'" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     case parseSlash reg "/tab list" of
       ParsedAction act -> runCommand act caps
@@ -40,7 +40,7 @@ spec = describe "Seal.Command.Tab" $ do
 
   it "/tab new creates a tab and replies with 'created'" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     case parseSlash reg "/tab new" of
       ParsedAction act -> runCommand act caps
@@ -53,7 +53,7 @@ spec = describe "Seal.Command.Tab" $ do
 
   it "/tab list after /tab new shows one tab" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     case parseSlash reg "/tab new" of
       ParsedAction act -> runCommand act caps
@@ -69,7 +69,7 @@ spec = describe "Seal.Command.Tab" $ do
 
   it "/tab close 0 closes the first tab" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
     case parseSlash reg "/tab close 0" of
@@ -80,9 +80,26 @@ spec = describe "Seal.Command.Tab" $ do
     snap <- snapshotTabs h
     tabCount snap `shouldBe` 0
 
+  it "/tab close invokes the TabCloseNotifier with the closed tab's TabRef" $ do
+    h <- newTabsHandle
+    notifiedRef <- newIORef ([] :: [TabRef])
+    let notifier :: TabCloseNotifier
+        notifier r = modifyIORef' notifiedRef (r :)
+        reg = mkRegistry [tabCommandSpec h notifier]
+    (ref, caps) <- recordingCaps
+    let sid = mkSid "close-notify"
+    _ <- insertTabH h (BoundSession sid) KindAi Nothing
+    case parseSlash reg "/tab close 0" of
+      ParsedAction act -> runCommand act caps
+      other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+    notified <- readIORef notifiedRef
+    notified `shouldBe` [BoundSession sid]
+    sent <- readIORef ref
+    sent `shouldSatisfy` any ("closed" `T.isInfixOf`)
+
   it "/tab rename 0 work sets the label" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
     case parseSlash reg "/tab rename 0 work" of
@@ -97,14 +114,14 @@ spec = describe "Seal.Command.Tab" $ do
 
   it "/help includes the tab family + the terse grammar synopsis" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h, terseGrammarSpec]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier, terseGrammarSpec]
         help = renderHelpIndex reg
     T.unpack help `shouldContain` "/tab"
     T.unpack help `shouldContain` "N [payload]"
 
   it "/tab focus 0 (with a tab present) replies 'focused'" $ do
     h <- newTabsHandle
-    let reg = mkRegistry [tabCommandSpec h]
+    let reg = mkRegistry [tabCommandSpec h noTabCloseNotifier]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
     case parseSlash reg "/tab focus 0" of

@@ -64,8 +64,9 @@ import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, resolveDefaultAgent, updateSessionAgent
   , updateSessionArchived, updateSessionSystemOverride )
+import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
-import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs)
+import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
   , addCustomModel, getUiState, setLastOptions )
@@ -83,6 +84,7 @@ data ApiDeps = ApiDeps
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
   , adBroker          :: Maybe StreamBroker      -- ^ the WS broker for pushing @lists@ frames (W6 broadcast triggers); 'Nothing' in tests without a broker
+  , adTabCloseNotifier :: TabCloseNotifier      -- ^ invoked after a tab is closed via the REST API so attached channels are notified; 'noTabCloseNotifier' in tests
   }
 
 -- | The REST API as a WAI Application.
@@ -1014,15 +1016,21 @@ tabInsertResponse (Right idx) mSid kind =
     ])
 
 -- | Handle POST /api/tabs/:index/close + /dismiss (remove the tab).
+-- Snapshots the tab's 'TabRef' before removing so attached channels can be
+-- notified via 'adTabCloseNotifier'.
 handleTabRemove :: ApiDeps -> Text -> IO Response
 handleTabRemove deps idxTxt =
   case parseIndex idxTxt of
     Nothing   -> pure (errJson status400 "invalid tab index")
     Just idx  -> do
+      mRef <- tabRefAt (adTabsHandle deps) idx
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> triggerBroadcast deps >> pure noContent
+        Right _ -> do
+          triggerBroadcast deps
+          maybe (pure ()) (adTabCloseNotifier deps) mRef
+          pure noContent
 
 -- | Handle POST /api/tabs/:index/acknowledge + /release (no-op for T10).
 handleTabAck :: ApiDeps -> Text -> IO Response
@@ -1032,16 +1040,21 @@ handleTabAck deps idxTxt =
     Just _idx -> triggerBroadcast deps >> pure noContent
 
 -- | Handle POST /api/tabs/:index/destroy (remove + delete from registry if
--- harness; for T10 just remove).
+-- harness; for T10 just remove). Notifies attached channels via
+-- 'adTabCloseNotifier' (same as close).
 handleTabDestroy :: ApiDeps -> Text -> BL.ByteString -> IO Response
 handleTabDestroy deps idxTxt _body =
   case parseIndex idxTxt of
     Nothing   -> pure (errJson status400 "invalid tab index")
     Just idx  -> do
+      mRef <- tabRefAt (adTabsHandle deps) idx
       r <- removeTabH (adTabsHandle deps) idx
       case r of
         Left _  -> pure (errJson status404 "tab index out of range")
-        Right _ -> triggerBroadcast deps >> pure noContent
+        Right _ -> do
+          triggerBroadcast deps
+          maybe (pure ()) (adTabCloseNotifier deps) mRef
+          pure noContent
 
 -- | Handle POST /api/adopt (consent-gated; the actual adoption wiring is
 -- Phase 6a's domain).
@@ -1073,6 +1086,14 @@ parseIndex t =
         Right idx -> Just idx
         Left _    -> Nothing
     _ -> Nothing
+
+-- | Look up the 'TabRef' at a tab index ('Nothing' if out of range). Used
+-- by close/destroy to snapshot the backing ref before removal so attached
+-- channels can be notified.
+tabRefAt :: TabsHandle -> TabIndex -> IO (Maybe TabRef)
+tabRefAt h idx = do
+  tl <- snapshotTabs h
+  pure (tRef <$> lookupTab tl idx)
 
 -- | T11: handle GET /api/sessions/:id/transcript. Returns the session's
 -- transcript as the frontend's @TranscriptEntry@ shape
