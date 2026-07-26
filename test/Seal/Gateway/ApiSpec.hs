@@ -3,6 +3,7 @@ module Seal.Gateway.ApiSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
+import Control.Monad (replicateM_, void)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -54,14 +55,15 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
+import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
-import Seal.Handles.Tab (TabKind (KindAi))
+import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
+import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Tabs (newTabsHandle, insertTabH)
-import Seal.Tabs.Types (TabRef (BoundSession))
+import Seal.Tabs.Types (TabRef (BoundSession, BoundHarness))
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -218,6 +220,35 @@ spec = describe "Seal.Gateway.API" $ do
       (A.encode (A.object [ "kind" .= ("provider" :: T.Text), "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
     status <- runAppStatus app req
     status `shouldBe` 200
+
+  it "POST /api/tabs/new with kind=provider does NOT leave an orphan session when the tab insert fails (full tab list)" $ do
+    -- Use a FRESH temp dir so sessions from other tests don't leak in and
+    -- masquerade as orphans (every test gets its own TabsHandle, so a
+    -- session created by another test has no backing tab in THIS handle).
+    dir <- withSystemTempDirectory "seal-api-orphan" $ \d -> do
+      createDirectoryIfMissing True (d </> "sessions")
+      pure d
+    let paths = fakePaths { spState = dir }
+    deps <- mkDepsFor paths
+    -- Fill the tab list to capacity (36 slots) so the next insert fails.
+    -- The provider branch mints a session id and attempts the insert; the
+    -- session.json must NOT be persisted when the insert fails, otherwise
+    -- the orphan surfaces in Recent Sessions with no backing tab.
+    replicateM_ 36 $ do
+      hid <- newHarnessId
+      void $ insertTabH (adTabsHandle deps) (BoundHarness hid) KindHarness Nothing
+    -- Drive the request through the real handler so the orphan-prevention
+    -- logic in handleTabNew is exercised.
+    let appFull = apiApp deps
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object [ "kind" .= ("provider" :: T.Text), "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
+    status <- runAppStatus appFull req
+    status `shouldBe` 400
+    -- No session.json should have been written for the failed insert —
+    -- the fresh dir started empty, and the 36 harness tabs carry no
+    -- session, so any on-disk session here is an orphan from this call.
+    sessions <- listSessions paths
+    sessions `shouldSatisfy` null
 
   it "POST /api/tabs/new with kind=shell returns 501" $ do
     app <- mkApp
@@ -2577,7 +2608,7 @@ spec = describe "Seal.Gateway.API" $ do
       -- assert it carries the SKILL_LOAD result entry (op.name = SKILL_LOAD
       -- with a result.body). This is the surface the frontend renders as the
       -- collapsible skill-load tool-call box.
-      transcriptReq <- pure (testRequest methodGet ["api", "sessions", requestSidTxt, "transcript"])
+      let transcriptReq = testRequest methodGet ["api", "sessions", requestSidTxt, "transcript"]
       (tStatus, tBody) <- runAppBody app transcriptReq
       tStatus `shouldBe` 200
       let entries = case A.decode tBody :: Maybe A.Value of
@@ -2588,7 +2619,7 @@ spec = describe "Seal.Gateway.API" $ do
       hasSkillLoad `shouldBe` True
       -- And the ACTIVE session's transcript must NOT carry the entry (it
       -- was not the target of the request).
-      activeTReq <- pure (testRequest methodGet ["api", "sessions", activeSidTxt, "transcript"])
+      let activeTReq = testRequest methodGet ["api", "sessions", activeSidTxt, "transcript"]
       (_aStatus, aBody) <- runAppBody app activeTReq
       let activeEntries = case A.decode aBody :: Maybe A.Value of
             Just (A.Array a) -> V.toList a

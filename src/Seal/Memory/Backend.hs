@@ -20,6 +20,7 @@ module Seal.Memory.Backend
 import Control.Monad (forM)
 import Data.Aeson (Value (..), encode)
 import Data.ByteString.Lazy qualified as BL
+import Data.Either (fromRight)
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -109,7 +110,7 @@ decodeMemory content =
         , meTags = fromMaybe [] (fmLookupList "tags" fm)
         , meCreatedAt = parseTime (fmLookup "created_at" fm)
         , meUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , meSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
+        , meSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Write one memory to disk (atomic) and auto-commit.

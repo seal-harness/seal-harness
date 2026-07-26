@@ -227,7 +227,7 @@ defaultWebConfig = WebConfig
 
 -- | The @[workdir]@ section: per-session workdir lifecycle. Every field
 -- is optional; a missing key decodes as 'Nothing' and the default applies.
-data WorkdirConfig = WorkdirConfig
+newtype WorkdirConfig = WorkdirConfig
   { wdcCleanupOnExit :: Maybe Bool
     -- ^ Remove the workdir when the session ends. Absent = false
     -- (persist for inspection).

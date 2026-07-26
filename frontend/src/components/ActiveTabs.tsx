@@ -70,7 +70,6 @@ export function TabRow({
   selected,
   onSelect,
   onClose,
-  onArchive,
   onDismiss,
   onAcknowledge,
   onRelease,
@@ -84,7 +83,6 @@ export function TabRow({
   selected: boolean
   onSelect: () => void
   onClose: () => void
-  onArchive: () => void
   onDismiss: () => void
   onAcknowledge: () => void
   onRelease: () => void
@@ -94,7 +92,6 @@ export function TabRow({
   // must not crash the render — fall back to a neutral glyph/label.
   const icon = statusIcon[tab.status] ?? FALLBACK_ICON
   const isRawShell = tab.kind.startsWith('shell:')
-  const isSessionBacked = tab.session_id !== null
   // Exited = harness process died (window still present) → offer a reserved
   // Restart + Dismiss. Orphaned = no live window → greyed row + Dismiss.
   const isExited = tab.status === 'exited'
@@ -150,8 +147,9 @@ export function TabRow({
           </span>
         )}
         <span
-          className="text-sm font-medium"
+          className="text-sm font-medium truncate mr-auto"
           style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
+          title={label}
         >
           {label}
         </span>
@@ -234,24 +232,6 @@ export function TabRow({
               </svg>
             </button>
           )}
-          {isSessionBacked && (
-            <button
-              className="session-archive"
-              title="Archive this session (close tab and archive)"
-              aria-label="Archive tab"
-              onClick={(e) => { e.stopPropagation(); onArchive() }}
-            >
-              <svg
-                width="11" height="11" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <rect x="2" y="3" width="12" height="3" rx="0.5" />
-                <path d="M3 6 v6 a1 1 0 0 0 1 1 h8 a1 1 0 0 0 1 -1 v-6" />
-                <path d="M6.5 9 h3" />
-              </svg>
-            </button>
-          )}
           {isAdopted && (
             <button
               className="session-archive"
@@ -306,7 +286,6 @@ export function ActiveTabs({
   onSelectTab,
   onNewTab,
   onCloseTab,
-  onArchiveTab,
   onDismiss,
   onAcknowledge,
   onRelease,
@@ -321,7 +300,6 @@ export function ActiveTabs({
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
-  onArchiveTab: (index: number) => void
   onDismiss: (index: number) => void
   onAcknowledge: (index: number) => void
   onRelease: (index: number) => void
@@ -357,7 +335,6 @@ export function ActiveTabs({
           selected={selectedId === `tab:${tab.index}`}
           onSelect={() => onSelectTab(tab.index)}
           onClose={() => onCloseTab(tab.index)}
-          onArchive={() => onArchiveTab(tab.index)}
           onDismiss={() => onDismiss(tab.index)}
           onAcknowledge={() => onAcknowledge(tab.index)}
           onRelease={() => onRelease(tab.index)}

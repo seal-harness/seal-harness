@@ -62,7 +62,8 @@ import Seal.Security.Adoption
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
-  , listSessions, newSession, resolveDefaultAgent, updateSessionAgent
+  , listSessions, newSession, newSessionMeta, resolveDefaultAgent
+  , saveSessionMeta, updateSessionAgent
   , updateSessionArchived, updateSessionSystemOverride )
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
@@ -469,19 +470,24 @@ handleTabNew deps v =
     Just "ssh"    -> pure (errJson status501 "shell/ssh tabs require Phase 4 untrusted execution")
     Just "attach" -> pure (errJson status501 "attach flow goes through /api/adopt")
     Just "provider" -> do
-      -- Persist session.json so /send can resolve the provider+model. The
-      -- provider/model default to the config defaults when the body omits
-      -- them; the agent is bound when supplied. newSession mints its own
-      -- session id; we bind the tab to THAT id (not a pre-minted one) so
-      -- the tab and session.json agree.
+      -- Mint the session id first, then insert the tab, and only persist
+      -- session.json AFTER the tab insert succeeds. If the insert fails
+      -- (full tab list, or a rare I2 collision), no session.json is left
+      -- on disk — otherwise the orphaned session would surface in Recent
+      -- Sessions with no tab to back it. newSessionMeta mints the id
+      -- without touching disk; saveSessionMeta writes the atomically.
       let paths = srPaths (adSessionRuntime deps)
           (provider, model) = parseProviderModel v
           mAgent = parseAgentField v
-      meta <- newSession paths provider model "web" mAgent
+      meta <- newSessionMeta paths provider model "web" mAgent
       let sid = smId meta
       res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
-      triggerBroadcast deps
-      pure (tabInsertResponse res (Just sid) "session:provider")
+      case res of
+        Left e   -> pure (errJson status400 e)
+        Right _  -> do
+          saveSessionMeta paths meta
+          triggerBroadcast deps
+          pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v

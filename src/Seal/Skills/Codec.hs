@@ -10,6 +10,7 @@ module Seal.Skills.Codec
   , decodeSkill
   ) where
 
+import Data.Either (fromRight)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -50,7 +51,7 @@ decodeSkill content =
         , skBody = body
         , skCreatedAt = parseTime (fmLookup "created_at" fm)
         , skUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , skSession = either (const (mkSystemSessionId "unknown")) id (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
+        , skSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
         }
 
 -- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).

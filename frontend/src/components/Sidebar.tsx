@@ -7,14 +7,13 @@ import { ActiveTabs } from './ActiveTabs'
 import { RunningHarnesses } from './RunningHarnesses'
 import { ActivityDot } from './StatusDot'
 
-/** A "Recent Sessions" section header with a "New session" `+` button
- *  (same glyph as the Active Tabs `+`, but a distinct label/title so screen
- *  readers + tooltips disambiguate: this one creates a bare session and
- *  focuses it; that one opens the new-tab composer). */
-function RecentSessionsHeader({ onNewSession }: { onNewSession: () => void }) {
+/** A "Recent Sessions" section header — plain label, no action button.
+ *  The "New Tab" button in Active Tabs is the single entry point for
+ *  creating new sessions/tabs. */
+function RecentSessionsHeader() {
   return (
     <div
-      className="px-3 py-1.5 flex items-center justify-between"
+      className="px-3 py-1.5 flex items-center"
       style={{ color: 'var(--text-muted)' }}
     >
       <span
@@ -23,16 +22,6 @@ function RecentSessionsHeader({ onNewSession }: { onNewSession: () => void }) {
       >
         Recent Sessions
       </span>
-      <button
-        type="button"
-        className="btn btn-ghost flex items-center justify-center"
-        style={{ width: 22, height: 22, padding: 0, fontSize: 14, lineHeight: 1 }}
-        onClick={onNewSession}
-        aria-label="New session"
-        title="New session"
-      >
-        +
-      </button>
     </div>
   )
 }
@@ -222,11 +211,9 @@ export function Sidebar({
   onSelectTab,
   onSelectSession,
   onNewTab,
-  onNewSession,
-  onArchiveSession,
   onUnarchiveSession,
   onCloseTab,
-  onArchiveTab,
+  onArchiveSession,
   onDismissTab,
   onAcknowledgeTab,
   onReleaseTab,
@@ -243,11 +230,9 @@ export function Sidebar({
   onSelectTab: (index: number) => void
   onSelectSession: (id: string) => void
   onNewTab: () => void
-  onNewSession: () => void
-  onArchiveSession: (id: string) => void
   onUnarchiveSession: (id: string) => void
+  onArchiveSession: (id: string) => void
   onCloseTab: (index: number) => void
-  onArchiveTab: (index: number) => void
   onDismissTab: (index: number) => void
   onAcknowledgeTab: (index: number) => void
   onReleaseTab: (index: number) => void
@@ -256,7 +241,6 @@ export function Sidebar({
   // "Running Harnesses" section; everything else stays under "Active Tabs".
   const harnessTabs = tabs.filter((t) => t.kind === 'harness')
   const otherTabs = tabs.filter((t) => t.kind !== 'harness')
-
   // A tab's display label = its backing session's title (so it reads
   // identically to its Recent Sessions row), falling back to the harness
   // `label` then an ellipsis — never blank. Computed once here so both
@@ -302,7 +286,6 @@ export function Sidebar({
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
-          onArchiveTab={onArchiveTab}
           onDismiss={onDismissTab}
           onAcknowledge={onAcknowledgeTab}
           onRelease={onReleaseTab}
@@ -315,13 +298,11 @@ export function Sidebar({
           tabLabel={tabLabel}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
-          onArchiveTab={onArchiveTab}
           onDismiss={onDismissTab}
           onAcknowledge={onAcknowledgeTab}
           onRelease={onReleaseTab}
         />
-
-        <RecentSessionsHeader onNewSession={onNewSession} />
+        <RecentSessionsHeader/>
         {recentSessions.map((s) => (
           <SessionRow
             key={s.id}
@@ -332,7 +313,6 @@ export function Sidebar({
             activity={sessionActivity?.[s.id]}
           />
         ))}
-
       </div>
       <ArchivedSection
         sessions={archivedSessions}
