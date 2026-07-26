@@ -1,8 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Layer-1 terse-grammar routing front-end. @\/N@ switches focus to
--- tab N, @\/N payload@ injects into tab N, a bare @\/tabs@ shows the current
+-- tab N, @\/N payload@ injects into tab N, a bare @\/tab@ shows the current
 -- tab, @\/<other>…@ is deferred to the @\/@-command registry (including
--- @\/tabs \u003csubcommand\u003e@), anything else is plain text to the focused
+-- @\/tab \u003csubcommand\u003e@), anything else is plain text to the focused
 -- tab. The grammar is a first-class synopsis entry in @\/help@ so it's
 -- discoverable.
 module Seal.Routing.Route
@@ -28,7 +28,7 @@ data RoutingDecision
   = Focus TabIndex                 -- ^ /N
   | Inject TabIndex Text           -- ^ /N payload
   | Plain Text                     -- ^ plain text to the focused tab
-  | TabCommand TabSlashCommand     -- ^ /tabs <subcommand> … (reserved; /tabs
+  | TabCommand TabSlashCommand     -- ^ /tab <subcommand> … (reserved; /tab
                                    --   is dispatched via the registry, but
                                    --   this variant is kept for future
                                    --   Layer-1 tab-command routing)
@@ -42,11 +42,11 @@ data RoutingDecision
 -- * @\/N@          -> 'Focus' N (N is a single char 0-9a-z, at end-of-string
 --                   or followed by a space)
 -- * @\/N payload@  -> 'Inject' N payload
--- * @\/tabs@       -> 'CurrentTab' (show the current tab)
+-- * @\/tab@        -> 'CurrentTab' (show the current tab)
 -- * @\/new@        -> 'NewSession' (start a fresh session in the current tab)
 -- * @\/<other>…@   -> 'SlashCommand' (deferred to the registry — this is
 --                   multi-char commands like @\/vault@, @\/help@, @\/ping@,
---                   and @\/tabs <subcommand>@)
+--                   and @\/tab <subcommand>@)
 -- * anything else  -> 'Plain'
 --
 -- The disambiguator: a single tab-char @\/N@ is the tab grammar ONLY when N
@@ -67,7 +67,7 @@ route t
                   case tabIndexFromChar c of
                     Left e -> Left (ParseError e)
                     Right idx -> Right (focusOrInject idx after)
-               | rest == "tabs" ->
+               | rest == "tab" ->
                   Right CurrentTab
                | rest == "new" || T.isPrefixOf "new " rest ->
                   Right NewSession

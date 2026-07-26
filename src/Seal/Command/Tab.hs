@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The @/tabs@ command family. Registered into the existing @\/@-command
--- registry so both the CLI TUI and the chat channels gain @\/tabs@ driving.
+-- | The @/tab@ command family. Registered into the existing @\/@-command
+-- registry so both the CLI TUI and the chat channels gain @\/tab@ driving.
 -- Plus the terse-grammar synopsis entry for @\/help@.
 module Seal.Command.Tab
   ( tabCommandSpec
@@ -21,13 +21,13 @@ import Seal.Routing.Route (terseSynopsis)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
 
--- | The @/tabs@ command spec. Bare @/tabs@ is intercepted by
+-- | The @/tab@ command spec. Bare @/tab@ is intercepted by
 -- 'Seal.Routing.Route' as 'CurrentTab' (show the focused tab) BEFORE the
 -- registry is consulted, so this spec's parser only runs when a subcommand
--- is present (@/tabs list@, @/tabs new@, etc.).
+-- is present (@/tab list@, @/tab new@, etc.).
 tabCommandSpec :: TabsHandle -> CommandSpec
 tabCommandSpec h = CommandSpec
-  { csName         = CommandName "tabs"
+  { csName         = CommandName "tab"
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"

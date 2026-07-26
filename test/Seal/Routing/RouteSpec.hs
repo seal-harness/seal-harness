@@ -27,12 +27,12 @@ spec = describe "Seal.Routing.Route" $ do
     it "/1  multiple   spaces -> Inject 1 (preserved)" $
       route "/1  multiple   spaces" `shouldBe` Right (Inject (mk 1) " multiple   spaces")
 
-  describe "/tabs commands (bare = CurrentTab; subcommands deferred to the registry)" $ do
-    it "/tabs -> CurrentTab" $ route "/tabs" `shouldBe` Right CurrentTab
-    it "/tabs list -> SlashCommand tabs list" $
-      route "/tabs list" `shouldBe` Right (SlashCommand "tabs list")
-    it "/tabs close 0 -> SlashCommand tabs close 0" $
-      route "/tabs close 0" `shouldBe` Right (SlashCommand "tabs close 0")
+  describe "/tab commands (bare = CurrentTab; subcommands deferred to the registry)" $ do
+    it "/tab -> CurrentTab" $ route "/tab" `shouldBe` Right CurrentTab
+    it "/tab list -> SlashCommand tab list" $
+      route "/tab list" `shouldBe` Right (SlashCommand "tab list")
+    it "/tab close 0 -> SlashCommand tab close 0" $
+      route "/tab close 0" `shouldBe` Right (SlashCommand "tab close 0")
 
   describe "other /commands" $ do
     it "/help -> SlashCommand help" $ route "/help" `shouldBe` Right (SlashCommand "help")

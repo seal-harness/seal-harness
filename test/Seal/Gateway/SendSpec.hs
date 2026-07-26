@@ -203,7 +203,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tabs list"
+        outcome <- handleSend sendDeps sid "/tab list"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -260,7 +260,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-106"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
-        outcome <- handleSend sendDeps sid "/tabs"
+        outcome <- handleSend sendDeps sid "/tab"
         case outcome of
           SendSlash msg _ -> msg `shouldSatisfy` ("0" `T.isInfixOf`)
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -278,14 +278,14 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-120000-107"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tabs"
+        outcome <- handleSend sendDeps sid "/tab"
         case outcome of
           SendSlash "no current tab" _ -> pure ()
           other -> expectationFailure ("expected SendSlash 'no current tab', got " <> show other)
         snap <- snapshotTabs tabsH
         tlTabs snap `shouldBe` []
 
-    it "/tabs close N does NOT auto-tab (no resurrection) and broadcasts the close" $
+    it "/tab close N does NOT auto-tab (no resurrection) and broadcasts the close" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
         let paths = SealPaths
               { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
@@ -297,7 +297,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-108"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
-        outcome <- handleSend sendDeps sid "/tabs close 0"
+        outcome <- handleSend sendDeps sid "/tab close 0"
         case outcome of
           SendSlash msg _ -> msg `shouldSatisfy` ("closed" `T.isInfixOf`)
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
