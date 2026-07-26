@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import App from '../App'
 import type { SessionInfo, TranscriptEntry } from '../types'
 
@@ -334,5 +334,203 @@ describe('App — send + branch', () => {
     await waitFor(() => {
       expect(screen.getAllByText('Dup Sess').length).toBe(1)
     })
+  })
+})
+
+// ── Tab close preserves the focused session ─────────────────────────────
+// When the user closes a tab ABOVE the focused tab, the backend compacts the
+// remaining tab indices. The frontend must re-select the focused session's
+// new tab index — NOT keep the stale tab number (which would either jump to a
+// different session or show nothing). These tests pin that behavior.
+
+describe('App — tab close preserves the focused session', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // jsdom's window.location persists across tests in the file; reset so
+    // each case starts from a clean root (no leftover /tab/<n> selection).
+    window.history.replaceState(null, '', '/')
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('after closing a tab above the focused one, re-selects the same session at its new tab index', async () => {
+    // Two tabs: index 0 = "Tab A", index 1 = "Tab B". User selects Tab B (the
+    // lower one), then closes Tab A. After the backend compacts, Tab B becomes
+    // index 0. The URL should reflect /tab/0 and the transcript for Tab B's
+    // session stays on screen (no jump to Tab A's session).
+    const tabASession = makeSession({ id: 'sess-A', description: 'Tab A' })
+    const tabBSession = makeSession({ id: 'sess-B', description: 'Tab B' })
+    let tabs = [
+      { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null },
+      { index: 1, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      let body: unknown = {}
+      if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+      else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
+      else if (url === '/api/lists') {
+        body = { tabs, recentSessions: [], archivedSessions: [], tabSessions: [tabASession, tabBSession] }
+      } else if (url === '/api/tabs') body = tabs
+      else if (url === '/api/sessions') body = []
+      else if (url === '/api/sessions/archived') body = []
+      else if (url === '/api/harnesses') body = []
+      else if (url === '/api/harnesses/discover') body = []
+      else if (url.includes('/transcript')) body = []
+      else if (url === '/api/tabs/0/close' && method === 'POST') {
+        // Compact: Tab A gone, Tab B slides to index 0.
+        tabs = [{ index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null }]
+        body = null
+      }
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    // Wait for both tabs to render, then select Tab B (index 1).
+    const tabBRow = await screen.findByText('Tab B')
+    fireEvent.click(tabBRow)
+    await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
+    // Close Tab A (index 0) via its row's Close button.
+    const tabARowEl = screen.getByText('Tab A').closest('.agent-row')
+    const tabAClose = tabARowEl!.querySelector('[aria-label="Close tab"]') as HTMLElement
+    await act(async () => { fireEvent.click(tabAClose) })
+    // Tick the /api/lists poll so the compacted tab list arrives.
+    await act(async () => { vi.advanceTimersByTimeAsync(3000) })
+    // After the backend compacts, the focused session (sess-B) re-selects at
+    // its new tab index (0). The URL updates to /tab/0 and Tab B stays on
+    // screen — no jump to Tab A or to the empty state.
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/tab/0')
+    })
+    // Tab B's row is still rendered (its label resolves via the tab).
+    expect(document.querySelector('.agent-row span[title="Tab B"]')).toBeTruthy()
+  })
+
+  it('after closing the focused tab itself, falls back to the bare session so the transcript stays', async () => {
+    // Two tabs: index 0 = "Tab A", index 1 = "Tab B". User selects Tab B, then
+    // closes Tab B itself. The session survives in Recent Sessions, so the
+    // frontend should switch to `session:<id>` and keep the transcript on
+    // screen (rather than blanking to the empty state).
+    const tabASession = makeSession({ id: 'sess-A', description: 'Tab A' })
+    const tabBSession = makeSession({ id: 'sess-B', description: 'Tab B' })
+    let tabs = [
+      { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null },
+      { index: 1, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      let body: unknown = {}
+      if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+      else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
+      else if (url === '/api/lists') {
+        // tabSessions empty so the sidebar resolves labels via recentSessions;
+        // the defense-in-depth filter drops tab-backed rows from the Recent
+        // Sessions list while they're tabs.
+        body = { tabs, recentSessions: [tabASession, tabBSession], archivedSessions: [], tabSessions: [] }
+      } else if (url === '/api/tabs') body = tabs
+      else if (url === '/api/sessions') body = []
+      else if (url === '/api/sessions/archived') body = []
+      else if (url === '/api/harnesses') body = []
+      else if (url === '/api/harnesses/discover') body = []
+      else if (url.includes('/transcript')) body = []
+      else if (url === '/api/tabs/1/close' && method === 'POST') {
+        // Close Tab B → only Tab A remains at index 0.
+        tabs = [{ index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null }]
+        body = null
+      }
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    // Select Tab B (the lower tab). It appears in Active Tabs.
+    const tabBRow = await screen.findByText('Tab B')
+    fireEvent.click(tabBRow)
+    await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
+    // Close Tab B (the focused tab) via its row's Close button. Use the
+    // title attribute to disambiguate the tab-row label from the chat header
+    // (both render "Tab B" once the tab is selected).
+    const tabBLabel = document.querySelector('.agent-row span[title="Tab B"]') as HTMLElement
+    const tabBRowEl = tabBLabel.closest('.agent-row')!
+    const tabBClose = tabBRowEl.querySelector('[aria-label="Close tab"]') as HTMLElement
+    await act(async () => { fireEvent.click(tabBClose) })
+    await act(async () => { vi.advanceTimersByTimeAsync(3000) })
+    // The focused session survives in Recent Sessions → re-select it as a
+    // bare session so its transcript stays on screen.
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/session/sess-B')
+    })
+  })
+
+  it('after closing a tab above the focused one in a 3-tab list, follows the focused session to its new index (not the stale tab number)', async () => {
+    // Three tabs: 0 = A, 1 = B, 2 = C. User selects tab 1 (B). Closes tab 0
+    // (above the focused one). Backend compacts: B slides to 0, C slides to 1.
+    // The frontend MUST follow the focused SESSION (B → /tab/0), NOT stay on
+    // the stale tab number /tab/1 (which now points at C). This pins the
+    // regression where the pin-tracker re-read the tab at the stale index
+    // (now C) and overwrote the pin before the re-selector ran.
+    const tabASession = makeSession({ id: 'sess-A', description: 'Tab A' })
+    const tabBSession = makeSession({ id: 'sess-B', description: 'Tab B' })
+    const tabCSession = makeSession({ id: 'sess-C', description: 'Tab C' })
+    let tabs = [
+      { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null },
+      { index: 1, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null },
+      { index: 2, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-C', ext_modified: false, stale: false, attach_command: null },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      let body: unknown = {}
+      if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+      else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
+      else if (url === '/api/lists') {
+        body = { tabs, recentSessions: [], archivedSessions: [], tabSessions: [tabASession, tabBSession, tabCSession] }
+      } else if (url === '/api/tabs') body = tabs
+      else if (url === '/api/sessions') body = []
+      else if (url === '/api/sessions/archived') body = []
+      else if (url === '/api/harnesses') body = []
+      else if (url === '/api/harnesses/discover') body = []
+      else if (url.includes('/transcript')) body = []
+      else if (url === '/api/tabs/0/close' && method === 'POST') {
+        // Compact: A gone. B → 0, C → 1.
+        tabs = [
+          { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null },
+          { index: 1, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-C', ext_modified: false, stale: false, attach_command: null },
+        ]
+        body = null
+      }
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    // Select tab 1 (Tab B).
+    const tabBRow = await screen.findByText('Tab B')
+    fireEvent.click(tabBRow)
+    await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
+    // Close tab 0 (Tab A) — the tab above the focused one.
+    const tabARowEl = screen.getByText('Tab A').closest('.agent-row')
+    const tabAClose = tabARowEl!.querySelector('[aria-label="Close tab"]') as HTMLElement
+    await act(async () => { fireEvent.click(tabAClose) })
+    await act(async () => { vi.advanceTimersByTimeAsync(3000) })
+    // The focused session (B) slides to index 0 → the URL must follow it to
+    // /tab/0. Staying at /tab/1 would show Tab C's contents (the regression).
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/tab/0')
+    })
+    // Tab B is the selected row; Tab C is NOT on screen as the focused tab.
+    expect(document.querySelector('.agent-row span[title="Tab B"]')).toBeTruthy()
+    // The chat header reflects the focused session (Tab B), not Tab C.
+    expect(document.querySelector('.editable-title-text')?.textContent).toBe('Tab B')
   })
 })

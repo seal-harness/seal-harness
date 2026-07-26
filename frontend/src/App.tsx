@@ -352,6 +352,53 @@ export default function App() {
     }
   }, [])
 
+  // ── Preserve the focused session across tab-list mutations ──────────────
+  // When the backend removes a tab above the focused one it compacts the
+  // remaining tab indices, so a `tab:<idx>` selection goes stale — it would
+  // either point at a different tab or resolve to nothing. Track the focused
+  // tab's session_id; on the next tabs update, re-select that session's new
+  // tab index (or fall back to `session:<id>` if the tab was closed but the
+  // session survives). This preserves the displayed transcript across a
+  // sibling close.
+  const pinnedSessionIdRef = useRef<string | null>(null)
+  // Track the selectedId we last pinned for. When `tabs` mutates but the
+  // selection is unchanged (a backend compact/close), we MUST NOT re-read the
+  // tab at the old index — that index now holds a different session, and
+  // overwriting the pin would defeat the re-selection below.
+  const lastPinnedSelectedIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (selectedId === lastPinnedSelectedIdRef.current) return
+    lastPinnedSelectedIdRef.current = selectedId
+    if (!selectedId?.startsWith('tab:')) {
+      pinnedSessionIdRef.current = null
+      return
+    }
+    const idx = parseInt(selectedId.slice('tab:'.length), 10)
+    const t = tabs.find((tab) => tab.index === idx)
+    pinnedSessionIdRef.current = t?.session_id ?? null
+  }, [selectedId, tabs])
+  useEffect(() => {
+    const pinned = pinnedSessionIdRef.current
+    if (!pinned || !selectedId?.startsWith('tab:')) return
+    const idx = parseInt(selectedId.slice('tab:'.length), 10)
+    const current = tabs.find((tab) => tab.index === idx)
+    // Still resolves to the pinned session → nothing to do.
+    if (current?.session_id === pinned) return
+    // Find the tab now carrying the pinned session and re-select its index.
+    const moved = tabs.find((tab) => tab.session_id === pinned)
+    if (moved) {
+      const newId = `tab:${moved.index}`
+      setSelectedId(newId)
+      syncPath(newId)
+    } else {
+      // The pinned tab is gone → keep the session's transcript on screen by
+      // selecting it as a bare session (it lives on in Recent Sessions).
+      const newId = `session:${pinned}`
+      setSelectedId(newId)
+      syncPath(newId)
+    }
+  }, [tabs, selectedId, syncPath])
+
   const syncSection = useCallback((s: TopSection) => {
     if (typeof window !== 'undefined') {
       window.history.pushState(null, '', pathFromSection(s))
@@ -625,11 +672,11 @@ export default function App() {
 
   const handleCloseTab = useCallback(async (index: number) => {
     await closeTab(index)
-    if (selectedId === `tab:${index}`) {
-      setSelectedId(null)
-      syncPath(null)
-    }
-  }, [selectedId, syncPath])
+    // The re-selection effect (pinnedSessionIdRef) recovers the focused
+    // session after the backend compacts: either re-selects the same session
+    // at its new tab index, or falls back to `session:<id>`. Do NOT clear the
+    // selection here — that would blank the transcript before recovery.
+  }, [])
 
   const handleDismissTab = useCallback(async (index: number) => {
     await dismissTab(index)
