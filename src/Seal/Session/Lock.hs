@@ -97,19 +97,21 @@ newtype ReplyRegistry = ReplyRegistry (TVar (Map SessionId [ReplySink]))
 newReplyRegistry :: IO ReplyRegistry
 newReplyRegistry = ReplyRegistry <$> newTVarIO Map.empty
 
--- | Subscribe a 'ChannelHandle' to a session's replies. The handle is
--- associated with an 'IORef' guard (returned to the caller) so it can be
--- later unsubscribed. If the handle was previously subscribed to a
--- different session, it is removed from that session's list first
--- (a handle tracks at most one session at a time).
+-- | Subscribe a 'ChannelHandle' to a session's replies. Replaces any
+-- existing subscribers for the session (each turn re-subscribes the same
+-- handle; the last one wins). This prevents duplicate deliveries from
+-- 'replyFanout' when multiple turns on the same session re-subscribe the
+-- same handle. The handle is associated with an 'IORef' guard (returned
+-- to the caller) so it can be later unsubscribed.
 replySubscribe
   :: ReplyRegistry -> ChannelHandle -> SessionId
   -> IO (IORef (Maybe SessionId))
 replySubscribe (ReplyRegistry tv) h sid = do
   guard <- newIORef (Just sid)
+  let sink = ReplySink h guard
   atomically $ do
     m <- readTVar tv
-    writeTVar tv (Map.insertWith (++) sid [ReplySink h guard] m)
+    writeTVar tv (Map.insert sid [sink] m)
   pure guard
 
 -- | Unsubscribe a handle from a session. The 'IORef' guard must match
