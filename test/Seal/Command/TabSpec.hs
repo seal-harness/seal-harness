@@ -28,21 +28,21 @@ recordingCaps = do
 
 spec :: Spec
 spec = describe "Seal.Command.Tab" $ do
-  it "/tab list on an empty handle replies 'no tabs'" $ do
+  it "/tabs list on an empty handle replies 'no tabs'" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
-    case parseSlash reg "/tab list" of
+    case parseSlash reg "/tabs list" of
       ParsedAction act -> runCommand act caps
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
     sent <- readIORef ref
     sent `shouldSatisfy` ("no tabs" `elem`)
 
-  it "/tab new creates a tab and replies with 'created'" $ do
+  it "/tabs new creates a tab and replies with 'created'" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
-    case parseSlash reg "/tab new" of
+    case parseSlash reg "/tabs new" of
       ParsedAction act -> runCommand act caps
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
     sent <- readIORef ref
@@ -51,14 +51,14 @@ spec = describe "Seal.Command.Tab" $ do
     snap <- snapshotTabs h
     tabCount snap `shouldBe` 1
 
-  it "/tab list after /tab new shows one tab" $ do
+  it "/tabs list after /tabs new shows one tab" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
-    case parseSlash reg "/tab new" of
+    case parseSlash reg "/tabs new" of
       ParsedAction act -> runCommand act caps
       _ -> pure ()
-    case parseSlash reg "/tab list" of
+    case parseSlash reg "/tabs list" of
       ParsedAction act -> runCommand act caps
       _ -> pure ()
     sent <- readIORef ref
@@ -67,12 +67,12 @@ spec = describe "Seal.Command.Tab" $ do
       (t:_) -> sent `shouldSatisfy` any (T.singleton (tabIndexToChar (tIndex t)) `T.isInfixOf`)
       []    -> expectationFailure "expected at least one tab"
 
-  it "/tab close 0 closes the first tab" $ do
+  it "/tabs close 0 closes the first tab" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
-    case parseSlash reg "/tab close 0" of
+    case parseSlash reg "/tabs close 0" of
       ParsedAction act -> runCommand act caps
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
     sent <- readIORef ref
@@ -80,12 +80,12 @@ spec = describe "Seal.Command.Tab" $ do
     snap <- snapshotTabs h
     tabCount snap `shouldBe` 0
 
-  it "/tab rename 0 work sets the label" $ do
+  it "/tabs rename 0 work sets the label" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
-    case parseSlash reg "/tab rename 0 work" of
+    case parseSlash reg "/tabs rename 0 work" of
       ParsedAction act -> runCommand act caps
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
     sent <- readIORef ref
@@ -102,12 +102,12 @@ spec = describe "Seal.Command.Tab" $ do
     T.unpack help `shouldContain` "/tab"
     T.unpack help `shouldContain` "N [payload]"
 
-  it "/tab focus 0 (with a tab present) replies 'focused'" $ do
+  it "/tabs focus 0 (with a tab present) replies 'focused'" $ do
     h <- newTabsHandle
     let reg = mkRegistry [tabCommandSpec h]
     (ref, caps) <- recordingCaps
     _ <- insertTabH h (BoundSession (mkSid "a")) KindAi Nothing
-    case parseSlash reg "/tab focus 0" of
+    case parseSlash reg "/tabs focus 0" of
       ParsedAction act -> runCommand act caps
       other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
     sent <- readIORef ref

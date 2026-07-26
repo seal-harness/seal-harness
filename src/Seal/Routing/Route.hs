@@ -1,9 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Layer-1 terse-grammar routing front-end. @\/N@ switches focus to
--- tab N, @\/N payload@ injects into tab N, a bare @\/tab …@ parses to the
--- 'TabSlashCommand' family, @\/<other>…@ is deferred to the @\/@-command
--- registry, anything else is plain text to the focused tab. The grammar is
--- a first-class synopsis entry in @\/help@ so it's discoverable.
+-- tab N, @\/N payload@ injects into tab N, a bare @\/tab@ or @\/tabs@ shows
+-- the current tab, @\/tab \u003cargs\u003e@ is a parse error (subcommands
+-- live under @\/tabs \u003csubcommand\u003e@), @\/<other>…@ is deferred to the
+-- @\/@-command registry, anything else is plain text to the focused tab.
+-- The grammar is a first-class synopsis entry in @\/help@ so it's
+-- discoverable.
 module Seal.Routing.Route
   ( ParseError (..)
   , RoutingDecision (..)
@@ -15,10 +17,8 @@ import Data.Char (isDigit, isAsciiLower)
 import Data.Text (Text)
 import Data.Text qualified as T
 
-import Seal.Core.Types (mkSessionId)
 import Seal.Handles.Tab (TabIndex, tabIndexFromChar)
-import Seal.Tabs.Types
-  ( ForceMode (..), TabKindArg (..), TabSlashCommand (..) )
+import Seal.Tabs.Types (TabSlashCommand (..))
 
 -- | A parse error from the routing grammar.
 newtype ParseError = ParseError Text
@@ -29,7 +29,11 @@ data RoutingDecision
   = Focus TabIndex                 -- ^ /N
   | Inject TabIndex Text           -- ^ /N payload
   | Plain Text                     -- ^ plain text to the focused tab
-  | TabCommand TabSlashCommand     -- ^ /tab …
+  | TabCommand TabSlashCommand     -- ^ /tabs <subcommand> … (reserved; /tabs
+                                   --   is dispatched via the registry, but
+                                   --   this variant is kept for future
+                                   --   Layer-1 tab-command routing)
+  | CurrentTab                     -- ^ bare /tab — show the current tab
   | NewSession                     -- ^ /new — start a fresh session in the current tab
   | SlashCommand Text              -- ^ other /commands (deferred to the registry)
   deriving stock (Eq, Show)
@@ -39,10 +43,14 @@ data RoutingDecision
 -- * @\/N@          -> 'Focus' N (N is a single char 0-9a-z, at end-of-string
 --                   or followed by a space)
 -- * @\/N payload@  -> 'Inject' N payload
--- * @\/tab …@      -> 'TabCommand' (parsed via the /tab command ADT)
+-- * @\/tab@        -> 'CurrentTab' (show the current tab)
+-- * @\/tabs@       -> 'CurrentTab' (alias for @\/tab@)
+-- * @\/tab \u003cargs\u003e@ -> 'ParseError' (subcommands live under @\/tabs@,
+--                   which is dispatched via the registry as a 'SlashCommand')
 -- * @\/new@        -> 'NewSession' (start a fresh session in the current tab)
 -- * @\/<other>…@   -> 'SlashCommand' (deferred to the registry — this is
---                   multi-char commands like @\/vault@, @\/help@, @\/ping@)
+--                   multi-char commands like @\/vault@, @\/help@, @\/ping@,
+--                   and @\/tabs <subcommand>@)
 -- * anything else  -> 'Plain'
 --
 -- The disambiguator: a single tab-char @\/N@ is the tab grammar ONLY when N
@@ -63,12 +71,16 @@ route t
                  case tabIndexFromChar c of
                    Left e -> Left (ParseError e)
                    Right idx -> Right (focusOrInject idx after)
-             | T.isPrefixOf "tab" rest && (T.length rest == 3 || T.head (T.drop 3 rest) == ' ') ->
-                 Right (TabCommand (parseTabCmd (T.drop 3 rest)))
-             | rest == "new" || T.isPrefixOf "new " rest ->
-                 Right NewSession
-             | otherwise ->
-                 Right (SlashCommand rest)
+              | T.isPrefixOf "tab" rest && (T.length rest == 3 || T.head (T.drop 3 rest) == ' ') ->
+                  if T.length rest == 3
+                    then Right CurrentTab
+                    else Left (ParseError "/tab shows the current tab; use /tabs <subcommand> (e.g. /tabs list, /tabs close N)")
+              | rest == "tabs" ->
+                  Right CurrentTab
+              | rest == "new" || T.isPrefixOf "new " rest ->
+                  Right NewSession
+              | otherwise ->
+                  Right (SlashCommand rest)
   where
     isTabChar c = isDigit c || isAsciiLower c
 
@@ -81,53 +93,6 @@ focusOrInject idx after
   | otherwise               =
       let payload = T.drop 1 (snd (T.breakOn " " after))  -- everything after the first space
       in Inject idx payload
-
--- | Parse the /tab subcommand family. 'rest' is the text after "/tab"
--- (with the leading space if any).
-parseTabCmd :: Text -> TabSlashCommand
-parseTabCmd rest =
-  let words' = T.words (T.strip rest)
-  in case words' of
-       []                   -> TabListCmd
-       ("list" : _)         -> TabListCmd
-       ("new" : kindArgs)   -> TabNewCmd (parseKindArg kindArgs)
-       ("close" : idxArgs)  -> parseClose idxArgs
-       ("focus" : idxArgs)  -> case idxArgs of
-         (idxStr : _) -> case tabIndexFromChar (T.head idxStr) of
-           Right i  -> TabFocusCmd i
-           Left _   -> TabListCmd  -- malformed; fall back
-         []          -> TabListCmd
-       ("resume" : sidArgs) -> case sidArgs of
-         (sidStr : _) -> case mkSessionId sidStr of
-           Right s  -> TabResumeCmd s
-           Left _   -> TabListCmd  -- malformed; fall back
-         []          -> TabListCmd
-       ("rename" : idxStr : nameParts) -> case tabIndexFromChar (T.head idxStr) of
-         Right i  -> TabRenameCmd i (T.intercalate " " nameParts)
-         Left _   -> TabListCmd
-       ("rename" : _)       -> TabListCmd
-       _                    -> TabListCmd  -- unknown /tab subcommand → list
-
--- | Parse the kind arg from the "new" subcommand's args.
-parseKindArg :: [Text] -> Maybe TabKindArg
-parseKindArg [] = Nothing
-parseKindArg (k : _) = case k of
-  "ai"       -> Just TkaAi
-  "provider" -> Just TkaProvider
-  "harness"  -> Just TkaHarness
-  "shell"    -> Just TkaShell
-  "ssh"      -> Just TkaSsh
-  "tmux"     -> Just TkaTmux
-  _          -> Nothing
-
--- | Parse the close subcommand: "close <N> [--force]".
-parseClose :: [Text] -> TabSlashCommand
-parseClose idxArgs =
-  case idxArgs of
-    (idxStr : restArgs) -> case tabIndexFromChar (T.head idxStr) of
-      Right i  -> TabCloseCmd i (if "--force" `elem` restArgs then Force else NoForce)
-      Left _   -> TabListCmd
-    [] -> TabListCmd
 
 -- | The terse-grammar synopsis (for /help). One line.
 terseSynopsis :: Text

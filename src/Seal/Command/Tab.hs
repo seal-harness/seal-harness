@@ -23,25 +23,31 @@ import Seal.Routing.Route (terseSynopsis)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
 
--- | The @/tab@ command spec (one hsubparser with the six subcommands).
+-- | The @/tabs@ command spec. Bare @/tabs@ is intercepted by
+-- 'Seal.Routing.Route' as 'CurrentTab' (show the focused tab) BEFORE the
+-- registry is consulted, so this spec's parser only runs when a subcommand
+-- is present (@/tabs list@, @/tabs new@, etc.).
 tabCommandSpec :: TabsHandle -> CommandSpec
 tabCommandSpec h = CommandSpec
-  { csName         = CommandName "tab"
-  , csAliases      = [CommandName "tabs"]  -- /tabs is an alias for /tab list
+  { csName         = CommandName "tabs"
+  , csAliases      = [CommandName "tab"]  -- /tab <subcommand> is an alias for /tabs <subcommand>
   , csGroup        = GroupGeneral
-  , csSynopsis     = "Manage tabs (new/list/close/focus/resume/rename)"
+  , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"
   , csParserInfo   = tabParserInfo h
   , csAvailability = AlwaysAvailable
   }
 
--- | The @/tabs@ alias spec. (An explicit alias entry so @/help@ shows it
--- distinctly; @/tab@ already lists @tabs@ as an alias, so this is redundant
--- but harmless — the registry's lookup-by-alias handles both.)
+-- | The @/tab@ alias spec. Bare @/tab@ is intercepted by
+-- 'Seal.Routing.Route' as 'CurrentTab' (same as @/tabs@), so this spec's
+-- parser only runs for subcommands. (An explicit alias entry so @/help@
+-- shows the distinct name; @/tabs@ already lists @tab@ as an alias, so
+-- this is redundant but harmless — the registry's lookup-by-alias handles
+-- both.)
 tabsCommandSpec :: TabsHandle -> CommandSpec
 tabsCommandSpec h = (tabCommandSpec h)
-  { csName     = CommandName "tabs"
+  { csName     = CommandName "tab"
   , csAliases  = []
-  , csSynopsis = "List tabs (alias for /tab list)"
+  , csSynopsis = "Show current tab, or manage tabs (alias for /tabs <subcommand>)"
   }
 
 -- | The terse-grammar synopsis entry for @/help@. A synthetic spec (no

@@ -88,6 +88,7 @@ import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
@@ -139,7 +140,7 @@ import Seal.Tabs
   , renameTabH, rebindTabH, snapshotTabs )
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
-  , tabCount, tlTabs )
+  , tabCount, tlTabs, lookupByRef )
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
@@ -306,6 +307,12 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
                 Right (Route.TabCommand tsc) -> do
                   _ <- handleTabCommand h tabsH tsc
                   loop h reg bgConvSid
+                Right Route.CurrentTab -> do
+                  tl <- snapshotTabs tabsH
+                  case mCursor >>= lookupByRef tl of
+                    Just t  -> chSend h (renderCurrentTab t)
+                    Nothing -> chSend h "no current tab"
+                  loop h reg bgConvSid
                 Right Route.NewSession -> do
                   _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
                   loop h reg bgConvSid
@@ -384,7 +391,7 @@ handleNewSession deps h tabsH kind oldMeta = do
     []       -> pure ()  -- no tab bound to old sid; cursor-only swap below
     (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
       Left e  -> chSend h ("warning: /new tab rebind failed: " <> e)
-      Right _ -> pure ()
+      Right _ -> broadcastTabs deps tabsH
   -- Migrate every conversation cursor pointing at the old ref to the new
   -- ref (includes THIS conversation's cursor). Per the user's model: a tab
   -- has one session at a time; all channels focused on it follow the
@@ -413,8 +420,23 @@ createConversationSession deps _h key kind tabsH = do
   r <- insertTabH tabsH (BoundSession (smId meta)) KindAi Nothing
   case r of
     Left _ -> pure ()  -- tab list full; session still works without a tab
-    Right _ -> cursorSet (cdCursors deps) key (BoundSession (smId meta))
+    Right _ -> do
+      cursorSet (cdCursors deps) key (BoundSession (smId meta))
+      -- Push the new tab to any WS subscribers (the web frontend sidebar)
+      -- so a channel-created tab surfaces immediately. No-op when cdBroker
+      -- is Nothing (standalone signal/telegram without serve).
+      broadcastTabs deps tabsH
   pure meta
+
+-- | Push the current tab-list snapshot to WS subscribers (the web frontend
+-- sidebar). No-op when 'cdBroker' is 'Nothing' (standalone channels without
+-- @seal serve@). Call after any channel-side tab mutation so the frontend
+-- reflects the change without waiting for a web-originated turn.
+broadcastTabs :: ChannelDeps -> TabsHandle -> IO ()
+broadcastTabs deps tabsH =
+  case cdBroker deps of
+    Nothing     -> pure ()
+    Just broker -> broadcastListsSnapshot broker tabsH (cdPaths deps)
 
 -- | Handle a parsed 'TabSlashCommand' over a channel (mutates the
 -- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.
@@ -424,7 +446,7 @@ handleTabCommand h tabsH = \case
     tl <- snapshotTabs tabsH
     if tabCount tl == 0
       then chSend h "no tabs"
-      else mapM_ (chSend h . renderTab) (tlTabs tl)
+      else mapM_ (chSend h . renderCurrentTab) (tlTabs tl)
   TabNewCmd _mKind -> do
     r <- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing
     case r of
@@ -454,9 +476,12 @@ handleTabCommand h tabsH = \case
     placeholderSid = case mkSessionId "tab-session" of
       Right s -> s
       Left _  -> error "placeholder session id"
-    renderTab t =
-      T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
-        <> maybe "" ("  " <>) (tLabel t)
+
+-- | Render one tab as a single line: @<index>  <kind>  [label]@.
+renderCurrentTab :: Tab -> Text
+renderCurrentTab t =
+  T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+    <> maybe "" ("  " <>) (tLabel t)
 
 -- | Run one plain-text turn through the agent loop with the
 -- 'MessageSource' threaded into 'aeMessageSource'. Takes the resolved
@@ -557,6 +582,11 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
       -- already inserted one on first message). Uses KindAi (channel/CLI
       -- tab kind, wire "session:ai"). Sources sid from smId meta only.
       ensureTabForSession (cdTabs deps) KindAi sid
+      -- Refresh the sidebar lists so the tab label updates with the
+      -- first-message snippet now that the transcript has content. Without
+      -- this, a freshly-created tab shows the agent name (snippet was null
+      -- at creation time) and never refreshes until a web-originated action.
+      broadcastTabs deps (cdTabs deps)
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
 -- a fresh persisted session from the config defaults (channel label

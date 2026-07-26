@@ -106,7 +106,7 @@ import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
-import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..))
+import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, deliverNextAnswerAny, askHuman
   , newApprovalCache )
@@ -643,6 +643,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
                   _ <- focusTabH th idx
                   plainHandler payload
                 Right (Seal.Routing.Route.TabCommand tsc) -> liftIO (handleTabCommand caps th tsc)
+                Right Seal.Routing.Route.CurrentTab -> liftIO $ do
+                  active <- readIORef (srActive sr)
+                  tl <- snapshotTabs th
+                  case lookupByRef tl (BoundSession (smId active)) of
+                    Just t  -> ccSend caps (renderTab t)
+                    Nothing -> ccSend caps "no current tab"
                 Right Seal.Routing.Route.NewSession -> do
                   -- /new is registered as a CommandSpec in the registry
                   -- (the CLI tracks "current" via srActive, not a cursor),
@@ -695,9 +701,12 @@ handleTabCommand caps tabsH = \case
     placeholderSid = case mkSessionId "tab-session" of
       Right s -> s
       Left _  -> error "placeholder session id"
-    renderTab t =
-      T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
-        <> maybe "" ("  " <>) (tLabel t)
+
+-- | Render one tab as a single line: @<index>  <kind>  [label]@.
+renderTab :: Tab -> Text
+renderTab t =
+  T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+    <> maybe "" ("  " <>) (tLabel t)
 
 -- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
 -- 'SecurityConfig'. Absent section / mode=local → the local arm (real local

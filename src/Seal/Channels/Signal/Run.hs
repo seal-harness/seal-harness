@@ -56,7 +56,7 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyCha
 import Seal.Routing.Route qualified
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
-import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs)
+import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, lookupByRef)
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
@@ -152,6 +152,12 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
                 Right (Seal.Routing.Route.TabCommand tsc) -> do
                   _ <- handleTabCommand' h tabsH tsc
                   loop h handleCaps
+                Right Seal.Routing.Route.CurrentTab -> do
+                  tl <- snapshotTabs tabsH
+                  case lookupByRef tl (BoundSession (smId meta)) of
+                    Just t  -> chSend h (renderTab t)
+                    Nothing -> chSend h "no current tab"
+                  loop h handleCaps
                 Right Seal.Routing.Route.NewSession -> do
                   -- /new is registered as a CommandSpec in the registry
                   -- (this standalone loop tracks "current" via srActive, not
@@ -214,9 +220,12 @@ handleTabCommand' h tabsH = \case
     placeholderSid = case mkSessionId "tab-session" of
       Right s -> s
       Left _  -> error "placeholder session id"
-    renderTab t =
-      T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
-        <> maybe "" ("  " <>) (tLabel t)
+
+-- | Render one tab as a single line: @<index>  <kind>  [label]@.
+renderTab :: Tab -> Text
+renderTab t =
+  T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+    <> maybe "" ("  " <>) (tLabel t)
 
 -- | Full @seal signal@ startup wiring: paths -> config -> vault -> session
 -- -> backends -> registry -> spawn the Signal channel -> run the loop.

@@ -21,7 +21,7 @@ module Seal.Gateway.Send
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Exception (catch, fromException, SomeException)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
@@ -61,10 +61,11 @@ import Seal.Handles.AskReply
   , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
-import Seal.Handles.Tab (TabKind (KindProvider))
+import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Session.Log (logTurnError)
-import Seal.Tabs (TabsHandle, ensureTabForSession)
+import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
+import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -247,7 +248,7 @@ handleSend deps sid rawText = do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure SendAssistant
-      Right (SlashCommand _) -> do
+      Right (SlashCommand cmdName) -> do
         -- The web gateway is multi-session: srActive is a process-global ref
         -- that may point at a DIFFERENT session than this request targets.
         -- Slash commands like /skill load and /call dispatch an opcode via
@@ -270,7 +271,13 @@ handleSend deps sid rawText = do
         case r of
           SendError _ _ -> pure r
           _            -> do
-            ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
+            -- /tabs and /tab own their tab lifecycle (close/resume mutate
+            -- the list); auto-tabbing the request's session afterward would
+            -- resurrect a tab that /tabs close just removed. Skip the
+            -- auto-tab for these commands; still broadcast so the frontend
+            -- reflects any mutation.
+            unless (isTabCommand cmdName) $
+              ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure r
       Right NewSession -> do
@@ -282,8 +289,29 @@ handleSend deps sid rawText = do
             triggerBroadcast deps
             pure r
       Right (TabCommand _)   -> pure (SendSlash "(tab commands are not supported over the web send endpoint)" Nothing)
+      Right CurrentTab        -> do
+        tl <- snapshotTabs (sdTabsHandle deps)
+        pure $ case lookupByRef tl (BoundSession (smId meta)) of
+          Just t  -> SendSlash (renderWebTab t) Nothing
+          Nothing -> SendSlash "no current tab" Nothing
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
+
+-- | Render the current tab for the web send endpoint: @<index>  <kind>  [label]@.
+renderWebTab :: Tab -> Text
+renderWebTab t =
+  T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
+    <> maybe "" ("  " <>) (tLabel t)
+
+-- | True for slash commands that own their tab lifecycle (@/tabs ...@,
+-- @/tab@). Used to skip 'ensureTabForSession' on the web send path so a
+-- @/tabs close N@ that just removed a tab isn't immediately undone by the
+-- auto-tab. The head word is checked case-insensitively (the registry
+-- lookup is case-insensitive too).
+isTabCommand :: Text -> Bool
+isTabCommand cmdName =
+  let headWord = T.takeWhile (/= ' ') (T.strip cmdName)
+  in T.toCaseFold headWord `elem` ["tab", "tabs"]
 
 -- | 'ensureTabForSession' is defined in 'Seal.Tabs' and re-exported here for
 -- the web send path. See its Haddock there for the contract (idempotent,
