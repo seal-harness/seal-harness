@@ -194,6 +194,36 @@ describe('useSendMessage', () => {
     await act(async () => { res = await result.current.send('hi') })
     expect(res).toBeNull()
   })
+
+  it('resets sending to false when sessionId changes (no stale thinking indicator on the new tab)', async () => {
+    // Simulate a slow POST /send that never resolves while the user switches
+    // to a different session. The `sending` flag must reset so the idle tab
+    // does not show a thinking indicator (the activity stream's harness state
+    // drives the indicator for the original still-thinking session).
+    let resolveSend: ((v: { kind: string }) => void) | null = null
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      fetchCalls.push({ url })
+      return new Promise<Response>((resolve) => {
+        resolveSend = (v: { kind: string }) => resolve(new Response(JSON.stringify(v), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }))
+      })
+    }))
+    const { result, rerender } = renderHook(
+      ({ sid }: { sid: string | null }) => useSendMessage(sid, () => {}),
+      { initialProps: { sid: 's1' as string | null } },
+    )
+    // Kick off a send on s1 — the POST stays in flight (never resolves).
+    await act(async () => { void result.current.send('hi') })
+    await act(async () => { await Promise.resolve() })
+    expect(result.current.sending).toBe(true)
+    // Switch focus to s2 (an idle tab) → sending must reset to false.
+    rerender({ sid: 's2' })
+    expect(result.current.sending).toBe(false)
+    // Resolve the in-flight POST so the test does not leak a pending promise.
+    const rs = resolveSend as ((v: { kind: string }) => void) | null
+    if (rs !== null) rs({ kind: 'assistant' })
+  })
 })
 
 describe('session mutators', () => {

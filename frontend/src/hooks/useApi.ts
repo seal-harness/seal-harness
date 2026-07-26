@@ -330,6 +330,13 @@ export interface SendResult {
 export function useSendMessage(sessionId: string | null, onComplete: () => void) {
   const [sending, setSending] = useState(false)
 
+  // The optimistic `sending` flag is per-session: reset it when the focused
+  // session changes so a slow POST /send in flight on tab A does not leave
+  // tab B showing a thinking indicator. The activity stream's harness state
+  // drives the indicator for the original (still-thinking) session, so
+  // dropping `sending` on switch is lossless.
+  useEffect(() => { setSending(false) }, [sessionId])
+
   // `model` selects the per-session model for this turn (frontend-only state,
   // never persisted). When null/empty it is omitted from the body so the
   // backend falls back to the most-recent transcript `_te_model` (else the

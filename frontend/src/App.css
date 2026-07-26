@@ -30,12 +30,6 @@ body {
   50% { box-shadow: 0 0 0 3px transparent; }
 }
 
-@keyframes thinkingGradient {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
-}
-
 /* Ping-style: sharp onset, ease-out expansion, then hold at zero so each
    cycle reads as a discrete pulse instead of a continuous wash. The sharp
    leading edge is what makes the pulse register peripherally. */
@@ -87,13 +81,10 @@ body {
 }
 
 .dot-thinking {
-  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
-  background-size: 200% 200%;
-  /* Gradient shift keeps the dot "alive" up close; the halo gives it a
-     peripheral-vision-visible pulse on an 8px target. */
+  background: var(--accent-primary);
+  /* Halo pulse keeps the dot "alive" in peripheral vision on an 8px target. */
   animation:
-    thinkingGradient var(--gradient-duration)        ease                       infinite,
-    thinkingHalo     var(--thinking-halo-duration)   cubic-bezier(0, 0, 0.2, 1) infinite;
+    thinkingHalo var(--thinking-halo-duration) cubic-bezier(0, 0, 0.2, 1) infinite;
 }
 
 .dot-idle {
