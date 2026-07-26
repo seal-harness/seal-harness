@@ -97,7 +97,7 @@ import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
-import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
+import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
@@ -520,10 +520,14 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
     -- operatorCeiling for fetch bytes). SSRF protection is always enforced
     -- (in the opcode, via Seal.Web.UrlSafety), regardless of allow-list.
     webSearchCfg = WebSearchConfig
-      { wscManager   = httpManager
-      , wscEndpoint  = unwrapOpt wcSearchEndpoint webCfg ""
-      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
-      , wscAuthKey   = Nothing
+      { wscManager     = httpManager
+      , wscProvider    = parseProvider (unwrapOpt wcSearchProvider webCfg "parallel")
+      , wscEndpoint    = unwrapOpt wcSearchEndpoint webCfg ""
+      , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
+      , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
+      , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
+      , wscVault       = Just rt
+      , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
       }
     webFetchCfg = WebFetchConfig
       { wfcManager   = httpManager
@@ -722,6 +726,15 @@ unwrapOpt field webCfg def =
     Nothing   -> def
     Just cfg  -> fromMaybe def (field cfg)
 
+-- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
+-- section-absent case yields 'Nothing'; the section-present case yields the
+-- field's value (which may itself be 'Nothing').
+unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
+unwrapOptMaybe field webCfg =
+  case webCfg of
+    Nothing  -> Nothing
+    Just cfg -> field cfg
+
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
 -- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +
 -- loaded config + wsRoot + operatorCeiling.
@@ -832,8 +845,16 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
           { wfcManager = sdHttpManager deps, wfcAllowList = []
           , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }
         webSearchCfg = WebSearchConfig
-          { wscManager = sdHttpManager deps, wscEndpoint = ""
-          , wscAllowList = [], wscAuthKey = Nothing }
+          { wscManager = sdHttpManager deps
+          , wscProvider = parseProvider (unwrapOpt wcSearchProvider childWebCfg "parallel")
+          , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
+          , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
+          , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
+          , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
+          , wscVault = Just (sdVault deps)
+          , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
+          }
+        childWebCfg = either (const Nothing) rcWeb eCfg
 
 -- | Extract the 'Text' from a 'ModelId'.
 modelText :: ModelId -> Text

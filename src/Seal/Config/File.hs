@@ -194,6 +194,15 @@ data WebConfig = WebConfig
   , wcMaxFetchBytes   :: Maybe Int
     -- ^ Operator-configured byte ceiling for WEB_FETCH. Absent →
     -- 'defaultRetrievalMaxScanBytes' (128 KiB).
+  , wcSearchProvider :: Maybe Text
+    -- ^ Which search backend to use: @parallel@ (default), @searxng@,
+    -- @exa@, @firecrawl@, or @custom@. Absent → auto-select ('parallel').
+  , wcSearchMaxResults :: Maybe Int
+    -- ^ Max results per search (default: 10).
+  , wcSearXngUrl     :: Maybe Text
+    -- ^ SearXNG instance URL (default: @http://localhost:8888@).
+  , wcSearchAuthKey  :: Maybe Text
+    -- ^ Vault key name for the search provider's API key.
   } deriving stock (Eq, Show)
 
 -- | Starting state: all fields absent, before @\/vault setup@ is run.
@@ -223,6 +232,10 @@ defaultWebConfig = WebConfig
   , wcSearchAllowList = Nothing
   , wcFetchAllowList  = Nothing
   , wcMaxFetchBytes   = Nothing
+  , wcSearchProvider = Nothing
+  , wcSearchMaxResults = Nothing
+  , wcSearXngUrl = Nothing
+  , wcSearchAuthKey = Nothing
   }
 
 -- | The @[workdir]@ section: per-session workdir lifecycle. Every field
@@ -346,6 +359,10 @@ webConfigCodec = WebConfig
   <*> Toml.dioptional (arrayOfText "search_allow_list") .= wcSearchAllowList
   <*> Toml.dioptional (arrayOfText "fetch_allow_list")  .= wcFetchAllowList
   <*> Toml.dioptional (Toml.int    "max_fetch_bytes")   .= wcMaxFetchBytes
+  <*> Toml.dioptional (Toml.text "search_provider") .= wcSearchProvider
+  <*> Toml.dioptional (Toml.int  "search_max_results") .= wcSearchMaxResults
+  <*> Toml.dioptional (Toml.text "searxng_url") .= wcSearXngUrl
+  <*> Toml.dioptional (Toml.text "search_auth_key") .= wcSearchAuthKey
 
 -- | TOML codec for an array-of-text. tomland doesn't export a direct
 -- @[_Text]@ codec, so we use 'Toml.arrayOf' with 'Toml._Text'.

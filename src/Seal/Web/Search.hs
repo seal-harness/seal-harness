@@ -8,6 +8,9 @@
 module Seal.Web.Search
   ( webSearchOp
   , WebSearchConfig (..)
+  , SearchProvider (..)
+  , parseProvider
+  , providerName
   ) where
 
 import Control.Exception (try)
@@ -29,13 +32,46 @@ import Network.HTTP.Types (statusCode)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Vault.Commands (VaultRuntime)
+
+-- | Which search backend to use. 'ProviderParallel' is the zero-config
+-- default (free MCP endpoint, no API key needed).
+data SearchProvider
+  = ProviderParallel    -- ^ Parallel Search (free MCP or REST with key)
+  | ProviderSearXNG     -- ^ Self-hosted SearXNG instance
+  | ProviderExa         -- ^ Exa search API (requires key)
+  | ProviderFirecrawl   -- ^ Firecrawl search API (requires key)
+  | ProviderCustom      -- ^ User-configured custom endpoint (legacy behavior)
+  deriving stock (Eq, Show)
+
+-- | Parse a provider name from config text. Unknown values default to
+-- 'ProviderParallel' (the zero-config default).
+parseProvider :: Text -> SearchProvider
+parseProvider t = case T.toLower t of
+  "searxng"   -> ProviderSearXNG
+  "exa"       -> ProviderExa
+  "firecrawl" -> ProviderFirecrawl
+  "custom"    -> ProviderCustom
+  _           -> ProviderParallel
+
+-- | Render a provider to its canonical string name (for 'orRecorded').
+providerName :: SearchProvider -> Text
+providerName ProviderParallel  = "parallel"
+providerName ProviderSearXNG   = "searxng"
+providerName ProviderExa       = "exa"
+providerName ProviderFirecrawl = "firecrawl"
+providerName ProviderCustom    = "custom"
 
 -- | The configuration for WEB_SEARCH.
 data WebSearchConfig = WebSearchConfig
-  { wscManager   :: Maybe Manager  -- ^ HTTP manager (Nothing = fail-closed)
-  , wscEndpoint  :: Text          -- ^ the search API endpoint URL (empty = fail-closed)
-  , wscAllowList :: [Text]        -- ^ allowed domains (empty = all allowed)
-  , wscAuthKey   :: Maybe Text    -- ^ vault key reference (NOT inline auth)
+  { wscManager     :: Maybe Manager     -- ^ HTTP manager (Nothing = fail-closed)
+  , wscProvider    :: SearchProvider    -- ^ which backend to use
+  , wscEndpoint    :: Text             -- ^ endpoint URL (empty = use provider default)
+  , wscAllowList   :: [Text]           -- ^ allowed domains (empty = all allowed)
+  , wscAuthKey     :: Maybe Text       -- ^ vault key reference for API key
+  , wscMaxResults  :: Int              -- ^ max results to return (0 = provider default)
+  , wscVault       :: Maybe VaultRuntime  -- ^ vault for resolving API keys
+  , wscSearXngUrl  :: Maybe Text       -- ^ SearXNG instance URL (Nothing = localhost:8888)
   }
 
 -- | WEB_SEARCH opcode. Input: @{ query: Text }@. The auth header is

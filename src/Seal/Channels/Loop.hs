@@ -149,7 +149,7 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
-import Seal.Web.Search (webSearchOp, WebSearchConfig (..))
+import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
 -- | The dependencies a channel turn needs to have full parity with the web
 -- and CLI paths. Built once at startup (in 'Seal.Command.Serve' or the
@@ -752,10 +752,14 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
     securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
     binAllowList = Nothing
     webSearchCfg = WebSearchConfig
-      { wscManager   = httpManager
-      , wscEndpoint  = unwrapOpt wcSearchEndpoint webCfg ""
-      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
-      , wscAuthKey   = Nothing
+      { wscManager     = httpManager
+      , wscProvider    = parseProvider (unwrapOpt wcSearchProvider webCfg "parallel")
+      , wscEndpoint    = unwrapOpt wcSearchEndpoint webCfg ""
+      , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
+      , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
+      , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
+      , wscVault       = Just rt
+      , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
       }
     webFetchCfg = WebFetchConfig
       { wfcManager   = httpManager
@@ -783,6 +787,15 @@ unwrapOpt field webCfg def =
   case webCfg of
     Nothing   -> def
     Just cfg  -> fromMaybe def (field cfg)
+
+-- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
+-- section-absent case yields 'Nothing'; the section-present case yields the
+-- field's value (which may itself be 'Nothing').
+unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
+unwrapOptMaybe field webCfg =
+  case webCfg of
+    Nothing  -> Nothing
+    Just cfg -> field cfg
 
 -- 'UntrustedIO' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
 -- child's narrowed registry). The worker-builder is 'channelMkWorker'
@@ -901,9 +914,14 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
           , wfcAuthKey = Nothing }
         webSearchCfg = WebSearchConfig
           { wscManager = cdHttpManager deps
+          , wscProvider = parseProvider (unwrapOpt wcSearchProvider childWebCfg "parallel")
           , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
           , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
-          , wscAuthKey = Nothing }
+          , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
+          , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
+          , wscVault = Just (cdVault deps)
+          , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
+          }
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
