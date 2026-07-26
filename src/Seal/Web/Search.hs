@@ -34,9 +34,9 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TEE
 import Data.Vector qualified as V
 import Network.HTTP.Client
-  ( HttpException, Manager, RequestBody (..), httpLbs, parseRequest
+  ( HttpException, Manager, RequestBody (..), httpLbs, method, parseRequest
   , requestBody, requestHeaders, responseBody, responseStatus )
-import Network.HTTP.Types (statusCode, urlEncode)
+import Network.HTTP.Types (methodPost, statusCode, urlEncode)
 
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
@@ -212,7 +212,8 @@ searchParallelMcp mgr _cfg q = do
             , "id"      .= (1 :: Int)
             ]
           req = initReq
-            { requestBody = RequestBodyLBS body
+            { method = methodPost
+            , requestBody = RequestBodyLBS body
             , requestHeaders =
                 [ ("content-type", "application/json")
                 , ("accept", "application/json, text/event-stream")
@@ -304,7 +305,8 @@ searchParallelRest mgr cfg q apiKey = do
       pure (mkError q "parallel" "WEB_SEARCH: invalid Parallel REST endpoint URL")
     Right initReq -> do
       let req = initReq
-            { requestBody = RequestBodyLBS body
+            { method = methodPost
+            , requestBody = RequestBodyLBS body
             , requestHeaders =
                 [ ("content-type", "application/json")
                 , ("x-api-key", TE.encodeUtf8 apiKey)
@@ -445,7 +447,8 @@ searchExa mgr cfg q = do
           pure (mkError q "exa" "WEB_SEARCH: invalid Exa endpoint URL")
         Right initReq -> do
           let req = initReq
-                { requestBody = RequestBodyLBS body
+                { method = methodPost
+                , requestBody = RequestBodyLBS body
                 , requestHeaders =
                     [ ("content-type", "application/json")
                     , ("x-api-key", TE.encodeUtf8 apiKey)
@@ -510,7 +513,8 @@ searchFirecrawl mgr cfg q = do
           pure (mkError q "firecrawl" "WEB_SEARCH: invalid Firecrawl endpoint URL")
         Right initReq -> do
           let req = initReq
-                { requestBody = RequestBodyLBS body
+                { method = methodPost
+                , requestBody = RequestBodyLBS body
                 , requestHeaders =
                     [ ("content-type", "application/json")
                     , ("authorization", "Bearer " <> TE.encodeUtf8 apiKey)
@@ -589,7 +593,8 @@ searchCustom mgr cfg q
         Right initReq -> do
           let body = A.encode (A.object ["query" .= q])
               req = initReq
-                { requestBody = RequestBodyLBS body
+                { method = methodPost
+                , requestBody = RequestBodyLBS body
                 , requestHeaders = [("content-type", "application/json")]
                 }
           eResp <- try (httpLbs req mgr)
