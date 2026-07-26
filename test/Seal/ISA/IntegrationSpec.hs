@@ -93,7 +93,7 @@ import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Browser (browserClickOp, browserOpenOp, browserReadOp,
                          noBrowserDriver)
 import Seal.Web.Fetch (WebFetchConfig (..), webFetchOp)
-import Seal.Web.Search (WebSearchConfig (..), webSearchOp)
+import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (ProviderParallel))
 
 -- ---------------------------------------------------------------------------
 -- Test helpers
@@ -101,6 +101,20 @@ import Seal.Web.Search (WebSearchConfig (..), webSearchOp)
 
 runTestApp :: App a -> IO a
 runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+
+-- | A minimal 'WebSearchConfig' for tests: no manager (fail-closed),
+-- 'ProviderParallel' default, empty allow-list, no vault/key.
+defaultTestSearchCfg :: WebSearchConfig
+defaultTestSearchCfg = WebSearchConfig
+  { wscManager    = Nothing
+  , wscProvider   = ProviderParallel
+  , wscEndpoint   = "https://x"
+  , wscAllowList  = []
+  , wscAuthKey    = Nothing
+  , wscMaxResults = 10
+  , wscVault      = Nothing
+  , wscSearXngUrl = Nothing
+  }
 
 -- | A scripted provider that pops 'CompletionResponse's from an IORef.
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
@@ -940,9 +954,13 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Search the web for 'Haskell runtime'.\" -> WEB_SEARCH -> query accepted, fail-closed result (no HTTP manager)" $ do
       let cfg = WebSearchConfig
             { wscManager = Nothing
+            , wscProvider = ProviderParallel
             , wscEndpoint = "https://search.example.com/api"
             , wscAllowList = ["example.com"]
             , wscAuthKey = Nothing
+            , wscMaxResults = 10
+            , wscVault = Nothing
+            , wscSearXngUrl = Nothing
             }
           op = webSearchOp cfg
           reg = Registry.mkRegistry [op]
@@ -961,7 +979,7 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Search for ''.\" -> WEB_SEARCH with empty query -> Denied at the gate" $ do
-      let cfg = WebSearchConfig Nothing "https://x" [] Nothing
+      let cfg = defaultTestSearchCfg
           op = webSearchOp cfg
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOne reg (OpName "WEB_SEARCH")
