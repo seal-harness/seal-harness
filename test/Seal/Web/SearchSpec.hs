@@ -2,6 +2,7 @@
 module Seal.Web.SearchSpec (spec) where
 
 import Data.Aeson (object, (.=))
+import Data.Text qualified as T
 import Test.Hspec
 
 import Seal.ISA.Opcode (uoAuthorize)
@@ -26,6 +27,18 @@ spec = describe "WEB_SEARCH" $ do
         op = webSearchOp cfg
     uoAuthorize op (object []) `shouldBe` Left "WEB_SEARCH requires {query:string}"
 
+  it "rejects a negative limit" $ do
+    let cfg = defaultTestCfg
+        op = webSearchOp cfg
+    uoAuthorize op (object ["query" .= ("test" :: String), "limit" .= ((-1) :: Int)])
+      `shouldBe` Left "WEB_SEARCH: limit must be >= 1"
+
+  it "accepts a valid limit" $ do
+    let cfg = defaultTestCfg
+        op = webSearchOp cfg
+    uoAuthorize op (object ["query" .= ("test" :: String), "limit" .= (5 :: Int)])
+      `shouldBe` Right ()
+
   it "parseProvider maps known names correctly" $ do
     parseProvider "parallel"  `shouldBe` ProviderParallel
     parseProvider "searxng"   `shouldBe` ProviderSearXNG
@@ -40,6 +53,13 @@ spec = describe "WEB_SEARCH" $ do
     providerName ProviderExa       `shouldBe` "exa"
     providerName ProviderFirecrawl `shouldBe` "firecrawl"
     providerName ProviderCustom    `shouldBe` "custom"
+
+  it "encodeResults produces valid JSON with a results array" $ do
+    let results = [SearchResult "Title" "https://example.com" "Description" 1]
+        encoded = encodeResults results
+    encoded `shouldSatisfy` ("results" `T.isInfixOf`)
+    encoded `shouldSatisfy` ("Title" `T.isInfixOf`)
+    encoded `shouldSatisfy` ("example.com" `T.isInfixOf`)
 
   where
     defaultTestCfg :: WebSearchConfig

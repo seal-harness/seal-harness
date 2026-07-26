@@ -6,6 +6,7 @@
 -- transcript via the dispatcher.)
 module Seal.ISA.Ops.Secret
   ( secretGetOp
+  , vaultGetByName
   ) where
 
 import Control.Monad.IO.Class (liftIO)

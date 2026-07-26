@@ -730,10 +730,7 @@ unwrapOpt field webCfg def =
 -- section-absent case yields 'Nothing'; the section-present case yields the
 -- field's value (which may itself be 'Nothing').
 unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
-unwrapOptMaybe field webCfg =
-  case webCfg of
-    Nothing  -> Nothing
-    Just cfg -> field cfg
+unwrapOptMaybe = maybe Nothing
 
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
 -- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +

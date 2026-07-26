@@ -130,6 +130,7 @@ library
         Seal.Tools.Exec.Untrusted
         Seal.Tools.Exec.UntrustedIO
         Seal.Web.Search
+        Seal.Web.SearXngSetup
         Seal.Web.Fetch
         Seal.Web.UrlSafety
         Seal.Web.Browser

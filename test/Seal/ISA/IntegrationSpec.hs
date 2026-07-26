@@ -975,6 +975,7 @@ spec = describe "Seal.ISA.Integration" $ do
           orRecorded res `shouldBe` object
             [ "query" .= ("Haskell runtime" :: Text)
             , "result_count" .= (0 :: Int)
+            , "provider" .= ("parallel" :: Text)
             ]
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
