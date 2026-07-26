@@ -196,6 +196,13 @@ export default function App() {
   const tabSessions = wsLive ? wsLists.tabSessions
     : usePollLists ? polledLists.tabSessions
     : []
+  // Thinking-session hydration set for the sidebar (so a refresh mid-turn
+  // does not blank the indicator). Sourced from the active list provider
+  // (WS when live, else the REST poll). Empty for the legacy three-poll
+  // fallback (older servers without /api/lists).
+  const thinkingSessionIds = wsLive ? wsLists.thinkingSessionIds
+    : usePollLists ? polledLists.thinkingSessionIds
+    : []
   const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
@@ -235,7 +242,7 @@ export default function App() {
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   const { entries: httpEntries, loading, refresh } = useTranscript(currentSessionId)
   const { entries: streamEntries, pendingQuestions } = useTranscriptStream(currentSessionId)
-  const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId)
+  const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = useMemo(() => {
     if (streamEntries.length === 0) return httpEntries
     let merged: TranscriptEntry[] = httpEntries

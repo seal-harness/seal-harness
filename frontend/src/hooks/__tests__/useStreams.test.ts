@@ -3,7 +3,7 @@ import { renderHook, act } from '@testing-library/react'
 import { useListsStream } from '../useListsStream'
 import { useTranscriptStream, reconcileEntries } from '../useTranscriptStream'
 import { useSessionActivityStream, applyActivity, clearUnread } from '../useSessionActivityStream'
-import type { StreamClient, ListsSnapshot, ActivityEvent } from '../../types/stream'
+import type { StreamClient, ListsSnapshot, ActivityEvent, SessionActivityState } from '../../types/stream'
 import type { TranscriptEntry } from '../../types'
 
 /** Build a fake StreamClient whose listeners we can drive from tests. */
@@ -65,7 +65,7 @@ describe('useListsStream', () => {
     act(() => {
       c.pushLists({
         tabs: [{ index: 0, kind: 'session:anthropic', label: null, status: 'running', session_id: 's1' }],
-        recentSessions: [{ id: 's2', agent: null, runtime: 'r', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: null, channelUserId: null }],
+        recentSessions: [{ id: 's2', agent: null, runtime: 'r', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: null, channelUserId: null, lastUserMessageAt: null }],
         archivedSessions: [],
         tabSessions: [],
       })
@@ -155,7 +155,7 @@ describe('applyActivity', () => {
   })
 
   it('is a no-op when harness-status carries the same value', () => {
-    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null } }
+    const before = { s1: { harness: 'idle' as const, unread: 0, lastEntryAt: null, seenAt: null } }
     const result = applyActivity(before, 's1', { kind: 'harness-status', status: 'idle' })
     expect(result).toBe(before)
   })
@@ -168,19 +168,46 @@ describe('applyActivity', () => {
     const result2 = applyActivity(result, 's1', { kind: 'session-created', session: { id: 's1', runtime: 'r', model: 'm', channel: 'cli', created_at: 't', last_active: 't' } })
     expect(result2).toBe(result)
   })
+
+  it('sets seenAt on reply-delivered (advances forward only)', () => {
+    const before = { s1: { harness: null as never, unread: 2, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z' } }
+    const r1 = applyActivity(before, 's1', { kind: 'reply-delivered', timestamp: '2025-01-01T00:00:00.000Z' })
+    expect(r1['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+    // An older delivered timestamp does NOT regress seenAt.
+    const r2 = applyActivity(r1, 's1', { kind: 'reply-delivered', timestamp: '2023-01-01T00:00:00.000Z' })
+    expect(r2['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+    // A malformed timestamp does NOT regress seenAt (defensive).
+    const r3 = applyActivity(r1, 's1', { kind: 'reply-delivered', timestamp: 'not-a-date' })
+    expect(r3['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+  })
 })
 
 describe('clearUnread', () => {
   it('zeros the unread counter for a session', () => {
-    const before = { s1: { harness: null, unread: 5, lastEntryAt: 't' } }
+    const before = { s1: { harness: null, unread: 5, lastEntryAt: 't', seenAt: null } }
     const result = clearUnread(before, 's1')
     expect(result['s1']!.unread).toBe(0)
   })
 
-  it('is a no-op when unread is already 0 or the session is unknown', () => {
-    const before = { s1: { harness: null, unread: 0, lastEntryAt: null } }
-    expect(clearUnread(before, 's1')).toBe(before)
-    expect(clearUnread(before, 'unknown')).toBe(before)
+  it('is a no-op when unread is already 0 and seenAt is already at-or-after the focus timestamp', () => {
+    const before = { s1: { harness: null, unread: 0, lastEntryAt: null, seenAt: '2099-01-01T00:00:00.000Z' } }
+    expect(clearUnread(before, 's1', '2099-01-01T00:00:00.000Z')).toBe(before)
+  })
+
+  it('marks the session seen at the focus timestamp (advances seenAt forward only)', () => {
+    const before = { s1: { harness: null, unread: 0, lastEntryAt: 't', seenAt: '2024-01-01T00:00:00.000Z' } }
+    const result = clearUnread(before, 's1', '2025-01-01T00:00:00.000Z')
+    expect(result['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+    // An older focus timestamp does NOT regress seenAt.
+    const result2 = clearUnread(result, 's1', '2023-01-01T00:00:00.000Z')
+    expect(result2['s1']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+  })
+
+  it('seeds a default seen state for a previously-unknown session', () => {
+    const before = {} as Record<string, SessionActivityState>
+    const result = clearUnread(before, 'new', '2025-01-01T00:00:00.000Z')
+    expect(result['new']!.seenAt).toBe('2025-01-01T00:00:00.000Z')
+    expect(result['new']!.unread).toBe(0)
   })
 })
 
@@ -198,5 +225,28 @@ describe('useSessionActivityStream', () => {
     await act(async () => { c.pushActivity('s1', { kind: 'entry-at', timestamp: 't2' }) })
     expect(result.current.sessions['s1']!.unread).toBe(0)
     expect(result.current.sessions['s1']!.lastEntryAt).toBe('t2')
+  })
+
+  it('hydrates thinking state from the lists snapshot thinkingSessionIds', async () => {
+    const c = fakeClient()
+    const { result, rerender } = renderHook(
+      ({ ids }: { ids: string[] }) => useSessionActivityStream(null, c, ids),
+      { initialProps: { ids: [] as string[] } },
+    )
+    // No thinking set yet → no state.
+    expect(Object.keys(result.current.sessions)).toHaveLength(0)
+    // A lists snapshot arrives reporting s1 + s2 are mid-turn → hydrate.
+    rerender({ ids: ['s1', 's2'] })
+    expect(result.current.sessions['s1']!.harness).toBe('thinking')
+    expect(result.current.sessions['s2']!.harness).toBe('thinking')
+    // A live harness-status event wins over the hydration seed (s1 goes
+    // idle); the seed never overrides a definitive live event.
+    await act(async () => { c.pushActivity('s1', { kind: 'harness-status', status: 'idle' }) })
+    expect(result.current.sessions['s1']!.harness).toBe('idle')
+    // Re-running the same hydration does NOT re-seed s1 (it stays idle,
+    // not thinking) — the seed only fills null/missing harness fields.
+    rerender({ ids: ['s1', 's2'] })
+    expect(result.current.sessions['s1']!.harness).toBe('idle')
+    expect(result.current.sessions['s2']!.harness).toBe('thinking')
   })
 })

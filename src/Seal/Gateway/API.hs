@@ -49,7 +49,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
-import Seal.Gateway.StreamBroker (StreamBroker)
+import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
 import Seal.Harness.Id (newHarnessId)
@@ -103,7 +103,10 @@ apiApp deps req respond =
     -- field — the WS @lists@ frame wraps it with @{"type": "lists", ...}@).
     -- The frontend's primary source (WS) and REST fallback (this endpoint).
     (m', ["api", "lists"]) | m' == methodGet -> do
-      snap <- buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps))
+      thinkingSids <- case adBroker deps of
+        Just broker -> thinkingSessions broker
+        Nothing    -> pure Set.empty
+      snap <- buildListsSnapshot (adTabsHandle deps) (srPaths (adSessionRuntime deps)) thinkingSids
       respond (jsonLBS status200 (A.encode snap))
     -- GET /api/sessions -> the recent, non-archived sessions. Archiving is a
     -- pure UI hint persisted as an @archived@ marker file in the session

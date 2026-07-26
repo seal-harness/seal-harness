@@ -26,6 +26,7 @@ module Seal.Session.Lock
   , replySubscribe
   , replyUnsubscribe
   , replyFanout
+  , replySubscriberCount
   , replyMigrateAll
   ) where
 
@@ -145,6 +146,14 @@ replyFanout (ReplyRegistry tv) sid text = do
   where
     safeSend h t = chSend h t `catch` \e ->
       hPutStrLn stderr ("reply fanout: send failed: " <> show (e :: IOException))
+
+-- | The number of channels currently subscribed to a session's replies.
+-- Used by the web send path to decide whether the last assistant reply
+-- counts as "seen" (delivered to ≥1 chat channel) for the sidebar's
+-- tab-status indicator.
+replySubscriberCount :: ReplyRegistry -> SessionId -> IO Int
+replySubscriberCount (ReplyRegistry tv) sid =
+  maybe 0 length . Map.lookup sid <$> readTVarIO tv
 
 -- | Migrate every 'ReplySink' subscribed to @oldSid@ to @newSid@. Used by
 -- @\/new@ when a tab is rebound to a fresh session: the channel handles

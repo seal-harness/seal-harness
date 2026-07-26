@@ -10,6 +10,7 @@ export function useListsStream(client?: StreamClient) {
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
   const [tabSessions, setTabSessions] = useState<SessionInfo[]>([])
+  const [thinkingSessionIds, setThinkingSessionIds] = useState<string[]>([])
 
   useEffect(() => {
     const unsub = sc.onLists((snapshot: ListsSnapshot) => {
@@ -23,9 +24,12 @@ export function useListsStream(client?: StreamClient) {
       // separately so a tab can still resolve its session (label + edit pencil).
       // Tolerate older servers that omit the field by defaulting to [].
       setTabSessions(snapshot.tabSessions ?? [])
+      // Hydration set for the sidebar's thinking indicator (see
+      // useSessionActivityStream). Tolerate older servers that omit the field.
+      setThinkingSessionIds(snapshot.thinkingSessionIds ?? [])
     })
     return unsub
   }, [sc])
 
-  return { tabs, recentSessions, archivedSessions, tabSessions }
+  return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds }
 }

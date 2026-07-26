@@ -16,22 +16,33 @@
 -- can be layered in here without changing the call sites.
 module Seal.Gateway.Broadcast
   ( broadcastListsSnapshot
+  , broadcastHarnessStatus
+  , broadcastReplyDelivered
   ) where
 
+import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Time (getCurrentTime)
 
 import Seal.Config.Paths (SealPaths)
+import Seal.Core.Types (SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
-import Seal.Gateway.StreamBroker (StreamBroker, broadcastLists)
+import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
+import Seal.Gateway.Transcript (showIso)
 import Seal.Tabs (TabsHandle)
 
 -- | Build the WS @lists@ envelope (@{"type": "lists", ...}@) from the
 -- current state and push it to every WS subscriber via 'broadcastLists'.
+-- Includes the broker's current thinking-session set so a freshly-connected
+-- web client hydrates its sidebar (mid-turn tabs show Thinking immediately).
 broadcastListsSnapshot :: StreamBroker -> TabsHandle -> SealPaths -> IO ()
 broadcastListsSnapshot broker tabsH paths = do
-  snap <- buildListsSnapshot tabsH paths
+  thinkingSids <- thinkingSessions broker
+  snap <- buildListsSnapshot tabsH paths thinkingSids
   -- Merge the "type": "lists" tag into the snapshot object so the WS frame
   -- carries the discriminator the frontend's useListsStream dispatches on.
   let snapObj = case A.toJSON snap of
@@ -39,3 +50,39 @@ broadcastListsSnapshot broker tabsH paths = do
         other      -> KeyMap.singleton (Key.fromText "snapshot") other
       envelope = A.Object (KeyMap.insert (Key.fromText "type") (A.String "lists") snapObj)
   broadcastLists broker envelope
+
+-- | Push a per-session @harness-status@ activity signal to every WS
+-- subscriber focused on the session. The frontend's
+-- @useSessionActivityStream@ consumes the @activity@ envelope to drive the
+-- tab status indicator (Thinking while the LLM is actively processing,
+-- Idle otherwise). 'Nothing' broker (tests) is a no-op. @status@ is
+-- @"thinking"@ at turn start and @"idle"@ at turn end (including failures).
+-- Also updates the broker's in-memory thinking set so a freshly-connected
+-- web client can hydrate its sidebar from the lists snapshot without
+-- waiting for the next harness-status event.
+broadcastHarnessStatus :: Maybe StreamBroker -> SessionId -> Text -> IO ()
+broadcastHarnessStatus mBroker sid status =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> do
+      setThinking broker sid (status == "thinking")
+      broadcast broker (BeActivity sid (object
+        [ "kind" .= ("harness-status" :: Text)
+        , "status" .= status
+        ]))
+
+-- | Push a per-session @reply-delivered@ activity signal to every WS
+-- subscriber focused on the session. Marks the last assistant reply as
+-- "seen" because it was delivered to ≥1 subscribed chat channel
+-- (Signal/Telegram/CLI), so the frontend transitions the tab to Idle Read.
+-- 'Nothing' broker (tests) is a no-op. The timestamp defaults to now.
+broadcastReplyDelivered :: Maybe StreamBroker -> SessionId -> IO ()
+broadcastReplyDelivered mBroker sid =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> do
+      now <- getCurrentTime
+      broadcast broker (BeActivity sid (object
+        [ "kind" .= ("reply-delivered" :: Text)
+        , "timestamp" .= T.pack (showIso now)
+        ]))

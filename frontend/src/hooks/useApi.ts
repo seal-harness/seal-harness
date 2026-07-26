@@ -193,6 +193,10 @@ export interface ListsPollResult {
   recentSessions: SessionInfo[]
   archivedSessions: SessionInfo[]
   tabSessions: SessionInfo[]
+  /** Sessions the backend reports are currently thinking — hydrates the
+   *  sidebar on (re)connect/refresh. Tolerant of older servers (defaults
+   *  to []). */
+  thinkingSessionIds: string[]
   error: boolean
   refresh: () => void
 }
@@ -202,6 +206,7 @@ interface ListsWire {
   recentSessions: SessionInfo[]
   archivedSessions: SessionInfo[]
   tabSessions: SessionInfo[]
+  thinkingSessionIds?: string[]
 }
 
 export function useListsPoll(): ListsPollResult {
@@ -209,6 +214,7 @@ export function useListsPoll(): ListsPollResult {
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
   const [tabSessions, setTabSessions] = useState<SessionInfo[]>([])
+  const [thinkingSessionIds, setThinkingSessionIds] = useState<string[]>([])
   const [error, setError] = useState(false)
 
   const poll = useCallback(async () => {
@@ -218,6 +224,7 @@ export function useListsPoll(): ListsPollResult {
       setRecentSessions(data.recentSessions ?? [])
       setArchivedSessions(data.archivedSessions ?? [])
       setTabSessions(data.tabSessions ?? [])
+      setThinkingSessionIds(data.thinkingSessionIds ?? [])
       setError(false)
     } else {
       setError(true)
@@ -230,7 +237,7 @@ export function useListsPoll(): ListsPollResult {
     return () => clearInterval(id)
   }, [poll])
 
-  return { tabs, recentSessions, archivedSessions, tabSessions, error, refresh: poll }
+  return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }
 }
 
 /** On-demand discovery of adoptable external tmux windows. Unlike the other
