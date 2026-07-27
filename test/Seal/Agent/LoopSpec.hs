@@ -88,24 +88,26 @@ spec = describe "Seal.Agent.Loop" $ do
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
     let env = AgentEnv
-                (SomeProvider (ScriptProvider ref))
-                "ollama"
-                (ModelId "m")
-                Nothing
-                (mkRegistry [stubOp])
-                h
-                localBackend
-                mkRemoteUntrustedIOStub
-                caps
-                (either (error "sid") id (mkSessionId "s1"))
-                8
-                Nothing
-                Full
-                approvals
-                Nothing
-                (pure ())
-                False
-                Nothing
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry [stubOp]
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
     readIORef sent `shouldReturn` ["ollama/m> all done"]
@@ -122,24 +124,26 @@ spec = describe "Seal.Agent.Loop" $ do
     ref <- newIORef script
     (h, readState) <- fakeTwoFileTranscript
     let env = AgentEnv
-                (SomeProvider (ScriptProvider ref))
-                "ollama"
-                (ModelId "m")
-                Nothing
-                (mkRegistry [])
-                h
-                localBackend
-                mkRemoteUntrustedIOStub
-                caps
-                (either (error "sid") id (mkSessionId "s1"))
-                8
-                Nothing
-                Full
-                approvals
-                Nothing
-                (pure ())
-                False
-                Nothing
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
     -- conversation.jsonl: user "hi" + assistant "reply" (2 lines)
@@ -175,24 +179,26 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef (script1 ++ script2)
       withTwoFileTranscript dir $ \h -> do
         let mkEnv' = AgentEnv
-                      (SomeProvider (ScriptProvider ref))
-                      "ollama"
-                      (ModelId "m")
-                      Nothing
-                      (mkRegistry [])
-                      h
-                      localBackend
-                      mkRemoteUntrustedIOStub
-                      caps
-                      (either (error "sid") id (mkSessionId "s1"))
-                      8
-                      Nothing
-                      Full
-                      approvals
-                      Nothing
-                      (pure ())
-                      False
-                      Nothing
+                      { aeProvider = SomeProvider (ScriptProvider ref)
+                      , aeProviderLabel = "ollama"
+                      , aeModel = ModelId "m"
+                      , aeSystem = Nothing
+                      , aeRegistry = mkRegistry []
+                      , aeTranscript = h
+                      , aeBackend = localBackend
+                      , aeUntrustedIO = mkRemoteUntrustedIOStub
+                      , aeCaps = caps
+                      , aeSession = either (error "sid") id (mkSessionId "s1")
+                      , aeMaxTurns = 8
+                      , aeMessageSource = Nothing
+                      , aeAutonomy = Full
+                      , aeApprovals = approvals
+                      , aeDebugRequestsPath = Nothing
+                      , aeOnEntry = pure ()
+                      , aeOnUserMessage = Nothing
+                      , aeOnDemandSchemas = False
+                      , aeLogPath = Nothing
+                      }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- The on-disk conversation.jsonl must contain exactly 4 lines:
@@ -226,24 +232,26 @@ spec = describe "Seal.Agent.Loop" $ do
       let reqPath = dir </> "requests.jsonl"
       withTwoFileTranscript dir $ \h -> do
         let mkEnv' = AgentEnv
-                      (SomeProvider (ScriptProvider ref))
-                      "ollama"
-                      (ModelId "m")
-                      Nothing
-                      (mkRegistry [])
-                      h
-                      localBackend
-                      mkRemoteUntrustedIOStub
-                      caps
-                      (either (error "sid") id (mkSessionId "s1"))
-                      8
-                      Nothing
-                      Full
-                      approvals
-                      (Just reqPath)
-                      (pure ())
-                      False
-                      Nothing
+                      { aeProvider = SomeProvider (ScriptProvider ref)
+                      , aeProviderLabel = "ollama"
+                      , aeModel = ModelId "m"
+                      , aeSystem = Nothing
+                      , aeRegistry = mkRegistry []
+                      , aeTranscript = h
+                      , aeBackend = localBackend
+                      , aeUntrustedIO = mkRemoteUntrustedIOStub
+                      , aeCaps = caps
+                      , aeSession = either (error "sid") id (mkSessionId "s1")
+                      , aeMaxTurns = 8
+                      , aeMessageSource = Nothing
+                      , aeAutonomy = Full
+                      , aeApprovals = approvals
+                      , aeDebugRequestsPath = Just reqPath
+                      , aeOnEntry = pure ()
+                      , aeOnUserMessage = Nothing
+                      , aeOnDemandSchemas = False
+                      , aeLogPath = Nothing
+                      }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- requests.jsonl has one line per provider call. Each line is the full
@@ -293,24 +301,26 @@ spec = describe "Seal.Agent.Loop" $ do
       let reqPath = dir </> "requests.jsonl"
       withTwoFileTranscript dir $ \h -> do
         let mkEnv' = AgentEnv
-                      (SomeProvider (ScriptProvider ref))
-                      "ollama"
-                      (ModelId "m")
-                      Nothing
-                      (mkRegistry [])
-                      h
-                      localBackend
-                      mkRemoteUntrustedIOStub
-                      caps
-                      (either (error "sid") id (mkSessionId "s1"))
-                      8
-                      Nothing
-                      Full
-                      approvals
-                      (Just reqPath)
-                      (pure ())
-                      False
-                      Nothing
+                      { aeProvider = SomeProvider (ScriptProvider ref)
+                      , aeProviderLabel = "ollama"
+                      , aeModel = ModelId "m"
+                      , aeSystem = Nothing
+                      , aeRegistry = mkRegistry []
+                      , aeTranscript = h
+                      , aeBackend = localBackend
+                      , aeUntrustedIO = mkRemoteUntrustedIOStub
+                      , aeCaps = caps
+                      , aeSession = either (error "sid") id (mkSessionId "s1")
+                      , aeMaxTurns = 8
+                      , aeMessageSource = Nothing
+                      , aeAutonomy = Full
+                      , aeApprovals = approvals
+                      , aeDebugRequestsPath = Just reqPath
+                      , aeOnEntry = pure ()
+                      , aeOnUserMessage = Nothing
+                      , aeOnDemandSchemas = False
+                      , aeLogPath = Nothing
+                      }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
       -- Read back the two-file format + the debug requests file.
@@ -394,9 +404,26 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = reg
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = uio
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Supervised
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
 
@@ -415,9 +442,26 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = reg
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = uio
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Supervised
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` False
 
@@ -436,9 +480,26 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing reg h localBackend
-                   uio caps (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals Nothing (pure ()) False Nothing
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = reg
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = uio
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
       readIORef prompts `shouldReturn` ([] :: [Text])
@@ -468,10 +529,26 @@ spec = describe "Seal.Agent.Loop" $ do
       (h, _) <- fakeTwoFileTranscript
       let reg = mkRegistry [stubOp]
           env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing reg h localBackend
-                  mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Supervised approvals Nothing (pure ()) False Nothing
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = reg
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Supervised
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
       runTestApp (runTurn env "ping")
       readIORef ran `shouldReturn` 1
       readIORef prompts `shouldReturn` ([] :: [Text])
@@ -491,11 +568,26 @@ spec = describe "Seal.Agent.Loop" $ do
       (h, _) <- fakeTwoFileTranscript
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
-                  mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
-                  Nothing (pure ()) False logPath
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  }
       runTestApp (runTurn env "hi")
       doesFileExist (fromJust logPath) `shouldReturn` True
       content <- readFile (fromJust logPath)
@@ -514,11 +606,26 @@ spec = describe "Seal.Agent.Loop" $ do
       (h, _) <- fakeTwoFileTranscript
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
-                  (SomeProvider (FailingProvider "connection refused"))
-                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
-                  mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
-                  Nothing (pure ()) False logPath
+                  { aeProvider = SomeProvider (FailingProvider "connection refused")
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  }
       runTestApp (runTurn env "hi")
       doesFileExist (fromJust logPath) `shouldReturn` True
       content <- readFile (fromJust logPath)
@@ -540,11 +647,26 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
       let env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing (mkRegistry []) h localBackend
-                  mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 8 Nothing Full approvals
-                  Nothing (pure ()) False Nothing
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = Nothing
+                  }
       runTestApp (runTurn env "hi")
       doesFileExist (logDir </> "seal.log") `shouldReturn` False
 
@@ -568,11 +690,26 @@ spec = describe "Seal.Agent.Loop" $ do
       (h, _) <- fakeTwoFileTranscript
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
-                  (SomeProvider (ScriptProvider ref))
-                  "ollama" (ModelId "m") Nothing (mkRegistry [stubOp]) h localBackend
-                  mkRemoteUntrustedIOStub caps
-                  (either (error "sid") id (mkSessionId "s1")) 2 Nothing Full approvals
-                  Nothing (pure ()) False logPath
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry [stubOp]
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 2
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  }
       runTestApp (runTurn env "loop")
       content <- readFile (fromJust logPath)
       content `shouldContain` "[WARN]"

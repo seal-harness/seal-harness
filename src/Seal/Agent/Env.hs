@@ -77,6 +77,15 @@ data AgentEnv = AgentEnv
     -- sees new entries live — including tool calls that are pending
     -- confirmation — rather than only at the end of the turn. The CLI and
     -- Signal channels set this to @pure ()@ (no live broadcast needed).
+  , aeOnUserMessage :: Maybe (IO ())
+    -- ^ When 'Just action', the loop records the initial user message with
+    -- 'tfwRecordAndAck' (synchronously fsync'd) and then runs @action@ —
+    -- guaranteeing the user message is durable on disk before @action@
+    -- runs. Used by the @/bg@ channel path to broadcast a @lists@ snapshot
+    -- whose snippet (the first user message) is populated, so the web
+    -- sidebar shows the session name immediately rather than after the
+    -- first LLM response. 'Nothing' (the default) keeps the async
+    -- 'tfwRecordAsync' write (no fsync latency at turn start).
   , aeOnDemandSchemas :: Bool
     -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
     -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,

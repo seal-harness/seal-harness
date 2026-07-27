@@ -125,6 +125,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                 }

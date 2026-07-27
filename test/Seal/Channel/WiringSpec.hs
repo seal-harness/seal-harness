@@ -39,24 +39,26 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
     (h, _) <- fakeTwoFileTranscript
     let agentEnv = AgentEnv
-          (SomeProvider (ScriptProvider ref))
-          "ollama"
-          (ModelId "test-model")
-          Nothing
-          (ISA.mkRegistry [])
-          h
-          localBackend
-          mkRemoteUntrustedIOStub
-          caps
-          (either (error "sid") id (mkSessionId "cli"))
-          4
-          Nothing
-          Full
-          approvals
-          Nothing
-          (pure ())
-          False
-          Nothing
+          { aeProvider = SomeProvider (ScriptProvider ref)
+          , aeProviderLabel = "ollama"
+          , aeModel = ModelId "test-model"
+          , aeSystem = Nothing
+          , aeRegistry = ISA.mkRegistry []
+          , aeTranscript = h
+          , aeBackend = localBackend
+          , aeUntrustedIO = mkRemoteUntrustedIOStub
+          , aeCaps = caps
+          , aeSession = either (error "sid") id (mkSessionId "cli")
+          , aeMaxTurns = 4
+          , aeMessageSource = Nothing
+          , aeAutonomy = Full
+          , aeApprovals = approvals
+          , aeDebugRequestsPath = Nothing
+          , aeOnEntry = pure ()
+          , aeOnUserMessage = Nothing
+          , aeOnDemandSchemas = False
+          , aeLogPath = Nothing
+          }
     env <- mkEnv defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc

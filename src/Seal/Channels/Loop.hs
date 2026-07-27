@@ -41,6 +41,10 @@ module Seal.Channels.Loop
   , mkBgRunner
   , channelCallDispatcher
   , mkTabCloseNotifier
+  , shouldAutoTab
+  , isBgSlash
+  , createConversationSession
+  , createConversationSessionHeadless
   ) where
 
 import Control.Concurrent (forkIO)
@@ -258,7 +262,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
     -- initial bottom is never read: the loop writes the real sid before
     -- any /bg dispatch.
     bgConvSid <- newIORef (error "bgConvSid: set before first dispatch" :: SessionId)
-    let bgRunner = mkBgRunner deps h askReply bgConvSid
+    let bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
         callDispatcher = channelCallDispatcher deps h askReply bgConvSid
         registryWithBg = mkRegistry (registrySpecs registry <>
           [ backgroundCommandSpec bgRunner
@@ -273,15 +277,26 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
         Nothing -> pure ()  -- EOF
         Just ms -> do
           let key = convKey ms
+              bgRoute = isBgSlash body
           -- Resolve the conversation's session (create if first message).
+          -- For a /bg command, take the headless path: the conversation needs
+          -- an anchor session (its sid keys the bg runner's confirmation ask
+          -- via bgConvSid below) but must NOT get a tab, since no turn ever
+          -- runs on this session — a tab would surface as an empty
+          -- conversation in the web sidebar. The bg turn itself runs on a
+          -- separate, fresh bg session minted by mkBgRunner.
           mCursor <- cursorLookup (cdCursors deps) key
           meta <- case mCursor of
             Just tabRef -> do
               mMeta <- resolveTabSession deps tabRef
               case mMeta of
                 Just m  -> pure m
-                Nothing -> createConversationSession deps h key (msChannelKind ms) tabsH
-            Nothing -> createConversationSession deps h key (msChannelKind ms) tabsH
+                Nothing
+                  | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
+                  | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
+            Nothing
+              | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
+              | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
           let sid = smId meta
           -- Record the conversation's active session so the /bg runner
           -- (dispatched below if this turn is a /bg) keys its
@@ -423,16 +438,61 @@ createConversationSession deps _h key kind tabsH = do
       channelLabel = channelKindToText kind
   meta <- newSessionMeta (cdPaths deps) provider model channelLabel mAgent
   saveSessionMeta (cdPaths deps) meta
+  -- Bind the conversation's cursor to this session unconditionally. The
+  -- cursor is what the loop's next-turn lookup (Loop.hs:278) uses to
+  -- resolve the conversation's session; if it isn't set, the next message
+  -- mints a brand-new session and orphans this one. Earlier this lived
+  -- inside the 'Right _' branch below, so a full tab list (Left _) silently
+  -- skipped cursor-binding — every subsequent turn from the conversation
+  -- would mint a fresh session, never reusing this one.
+  cursorSet (cdCursors deps) key (BoundSession (smId meta))
   r <- insertTabH tabsH (BoundSession (smId meta)) KindAi Nothing
   case r of
     Left _ -> pure ()  -- tab list full; session still works without a tab
-    Right _ -> do
-      cursorSet (cdCursors deps) key (BoundSession (smId meta))
+    Right _ ->
       -- Push the new tab to any WS subscribers (the web frontend sidebar)
       -- so a channel-created tab surfaces immediately. No-op when cdBroker
       -- is Nothing (standalone signal/telegram without serve).
       broadcastTabs deps tabsH
   pure meta
+
+-- | Create a new session for a conversation WITHOUT inserting a tab or
+-- broadcasting to the sidebar. Used by the @/bg@ path (see 'isBgSlash')
+-- where the conversation needs an anchor session (its sid keys the bg
+-- runner's confirmation ask via 'bgConvSid') but must NOT surface an empty
+-- tab in the web sidebar — the @/bg@ turn runs headless on a fresh bg
+-- session, so a tab bound to this conversation session would never receive
+-- a turn and would appear dead. The cursor is always set (unlike
+-- 'createConversationSession', there is no tab-list-full failure mode to
+-- skip it on), so subsequent non-bg messages resolve to this session.
+createConversationSessionHeadless
+  :: ChannelDeps -> (Text, Text) -> ChannelKind -> IO SessionMeta
+createConversationSessionHeadless deps key kind = do
+  cfg <- cdConfig deps
+  (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
+  let (cfgProv, cfgModel) = defaultSessionSelection cfg
+      provider = fromMaybe cfgProv mProv
+      model    = fromMaybe cfgModel mModel
+      channelLabel = channelKindToText kind
+  meta <- newSessionMeta (cdPaths deps) provider model channelLabel mAgent
+  saveSessionMeta (cdPaths deps) meta
+  cursorSet (cdCursors deps) key (BoundSession (smId meta))
+  pure meta
+
+-- | Does an inbound body route to a @/bg@ slash command? Layer-1 routing
+-- ('Seal.Routing.Route.route') sends any @\/<other>…@ to 'SlashCommand'; this
+-- checks the command name is @"bg"@ (case-insensitive, matching the terse
+-- grammar's single-token form @\/bg@ or @\/bg <prompt>@). Used by the loop to
+-- pick the headless session-creation path, so @/bg@ does not mint a spurious
+-- empty tab for the conversation while still anchoring the bg runner's
+-- confirmation-ask key on the conversation's sid.
+isBgSlash :: Text -> Bool
+isBgSlash body =
+  case Route.route body of
+    Right (Route.SlashCommand rest) ->
+      let cmd = T.toCaseFold (T.takeWhile (/= ' ') rest)
+      in cmd == "bg"
+    _ -> False
 
 -- | Push the current tab-list snapshot to WS subscribers (the web frontend
 -- sidebar). No-op when 'cdBroker' is 'Nothing' (standalone channels without
@@ -586,13 +646,29 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
                 (cdHttpManager deps) handleCaps onDemand
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+          -- For a /bg turn, broadcast a lists snapshot as soon as the user
+          -- message is durable on disk: the snapshot's first-user-message
+          -- snippet is now populated, so the web sidebar shows the session
+          -- name immediately (the pre-turn broadcast in mkBgRunner fired
+          -- before the transcript write, so its snippet was empty and only
+          -- the agent name showed). The hook runs inside runTurn right after
+          -- a synchronous (fsync'd) tfwRecordAndAck of the user message,
+          -- eliminating the race an async write + immediate read would have.
+          -- Normal channel turns pass Nothing (no fsync latency at turn
+          -- start); they get their snippet refresh from the post-turn
+          -- broadcastTabs below.
+          let onUserMessage =
+                if shouldAutoTab meta
+                  then Nothing
+                  else Just (broadcastTabs deps (cdTabs deps))
           let env = (mkSessionAgentEnv
                        handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle untrustedIO
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand
                        (Just (sessionLogPath paths sid))
-                       (either (const defaultMaxTurns) maxTurnsConfig eCfg))
+                       (either (const defaultMaxTurns) maxTurnsConfig eCfg)
+                       onUserMessage)
                       { aeMessageSource = mSrc }
           runApp appEnv (runTurn env t)
             `catch` \e -> do
@@ -614,12 +690,44 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
       -- (no-op if a tab already binds sid — e.g. createConversationSession
       -- already inserted one on first message). Uses KindAi (channel/CLI
       -- tab kind, wire "session:ai"). Sources sid from smId meta only.
-      ensureTabForSession (cdTabs deps) KindAi sid
-      -- Refresh the sidebar lists so the tab label updates with the
-      -- first-message snippet now that the transcript has content. Without
-      -- this, a freshly-created tab shows the agent name (snippet was null
-      -- at creation time) and never refreshes until a web-originated action.
-      broadcastTabs deps (cdTabs deps)
+      --
+      -- Gated on 'shouldAutoTab' to honor the @mkBgRunner@ contract
+      -- (Loop.hs:624-636): a @/bg@ turn runs on a fresh, headless session
+      -- that must NOT get a tab — the tab would be bound to the bg
+      -- session's sid while the reply/ask-key is wired to the originating
+      -- conversation's sid, producing a dead-looking tab. But a @/bg@
+      -- session DOES legitimately surface in the sidebar's
+      -- @recentSessions@ (it's a real, persisted, one-shot session), so
+      -- we still broadcast a @lists@ snapshot after the turn — now that
+      -- the transcript holds the user prompt, the snapshot's snippet
+      -- populates the session name. Without this refresh the sidebar
+      -- keeps the pre-turn snapshot (snippet null → only the agent name
+      -- shows) until a hard refresh.
+      if shouldAutoTab meta
+        then do
+          ensureTabForSession (cdTabs deps) KindAi sid
+          -- Refresh the sidebar lists so the tab label updates with the
+          -- first-message snippet now that the transcript has content. Without
+          -- this, a freshly-created tab shows the agent name (snippet was null
+          -- at creation time) and never refreshes until a web-originated action.
+          broadcastTabs deps (cdTabs deps)
+        else
+          -- /bg path: no tab, but still push a lists snapshot so the
+          -- session's recentSessions row picks up the now-populated
+          -- first-user-message snippet as its name.
+          broadcastTabs deps (cdTabs deps)
+
+-- | Should 'runTurnOnSession' auto-tab the session after a turn? 'True' for
+-- normal channel turns (W3 invariant 2: every channel-originated session is
+-- visible in the sidebar). 'False' for @/bg@ sessions, whose 'smChannel' is
+-- @"bg"@ (set at Loop.hs:645 and Cli.hs:551): a @/bg@ turn runs headless on a
+-- fresh session that must NOT surface in the web sidebar (see the
+-- 'mkBgRunner' contract at Loop.hs:636-656). The label @"bg"@ is the
+-- established convention shared by both bg runner sites; 'channelKindToText'
+-- never produces it (the 'Background' kind maps to @"background"@), so there
+-- is no collision with any real channel kind.
+shouldAutoTab :: SessionMeta -> Bool
+shouldAutoTab meta = smChannel meta /= "bg"
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
 -- a fresh persisted session from the config defaults (channel label
@@ -634,8 +742,21 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
 -- cache stay scoped to it); only the ask-delivery key moves to the
 -- conversation. The assistant reply is delivered via the handle's
 -- @chSend@. No tab or cursor state is mutated.
-mkBgRunner :: ChannelDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> BgRunner
-mkBgRunner deps h askReply bgConvSid = BgRunner $ \prompt -> do
+--
+-- After persisting the session, a @lists@ snapshot is broadcast (via
+-- 'broadcastTabs') so the web frontend's 'useListsStream' learns about the
+-- new session immediately — it surfaces in @recentSessions@ (it's a real,
+-- persisted, one-shot session, just not tabbed). At this point the
+-- transcript is empty so the row shows the agent name as a placeholder;
+-- the @runTurnOnSession@ path's @aeOnUserMessage@ hook (wired in
+-- 'runTurnOnSession' when @shouldAutoTab@ is False) re-broadcasts a
+-- @lists@ snapshot as soon as the user message is durable on disk, so
+-- the snippet (the first user message) populates the session name
+-- before the LLM responds. Without the pre-turn push the frontend only
+-- discovers the session on a hard refresh. No-op when 'cdBroker' is
+-- 'Nothing' (standalone Telegram/Signal without @seal serve@).
+mkBgRunner :: ChannelDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> TabsHandle -> BgRunner
+mkBgRunner deps h askReply bgConvSid tabsH = BgRunner $ \prompt -> do
   convSid <- readIORef bgConvSid
   cfg <- cdConfig deps
   (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
@@ -644,6 +765,7 @@ mkBgRunner deps h askReply bgConvSid = BgRunner $ \prompt -> do
       model    = fromMaybe cfgModel mModel
   meta <- newSessionMeta (cdPaths deps) provider model "bg" mAgent
   saveSessionMeta (cdPaths deps) meta
+  broadcastTabs deps tabsH
   void (forkIO (runTurnOnSession deps h askReply convSid meta Nothing prompt))
 
 -- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.

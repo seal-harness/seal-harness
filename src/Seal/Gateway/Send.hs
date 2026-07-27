@@ -413,6 +413,7 @@ plainTurn deps meta t = do
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
                   (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
+                  Nothing
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- (Right <$> runApp appEnv (runTurn env t))
               `catch` \e -> do
@@ -646,6 +647,7 @@ plainTurnWithCaps deps meta caps t = do
               (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
               onDemand
               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
+              Nothing
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- (Right <$> runApp appEnv (runTurn env t))
           `catch` \e -> do

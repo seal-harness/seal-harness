@@ -142,6 +142,7 @@ spec = do
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }

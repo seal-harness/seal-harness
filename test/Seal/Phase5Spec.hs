@@ -172,6 +172,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                 , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }

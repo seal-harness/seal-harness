@@ -91,7 +91,17 @@ runTurn env userText = do
           , erCorrelation = Nothing
           , erMeta = requestMeta (aeMessageSource env)
           }
-    tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
+    -- When a caller wants to react to the user message being durable
+    -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows
+    -- the session name immediately), record it with tfwRecordAndAck
+    -- (synchronously fsync'd) and run the hook. Otherwise keep the async
+    -- write (no fsync latency at turn start).
+    case aeOnUserMessage env of
+      Just after -> do
+        tfwRecordAndAck (aeTranscript env) (TwoFileWrite turn0 entry)
+        liftIO after
+      Nothing ->
+        tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
   go (aeMaxTurns env) turn0
   where
     go :: Int -> [Message] -> App ()

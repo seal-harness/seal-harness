@@ -170,6 +170,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeApprovals  = dwdApprovals deps
               , aeDebugRequestsPath = Nothing
               , aeOnEntry    = dwdOnEntry deps
+              , aeOnUserMessage = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
               }

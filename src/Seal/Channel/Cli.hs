@@ -225,8 +225,8 @@ mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
-  -> Maybe FilePath -> Int -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns = AgentEnv
+  -> Maybe FilePath -> Int -> Maybe (IO ()) -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -243,6 +243,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeApprovals  = approvals
   , aeDebugRequestsPath = debugReqPath
   , aeOnEntry    = onEntry
+  , aeOnUserMessage = onUserMessage
   , aeOnDemandSchemas = onDemand
   , aeLogPath    = logPath
   }
@@ -575,7 +576,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               bgUio <- mkSessionUio bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
-                    (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
+                    (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
       -- The /call dispatcher: dispatch an opcode against the active
@@ -612,7 +613,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
-               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg))
+               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing)
             appEnv t
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
