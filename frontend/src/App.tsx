@@ -249,8 +249,43 @@ export default function App() {
   // loads providers/models on mount regardless of which composer opens).
   const composerSpec = useNewTabSpec()
 
+  // ── Preserve the focused session across tab-list mutations ──────────────
+  // When the backend removes a tab above the focused one it compacts the
+  // remaining tab indices, so a `tab:<idx>` selection goes stale — it would
+  // either point at a different tab or resolve to nothing. Track the focused
+  // tab's session_id; on the next tabs update, re-select that session's new
+  // tab index (or fall back to `session:<id>` if the tab was closed but the
+  // session survives). This preserves the displayed transcript across a
+  // sibling close.
+  const pinnedSessionIdRef = useRef<string | null>(null)
+  // Track the selectedId we last pinned for. When `tabs` mutates but the
+  // selection is unchanged (a backend compact/close), we MUST NOT re-read the
+  // tab at the old index — that index now holds a different session, and
+  // overwriting the pin would defeat the re-selection below.
+  const lastPinnedSelectedIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (selectedId === lastPinnedSelectedIdRef.current) return
+    lastPinnedSelectedIdRef.current = selectedId
+    if (!selectedId?.startsWith('tab:')) {
+      pinnedSessionIdRef.current = null
+      return
+    }
+    const idx = parseInt(selectedId.slice('tab:'.length), 10)
+    const t = tabs.find((tab) => tab.index === idx)
+    pinnedSessionIdRef.current = t?.session_id ?? null
+  }, [selectedId, tabs])
+
   // ── Resolve focused session ────────────────────────────────────────────
-  const currentSessionId = sessionIdFromSelection(selectedId, tabs)
+  // Fall back to the pinned session id when a `tab:<idx>` selection goes
+  // stale (the backend compacted the tab list but the re-selection effect
+  // below hasn't run yet for this render). Without the fallback,
+  // `currentSessionId` would momentarily be `null`, clearing the transcript
+  // and forcing a re-fetch + "Loading..." flash even though the focused
+  // session never changed. The pin holds the session id across that window.
+  let currentSessionId = sessionIdFromSelection(selectedId, tabs)
+  if (currentSessionId === null && selectedId?.startsWith('tab:')) {
+    currentSessionId = pinnedSessionIdRef.current
+  }
 
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   // `useTranscriptStream` is the SOLE source of transcript entries. It
@@ -351,31 +386,10 @@ export default function App() {
     }
   }, [])
 
-  // ── Preserve the focused session across tab-list mutations ──────────────
-  // When the backend removes a tab above the focused one it compacts the
-  // remaining tab indices, so a `tab:<idx>` selection goes stale — it would
-  // either point at a different tab or resolve to nothing. Track the focused
-  // tab's session_id; on the next tabs update, re-select that session's new
-  // tab index (or fall back to `session:<id>` if the tab was closed but the
-  // session survives). This preserves the displayed transcript across a
-  // sibling close.
-  const pinnedSessionIdRef = useRef<string | null>(null)
-  // Track the selectedId we last pinned for. When `tabs` mutates but the
-  // selection is unchanged (a backend compact/close), we MUST NOT re-read the
-  // tab at the old index — that index now holds a different session, and
-  // overwriting the pin would defeat the re-selection below.
-  const lastPinnedSelectedIdRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (selectedId === lastPinnedSelectedIdRef.current) return
-    lastPinnedSelectedIdRef.current = selectedId
-    if (!selectedId?.startsWith('tab:')) {
-      pinnedSessionIdRef.current = null
-      return
-    }
-    const idx = parseInt(selectedId.slice('tab:'.length), 10)
-    const t = tabs.find((tab) => tab.index === idx)
-    pinnedSessionIdRef.current = t?.session_id ?? null
-  }, [selectedId, tabs])
+  // Re-selection effect: after a backend compact/close the `tab:<idx>`
+  // selection resolves to a different session (or nothing). Re-select the
+  // pinned session's new tab index, or fall back to `session:<id>` when the
+  // tab is gone but the session survives in Recent Sessions.
   useEffect(() => {
     const pinned = pinnedSessionIdRef.current
     if (!pinned || !selectedId?.startsWith('tab:')) return

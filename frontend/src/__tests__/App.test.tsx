@@ -470,6 +470,70 @@ describe('App — tab close preserves the focused session', () => {
     })
   })
 
+  it('does NOT re-fetch the transcript when closing the focused tab (session id is stable across the compact)', async () => {
+    // Regression: closing the focused tab caused `currentSessionId` to
+    // briefly become null (the stale `tab:<idx>` no longer resolved before
+    // the re-selection effect ran), which cleared the transcript and
+    // triggered a duplicate seed fetch + "Loading..." flash. The fix holds
+    // the pinned session id in `currentSessionId` across that window.
+    const tabASession = makeSession({ id: 'sess-A', description: 'Tab A' })
+    const tabBSession = makeSession({ id: 'sess-B', description: 'Tab B' })
+    let tabs = [
+      { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null },
+      { index: 1, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-B', ext_modified: false, stale: false, attach_command: null },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      let body: unknown = {}
+      if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]
+      else if (url === '/api/providers/anthropic/models') body = [{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]
+      else if (url === '/api/lists') {
+        body = { tabs, recentSessions: [tabASession, tabBSession], archivedSessions: [], tabSessions: [] }
+      } else if (url === '/api/tabs') body = tabs
+      else if (url === '/api/sessions') body = []
+      else if (url === '/api/sessions/archived') body = []
+      else if (url === '/api/harnesses') body = []
+      else if (url === '/api/harnesses/discover') body = []
+      else if (url.includes('/transcript')) body = []
+      else if (url === '/api/tabs/1/close' && method === 'POST') {
+        tabs = [{ index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-A', ext_modified: false, stale: false, attach_command: null }]
+        body = null
+      }
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    // Select Tab B (index 1) and let its transcript seed land.
+    const tabBRow = await screen.findByText('Tab B')
+    fireEvent.click(tabBRow)
+    await waitFor(() => { expect(window.location.pathname).toBe('/tab/1') })
+    // Drain any in-flight seed fetch for sess-B.
+    await act(async () => { vi.advanceTimersByTimeAsync(3000) })
+    // Snapshot the transcript fetches observed so far (the initial seed for
+    // sess-B should be among them).
+    const transcriptFetchesBefore = fetchCalls.filter(
+      (c) => c.url.includes('/transcript') && (c.init?.method ?? 'GET') === 'GET',
+    ).length
+    expect(transcriptFetchesBefore).toBeGreaterThanOrEqual(1)
+    // Close Tab B (the focused tab).
+    const tabBLabel = document.querySelector('.agent-row span[title="Tab B"]') as HTMLElement
+    const tabBRowEl = tabBLabel.closest('.agent-row')!
+    const tabBClose = tabBRowEl.querySelector('[aria-label="Close tab"]') as HTMLElement
+    await act(async () => { fireEvent.click(tabBClose) })
+    await act(async () => { vi.advanceTimersByTimeAsync(3000) })
+    // The session survived (now selected as a bare session). The transcript
+    // must NOT have been re-fetched — the focused session id never changed.
+    await waitFor(() => { expect(window.location.pathname).toBe('/session/sess-B') })
+    const transcriptFetchesAfter = fetchCalls.filter(
+      (c) => c.url.includes('/transcript') && (c.init?.method ?? 'GET') === 'GET',
+    ).length
+    expect(transcriptFetchesAfter).toBe(transcriptFetchesBefore)
+  })
+
   it('after closing a tab above the focused one in a 3-tab list, follows the focused session to its new index (not the stale tab number)', async () => {
     // Three tabs: 0 = A, 1 = B, 2 = C. User selects tab 1 (B). Closes tab 0
     // (above the focused one). Backend compacts: B slides to 0, C slides to 1.
