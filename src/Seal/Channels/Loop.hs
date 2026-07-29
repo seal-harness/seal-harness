@@ -135,7 +135,8 @@ import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
-  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout, replyMigrateAll
+  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
+  , replyFanoutMessage, replyMigrateAll
   , SessionLocks, newSessionLocks, withSessionLock )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
@@ -667,6 +668,12 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
       -- this channel). The guard is stored so we can unsubscribe later
       -- (e.g. when the conversation focuses a different tab).
       _guard <- replySubscribe (cdReplies deps) h sid
+      -- Cross-channel message mirroring: fan out the user's message to
+      -- every OTHER append-only channel subscribed to this session,
+      -- prefixed with the sender's channel label (e.g. "[telegram] hi").
+      -- The sender is excluded (it already has the message); the web
+      -- frontend sees the message via the transcript, not this registry.
+      replyFanoutMessage (cdReplies deps) sid (chLabel h) t
       -- Signal the turn start so the web sidebar transitions the tab to
       -- Thinking. Paired with the idle signal after the lock bracket.
       broadcastHarnessStatus (cdBroker deps) sid "thinking"

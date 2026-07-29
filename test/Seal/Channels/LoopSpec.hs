@@ -69,7 +69,8 @@ stubTmux = TmuxRunner (\_args -> pure (Right ""))
 -- invoke those, so a handle with stub sends is safe.
 stubHandle :: ChannelHandle
 stubHandle = ChannelHandle
-  { chSend         = \_ -> pure ()
+  { chLabel       = "test"
+  , chSend         = \_ -> pure ()
   , chSendError    = \_ -> pure ()
   , chSendChunk    = \_ -> pure ()
   , chPrompt       = \_ -> pure (Left Deferred)

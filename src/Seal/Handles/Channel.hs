@@ -23,7 +23,14 @@ data Deferral = Deferred | AsyncQueued
 -- | The widened channel capability record. Every field is an IO action so the
 -- type is uniform between real and fake variants.
 data ChannelHandle = ChannelHandle
-  { chSend        :: Text -> IO ()
+  { chLabel       :: Text
+  -- ^ The channel's label (e.g. @"telegram"@, @"signal"@, @"cli"@, @"web"@).
+  -- Used by the reply registry to dedup subscribers: at most one handle per
+  -- channel kind is kept per session, so re-subscribing the same channel
+  -- replaces the old handle but a different channel's handle is preserved.
+  -- The web frontend is NOT in the registry (it receives entries via the WS
+  -- broker), so only append-only chat channels appear here.
+  , chSend        :: Text -> IO ()
   -- ^ Emit one line to the user.
   , chSendError   :: Text -> IO ()
   -- ^ Emit an error line (may be formatted differently on some channels).

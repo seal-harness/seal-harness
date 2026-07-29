@@ -48,7 +48,8 @@ data TelegramChannel = TelegramChannel
 
 instance Channel TelegramChannel where
   toHandle ch = ChannelHandle
-    { chSend         = sendChunked ch
+    { chLabel       = "telegram"
+    , chSend         = sendChunked ch
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
     , chPrompt       = \_ -> pure (Left Deferred)  -- Telegram can't answer inline

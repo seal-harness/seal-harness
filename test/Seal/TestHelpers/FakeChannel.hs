@@ -48,7 +48,8 @@ newFakeChannelWith streaming inbox prompts = FakeChannel
 
 instance Channel FakeChannel where
   toHandle fc = ChannelHandle
-    { chSend         = \t -> modifyIORef' (fcSent fc) (t :)
+    { chLabel       = "test"
+    , chSend         = \t -> modifyIORef' (fcSent fc) (t :)
     , chSendError    = \t -> modifyIORef' (fcErrors fc) (t :)
     , chSendChunk    = \t -> modifyIORef' (fcChunks fc) (t :)
     , chPrompt       = const (popPrompt fc)

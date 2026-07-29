@@ -48,7 +48,8 @@ data SignalChannel = SignalChannel
 
 instance Channel SignalChannel where
   toHandle ch = ChannelHandle
-    { chSend         = sendChunked ch
+    { chLabel       = "signal"
+    , chSend         = sendChunked ch
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
     , chPrompt       = \_ -> pure (Left Deferred)   -- Signal can't answer inline

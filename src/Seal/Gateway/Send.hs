@@ -108,7 +108,8 @@ import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPol
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Session.Lock
-  ( ReplyRegistry, replyFanout, replySubscriberCount, SessionLocks, withSessionLock )
+  ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
+  , SessionLocks, withSessionLock )
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
@@ -384,6 +385,12 @@ plainTurn deps meta t = do
       -- Thinking. Paired with the idle signal below (run on every exit
       -- path of the lock bracket via 'finally').
       broadcastHarnessStatus (sdBroker deps) sid "thinking"
+      -- Cross-channel message mirroring: fan out the web user's message
+      -- to every append-only channel subscribed to this session, prefixed
+      -- with "[web]". The web frontend sees the message directly (it's
+      -- the sender), so it is excluded by the "web" label (no chat channel
+      -- has that label, so all subscribed channels receive the mirror).
+      replyFanoutMessage (sdReplies deps) sid "web" t
       turnResult <- withSessionLock (sdLocks deps) sid
            (withTwoFileTranscript sessionDirPath (\tHandle -> do
             appEnv <- mkEnv (sdLogger deps) defaultConfig
@@ -613,6 +620,8 @@ plainTurnWithCaps deps meta caps t = do
           sid = smId meta
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
+      -- Cross-channel message mirroring (see plainTurn for the rationale).
+      replyFanoutMessage (sdReplies deps) sid "web" t
       withTwoFileTranscript sessionDirPath (\tHandle -> do
         appEnv <- mkEnv (sdLogger deps) defaultConfig
         eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
