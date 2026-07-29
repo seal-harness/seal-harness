@@ -176,49 +176,70 @@ The insecure path is harder to write than the secure path. That's the point.
 
 ### Cross-Channel Message Mirroring
 
-Most agent interfaces are locked to a single channel: you chat in the web
-UI, or you chat in Telegram, but the two are separate worlds. Seal Harness
-treats every communications channel as a view into the same ground-truth
-state — the transcript — and mirrors user messages across all subscribed
-append-only channels in real time.
+Running multiple agents concurrently is the hard part. Not the coding —
+the *awareness*. A common solution is a tmux TUI that lists agent panes
+and shows a live status next to each one, grouped by project. That helps
+you see *which* agents are idle or stuck on a permission prompt, but it
+doesn't solve the deeper problem: each agent is still an isolated
+conversation. You tab into a pane, type into that agent, tab out. If you
+want to check the same agent from your phone, or let a teammate glance at
+the state, or keep an eye on two agents at once, you're back to tabbing.
+
+Seal Harness solves this by designing the harness around the use case
+from the ground up. Every agent session is a first-class, persistent
+object — a tab — that multiple communications channels can subscribe to
+simultaneously. You don't tab *into* an agent; you *subscribe* a channel
+to it. Telegram, Signal, and the web UI are all live views into the same
+ground-truth state: the transcript.
 
 Here's how it works:
 
 - **The web frontend is the source of truth.** It renders the transcript
-  directly — every message, every tool call, every skill load — with full
-  fidelity (channel attribution, timestamps, raw JSON). It is NOT
-  append-only; it presents a direct representation of the ground-truth
-  data.
+  directly — every message, every tool call, every skill load, every
+  permission prompt — with full fidelity (channel attribution,
+  timestamps, raw JSON inspection). It is NOT append-only; it presents a
+  direct, structured representation of the ground-truth data. This is where
+  you do deep work: scroll the full history, branch from any point,
+  inspect exactly what the agent was sent and what it returned.
 - **Append-only channels (Telegram, Signal) subscribe to the tab.** When
   a Telegram conversation sends its first message to a session, it
   subscribes to that session's reply fanout. A Signal conversation can
   subscribe to the same session later — both accumulate (one handle per
   channel kind, deduped so re-subscribing the same channel replaces the
-  old handle, not the other channels).
-- **Every user message is mirrored.** When a message arrives on any
-  channel — including the web UI — it is fanned out to every OTHER
-  subscribed append-only channel, prefixed with the sender's channel
-  label: `[telegram] what is your name?` appears in Signal; `[web] do
-  the thing` appears in Telegram. The sender never receives its own
-  message back. The web frontend sees the message directly (it's the
-  sender), so it is excluded by construction.
+  old handle, not the other channels). Each channel is now a live view:
+  it sees new messages and replies as they happen, without the full
+  history the web frontend renders.
+- **Every user message is mirrored across channels.** When a message
+  arrives on any channel — including the web UI — it is fanned out to
+  every OTHER subscribed append-only channel, prefixed with the sender's
+  channel label: `[telegram] what is your name?` appears in Signal;
+  `[web] fix the failing test` appears in Telegram. The sender never
+  receives its own message back. The web frontend sees the message
+  directly (it's the sender), so it is excluded by construction.
 - **Assistant replies go to all subscribers.** When the LLM responds,
   the reply is fanned out to every subscribed channel (no exclusion) so
-  every append-only channel sees the answer.
+  every append-only channel sees the answer — no tabbing required.
 
-This means a user can start a conversation on Telegram, continue it from
-the web UI, and watch the exchange unfold on Signal — all three channels
-stay in sync because they're all views into the same transcript. The
-`[channel]` prefix makes the origin of every message visible at a glance.
+This means a user can start a conversation on Telegram from their phone,
+continue it from the web UI at their desk, and watch the exchange unfold
+on Signal — all three channels stay in sync because they're all views
+into the same transcript. The `[channel]` prefix makes the origin of
+every message visible at a glance. A teammate monitoring the Signal
+conversation sees `[web] fix the failing test` arrive and knows the
+operator is engaged from the web UI — they don't need to ask "did someone
+send that?" or tab through terminals to find out.
 
-This is a novel approach to multi-channel agent interaction: rather than
-each channel being a separate conversation, every channel is a subscriber
-to a shared, persistent state. The append-only channels get a
-stream-of-consciousness view (prefixed, linear); the web frontend gets
-the full structured representation (collapsible tool calls, channel
-attribution, raw JSON inspection). The user picks the view that fits the
-moment — quick check from Telegram, deep work in the web UI — without
-losing context.
+This is a fundamentally different model from "a list of agent panes you
+tab into." Every channel is a subscriber to a shared, persistent state.
+The append-only channels get a stream-of-consciousness view (prefixed,
+linear, lightweight — the view you check from your phone); the web
+frontend gets the full structured representation (collapsible tool calls,
+channel attribution, raw JSON, branching — the view you use for deep
+work). The user picks the view that fits the moment. No agent is locked to
+a terminal. No conversation is lost when a tmux session dies (the
+transcript is on disk). And the state of every agent — idle, thinking,
+waiting on a permission prompt — is visible from any subscribed channel,
+not just the one it was started in.
 
 ## Quick Start
 
