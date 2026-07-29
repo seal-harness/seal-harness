@@ -108,6 +108,50 @@ function useFragmentAnchor<T extends HTMLElement>(anchorId: string | undefined, 
   return targeted
 }
 
+/** Copy-session-id button for the chat header. Renders a small ID-style
+ *  icon; clicking copies the session id to the clipboard with a brief
+ *  "Copied!" tooltip as feedback. Uses the same copyTextToClipboard helper
+ *  as the permalink and JSON-copy buttons elsewhere in this file. */
+function CopySessionIdButton({ sessionId }: { sessionId: string }) {
+  const [copied, setCopied] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => { if (timeoutRef.current) clearTimeout(timeoutRef.current) }, [])
+
+  const onClick = async () => {
+    const ok = await copyTextToClipboard(sessionId)
+    if (ok) {
+      setCopied(true)
+      if (timeoutRef.current) clearTimeout(timeoutRef.current)
+      timeoutRef.current = setTimeout(() => setCopied(false), 1500)
+    }
+  }
+
+  return (
+    <button
+      className="header-scroll-btn"
+      title={copied ? 'Copied!' : `Copy session ID: ${sessionId}`}
+      aria-label={copied ? 'Session ID copied to clipboard' : 'Copy session ID to clipboard'}
+      onClick={onClick}
+    >
+      {copied ? (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <path d="M3 8 L7 12 L13 4" />
+        </svg>
+      ) : (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <rect x="5" y="5" width="8" height="8" rx="1.5" />
+          <path d="M3 11 V3.5 A1.5 1.5 0 0 1 4.5 2 H11" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
 /** Best-effort clipboard copy that survives non-secure contexts. Returns a
  *  Promise<boolean> that resolves true if either the modern Clipboard API
  *  or the legacy execCommand path succeeded. */
@@ -1955,6 +1999,11 @@ export function ChatArea({
                 aria-hidden="true">
                 <path d="M3 6 L8 11 L13 6" />
               </svg>
+        {selectedSession && (
+          <div className={messages.length > 0 ? 'flex items-center gap-1 shrink-0' : 'ml-auto flex items-center gap-1 shrink-0'}>
+            <CopySessionIdButton sessionId={selectedSession.id} />
+          </div>
+        )}
             </button>
           </div>
         )}
