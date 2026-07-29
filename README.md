@@ -185,12 +185,11 @@ conversation. You tab into a pane, type into that agent, tab out. If you
 want to check the same agent from your phone, or let a teammate glance at
 the state, or keep an eye on two agents at once, you're back to tabbing.
 
-Seal Harness solves this by designing the harness around the use case
-from the ground up. Every agent session is a first-class, persistent
-object — a tab — that multiple communications channels can subscribe to
-simultaneously. You don't tab *into* an agent; you *subscribe* a channel
-to it. Telegram, Signal, and the web UI are all live views into the same
-ground-truth state: the transcript.
+Seal Harness approaches this differently. Every agent session is a
+first-class, persistent object — a tab — that multiple communications
+channels can subscribe to simultaneously. You don't tab *into* an agent;
+you *subscribe* a channel to it. Telegram, Signal, and the web UI are all
+live views into the same ground-truth state: the transcript.
 
 Here's how it works:
 
