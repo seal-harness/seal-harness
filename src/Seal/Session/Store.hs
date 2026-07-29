@@ -22,7 +22,7 @@ module Seal.Session.Store
   ) where
 
 import Control.Monad (filterM, forM, unless, when)
-import Data.Aeson (decode, encode)
+import Data.Aeson (encode)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef)
 import Data.List (sortOn)
@@ -48,6 +48,7 @@ import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The mutable active-session ref plus the paths the commands need.
 data SessionRuntime = SessionRuntime
@@ -120,7 +121,7 @@ listSessions paths = do
             marker = root </> e </> "archived"
         ok <- doesFileExist mp
         archived <- doesFileExist marker
-        if not ok || archived then pure Nothing else decode <$> BL.readFile mp
+        if not ok || archived then pure Nothing else decodeFileStrict mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
 
 -- | All archived sessions (those with an @archived@ marker file), newest
@@ -142,7 +143,7 @@ listArchivedSessions paths = do
             marker = root </> e </> "archived"
         ok <- doesFileExist mp
         archived <- doesFileExist marker
-        if not ok || not archived then pure Nothing else decode <$> BL.readFile mp
+        if not ok || not archived then pure Nothing else decodeFileStrict mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
 
 -- | Set or clear the archived flag on a session by creating/removing the
@@ -247,7 +248,7 @@ updateSessionAgent paths sid mAgent = do
   if not exists
     then pure False
     else do
-      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
@@ -289,7 +290,7 @@ updateSessionSystemOverride paths sid mOverride mFallbackName = do
   if not exists
     then pure False
     else do
-      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       case mMeta of
         Nothing  -> pure False
         Just meta -> do

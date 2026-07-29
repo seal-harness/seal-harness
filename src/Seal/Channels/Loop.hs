@@ -50,8 +50,6 @@ module Seal.Channels.Loop
 
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
-import Data.Aeson qualified as A
-import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
@@ -157,6 +155,7 @@ import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies a channel turn needs to have full parity with the web
 -- and CLI paths. Built once at startup (in 'Seal.Command.Serve' or the
@@ -415,7 +414,7 @@ resolveTabSession deps ref = case ref of
     exists <- doesFileExist mp
     if not exists
       then pure Nothing
-      else (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+      else decodeFileStrict mp :: IO (Maybe SessionMeta)
   BoundHarness _   -> pure Nothing
 
 -- | Load a session's channel provenance label (e.g. @"telegram"@, @"web"@,
@@ -431,7 +430,7 @@ loadChannelLabel paths sid = do
   if not exists
     then pure Nothing
     else do
-      mMeta <- (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       pure (smChannel <$> mMeta)
 
 -- | Handle @\/new@ on an inbox channel: mint a fresh session from config
@@ -1116,7 +1115,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
       exists <- doesFileExist mp
       if not exists
         then pure Nothing
-        else (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+        else decodeFileStrict mp :: IO (Maybe SessionMeta)
 
 -- | Extract the 'Text' from a 'ModelId'.
 modelText :: ModelId -> Text

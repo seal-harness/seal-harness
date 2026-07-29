@@ -7,6 +7,9 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Lens (view)
 import System.Environment (getArgs, withArgs)
 import qualified Configuration.Utils as CUtils
+import System.Posix.Resource
+  ( ResourceLimits (..), ResourceLimit (..), Resource (ResourceOpenFiles)
+  , getResourceLimit, setResourceLimit )
 
 import Seal.Logging.Logger (withSealLogger)
 import Seal.Logging.Global (setGlobalLogger)
@@ -49,9 +52,25 @@ withDefaultArgs :: [String] -> [String]
 withDefaultArgs [] = ["--help"]
 withDefaultArgs as = as
 
+-- | Raise the soft FD limit to the hard limit. The default macOS soft limit
+-- is 256, which the gateway's @buildListsSnapshot@ hot path blows through
+-- (hundreds of small files per request, historically via lazy IO that left
+-- handles open for the GC). Even with strict reads, raising the soft limit
+-- to the hard ceiling is cheap defense-in-depth against FD exhaustion. The
+-- raise is best-effort: a failure (e.g. a sandboxed runner that blocks
+-- @setrlimit@) is swallowed so the binary still starts.
+raiseFdLimit :: IO ()
+raiseFdLimit = do
+  limits <- getResourceLimit ResourceOpenFiles
+  case hardLimit limits of
+    ResourceLimit _hard | softLimit limits /= hardLimit limits ->
+      setResourceLimit ResourceOpenFiles limits { softLimit = hardLimit limits }
+    _ -> pure ()
+
 -- | Entry point: parse defaults + config file + CLI flags, then dispatch.
 -- With no arguments, fall back to @--help@.
 appMain :: IO ()
 appMain = do
+  raiseFdLimit
   args <- getArgs
   withArgs (withDefaultArgs args) (CUtils.runWithConfiguration programInfo dispatch)
