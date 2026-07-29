@@ -41,6 +41,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     payload: '{}',
     harness: null,
     model: null,
+    channel: null,
     raw: '{}',
     ...overrides,
   }
@@ -263,6 +264,29 @@ describe('transcriptToMessages', () => {
     const userRow = msgs.find((m) => m.agentName === 'You')
     expect(userRow).toBeTruthy()
     expect(userRow!.blocks[0]!.text).toBe('hi there')
+  })
+
+  it('surfaces the originating channel in the user-message source label', () => {
+    // A user message sent from a channel (e.g. Telegram) carries the
+    // channel label as a top-level `channel` field on the TranscriptEntry
+    // (stamped into the request entry's erMeta by runTurn's requestMeta).
+    // transcriptToMessages should render the source label as
+    // "You · <channel>" so the user can tell where the message came from.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u-tg',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi from telegram' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const userRow = msgs.find((m) => m.agentName === 'You · telegram')
+    expect(userRow).toBeTruthy()
+    expect(userRow!.blocks[0]!.text).toBe('hi from telegram')
   })
 
   it('carries the verbatim raw json through to the row', () => {
@@ -489,6 +513,34 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.input).toEqual({ id: 'greet' })
     expect(tcBlock!.toolCall!.result).toBe('say hello warmly')
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    // No channel in the payload → the source label is just "Skill".
+    expect(msgs[0]!.agentName).toBe('Skill')
+  })
+
+  it('surfaces the originating channel in the SKILL_LOAD source label', () => {
+    // When a skill is loaded from a channel (e.g. Telegram), the backend
+    // stamps the channel label into the entry's erMeta under "channel",
+    // shipped as a top-level `channel` field on the TranscriptEntry.
+    // transcriptToMessages should render the source label as
+    // "Skill · <channel>" so the user can tell how/why the skill was loaded.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'skillload-tg',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SKILL_LOAD' },
+          input: { id: 'start' },
+          result: { id: 'start', description: 'start skill', body: 'body text' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    expect(msgs[0]!.agentName).toBe('Skill · telegram')
   })
 })
 

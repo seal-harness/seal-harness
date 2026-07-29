@@ -25,6 +25,7 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 
 -- A fake TmuxRunner that records argv + returns scripted stdout (LIFO).
 mkFakeRunner :: [Text] -> IO (TmuxRunner, IO [[String]])
@@ -58,7 +59,8 @@ spec = describe "Seal.Phase6aSpec" $ do
         mintId = newHarnessId
         startOp = harnessStartOp reg runner session window HfClaudeCode mintId
         listOp  = harnessListOp reg
-    appEnv <- mkEnv defaultConfig
+    logger <- testSealLogger
+    appEnv <- mkEnv logger defaultConfig
     (tHandle, _) <- fakeTwoFileTranscript
 
     -- 1. HARNESS_START

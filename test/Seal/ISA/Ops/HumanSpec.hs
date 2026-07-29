@@ -13,9 +13,10 @@ import Seal.Providers.Class
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 fakeCaps :: IORef [String] -> String -> ChannelCaps
 fakeCaps sent reply = ChannelCaps

@@ -63,14 +63,20 @@ skillParser backend dispatcher = hsubparser
        (info (infoCmd backend <$> skillArg)
              (progDesc "Show one skill's full body"))
   <> command "load"
-       (info (loadCmd dispatcher <$> skillArg)
-             (progDesc "Load one skill into the current session (records a SKILL_LOAD audit entry)"))
+       (info (loadCmd dispatcher <$> skillArg <*> messageArg)
+             (progDesc "Load one skill into the current session, with an optional trailing message"))
   <> metavar "COMMAND"
   )
 
 -- | Required skill-id argument.
 skillArg :: Parser Text
 skillArg = T.pack <$> strArgument (metavar "SKILL" <> help "Skill id (e.g. greet)")
+
+-- | Optional trailing message (everything after the skill id). Joined with
+-- spaces so @/skill load foo do something@ yields the message @do something@.
+-- Empty when no trailing text is supplied (just a skill load, no message).
+messageArg :: Parser Text
+messageArg = T.intercalate " " . map T.pack <$> many (strArgument (metavar "MESSAGE..." <> help "Optional message appended after the skill body"))
 
 listCmd :: SkillBackend -> CommandAction
 listCmd backend = CommandAction $ \caps -> do
@@ -89,9 +95,18 @@ infoCmd backend raw = CommandAction $ \caps ->
         Nothing -> ccSend caps ("skill not found: " <> skillIdText sid)
         Just s  -> mapM_ (ccSend caps) (renderSkillInfo s)
 
--- | @/skill load <id>@ — dispatch the 'SKILL_LOAD' opcode with @{"id": <id>}@
--- via the channel-supplied 'CallDispatcher'. Mirrors @/call@'s pattern:
--- echo a header line first (so the "Command output" bubble is self-contained).
+-- | @/skill load <id> [message...]@ — dispatch the 'SKILL_LOAD' opcode with
+-- @{"id": <id>, "message": <message>}@ via the channel-supplied
+-- 'CallDispatcher'. Mirrors @/call@'s pattern: echo a header line first (so
+-- the "Command output" bubble is self-contained).
+--
+-- The optional trailing @message@ is forwarded to the dispatcher as a
+-- @message@ field in the opcode input. 'recordSkillLoadResult' appends it to
+-- @conversation.jsonl@ as a separate 'User' message AFTER the skill body, so
+-- the model sees the skill followed by the user's request on the next turn
+-- (e.g. @/skill load start #123@ loads the @start@ skill then sends
+-- @#123@ as the user's message). When no message is supplied, the input
+-- omits the @message@ key and the load behaves as before (skill body only).
 --
 -- On success, the skill body is NOT rendered via 'ccSend' — the dispatcher
 -- records a second 'EKHarness' entry to the transcript carrying the
@@ -104,13 +119,16 @@ infoCmd backend raw = CommandAction $ \caps ->
 -- text IS rendered via 'ccSend' so the user sees it in the slash bubble —
 -- error paths produce no transcript body entry, so the slash bubble is
 -- the only surface for the error message.
-loadCmd :: CallDispatcher -> Text -> CommandAction
-loadCmd dispatcher raw = CommandAction $ \caps -> do
+loadCmd :: CallDispatcher -> Text -> Text -> CommandAction
+loadCmd dispatcher raw message = CommandAction $ \caps -> do
   ccSend caps ("$ /skill load " <> raw)
   case mkSkillId raw of
     Left err -> ccSend caps err
     Right sid -> do
-      let input = object ["id" .= skillIdText sid]
+      let input = object
+            [ "id" .= skillIdText sid
+            , "message" .= message
+            ]
       res <- dispatcher (OpName "SKILL_LOAD") input
       case res of
         Left e  -> ccSend caps (renderDispatchError e)

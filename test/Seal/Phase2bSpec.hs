@@ -45,6 +45,7 @@ import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Ingest (emptyChain)
 
 -- A scripted provider: replies a long message to test chunking.
@@ -101,7 +102,8 @@ spec = describe "Seal.Phase2bSpec" $ do
         sid      = either (error "sid") id (mkSessionId "phase2b")
         isaReg   = ISA.mkRegistry []
         allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
-    appEnv <- mkEnv defaultConfig
+    sigLogger <- testSealLogger
+    appEnv <- mkEnv sigLogger defaultConfig
     let runOneTurn h ms body =
           let handleCaps = ChannelCaps
                 { ccSend = chSend h
@@ -120,6 +122,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeCaps = handleCaps
                 , aeSession = sid
                 , aeMaxTurns = 4
+                , aeChannel = "signal"
                 , aeMessageSource = Just ms
                 , aeAutonomy = Full
                 , aeApprovals = approvals
@@ -145,7 +148,8 @@ spec = describe "Seal.Phase2bSpec" $ do
           , srConfigPath = ""
           , srActive = activeRef
           }
-    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+    sigLogger2 <- testSealLogger
+    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler sigLogger2
     -- The plain turn is forked so the loop can keep receiving; give the
     -- forked thread a moment to finish its runTurn + chSend before reading
     -- the captured sends.

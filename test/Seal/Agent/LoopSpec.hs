@@ -32,6 +32,7 @@ import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -60,7 +61,8 @@ instance Provider FailingProvider where
 
 runTestApp :: App a -> IO a
 runTestApp act = do
-  env <- mkEnv defaultConfig
+  logger <- testSealLogger
+  env <- mkEnv logger defaultConfig
   runApp env act
 
 spec :: Spec
@@ -99,6 +101,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeCaps = caps
                 , aeSession = either (error "sid") id (mkSessionId "s1")
                 , aeMaxTurns = 8
+                , aeChannel = "test"
                 , aeMessageSource = Nothing
                 , aeAutonomy = Full
                 , aeApprovals = approvals
@@ -135,6 +138,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeCaps = caps
                 , aeSession = either (error "sid") id (mkSessionId "s1")
                 , aeMaxTurns = 8
+                , aeChannel = "test"
                 , aeMessageSource = Nothing
                 , aeAutonomy = Full
                 , aeApprovals = approvals
@@ -190,6 +194,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeCaps = caps
                       , aeSession = either (error "sid") id (mkSessionId "s1")
                       , aeMaxTurns = 8
+                      , aeChannel = "test"
                       , aeMessageSource = Nothing
                       , aeAutonomy = Full
                       , aeApprovals = approvals
@@ -243,6 +248,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeCaps = caps
                       , aeSession = either (error "sid") id (mkSessionId "s1")
                       , aeMaxTurns = 8
+                      , aeChannel = "test"
                       , aeMessageSource = Nothing
                       , aeAutonomy = Full
                       , aeApprovals = approvals
@@ -312,6 +318,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeCaps = caps
                       , aeSession = either (error "sid") id (mkSessionId "s1")
                       , aeMaxTurns = 8
+                      , aeChannel = "test"
                       , aeMessageSource = Nothing
                       , aeAutonomy = Full
                       , aeApprovals = approvals
@@ -415,6 +422,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
@@ -453,6 +461,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
@@ -491,6 +500,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                   , aeApprovals = approvals
@@ -540,6 +550,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Supervised
                   , aeApprovals = approvals
@@ -579,6 +590,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                   , aeApprovals = approvals
@@ -617,6 +629,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                   , aeApprovals = approvals
@@ -658,6 +671,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                   , aeApprovals = approvals
@@ -701,6 +715,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeCaps = caps
                   , aeSession = either (error "sid") id (mkSessionId "s1")
                   , aeMaxTurns = 2
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                   , aeApprovals = approvals

@@ -17,9 +17,10 @@ import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 sampleSession :: SessionId
 sampleSession = mkSystemSessionId "s1"

@@ -86,6 +86,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),
     harness: null,
     model: 'claude-sonnet-4-20250514',
+    channel: null,
     raw: '{}',
     ...overrides,
   }

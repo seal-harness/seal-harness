@@ -127,7 +127,7 @@ describe('streamClient', () => {
     client.focus('sess-1')
     const received: unknown[] = []
     const unsub = client.onEntry((e) => received.push(e))
-    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', raw: '{}' }
+    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', channel: null, raw: '{}' }
     ref.socket!.simulateMessage({ type: 'entry', sessionId: 'sess-1', entry })
     expect(received).toHaveLength(1)
     expect((received[0] as { id: string }).id).toBe('e1')
@@ -139,7 +139,7 @@ describe('streamClient', () => {
     client.focus('sess-1')
     const received: unknown[] = []
     client.onEntry((e) => received.push(e))
-    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', raw: '{}' }
+    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', channel: null, raw: '{}' }
     ref.socket!.simulateMessage({ type: 'entry', sessionId: 'other-session', entry })
     expect(received).toHaveLength(0)
   })
@@ -168,7 +168,7 @@ describe('streamClient', () => {
     expect(received).toHaveLength(0)
     expect(client.lastError()).toBeNull()
     // A subsequent well-formed frame still dispatches.
-    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', raw: '{}' }
+    const entry = { id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', channel: null, raw: '{}' }
     ref.socket!.simulateMessage({ type: 'entry', sessionId: 'sess-1', entry })
     expect(received).toHaveLength(1)
   })

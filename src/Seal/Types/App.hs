@@ -1,20 +1,16 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings #-}
 module Seal.Types.App
   ( App(..)
   , runApp
-  , withKatip
   ) where
 
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Reader
-import Data.Maybe
-import Data.Text (Text)
 
 import Katip
-import System.IO
 
+import Seal.Logging.Logger (SealLogger (..))
 import Seal.Types.Env
 
 -- | The application monad: @ReaderT Env (KatipContextT IO)@, matching the
@@ -35,21 +31,14 @@ instance KatipContext App where
   getKatipNamespace = App (lift getKatipNamespace)
   localKatipNamespace f (App m) = App (localKatipNamespace f m)
 
--- | Run an 'App' action: build the katip environment via 'withKatip' and run
--- the 'ReaderT' against the given 'Env'.
+-- | Run an 'App' action: use the 'SealLogger' from 'Env' to set up the katip
+-- context (LogEnv + LogContexts + Namespace), then run the 'ReaderT' against
+-- the given 'Env'. The logger is built once at startup via 'withSealLogger'
+-- and threaded through 'Env' so 'App'-level 'logMsg' calls and 'IO'-level
+-- 'logIO' calls reach the same scribe.
 runApp :: Env -> App a -> IO a
-runApp env (App m) = withKatip (envLogLevel env) $ \le ->
-  runKatipContextT le () "seal-harness" (runReaderT m env)
-
--- | Bracket the lifetime of a 'LogEnv' with a single stderr scribe using a
--- compact bracket formatter. The minimum 'Severity' is derived from the
--- config (via @--log-level@, defaulting to @InfoS@).
-withKatip :: Text -> (LogEnv -> IO a) -> IO a
-withKatip logLevel = bracket makeLogEnv closeScribes
+runApp env (App m) =
+  runKatipContextT (slLogEnv logger) (slContext logger)
+    (slNamespace logger) (runReaderT m env)
   where
-    makeLogEnv = do
-      let sev = fromMaybe InfoS (textToSeverity logLevel)
-      scribe <- mkHandleScribeWithFormatter bracketFormat
-        ColorIfTerminal stderr (permitItem sev) V2
-      registerScribe "stderr" scribe defaultScribeSettings
-        =<< initLogEnv "seal-harness" "production"
+    logger = envLogger env

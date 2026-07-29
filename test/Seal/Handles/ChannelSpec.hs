@@ -35,7 +35,8 @@ newInlineFake streaming inbox prompts = InlineFake
 
 inlineHandle :: InlineFake -> ChannelHandle
 inlineHandle fc = ChannelHandle
-  { chSend         = \t -> modifyIORef' (ifSent fc) (t :)
+  { chLabel       = "test"
+  , chSend         = \t -> modifyIORef' (ifSent fc) (t :)
   , chSendError    = \t -> modifyIORef' (ifErrors fc) (t :)
   , chSendChunk    = \t -> modifyIORef' (ifChunks fc) (t :)
   , chPrompt       = const (popPrompt fc)

@@ -1386,6 +1386,12 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           const input = parsed.input as { id?: string } | undefined
           const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
           const body = result?.body ?? ''
+          // The originating channel label (e.g. "telegram", "web", "cli"),
+          // stamped into the entry's erMeta by the backend's
+          // recordSkillLoadResult and shipped as a top-level `channel` field
+          // on the TranscriptEntry. Surfaced in the source label so the user
+          // can tell how/why the skill was loaded ("Skill · telegram").
+          const channel = e.channel
           const tc: ToolCallInfo = {
             id: 'skillload-' + e.id,
             name: 'SKILL_LOAD',
@@ -1396,7 +1402,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-skillload',
             entryId: e.id,
-            agentName: 'Skill',
+            agentName: channel ? `Skill · ${channel}` : 'Skill',
             agentStatus: 'completed',
             timestamp: ts,
             blocks: [{ id: 'tc-skillload-' + e.id, toolCall: tc }],
@@ -1473,7 +1479,12 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-user',
                 entryId: e.id,
-                agentName: 'You',
+                // Surface the originating channel (e.g. "telegram", "web")
+                // in the source label so the user can tell where a message
+                // came from. The channel is stamped into the request
+                // entry's erMeta by runTurn's requestMeta and shipped as
+                // a top-level `channel` field on the TranscriptEntry.
+                agentName: e.channel ? `You · ${e.channel}` : 'You',
                 agentStatus: 'completed',
                 timestamp: ts,
                 blocks: [{ id: 'u-' + e.id, text: textParts }],

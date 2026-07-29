@@ -44,6 +44,7 @@ import Seal.Types.App (runApp)
 import Seal.Types.Command (Command (..), pCommand)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Ingest (emptyChain)
 
 -- A scripted provider that replies "hi from model" to any plain text.
@@ -117,7 +118,8 @@ spec = do
           sid      = either (error "sid") id (mkSessionId "sig-test")
           isaReg   = ISA.mkRegistry []
           allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
-      appEnv <- mkEnv defaultConfig
+      sigLogger <- testSealLogger
+      appEnv <- mkEnv sigLogger defaultConfig
       approvals <- newApprovalCache
       let runOneTurn h ms body =
             let handleCaps = ChannelCaps
@@ -137,6 +139,7 @@ spec = do
                   , aeCaps = handleCaps
                   , aeSession = sid
                   , aeMaxTurns = 4
+                  , aeChannel = "signal"
                   , aeMessageSource = Just ms
                   , aeAutonomy = Full
                   , aeApprovals = approvals
@@ -162,7 +165,8 @@ spec = do
             , srConfigPath = ""
             , srActive = activeRef
             }
-      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+      sigLogger2 <- testSealLogger
+      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler sigLogger2
       -- The plain turn is forked so the loop can keep receiving; give the
       -- forked thread a moment to finish its runTurn + chSend before reading
       -- the captured sends.

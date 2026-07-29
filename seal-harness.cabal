@@ -183,6 +183,10 @@ library
         Seal.Skills.Backend
         Seal.Skills.Autoload
         Seal.Skills.Builtins
+        Seal.Logging.Logger
+        Seal.Logging.ChannelContext
+        Seal.Logging.Exceptions
+        Seal.Logging.Global
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -258,6 +262,7 @@ test-suite tests
       , hspec
       , http-client
       , http-client-tls
+      , katip
       , optparse-applicative
       , stm
       , temporary
@@ -371,6 +376,7 @@ test-suite tests
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
+        Seal.Session.LockSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
@@ -412,3 +418,5 @@ test-suite tests
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
+        Seal.Logging.LoggerSpec
+        Seal.Logging.ExceptionsSpec

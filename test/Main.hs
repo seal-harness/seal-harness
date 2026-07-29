@@ -18,6 +18,7 @@ import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
 import qualified Seal.Session.LogSpec
+import qualified Seal.Session.LockSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
@@ -134,6 +135,8 @@ import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
+import qualified Seal.Logging.LoggerSpec
+import qualified Seal.Logging.ExceptionsSpec
 
 main :: IO ()
 main = hspec $ do
@@ -153,6 +156,7 @@ main = hspec $ do
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
   Seal.Session.LogSpec.spec
+  Seal.Session.LockSpec.spec
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
@@ -269,3 +273,5 @@ main = hspec $ do
   Seal.ISA.Ops.PatchSpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
+  Seal.Logging.LoggerSpec.spec
+  Seal.Logging.ExceptionsSpec.spec

@@ -15,6 +15,7 @@ import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.TestHelpers.FakeCaps
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.Config
 import Seal.Types.Env
 
@@ -50,6 +51,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeCaps = caps
           , aeSession = either (error "sid") id (mkSessionId "cli")
           , aeMaxTurns = 4
+          , aeChannel = "test"
           , aeMessageSource = Nothing
           , aeAutonomy = Full
           , aeApprovals = approvals
@@ -59,7 +61,8 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeOnDemandSchemas = False
           , aeLogPath = Nothing
           }
-    env <- mkEnv defaultConfig
+    logger <- testSealLogger
+    env <- mkEnv logger defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc
     sent `shouldBe` ["ollama/test-model> hello from model"]

@@ -89,6 +89,7 @@ import Seal.Tools.Exec.UntrustedIO
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Browser (browserClickOp, browserOpenOp, browserReadOp,
                          noBrowserDriver)
@@ -100,7 +101,7 @@ import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (Provi
 -- ---------------------------------------------------------------------------
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A minimal 'WebSearchConfig' for tests: no manager (fail-closed),
 -- 'ProviderParallel' default, empty allow-list, no vault/key.
@@ -240,7 +241,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    mkRemoteUntrustedIOStub caps sid 8 Nothing Full approvals Nothing (pure ()) Nothing False Nothing
+                    mkRemoteUntrustedIOStub caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

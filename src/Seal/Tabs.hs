@@ -20,10 +20,11 @@ import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO
 import Control.Exception (SomeException, catch)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.IO (hPutStrLn, stderr)
 
+import Katip (Severity (..), ls)
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Handles.Tab (TabIndex, TabKind)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Tabs.Persist (saveTabList)
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), emptyTabList, insertTab
@@ -139,7 +140,7 @@ persistIf h r = do
     Left _  -> pure ()
     Right _ -> case thSave h of
       Nothing  -> pure ()
-      Just act -> act `catch` \e -> hPutStrLn stderr ("[persist] tabs.json save failed: " <> show (e :: SomeException))
+      Just act -> act `catch` \e -> globalLogIO WarningS ("[persist] tabs.json save failed: " <> ls (T.pack (show (e :: SomeException))))
   pure r
 
 -- | Idempotent: if no tab binds @sid@, insert a @'BoundSession' sid@ tab of
@@ -160,5 +161,5 @@ ensureTabForSession tabsH kind sid = do
     else do
       r <- insertTabH tabsH (BoundSession sid) kind Nothing
       case r of
-        Left e -> hPutStrLn stderr ("[auto-tab] could not insert tab for " <> T.unpack (sessionIdText sid) <> ": " <> T.unpack e)
+        Left e -> globalLogIO WarningS ("[auto-tab] could not insert tab for " <> ls (sessionIdText sid) <> ": " <> ls e)
         Right _ -> pure ()

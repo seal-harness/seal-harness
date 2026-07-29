@@ -41,14 +41,29 @@ data AgentEnv = AgentEnv
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int
+  , aeChannel :: Text
+    -- ^ The channel this turn's message arrived on (e.g. @\"telegram\"@,
+    -- @\"web\"@, @\"cli\"@). This is the /arrival/ channel, NOT the
+    -- session's channel-of-origin — a web message sent to a
+    -- Telegram-created session carries @\"web\"@, not @\"telegram\"@. Each
+    -- wiring site passes the channel the message actually came in on:
+    -- the web gateway passes @"web"@, the CLI passes @"cli"@, and the
+    -- inbox-channel loop passes @smChannel@ (correct because an inbox
+    -- session is always created on the channel its messages arrive on).
+    -- 'runTurn' stamps this into every request entry's @erMeta@ @channel@
+    -- field so the frontend can attribute every user message to the
+    -- channel it came from. This is the single source of truth for channel
+    -- provenance — 'MessageSource' carries the finer-grained conversation
+    -- id + user id, but the channel label itself always comes from here.
   , aeMessageSource :: Maybe MessageSource
     -- ^ The authenticated-transport identity of the inbound message this
-    -- turn is answering. 'Nothing' for the CLI TUI (which bypasses
-    -- 'MessageSource'); @'Just' ms@ for channels that carry one (Signal).
-    -- 'runTurn' folds the 'msChannelKind' into the request 'EntryRecord's
-    -- @erMeta@ @channel@ field and the 'msConversationId' into
-    -- @conversationId@, so the transcript records which channel + conversation
-    -- each turn served.
+    -- turn is answering. 'Nothing' for the CLI TUI and the web (which
+    -- bypass 'MessageSource'); @'Just' ms@ for channels that carry one
+    -- (Signal, Telegram). 'runTurn' folds the 'msConversationId' into the
+    -- request 'EntryRecord's @erMeta@ @conversationId@ field. The
+    -- @channel@ field comes from 'aeChannel' (above), NOT from here, so
+    -- every channel — including those with no 'MessageSource' — is
+    -- attributed.
   , aeAutonomy :: AutonomyLevel
     -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
     -- human-confirmation gate for Untrusted opcodes (they run immediately after

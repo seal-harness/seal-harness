@@ -9,6 +9,7 @@ import qualified Data.Text as T
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
+import Seal.Logging.Logger (SealLogger)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
@@ -68,8 +69,8 @@ tryOpenVault paths cfg =
 
 -- | Full TUI wiring. The autonomy level threads through to 'mkSessionAgentEnv'
 -- so 'Supervised' (the default) prompts before running Untrusted opcodes.
-runTui :: AutonomyLevel -> IO ()
-runTui autonomy = do
+runTui :: AutonomyLevel -> SealLogger -> IO ()
+runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
@@ -172,4 +173,4 @@ runTui autonomy = do
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]
-  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply
+  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply logger

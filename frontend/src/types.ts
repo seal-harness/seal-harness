@@ -273,6 +273,14 @@ export interface TranscriptEntry {
   payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
+  /** The originating communications-channel label of this entry (e.g.
+   *  "telegram", "web", "cli"), or null when the entry carries no channel
+   *  (response entries, CLI TUI turns with no MessageSource, the
+   *  conversation-only fallback path). Stamped into the request entry's
+   *  erMeta by runTurn's requestMeta, and into SKILL_LOAD entries by
+   *  recordSkillLoadResult. Surfaced so the frontend can attribute user
+   *  messages and skill loads to the channel they came from. */
+  channel: string | null
   /** The full, verbatim on-disk transcript.jsonl line for this entry — all 9
    *  `_te_*` fields including `_te_metadata`, byte-faithful to disk. Surfaced in
    *  the "View raw JSON (message)" modal. Required, never optional, per the

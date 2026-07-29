@@ -9,7 +9,9 @@ import Test.Hspec
 
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
-import Seal.Channels.Signal.Transport (mkMockSignalTransport)
+import Seal.Channels.Signal.Transport
+  ( mkMockSignalTransport )
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.MessageSource
@@ -42,7 +44,8 @@ spec = describe "Seal.Channels.Signal" $ do
     let env1 = signalEnvelope src1 (Just uuid1) "hello"
         env2 = signalEnvelope src1 (Just uuid1) "/ping"
     (transport, _) <- mkMockSignalTransport [env1, env2]
-    withSignalChannel (AllowAll, 1998) acct transport $ \ch -> do
+    logger <- testSealLogger
+    withSignalChannel (AllowAll, 1998) acct transport logger $ \ch -> do
       let h = toHandle ch
       (m1, t1) <- chReceive h
       (_, t2)  <- chReceive h
@@ -59,7 +62,8 @@ spec = describe "Seal.Channels.Signal" $ do
     let longMsg = T.replicate 25 "a"
         env1 = signalEnvelope src1 (Just uuid1) "x"  -- primes the last-sender
     (transport, getCaptured) <- mkMockSignalTransport [env1]
-    withSignalChannel (AllowAll, 10) acct transport $ \ch -> do
+    logger <- testSealLogger
+    withSignalChannel (AllowAll, 10) acct transport logger $ \ch -> do
       let h = toHandle ch
       (_, _) <- chReceive h  -- pop env1, sets last sender to src1
       chSend h longMsg
@@ -70,7 +74,8 @@ spec = describe "Seal.Channels.Signal" $ do
 
   it "chSend with no last sender is dropped (capture empty)" $ do
     (transport, getCaptured) <- mkMockSignalTransport []
-    withSignalChannel (AllowAll, 1998) acct transport $ \ch -> do
+    logger <- testSealLogger
+    withSignalChannel (AllowAll, 1998) acct transport logger $ \ch -> do
       let h = toHandle ch
       chSend h "nobody to reply to"
       cap <- getCaptured
@@ -81,7 +86,8 @@ spec = describe "Seal.Channels.Signal" $ do
         envDisallowed = signalEnvelope "+19999999999" Nothing "out"
     (transport, _) <- mkMockSignalTransport [envDisallowed, envAllowed]
     let allow = AllowOnly (Set.fromList [mkAllowedUserId src1])
-    withSignalChannel (allow, 1998) acct transport $ \ch -> do
+    logger <- testSealLogger
+    withSignalChannel (allow, 1998) acct transport logger $ \ch -> do
       let h = toHandle ch
       (m1, t1) <- chReceive h
       -- envDisallowed is dropped; envAllowed is yielded
@@ -92,13 +98,15 @@ spec = describe "Seal.Channels.Signal" $ do
 
   it "chPrompt returns Left Deferred (Signal can't answer inline)" $ do
     (transport, _) <- mkMockSignalTransport []
-    withSignalChannel (AllowAll, 1998) acct transport $ \ch -> do
+    logger <- testSealLogger
+    withSignalChannel (AllowAll, 1998) acct transport logger $ \ch -> do
       r <- chPrompt (toHandle ch) "q?"
       r `shouldBe` Left Deferred
 
   it "chStreaming is True for Signal" $ do
     (transport, _) <- mkMockSignalTransport []
-    withSignalChannel (AllowAll, 1998) acct transport $ \ch ->
+    logger <- testSealLogger
+    withSignalChannel (AllowAll, 1998) acct transport logger $ \ch ->
       chStreaming (toHandle ch) `shouldBe` True
 
 -- | Build the AllowList UserId for the test from a phone number.

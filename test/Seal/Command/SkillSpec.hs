@@ -2,7 +2,10 @@
 module Seal.Command.SkillSpec (spec) where
 
 import Data.Aeson (object)
-import Data.IORef (modifyIORef')
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as AKey
+import Data.Aeson.KeyMap qualified as KM
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -41,6 +44,27 @@ fakeLoadDispatcher parts isErr _opName _val =
 -- | A canned 'Left' dispatcher for the /skill load error path.
 fakeErrorDispatcher :: DispatchError -> CallDispatcher
 fakeErrorDispatcher e _opName _val = pure (Left e)
+
+-- | A recording dispatcher that captures the input Value it was called with
+-- and returns a successful result. Used to verify the /skill load parser
+-- forwards the trailing message in the opcode input.
+recordingDispatcher :: IO (CallDispatcher, IO A.Value)
+recordingDispatcher = do
+  ref <- newIORef (A.Null :: A.Value)
+  let disp _opName val = do
+        modifyIORef' ref (const val)
+        pure (Right (OpResult [TrpText "ok"] False (object [])))
+  pure (disp, readIORef ref)
+
+-- | Extract a required text field from an Aeson object Value, failing the
+-- test if the value isn't an object or the field is absent/non-string.
+requireTextField :: A.Value -> Text -> IO Text
+requireTextField v key =
+  case v of
+    A.Object o -> case KM.lookup (AKey.fromText key) o of
+      Just (A.String t) -> pure t
+      other -> expectationFailure ("expected field " <> T.unpack key <> " (string) in input, got " <> show other) >> pure ""
+    _ -> expectationFailure ("expected object input, got " <> show v) >> pure ""
 
 -- | Run a /skill command against a backend preloaded with the given skills,
 -- using a supplied CallDispatcher for /skill load.
@@ -138,3 +162,29 @@ spec = describe "Seal.Command.Skill" $ do
           echo `shouldBe` "$ /skill load greet"
           T.unlines rest `shouldSatisfy` ("opcode not found" `T.isInfixOf`)
         _ -> expectationFailure "expected at least the echo line"
+
+    it "forwards the trailing message in the opcode input" $ do
+      -- /skill load start #123 should dispatch SKILL_LOAD with
+      -- input.message = "#123" so recordSkillLoadResult appends it to
+      -- conversation.jsonl after the skill body.
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, getInput) <- recordingDispatcher
+      runSkillWith [] dispatcher ["load", "start", "#123"] fc
+      val <- getInput
+      requireTextField val "id" `shouldReturn` "start"
+      requireTextField val "message" `shouldReturn` "#123"
+
+    it "omits the message (empty string) when no trailing text is supplied" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, getInput) <- recordingDispatcher
+      runSkillWith [] dispatcher ["load", "greet"] fc
+      val <- getInput
+      requireTextField val "id" `shouldReturn` "greet"
+      requireTextField val "message" `shouldReturn` ""
+
+    it "joins multiple trailing words with spaces" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, getInput) <- recordingDispatcher
+      runSkillWith [] dispatcher ["load", "start", "do", "something", "now"] fc
+      val <- getInput
+      requireTextField val "message" `shouldReturn` "do something now"

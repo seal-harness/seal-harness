@@ -53,14 +53,15 @@ import Data.Word (Word8)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
 import System.Posix.IO
   ( OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags
   , fdWriteBuf, openFd )
 import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
 
+import Katip (Severity (..), ls)
 import Seal.Core.Types (OpName, ToolCallId)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), ToolResultPart (..) )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
@@ -328,7 +329,7 @@ withTwoFileTranscript dir action = do
             safeDaemon st =
               daemon st `catch` \e -> do
                 atomically (writeTVar aliveRef False)
-                hPutStrLn stderr ("[transcript] writer daemon died: " <> show (e :: SomeException))
+                globalLogIO ErrorS ("[transcript] writer daemon died: " <> ls (T.pack (show (e :: SomeException))))
                 -- Drain remaining queue items WITHOUT filling their ACK slots
                 -- (the writes never completed). Callers blocked on takeTMVar
                 -- unblock via the aliveRef check in ackWrite's orElse. Shutdown
@@ -387,8 +388,8 @@ readEntries path = do
     then pure []
     else do
       bs <- BS.readFile path
-      let ls = filter (not . BS.null) (BS.split 0x0a bs)
-      pure (mapMaybe (decode . BL.fromStrict) ls)
+      let lns = filter (not . BS.null) (BS.split 0x0a bs)
+      pure (mapMaybe (decode . BL.fromStrict) lns)
 
 -- | In-memory two-file handle for tests. No file IO, no daemon.
 fakeTwoFileTranscript :: IO (TwoFileHandle, IO ([Message], [EntryRecord]))

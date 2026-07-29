@@ -53,7 +53,7 @@ function fakeClient(): StreamClient & {
 }
 
 function makeEntry(id: string, ts: string, payload = 'hi'): TranscriptEntry {
-  return { id, timestamp: ts, direction: 'response', payload, harness: null, model: 'm', raw: '{}' }
+  return { id, timestamp: ts, direction: 'response', payload, harness: null, model: 'm', channel: null, raw: '{}' }
 }
 
 // ── useListsStream ───────────────────────────────────────────────────────

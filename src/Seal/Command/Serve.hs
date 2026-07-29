@@ -14,7 +14,8 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
-import System.IO (hPutStrLn, stderr)
+
+import Katip (Severity (..), ls)
 
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
@@ -37,6 +38,7 @@ import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
+import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
@@ -71,23 +73,23 @@ import Seal.Web.UiState (newUiStateHandle)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: AutonomyLevel -> IO ()
-runServeMain autonomy = do
+runServeMain :: AutonomyLevel -> SealLogger -> IO ()
+runServeMain autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
+      logIO logger WarningS ("could not load config: " <> ls err)
       pure defaultRuntimeConfig
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      logIO logger WarningS ("could not load security config: " <> ls err)
       pure defaultSecurityConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths secCfg
+  mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -141,7 +143,7 @@ runServeMain autonomy = do
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg tabsH
+        reg tmuxR (Just mgr) approvals loadCfg tabsH logger
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -203,6 +205,7 @@ runServeMain autonomy = do
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
         , sdTabsHandle  = tabsH
+        , sdLogger      = logger
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
@@ -257,13 +260,13 @@ runServeMain autonomy = do
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
-tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe VaultHandle)
-tryOpenVault paths fcfg =
+tryOpenVault :: SealPaths -> SecurityConfig -> SealLogger -> IO (Maybe VaultHandle)
+tryOpenVault paths fcfg logger =
   case (scVaultRecipient fcfg, scVaultIdentity fcfg) of
     (Just _, Just _) ->
       resolveEncryptor fcfg >>= \case
         Left err -> do
-          hPutStrLn stderr ("Warning: vault not available: " <> show err)
+          logIO logger WarningS ("vault not available: " <> ls (T.pack (show err)))
           pure Nothing
         Right enc -> do
           let vcfg = VaultConfig
@@ -310,11 +313,11 @@ forkSignalListener deps cfg registry =
       let accountLabel = Seal.Signal.Config.signalAccountText account
       eTransport <- mkRealSignalTransport accountLabel
       case eTransport of
-        Left err -> hPutStrLn stderr ("seal serve: signal channel skipped: " <> T.unpack err)
+        Left err -> logIO (cdLogger deps) WarningS ("seal serve: signal channel skipped: " <> ls err)
         Right transport -> do
           let tabsH = cdTabs deps
           askReply <- newAskReplyStore 0
-          let withCh = withSignalChannel (allow, chunkLimit) account transport
+          let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
               plainHandler h = plainTurn deps h askReply
           _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
           pure ()
@@ -341,7 +344,7 @@ forkTelegramListener deps cfg registry = do
           -- The [telegram] section is present but unresolved (e.g. the vault
           -- is locked / missing the token). Surface it so the channel isn't
           -- silently dropped on startup.
-          hPutStrLn stderr ("seal serve: telegram channel skipped: " <> T.unpack err)
+          logIO (cdLogger deps) WarningS ("seal serve: telegram channel skipped: " <> ls err)
       | otherwise -> pure ()  -- not configured; skip silently
     Right (token, chunkLimit, allow) -> do
       mgr <- newTlsManager
@@ -350,7 +353,7 @@ forkTelegramListener deps cfg registry = do
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
       let tabsH = cdTabs deps
       askReply <- newAskReplyStore 0
-      let withCh = withTelegramChannel (allow, chunkLimit) transport
+      let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
       _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
       pure ()
