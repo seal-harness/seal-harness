@@ -72,6 +72,7 @@ import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
   , addCustomModel, getUiState, setLastOptions )
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies the API needs (injected so the test can supply fakes).
 data ApiDeps = ApiDeps
@@ -545,7 +546,7 @@ handleSessionRebindNew deps sidTxt =
       if not exists
         then pure (errJson status404 "session not found")
         else do
-          mOldMeta <- (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+          mOldMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
           case mOldMeta of
             Nothing -> pure (errJson status404 "session not found")
             Just oldMeta -> do

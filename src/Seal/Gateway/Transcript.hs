@@ -34,7 +34,6 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
@@ -46,6 +45,7 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Util.StrictIO (readFileTextStrict)
 
 -- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
 -- so the @Server-Timing@ header can name the path the request took.
@@ -146,7 +146,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
   if legacyExists
     then do
       tFr0 <- getCurrentTime
-      raw <- TIO.readFile legacyPath
+      raw <- readFileTextStrict legacyPath
       tFr1 <- getCurrentTime
       tPr0 <- getCurrentTime
       let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -170,7 +170,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
     else if convExists
       then do
         tFr0 <- getCurrentTime
-        raw <- TIO.readFile convPath
+        raw <- readFileTextStrict convPath
         tFr1 <- getCurrentTime
         tPr0 <- getCurrentTime
         let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -182,7 +182,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
         if entriesExist
           then do
             tFr2 <- getCurrentTime
-            eraw <- TIO.readFile (sessionEntriesPath paths sid)
+            eraw <- readFileTextStrict (sessionEntriesPath paths sid)
             tFr3 <- getCurrentTime
             tPr2 <- getCurrentTime
             let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -251,13 +251,13 @@ firstUserMessageSnippet paths sid = do
   convExists   <- doesFileExist convPath
   if convExists
     then do
-      raw <- TIO.readFile convPath
+      raw <- readFileTextStrict convPath
       let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                           (filter (not . T.null) (T.lines raw)) :: [Message]
       pure (snippetFromMessages msgs)
     else if legacyExists
       then do
-        raw <- TIO.readFile legacyPath
+        raw <- readFileTextStrict legacyPath
         let entries = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines raw)) :: [TranscriptEntry]
         pure (snippetFromMessages (legacyRequestMessages entries))
