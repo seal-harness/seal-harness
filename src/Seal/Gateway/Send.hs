@@ -31,7 +31,6 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -117,6 +116,7 @@ import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
 
 -- | The dependencies the send handler needs (the agent-loop plumbing). Built
 -- once in 'Seal.Command.Serve.runServeMain' and shared across requests. The
@@ -335,8 +335,7 @@ loadSessionMeta paths sid = do
   exists <- doesFileExist mp
   if not exists
     then pure Nothing
-    else do
-      (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+    else decodeFileStrict mp :: IO (Maybe SessionMeta)
 
 -- | Resolve the system prompt for a web turn. An ad-hoc
 -- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
@@ -960,7 +959,7 @@ fanoutLastReply replies mBroker paths sid = do
   if not exists
     then pure ()
     else do
-      raw <- TIO.readFile convPath
+      raw <- readFileTextStrict convPath
       let lines' = filter (not . T.null) (T.lines raw)
           msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
       for_ (lastAssistantText msgs) $ \reply -> do

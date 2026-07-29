@@ -50,6 +50,7 @@ library
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Util.AesonUtils
+        Seal.Util.StrictIO
         Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
@@ -202,6 +203,7 @@ library
       , bytestring
       , configuration-tools
       , containers
+      , conduit
       , crypton
       , directory
       , exceptions
