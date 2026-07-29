@@ -188,7 +188,7 @@ the state, or keep an eye on two agents at once, you're back to tabbing.
 Seal Harness approaches this differently. Every agent session is a
 first-class, persistent object — a tab — that multiple communications
 channels can subscribe to simultaneously. You don't tab *into* an agent;
-you *subscribe* a channel to it. Telegram, Signal, and the web UI are all
+you *view* it with a channel. Telegram, Signal, and the web UI are all
 live views into the same ground-truth state: the transcript.
 
 Here's how it works:
