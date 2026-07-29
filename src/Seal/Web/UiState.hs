@@ -30,9 +30,10 @@ import GHC.Generics (Generic)
 import System.Directory
   ( createDirectoryIfMissing, doesFileExist, renameFile )
 import System.FilePath ((</>), takeDirectory)
-import System.IO (hPutStrLn, stderr)
 
+import Katip (Severity (..))
 import Seal.Config.Paths (SealPaths (..))
+import Seal.Logging.Global (globalLogIO)
 
 -- | The persisted UI state. Both fields are optional so a missing/empty
 -- file decodes to the empty state (the frontend treats that as "use the
@@ -169,7 +170,7 @@ loadUiState path = do
       case A.decode bs :: Maybe UiState of
         Just s  -> pure s
         Nothing -> do
-          hPutStrLn stderr "Warning: could not parse ui_state.json; using empty UI state"
+          globalLogIO WarningS "could not parse ui_state.json; using empty UI state"
           pure emptyUiState
 
 -- | Persist the state atomically: write @.tmp@, rename over the target.

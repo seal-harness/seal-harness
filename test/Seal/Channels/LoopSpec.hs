@@ -8,24 +8,33 @@
 -- registry and return the structured result.
 module Seal.Channels.LoopSpec (spec) where
 
-import Data.Aeson (object)
+import Data.Aeson (object, (.=))
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.FilePath ((</>))
 import Network.HTTP.Client (newManager, defaultManagerSettings)
+import Options.Applicative qualified as Opt
 import Test.Hspec
 
-import Seal.Channel.Cli (newBackends)
+import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Channels.Loop
   ( channelCallDispatcher, newChannelDeps, ChannelDeps (..)
   , shouldAutoTab, isBgSlash, createConversationSession, createConversationSessionHeadless
-  , mkBgRunner )
+  , mkBgRunner, buildChannelRegistry )
 import Seal.Command.Background (BgRunner (..))
+import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Spec
+  ( CommandAction (..), CommandName (..), CommandSpec (..), Registry
+  , Availability (..), CommandGroup (..)
+  , lookupSpec, mkRegistry, registrySpecs, runCommandAction )
 import Seal.Core.ChannelKind (ChannelKind (..))
-import Seal.Core.Types (OpName (..), mkSessionId)
+import Seal.Core.Types (OpName (..), mkSessionId, mkSystemSessionId)
 import Seal.Config.File (defaultRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe )
@@ -33,12 +42,19 @@ import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner (..))
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
+import Seal.Handles.Transcript (withTwoFileTranscript, TwoFileHandle (..))
+import Seal.ISA.Opcode (OpResult (..))
+import Seal.Logging.Logger (testSealLogger)
 import Seal.ISA.Dispatch (DispatchError (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), ToolResultPart (..))
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Skills.Backend (noneBackend, sbCreate)
+import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs, ensureTabForSession)
 import Seal.Tabs.Types (TabRef (BoundSession), Tab (tRef), tlTabs)
 import Seal.Handles.Tab (TabKind (KindAi))
+import Seal.TestHelpers.FakeCaps (makeFakeCaps, getSent)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Channels.Cursor (cursorLookup)
 
@@ -61,6 +77,21 @@ stubHandle = ChannelHandle
   , chStreaming    = False
   , chReadSecret   = pure Nothing
   , chReceive      = pure (Nothing, "")
+  }
+
+-- | A minimal no-op CommandSpec with the given name, used to populate a base
+-- registry in the buildChannelRegistry tests. Its parser parses no args and
+-- its action does nothing — only the name (used by the collision filter)
+-- matters.
+stubSpec :: Text -> CommandSpec
+stubSpec name = CommandSpec
+  { csName         = CommandName name
+  , csAliases      = []
+  , csGroup        = GroupGeneral
+  , csSynopsis     = "stub"
+  , csParserInfo   = Opt.info (pure (CommandAction (\_ -> pure ())))
+                          (Opt.progDesc "stub")
+  , csAvailability = AlwaysAvailable
   }
 
 spec :: Spec
@@ -96,8 +127,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
     sidRef <- newIORef sid
@@ -106,6 +138,142 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     case res of
       Left (OpNotFound (OpName n)) -> n `shouldBe` "BOGUS_OP"
       _ -> expectationFailure ("expected Left (OpNotFound ...), got: " <> show res)
+
+  it "SKILL_LOAD writes the skill body to conversation.jsonl (the Telegram/Signal path)" $ do
+    -- Regression: /skill load displays the "Command output" box but the skill
+    -- body never reaches the model's context on inbox channels (Telegram,
+    -- Signal). The channelCallDispatcher calls dispatch (which records an
+    -- EKHarness entry to entries.jsonl) then recordSkillLoadResult (which
+    -- must write the skill body to conversation.jsonl so runTurn's prior-read
+    -- picks it up on the next turn). This test exercises the REAL dispatcher
+    -- wiring — same as the Telegram path under seal serve / seal telegram.
+    let cfgRoot = "/tmp/seal-channelCallDispatcher-skillload-test"
+    ensureConfigRepo cfgRoot
+    let repo = openConfigRepo cfgRoot
+    backends <- newBackends cfgRoot repo
+    -- Preload a skill into the backend.
+    let skillId = case mkSkillId "greet" of
+          Right i  -> i
+          Left _   -> error "invalid skill id"
+        aTime = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+        skill = Skill
+          { skId = skillId
+          , skDescription = "greeting skill"
+          , skBody = "say hi warmly"
+          , skCreatedAt = aTime
+          , skUpdatedAt = aTime
+          , skSession = mkSystemSessionId "s1"
+          }
+    sbCreate (bSkills backends) skill
+    harnessReg <- newHarnessRegistry
+    let paths = SealPaths
+          { spHome = cfgRoot, spState = cfgRoot </> "state"
+          , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+          , spCache = cfgRoot </> "cache"
+          }
+        vaultRt = VaultRuntime
+          { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"
+          , vrHandleRef = error "vrHandleRef: stubbed — SKILL_LOAD test does not read the vault"
+          }
+    mgr <- newManager defaultManagerSettings
+    cntRef <- newIORef (0 :: Int)
+    let pr = ProviderRuntime
+          { prConfigPath = cfgRoot </> "config.toml"
+          , prVault = vaultRt
+          , prManager = mgr
+          , prCallCounter = cntRef
+          }
+    approvals <- newApprovalCache
+    tabsH <- newTabsHandle
+    logger <- testSealLogger
+    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
+    askReply <- newAskReplyStore 0
+    let sid = either (error "sid") id (mkSessionId "skillload-test")
+    sidRef <- newIORef sid
+    let dispatcher = channelCallDispatcher deps stubHandle askReply sidRef
+    res <- dispatcher (OpName "SKILL_LOAD") (object ["id" .= ("greet" :: Text)])
+    case res of
+      Left e -> expectationFailure ("expected Right, got Left: " <> show e)
+      Right _r -> do
+        -- The dispatcher succeeded. Now verify the skill body landed in
+        -- conversation.jsonl by opening the session's transcript and reading
+        -- back the conversation.
+        let sessionDirPath = sessionDir paths sid
+        withTwoFileTranscript sessionDirPath $ \h -> do
+          conv <- tfwReadConversation h
+          let bodies = [ t | Message _ cs <- conv, CbText t <- cs ]
+          T.unlines bodies `shouldSatisfy` ("say hi warmly" `T.isInfixOf`)
+
+  describe "buildChannelRegistry" $ do
+    -- Regression guard for the /skill load shadowing bug. Under @seal serve@,
+    -- the web gateway's registry is passed to runChannelLoop, and it contains
+    -- a skillCommandSpec + callCommandSpec bound to webCallDispatcher (which
+    -- reads the process-global srActive ref). Without filtering those out
+    -- before appending the channel-dispatcher versions, lookupSpec returns
+    -- the FIRST match — the web spec — so a /skill load issued from Telegram
+    -- records the SKILL_LOAD entry on whatever srActive points at, NOT the
+    -- Telegram conversation's session. buildChannelRegistry must drop the
+    -- incoming skill/call/bg specs so the channel-dispatcher versions win.
+    --
+    -- We can't observe which CallDispatcher a resolved spec closes over
+    -- directly, so the test uses recording dispatchers: the "web" dispatcher
+    -- records "web", the "channel" dispatcher records "channel". After running
+    -- /skill load through the assembled registry's spec, the recorded value
+    -- must be "channel".
+    it "channel skill spec shadows a same-named web spec in the base registry" $ do
+      webCalls <- newIORef ([] :: [Text])
+      chanCalls <- newIORef ([] :: [Text])
+      let webDispatcher :: CallDispatcher
+          webDispatcher _opName _val = do
+            modifyIORef' webCalls ("web" :)
+            pure (Right (OpResult [TrpText "web"] False (object [])))
+          chanDispatcher :: CallDispatcher
+          chanDispatcher _opName _val = do
+            modifyIORef' chanCalls ("channel" :)
+            pure (Right (OpResult [TrpText "channel"] False (object [])))
+          bgRunner = BgRunner (\_prompt -> pure ())
+      skillBackend <- noneBackend
+      let baseRegistry :: Registry
+          baseRegistry = mkRegistry
+            [ skillCommandSpec skillBackend webDispatcher
+            , stubSpec "ping"
+            ]
+          channelReg = buildChannelRegistry skillBackend bgRunner chanDispatcher baseRegistry
+      -- The channel registry must have exactly one "skill" spec (the channel
+      -- one), not two.
+      let skillSpecs = [ s | s <- registrySpecs channelReg, csName s == CommandName "skill" ]
+      length skillSpecs `shouldBe` 1
+      -- And it must resolve to the CHANNEL dispatcher. Run /skill load greet
+      -- through the resolved spec and check the recording IORef.
+      case lookupSpec channelReg (CommandName "skill") of
+        Nothing -> expectationFailure "expected a skill spec in the channel registry"
+        Just skillSpec -> do
+          (fc, caps) <- makeFakeCaps []
+          case Opt.execParserPure Opt.defaultPrefs (csParserInfo skillSpec) ["load", "greet"] of
+            Opt.Success act -> do
+              runCommandAction act caps
+              _ <- getSent fc  -- drain (echo line); not asserted
+              chan <- readIORef chanCalls
+              web <- readIORef webCalls
+              chan `shouldBe` ["channel"]
+              web `shouldBe` []
+            _ -> expectationFailure "parse failed for /skill load greet"
+
+    it "preserves non-colliding specs from the base registry" $ do
+      let chanDispatcher :: CallDispatcher
+          chanDispatcher _opName _val = pure (Right (OpResult [] False (object [])))
+          bgRunner = BgRunner (\_prompt -> pure ())
+      skillBackend <- noneBackend
+      let baseRegistry = mkRegistry [ stubSpec "ping", stubSpec "vault" ]
+          channelReg = buildChannelRegistry skillBackend bgRunner chanDispatcher baseRegistry
+          names = [ n | CommandName n <- map csName (registrySpecs channelReg) ]
+      -- ping + vault preserved, plus bg + call + skill appended.
+      "ping" `elem` names `shouldBe` True
+      "vault" `elem` names `shouldBe` True
+      "bg" `elem` names `shouldBe` True
+      "call" `elem` names `shouldBe` True
+      "skill" `elem` names `shouldBe` True
 
   it "newChannelDeps sets cdTabs to the passed TabsHandle (unified)" $ do
     let cfgRoot = "/tmp/seal-channelCallDispatcher-test"
@@ -132,8 +300,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     -- A tab inserted via the passed handle is visible through cdTabs —
     -- proving cdTabs IS the passed handle (unified, not a forked copy).
     -- (TabsHandle has no Eq instance, so we verify unification by behavior.)
@@ -171,8 +340,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     let sid = either (error "sid") id (mkSessionId "w3-autotab")
     -- Simulate the channel auto-tab call (production code: Loop.hs runTurnOnSession)
     ensureTabForSession (cdTabs deps) KindAi sid
@@ -282,8 +452,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
             }
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
+      logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                      harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       let key = ("telegram", "conv-headless-test")
       meta <- createConversationSessionHeadless deps key Telegram
       -- The conversation session is persisted (cursor can resolve it).
@@ -337,8 +508,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
         [1 :: Int .. 36]
       fullSnap <- snapshotTabs tabsH
       length (tlTabs fullSnap) `shouldBe` 36
+      logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                      harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       let key = ("telegram", "conv-full-tabs-test")
       meta <- createConversationSession deps stubHandle key Telegram tabsH
       -- The tab insertion fails (list full) but the cursor MUST still bind
@@ -384,8 +556,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       broker <- newStreamBroker 10
       eventsRef <- newIORef ([] :: [BrokerEvent])
       _ <- subscribe broker (either (error "sid") id (mkSessionId "any")) (\e -> modifyIORef' eventsRef (e :))
+      logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt pr backends Supervised (Just broker)
-                      harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0
       let runner = mkBgRunner deps stubHandle askReply bgConvSid tabsH
@@ -423,8 +596,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
             }
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
+      logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
-                      harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0
       let runner = mkBgRunner deps stubHandle askReply bgConvSid tabsH

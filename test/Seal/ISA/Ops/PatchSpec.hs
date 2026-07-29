@@ -15,9 +15,10 @@ import Seal.Tools.Exec.UntrustedIO (UntrustedIO, mkLocalUntrustedIO)
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 mkTestUio :: WorkspaceRoot -> UntrustedIO
 mkTestUio = mkLocalUntrustedIO

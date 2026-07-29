@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 -- | The Signal channel: a 'SignalChannel' record (resolved allow-list +
--- chunk limit + account + inbox 'TQueue' + transport + last-sender 'IORef')
--- and its 'Channel' instance. The reader thread parses signal-cli output,
--- allow-lists the sender, and pushes envelopes to the inbox; sends are
--- chunked via 'Seal.Channels.Signal.Transport.chunkMessage' to the
+-- chunk limit + account + inbox 'TQueue' + transport + last-sender 'IORef'
+-- + logger) and its 'Channel' instance. The reader thread parses signal-cli
+-- output, allow-lists the sender, and pushes envelopes to the inbox; sends
+-- are chunked via 'Seal.Channels.Signal.Transport.chunkMessage' to the
 -- configured limit and addressed to the last sender.
 module Seal.Channels.Signal
   ( SignalChannel (..)
@@ -13,11 +13,10 @@ module Seal.Channels.Signal
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
-import Control.Exception (bracket, SomeException, try)
+import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.IO (hPutStrLn, stderr)
 
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal.Transport
@@ -27,7 +26,10 @@ import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.MessageSource
   ( MessageSource, UserId, mkMessageSource, userIdText )
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
+import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Signal.Config (SignalAccount (..))
+
+import Katip (Severity (..), ls)
 
 -- | The live Signal channel state.
 data SignalChannel = SignalChannel
@@ -40,6 +42,8 @@ data SignalChannel = SignalChannel
   , scReaderAlive  :: IORef Bool
     -- ^ 'True' while the reader thread is running. 'chReceive' stops
     -- returning once the inbox drains and this is 'False'.
+  , scLogger       :: SealLogger
+    -- ^ The shared logger for structured katip logging.
   }
 
 instance Channel SignalChannel where
@@ -63,9 +67,10 @@ withSignalChannel
   :: (AllowList UserId, Int)
   -> SignalAccount
   -> SignalTransport
+  -> SealLogger
   -> (SignalChannel -> IO a)
   -> IO a
-withSignalChannel (allow, chunkLimit) account transport action =
+withSignalChannel (allow, chunkLimit) account transport logger action =
   bracket before after (action . snd)
   where
     before = do
@@ -80,6 +85,7 @@ withSignalChannel (allow, chunkLimit) account transport action =
             , scTransport  = transport
             , scLastSender = lastSender
             , scReaderAlive = alive
+            , scLogger     = logger
             }
       tid <- forkIO (readerLoop ch)
       pure (tid, ch)
@@ -89,48 +95,51 @@ withSignalChannel (allow, chunkLimit) account transport action =
 
 -- | The background reader: loop 'stReceive', parse each inbound value,
 -- allow-list the sender, and push to the inbox. A malformed line or a
--- non-allow-listed sender is logged to stderr and dropped (not fatal).
--- Exits when 'stReceive' returns 'Left' repeatedly — but to keep the loop
--- from spinning on a permanently-empty mock inbox, a 'Left' breaks the
--- loop (the channel is closing anyway). For a real transport, a closed
--- stdout EOF is the natural exit.
+-- non-allow-listed sender is logged via 'logIO' and dropped (not fatal).
+-- Exits when 'stReceive' returns 'Left' (the channel is closing).
+-- 'ThreadKilled' is logged at 'InfoS' (normal shutdown); other
+-- 'AsyncException's at 'WarningS'; synchronous exceptions at 'ErrorS'.
 readerLoop :: SignalChannel -> IO ()
 readerLoop ch = go
   where
+    logger = scLogger ch
     go = do
       eVal <- try @SomeException (stReceive (scTransport ch))
       case eVal of
         Left e -> do
-          logErr ("reader thread exception: " <> T.pack (show e))
+          case (fromException e :: Maybe AsyncException) of
+            Just ThreadKilled ->
+              logIO logger InfoS "reader thread stopped (channel shutting down)"
+            Just _ ->
+              logIO logger WarningS ("reader thread terminated by async exception: " <> ls (T.pack (show e)))
+            Nothing ->
+              logIO logger ErrorS ("reader thread exception: " <> ls (T.pack (show e)))
           writeIORef (scReaderAlive ch) False
         Right (Left err) -> do
-          -- Transport reports an error / closed inbox. Stop the reader so
-          -- 'chReceive' can return EOF rather than block forever.
-          logErr ("reader exiting: " <> err)
+          logIO logger ErrorS ("reader exiting: " <> ls err)
           writeIORef (scReaderAlive ch) False
         Right (Right val) -> do
           case parseSignalEnvelope val of
-            Left err -> logErr ("envelope parse error: " <> err)
+            Left err -> logIO logger WarningS ("envelope parse error: " <> ls err)
             Right env -> do
               let sender = seSender env
               if isAllowed sender (scAllowList ch)
                 then do
                   case mkMessageSource (seConversationId env) Signal (Just sender) mempty of
-                    Left err -> logErr ("MessageSource construction failed: " <> err)
+                    Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
                     Right ms -> do
                       writeIORef (scLastSender ch) (Just sender)
                       atomically (writeTQueue (scInbox ch) (ms, seBody env))
-                else logErr ("dropped non-allow-listed sender: " <> userIdText sender)
+                else logIO logger InfoS ("dropped non-allow-listed sender: " <> ls (userIdText sender))
           go
-    logErr t = hPutStrLn stderr (T.unpack t)
 
 -- | Send a message, chunked to 'scChunkLimit', addressed to the last sender.
--- If no peer has been seen yet, the send is dropped with a stderr log.
+-- If no peer has been seen yet, the send is dropped with a warning log.
 sendChunked :: SignalChannel -> Text -> IO ()
 sendChunked ch t = do
   mSender <- readIORef (scLastSender ch)
   case mSender of
-    Nothing -> hPutStrLn stderr "signal: dropping send — no last sender yet"
+    Nothing -> logIO (scLogger ch) WarningS "signal: dropping send — no last sender yet"
     Just _  -> mapM_ (sendRaw ch) (chunkMessage (scChunkLimit ch) t)
 
 -- | Send one chunk verbatim to the last sender (no further splitting).
@@ -140,7 +149,7 @@ sendRaw :: SignalChannel -> Text -> IO ()
 sendRaw ch t = do
   mSender <- readIORef (scLastSender ch)
   case mSender of
-    Nothing -> hPutStrLn stderr "signal: dropping chunk — no last sender yet"
+    Nothing -> logIO (scLogger ch) WarningS "signal: dropping chunk — no last sender yet"
     Just uid -> stSend (scTransport ch) (userIdText uid) t
 
 -- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:

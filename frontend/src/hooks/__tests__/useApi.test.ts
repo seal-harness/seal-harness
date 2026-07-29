@@ -153,7 +153,7 @@ describe('useDiscoverableWindows', () => {
 
 describe('useTranscript', () => {
   it('fetches GET /api/sessions/:id/transcript when sessionId is set', async () => {
-    setNextResponse([{ id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', raw: '{}' }])
+    setNextResponse([{ id: 'e1', timestamp: 't', direction: 'response', payload: 'hi', harness: null, model: 'm', channel: null, raw: '{}' }])
     const { result } = renderHook(() => useTranscript('s1'))
     await waitFor(() => expect(result.current.entries).toHaveLength(1))
     expect(fetchCalls.some((c) => c.url === '/api/sessions/s1/transcript')).toBe(true)

@@ -16,9 +16,11 @@ import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.IO (hPutStrLn, stderr)
+
+import Katip (Severity (..), ls)
 
 import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
+import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -69,7 +71,7 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
   transport <- mkRealTelegramTransport (telegramTokenText token) mgr
   -- Register the bot's slash-command menu with BotFather for auto-completion.
   tgSetCommands transport (telegramBotCommands registry)
-  let withCh = withTelegramChannel (allow, chunkLimit) transport
+  let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
       plainHandler h = plainTurn deps h askReply
   tabsH <- newTabsHandle
   runChannelLoop deps withCh plainHandler registry chain askReply tabsH
@@ -80,23 +82,23 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
 -- channel instead. Resolves the @[telegram]@ config section + an optional
 -- vault-supplied token; fails fast with a stderr diagnostic if the token is
 -- unresolved.
-runTelegramMain :: AutonomyLevel -> IO ()
-runTelegramMain autonomy = do
+runTelegramMain :: AutonomyLevel -> SealLogger -> IO ()
+runTelegramMain autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
+      logIO logger WarningS ("could not load config: " <> ls err)
       pure defaultRuntimeConfig
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      logIO logger WarningS ("could not load security config: " <> ls err)
       pure defaultSecurityConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths secCfg
+  mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -138,7 +140,7 @@ runTelegramMain autonomy = do
         pure (fromRight defaultRuntimeConfig lc)
   chanDeps <- newChannelDeps
         paths rt pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH
+        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH logger
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
@@ -158,18 +160,18 @@ runTelegramMain autonomy = do
         Right bs -> Just (TE.decodeUtf8 bs)
         Left _   -> Nothing
   case resolveTelegramConfig (rcTelegram cfg) mVaultToken of
-    Left err -> hPutStrLn stderr ("seal telegram: " <> T.unpack err)
+    Left err -> logIO logger ErrorS ("seal telegram: " <> ls err)
     Right resolved -> runTelegram chanDeps registry emptyChain resolved askReply
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone.
-tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe Vault.VaultHandle)
-tryOpenVault paths cfg =
+tryOpenVault :: SealPaths -> SecurityConfig -> SealLogger -> IO (Maybe Vault.VaultHandle)
+tryOpenVault paths cfg logger =
   case (scVaultRecipient cfg, scVaultIdentity cfg) of
     (Just _, Just _) ->
       resolveEncryptor cfg >>= \case
         Left err -> do
-          hPutStrLn stderr ("Warning: vault not available: " <> show err)
+          logIO logger WarningS ("vault not available: " <> ls (T.pack (show err)))
           pure Nothing
         Right enc -> do
           let vcfg = Vault.VaultConfig

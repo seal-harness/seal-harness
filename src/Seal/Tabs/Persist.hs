@@ -15,12 +15,13 @@ import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
 import System.FilePath (takeDirectory)
-import System.IO (hPutStrLn, stderr)
 import System.Posix.Files (setFileMode, unionFileModes, ownerReadMode, ownerWriteMode)
 import System.IO.Unsafe (unsafePerformIO)
 
+import Katip (Severity (..))
 import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Harness.Id (parseHarnessId, harnessIdToText)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 
 -- | Module-level write lock — serializes concurrent 'saveTabList' calls so
@@ -58,7 +59,7 @@ loadTabList path = do
       bs <- BL.readFile path
       case A.decode bs :: Maybe TabList of
         Nothing -> do
-          hPutStrLn stderr "Warning: could not parse tabs.json; using empty tab list"
+          globalLogIO WarningS "could not parse tabs.json; using empty tab list"
           pure Nothing
         Just tl -> pure (Just (filterValidTabs tl))
 

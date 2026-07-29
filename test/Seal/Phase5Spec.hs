@@ -50,6 +50,7 @@ import Seal.Skills.Backend qualified as Skill
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.Env (mkEnv)
 
 -- | A provider that returns a scripted list of responses, one per call.
@@ -64,7 +65,7 @@ instance Provider ScriptProvider where
       []     -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 sampleSession :: SessionId
 sampleSession = mkSystemSessionId "s1"
@@ -167,6 +168,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeCaps = caps
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                 , aeApprovals = approvals

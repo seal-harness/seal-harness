@@ -31,9 +31,10 @@ import Seal.Tools.Exec.Untrusted
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A fake 'UntrustedIO' that records shell invocations and returns canned
 -- output. File-write returns success (no real FS write). Other methods are

@@ -39,10 +39,12 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
-import System.IO (hPutStrLn, stderr)
+import Data.Text qualified as T
 
+import Katip (Severity (..), ls)
 import Seal.Core.Types (SessionId)
 import Seal.Handles.Channel (ChannelHandle (..))
+import Seal.Logging.Global (globalLogIO)
 
 -- ---------------------------------------------------------------------------
 -- Write locks
@@ -145,7 +147,7 @@ replyFanout (ReplyRegistry tv) sid text = do
     mapM_ (\sink -> safeSend (rsHandle sink) text) sinks
   where
     safeSend h t = chSend h t `catch` \e ->
-      hPutStrLn stderr ("reply fanout: send failed: " <> show (e :: IOException))
+      globalLogIO WarningS ("reply fanout: send failed: " <> ls (T.pack (show (e :: IOException))))
 
 -- | The number of channels currently subscribed to a session's replies.
 -- Used by the web send path to decide whether the last assistant reply

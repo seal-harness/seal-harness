@@ -134,6 +134,8 @@ import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
+import qualified Seal.Logging.LoggerSpec
+import qualified Seal.Logging.ExceptionsSpec
 
 main :: IO ()
 main = hspec $ do
@@ -269,3 +271,5 @@ main = hspec $ do
   Seal.ISA.Ops.PatchSpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
+  Seal.Logging.LoggerSpec.spec
+  Seal.Logging.ExceptionsSpec.spec

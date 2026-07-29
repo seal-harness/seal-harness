@@ -18,7 +18,6 @@ module Seal.Channels.Telegram.Transport
 import Control.Concurrent.STM
   ( atomically, newTQueueIO, tryReadTQueue, writeTQueue )
 import Control.Exception (SomeException, try)
-import Control.Monad (when)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -32,10 +31,11 @@ import Network.HTTP.Client
   ( Manager, Request (..), httpLbs, parseRequest, requestBody, responseBody
   , responseStatus, responseTimeoutMicro, RequestBody (RequestBodyLBS) )
 import Network.HTTP.Types (statusCode, methodPost)
-import System.IO (hPutStrLn, stderr)
 
+import Katip (Severity (..), ls)
 import Seal.Core.MessageSource
   ( ConversationId, UserId, mkConversationId, mkUserId )
+import Seal.Logging.Global (globalLogIO)
 
 -- ---------------------------------------------------------------------------
 -- TelegramTransport — the testability seam
@@ -133,7 +133,11 @@ mkRealTelegramTransport token mgr = do
   pure TelegramTransport
     { tgReceive = fillAndReceive buffer offsetRef
     , tgSend = sendViaApi mgr token
-    , tgSetCommands = setMyCommandsViaApi mgr token
+    , tgSetCommands = \cmds -> do
+        eRes <- setMyCommandsViaApi mgr token cmds
+        case eRes of
+          Left err -> globalLogIO ErrorS ("telegram setMyCommands failed: " <> ls err)
+          Right _  -> pure ()
     , tgClose = pure ()
     }
   where
@@ -271,7 +275,7 @@ sendViaApi mgr token chatId body = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
   case eReq of
-    Left _ -> pure ()  -- silent on send failure; the channel logs elsewhere
+    Left ex -> globalLogIO WarningS ("telegram send: request error: " <> ls (T.pack (show ex)))
     Right req0 -> do
       let payload = A.object
             [ "chat_id" A..= chatId
@@ -286,14 +290,15 @@ sendViaApi mgr token chatId body = do
 
 -- | Register the bot's command menu via @setMyCommands@ so Telegram shows
 -- auto-completion for the bot's slash commands. Calls the Bot API with a
--- JSON array of @{command, description}@ objects. Logs errors to stderr
--- (the bot still works without auto-completion).
-setMyCommandsViaApi :: Manager -> Text -> [BotCommand] -> IO ()
+-- JSON array of @{command, description}@ objects. Returns 'Left' with a
+-- diagnostic on failure (the bot still works without auto-completion); the
+-- caller logs the error.
+setMyCommandsViaApi :: Manager -> Text -> [BotCommand] -> IO (Either Text ())
 setMyCommandsViaApi mgr token commands = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/setMyCommands")))
   case eReq of
-    Left ex -> hPutStrLn stderr ("telegram setMyCommands: request error: " <> show ex)
+    Left ex -> pure (Left ("request error: " <> T.pack (show ex)))
     Right req0 -> do
       let cmds = [ A.object [ "command" A..= bcName bc
                             , "description" A..= bcDescription bc
@@ -307,12 +312,12 @@ setMyCommandsViaApi mgr token commands = do
                      }
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
-        Left ex -> hPutStrLn stderr ("telegram setMyCommands: network error: " <> show ex)
+        Left ex -> pure (Left ("network error: " <> T.pack (show ex)))
         Right resp -> do
           let code = statusCode (responseStatus resp)
-          when (code /= 200) $
-            hPutStrLn stderr ("telegram setMyCommands: HTTP " <> show code
-                               <> " — " <> show (responseBody resp))
+          if code == 200
+            then pure (Right ())
+            else pure (Left ("HTTP " <> T.pack (show code) <> " — " <> T.pack (show (responseBody resp))))
 
 -- ---------------------------------------------------------------------------
 -- chunkMessage — split long messages for Telegram's 4096-char limit

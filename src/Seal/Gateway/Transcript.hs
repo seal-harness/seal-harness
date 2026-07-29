@@ -29,6 +29,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -318,6 +319,15 @@ teLineToFrontend rawLine =
           Just v  -> v
           Nothing -> A.String s
         other -> fromMaybe A.Null other
+      -- The legacy transcript.jsonl entry's `meta` field carries the
+      -- channel label (stamped by runTurn's requestMeta). Extract it so
+      -- the frontend can attribute user messages to their channel on the
+      -- legacy path too. Null when absent (response entries, old entries).
+      mChannel = case KeyMap.lookup (k "meta") o of
+        Just (A.Object mo) -> case KeyMap.lookup (k "channel") mo of
+          Just (A.String ch) -> Just ch
+          _                  -> Nothing
+        _ -> Nothing
   in object
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
@@ -325,6 +335,7 @@ teLineToFrontend rawLine =
      , "payload"   .= payloadVal
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
+     , "channel"   .= mChannel
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
 
@@ -354,15 +365,16 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
         else A.object ["content" A..= content]
       entryId = T.pack (show idx)
       ts = fromMaybe fallbackTs (lookup idx (zip [0..] entryTimestamps))
-   in object
-      [ "id"        .= entryId
-      , "timestamp" .= T.pack ts
-      , "direction" .= direction
-      , "payload"   .= payloadJson
-      , "harness"   .= (Nothing :: Maybe Text)
-      , "model"     .= model
-     , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
-     ]
+    in object
+       [ "id"        .= entryId
+       , "timestamp" .= T.pack ts
+       , "direction" .= direction
+       , "payload"   .= payloadJson
+       , "harness"   .= (Nothing :: Maybe Text)
+       , "model"     .= model
+       , "channel"   .= (Nothing :: Maybe Text)
+      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
+      ]
 
 -- | Rewrite one on-disk 'ContentBlock' (GHC-Generics 'TaggedObject' shape)
 -- into the Anthropic-style block the frontend parses.
@@ -479,6 +491,17 @@ reconEntryToFrontend idx te =
             Response -> "response"
           payloadJson = rewritePayload payloadVal (teDirection te)
           entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw
+          -- The originating channel label (e.g. "telegram", "web", "cli"),
+          -- stamped into the request entry's erMeta by runTurn's
+          -- requestMeta (and into SKILL_LOAD entries by
+          -- recordSkillLoadResult). Surfaced as a top-level `channel` field
+          -- so the frontend can attribute user messages — and skill loads —
+          -- to the channel they came from. Null when the entry carries no
+          -- channel (e.g. response entries, CLI TUI turns with no
+          -- MessageSource).
+          mChannel = case Map.lookup "channel" (teMeta te) of
+            Just (A.String ch) -> Just ch
+            _                  -> Nothing
       in object
          [ "id"        .= entryId
          , "timestamp" .= T.pack (showIso (teTimestamp te))
@@ -495,6 +518,7 @@ reconEntryToFrontend idx te =
          , "payload"   .= payloadJson
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
+         , "channel"   .= mChannel
          -- The `raw` field is deliberately EMPTY for the reconstructed
          -- (two-file) path. The pre-rewrite payload Value is the same
          -- content as `payload` (just in GHC-Generics TaggedObject shape
@@ -568,9 +592,10 @@ rewritePayload val dir =
                -- passing @input@ + @result@ through, the frontend's
                -- @transcriptToMessages@ sees @op.name = "SKILL_LOAD"@ but no
                -- @result@, so the skill-load tool-call box never renders.
-               <> passthrough (k "input")
-               <> passthrough (k "result")
-               <> rewriteMsgs
+                <> passthrough (k "input")
+                <> passthrough (k "result")
+                <> passthrough (k "channel")
+                <> rewriteMsgs
             Response ->
               passthrough (k "model")
                <> rewriteContent

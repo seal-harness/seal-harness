@@ -21,9 +21,10 @@ import Seal.Text.LineFile (maxScanBytes)
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | The local 'UntrustedIO' handle for the test (real local FS IO via the
 -- workspace root). Tests that need a temp workspace build this per-test

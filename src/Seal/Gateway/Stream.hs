@@ -24,11 +24,12 @@ import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
   , withPingThread )
 import Network.WebSockets qualified as WS
-import System.IO (hPutStrLn, stderr)
 
+import Katip (Severity (..), ls)
 import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
+import Seal.Logging.Global (globalLogIO)
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
 data StreamGuard = StreamGuard
@@ -53,7 +54,7 @@ streamApp guard broker pending = do
     Nothing                   -> acceptConn  -- no Origin header (local dev client); accept
     Just _  | null allowed    -> acceptConn  -- wildcard mode (host=0.0.0.0); accept any
     Just o | o `elem` allowed -> acceptConn
-    Just o                    -> hPutStrLn stderr ("ws: rejected Origin " <> show o)
+    Just o                    -> globalLogIO InfoS ("ws: rejected Origin " <> ls (T.pack (show o)))
   where
     acceptConn = do
       conn <- acceptRequest pending

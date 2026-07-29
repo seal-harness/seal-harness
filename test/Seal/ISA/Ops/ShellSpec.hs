@@ -20,9 +20,10 @@ import Seal.Tools.Exec.Types (ExecError (..))
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A fake 'UntrustedIO' that records the 'ShellCommand' its 'uioShellExec'
 -- received and returns a canned stdout. Other methods are the fail-closed

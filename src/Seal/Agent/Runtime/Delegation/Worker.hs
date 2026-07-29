@@ -122,6 +122,12 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdOnEntry :: IO ()
     -- ^ The on-entry hook for the child's transcript (live broadcast).
     -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
+  , dwdChannel :: Text
+    -- ^ The parent session's channel label (e.g. @\"telegram\"@, @\"web\"@,
+    -- @\"cli\"@), inherited by the child so the child's request entries are
+    -- attributed to the same channel the parent turn ran on. Stamped into
+    -- the child's 'aeChannel' so 'runTurn' attributes the child's user
+    -- messages (the task goals) to the originating channel.
   }
 
 -- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
@@ -165,6 +171,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 90
+              , aeChannel    = dwdChannel deps
               , aeMessageSource = Nothing
               , aeAutonomy   = dwdAutonomy deps
               , aeApprovals  = dwdApprovals deps

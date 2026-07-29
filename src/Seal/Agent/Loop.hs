@@ -20,7 +20,6 @@ import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import qualified System.IO as IO
 
 import Seal.Agent.Env (AgentEnv (..))
-import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
@@ -39,16 +38,22 @@ import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
 
--- | Fold the 'aeMessageSource' into the request @erMeta@: a @channel@
--- key carrying the 'ChannelKind' text tag, and a @conversationId@ key
--- carrying the server-derived conversation id. 'Nothing' (the CLI TUI
--- path) yields an empty map, leaving the transcript unchanged.
-requestMeta :: Maybe MessageSource -> Map.Map Text Value
-requestMeta Nothing = Map.empty
-requestMeta (Just ms) = Map.fromList
-  [ ("channel", String (channelKindToText (msChannelKind ms)))
-  , ("conversationId", String (conversationIdText (msConversationId ms)))
-  ]
+-- | Build the request @erMeta@: a @channel@ key (always present, sourced
+-- from 'aeChannel' so every channel — including web/CLI with no
+-- 'MessageSource' — is attributed) plus a @conversationId@ key when
+-- 'aeMessageSource' is present (carrying the server-derived conversation
+-- id for channels that have one). This is the single place channel
+-- provenance is stamped into the transcript, so every turn is attributed
+-- regardless of the source channel.
+requestMeta :: Text -> Maybe MessageSource -> Map.Map Text Value
+requestMeta channel mSrc =
+  Map.fromList
+    ([ ("channel", String channel)
+     ] <> conversationIdField)
+  where
+    conversationIdField = case mSrc of
+      Nothing -> []
+      Just ms -> [("conversationId", String (conversationIdText (msConversationId ms)))]
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
@@ -89,7 +94,7 @@ runTurn env userText = do
           , erDurationMs = Nothing
           , erHarness = Nothing
           , erCorrelation = Nothing
-          , erMeta = requestMeta (aeMessageSource env)
+          , erMeta = requestMeta (aeChannel env) (aeMessageSource env)
           }
     -- When a caller wants to react to the user message being durable
     -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows

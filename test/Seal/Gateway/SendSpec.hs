@@ -17,6 +17,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
@@ -58,6 +59,7 @@ instance Provider ScriptProvider where
 -- update in the test: `baseDeps { sdTabsHandle = tabsH }`).
 mkSendDeps :: SealPaths -> IORef [CompletionResponse] -> IO SendDeps
 mkSendDeps paths providerRef = do
+  logger <- testSealLogger
   let configRoot = spConfig paths
       stateRoot  = spState paths
       sessionRoot = stateRoot </> "sessions"
@@ -106,6 +108,7 @@ mkSendDeps paths providerRef = do
         , sdReplies     = testReplies
         , sdLocks       = testLocks
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
+        , sdLogger      = logger
         }
   pure sendDeps
 

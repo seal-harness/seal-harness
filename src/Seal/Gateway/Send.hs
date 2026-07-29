@@ -20,7 +20,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (catch, fromException, finally, SomeException)
+import Control.Exception (finally)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
@@ -36,7 +36,6 @@ import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
 
 import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
@@ -60,10 +59,9 @@ import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.Session.Log (logTurnError)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
@@ -114,6 +112,8 @@ import Seal.Session.Lock
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
+import Seal.Logging.Logger (SealLogger)
+import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
 
@@ -179,6 +179,9 @@ data SendDeps = SendDeps
     -- successful turn (W2 invariant 2: any message sent to a session with
     -- no active tab creates one). Sourced from server-validated 'SessionMeta'
     -- only — never from raw client strings.
+  , sdLogger :: SealLogger
+    -- ^ The shared logger for structured katip logging. Built once at
+    -- startup via 'withSealLogger'.
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -237,14 +240,12 @@ handleSend deps sid rawText = do
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        er <- plainTurn deps meta t `catch` \e -> do
-          let msg = T.pack (show (e :: SomeException))
-          logTurnError (Just (sessionLogPath (sdPaths deps) (smId meta))) msg
-          hPutStrLn stderr ("[send] plainTurn threw: " <> T.unpack msg)
-          pure (Left ("internal error: " <> msg))
+        er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) (smId meta))) "plainTurn" $
+          plainTurn deps meta t
         case er of
           Left err -> pure (SendError 500 err)
-          Right () -> do
+          Right (Left err) -> pure (SendError 500 err)
+          Right (Right ()) -> do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure SendAssistant
@@ -385,7 +386,7 @@ plainTurn deps meta t = do
       broadcastHarnessStatus (sdBroker deps) sid "thinking"
       turnResult <- withSessionLock (sdLocks deps) sid
            (withTwoFileTranscript sessionDirPath (\tHandle -> do
-            appEnv <- mkEnv defaultConfig
+            appEnv <- mkEnv (sdLogger deps) defaultConfig
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
             let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -401,7 +402,7 @@ plainTurn deps meta t = do
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
-                  wsroot operatorCeiling
+                  wsroot operatorCeiling "web"
                 isaReg = buildWebRegistry
                   (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
@@ -414,17 +415,10 @@ plainTurn deps meta t = do
                   onDemand
                   (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                   Nothing
+                  "web"
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-            result <- (Right <$> runApp appEnv (runTurn env t))
-              `catch` \e -> do
-                let msg = case fromException e of
-                      Just (TranscriptError te) ->
-                        "transcript error: " <> te
-                      Nothing -> T.pack (show e)
-                let logPath = Just (sessionLogPath paths sid)
-                logTurnError logPath msg
-                hPutStrLn stderr ("[send] turn failed: " <> T.unpack msg)
-                pure (Left msg)
+            result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
+              runApp appEnv (runTurn env t)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
             pure result))
       -- Signal the turn end so the web sidebar transitions the tab back to
@@ -620,7 +614,7 @@ plainTurnWithCaps deps meta caps t = do
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
       withTwoFileTranscript sessionDirPath (\tHandle -> do
-        appEnv <- mkEnv defaultConfig
+        appEnv <- mkEnv (sdLogger deps) defaultConfig
         eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
         eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -635,7 +629,7 @@ plainTurnWithCaps deps meta caps t = do
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
-              wsRoot operatorCeiling
+              wsRoot operatorCeiling "web"
             isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
@@ -648,16 +642,10 @@ plainTurnWithCaps deps meta caps t = do
               onDemand
               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
               Nothing
+              "web"
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        result <- (Right <$> runApp appEnv (runTurn env t))
-          `catch` \e -> do
-            let msg = case fromException e of
-                  Just (TranscriptError te) ->
-                    "transcript error: " <> te
-                  Nothing -> T.pack (show e)
-            logTurnError (Just (sessionLogPath paths sid)) msg
-            hPutStrLn stderr ("[send] turn (withCaps) failed: " <> T.unpack msg)
-            pure (Left msg)
+        result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
+          runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
         pure result)
 
@@ -676,7 +664,7 @@ webCallDispatcher deps callOpName val = do
       sessionDirPath = sessionDir paths sid
   createDirectoryIfMissing True sessionDirPath
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    appEnv <- mkEnv defaultConfig
+    appEnv <- mkEnv (sdLogger deps) defaultConfig
     eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -689,7 +677,7 @@ webCallDispatcher deps callOpName val = do
     let onDemand = either (const False) onDemandSchemas eCfg
         startWiring = webStartWiring
           deps paths sid caps untrustedIO appEnv eCfg
-          wsRoot operatorCeiling
+          wsRoot operatorCeiling "web"
         isaReg = buildWebRegistry
               (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
@@ -699,7 +687,7 @@ webCallDispatcher deps callOpName val = do
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> do
-        recordSkillLoadResult tHandle callOpName val r
+        recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -739,8 +727,8 @@ unwrapOptMaybe = maybe Nothing
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> AgentStartWiring
-webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling =
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> AgentStartWiring
+webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel =
   AgentStartWiring
     { aswDefBackend = bAgentDefs (sdBackends deps)
     , aswRuntime = bRuntime (sdBackends deps)
@@ -751,7 +739,7 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling
+    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel
     }
 
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
@@ -764,9 +752,9 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text
   -> AgentWorkerBuilder
-webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling =
+webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling channel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
@@ -786,6 +774,7 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
     , dwdChildRegistry = buildChildRegistry
     , dwdChildSystemPrompt = childSystemPrompt
     , dwdOnEntry = pure ()  -- web child onEntry: no live broadcast (would need the broker + child sid)
+    , dwdChannel = channel
     }
   where
     resolveChild def = do

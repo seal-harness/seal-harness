@@ -1,10 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeApplications #-}
 -- | The Telegram channel: a 'TelegramChannel' record (resolved allow-list +
--- chunk limit + inbox 'TQueue' + transport + last-sender 'IORef') and its
--- 'Channel' instance. The reader thread loops 'tgReceive', allow-lists the
--- sender, and pushes @(MessageSource, body)@ to the inbox; sends are
--- chunked via 'Seal.Channels.Telegram.Transport.chunkMessage' to the
+-- chunk limit + inbox 'TQueue' + transport + last-sender 'IORef' + logger)
+-- and its 'Channel' instance. The reader thread loops 'tgReceive',
+-- allow-lists the sender, and pushes @(MessageSource, body)@ to the inbox;
+-- sends are chunked via 'Seal.Channels.Telegram.Transport.chunkMessage' to the
 -- configured limit and addressed to the last sender's chat id. Mirrors
 -- "Seal.Channels.Signal" in structure.
 module Seal.Channels.Telegram
@@ -15,11 +15,10 @@ module Seal.Channels.Telegram
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM
   (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
-import Control.Exception (bracket, SomeException, try)
+import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.IO (hPutStrLn, stderr)
 
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Telegram.Transport
@@ -29,6 +28,9 @@ import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.MessageSource
   ( MessageSource, UserId, mkMessageSource, userIdText )
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
+import Seal.Logging.Logger (SealLogger, logIO)
+
+import Katip (Severity (..), ls)
 
 -- | The live Telegram channel state.
 data TelegramChannel = TelegramChannel
@@ -40,6 +42,8 @@ data TelegramChannel = TelegramChannel
   , tcgReaderAlive :: IORef Bool
     -- ^ 'True' while the reader thread is running. 'chReceive' stops
     -- returning once the inbox drains and this is 'False'.
+  , tcgLogger      :: SealLogger
+    -- ^ The shared logger for structured katip logging.
   }
 
 instance Channel TelegramChannel where
@@ -62,9 +66,10 @@ instance Channel TelegramChannel where
 withTelegramChannel
   :: (AllowList UserId, Int)
   -> TelegramTransport
+  -> SealLogger
   -> (TelegramChannel -> IO a)
   -> IO a
-withTelegramChannel (allow, chunkLimit) transport action =
+withTelegramChannel (allow, chunkLimit) transport logger action =
   bracket before after (action . snd)
   where
     before = do
@@ -78,6 +83,7 @@ withTelegramChannel (allow, chunkLimit) transport action =
             , tcgTransport   = transport
             , tcgLastChat    = lastChat
             , tcgReaderAlive = alive
+            , tcgLogger      = logger
             }
       tid <- forkIO (readerLoop ch)
       pure (tid, ch)
@@ -86,20 +92,29 @@ withTelegramChannel (allow, chunkLimit) transport action =
       tgClose transport
 
 -- | The background reader: loop 'tgReceive', allow-list the sender, and push
--- to the inbox. A malformed update or a non-allow-listed sender is logged to
--- stderr and dropped (not fatal). Exits when 'tgReceive' returns 'Left' (the
--- transport is closing).
+-- to the inbox. A malformed update or a non-allow-listed sender is logged
+-- via 'logIO' and dropped (not fatal). Exits when 'tgReceive' returns 'Left'
+-- (the transport is closing). 'ThreadKilled' is logged at 'InfoS' (normal
+-- shutdown); other 'AsyncException's at 'WarningS'; synchronous exceptions
+-- at 'ErrorS'.
 readerLoop :: TelegramChannel -> IO ()
 readerLoop ch = go
   where
+    logger = tcgLogger ch
     go = do
       eUpd <- try @SomeException (tgReceive (tcgTransport ch))
       case eUpd of
         Left e -> do
-          logErr ("reader thread exception: " <> T.pack (show e))
+          case (fromException e :: Maybe AsyncException) of
+            Just ThreadKilled ->
+              logIO logger InfoS "reader thread stopped (channel shutting down)"
+            Just _ ->
+              logIO logger WarningS ("reader thread terminated by async exception: " <> ls (T.pack (show e)))
+            Nothing ->
+              logIO logger ErrorS ("reader thread exception: " <> ls (T.pack (show e)))
           writeIORef (tcgReaderAlive ch) False
         Right (Left err) -> do
-          logErr ("reader exiting: " <> err)
+          logIO logger ErrorS ("reader exiting: " <> ls err)
           writeIORef (tcgReaderAlive ch) False
         Right (Right upd) -> do
           let sender = tuSender upd
@@ -107,19 +122,18 @@ readerLoop ch = go
             then do
               writeIORef (tcgLastChat ch) (Just (tuChatId upd))
               case mkMessageSource (tuConversationId upd) Telegram (Just sender) mempty of
-                Left err -> logErr ("MessageSource construction failed: " <> err)
+                Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
                 Right ms -> atomically (writeTQueue (tcgInbox ch) (ms, tuBody upd))
-            else logErr ("dropped non-allow-listed sender: " <> userIdText sender)
+            else logIO logger InfoS ("dropped non-allow-listed sender: " <> ls (userIdText sender))
           go
-    logErr t = hPutStrLn stderr (T.unpack t)
 
 -- | Send a message, chunked to 'tcgChunkLimit', addressed to the last chat.
--- If no chat has been seen yet, the send is dropped with a stderr log.
+-- If no chat has been seen yet, the send is dropped with a warning log.
 sendChunked :: TelegramChannel -> Text -> IO ()
 sendChunked ch t = do
   mChat <- readIORef (tcgLastChat ch)
   case mChat of
-    Nothing -> hPutStrLn stderr "telegram: dropping send — no last chat yet"
+    Nothing -> logIO (tcgLogger ch) WarningS "telegram: dropping send — no last chat yet"
     Just _  -> mapM_ (sendRaw ch) (chunkMessage (tcgChunkLimit ch) t)
 
 -- | Send one chunk verbatim to the last chat (no further splitting).
@@ -127,7 +141,7 @@ sendRaw :: TelegramChannel -> Text -> IO ()
 sendRaw ch t = do
   mChat <- readIORef (tcgLastChat ch)
   case mChat of
-    Nothing -> hPutStrLn stderr "telegram: dropping chunk — no last chat yet"
+    Nothing -> logIO (tcgLogger ch) WarningS "telegram: dropping chunk — no last chat yet"
     Just chatId -> tgSend (tcgTransport ch) chatId t
 
 -- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:

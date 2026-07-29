@@ -17,7 +17,6 @@ module Seal.Channel.Cli
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (catch, fromException)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
@@ -57,7 +56,7 @@ import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
-  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript, TranscriptError (..) )
+  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
 import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
@@ -112,13 +111,14 @@ import Seal.Handles.AskReply
   , newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Log (logTurnError)
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, formatSessionId
   , newSession, resolveDefaultAgent, saveSessionMeta )
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
-import Seal.Types.Env (Env, mkEnv)
+import Seal.Logging.Logger (SealLogger)
+import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Types.Env (Env, mkEnv, envLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | The evolutionary-store backends + the in-process agent runtime, created
@@ -184,15 +184,12 @@ interpretDisposition caps plainHandler = \case
 -- Catches exceptions (including 'TranscriptError' from a dead writer daemon)
 -- so the TUI reports the error instead of crashing.
 handlePlain :: AgentEnv -> Env -> Text -> IO ()
-handlePlain agentEnv env t =
-  runApp env (runTurn agentEnv t)
-    `catch` \e -> do
-      let msg = case fromException e of
-            Just (TranscriptError te) ->
-              "transcript error: " <> te
-            Nothing -> T.pack (show e)
-      logTurnError (aeLogPath agentEnv) msg
-      ccSend (aeCaps agentEnv) ("turn failed: " <> msg)
+handlePlain agentEnv env t = do
+  eResult <- withExceptionLogging (envLogger env) (aeLogPath agentEnv) "plain" $
+    runApp env (runTurn agentEnv t)
+  case eResult of
+    Left errMsg -> ccSend (aeCaps agentEnv) ("turn failed: " <> errMsg)
+    Right _     -> pure ()
 
 -- | Resolve the active session's provider from the vault, or explain why not.
 -- Key bytes never surface: 'resolveProvider' returns an opaque 'SomeProvider'.
@@ -225,8 +222,8 @@ mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
-  -> Maybe FilePath -> Int -> Maybe (IO ()) -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage = AgentEnv
+  -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -238,6 +235,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = maxTurns
+  , aeChannel    = channel
   , aeMessageSource = Nothing
   , aeAutonomy   = autonomy
   , aeApprovals  = approvals
@@ -280,8 +278,8 @@ onDemandFromCfg eCfg =
 runCliTui
   :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
-  -> AskReplyStore -> IO ()
-runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
+  -> AskReplyStore -> SealLogger -> IO ()
+runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
   let histFile       = spState paths </> "history"
@@ -305,7 +303,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
-  appEnv <- mkEnv defaultConfig
+  appEnv <- mkEnv logger defaultConfig
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -440,6 +438,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               , dwdChildRegistry = cliChildRegistryBuilder
               , dwdChildSystemPrompt = cliChildSystemPrompt
               , dwdOnEntry = pure ()
+              , dwdChannel = "cli"
               }
             mkWorker = mkDelegateWorker delegateDeps
             delegationCfg = do
@@ -577,6 +576,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
+                    "cli"
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
       -- The /call dispatcher: dispatch an opcode against the active
@@ -603,7 +603,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           callUio <- mkSessionUio sid
           res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
           case res of
-            Right r -> recordSkillLoadResult tHandle callOpName val r
+            Right r -> recordSkillLoadResult tHandle callOpName val r (Just "cli")
             Left _  -> pure ()
           pure res
       plainHandler t = do
@@ -613,7 +613,8 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply = do
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
-               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing)
+               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
+               "cli")
             appEnv t
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
