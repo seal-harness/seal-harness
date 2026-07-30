@@ -85,6 +85,14 @@ streamApp guard broker pending = do
               , "sessionId" .= sessionIdText sid
               , "ask" .= v
               ]))
+          sendEvent BeAgentDefsChanged =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("agent-defs-changed" :: Text)
+              ]))
+          sendEvent BeSkillsChanged =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("skills-changed" :: Text)
+              ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
       withPingThread conn 30 (pure ()) $ do

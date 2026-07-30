@@ -15,6 +15,7 @@ import type {
   TranscriptEntry,
 } from '../types'
 import * as perf from '../lib/perf'
+import { streamClient } from '../lib/streamClient'
 
 export const POLL_INTERVAL = 3000
 
@@ -506,16 +507,20 @@ export async function cancelQuestion(sessionId: string, askId: string): Promise<
 export function useAgents() {
   const [agents, setAgents] = useState<AgentInfo[]>([])
 
-  useEffect(() => {
-    const load = () => {
-      fetchJson<AgentInfo[]>('/api/agents').then((data) => {
-        if (Array.isArray(data)) setAgents(data)
-      })
-    }
-    load()
-    const id = setInterval(load, POLL_INTERVAL)
-    return () => clearInterval(id)
+  const load = useCallback(() => {
+    fetchJson<AgentInfo[]>('/api/agents').then((data) => {
+      if (Array.isArray(data)) setAgents(data)
+    })
   }, [])
+
+  // Initial fetch on mount.
+  useEffect(() => { load() }, [load])
+
+  // Re-fetch when the WS signals agent defs changed (no polling).
+  useEffect(() => {
+    const unsub = streamClient().onAgentDefsChanged(() => load())
+    return unsub
+  }, [load])
 
   return { agents }
 }
@@ -868,10 +873,11 @@ export function useAgentDefs() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals agent defs changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onAgentDefsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { agents, loaded, error, refresh }
 }
@@ -955,10 +961,11 @@ export function useSkills() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals skills changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onSkillsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { skills, loaded, error, refresh }
 }

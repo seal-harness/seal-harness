@@ -10,6 +10,8 @@ module Seal.Gateway.StreamBroker
   , updateSubscriberSession
   , broadcast
   , broadcastLists
+  , broadcastAgentDefsChanged
+  , broadcastSkillsChanged
   , subscriberCount
   , thinkingSessions
   , setThinking
@@ -32,6 +34,8 @@ data BrokerEvent
   | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
   | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
   | BeActivity SessionId Value          -- ^ a per-session activity signal (harness-status / reply-delivered) the WS peer renders as an @activity@ envelope
+  | BeAgentDefsChanged                 -- ^ agent defs were created/updated/deleted; clients should re-fetch
+  | BeSkillsChanged                    -- ^ skills were created/updated/deleted; clients should re-fetch
   deriving stock (Eq, Show)
 
 -- | The per-subscriber state: the focused session (via an 'IORef' so the
@@ -115,6 +119,8 @@ broadcast broker event = do
       BeListsSnapshot _  -> pure True
       BeHarnessStatus _  -> pure True
       BeActivity _ _      -> pure True
+      BeAgentDefsChanged  -> pure True
+      BeSkillsChanged     -> pure True
       BeEntryRecorded sid _ -> matchSession s sid
       BeAsk sid _          -> matchSession s sid
       BeAskResolved sid _  -> matchSession s sid
@@ -125,6 +131,16 @@ broadcast broker event = do
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()
 broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)
+
+-- | Push an @agent-defs-changed@ invalidation signal to every connection.
+-- All subscribers receive it (agent defs are not session-scoped).
+broadcastAgentDefsChanged :: StreamBroker -> IO ()
+broadcastAgentDefsChanged broker = broadcast broker BeAgentDefsChanged
+
+-- | Push a @skills-changed@ invalidation signal to every connection.
+-- All subscribers receive it (skills are not session-scoped).
+broadcastSkillsChanged :: StreamBroker -> IO ()
+broadcastSkillsChanged broker = broadcast broker BeSkillsChanged
 
 -- | The current subscriber count (for diagnostics / the global cap check).
 subscriberCount :: StreamBroker -> IO Int
