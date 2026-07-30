@@ -158,20 +158,16 @@ const DEFAULT_AGENT: Agent = { id: 'seal', name: 'Seal Harness', status: 'idle',
 export default function App() {
   // ── List streams ──────────────────────────────────────────────────────
   // 3-tier precedence (W7):
-  //   1. WS `lists` frame is primary. "WS live" means a `lists` frame has
-  //      arrived in this connection (tracked by `wsListsReceived`; reset on
-  //      reconnect). When live, all four fields come from the WS frame.
+  //      arrived in this connection (tracked by `wsListsReceived`). When
+  //      live, all four fields come from the WS frame and ALL REST polling
+  //      hooks are disabled (zero XHRs).
   //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
-  //      always active (polls on mount regardless of WS state), selected
+  //      polls every 3s when WS is not live AND /api/lists is not in error.
   //      when WS is not live AND /api/lists is not in error.
   //   3. Else (older server without /api/lists) the legacy three-poll
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
   //      final fallback.
   const wsLists = useListsStream()
-  const polledLists = useListsPoll()
-  const polledTabs = useTabs()
-  const polledRecent = useRecentSessions()
-  const polledArchived = useArchivedSessions()
   // wsListsReceived flips true on the first WS lists frame, resets on
   // reconnect (so a stale closed-frame state doesn't suppress the poll).
   const [wsListsReceived, setWsListsReceived] = useState(false)
@@ -181,7 +177,23 @@ export default function App() {
     }
   }, [wsLists.tabs.length, wsLists.recentSessions.length])
   const wsLive = wsListsReceived
+
+  // ── Fallback polling (only when WS is NOT live) ──────────────────────
+  // When WS is delivering `lists` frames, all REST polling hooks are
+  // disabled — zero XHRs. When WS drops or hasn't connected yet, the
+  // fallback hooks poll every 3s. The 3-tier precedence:
+  //   1. WS `lists` frame (primary) — wsLive = true
+  //   2. GET /api/lists (REST fallback) — !wsLive && !polledLists.error
+  //   3. Legacy 3-poll hooks (final fallback) — !wsLive && polledLists.error
+  const polledLists = useListsPoll(wsLive)
   const usePollLists = !wsLive && !polledLists.error
+  // Legacy hooks are only needed when /api/lists is unavailable (older
+  // server). When usePollLists is true, /api/lists is the source. When
+  // wsLive is true, WS is the source and ALL polling is disabled.
+  const legacyDisabled = wsLive || usePollLists
+  const polledTabs = useTabs(legacyDisabled)
+  const polledRecent = useRecentSessions(legacyDisabled)
+  const polledArchived = useArchivedSessions(legacyDisabled)
   // Optimistic first-message-snippet overlay keyed by session id. Set on
   // send so a freshly-created tab's label updates immediately (before the
   // backend's next `lists` frame arrives with the persisted snippet).
