@@ -67,11 +67,6 @@ streamApp guard broker pending = do
     acceptConn = do
       conn <- acceptRequest pending
       sendTextData conn (A.encode (object ["type" .= ("hello" :: Text)]))
-      -- Send an initial lists snapshot so the frontend switches from REST
-      -- polling to WS immediately (wsListsReceived flips on the first
-      -- lists frame). Without this, the frontend polls REST every 3s
-      -- until the first mutation triggers a broadcastListsSnapshot.
-      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
       let sendEvent (BeEntryRecorded sid v) =
             sendTextData conn (A.encode (object
               [ "type" .= ("entry" :: Text)
@@ -108,6 +103,11 @@ streamApp guard broker pending = do
               ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
+      -- Send an initial lists snapshot AFTER subscribing so this connection
+      -- is in the broker's subscriber list and actually receives the frame.
+      -- Without this, the snapshot is broadcast to zero subscribers, the
+      -- frontend never flips wsLive, and REST /api/lists polling stays on.
+      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
       withPingThread conn 30 (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn

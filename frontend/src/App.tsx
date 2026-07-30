@@ -158,9 +158,9 @@ const DEFAULT_AGENT: Agent = { id: 'seal', name: 'Seal Harness', status: 'idle',
 export default function App() {
   // ── List streams ──────────────────────────────────────────────────────
   // 3-tier precedence (W7):
-  //      arrived in this connection (tracked by `wsListsReceived`). When
-  //      live, all four fields come from the WS frame and ALL REST polling
-  //      hooks are disabled (zero XHRs).
+  //   1. WS `lists` frame (primary) — `wsLists.received` flips true on the
+  //      first frame (even if empty). When live, all four fields come from
+  //      the WS frame and ALL REST polling hooks are disabled (zero XHRs).
   //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
   //      polls every 3s when WS is not live AND /api/lists is not in error.
   //      when WS is not live AND /api/lists is not in error.
@@ -168,15 +168,10 @@ export default function App() {
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
   //      final fallback.
   const wsLists = useListsStream()
-  // wsListsReceived flips true on the first WS lists frame, resets on
-  // reconnect (so a stale closed-frame state doesn't suppress the poll).
-  const [wsListsReceived, setWsListsReceived] = useState(false)
-  useEffect(() => {
-    if (wsLists.tabs.length > 0 || wsLists.recentSessions.length > 0) {
-      setWsListsReceived(true)
-    }
-  }, [wsLists.tabs.length, wsLists.recentSessions.length])
-  const wsLive = wsListsReceived
+  // wsLive tracks whether the WS `lists` frame is delivering data. The hook's
+  // `received` flag flips on the first frame regardless of content (a quiet
+  // server sends empty arrays), so REST polling stops the moment WS connects.
+  const wsLive = wsLists.received
 
   // ── Fallback polling (only when WS is NOT live) ──────────────────────
   // When WS is delivering `lists` frames, all REST polling hooks are
