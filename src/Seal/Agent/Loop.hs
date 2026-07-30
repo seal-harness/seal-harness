@@ -8,6 +8,8 @@ module Seal.Agent.Loop
 
 import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
+import Control.Retry
+  ( RetryPolicyM, exponentialBackoff, limitRetries, retrying )
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString qualified as BS
@@ -146,11 +148,36 @@ runTurn env userText = do
                   , crMaxTokens = 4096
                   }
       liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
-      eresp <- liftIO (providerComplete (aeProvider env) req)
+      eresp <- liftIO (providerCompleteWithRetry (aeProvider env) req)
       case eresp of
         Left err -> liftIO $ do
           logProviderError (aeLogPath env) err
-          ccSend (aeCaps env) ("provider error: " <> err)
+          -- Record the provider error as a response entry + an assistant
+          -- message so every channel surfaces it. The web channel's ccSend
+          -- is a no-op (replies surface via the transcript poll); without
+          -- this transcript write the web frontend would never learn the
+          -- turn ended and the session would sit idle with no message — a
+          -- silent failure. Mirrors the max-turns stop branch below.
+          let errMsg = "provider error: " <> err
+              assistantMsg = Message Assistant [CbText errMsg]
+              conv = msgs <> [assistantMsg]
+          now <- getCurrentTime
+          let entry = EntryRecord
+                { erId = ""
+                , erTimestamp = now
+                , erKind = EKResponse
+                , erConvLen = length conv
+                , erEnvelope = Nothing
+                , erUsage = Nothing
+                , erStop = Nothing
+                , erDurationMs = Nothing
+                , erHarness = Nothing
+                , erCorrelation = Nothing
+                , erMeta = Map.empty
+                }
+          tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+          aeOnEntry env
+          ccSend (aeCaps env) errMsg
         Right resp -> do
           -- Record the provider response. Safe because CompletionResponse only
           -- contains CbText and CbToolUse blocks (model output + tool-call
@@ -320,6 +347,46 @@ runTurn env userText = do
 
 providerComplete :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
 providerComplete (SomeProvider p) = complete p
+
+-- | Retry policy for transient provider failures: up to 2 retries after the
+-- initial attempt (3 attempts total), with exponential backoff starting at
+-- 50ms growing as 50ms, 100ms, 200ms. With only 2 retries the delays stay
+-- small, keeping recovery fast while a wedged daemon comes back.
+providerRetryPolicy :: RetryPolicyM IO
+providerRetryPolicy =
+  exponentialBackoff 50_000 <> limitRetries 2
+
+-- | Is a provider error text transient (worth retrying)? Transport failures
+-- (the common "Ollama not running" case), rate limits (HTTP 429), and server
+-- errors (HTTP 5xx) are transient — the daemon might come back, a rate limit
+-- might clear, a 5xx might be a transient upstream fault. Auth errors (401),
+-- bad requests (400), and decode failures are permanent — retrying wastes
+-- time and delays surfacing the real problem to the user.
+isTransientError :: Text -> Bool
+isTransientError err =
+  any (`T.isInfixOf` err) transientMarkers
+  where
+    transientMarkers =
+      [ "could not reach"           -- Ollama transport failure
+      , "connection or transport error"  -- Anthropic transport failure
+      , "HTTP 429"                  -- rate limit (Anthropic + Ollama)
+      , "HTTP 500"                  -- server error
+      , "HTTP 502"                  -- bad gateway
+      , "HTTP 503"                  -- service unavailable
+      , "HTTP 504"                  -- gateway timeout
+      ]
+
+-- | Call the provider with retry: up to 2 retries on transient errors with
+-- exponential backoff. A non-retryable error (auth, bad request) returns
+-- immediately after the first attempt. The final result (success or the last
+-- error) is returned to the caller, which records it in the transcript.
+providerCompleteWithRetry
+  :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
+providerCompleteWithRetry sp req =
+  retrying providerRetryPolicy shouldRetry $ \_ -> providerComplete sp req
+  where
+    shouldRetry _ (Left err) = pure (isTransientError err)
+    shouldRetry _ (Right _)  = pure False
 
 -- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
 -- append the full 'CompletionRequest' (one JSONL line, with trailing newline)

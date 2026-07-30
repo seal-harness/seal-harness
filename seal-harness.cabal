@@ -229,8 +229,9 @@ library
       , unordered-containers
       , validation-selective
       , vector
-      , random
-      , uuid-types
+        , random
+        , retry
+        , uuid-types
       , wai
       , warp
       , websockets
