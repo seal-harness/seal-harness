@@ -26,15 +26,23 @@ import Network.WebSockets
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
+import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (mkSessionId, sessionIdText)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
 import Seal.Logging.Global (globalLogIO)
+import Seal.Tabs (TabsHandle)
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
+-- Also carries the TabsHandle + SealPaths so the stream can send an
+-- initial @lists@ snapshot on connect (the frontend's @wsListsReceived@
+-- flag requires at least one @lists@ frame to switch from polling to WS).
 data StreamGuard = StreamGuard
   { sgAllowedOrigins :: [Text]
   , sgGlobalCap :: Int
+  , sgTabsHandle :: TabsHandle
+  , sgPaths :: SealPaths
   }
 
 -- | Run the WebSocket stream server on the given port. Blocks (run in a
@@ -59,6 +67,11 @@ streamApp guard broker pending = do
     acceptConn = do
       conn <- acceptRequest pending
       sendTextData conn (A.encode (object ["type" .= ("hello" :: Text)]))
+      -- Send an initial lists snapshot so the frontend switches from REST
+      -- polling to WS immediately (wsListsReceived flips on the first
+      -- lists frame). Without this, the frontend polls REST every 3s
+      -- until the first mutation triggers a broadcastListsSnapshot.
+      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
       let sendEvent (BeEntryRecorded sid v) =
             sendTextData conn (A.encode (object
               [ "type" .= ("entry" :: Text)
