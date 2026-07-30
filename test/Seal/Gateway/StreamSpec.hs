@@ -8,14 +8,20 @@ import Data.ByteString.Lazy qualified as BL
 import Network.WebSockets (ClientApp, runClient, receiveData)
 import Test.Hspec
 
+import Seal.Config.Paths (SealPaths(..))
 import Seal.Gateway.Stream
 import Seal.Gateway.StreamBroker
+import Seal.Tabs (newTabsHandle)
+
+fakePaths :: SealPaths
+fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
 
 spec :: Spec
 spec = describe "Seal.Gateway.Stream" $ do
   it "a client connects and receives hello" $ do
     broker <- newStreamBroker 10
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
         port = 18080
     _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 100000  -- wait for the server to bind
@@ -29,13 +35,16 @@ spec = describe "Seal.Gateway.Stream" $ do
 
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
         port = 18081
     _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 100000
     let client :: ClientApp ()
         client conn = do
           _hello <- receiveData conn :: IO BL.ByteString
+          -- The server sends an initial lists snapshot after hello.
+          _lists <- receiveData conn :: IO BL.ByteString
           broadcastLists broker (object ["tabs" .= ([] :: [String])])
           threadDelay 100000
           msg <- receiveData conn :: IO BL.ByteString

@@ -45,7 +45,7 @@ import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
-import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
@@ -689,6 +689,7 @@ handleAgentCreate deps body =
       Right aid -> do
         d <- stampAgentDef deps aid v Nothing
         adbUpdate (adAgentDefs deps) d
+        broadcastAgentDefsChanged (adBroker deps)
         mDef <- adDefaultAgent deps
         pure (jsonCreated (agentInfoJson mDef d))
 
@@ -715,11 +716,13 @@ handleAgentUpdate deps aidTxt body =
               d <- stampAgentDef deps newId v (Just existing)
               adbUpdate (adAgentDefs deps) d
               adbDelete (adAgentDefs deps) aid
+              broadcastAgentDefsChanged (adBroker deps)
               mDef <- adDefaultAgent deps
               pure (jsonOk (agentInfoJson mDef d))
             _ -> do
               d <- stampAgentDef deps aid v (Just existing)
               adbUpdate (adAgentDefs deps) d
+              broadcastAgentDefsChanged (adBroker deps)
               mDef <- adDefaultAgent deps
               pure (jsonOk (agentInfoJson mDef d))
 
@@ -769,7 +772,9 @@ handleAgentSetDefault deps body =
         eRes <- updateRuntimeConfig cfgPath (\cfg -> cfg { rcDefaultAgent = Nothing })
         case eRes of
           Left e  -> pure (errJson status500 ("config write failed: " <> e))
-          Right _ -> pure (jsonOk (A.object [ "agent" .= (Nothing :: Maybe Text) ]))
+          Right _ -> do
+            broadcastAgentDefsChanged (adBroker deps)
+            pure (jsonOk (A.object [ "agent" .= (Nothing :: Maybe Text) ]))
       DefaultSet aidTxt -> case mkAgentDefId aidTxt of
         Left e -> pure (errJson status400 ("invalid agent id: " <> e))
         Right aid -> do
@@ -876,6 +881,7 @@ handleSkillCreate deps body =
       Right sid -> do
         s <- stampSkill sid v Nothing
         sbCreate (adSkills deps) s
+        broadcastSkillsChanged (adBroker deps)
         pure (jsonCreated (skillInfoJson s))
 
 -- | Handle PUT /api/skills/:id. The path id is authoritative for finding
@@ -899,10 +905,12 @@ handleSkillUpdate deps sidTxt body =
               s <- stampSkill newSid v (Just existing)
               sbUpdate (adSkills deps) s
               sbDelete (adSkills deps) sid
+              broadcastSkillsChanged (adBroker deps)
               pure (jsonOk (skillInfoJson s))
             _ -> do
               s <- stampSkill sid v (Just existing)
               sbUpdate (adSkills deps) s
+              broadcastSkillsChanged (adBroker deps)
               pure (jsonOk (skillInfoJson s))
 
 -- | Parse an optional @new_id@ field for rename-on-PUT of a skill.
@@ -927,6 +935,7 @@ handleSkillDelete deps sidTxt =
     Left e  -> pure (errJson status400 ("invalid skill id: " <> e))
     Right sid -> do
       sbDelete (adSkills deps) sid
+      broadcastSkillsChanged (adBroker deps)
       pure noContent
 
 -- | Build a 'Skill' from a JSON body + the authoritative id. When

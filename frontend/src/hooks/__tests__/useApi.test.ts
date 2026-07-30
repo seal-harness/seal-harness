@@ -25,6 +25,7 @@ import {
   fetchModelContext,
 } from '../useApi'
 import type { TabInfoWire } from '../useApi'
+import { POLL_INTERVAL } from '../useApi'
 
 /** Capture fetch calls so each test can assert the URL + method + body. */
 type FetchCall = { url: string; init?: RequestInit }
@@ -134,6 +135,52 @@ describe('useListsPoll', () => {
     setNextResponse('not found', 404)
     const { result } = renderHook(() => useListsPoll())
     await waitFor(() => expect(result.current.error).toBe(true))
+  })
+})
+
+describe('disabled polling hooks', () => {
+  it('useListsPoll(disabled=true) does NOT fetch on mount', async () => {
+    vi.useFakeTimers()
+    setNextResponse({ tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    renderHook(() => useListsPoll(true))
+    // Advance past the poll interval — no fetch should fire.
+    act(() => { vi.advanceTimersByTime(POLL_INTERVAL * 3) })
+    expect(fetchCalls.filter((c) => c.url === '/api/lists')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('useTabs(disabled=true) does NOT fetch on mount', async () => {
+    vi.useFakeTimers()
+    renderHook(() => useTabs(true))
+    act(() => { vi.advanceTimersByTime(POLL_INTERVAL * 3) })
+    expect(fetchCalls.filter((c) => c.url === '/api/tabs')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('useRecentSessions(disabled=true) does NOT fetch on mount', async () => {
+    vi.useFakeTimers()
+    renderHook(() => useRecentSessions(true))
+    act(() => { vi.advanceTimersByTime(POLL_INTERVAL * 3) })
+    expect(fetchCalls.filter((c) => c.url === '/api/sessions')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('useArchivedSessions(disabled=true) does NOT fetch on mount', async () => {
+    vi.useFakeTimers()
+    renderHook(() => useArchivedSessions(true))
+    act(() => { vi.advanceTimersByTime(POLL_INTERVAL * 3) })
+    expect(fetchCalls.filter((c) => c.url === '/api/sessions/archived')).toHaveLength(0)
+    vi.useRealTimers()
+  })
+
+  it('useTabs(disabled=true) starts polling when re-rendered with disabled=false', async () => {
+    const { rerender } = renderHook(({ d }: { d: boolean }) => useTabs(d), { initialProps: { d: true } })
+    // No fetch while disabled
+    expect(fetchCalls.filter((c) => c.url === '/api/tabs')).toHaveLength(0)
+    const wire: TabInfoWire = { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 's1', ext_modified: false, stale: false, origin: undefined, attach_command: null }
+    setNextResponse([wire])
+    rerender({ d: false })
+    await waitFor(() => expect(fetchCalls.filter((c) => c.url === '/api/tabs').length).toBeGreaterThan(0))
   })
 })
 

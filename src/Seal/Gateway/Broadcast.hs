@@ -18,6 +18,8 @@ module Seal.Gateway.Broadcast
   ( broadcastListsSnapshot
   , broadcastHarnessStatus
   , broadcastReplyDelivered
+  , broadcastAgentDefsChanged
+  , broadcastSkillsChanged
   ) where
 
 import Data.Aeson (object, (.=))
@@ -31,6 +33,7 @@ import Data.Time (getCurrentTime)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
 import Seal.Gateway.Transcript (showIso)
 import Seal.Tabs (TabsHandle)
@@ -86,3 +89,22 @@ broadcastReplyDelivered mBroker sid =
         [ "kind" .= ("reply-delivered" :: Text)
         , "timestamp" .= T.pack (showIso now)
         ]))
+
+-- | Push an @agent-defs-changed@ signal to every WS subscriber. The
+-- frontend re-fetches GET /api/agents on receipt (invalidation, not
+-- payload — the full list is too large to inline). 'Nothing' broker
+-- (tests) is a no-op.
+broadcastAgentDefsChanged :: Maybe StreamBroker -> IO ()
+broadcastAgentDefsChanged mBroker =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> SB.broadcastAgentDefsChanged broker
+
+-- | Push a @skills-changed@ signal to every WS subscriber. The frontend
+-- re-fetches GET /api/skills on receipt. 'Nothing' broker (tests) is a
+-- no-op.
+broadcastSkillsChanged :: Maybe StreamBroker -> IO ()
+broadcastSkillsChanged mBroker =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> SB.broadcastSkillsChanged broker

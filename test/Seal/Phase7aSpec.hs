@@ -80,7 +80,8 @@ spec = describe "Seal.Phase7aSpec" $ do
 
   it "a WS client connects, receives hello + a broadcastLists event" $ do
     broker <- newStreamBroker 10
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
         port = 18095
     _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 200000
@@ -90,6 +91,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           case A.decode hello :: Maybe A.Value of
             Just _ -> pure ()
             Nothing -> error "expected hello JSON"
+          -- The server sends an initial lists snapshot after hello.
+          _lists <- receiveData conn :: IO BL.ByteString
           broadcastLists broker (A.object ["tabs" A..= ([] :: [String])])
           threadDelay 100000
           msg <- receiveData conn :: IO BL.ByteString

@@ -15,8 +15,9 @@ import type {
   TranscriptEntry,
 } from '../types'
 import * as perf from '../lib/perf'
+import { streamClient } from '../lib/streamClient'
 
-const POLL_INTERVAL = 3000
+export const POLL_INTERVAL = 3000
 
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
@@ -110,7 +111,7 @@ export function useHarnesses() {
   return { harnesses, error }
 }
 
-export function useRecentSessions() {
+export function useRecentSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -125,15 +126,16 @@ export function useRecentSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
 
-export function useTabs() {
+export function useTabs(disabled = false) {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -148,10 +150,11 @@ export function useTabs() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   // `refresh` lets callers force an immediate poll instead of waiting for
   // the next interval — the new-tab compose-send flow uses this so the
@@ -159,7 +162,7 @@ export function useTabs() {
   return { tabs, error, refresh: poll }
 }
 
-export function useArchivedSessions() {
+export function useArchivedSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -174,10 +177,11 @@ export function useArchivedSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
@@ -210,7 +214,7 @@ interface ListsWire {
   thinkingSessionIds?: string[]
 }
 
-export function useListsPoll(): ListsPollResult {
+export function useListsPoll(disabled = false): ListsPollResult {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
@@ -233,10 +237,11 @@ export function useListsPoll(): ListsPollResult {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }
 }
@@ -502,16 +507,20 @@ export async function cancelQuestion(sessionId: string, askId: string): Promise<
 export function useAgents() {
   const [agents, setAgents] = useState<AgentInfo[]>([])
 
-  useEffect(() => {
-    const load = () => {
-      fetchJson<AgentInfo[]>('/api/agents').then((data) => {
-        if (Array.isArray(data)) setAgents(data)
-      })
-    }
-    load()
-    const id = setInterval(load, POLL_INTERVAL)
-    return () => clearInterval(id)
+  const load = useCallback(() => {
+    fetchJson<AgentInfo[]>('/api/agents').then((data) => {
+      if (Array.isArray(data)) setAgents(data)
+    })
   }, [])
+
+  // Initial fetch on mount.
+  useEffect(() => { load() }, [load])
+
+  // Re-fetch when the WS signals agent defs changed (no polling).
+  useEffect(() => {
+    const unsub = streamClient().onAgentDefsChanged(() => load())
+    return unsub
+  }, [load])
 
   return { agents }
 }
@@ -864,10 +873,11 @@ export function useAgentDefs() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals agent defs changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onAgentDefsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { agents, loaded, error, refresh }
 }
@@ -951,10 +961,11 @@ export function useSkills() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals skills changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onSkillsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { skills, loaded, error, refresh }
 }

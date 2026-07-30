@@ -26,15 +26,23 @@ import Network.WebSockets
 import Network.WebSockets qualified as WS
 
 import Katip (Severity (..), ls)
+import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (mkSessionId, sessionIdText)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
 import Seal.Logging.Global (globalLogIO)
+import Seal.Tabs (TabsHandle)
 
 -- | The per-connection guard: the Origin allowlist + the global cap.
+-- Also carries the TabsHandle + SealPaths so the stream can send an
+-- initial @lists@ snapshot on connect (the frontend's @wsListsReceived@
+-- flag requires at least one @lists@ frame to switch from polling to WS).
 data StreamGuard = StreamGuard
   { sgAllowedOrigins :: [Text]
   , sgGlobalCap :: Int
+  , sgTabsHandle :: TabsHandle
+  , sgPaths :: SealPaths
   }
 
 -- | Run the WebSocket stream server on the given port. Blocks (run in a
@@ -85,8 +93,21 @@ streamApp guard broker pending = do
               , "sessionId" .= sessionIdText sid
               , "ask" .= v
               ]))
+          sendEvent BeAgentDefsChanged =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("agent-defs-changed" :: Text)
+              ]))
+          sendEvent BeSkillsChanged =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("skills-changed" :: Text)
+              ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
+      -- Send an initial lists snapshot AFTER subscribing so this connection
+      -- is in the broker's subscriber list and actually receives the frame.
+      -- Without this, the snapshot is broadcast to zero subscribers, the
+      -- frontend never flips wsLive, and REST /api/lists polling stays on.
+      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
       withPingThread conn 30 (pure ()) $ do
         let readerLoop = forever $ do
               msg <- receiveData conn
