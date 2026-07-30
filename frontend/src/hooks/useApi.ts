@@ -16,7 +16,7 @@ import type {
 } from '../types'
 import * as perf from '../lib/perf'
 
-const POLL_INTERVAL = 3000
+export const POLL_INTERVAL = 3000
 
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
@@ -110,7 +110,7 @@ export function useHarnesses() {
   return { harnesses, error }
 }
 
-export function useRecentSessions() {
+export function useRecentSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -125,15 +125,16 @@ export function useRecentSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
 
-export function useTabs() {
+export function useTabs(disabled = false) {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -148,10 +149,11 @@ export function useTabs() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   // `refresh` lets callers force an immediate poll instead of waiting for
   // the next interval — the new-tab compose-send flow uses this so the
@@ -159,7 +161,7 @@ export function useTabs() {
   return { tabs, error, refresh: poll }
 }
 
-export function useArchivedSessions() {
+export function useArchivedSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -174,10 +176,11 @@ export function useArchivedSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
@@ -210,7 +213,7 @@ interface ListsWire {
   thinkingSessionIds?: string[]
 }
 
-export function useListsPoll(): ListsPollResult {
+export function useListsPoll(disabled = false): ListsPollResult {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
@@ -233,10 +236,11 @@ export function useListsPoll(): ListsPollResult {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }
 }
