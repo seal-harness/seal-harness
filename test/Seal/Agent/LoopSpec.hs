@@ -29,7 +29,7 @@ import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Transcript.Conv (readConversation)
-import Seal.Transcript.Entries (EntryRecord (..))
+import Seal.Transcript.Entries (EntryRecord (..), EntryKind (EKResponse))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Logging.Logger (testSealLogger)
@@ -58,6 +58,31 @@ newtype FailingProvider = FailingProvider Text
 instance Provider FailingProvider where
   listModels _ = pure (Right [])
   complete (FailingProvider err) _ = pure (Left err)
+
+-- | A provider that always fails with a fixed error message and counts calls.
+-- Used to assert no retries happen on non-retryable errors.
+newtype CountingFailProvider = CountingFailProvider (IORef Int, Text)
+
+instance Provider CountingFailProvider where
+  listModels _ = pure (Right [])
+  complete (CountingFailProvider (ref, err)) _ = do
+    modifyIORef' ref (+ 1)
+    pure (Left err)
+
+-- | A provider that fails the first @n@ calls with the given error, then
+-- succeeds with the scripted response. Used to verify retry behavior: the
+-- turn loop retries transient provider errors with exponential backoff.
+newtype FlakyProvider = FlakyProvider (IORef (Int, CompletionResponse, Text))
+
+instance Provider FlakyProvider where
+  listModels _ = pure (Right [])
+  complete (FlakyProvider ref) _ = do
+    (n, ok, err) <- readIORef ref
+    if n <= 0
+      then pure (Right ok)
+      else do
+        writeIORef ref (n - 1, ok, err)
+        pure (Left err)
 
 runTestApp :: App a -> IO a
 runTestApp act = do
@@ -647,6 +672,142 @@ spec = describe "Seal.Agent.Loop" $ do
       content `shouldContain` "connection refused"
       -- The turn start should also be logged (the error happens after start).
       content `shouldContain` "start"
+
+  -- Regression: a provider error (Left err) must surface in the transcript
+  -- as an EKResponse entry + an assistant message, not just in seal.log.
+  -- The web channel's ccSend is a no-op (replies surface via the transcript
+  -- poll), so without a transcript write the web frontend never learns the
+  -- turn ended and the session sits idle with no message — a silent failure.
+  -- The CLI/Telegram/Signal channels still receive the error via ccSend.
+  it "writes a provider error to the transcript as a response entry + assistant message" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+    (h, readState) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    (msgs, entries) <- readState
+    -- conversation.jsonl: user "hi" + an assistant message carrying the error.
+    length msgs `shouldBe` 2
+    let assistantMsg = msgs !! 1
+    msgRole assistantMsg `shouldBe` Assistant
+    [CbText txt] <- pure (msgContent assistantMsg)
+    txt `shouldSatisfy` ("provider error" `T.isInfixOf`)
+    txt `shouldSatisfy` ("could not reach Ollama" `T.isInfixOf`)
+    -- entries.jsonl: one Request (user) + one Response (the error) = 2 entries.
+    length entries `shouldBe` 2
+    erKind (entries !! 1) `shouldBe` EKResponse
+    -- ccSend still fires so CLI/Telegram/Signal channels see the error too.
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("provider error" `T.isInfixOf`)
+
+  -- Retry: a transient provider error (transport failure / rate limit / 5xx)
+  -- is retried twice with exponential backoff. A provider that fails twice
+  -- then succeeds yields the successful response, not the error.
+  it "retries a transient provider error twice then succeeds" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+    (h, _) <- fakeTwoFileTranscript
+    -- Fail the first 2 calls (transport-style error), then succeed.
+    ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
+    let env = AgentEnv
+                { aeProvider = SomeProvider (FlakyProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    -- The turn recovered: the user sees the successful reply, not the error.
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("recovered" `T.isInfixOf`)
+    sentMsgs `shouldNotSatisfy` any ("provider error" `T.isInfixOf`)
+
+  -- Retry: a non-retryable error (auth / bad request) fails immediately
+  -- without burning retries. A provider that always returns a 401-style
+  -- error yields the error on the first attempt.
+  it "does NOT retry a non-retryable (401) provider error" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    callCount <- newIORef (0 :: Int)
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+    (h, _) <- fakeTwoFileTranscript
+    -- A provider that counts calls and always returns a 401 auth error.
+    let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
+        env = AgentEnv
+                { aeProvider = countingAuthFail
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    -- The provider was called exactly once (no retries).
+    readIORef callCount `shouldReturn` 1
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("provider error" `T.isInfixOf`)
+    sentMsgs `shouldSatisfy` any ("HTTP 401" `T.isInfixOf`)
 
   it "does NOT write seal.log when aeLogPath is Nothing" $
     withSystemTempDirectory "seal-log" $ \logDir -> do
