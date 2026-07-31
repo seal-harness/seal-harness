@@ -44,6 +44,7 @@ interface NewTabComposerProps {
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
+  const [repoWarning, setRepoWarning] = useState<string | null>(null)
 
   // Lock the kind to provider whenever a branchFrom is supplied. The hook's
   // own state is the source of truth; we just force-set it here whenever the
@@ -56,6 +57,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
 
   const handleSubmit = async () => {
     if (spec.validationError) return
+    setRepoWarning(null)
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
       if (res.ok) {
@@ -70,12 +72,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     if (res) {
       // If the user entered a repo URL and the new tab has a session id
       // (provider kind), clone the repo into the session's workdir before
-      // the first turn. Best-effort: a clone failure is surfaced inline
-      // but does not block the tab. The repo is recorded to history via
-      // persistOnSubmit regardless of clone success.
+      // the first turn. A clone failure does NOT block the tab — but it
+      // IS surfaced as a warning so the user knows the repo isn't set up.
+      // The repo is recorded to history via persistOnSubmit regardless of
+      // clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl && res.session_id) {
-        await setupRepo(res.session_id, repoUrl)
+        const result = await setupRepo(res.session_id, repoUrl)
+        if (!result || !result.ok || result.status === 'failed') {
+          const reason = result?.error ?? result?.status ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. The tab started anyway — ask the model to call SETUP_REPO, or re-enter the URL (e.g. try https:// instead of git@).`)
+        }
       }
       spec.persistOnSubmit()
       onSubmit(res)
@@ -249,6 +256,15 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
           style={{ fontSize: 12, color: 'var(--needs-input)' }}
         >
           {spec.validationError}
+        </div>
+      )}
+
+      {repoWarning && (
+        <div
+          data-testid="composer-repo-warning"
+          style={{ fontSize: 12, color: 'var(--needs-input)' }}
+        >
+          {repoWarning}
         </div>
       )}
 

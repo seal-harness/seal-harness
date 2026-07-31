@@ -34,20 +34,27 @@ interface NewSessionComposerProps {
 export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionComposerProps) {
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const [submitting, setSubmitting] = useState(false)
+  const [repoWarning, setRepoWarning] = useState<string | null>(null)
 
   const handleSubmit = async () => {
     if (spec.validationError) return
     setSubmitting(true)
+    setRepoWarning(null)
     const res = await createBareSession({ provider: spec.provider, model: spec.model.trim() })
     if (res) {
       // If the user entered a repo URL, clone it into the session's
-      // workdir before the first turn. Best-effort: a clone failure is
-      // surfaced inline but does not block the session (the user can
-      // retry via SETUP_REPO later). The repo is recorded to history via
-      // persistOnSubmit regardless of clone success.
+      // workdir before the first turn. A clone failure does NOT block the
+      // session (the user can retry via SETUP_REPO later) — but it IS
+      // surfaced as a warning so the user knows the repo isn't set up
+      // rather than discovering it mid-turn. The repo is recorded to
+      // history via persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl) {
-        await setupRepo(res.session_id, repoUrl)
+        const result = await setupRepo(res.session_id, repoUrl)
+        if (!result || !result.ok || result.status === 'failed') {
+          const reason = result?.error ?? result?.status ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. The session started anyway — ask the model to call SETUP_REPO, or re-enter the URL (e.g. try https:// instead of git@).`)
+        }
       }
       spec.persistOnSubmit()
       onSubmit(res)
@@ -140,6 +147,15 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
           style={{ fontSize: 12, color: 'var(--needs-input)' }}
         >
           {spec.validationError}
+        </div>
+      )}
+
+      {repoWarning && (
+        <div
+          data-testid="composer-repo-warning"
+          style={{ fontSize: 12, color: 'var(--needs-input)' }}
+        >
+          {repoWarning}
         </div>
       )}
 

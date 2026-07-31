@@ -29,6 +29,7 @@ module Seal.ISA.Ops.Repo
   ( setupRepoOp
   , validateRepoUrl
   , sanitizeRepoName
+  , normalizeRepoUrl
   , isShellMetachar
   , CloneResult (..)
   , cloneRepoIO
@@ -139,10 +140,47 @@ isScpStyle url =
 isShellMetachar :: Char -> Bool
 isShellMetachar c = c `elem` (";`$\\\"'|\n\r&<>(){}*?[]#!~" :: String)
 
--- | Derive a filesystem-safe target directory name from a repo URL: the
--- last path segment, with a trailing @.git@ stripped, sanitized to
--- @[A-Za-z0-9_-]+@ (any other char → @-@). Falls back to @"repo"@ if the
--- result is empty (e.g. the URL was a bare host).
+-- | Normalize a repo URL to a canonical form for idempotency/conflict
+-- comparison. The same repo reached via different schemes (e.g.
+-- @git\@github.com:foo/bar.git@ vs @https://github.com/foo/bar.git@)
+-- should compare equal so a repeat call is a no-op, not a spurious
+-- conflict. Normalization:
+--
+--   * strip a scheme (@https://@, @http://@, @git://@, @ssh://@);
+--   * strip a leading @user\@@ (SCP-style);
+--   * replace the SCP-style @:@ separator with @/@;
+--   * strip a trailing @.git@;
+--   * strip trailing slashes;
+--   * lowercase (GitHub URLs are case-insensitive in host/path).
+--
+-- Returns the empty string only if the input is empty after trimming.
+normalizeRepoUrl :: Text -> Text
+normalizeRepoUrl raw =
+  let t1 = T.strip raw
+      -- Strip a scheme.
+      t2 = foldr (\s acc -> fromMaybe acc (T.stripPrefix s acc))
+                 t1 [ "https://", "http://", "git://", "ssh://", "file://" ]
+      -- Strip a leading user@ (SCP-style: git@host:path).
+      t3 = case T.breakOn "@" t2 of
+             (_, rest) | not (T.null rest) -> T.drop 1 rest
+             _ -> t2
+      -- Replace the SCP ':' separator with '/'. Only the FIRST ':'
+      -- (after the host) is the separator; later ':' would be port-like,
+      -- but a bare SCP url has exactly one ':'. If there's no '/', the
+      -- first ':' is host/path; if there's a '/' before the ':', it's
+      -- not SCP-style (e.g. ssh://host:port/path already had scheme
+      -- stripped, so unlikely) — leave it.
+      t4 = case T.breakOn ":" t3 of
+             (host, rest) | not (T.null rest), not (T.any (== '/') host) ->
+               host <> "/" <> T.drop 1 rest
+             _ -> t3
+      -- Strip trailing slashes, then a trailing .git, then any slash
+      -- that the .git-strip might have exposed (e.g. ".../repo.git/"
+      -- → ".../repo.git" → ".../repo"). Apply twice in case of a
+      -- ".../repo.git/."-like edge; the composition is idempotent.
+      stripTail t = T.dropWhileEnd (== '/') (fromMaybe t (T.stripSuffix ".git" (T.dropWhileEnd (== '/') t)))
+      t5 = stripTail t4
+  in T.toLower t5
 sanitizeRepoName :: Text -> Text
 sanitizeRepoName url =
   -- Strip trailing slashes first so a trailing slash doesn't yield an
@@ -188,7 +226,7 @@ cloneRepoIO uio url = do
       let existingUrl = T.strip (T.filter (/= '\n') existing)
           cleanUrl = T.strip url
       if existingUrl /= "__NONE__"
-        then if existingUrl == cleanUrl
+        then if normalizeRepoUrl existingUrl == normalizeRepoUrl cleanUrl
                then pure (CloneNoop repoName)
                else pure (CloneConflict repoName existingUrl)
         else do

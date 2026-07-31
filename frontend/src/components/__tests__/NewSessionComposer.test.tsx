@@ -7,7 +7,7 @@ import type { ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   createBareSession: vi.fn(async () => ({ session_id: 's-new-1' })),
-  setupRepo: vi.fn(async () => ({ ok: true, target: 'repo', status: 'cloned' })),
+  setupRepo: vi.fn(async () => ({ ok: false, target: '', status: 'failed', error: 'clone failed: SSH unavailable' })),
 }))
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -130,5 +130,15 @@ describe('NewSessionComposer', () => {
     fireEvent.click(screen.getByLabelText('Submit new session'))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' }))
     expect(setupRepo).toHaveBeenCalledWith('s-new-1', 'https://github.com/foo/bar')
+  })
+
+  it('surfaces a repo warning banner when setupRepo fails (and still submits)', async () => {
+    const onSubmit = vi.fn()
+    render(<NewSessionComposer spec={makeSpec({ repo: 'git@github.com:foo/bar' })} onSubmit={onSubmit} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new session'))
+    await waitFor(() => expect(screen.getByTestId('composer-repo-warning')).toBeTruthy())
+    // The session still starts (the warning does not block onSubmit).
+    expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' })
+    expect(screen.getByTestId('composer-repo-warning').textContent).toContain('Could not set up repo')
   })
 })
