@@ -84,7 +84,7 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir, sessionLogPath)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
@@ -122,13 +122,17 @@ import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Skills.Autoload (injectAutoloadSkill)
+import Seal.Skills.Prompt (injectAvailableSkills)
+import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Skills.Backend (SkillBackend)
+import Seal.Skills.Backend qualified as SkillBackend
 import qualified Seal.Security.Policy as Policy
   ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -691,11 +695,25 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           let wsroot = case eWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+          -- Workdir-aware skill backend: repo-local (SETUP_REPO) ⊕ user ⊕
+          -- builtin, workdir-wins. Fail-closed on a workdir error.
+          workdirSkills <- case eWd of
+            Right wd -> SkillBackend.workdirSkillBackend wd
+            Left _err -> SkillBackend.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+          let sessionSkills = SkillBackend.tripleUnionSkillBackend workdirSkills (bSkills backends)
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
           let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-          mSystem' <- injectAutoloadSkill (bSkills backends) autoloadId mSystem
+              injectCatalog = either (const True) resolvedAvailableSkills eCfg
+              parallel = either (const True) resolvedParallelToolGuidance eCfg
+              toolUse = either (const True) resolvedToolUseEnforcement eCfg
+              taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+              withGuidance = injectStaticGuidance parallel toolUse taskCompletion mSystem
+          mSystem' <- injectAutoloadSkill sessionSkills autoloadId withGuidance
+          mSystem'' <- if injectCatalog
+                         then injectAvailableSkills sessionSkills mSystem'
+                         else pure mSystem'
           let handleCaps = mkHandleCaps h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
@@ -724,7 +742,7 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                   then Nothing
                   else Just (broadcastTabs deps (cdTabs deps))
           let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle untrustedIO
+                       handleCaps prov (smProvider meta) model sid mSystem'' isaReg tHandle untrustedIO
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand
@@ -924,6 +942,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
+      , setupRepoOp wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -1054,7 +1073,15 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
             (Nothing, Nothing)                -> Nothing
           autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-      injectAutoloadSkill (bSkills (cdBackends deps)) autoloadId basePrompt
+          injectCatalog = either (const True) resolvedAvailableSkills eCfg
+          parallel = either (const True) resolvedParallelToolGuidance eCfg
+          toolUse = either (const True) resolvedToolUseEnforcement eCfg
+          taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+          withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
+      withAutoload <- injectAutoloadSkill (bSkills (cdBackends deps)) autoloadId withGuidance
+      if injectCatalog
+        then injectAvailableSkills (bSkills (cdBackends deps)) withAutoload
+        else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
       let childWsRoot = case eChildWd of
@@ -1081,6 +1108,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
+            , setupRepoOp childWsRoot (cdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

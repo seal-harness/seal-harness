@@ -1932,7 +1932,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "writer" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Writer" "draft text" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1982,7 +1982,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "alpha" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Alpha" "body" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Alpha" "body" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2031,7 +2031,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         sid = case mkSkillId "gone" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Gone" "body" now now (mkSystemSessionId "manual")
+        seed = Skill sid "Gone" "body" Nothing now now (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2072,7 +2072,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         mkS n = case mkSkillId n of
-          Right sid -> Skill sid n "body" now now (mkSystemSessionId "manual")
+          Right sid -> Skill sid n "body" Nothing now now (mkSystemSessionId "manual")
           Left _    -> error "sid"
     Skill.sbCreate skills (mkS "zeta")
     Skill.sbCreate skills (mkS "alpha")

@@ -31,7 +31,7 @@ mkSkill :: Text -> Text -> Text -> IO Skill
 mkSkill sid desc body =
   case mkSkillId sid of
     Right i  -> pure Skill
-      { skId = i, skDescription = desc, skBody = body
+      { skId = i, skDescription = desc, skBody = body, skGroup = Nothing
       , skCreatedAt = aTime, skUpdatedAt = aTime, skSession = mkSystemSessionId "s1" }
     Left e   -> error ("invalid skill id: " <> T.unpack e)
 

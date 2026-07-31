@@ -157,6 +157,7 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
         Seal.Agent.Runtime.Registry
@@ -174,6 +175,7 @@ library
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
         Seal.ISA.Ops.Skills
+        Seal.ISA.Ops.Repo
         Seal.ISA.Ops.Agent
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
@@ -183,6 +185,7 @@ library
         Seal.Skills.Codec
         Seal.Skills.Backend
         Seal.Skills.Autoload
+        Seal.Skills.Prompt
         Seal.Skills.Builtins
         Seal.Logging.Logger
         Seal.Logging.ChannelContext
@@ -320,12 +323,15 @@ test-suite tests
         Seal.Skills.TypesSpec
         Seal.Skills.BackendSpec
         Seal.Skills.AutoloadSpec
+        Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec
         Seal.Agent.Def.TypesSpec
         Seal.Agent.Def.BackendSpec
+        Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
+        Seal.ISA.Ops.RepoSpec
         Seal.ISA.Ops.AgentSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec

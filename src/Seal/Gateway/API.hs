@@ -26,7 +26,7 @@ import Data.Text.Read (decimal)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status500, status501 )
+  , status200, status201, status204, status400, status403, status404, status409, status500, status501, status503 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
@@ -44,7 +44,9 @@ import Seal.Config.Paths (sessionMetaPath)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
-  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
+  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
+  , handleSetupRepo, sendOutcomeJson )
+import Seal.ISA.Ops.Repo qualified as Repo
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
@@ -148,6 +150,22 @@ apiApp deps req respond =
               outcome <- handleSend sendDeps sId msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
+    -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
+    -- workdir before the first turn (the web "set up repo" combo box calls
+    -- this). Shares the clone logic with the SETUP_REPO opcode via
+    -- 'cloneRepoIO'. Returns 200 {ok:true, target, status} on
+    -- cloned/noop, 409 on a conflict, 400 on an invalid url, 503 on a
+    -- clone failure. When 'adSend' is Nothing (tests without the full
+    -- runtime), returns a stub 200.
+    (m', ["api", "sessions", sid, "setup-repo"]) | m' == methodPost -> do
+      body <- collectBody req
+      case parseRepoUrl body of
+        Nothing -> respond (errJson status400 "missing or invalid 'url' field")
+        Just url -> case adSend deps of
+          Nothing -> respond (jsonOk (object ["ok" .= True, "target" .= ("" :: Text), "status" .= ("stubbed" :: Text)]))
+          Just sendDeps -> case mkSessionId sid of
+            Left e -> respond (errJson status400 ("invalid session id: " <> e))
+            Right sId -> respond =<< handleSetupRepoApi sendDeps sId url
     -- T11 STUB: PUT /api/sessions/:id/description — 204 (no persistence yet;
     -- 'SessionMeta' has no description field).
     (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
@@ -420,6 +438,37 @@ parseSendMessage body =
       Just (A.String t) -> t
       _                 -> ""
     _ -> ""
+
+-- | Parse the @url@ field from a POST /setup-repo body. Returns 'Nothing'
+-- on a missing/invalid body or a non-string @url@.
+parseRepoUrl :: BL.ByteString -> Maybe Text
+parseRepoUrl body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "url") o of
+      Just (A.String t) | not (T.null (T.strip t)) -> Just t
+      _ -> Nothing
+    _ -> Nothing
+
+-- | Handle @POST /api/sessions/:id/setup-repo@: build the response from the
+-- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
+-- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
+-- url, 500 on a capability/workdir failure.
+handleSetupRepoApi :: SendDeps -> SessionId -> Text -> IO Response
+handleSetupRepoApi sendDeps sId url = do
+  eRes <- handleSetupRepo sendDeps sId url
+  case eRes of
+    Left err -> pure (errJson status400 err)
+    Right res -> case res of
+      Repo.CloneCloned repoName ->
+        pure (jsonOk (object [ "ok" .= True, "target" .= repoName, "status" .= ("cloned" :: Text) ]))
+      Repo.CloneNoop repoName ->
+        pure (jsonOk (object [ "ok" .= True, "target" .= repoName, "status" .= ("noop" :: Text) ]))
+      Repo.CloneConflict repoName existing ->
+        pure (jsonLBS status409 (A.encode (object
+          [ "ok" .= False, "target" .= repoName, "status" .= ("conflict" :: Text)
+          , "existing" .= existing ])))
+      Repo.CloneFailed err ->
+        pure (errJson status503 ("clone failed: " <> err))
 
 -- | Map an integer HTTP status code to a 'Status'. The send outcome carries
 -- an Int (so 'Seal.Gateway.Send' doesn't depend on @http-types@); this
@@ -952,12 +1001,18 @@ stampSkill sid v mExisting = do
         _                 -> Nothing
       description = fromMaybe "" (lookupStr "description")
       body        = fromMaybe "" (lookupStr "body")
+      mGroup      = T.strip <$> lookupStr "group"
+      group_      = case (mGroup, mExisting) of
+        (Just g, _) | not (T.null g) -> Just g
+        (Nothing, Just ex)           -> skGroup ex
+        _                            -> Nothing
       createdAt   = maybe now skCreatedAt mExisting
       session     = maybe (mkSystemSessionId "web") skSession mExisting
   pure Skill
     { skId          = sid
     , skDescription = description
     , skBody        = body
+    , skGroup       = group_
     , skCreatedAt   = createdAt
     , skUpdatedAt   = now
     , skSession     = session

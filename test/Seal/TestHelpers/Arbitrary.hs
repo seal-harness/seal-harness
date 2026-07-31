@@ -148,6 +148,7 @@ instance Arbitrary Skill where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
+    <*> arbitrary
     <*> genSessionId
 
 -- | An 'AgentDefId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).

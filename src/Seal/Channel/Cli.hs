@@ -49,7 +49,8 @@ import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
-                          rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill)
+                          rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
+                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
@@ -80,6 +81,7 @@ import Seal.ISA.Ops.Agent
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, AgentStartWiring (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Repo (setupRepoOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -87,6 +89,8 @@ import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.Memory.Backend qualified as Mem
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend qualified as Skill
+import Seal.Skills.Prompt (injectAvailableSkills)
+import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
 import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
@@ -386,7 +390,14 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
               (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
               (Nothing, Nothing)                -> Nothing
         cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
-        injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) basePrompt
+        let withGuidance = injectStaticGuidance (resolvedParallelToolGuidance cfg)
+                                                 (resolvedToolUseEnforcement cfg)
+                                                 (resolvedTaskCompletionGuidance cfg)
+                                                 basePrompt
+        withAutoload <- injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) withGuidance
+        if resolvedAvailableSkills cfg
+          then injectAvailableSkills skillBackend withAutoload
+          else pure withAutoload
       cliChildRegistryBuilder _def childSid childCaps = do
         eChildWd <- ensureSessionWorkdir paths childSid
         let childWsRoot = case eChildWd of
@@ -410,6 +421,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
               -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
               -- AGENT_INTERRUPT
               , shellExecOp childWsRoot cliSecurityPolicy
+              , setupRepoOp childWsRoot autonomy
               , binExecOp childWsRoot cliSecurityPolicy binAllowList
               , processManageOp childWsRoot cliSecurityPolicy
               , fileWriteOp childWsRoot operatorCeiling
@@ -487,8 +499,9 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
               , agentStatusOp agentRuntime
               , agentStopOp agentRuntime
               , agentInterruptOp agentRuntime
-              , shellExecOp wsRoot cliSecurityPolicy
-              , binExecOp wsRoot cliSecurityPolicy binAllowList
+               , shellExecOp wsRoot cliSecurityPolicy
+               , setupRepoOp wsRoot autonomy
+               , binExecOp wsRoot cliSecurityPolicy binAllowList
               , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling
               , filePatchOp wsRoot
@@ -500,13 +513,29 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
       -- system prompt. The auto-loaded skill (default @seal-usage@, the
       -- fresh-workdir contract) is appended so the model is oriented to its
       -- per-session workspace from turn one. Disabled by setting
-      -- @[skills] autoload = ""@ in @config.toml@.
-      resolveSystem meta = do
+      -- @[skills] autoload = ""@ in @config.toml@. The
+      -- @\<available_skills\>@ catalog is then appended so the model
+      -- discovers and uses skills; disabled by
+      -- @[skills] available_skills = false@. The catalog is built from the
+      -- workdir-aware backend (repo-local skills discovered by SETUP_REPO
+      -- ⊕ user ⊕ builtin, workdir-wins).
+      resolveSystem meta mWd = do
         base <- case smAgent meta of
           Nothing  -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
         cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
-        injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) base
+        workdirSkills <- case mWd of
+          Just wd -> Skill.workdirSkillBackend wd
+          Nothing -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+        let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills skillBackend
+            withGuidance = injectStaticGuidance (resolvedParallelToolGuidance cfg)
+                                                (resolvedToolUseEnforcement cfg)
+                                                (resolvedTaskCompletionGuidance cfg)
+                                                base
+        withAutoload <- injectAutoloadSkill sessionSkills (resolvedAutoloadSkill cfg) withGuidance
+        if resolvedAvailableSkills cfg
+          then injectAvailableSkills sessionSkills withAutoload
+          else pure withAutoload
       -- The per-turn body: open the transcript for `sid`, build the ISA
       -- registry, run a turn under a `withTwoFileTranscript` bracket.
       -- Mirrors `runTurnOnSession` from `Seal.Channels.Loop`. Used by
@@ -523,6 +552,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
           let wsRoot = case eWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              mWd = either (const Nothing) Just eWd
               startWiring = cliStartWiring sid
               isaReg = cliIsaReg sid startWiring caps wsRoot
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -530,7 +560,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
           case eprov of
             Left err -> ccSend caps err
             Right (prov, model) -> do
-              mSystem <- resolveSystem meta
+              mSystem <- resolveSystem meta mWd
               act sid tHandle isaReg prov model mSystem
     -- The /bg runner: mint a fresh persisted session from the config
     -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
@@ -565,13 +595,14 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
           let bgWsRoot = case eBgWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+              bgMwd = either (const Nothing) Just eBgWd
               bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot
           tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
             Left err -> ccSend caps ("bg failed: " <> err)
             Right (prov, mdl) -> do
-              mSystem <- resolveSystem meta
+              mSystem <- resolveSystem meta bgMwd
               bgUio <- mkSessionUio bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
