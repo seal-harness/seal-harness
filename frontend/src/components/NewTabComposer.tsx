@@ -6,7 +6,7 @@ import {
   type NewTabKind,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
-import { adoptWindow, createTab, type NewTabResponse } from '../hooks/useApi'
+import { adoptWindow, createTab, setupRepo, type NewTabResponse } from '../hooks/useApi'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -68,6 +68,15 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     if (branchFrom) body.branch_from = branchFrom
     const res = await createTab(body)
     if (res) {
+      // If the user entered a repo URL and the new tab has a session id
+      // (provider kind), clone the repo into the session's workdir before
+      // the first turn. Best-effort: a clone failure is surfaced inline
+      // but does not block the tab. The repo is recorded to history via
+      // persistOnSubmit regardless of clone success.
+      const repoUrl = spec.repo.trim()
+      if (repoUrl && res.session_id) {
+        await setupRepo(res.session_id, repoUrl)
+      }
       spec.persistOnSubmit()
       onSubmit(res)
     }
@@ -169,6 +178,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               />
             </Row>
           )}
+
+          <Row label="Set up repo" htmlFor="provider-repo">
+            <CustomModelCombobox
+              id="provider-repo"
+              value={spec.repo}
+              onChange={spec.setRepo}
+              options={spec.repoHistory}
+              placeholder="git URL (optional — cloned into the session before turn one)"
+              testId="provider-repo-list"
+            />
+          </Row>
 
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">
@@ -434,13 +454,14 @@ function Row({
    .composer-datalist class so it gets the same chevron and 10px left text
    inset as the other composer controls. */
 function CustomModelCombobox({
-  id, value, onChange, options, placeholder,
+  id, value, onChange, options, placeholder, testId,
 }: {
   id: string
   value: string
   onChange: (v: string) => void
   options: string[]
   placeholder?: string
+  testId?: string
 }) {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(-1)
@@ -516,7 +537,7 @@ function CustomModelCombobox({
         <div
           className="composer-combobox-popup"
           role="listbox"
-          data-testid="provider-model-custom-list"
+          data-testid={testId ?? 'provider-model-custom-list'}
           style={{
             position: 'fixed',
             left: rect.left,

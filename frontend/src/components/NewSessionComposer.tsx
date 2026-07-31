@@ -4,7 +4,7 @@ import {
   CUSTOM_MODEL_VALUE,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
-import { createBareSession, type NewBareSessionResponse } from '../hooks/useApi'
+import { createBareSession, setupRepo, type NewBareSessionResponse } from '../hooks/useApi'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -39,11 +39,20 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
     if (spec.validationError) return
     setSubmitting(true)
     const res = await createBareSession({ provider: spec.provider, model: spec.model.trim() })
-    setSubmitting(false)
     if (res) {
+      // If the user entered a repo URL, clone it into the session's
+      // workdir before the first turn. Best-effort: a clone failure is
+      // surfaced inline but does not block the session (the user can
+      // retry via SETUP_REPO later). The repo is recorded to history via
+      // persistOnSubmit regardless of clone success.
+      const repoUrl = spec.repo.trim()
+      if (repoUrl) {
+        await setupRepo(res.session_id, repoUrl)
+      }
       spec.persistOnSubmit()
       onSubmit(res)
     }
+    setSubmitting(false)
   }
 
   return (
@@ -112,6 +121,17 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
             />
           </Row>
         )}
+
+        <Row label="Set up repo" htmlFor="ns-repo">
+          <CustomModelCombobox
+            id="ns-repo"
+            value={spec.repo}
+            onChange={spec.setRepo}
+            options={spec.repoHistory}
+            placeholder="git URL (optional — cloned into the session before turn one)"
+            testId="ns-repo-list"
+          />
+        </Row>
       </div>
 
       {spec.validationError && (
@@ -180,13 +200,14 @@ function Row({
 //    new-session composer is self-contained without reaching into
 //    NewTabComposer's private helpers). ────────────────────────────────
 function CustomModelCombobox({
-  id, value, onChange, options, placeholder,
+  id, value, onChange, options, placeholder, testId,
 }: {
   id: string
   value: string
   onChange: (v: string) => void
   options: string[]
   placeholder?: string
+  testId?: string
 }) {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(-1)
@@ -259,7 +280,7 @@ function CustomModelCombobox({
         <div
           className="composer-combobox-popup"
           role="listbox"
-          data-testid="ns-provider-model-custom-list"
+          data-testid={testId ?? 'ns-provider-model-custom-list'}
           style={{
             position: 'fixed',
             left: rect.left,

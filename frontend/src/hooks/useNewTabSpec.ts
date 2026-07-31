@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, type LastOptions } from './useApi'
+import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
@@ -41,6 +41,15 @@ export interface NewTabSpec {
    *  Loaded from the persisted UI state on mount; the combobox offers these
    *  as suggestions. Populated by `recordCustomModel` on submit. */
   customModels: string[]
+
+  // Repository ("set up repo" combo box)
+  /** The current repo URL in the form. Empty string = no repo. */
+  repo: string
+  setRepo: (v: string) => void
+  /** Repo URLs the user has "set up" before, most-recent first, deduped.
+   *  Loaded from the persisted UI state on mount; the combobox offers these
+   *  as suggestions. Populated by `recordRepo` on submit. */
+  repoHistory: string[]
 
   // Harness
   flavour: HarnessFlavour
@@ -86,6 +95,10 @@ export function useNewTabSpec(): NewTabSpec {
   // Custom-model history (loaded from persisted UI state). The combobox
   // offers these as suggestions; `recordCustomModel` appends on submit.
   const [customModels, setCustomModels] = useState<string[]>([])
+  // Repo URL history (loaded from persisted UI state). The "set up repo"
+  // combobox offers these as suggestions; `recordRepo` appends on submit.
+  const [repo, setRepo] = useState<string>('')
+  const [repoHistory, setRepoHistory] = useState<string[]>([])
   // When lastOptions restores a provider+model, the model-fetch effect
   // would normally clobber the restored model with the provider's default.
   // `pendingRestoreModel` holds the restored model id so the fetch effect
@@ -130,6 +143,8 @@ export function useNewTabSpec(): NewTabSpec {
       if (!st) return
       const models = Array.isArray(st.custom_models) ? st.custom_models : []
       if (models.length > 0) setCustomModels(models)
+      const repos = Array.isArray(st.repo_history) ? st.repo_history : []
+      if (repos.length > 0) setRepoHistory(repos)
       const opts = st.last_options
       if (!opts) return
       setKind(opts.kind as NewTabKind)
@@ -138,6 +153,7 @@ export function useNewTabSpec(): NewTabSpec {
       if (opts.attachSession) setAttachSession(opts.attachSession)
       if (opts.attachWindow) setAttachWindow(opts.attachWindow)
       if (opts.attachManual) setAttachManual(true)
+      if (opts.repo) setRepo(opts.repo)
       // Provider + model: stage the model so the model-fetch effect (which
       // fires when the restored provider lands) honors it instead of the
       // configured default. The fetch effect clears the ref once consumed.
@@ -265,6 +281,7 @@ export function useNewTabSpec(): NewTabSpec {
       attachSession,
       attachWindow,
       attachManual,
+      repo: repo.trim(),
     }
     void putUiState(opts)
     if (useCustomModel && model.trim()) {
@@ -274,7 +291,14 @@ export function useNewTabSpec(): NewTabSpec {
         return next.slice(0, 32)
       })
     }
-  }, [kind, provider, model, useCustomModel, flavour, customBinary, attachSession, attachWindow, attachManual])
+    if (repo.trim()) {
+      void addRepo(repo.trim())
+      setRepoHistory((prev) => {
+        const next = [repo.trim(), ...prev.filter((r) => r !== repo.trim())]
+        return next.slice(0, 32)
+      })
+    }
+  }, [kind, provider, model, useCustomModel, flavour, customBinary, attachSession, attachWindow, attachManual, repo])
 
   return {
     kind, setKind,
@@ -282,6 +306,7 @@ export function useNewTabSpec(): NewTabSpec {
     provider, setProvider,
     model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
     customModels,
+    repo, setRepo, repoHistory,
     flavour, setFlavour,
     customBinary, setCustomBinary,
     attachSession, setAttachSession,

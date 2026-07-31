@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { NewSessionComposer } from '../NewSessionComposer'
-import { createBareSession } from '../../hooks/useApi'
+import { createBareSession, setupRepo } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
 import type { ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   createBareSession: vi.fn(async () => ({ session_id: 's-new-1' })),
+  setupRepo: vi.fn(async () => ({ ok: true, target: 'repo', status: 'cloned' })),
 }))
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -30,6 +31,9 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),
     customModels: [],
+    repo: '',
+    setRepo: vi.fn(),
+    repoHistory: [],
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
@@ -103,5 +107,28 @@ describe('NewSessionComposer', () => {
     render(<NewSessionComposer spec={makeSpec()} onSubmit={() => {}} onCancel={onCancel} />)
     fireEvent.click(screen.getByText('Cancel'))
     expect(onCancel).toHaveBeenCalled()
+  })
+
+  it('renders the "Set up repo" combo box', () => {
+    render(<NewSessionComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />)
+    expect(screen.getByText('Set up repo')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/git URL/)).toBeTruthy()
+  })
+
+  it('does not call setupRepo when the repo field is empty', async () => {
+    const onSubmit = vi.fn()
+    render(<NewSessionComposer spec={makeSpec({ repo: '' })} onSubmit={onSubmit} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new session'))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    expect(setupRepo).not.toHaveBeenCalled()
+  })
+
+  it('calls setupRepo with the new session id + repo URL when a repo is entered', async () => {
+    const onSubmit = vi.fn()
+    const setRepo = vi.fn()
+    render(<NewSessionComposer spec={makeSpec({ repo: 'https://github.com/foo/bar', setRepo })} onSubmit={onSubmit} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new session'))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' }))
+    expect(setupRepo).toHaveBeenCalledWith('s-new-1', 'https://github.com/foo/bar')
   })
 })

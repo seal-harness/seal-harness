@@ -73,7 +73,7 @@ import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
-  , addCustomModel, getUiState, setLastOptions )
+  , addCustomModel, addRepoHistory, getUiState, setLastOptions )
 import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies the API needs (injected so the test can supply fakes).
@@ -367,6 +367,14 @@ apiApp deps req respond =
       body <- collectBody req
       case A.decode body :: Maybe A.Value of
         Just v  -> respond =<< handleUiCustomModelAdd deps v
+        Nothing -> respond (errJson status400 "invalid JSON body")
+    -- POST /api/ui/repos -> add a repo URL to the persisted history. Body:
+    -- { "url": "<url>" }. Idempotent + deduped + capped. The "set up repo"
+    -- combo box records a URL here on submit so the history populates.
+    (m', ["api", "ui", "repos"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleUiRepoAdd deps v
         Nothing -> respond (errJson status400 "invalid JSON body")
     (m', ["api", "tabs", "new"]) | m' == methodPost -> do
       body <- collectBody req
@@ -1039,6 +1047,7 @@ uiStateJson :: UiState -> Value
 uiStateJson s = object
   [ "last_options"  .= usLastOptions s
   , "custom_models" .= usCustomModels s
+  , "repo_history"  .= usRepoHistory s
   ]
 
 -- | Handle PUT /api/ui/state. The body is the @last_options@ object (the
@@ -1070,6 +1079,25 @@ parseModelField (A.Object o) = case KeyMap.lookup (Key.fromText "model") o of
   Just (A.String t) -> Just t
   _                -> Nothing
 parseModelField _ = Nothing
+
+-- | Handle POST /api/ui/repos. The body is @{"url":"<url>"}@. A
+-- blank/missing url is a no-op success (the frontend shouldn't send one,
+-- but the store is defensive).
+handleUiRepoAdd :: ApiDeps -> A.Value -> IO Response
+handleUiRepoAdd deps v = do
+  let mUrl = parseUrlField v
+  case mUrl of
+    Nothing -> pure (errJson status400 "missing 'url' field")
+    Just u  -> do
+      addRepoHistory (adUiState deps) u
+      pure (jsonOk (object ["ok" .= True]))
+
+-- | Parse the @url@ field from a JSON body.
+parseUrlField :: A.Value -> Maybe Text
+parseUrlField (A.Object o) = case KeyMap.lookup (Key.fromText "url") o of
+  Just (A.String t) -> Just t
+  _                 -> Nothing
+parseUrlField _ = Nothing
 
 -- | Parse the @harness_id@ field (the flavour-name or @custom:<binary>@
 -- encoding) into the tab's label.
