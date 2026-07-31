@@ -50,7 +50,7 @@ import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO, renderUntrustedErr, uioShellExec)
-import Seal.Tools.Exec.Types (mkRemotePath)
+import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Types.App (App)
 
 -- | SETUP_REPO opcode. Input: @{url: Text}@. Authorize: autonomy must not
@@ -234,7 +234,33 @@ cloneRepoIO uio url = do
           cloneRes <- uioShellExec uio (shellCmd cloneCmd) mCwdPath
           case cloneRes of
             Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
-            Right _out -> pure (CloneCloned repoName)
+            Right _out ->
+              -- uioShellExec returns Right even on a non-zero git exit
+              -- (it surfaces stderr to the model for SHELL_EXEC). So we
+              -- can't trust the exit code here — verify the clone actually
+              -- landed by checking for <repoName>/.git. If absent, the
+              -- clone failed (e.g. SSH auth, bad URL, network); report
+              -- the failure with the clone's stdout/stderr so the user
+              -- knows why.
+              verifyClone uio repoName _out mCwdPath
+
+-- | Verify a clone actually landed by checking for @<repoName>/.git@.
+-- 'uioShellExec' returns 'Right' even on non-zero exit (it surfaces
+-- stderr to the model for SHELL_EXEC), so the exit code is unreliable
+-- for distinguishing success from failure. The filesystem is the source
+-- of truth. Returns 'CloneCloned' on success, 'CloneFailed' (with the
+-- clone's output text so the user sees /why/) on failure.
+verifyClone :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult
+verifyClone uio repoName cloneOut mCwdPath = do
+  let verifyCmd = "test -d " <> shellQ repoName <> "/.git && echo __OK__ || echo __MISSING__"
+  vRes <- uioShellExec uio (shellCmd verifyCmd) mCwdPath
+  case vRes of
+    Left err -> pure (CloneFailed ("clone verify failed: " <> renderUntrustedErr err))
+    Right vOut
+      | "__OK__" `T.isInfixOf` vOut -> pure (CloneCloned repoName)
+      | otherwise -> pure (CloneFailed
+                            ("clone did not land — git output: "
+                             <> T.strip (T.filter (/= '\n') cloneOut)))
 
 -- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
 -- 'cloneRepoIO' with the audit 'orRecorded' payload).

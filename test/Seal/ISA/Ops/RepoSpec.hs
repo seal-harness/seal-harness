@@ -250,6 +250,22 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             CloneConflict _name existing -> existing `shouldBe` urlA
             other -> expectationFailure ("expected CloneConflict, got " <> show other)
 
+    it "reports CloneFailed (not CloneCloned) when the clone errors — git's non-zero exit is returned as Right by uioShellExec, so the filesystem must be the source of truth" $
+      withSystemTempDirectory "seal-repo-fail" $ \wd -> do
+        let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
+            -- A URL that parses but points at nothing cloneable: an
+            -- SCP-style URL to a nonexistent host. git will fail with
+            -- "Could not read from remote repository" (exit 128), which
+            -- uioShellExec returns as Right (stderr text). cloneRepoIO
+            -- must detect the missing <repo>/.git and report failure.
+            badUrl = "git@nonexistent-host.invalid:foo/bar.git"
+        res <- cloneRepoIO uio badUrl
+        case res of
+          CloneFailed _ -> pure ()   -- expected
+          other -> expectationFailure
+            ("expected CloneFailed, got " <> show other
+             <> " — cloneRepoIO must verify the clone landed, since uioShellExec returns Right on non-zero exit")
+
 isLeft :: Either a b -> Bool
 isLeft (Left _)  = True
 isLeft (Right _) = False
