@@ -30,8 +30,8 @@ import Data.Text.IO qualified as TIO
 import System.Exit (ExitCode (..))
 import System.IO (BufferMode (..), hClose, hFlush, hGetLine, hSetBuffering)
 import System.Process
-  ( CreateProcess (..), StdStream (..), proc, terminateProcess, waitForProcess
-  , withCreateProcess )
+  ( CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess,
+    waitForProcess, withCreateProcess )
 import System.Timeout (timeout)
 
 import Seal.Core.MessageSource (ConversationId (..), UserId (..), mkConversationId, mkUserId)
@@ -81,10 +81,10 @@ mkRealSignalTransport :: Text -> IO (Either Text SignalTransport)
 mkRealSignalTransport account = do
   versionOk <- probeSignalCli
   if not versionOk
-    then pure (Left "signal-cli not installed or not on PATH")
+    then pure (Left "signal-cli not installed or on PATH")
     else do
       eStarted <- try @IOException $
-        withCreateProcess
+        createProcess
           ( (proc "signal-cli"
               [ "--output=json"
               , "--trust-new-identities=always"
@@ -92,16 +92,15 @@ mkRealSignalTransport account = do
               , "jsonRpc"
               ])
               { std_in = CreatePipe, std_out = CreatePipe, std_err = Inherit }
-          ) $ \mIn mOut _err ph -> do
-            (hIn, hOut) <- case (mIn, mOut) of
-              (Just a, Just b) -> pure (a, b)
-              _ -> error "mkRealSignalTransport: pipe creation failed (unreachable)"
-            hSetBuffering hIn (BlockBuffering Nothing)
-            hSetBuffering hOut LineBuffering
-            pure (hIn, hOut, ph)
+          )
       case eStarted of
         Left e -> pure (Left ("signal-cli launch failed: " <> T.pack (show e)))
-        Right (hIn, hOut, ph) ->
+        Right (mIn, mOut, _err, ph) -> do
+          (hIn, hOut) <- case (mIn, mOut) of
+            (Just a, Just b) -> pure (a, b)
+            _ -> error "mkRealSignalTransport: pipe creation failed (unreachable)"
+          hSetBuffering hIn (BlockBuffering Nothing)
+          hSetBuffering hOut LineBuffering
           pure (Right SignalTransport
             { stReceive = do
                 line <- hGetLine hOut

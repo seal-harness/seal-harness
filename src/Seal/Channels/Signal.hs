@@ -122,17 +122,23 @@ readerLoop ch = go
         Right (Right val) -> do
           case parseSignalEnvelope val of
             Left err -> logIO logger WarningS ("envelope parse error: " <> ls err)
-            Right env -> do
-              let sender = seSender env
-              if isAllowed sender (scAllowList ch)
-                then do
-                  case mkMessageSource (seConversationId env) Signal (Just sender) mempty of
-                    Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
-                    Right ms -> do
-                      writeIORef (scLastSender ch) (Just sender)
-                      atomically (writeTQueue (scInbox ch) (ms, seBody env))
-                else logIO logger InfoS ("dropped non-allow-listed sender: " <> ls (userIdText sender))
-          go
+            Right env
+              | T.null (seBody env) -> go
+                -- Skip non-data envelopes (receipts, typing, sync messages).
+                -- signal-cli emits these constantly; only dataMessage carries
+                -- real text. Avoids tight-cycling the loop with empty envelopes.
+              | otherwise -> do
+                let sender = seSender env
+                logIO logger DebugS ("signal: inbound message from " <> ls (userIdText sender))
+                if isAllowed sender (scAllowList ch)
+                  then do
+                    case mkMessageSource (seConversationId env) Signal (Just sender) mempty of
+                      Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
+                      Right ms -> do
+                        writeIORef (scLastSender ch) (Just sender)
+                        atomically (writeTQueue (scInbox ch) (ms, seBody env))
+                  else logIO logger InfoS ("dropped non-allow-listed sender: " <> ls (userIdText sender))
+                go
 
 -- | Send a message, chunked to 'scChunkLimit', addressed to the last sender.
 -- If no peer has been seen yet, the send is dropped with a warning log.
