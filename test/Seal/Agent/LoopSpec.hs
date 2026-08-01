@@ -84,6 +84,17 @@ instance Provider FlakyProvider where
         writeIORef ref (n - 1, ok, err)
         pure (Left err)
 
+-- | A provider that always returns a truncated (StopMaxTokens) response and
+-- counts how many times it was called. Used to verify the continuation
+-- retry cap (1 initial + 3 continuations = 4 calls, then give-up).
+newtype CountingTruncProvider = CountingTruncProvider (IORef Int)
+
+instance Provider CountingTruncProvider where
+  listModels _ = pure (Right [])
+  complete (CountingTruncProvider ref) _ = do
+    modifyIORef' ref (+ 1)
+    pure (Right (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)))
+
 runTestApp :: App a -> IO a
 runTestApp act = do
   logger <- testSealLogger
@@ -894,3 +905,273 @@ spec = describe "Seal.Agent.Loop" $ do
       sentMsgs <- readIORef sent
       sentMsgs `shouldSatisfy` any ("2-turn limit" `T.isInfixOf`)
       sentMsgs `shouldSatisfy` any ("max_turns" `T.isInfixOf`)
+
+  -- ── StopMaxTokens handling ──────────────────────────────────────────────
+
+  -- A truncated text response (StopMaxTokens, no tool calls) must trigger an
+  -- auto-continuation: the loop appends the partial text + a synthetic
+  -- continuation prompt and re-requests. The model "resumes" and emits the
+  -- final text, which the user sees as the reply.
+  it "auto-continues when a text response is truncated (StopMaxTokens)" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        script =
+          [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
+          , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
+          ]
+    ref <- newIORef script
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    -- The user sees the resumed final text ("done"), not just "partial".
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("done" `T.isInfixOf`)
+
+  -- A truncated EMPTY response (StopMaxTokens, content=[] — the model spent
+  -- all tokens on an incomplete tool-call block that produced zero complete
+  -- blocks). This is exactly session 3's symptom. Auto-continue must still
+  -- fire and give the model another chance, rather than silently halting
+  -- with an empty reply.
+  it "auto-continues when a truncated response yields no content blocks" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        script =
+          [ CompletionResponse [] StopMaxTokens (Usage 1 4096)
+          , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 50)
+          ]
+    ref <- newIORef script
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("recovered" `T.isInfixOf`)
+
+  -- After 3 continuation retries the loop gives up and surfaces a truncation
+  -- notice to the user (instead of silently shipping an empty/partial reply).
+  -- The notice must mention "truncated" so the user knows the turn failed.
+  it "surfaces a truncation notice after 3 failed continuation attempts" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        -- Every response is truncated — the loop retries 3 times then gives
+        -- up. 1 initial + 3 continuations = 4 scripted responses consumed.
+        script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
+    ref <- newIORef script
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("truncated" `T.isInfixOf`)
+    sentMsgs `shouldSatisfy` any ("continuation attempts" `T.isInfixOf`)
+
+  -- The continuation retries must be bounded — verify the loop does NOT
+  -- loop forever on persistent truncation. With 4 scripted truncated
+  -- responses (1 initial + 3 retries) and maxTurns=8, the loop must stop
+  -- after consuming exactly 4 provider calls (not 8).
+  it "stops after exactly 3 continuation retries on persistent truncation" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    calls <- newIORef (0 :: Int)
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        -- A provider that always truncates and counts calls.
+        countingTrunc = SomeProvider (CountingTruncProvider calls)
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = countingTrunc
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "hi")
+    -- 1 initial + 3 continuations = 4 calls total, then the loop gives up.
+    readIORef calls `shouldReturn` 4
+
+  -- A truncated response followed by a tool call: after auto-continue, the
+  -- model emits a tool call (not final text). The loop must dispatch the
+  -- tool and continue, proving the continuation counter doesn't break the
+  -- tool-call path.
+  it "auto-continue then tool call: continuation feeds into the tool loop" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    ran <- newIORef (0 :: Int)
+    let caps = ChannelCaps
+                 (\t -> modifyIORef' sent (++ [t]))
+                 (\_ -> pure "")
+                 (\_ -> pure "")
+        stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
+                    (const (Right ()))
+                    (\_ _ -> do
+                      liftIO (modifyIORef' ran (+ 1))
+                      pure (OpResult [TrpText "pong"] False Null))
+        script =
+          [ CompletionResponse [CbText "let me check"] StopMaxTokens (Usage 1 100)
+          , CompletionResponse
+              [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
+              StopToolUse (Usage 1 50)
+          , CompletionResponse [CbText "all done"] StopEnd (Usage 1 50)
+          ]
+    ref <- newIORef script
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry [stubOp]
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                }
+    runTestApp (runTurn env "ping")
+    readIORef ran `shouldReturn` 1
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("all done" `T.isInfixOf`)
+
+  -- The truncation event must be logged to seal.log when aeLogPath is set.
+  it "logs StopMaxTokens continuation to seal.log" $
+    withSystemTempDirectory "seal-log" $ \logDir -> do
+      approvals <- newApprovalCache
+      sent <- newIORef ([] :: [Text])
+      let caps = ChannelCaps
+                   (\t -> modifyIORef' sent (++ [t]))
+                   (\_ -> pure "")
+                   (\_ -> pure "")
+          script =
+            [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
+            , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
+            ]
+      ref <- newIORef script
+      (h, _) <- fakeTwoFileTranscript
+      let logPath = Just (logDir </> "seal.log")
+          env = AgentEnv
+                  { aeProvider = SomeProvider (ScriptProvider ref)
+                  , aeProviderLabel = "ollama"
+                  , aeModel = ModelId "m"
+                  , aeSystem = Nothing
+                  , aeRegistry = mkRegistry []
+                  , aeTranscript = h
+                  , aeBackend = localBackend
+                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCaps = caps
+                  , aeSession = either (error "sid") id (mkSessionId "s1")
+                  , aeMaxTurns = 8
+                  , aeChannel = "test"
+                  , aeMessageSource = Nothing
+                  , aeAutonomy = Full
+                  , aeApprovals = approvals
+                  , aeDebugRequestsPath = Nothing
+                  , aeOnEntry = pure ()
+                  , aeOnUserMessage = Nothing
+                  , aeOnDemandSchemas = False
+                  , aeLogPath = logPath
+                  }
+      runTestApp (runTurn env "hi")
+      doesFileExist (fromJust logPath) `shouldReturn` True
+      content <- readFile (fromJust logPath)
+      content `shouldContain` "truncated"
+      content `shouldContain` "continuation"
