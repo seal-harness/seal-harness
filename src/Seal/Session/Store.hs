@@ -18,6 +18,7 @@ module Seal.Session.Store
   , initSessionMeta
   , updateSessionAgent
   , updateSessionSystemOverride
+  , updateSessionDescription
   , SessionRuntime (..)
   ) where
 
@@ -83,6 +84,7 @@ newSessionMeta _paths provider model channel mAgent = do
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -314,6 +316,35 @@ updateSessionSystemOverride paths sid mOverride mFallbackName = do
                   meta { smSystemOverride = Nothing }
           saveSessionMeta paths next
           pure True
+
+-- | Update (or clear) the user-set display description for a session.
+-- 'Nothing' clears it (the UI then falls back to the auto-summary /
+-- first-message snippet / agent name); 'Just t' sets it (a blank or
+-- all-whitespace string is normalized to 'Nothing' so the caller can pass
+-- the raw input). Returns 'False' when the session's @session.json@ can't
+-- be found or parsed; 'True' on a successful write. Only touches
+-- 'smDescription' — all other fields (agent binding, override, etc.) are
+-- preserved.
+updateSessionDescription :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionDescription paths sid mDesc = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smDescription = normalized }
+          saveSessionMeta paths next
+          pure True
+  where
+    normalized = case mDesc of
+      Just t
+        | not (T.null (T.strip t)) -> Just t
+        | otherwise                -> Nothing
+      Nothing                      -> Nothing
 
 -- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
 -- Returns 'Nothing' when the file has no frontmatter or no @id@ key.

@@ -42,6 +42,7 @@ spec = describe "Seal.Command.New" $ do
           , smAgent = Nothing
           , smSystemOverride = Nothing
           , smAgentName = Nothing
+          , smDescription = Nothing
           , smCreatedAt = error "unused"
           , smLastActive = error "unused"
           }

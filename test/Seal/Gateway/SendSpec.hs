@@ -75,7 +75,7 @@ mkSendDeps paths providerRef = do
   approvals <- newApprovalCache
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
       resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
@@ -117,7 +117,7 @@ seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 spec :: Spec

@@ -66,7 +66,8 @@ import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
   , saveSessionMeta, updateSessionAgent
-  , updateSessionArchived, updateSessionSystemOverride )
+  , updateSessionArchived, updateSessionSystemOverride
+  , updateSessionDescription )
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
@@ -165,11 +166,18 @@ apiApp deps req respond =
           Just sendDeps -> case mkSessionId sid of
             Left e -> respond (errJson status400 ("invalid session id: " <> e))
             Right sId -> respond =<< handleSetupRepoApi sendDeps sId url
-    -- T11 STUB: PUT /api/sessions/:id/description — 204 (no persistence yet;
-    -- 'SessionMeta' has no description field).
-    (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
-      _body <- collectBody req
-      respond noContent
+    -- PUT /api/sessions/:id/description — set or clear the user-set
+    -- display title for a session (the chat-header pencil). Body:
+    -- {"description":"<text>"} (empty/missing/whitespace clears it).
+    -- Persists via 'updateSessionDescription' (a field on session.json)
+    -- and triggers a lists broadcast so the sidebar picks up the new
+    -- label without a refresh. Returns 200 {ok:true} on success, 404
+    -- when the session has no session.json on disk, 400 on invalid JSON.
+    (m', ["api", "sessions", sid, "description"]) | m' == methodPut -> do
+      body <- collectBody req
+      case mkSessionId sid of
+        Left e  -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> respond =<< handleSessionDescription deps sId body
     -- PUT /api/sessions/:id/archived — set or clear the archive flag. Body:
     -- {"archived": true|false}. Persists via 'updateSessionArchived' (a marker
     -- file in the session directory). Returns 200 {ok:true} on success, 404
@@ -631,6 +639,26 @@ handleSessionArchived deps sid archived = do
   ok <- updateSessionArchived (srPaths (adSessionRuntime deps)) sid archived
   if ok then triggerBroadcast deps >> pure (jsonOk (object ["ok" .= True]))
         else pure (errJson status404 "session not found")
+
+-- | Handle PUT /api/sessions/:id/description. Parses the @description@
+-- field from the body (an empty/missing/whitespace value clears it),
+-- and persists via 'updateSessionDescription'. Triggers a lists broadcast
+-- so the sidebar picks up the new label without a refresh. Returns 200
+-- {ok:true} on success, 404 when the session has no @session.json@ on
+-- disk, 400 on invalid JSON.
+handleSessionDescription :: ApiDeps -> SessionId -> BL.ByteString -> IO Response
+handleSessionDescription deps sid body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> do
+      let mDesc = case v of
+            A.Object o -> case KeyMap.lookup (Key.fromText "description") o of
+              Just (A.String t) -> Just t
+              _                 -> Nothing
+            _ -> Nothing
+      ok <- updateSessionDescription (srPaths (adSessionRuntime deps)) sid mDesc
+      if ok then triggerBroadcast deps >> pure (jsonOk (object ["ok" .= True]))
+            else pure (errJson status404 "session not found")
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is

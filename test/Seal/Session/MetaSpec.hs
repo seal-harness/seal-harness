@@ -19,6 +19,7 @@ sampleMeta =
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
        , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+       , smDescription = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 
 spec :: Spec
@@ -78,3 +79,16 @@ spec = describe "Seal.Session.Meta" $ do
               , "created_at" .= sampleTime
               , "last_active" .= sampleTime ]
     fmap smAgentName (decode (encode j)) `shouldBe` Just Nothing
+
+  it "round-trips smDescription = Just t" $ do
+    let m = sampleMeta { smDescription = Just "my tab name" }
+    fmap smDescription (decode (encode m)) `shouldBe` Just (Just "my tab name")
+
+  it "defaults smDescription to Nothing when absent (backwards-compat)" $ do
+    let j = object
+              [ "id" .= ("20260701-120000-042" :: String)
+              , "provider" .= ("anthropic" :: String)
+              , "model" .= ("claude-opus-4-8" :: String)
+              , "created_at" .= sampleTime
+              , "last_active" .= sampleTime ]
+    fmap smDescription (decode (encode j)) `shouldBe` Just Nothing

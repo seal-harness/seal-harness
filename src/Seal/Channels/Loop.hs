@@ -1137,6 +1137,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+      , smDescription = Nothing
       , smCreatedAt = t, smLastActive = t }
     loadMeta p sid = do
       let mp = sessionDir p sid </> "session.json"

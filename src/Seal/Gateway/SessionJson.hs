@@ -65,10 +65,12 @@ sessionWire (BoundHarness _)   = Nothing
 -- | Map a 'SessionMeta' to the frontend's 'SessionInfo' JSON shape
 -- (camelCase). The on-disk 'SessionMeta' uses snake_case; the gateway maps
 -- to the frontend's shape without changing 'SessionMeta's instance.
--- Fields the backend doesn't track yet (@description@, @autoSummary@,
--- @channelUserId@) are returned as @null@. @firstMessageSnippet@ is derived
--- from the session's transcript (the first user message), so a session
--- has a readable title before the user sets an explicit description.
+-- @description@ is the user-set title (persisted via @PUT
+-- /api/sessions/:id/description@); @autoSummary@ and @channelUserId@ are
+-- fields the backend doesn't track yet and are returned as @null@.
+-- @firstMessageSnippet@ is derived from the session's transcript (the
+-- first user message), so a session has a readable title before the user
+-- sets an explicit description.
 --
 -- @agent@ is the display label for the session's active agent (used by
 -- the sidebar / chat header). It prefers 'smAgentName' (set whenever an
@@ -83,7 +85,7 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "model" .= smModel m
   , "lastActive" .= smLastActive m
   , "createdAt" .= smCreatedAt m
-  , "description" .= (Nothing :: Maybe Text)
+  , "description" .= smDescription m
   , "autoSummary" .= (Nothing :: Maybe Text)
   , "firstMessageSnippet" .= mSnippet
   , "channel" .= smChannel m
