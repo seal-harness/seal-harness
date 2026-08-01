@@ -681,8 +681,10 @@ decodeUtf8 = decodeUtf8With lenientDecode
 -- has the full window to scan it.
 renderQR :: Text -> IO (Maybe Text)
 renderQR uri = do
-  (ec, out, _err) <- readProcessNoInput "qrencode" ["-t", "ANSIUTF8", "-o", "-", T.unpack uri]
-  pure $ case ec of
-    ExitSuccess
+  eResult <- try @IOException $
+    readProcessNoInput "qrencode" ["-t", "ANSIUTF8", "-o", "-", T.unpack uri]
+  pure $ case eResult of
+    Left _ -> Nothing
+    Right (ExitSuccess, out, _)
       | not (BS.null out) -> Just (T.strip (decodeUtf8 out))
-    _ -> Nothing
+    Right _ -> Nothing
