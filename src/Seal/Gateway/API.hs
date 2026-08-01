@@ -26,7 +26,7 @@ import Data.Text.Read (decimal)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status409, status500, status501, status503 )
+  , status200, status201, status204, status400, status403, status404, status500, status501 )
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
@@ -46,7 +46,6 @@ import Seal.Handles.AskReply
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
   , handleSetupRepo, sendOutcomeJson )
-import Seal.ISA.Ops.Repo qualified as Repo
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
@@ -466,17 +465,11 @@ handleSetupRepoApi sendDeps sId url = do
   eRes <- handleSetupRepo sendDeps sId url
   case eRes of
     Left err -> pure (errJson status400 err)
-    Right res -> case res of
-      Repo.CloneCloned repoName ->
-        pure (jsonOk (object [ "ok" .= True, "target" .= repoName, "status" .= ("cloned" :: Text) ]))
-      Repo.CloneNoop repoName ->
-        pure (jsonOk (object [ "ok" .= True, "target" .= repoName, "status" .= ("noop" :: Text) ]))
-      Repo.CloneConflict repoName existing ->
-        pure (jsonLBS status409 (A.encode (object
-          [ "ok" .= False, "target" .= repoName, "status" .= ("conflict" :: Text)
-          , "existing" .= existing ])))
-      Repo.CloneFailed err ->
-        pure (errJson status503 ("clone failed: " <> err))
+    Right msg ->
+      -- The opcode dispatched + recorded into the transcript. Return
+      -- ok:true with the opcode's message text so the frontend can show
+      -- it (and the user sees the result in the chat transcript too).
+      pure (jsonOk (object [ "ok" .= True, "message" .= msg ]))
 
 -- | Map an integer HTTP status code to a 'Status'. The send outcome carries
 -- an Int (so 'Seal.Gateway.Send' doesn't depend on @http-types@); this

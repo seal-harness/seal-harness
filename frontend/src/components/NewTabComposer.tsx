@@ -71,17 +71,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     const res = await createTab(body)
     if (res) {
       // If the user entered a repo URL and the new tab has a session id
-      // (provider kind), clone the repo into the session's workdir before
-      // the first turn. A clone failure does NOT block the tab — but it
-      // IS surfaced as a warning so the user knows the repo isn't set up.
-      // The repo is recorded to history via persistOnSubmit regardless of
-      // clone success.
+      // (provider kind), dispatch SETUP_REPO into the session's
+      // transcript (audited — visible in the chat, not a silent side
+      // channel). A clone failure does NOT block the tab; the error is
+      // recorded in the transcript. The repo is recorded to history via
+      // persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl && res.session_id) {
         const result = await setupRepo(res.session_id, repoUrl)
-        if (!result || !result.ok || result.status === 'failed') {
-          const reason = result?.error ?? result?.status ?? 'network error'
-          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. The tab started anyway — ask the model to call SETUP_REPO, or re-enter the URL (e.g. try https:// instead of git@).`)
+        if (!result || !result.ok) {
+          const reason = result?.error ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
         }
       }
       spec.persistOnSubmit()

@@ -44,7 +44,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Call (CallDispatcher)
+import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
@@ -53,7 +53,7 @@ import Seal.Config.File
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
@@ -84,11 +84,12 @@ import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
-import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Opcode (OpResult (..), localBackend, opName)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult, recordSetupRepoResult)
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
-import Seal.ISA.Ops.Repo qualified as Repo
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -102,7 +103,6 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
@@ -740,7 +740,15 @@ webCallDispatcher deps callOpName val = do
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> do
-        recordSkillLoadResult tHandle callOpName val r (Just "web")
+        -- Record the opcode result into the transcript. SKILL_LOAD and
+        -- SETUP_REPO each have a dedicated recorder (SETUP_REPO records
+        -- both success AND failure so the user sees clone errors in the
+        -- chat, not just the request). Other opcodes are not recorded
+        -- here — their results surface via the turn's normal entry flow.
+        let opNm = case callOpName of OpName n -> n
+        if opNm == "SETUP_REPO"
+          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          else recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -968,27 +976,50 @@ broadcastAskResolved mBroker sid qid resolution =
 
 -- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
 -- session's workdir before the first turn. The web "set up repo" combo box
--- calls this. Shares the clone logic with the SETUP_REPO opcode via
--- 'cloneRepoIO'. The URL is validated by 'validateRepoUrl' (rejects
--- shell-metacharacter URLs). The clone runs via the same sandboxed
--- 'UntrustedIO' the opcode uses, so it is fail-closed against the
--- session's workspace root (never the trusted machine). Returns @Left err@
--- for an invalid url or a workdir/capability failure; @Right result@ for a
--- clone/no-op/conflict outcome (the API layer maps these to status codes).
-handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Repo.CloneResult)
+-- calls this. Rather than calling 'cloneRepoIO' directly (which is
+-- unaudited — a side channel that never appears in the transcript), this
+-- dispatches the real 'SETUP_REPO' opcode via 'webCallDispatcher'. The
+-- clone (and any failure) is therefore recorded in the session's
+-- transcript exactly like a model-invoked SETUP_REPO, so the user sees it
+-- in the chat and any error is visible there — not silent.
+--
+-- The 'srActive' ref is scoped to the target session for the duration of
+-- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
+-- reads 'srActive' to pick the transcript), then restored.
+--
+-- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
+-- with the opcode's text result (the clone/no-op/conflict/failure message)
+-- for the API layer to pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
 handleSetupRepo deps sid url =
   case validateRepoUrl url of
     Left err -> pure (Left ("invalid url: " <> err))
     Right cleanUrl -> do
-      let paths = sdPaths deps
-      -- Build the sandboxed UntrustedIO (anchored to the session workdir;
-      -- 'mkSessionUntrustedIO' creates the workdir if needed and anchors
-      -- the capability to it). The clone runs through this capability,
-      -- never a trusted shell — same fail-closed contract as the opcode.
-      eSecCfg <- loadSecurityConfig (securityFilePath paths)
-      uio <- either (const (const (pure mkRemoteUntrustedIOStub)))
-                    (mkSessionUntrustedIO paths) eSecCfg sid
-      Right <$> Repo.cloneRepoIO uio cleanUrl
+      -- Scope srActive to the target session for the dispatch.
+      let sr = sdSession deps
+      activeBefore <- readIORef (srActive sr)
+      mMeta <- loadSessionMeta (sdPaths deps) sid
+      case mMeta of
+        Nothing -> pure (Left "session not found")
+        Just targetMeta -> do
+          writeIORef (srActive sr) targetMeta
+          -- Dispatch SETUP_REPO via the audited path (records into the
+          -- transcript + broadcasts the entry so the frontend sees it).
+          let dispatcher = webCallDispatcher deps
+          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+          -- Restore srActive.
+          writeIORef (srActive sr) activeBefore
+          case res of
+            Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
+            Right opRes ->
+              if orIsError opRes
+                then pure (Left (opResultText opRes))
+                else pure (Right (opResultText opRes))
+
+-- | Join the text parts of an 'OpResult' into a single message (the
+-- clone/no-op/conflict/failure text from SETUP_REPO).
+opResultText :: OpResult -> Text
+opResultText r = T.intercalate "\n" [ t | TrpText t <- orParts r ]
 
 -- | Deliver an answer to a pending question for a session. Returns 'True'
 -- if the answer was accepted (the question was pending and not yet

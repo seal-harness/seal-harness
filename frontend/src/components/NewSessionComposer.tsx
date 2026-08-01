@@ -42,18 +42,22 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
     setRepoWarning(null)
     const res = await createBareSession({ provider: spec.provider, model: spec.model.trim() })
     if (res) {
-      // If the user entered a repo URL, clone it into the session's
-      // workdir before the first turn. A clone failure does NOT block the
-      // session (the user can retry via SETUP_REPO later) — but it IS
-      // surfaced as a warning so the user knows the repo isn't set up
-      // rather than discovering it mid-turn. The repo is recorded to
-      // history via persistOnSubmit regardless of clone success.
+      // If the user entered a repo URL, dispatch SETUP_REPO into the
+      // session's transcript (audited — visible in the chat, not a silent
+      // side channel). A clone failure does NOT block the session, and
+      // the error is recorded in the transcript (the SETUP_REPO entry
+      // shows the full failure message). The repo is recorded to history
+      // via persistOnSubmit regardless of clone success. Navigate to the
+      // session so the user sees the SETUP_REPO result (or error) in the
+      // chat transcript.
       const repoUrl = spec.repo.trim()
       if (repoUrl) {
         const result = await setupRepo(res.session_id, repoUrl)
-        if (!result || !result.ok || result.status === 'failed') {
-          const reason = result?.error ?? result?.status ?? 'network error'
-          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. The session started anyway — ask the model to call SETUP_REPO, or re-enter the URL (e.g. try https:// instead of git@).`)
+        if (!result || !result.ok) {
+          // Surface a short warning here too, but still navigate so the
+          // full error is visible in the transcript.
+          const reason = result?.error ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
         }
       }
       spec.persistOnSubmit()

@@ -7,7 +7,7 @@ import type { ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   createBareSession: vi.fn(async () => ({ session_id: 's-new-1' })),
-  setupRepo: vi.fn(async () => ({ ok: false, target: '', status: 'failed', error: 'clone failed: SSH unavailable' })),
+  setupRepo: vi.fn(async () => ({ ok: true, message: 'Cloned https://...' })),
 }))
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -133,11 +133,15 @@ describe('NewSessionComposer', () => {
   })
 
   it('surfaces a repo warning banner when setupRepo fails (and still submits)', async () => {
+    const setupRepoMock = setupRepo as unknown as ReturnType<typeof vi.fn>
+    setupRepoMock.mockResolvedValueOnce({ ok: false, error: 'clone did not land — git output: Permission denied (publickey)' })
     const onSubmit = vi.fn()
     render(<NewSessionComposer spec={makeSpec({ repo: 'git@github.com:foo/bar' })} onSubmit={onSubmit} onCancel={() => {}} />)
     fireEvent.click(screen.getByLabelText('Submit new session'))
     await waitFor(() => expect(screen.getByTestId('composer-repo-warning')).toBeTruthy())
-    // The session still starts (the warning does not block onSubmit).
+    // The session still starts (the warning does not block onSubmit) —
+    // the user navigates to the session and sees the SETUP_REPO error in
+    // the transcript too.
     expect(onSubmit).toHaveBeenCalledWith({ session_id: 's-new-1' })
     expect(screen.getByTestId('composer-repo-warning').textContent).toContain('Could not set up repo')
   })

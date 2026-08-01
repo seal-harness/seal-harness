@@ -20,6 +20,7 @@ module Seal.ISA.Dispatch
   ( DispatchError (..)
   , dispatch
   , recordSkillLoadResult
+  , recordSetupRepoResult
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -180,3 +181,37 @@ recordSkillLoadResult h (OpName nm) input result mChannel
             <> [ Message User [CbText trimmedMessage] | not (T.null trimmedMessage) ]
       tfwRecordAndAck h (TwoFileWrite convMsgs entry)
   | otherwise = pure ()
+
+-- | Record the result of a 'SETUP_REPO' opcode invocation as an
+-- 'EKHarness' transcript entry + a conversation message. Unlike
+-- 'recordSkillLoadResult', this records BOTH success and failure (a
+-- failed clone is the case the operator most needs to see in the
+-- transcript — the error text tells them why the repo didn't appear).
+-- The conversation message carries the opcode's text result so the
+-- user sees the clone/no-op/conflict/failure message in the chat.
+recordSetupRepoResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordSetupRepoResult h (OpName nm) input result mChannel = do
+  now <- getCurrentTime
+  let channelMeta = case mChannel of
+        Just ch  -> [("channel", A.String ch)]
+        Nothing  -> []
+      entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 0
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList
+            ([ ("op", object ["name" .= OpName nm])
+             , ("input", input)
+             , ("result", orRecorded result)
+             ] <> channelMeta)
+        }
+      bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
+      convMsgs = [ Message User [CbText bodyText] | not (T.null bodyText) ]
+  tfwRecordAndAck h (TwoFileWrite convMsgs entry)
