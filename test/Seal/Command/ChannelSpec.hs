@@ -49,7 +49,12 @@ mkMockCli check link register verify accounts = do
   rAccounts <- newIORef accounts
   pure SignalCli
     { scCheckInstalled = readIORef rCheck
-    , scLink           = readIORef rLink
+    , scLink           = \onUri -> do
+        o <- readIORef rLink
+        case o of
+          LinkSucceeded uri -> onUri uri >> pure o
+          LinkFailed _      -> pure o
+          LinkTimedOut      -> pure o
     , scRegister       = \phone mCaptcha -> do
         qs <- readIORef rRegister
         case qs of
@@ -201,6 +206,7 @@ spec = describe "Seal.Command.Channel" $ do
           (AccountsFound ["+15551234567"])
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
         sentBlock sent `shouldSatisfy` ("sgnl://link?enc=xyz" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Linked successfully!" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Detected account: +15551234567" `T.isInfixOf`)
         mSig <- signalSection cfgPath
         mSig `shouldSatisfy` isJust
@@ -224,6 +230,43 @@ spec = describe "Seal.Command.Channel" $ do
         mSig `shouldSatisfy` isJust
         let sig = unsafeSig mSig
         scAccount sig `shouldBe` Just "+18005551234"
+
+  describe "/channel signal — link shows URI before timeout failure" $
+    it "delivers the sgnl:// URI via the callback even when link ultimately fails" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+            testUri = "sgnl://linkdevice?uuid=timeout-test"
+        -- Simulates real signal-cli: URI appears on stdout immediately,
+        -- then the process exits with a timeout error after the user
+        -- doesn't scan in time. The wizard must show the URI first.
+        cliBase <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
+                     (AccountsFailed "x")
+        let cli = cliBase { scLink = \onUri -> onUri testUri >> pure (LinkFailed "Connection closed!") }
+        sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
+        sentBlock sent `shouldSatisfy` (testUri `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Link failed or was cancelled." `T.isInfixOf`)
+
+  describe "/channel signal — link retries on timeout then succeeds" $
+    it "generates a fresh link after a 60s timeout and completes on retry" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        -- First scLink call times out, second succeeds. Simulates the user
+        -- needing more than 60s on the first QR but succeeding on the second.
+        callCount <- newIORef (0 :: Int)
+        cliBase <- mkMockCli (Right "0.13.0") (LinkSucceeded "sgnl://retry-ok") [] []
+                     (AccountsFound ["+15559990000"])
+        let cli = cliBase { scLink = \onUri -> do
+                n <- readIORef callCount
+                writeIORef callCount (n + 1)
+                if n == 0
+                  then pure LinkTimedOut
+                  else onUri "sgnl://retry-ok" >> pure (LinkSucceeded "sgnl://retry-ok") }
+        sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
+        sentBlock sent `shouldSatisfy` ("Link timed out after 60s" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Generating a fresh link" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("sgnl://retry-ok" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Linked successfully!" `T.isInfixOf`)
+        readIORef callCount `shouldReturn` 2
 
   describe "/channel signal — register flow (no captcha)" $
     it "registers, verifies, and writes config" $
