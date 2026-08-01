@@ -98,9 +98,11 @@ data SignalCli = SignalCli
   { scCheckInstalled :: IO (Either Text Text)
     -- ^ @signal-cli --version@. Right version-string on success; Left
     -- diagnostic if absent or failing.
-  , scLink           :: IO LinkOutcome
-    -- ^ @signal-cli link -n Seal@. Streams the @sgnl:\/\/@ URI; blocks until
-    -- the user scans it. See 'LinkOutcome'.
+  , scLink           :: (Text -> IO ()) -> IO LinkOutcome
+    -- ^ @signal-cli link -n Seal@. The callback is invoked with the
+    -- @sgnl:\/\/@ URI the instant it appears (before the scan completes),
+    -- so the wizard can show it immediately. 'scLink' then blocks until
+    -- the user scans it (or signal-cli times out). See 'LinkOutcome'.
   , scRegister       :: Text -> Maybe Text -> IO RegisterOutcome
     -- ^ @signal-cli -u <phone> register [--captcha <token>]@.
   , scVerify         :: Text -> Text -> IO VerifyOutcome
@@ -114,6 +116,9 @@ data SignalCli = SignalCli
 -- before blocking, so the wizard can show it immediately.
 data LinkOutcome
   = LinkFailed Text
+  | LinkTimedOut
+    -- ^ signal-cli's provisioning WebSocket closed before the scan completed
+    -- (60s idle timeout). The wizard may retry to give the user a fresh window.
   | LinkSucceeded Text
     -- ^ The @sgnl:\/\/@ URI; the scan completed with @ExitSuccess@.
 
@@ -232,24 +237,43 @@ signalSetupCmd rt = CommandAction $ \caps -> do
         _   -> ccSend caps "Invalid choice. Setup cancelled."
 
 -- | Link to an existing Signal account by scanning a @sgnl:\/\/@ URI.
+-- Retries up to 3 times on timeout (signal-cli's provisioning WebSocket has a
+-- fixed 60s idle timeout); each retry mints a fresh URI + QR so the user
+-- gets a new window. A real failure exits immediately.
 signalLinkFlow :: ChannelRuntime -> ChannelCaps -> IO ()
-signalLinkFlow rt caps = do
-  ccSend caps "Generating link... (this may take a moment)"
-  outcome <- scLink (crSignalCli rt)
-  case outcome of
-    LinkFailed err -> ccSend caps ("signal-cli link failed: " <> err)
-    LinkSucceeded uri -> do
-      ccSend caps $ T.intercalate "\n"
-        [ "Open Signal on your phone:"
-        , "  Settings \x2192 Linked Devices \x2192 Link New Device"
-        , ""
-        , "Scan this link (or paste into a QR code generator):"
-        , ""
-        , "  " <> uri
-        , ""
-        , "Waiting for you to scan... (this will complete automatically)"
-        ]
-      detectAndWriteSignalConfig rt caps
+signalLinkFlow rt caps = linkAttempt (3 :: Int)
+  where
+    linkAttempt 0 = ccSend caps "Link timed out. Run /channel signal again to retry."
+    linkAttempt triesLeft = do
+      ccSend caps "Generating link... (this may take a moment)"
+      let onUri uri = do
+            mQr <- renderQR uri
+            let qrBlock = case mQr of
+                  Just qr -> [ "Scan this QR code with Signal on your phone:"
+                             , ""
+                             , qr
+                             , ""
+                             , "Or paste this link into a QR code generator:"
+                             ]
+                  Nothing -> [ "Scan this link (or paste into a QR code generator):" ]
+            ccSend caps $ T.intercalate "\n"
+              ( [ "Open Signal on your phone:"
+                , "  Settings \x2192 Linked Devices \x2192 Link New Device"
+                , ""
+                ] <> qrBlock <> [ ""
+                , "  " <> uri
+                , ""
+                , "Waiting for you to scan... (this will complete automatically)"
+                ] )
+      outcome <- scLink (crSignalCli rt) onUri
+      case outcome of
+        LinkFailed err -> ccSend caps ("Link failed or was cancelled.\n" <> err)
+        LinkTimedOut -> do
+          ccSend caps "Link timed out after 60s. Generating a fresh link..."
+          linkAttempt (triesLeft - 1)
+        LinkSucceeded _uri -> do
+          ccSend caps "Linked successfully!"
+          detectAndWriteSignalConfig rt caps
 
 -- | Register a new phone number (primary device). Prompts for the E.164
 -- number, calls @signal-cli register@ (handling a captcha challenge if
@@ -337,6 +361,7 @@ writeSignalConfig rt caps phoneNumber = do
     , "Signal configured!"
     , "  Account: " <> phoneNumber
     , "  DM policy: open (accepts messages from anyone)"
+    , "  Default channel: signal"
     , ""
     , "To start chatting:"
     , "  1. Restart Seal (or run: seal signal)"
@@ -345,7 +370,7 @@ writeSignalConfig rt caps phoneNumber = do
     , ""
     , "To restrict access later, edit " <> T.pack cfgPath <> ":"
     , "  [signal]"
-    , "  allow_from = [\"<your-phone-or-uuid>\"]"
+    , "  allow_from = [\"<your-uuid>\"]"
     , ""
     , "Your UUID will appear in the logs on first message."
     ]
@@ -572,8 +597,8 @@ extractUsername body = do
 -- ---------------------------------------------------------------------------
 -- runLink — signal-cli link subprocess
 -- ---------------------------------------------------------------------------
-runLink :: IO LinkOutcome
-runLink =
+runLink :: (Text -> IO ()) -> IO LinkOutcome
+runLink onUri =
   withCreateProcess
     ( (proc "signal-cli" ["link", "-n", "Seal"])
         { std_out = CreatePipe, std_err = CreatePipe }
@@ -582,25 +607,35 @@ runLink =
           stdoutH = fromMaybe (error "runLink: no stdout handle") mOut
       hSetBuffering stderrH LineBuffering
       hSetBuffering stdoutH LineBuffering
-      mUri <- readUntilLink stderrH stdoutH
+      mUri <- readUntilLink stdoutH stderrH
       case mUri of
         Nothing -> do
           _ <- waitForProcess ph
           pure (LinkFailed "no sgnl:// URI found in signal-cli link output")
         Just uri -> do
+          onUri uri
           ec <- waitForProcess ph
           case ec of
             ExitSuccess -> pure (LinkSucceeded uri)
-            _ -> pure (LinkFailed ("signal-cli link exited " <> T.pack (show ec)))
+            _ -> do
+              -- Read all remaining stderr (signal-cli emits many debug log
+              -- lines before the "Connection closed!" error; a single
+              -- hGetLine would miss it). Process has exited so the handle
+              -- is at EOF — hGetContents returns immediately.
+              errRest <- BS.hGetContents stderrH
+              let errText = decodeUtf8 errRest
+              if "Connection closed" `T.isInfixOf` errText
+                then pure LinkTimedOut
+                else pure (LinkFailed (T.strip errText))
 
--- | Read lines from stderr then stdout looking for a @sgnl:\/\/@ URI. Max
+-- | Read lines from stdout then stderr looking for a @sgnl:\/\/@ URI. Max
 -- 50 lines to prevent an infinite loop on a misbehaving signal-cli.
 readUntilLink :: Handle -> Handle -> IO (Maybe Text)
-readUntilLink stderrH stdoutH = go (50 :: Int)
+readUntilLink stdoutH stderrH = go (50 :: Int)
   where
     go 0 = pure Nothing
     go n = do
-      lineResult <- try @IOException (hGetLine stderrH)
+      lineResult <- try @IOException (hGetLine stdoutH)
       case lineResult of
         Right line ->
           let t = T.pack line
@@ -608,8 +643,8 @@ readUntilLink stderrH stdoutH = go (50 :: Int)
              then pure (Just (T.strip t))
              else go (n - 1)
         Left _ -> do
-          outResult <- try @IOException (hGetLine stdoutH)
-          case outResult of
+          errResult <- try @IOException (hGetLine stderrH)
+          case errResult of
             Right line ->
               let t = T.pack line
               in if "sgnl://" `T.isInfixOf` t
@@ -638,3 +673,16 @@ readProcessNoInput cmdPath args =
 
 decodeUtf8 :: ByteString -> Text
 decodeUtf8 = decodeUtf8With lenientDecode
+
+-- | Render a @sgnl:\/\/@ URI (or any text) as an ANSI QR code by shelling out
+-- to @qrencode -t ANSIUTF8@. Returns 'Nothing' if @qrencode@ is not installed
+-- or exits non-zero, so the wizard can fall back to showing the raw URI. The
+-- QR is emitted immediately (before the 60s scan window opens) so the user
+-- has the full window to scan it.
+renderQR :: Text -> IO (Maybe Text)
+renderQR uri = do
+  (ec, out, _err) <- readProcessNoInput "qrencode" ["-t", "ANSIUTF8", "-o", "-", T.unpack uri]
+  pure $ case ec of
+    ExitSuccess
+      | not (BS.null out) -> Just (T.strip (decodeUtf8 out))
+    _ -> Nothing

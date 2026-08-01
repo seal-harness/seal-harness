@@ -36,7 +36,9 @@ import Data.Time
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , listDirectory, removeFile, renameFile )
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeBaseName)
+import System.IO
+  ( hClose, openBinaryTempFile )
 import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
@@ -90,15 +92,20 @@ newSession paths provider model channel mAgent = do
   saveSessionMeta paths meta
   pure meta
 
--- | Persist @session.json@ atomically: dir 0700, write @.tmp@, chmod 0600, rename.
+-- | Persist @session.json@ atomically: dir 0700, write a unique temp file,
+-- chmod 0600, rename. The temp file is unique per call (via 'openBinaryTempFile')
+-- so concurrent saves from multiple threads (channel loop + gateway API +
+-- /model command) don't collide on a shared @.tmp@ path ("resource busy"
+-- / "does not exist" rename race). The rename is atomic on POSIX.
 saveSessionMeta :: SealPaths -> SessionMeta -> IO ()
 saveSessionMeta paths meta = do
   let dir  = sessionDir paths (smId meta)
       path = sessionMetaPath paths (smId meta)
-      tmp  = path <> ".tmp"
   createDirectoryIfMissing True dir
   setFileMode dir 0o700
-  BL.writeFile tmp (encode meta)
+  (tmp, h) <- openBinaryTempFile dir (takeBaseName path <> ".tmp")
+  BL.hPut h (encode meta)
+  hClose h
   setFileMode tmp 0o600
   renameFile tmp path
 
