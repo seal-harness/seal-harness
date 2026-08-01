@@ -129,6 +129,7 @@ readerLoop ch = go
                 -- real text. Avoids tight-cycling the loop with empty envelopes.
               | otherwise -> do
                 let sender = seSender env
+                logIO logger DebugS ("signal: inbound message from " <> ls (userIdText sender))
                 if isAllowed sender (scAllowList ch)
                   then do
                     case mkMessageSource (seConversationId env) Signal (Just sender) mempty of

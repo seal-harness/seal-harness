@@ -23,14 +23,19 @@ module Seal.Command.Channel
   , RegisterOutcome (..)
   , VerifyOutcome (..)
   , AccountsOutcome (..)
+  , ReceiveOutcome (..)
   ) where
 
 import Control.Exception (IOException, SomeException, try)
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8With)
@@ -109,6 +114,10 @@ data SignalCli = SignalCli
     -- ^ @signal-cli -u <phone> verify <code>@.
   , scListAccounts   :: IO AccountsOutcome
     -- ^ @signal-cli listAccounts@. Used to detect the linked account.
+  , scReceiveSender  :: Text -> Int -> IO ReceiveOutcome
+    -- ^ @signal-cli -u <account> receive --max-messages 1 -t <timeout>@.
+    -- Blocks until one message arrives or the timeout elapses. Used by the
+    -- wizard to capture the sender's user id and lock down @allow_from@.
   }
 
 -- | Outcome of @signal-cli link@: the @sgnl:\/\/@ URI to show the user (or a
@@ -138,6 +147,14 @@ data AccountsOutcome
   = AccountsFailed Text
   | AccountsFound [Text]
     -- ^ The detected @+…@ phone numbers (E.164).
+
+-- | Outcome of @signal-cli receive@ (one message, with a timeout). The
+-- sender's user id is the phone number signal-cli reports in the envelope's
+-- @source@ field (used to populate @allow_from@).
+data ReceiveOutcome
+  = ReceiveFailed Text
+  | ReceiveTimedOut
+  | ReceiveSender Text
 
 -- ---------------------------------------------------------------------------
 -- TelegramBotApi — seam over the Telegram Bot API
@@ -340,8 +357,9 @@ detectAndWriteSignalConfig rt caps = do
       writeSignalConfig rt caps phoneNumber
 
 -- | Write the @[signal]@ section into @config.toml@ and confirm. Preserves
--- all other config; sets the account and a permissive default DM policy
--- (@AllowAll@), which the user can tighten later by editing @allow_from@.
+-- all other config; sets the account and a permissive initial DM policy
+-- (@AllowAll@), then immediately prompts the user to send a message and
+-- locks down @allow_from@ to the captured sender (see 'lockDownAllowFrom').
 writeSignalConfig :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
 writeSignalConfig rt caps phoneNumber = do
   let cfgPath = crConfigPath rt
@@ -360,20 +378,63 @@ writeSignalConfig rt caps phoneNumber = do
     [ ""
     , "Signal configured!"
     , "  Account: " <> phoneNumber
-    , "  DM policy: open (accepts messages from anyone)"
     , "  Default channel: signal"
     , ""
-    , "To start chatting:"
-    , "  1. Restart Seal (or run: seal signal)"
-    , "  2. Open Signal on your phone"
-    , "  3. Send a message to " <> phoneNumber
-    , ""
-    , "To restrict access later, edit " <> T.pack cfgPath <> ":"
-    , "  [signal]"
-    , "  allow_from = [\"<your-uuid>\"]"
-    , ""
-    , "Your UUID will appear in the logs on first message."
+    , "One more step to secure your setup:"
+    , "  Send any message from Signal to " <> phoneNumber
+    , "  and I'll lock down access to just that sender."
     ]
+  lockDownAllowFrom rt caps phoneNumber
+
+-- | Prompt the user to send a Signal message, capture the sender's user id
+-- via @signal-cli receive@, and rewrite the @[signal].allow_from@ to
+-- 'AllowOnly' that sender. Retries up to 3 times on timeout (120s each). On
+-- failure, leaves the config at 'AllowAll' with a warning to lock down
+-- manually. Idempotent: only writes when a sender is captured.
+lockDownAllowFrom :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
+lockDownAllowFrom rt caps account = lockAttempt (3 :: Int)
+  where
+    lockAttempt 0 = ccSend caps $ T.intercalate "\n"
+      [ ""
+      , "No message received. Your config currently accepts messages from"
+      , "anyone. To lock it down later, edit the [signal] section of your"
+      , "config and set allow_from = [\"<your-phone-or-uuid>\"]."
+      ]
+    lockAttempt triesLeft = do
+      ccSend caps "Waiting for your message... (this may take a moment)"
+      result <- scReceiveSender (crSignalCli rt) account 120
+      case result of
+        ReceiveFailed err -> ccSend caps ("Receiving failed: " <> err)
+        ReceiveTimedOut -> do
+          ccSend caps "No message received in time. Let's try again."
+          lockAttempt (triesLeft - 1)
+        ReceiveSender sender -> do
+          let cfgPath = crConfigPath rt
+          existing <- loadRuntimeConfig cfgPath
+          let baseCfg = fromRight defaultRuntimeConfig existing
+              mSig = rcSignal baseCfg
+              sigCfg = fromMaybe SignalConfig
+                         { scAccount = Just account
+                         , scTextChunkLimit = Just defaultSignalChunkLimit
+                         , scAllowFrom = AllowAll
+                         } mSig
+              updated = baseCfg
+                { rcSignal = Just sigCfg { scAllowFrom = AllowOnly (Set.singleton sender) }
+                }
+          saveRuntimeConfig cfgPath updated
+          ccSend caps $ T.intercalate "\n"
+            [ ""
+            , "Locked down! Access is now restricted to: " <> sender
+            , ""
+            , "To start chatting:"
+            , "  1. Restart Seal (or run: seal signal)"
+            , "  2. Open Signal on your phone"
+            , "  3. Send a message to " <> account
+            , ""
+            , "To allow more senders later, edit " <> T.pack cfgPath <> ":"
+            , "  [signal]"
+            , "  allow_from = [\"" <> sender <> "\", \"<other-sender>\"]"
+            ]
 
 -- ---------------------------------------------------------------------------
 -- Telegram wizard
@@ -506,6 +567,21 @@ mkRealSignalCli = pure SignalCli
                          (map T.strip (T.lines (decodeUtf8 out)))
           in AccountsFound phones
         _ -> AccountsFailed "signal-cli listAccounts failed"
+  , scReceiveSender = \account timeoutSecs -> do
+      (ec, out, err) <- readProcessNoInput "signal-cli"
+        [ "--output=json"
+        , "-u", T.unpack account
+        , "receive"
+        , "--max-messages", "1"
+        , "-t", show timeoutSecs
+        ]
+      pure $ case ec of
+        ExitSuccess
+          | T.null (T.strip (decodeUtf8 out)) -> ReceiveTimedOut
+          | otherwise -> case parseReceiveSender (decodeUtf8 out) of
+              Just src -> ReceiveSender src
+              Nothing  -> ReceiveFailed "could not parse sender from signal-cli receive output"
+        _ -> ReceiveFailed (T.strip (decodeUtf8 err))
   }
 
 -- ---------------------------------------------------------------------------
@@ -688,3 +764,26 @@ renderQR uri = do
     Right (ExitSuccess, out, _)
       | not (BS.null out) -> Just (T.strip (decodeUtf8 out))
     Right _ -> Nothing
+
+-- | Extract the @source@ (sender phone number) from one
+-- @signal-cli receive --output=json@ envelope. The output is a JSON array of
+-- envelope objects (or a single object); each has @envelope.source@. Returns
+-- the first sender found, or 'Nothing' if the shape doesn't match.
+parseReceiveSender :: Text -> Maybe Text
+parseReceiveSender body =
+  case A.decode (BL.fromStrict (TE.encodeUtf8 body)) of
+    Just (vals :: [A.Value]) -> firstSource vals
+    Nothing                  ->
+      case A.decode (BL.fromStrict (TE.encodeUtf8 body)) of
+        Just (val :: A.Value) -> sourceOf val
+        Nothing              -> Nothing
+  where
+    sourceOf v = do
+      o <- asObject v
+      env <- KeyMap.lookup (Key.fromString "envelope") o
+      envO <- asObject env
+      A.String src <- KeyMap.lookup (Key.fromString "source") envO
+      Just src
+    firstSource = foldr (\v acc -> sourceOf v <|> acc) Nothing
+    asObject (A.Object o) = Just o
+    asObject _            = Nothing

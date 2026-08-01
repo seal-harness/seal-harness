@@ -4,6 +4,7 @@ module Seal.Command.ChannelSpec (spec) where
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, modifyIORef', writeIORef)
 import Data.Maybe (isJust)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
@@ -14,7 +15,7 @@ import Test.Hspec
 
 import Seal.Command.Channel
   ( AccountsOutcome (..), ChannelRuntime (..), GetMeOutcome (..)
-  , LinkOutcome (..), RegisterOutcome (..), SignalCli (..)
+  , LinkOutcome (..), RegisterOutcome (..), ReceiveOutcome (..), SignalCli (..)
   , TelegramBotApi (..), VaultStore (..), VerifyOutcome (..)
   , channelCommandSpec )
 import Seal.Command.Spec
@@ -40,13 +41,15 @@ mkMockCli
   -> [(Text, Maybe Text, RegisterOutcome)]
   -> [(Text, Text, VerifyOutcome)]
   -> AccountsOutcome
+  -> [ReceiveOutcome]
   -> IO SignalCli
-mkMockCli check link register verify accounts = do
+mkMockCli check link register verify accounts receive = do
   rCheck    <- newIORef check
   rLink     <- newIORef link
   rRegister <- newIORef register
   rVerify   <- newIORef verify
   rAccounts <- newIORef accounts
+  rReceive  <- newIORef receive
   pure SignalCli
     { scCheckInstalled = readIORef rCheck
     , scLink           = \onUri -> do
@@ -72,6 +75,11 @@ mkMockCli check link register verify accounts = do
             (p, c) `shouldBe` (phone, code)
             pure o
     , scListAccounts = readIORef rAccounts
+    , scReceiveSender = \_account _timeout -> do
+        qs <- readIORef rReceive
+        case qs of
+          []         -> pure (ReceiveFailed "no scripted receive outcome")
+          (o:rest)   -> writeIORef rReceive rest >> pure o
     }
 
 -- ---------------------------------------------------------------------------
@@ -174,7 +182,7 @@ spec = describe "Seal.Command.Channel" $ do
 
   describe "command spec metadata" $ do
     cli <- runIO (mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x"))
+                        (AccountsFailed "x") [])
     let rt = ChannelRuntime { crConfigPath = "/tmp/x.toml", crSignalCli = cli
                             , crTelegramBotApi = dummyTgApi
                             , crVaultStore = noVaultStore' }
@@ -189,7 +197,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Left "not found") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] [] cfgPath
         sentBlock sent `shouldSatisfy` ("signal-cli is not installed" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("github.com/AsamK/signal-cli" `T.isInfixOf`)
@@ -204,16 +212,18 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+15551234567"])
+          [ReceiveSender "+15550000000"]
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
         sentBlock sent `shouldSatisfy` ("sgnl://link?enc=xyz" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Linked successfully!" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Detected account: +15551234567" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Locked down!" `T.isInfixOf`)
         mSig <- signalSection cfgPath
         mSig `shouldSatisfy` isJust
         let sig = unsafeSig mSig
         scAccount sig `shouldBe` Just "+15551234567"
         scTextChunkLimit sig `shouldBe` Just defaultSignalChunkLimit
-        scAllowFrom sig `shouldBe` AllowAll
+        scAllowFrom sig `shouldBe` AllowOnly (Set.fromList ["+15550000000"])
 
   describe "/channel signal — link flow with undetectable account" $
     it "prompts for the phone number when listAccounts finds nothing" $
@@ -225,6 +235,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound [])
+          [ReceiveSender "+15550000000"]
         _sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1", "+18005551234"] cfgPath
         mSig <- signalSection cfgPath
         mSig `shouldSatisfy` isJust
@@ -240,7 +251,7 @@ spec = describe "Seal.Command.Channel" $ do
         -- then the process exits with a timeout error after the user
         -- doesn't scan in time. The wizard must show the URI first.
         cliBase <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                     (AccountsFailed "x")
+                     (AccountsFailed "x") []
         let cli = cliBase { scLink = \onUri -> onUri testUri >> pure (LinkFailed "Connection closed!") }
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
         sentBlock sent `shouldSatisfy` (testUri `T.isInfixOf`)
@@ -254,7 +265,7 @@ spec = describe "Seal.Command.Channel" $ do
         -- needing more than 60s on the first QR but succeeding on the second.
         callCount <- newIORef (0 :: Int)
         cliBase <- mkMockCli (Right "0.13.0") (LinkSucceeded "sgnl://retry-ok") [] []
-                     (AccountsFound ["+15559990000"])
+                     (AccountsFound ["+15559990000"]) [ReceiveSender "+15550000000"]
         let cli = cliBase { scLink = \onUri -> do
                 n <- readIORef callCount
                 writeIORef callCount (n + 1)
@@ -278,6 +289,7 @@ spec = describe "Seal.Command.Channel" $ do
           [("+15557654321", Nothing, RegisterOk)]
           [("+15557654321", "123456", VerifyOk)]
           (AccountsFound ["+15557654321"])
+          [ReceiveSender "+15550000000"]
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["2", "+15557654321", "123456"] cfgPath
         sentBlock sent `shouldSatisfy` ("Sending verification SMS to +15557654321" `T.isInfixOf`)
         sentBlock sent `shouldSatisfy` ("Phone number verified!" `T.isInfixOf`)
@@ -298,6 +310,7 @@ spec = describe "Seal.Command.Channel" $ do
           ]
           [ ("+15551112222", "999000", VerifyOk) ]
           (AccountsFound ["+15551112222"])
+          [ReceiveSender "+15550000000"]
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"]
                    ["2", "+15551112222", "signalcaptcha://tok123", "999000"] cfgPath
         sentBlock sent `shouldSatisfy` ("requires a captcha" `T.isInfixOf`)
@@ -307,12 +320,50 @@ spec = describe "Seal.Command.Channel" $ do
         let sig = unsafeSig mSig
         scAccount sig `shouldBe` Just "+15551112222"
 
+  describe "/channel signal — lock-down retries on receive timeout" $
+    it "captures the sender on the second receive attempt and locks allow_from" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli
+          (Right "0.13.0")
+          (LinkSucceeded "sgnl://lock")
+          []
+          []
+          (AccountsFound ["+15557778888"])
+          [ReceiveTimedOut, ReceiveSender "+15550000000"]
+        sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
+        sentBlock sent `shouldSatisfy` ("No message received in time" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("Locked down!" `T.isInfixOf`)
+        sentBlock sent `shouldSatisfy` ("+15550000000" `T.isInfixOf`)
+        mSig <- signalSection cfgPath
+        mSig `shouldSatisfy` isJust
+        let sig = unsafeSig mSig
+        scAllowFrom sig `shouldBe` AllowOnly (Set.fromList ["+15550000000"])
+
+  describe "/channel signal — lock-down fails after 3 timeouts leaves AllowAll" $
+    it "leaves allow_from at AllowAll when no message arrives after 3 tries" $
+      withSystemTempDirectory "seal-channel" $ \tmp -> do
+        let cfgPath = tmp <> "/config/config.toml"
+        cli <- mkMockCli
+          (Right "0.13.0")
+          (LinkSucceeded "sgnl://lock")
+          []
+          []
+          (AccountsFound ["+15557778888"])
+          [ReceiveTimedOut, ReceiveTimedOut, ReceiveTimedOut]
+        sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
+        sentBlock sent `shouldSatisfy` ("accepts messages from" `T.isInfixOf`)
+        mSig <- signalSection cfgPath
+        mSig `shouldSatisfy` isJust
+        let sig = unsafeSig mSig
+        scAllowFrom sig `shouldBe` AllowAll
+
   describe "/channel signal — invalid choice" $
     it "reports the invalid choice and cancels" $
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["9"] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid choice" `T.isInfixOf`)
 
@@ -321,7 +372,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["2", "5551234"] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid phone number" `T.isInfixOf`)
 
@@ -335,6 +386,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+14045551234"])
+          [ReceiveSender "+15550000000"]
         sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] [""] cfgPath
         sentBlock sent `shouldSatisfy` ("sgnl://link?enc=dflt" `T.isInfixOf`)
         mSig <- signalSection cfgPath
@@ -356,6 +408,7 @@ spec = describe "Seal.Command.Channel" $ do
           []
           []
           (AccountsFound ["+15550000000"])
+          [ReceiveSender "+15550000000"]
         _sent <- runChannel cli dummyTgApi noVaultStore' ["signal"] ["1"] cfgPath
         -- security.toml must be unchanged by the signal config write.
         eSec <- loadSecurityConfig secPath
@@ -377,7 +430,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "MySealBot")
         (vault, getStored) <- mkMockVaultStore
         sent <- runChannel cli tgApi vault ["telegram"] ["123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"] cfgPath
@@ -400,7 +453,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeFailed "Unauthorized")
         sent <- runChannel cli tgApi noVaultStore' ["telegram"] ["123456:BAD"] cfgPath
         sentBlock sent `shouldSatisfy` ("Token validation failed: Unauthorized" `T.isInfixOf`)
@@ -412,7 +465,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "never")
         sent <- runChannel cli tgApi noVaultStore' ["telegram"] [""] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid token" `T.isInfixOf`)
@@ -424,7 +477,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "never")
         sent <- runChannel cli tgApi noVaultStore' ["telegram"] ["--version"] cfgPath
         sentBlock sent `shouldSatisfy` ("Invalid token" `T.isInfixOf`)
@@ -434,7 +487,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "SealBot")
         sent <- runChannel cli tgApi noVaultStore' ["telegram"] ["123456:ABC-DEF"] cfgPath
         sentBlock sent `shouldSatisfy` ("Vault is not set up" `T.isInfixOf`)
@@ -449,7 +502,7 @@ spec = describe "Seal.Command.Channel" $ do
         System.Directory.createDirectoryIfMissing True (System.FilePath.takeDirectory cfgPath)
         saveSecurityConfig secPath (defaultSecurityConfig { scVaultRecipient = Just "age1yyy" })
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         tgApi <- mkMockTgApi (GetMeOk "SealBot")
         (vault, _) <- mkMockVaultStore
         _sent <- runChannel cli tgApi vault ["telegram"] ["123456:ABC-DEF"] cfgPath
@@ -471,7 +524,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
                                 , crTelegramBotApi = dummyTgApi
                                 , crVaultStore = noVaultStore' }
@@ -486,7 +539,7 @@ spec = describe "Seal.Command.Channel" $ do
       withSystemTempDirectory "seal-channel" $ \tmp -> do
         let cfgPath = tmp <> "/config/config.toml"
         cli <- mkMockCli (Right "0.13.0") (LinkFailed "x") [] []
-                        (AccountsFailed "x")
+                        (AccountsFailed "x") []
         let rt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli
                                 , crTelegramBotApi = dummyTgApi
                                 , crVaultStore = noVaultStore' }
