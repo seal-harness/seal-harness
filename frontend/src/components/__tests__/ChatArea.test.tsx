@@ -542,6 +542,62 @@ describe('transcriptToMessages', () => {
     expect(msgs.length).toBe(1)
     expect(msgs[0]!.agentName).toBe('Skill · telegram')
   })
+
+  it('renders a SETUP_REPO harness result entry (failed clone) as a tool-call box marked as error', () => {
+    // A failed clone (e.g. git@ SSH auth failure) is recorded by the
+    // backend's recordSetupRepoResult. transcriptToMessages should
+    // synthesize a ToolCallBlock so the failure is visible in the chat
+    // (not silent), with resultIsError=true so it renders as an error.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-fail',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'git@github.com:foo/bar.git' },
+          result: { status: 'failed', target: '' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('SETUP_REPO')
+    expect(tcBlock!.toolCall!.input).toEqual({ url: 'git@github.com:foo/bar.git' })
+    expect(tcBlock!.toolCall!.result).toBe('Clone failed')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(true)
+    expect(msgs[0]!.agentName).toBe('Repo')
+  })
+
+  it('renders a SETUP_REPO harness result entry (successful clone) as a tool-call box', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-ok',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git' },
+          result: { status: 'cloned', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('SETUP_REPO')
+    expect(tcBlock!.toolCall!.result).toBe('Cloned into bar')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    expect(msgs[0]!.agentName).toBe('Repo · web')
+  })
 })
 
 // ── ChatArea rendering ──────────────────────────────────────────────────────

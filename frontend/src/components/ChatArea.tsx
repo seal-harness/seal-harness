@@ -1417,14 +1417,13 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     if (e.direction === 'request') {
       const parsed = tryParsePayload(e.payload)
       if (parsed) {
-        // SKILL_LOAD result entries (EKHarness with op.name="SKILL_LOAD"
-        // and a "result" key in the payload, recorded by the backend's
-        // recordSkillLoadResult after the opcode runs). Render as a
-        // collapsible ToolCallBlock — collapsed by default showing
-        // "SKILL_LOAD" + the skill id; expanded shows the skill body.
-        // This is the /skill load user-command surface: the slash bubble
-        // shows only the echo line ($ /skill load <id>); the skill body
-        // lives in this transcript entry so it persists across reloads.
+        // Opcode result entries (EKHarness with an "op.name" and a
+        // "result" key in the payload, recorded by the backend after the
+        // opcode runs). Render as a collapsible ToolCallBlock — collapsed
+        // by default showing the opcode name + a one-line summary;
+        // expanded shows the full input/result. SKILL_LOAD carries the
+        // skill body in result.body; SETUP_REPO carries status/target
+        // (and, on failure, the error text is in the conversation message).
         const opName = (parsed.op as { name?: string } | undefined)?.name
         if (opName === 'SKILL_LOAD' && parsed.result) {
           const input = parsed.input as { id?: string } | undefined
@@ -1450,6 +1449,40 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
             agentStatus: 'completed',
             timestamp: ts,
             blocks: [{ id: 'tc-skillload-' + e.id, toolCall: tc }],
+            rawJson,
+          })
+          continue
+        }
+        if (opName === 'SETUP_REPO' && parsed.result) {
+          // SETUP_REPO result entry — render as a tool-call box so the
+          // clone/no-op/conflict/failure is visible in the chat (not just
+          // the raw transcript). The result carries {status, target}; on
+          // failure the error text is in the conversation message, so the
+          // box shows the status + target as a one-line summary.
+          const input = parsed.input as { url?: string } | undefined
+          const result = parsed.result as { status?: string; target?: string } | undefined
+          const status = result?.status ?? ''
+          const target = result?.target ?? ''
+          const summary = status === 'cloned' ? `Cloned into ${target}`
+                        : status === 'noop' ? `Repo already exists — ${target}`
+                        : status === 'conflict' ? `Conflict at ${target}`
+                        : status === 'failed' ? 'Clone failed'
+                        : status
+          const channel = e.channel
+          const tc: ToolCallInfo = {
+            id: 'setuprepo-' + e.id,
+            name: 'SETUP_REPO',
+            input: input ?? {},
+            result: summary,
+            resultIsError: status === 'failed' || status === 'conflict',
+          }
+          messages.push({
+            id: e.id + '-setuprepo',
+            entryId: e.id,
+            agentName: channel ? `Repo · ${channel}` : 'Repo',
+            agentStatus: status === 'failed' ? 'idle' : 'completed',
+            timestamp: ts,
+            blocks: [{ id: 'tc-setuprepo-' + e.id, toolCall: tc }],
             rawJson,
           })
           continue
