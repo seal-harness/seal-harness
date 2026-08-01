@@ -23,6 +23,7 @@ mkSkill sid desc body =
       { skId = i
       , skDescription = desc
       , skBody = body
+      , skGroup = Nothing
       , skCreatedAt = sampleTime
       , skUpdatedAt = sampleTime
       , skSession = mkSystemSessionId "test"

@@ -18,6 +18,7 @@ module Seal.Config.File
   , WebConfig (..)
   , WorkdirConfig (..)
   , SkillsConfig (..)
+  , AgentConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
@@ -33,6 +34,10 @@ module Seal.Config.File
   , onDemandSchemas
   , defaultAutoloadSkill
   , resolvedAutoloadSkill
+  , resolvedAvailableSkills
+  , resolvedParallelToolGuidance
+  , resolvedToolUseEnforcement
+  , resolvedTaskCompletionGuidance
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
@@ -123,6 +128,10 @@ data RuntimeConfig = RuntimeConfig
     -- start). Absent means the built-in default applies: the
     -- @seal-usage@ skill is auto-injected into the system prompt. Set
     -- @[skills] autoload = ""@ to disable auto-injection explicitly.
+  , rcAgent :: Maybe AgentConfig
+    -- ^ Optional @[agent]@ section (static behavioral guidance blocks
+    -- injected into the system prompt). Absent means all three blocks
+    -- are injected (the defaults); individual flags disable each block.
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
@@ -222,6 +231,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcWeb             = Nothing
   , rcWorkdir          = Nothing
   , rcSkills           = Nothing
+  , rcAgent            = Nothing
   , rcMaxTurns         = Nothing
   }
 
@@ -246,15 +256,40 @@ newtype WorkdirConfig = WorkdirConfig
     -- (persist for inspection).
   } deriving stock (Eq, Show)
 
--- | The @[skills]@ section: skill auto-injection at session start. Every
--- field is optional; a missing key decodes as 'Nothing' and the resolved
--- default applies at the call site.
-newtype SkillsConfig = SkillsConfig
+-- | The @[skills]@ section: skill auto-injection + catalog at session start.
+-- Every field is optional; a missing key decodes as 'Nothing' and the
+-- resolved default applies at the call site.
+data SkillsConfig = SkillsConfig
   { scAutoload :: Maybe Text
     -- ^ The skill id to auto-inject into the system prompt at session
     -- start. Absent (the default) means @\"seal-usage\"@ is injected. An
     -- empty string (@\"\"@) explicitly disables auto-injection. Any other
     -- value overrides the injected skill id.
+  , scAvailableSkills :: Maybe Bool
+    -- ^ Whether to inject the @\<available_skills\>@ catalog (a grouped
+    -- listing of all skill ids + descriptions) into the system prompt so
+    -- the model discovers and uses skills. Absent (the default) means
+    -- @true@ (the catalog is injected when at least one skill exists).
+    -- Set @available_skills = false@ to disable.
+  } deriving stock (Eq, Show)
+
+-- | The @[agent]@ section: static behavioral guidance blocks injected
+-- into the system prompt. Every field is optional; a missing key decodes
+-- as 'Nothing' and the resolved default (the block is injected) applies.
+-- Each block is a few sentences of operational guidance; setting a flag
+-- to @false@ disables that block.
+data AgentConfig = AgentConfig
+  { acParallelToolGuidance :: Maybe Bool
+    -- ^ Whether to inject the parallel tool-call guidance ("batch
+    -- independent tool calls into one turn"). Absent (the default) →
+    -- @true@ (injected).
+  , acToolUseEnforcement :: Maybe Bool
+    -- ^ Whether to inject the tool-use enforcement guidance ("call the
+    -- tool; don't describe calling it"). Absent → @true@.
+  , acTaskCompletionGuidance :: Maybe Bool
+    -- ^ Whether to inject the task-completion / anti-fabrication guidance
+    -- ("don't stop after a stub; don't fabricate output when blocked").
+    -- Absent → @true@.
   } deriving stock (Eq, Show)
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -322,6 +357,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table webConfigCodec "web") .= rcWeb
   <*> Toml.dioptional (Toml.table workdirConfigCodec "workdir") .= rcWorkdir
   <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
+  <*> Toml.dioptional (Toml.table agentConfigCodec "agent")     .= rcAgent
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
@@ -378,6 +414,14 @@ workdirConfigCodec = WorkdirConfig
 skillsConfigCodec :: Toml.TomlCodec SkillsConfig
 skillsConfigCodec = SkillsConfig
   <$> Toml.dioptional (Toml.text "autoload") .= scAutoload
+  <*> Toml.dioptional (Toml.bool "available_skills") .= scAvailableSkills
+
+-- | Bidirectional tomland codec for the @[agent]@ section.
+agentConfigCodec :: Toml.TomlCodec AgentConfig
+agentConfigCodec = AgentConfig
+  <$> Toml.dioptional (Toml.bool "parallel_tool_guidance") .= acParallelToolGuidance
+  <*> Toml.dioptional (Toml.bool "tool_use_enforcement") .= acToolUseEnforcement
+  <*> Toml.dioptional (Toml.bool "task_completion_guidance") .= acTaskCompletionGuidance
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization
@@ -508,6 +552,35 @@ resolvedAutoloadSkill cfg =
   case rcSkills cfg >>= scAutoload of
     Nothing -> Just defaultAutoloadSkill
     Just t  -> if T.null t then Nothing else Just t
+
+-- | Resolve whether the @\<available_skills\>@ catalog is injected into
+-- the system prompt. Absent @[skills]@ section or @available_skills@ key
+-- resolves to @True@ (the catalog is injected when at least one skill
+-- exists); an explicit @false@ disables.
+resolvedAvailableSkills :: RuntimeConfig -> Bool
+resolvedAvailableSkills cfg =
+  fromMaybe True (rcSkills cfg >>= scAvailableSkills)
+
+-- | Resolve whether the parallel tool-call guidance block is injected.
+-- Absent @[agent]@ section or @parallel_tool_guidance@ key → @True@
+-- (injected); an explicit @false@ disables.
+resolvedParallelToolGuidance :: RuntimeConfig -> Bool
+resolvedParallelToolGuidance cfg =
+  fromMaybe True (rcAgent cfg >>= acParallelToolGuidance)
+
+-- | Resolve whether the tool-use enforcement guidance block is injected.
+-- Absent @[agent]@ section or @tool_use_enforcement@ key → @True@
+-- (injected); an explicit @false@ disables.
+resolvedToolUseEnforcement :: RuntimeConfig -> Bool
+resolvedToolUseEnforcement cfg =
+  fromMaybe True (rcAgent cfg >>= acToolUseEnforcement)
+
+-- | Resolve whether the task-completion / anti-fabrication guidance block
+-- is injected. Absent @[agent]@ section or @task_completion_guidance@ key
+-- → @True@ (injected); an explicit @false@ disables.
+resolvedTaskCompletionGuidance :: RuntimeConfig -> Bool
+resolvedTaskCompletionGuidance cfg =
+  fromMaybe True (rcAgent cfg >>= acTaskCompletionGuidance)
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).

@@ -6,7 +6,7 @@ import {
   type NewTabKind,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
-import { adoptWindow, createTab, type NewTabResponse } from '../hooks/useApi'
+import { adoptWindow, createTab, setupRepo, type NewTabResponse } from '../hooks/useApi'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -44,6 +44,7 @@ interface NewTabComposerProps {
 export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
+  const [repoWarning, setRepoWarning] = useState<string | null>(null)
 
   // Lock the kind to provider whenever a branchFrom is supplied. The hook's
   // own state is the source of truth; we just force-set it here whenever the
@@ -56,6 +57,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
 
   const handleSubmit = async () => {
     if (spec.validationError) return
+    setRepoWarning(null)
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
       if (res.ok) {
@@ -68,6 +70,20 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
     if (branchFrom) body.branch_from = branchFrom
     const res = await createTab(body)
     if (res) {
+      // If the user entered a repo URL and the new tab has a session id
+      // (provider kind), dispatch SETUP_REPO into the session's
+      // transcript (audited — visible in the chat, not a silent side
+      // channel). A clone failure does NOT block the tab; the error is
+      // recorded in the transcript. The repo is recorded to history via
+      // persistOnSubmit regardless of clone success.
+      const repoUrl = spec.repo.trim()
+      if (repoUrl && res.session_id) {
+        const result = await setupRepo(res.session_id, repoUrl)
+        if (!result || !result.ok) {
+          const reason = result?.error ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
+        }
+      }
       spec.persistOnSubmit()
       onSubmit(res)
     }
@@ -170,6 +186,17 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
             </Row>
           )}
 
+          <Row label="Set up repo" htmlFor="provider-repo">
+            <CustomModelCombobox
+              id="provider-repo"
+              value={spec.repo}
+              onChange={spec.setRepo}
+              options={spec.repoHistory}
+              placeholder="git URL (optional — cloned into the session before turn one)"
+              testId="provider-repo-list"
+            />
+          </Row>
+
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">
               <input
@@ -229,6 +256,15 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
           style={{ fontSize: 12, color: 'var(--needs-input)' }}
         >
           {spec.validationError}
+        </div>
+      )}
+
+      {repoWarning && (
+        <div
+          data-testid="composer-repo-warning"
+          style={{ fontSize: 12, color: 'var(--needs-input)' }}
+        >
+          {repoWarning}
         </div>
       )}
 
@@ -434,13 +470,14 @@ function Row({
    .composer-datalist class so it gets the same chevron and 10px left text
    inset as the other composer controls. */
 function CustomModelCombobox({
-  id, value, onChange, options, placeholder,
+  id, value, onChange, options, placeholder, testId,
 }: {
   id: string
   value: string
   onChange: (v: string) => void
   options: string[]
   placeholder?: string
+  testId?: string
 }) {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(-1)
@@ -516,7 +553,7 @@ function CustomModelCombobox({
         <div
           className="composer-combobox-popup"
           role="listbox"
-          data-testid="provider-model-custom-list"
+          data-testid={testId ?? 'provider-model-custom-list'}
           style={{
             position: 'fixed',
             left: rect.left,

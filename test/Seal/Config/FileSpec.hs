@@ -13,11 +13,14 @@ import Test.Hspec
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), RetrievalConfig (..), WorkdirConfig (..)
   , SkillsConfig (..)
+  , AgentConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalMaxScanBytes, loadRuntimeConfig, onDemandSchemas, providerBaseUrl
   , providerDefaultModel, retrievalMaxScanBytes, saveRuntimeConfig
   , updateRuntimeConfig, upsertProvider
-  , defaultAutoloadSkill, resolvedAutoloadSkill, maxTurnsConfig )
+  , defaultAutoloadSkill, resolvedAutoloadSkill, resolvedAvailableSkills
+  , resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  , maxTurnsConfig )
 
 spec :: Spec
 spec = describe "Seal.Config.File" $ do
@@ -39,6 +42,7 @@ spec = describe "Seal.Config.File" $ do
         , rcWeb             = Nothing
         , rcWorkdir          = Nothing
         , rcSkills           = Nothing
+        , rcAgent            = Nothing
         , rcMaxTurns         = Nothing
         }
 
@@ -91,6 +95,7 @@ spec = describe "Seal.Config.File" $ do
               , rcWeb             = Nothing
               , rcWorkdir         = Nothing
               , rcSkills          = Nothing
+              , rcAgent           = Nothing
               , rcMaxTurns        = Nothing
               }
         saveRuntimeConfig path cfg
@@ -115,6 +120,7 @@ spec = describe "Seal.Config.File" $ do
         let cfg = defaultRuntimeConfig
               { rcSkills = Just SkillsConfig
                   { scAutoload = Just "custom-skill"
+                  , scAvailableSkills = Nothing
                   }
               }
         saveRuntimeConfig path cfg
@@ -127,6 +133,7 @@ spec = describe "Seal.Config.File" $ do
         let cfg = defaultRuntimeConfig
               { rcSkills = Just SkillsConfig
                   { scAutoload = Just ""
+                  , scAvailableSkills = Nothing
                   }
               }
         saveRuntimeConfig path cfg
@@ -159,16 +166,57 @@ spec = describe "Seal.Config.File" $ do
         resolvedAutoloadSkill defaultRuntimeConfig `shouldBe` Just defaultAutoloadSkill
 
       it "defaults to seal-usage when autoload key is absent" $
-        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing } })
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing, scAvailableSkills = Nothing } })
           `shouldBe` Just defaultAutoloadSkill
 
       it "returns the custom id when autoload is set" $
-        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "custom" } })
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "custom", scAvailableSkills = Nothing } })
           `shouldBe` Just "custom"
 
       it "returns Nothing when autoload is explicitly empty (disabled)" $
-        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "" } })
+        resolvedAutoloadSkill (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Just "", scAvailableSkills = Nothing } })
           `shouldBe` (Nothing :: Maybe T.Text)
+
+    describe "resolvedAvailableSkills" $ do
+      it "defaults to True when [skills] is absent" $
+        resolvedAvailableSkills defaultRuntimeConfig `shouldBe` True
+
+      it "defaults to True when available_skills key is absent" $
+        resolvedAvailableSkills (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing, scAvailableSkills = Nothing } })
+          `shouldBe` True
+
+      it "returns False when available_skills = False" $
+        resolvedAvailableSkills (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing, scAvailableSkills = Just False } })
+          `shouldBe` False
+
+      it "returns True when available_skills = True" $
+        resolvedAvailableSkills (defaultRuntimeConfig { rcSkills = Just SkillsConfig { scAutoload = Nothing, scAvailableSkills = Just True } })
+          `shouldBe` True
+
+    describe "resolvedParallelToolGuidance / resolvedToolUseEnforcement / resolvedTaskCompletionGuidance" $ do
+      let allNothing = AgentConfig { acParallelToolGuidance = Nothing
+                                    , acToolUseEnforcement = Nothing
+                                    , acTaskCompletionGuidance = Nothing
+                                    }
+
+      it "default to True when [agent] is absent" $ do
+        resolvedParallelToolGuidance defaultRuntimeConfig `shouldBe` True
+        resolvedToolUseEnforcement defaultRuntimeConfig `shouldBe` True
+        resolvedTaskCompletionGuidance defaultRuntimeConfig `shouldBe` True
+
+      it "default to True when the keys are absent" $ do
+        let cfg = defaultRuntimeConfig { rcAgent = Just allNothing }
+        resolvedParallelToolGuidance cfg `shouldBe` True
+        resolvedToolUseEnforcement cfg `shouldBe` True
+        resolvedTaskCompletionGuidance cfg `shouldBe` True
+
+      it "return False when a flag is explicitly False" $ do
+        let cfg = defaultRuntimeConfig { rcAgent = Just allNothing { acParallelToolGuidance = Just False } }
+        resolvedParallelToolGuidance cfg `shouldBe` False
+        let cfg2 = defaultRuntimeConfig { rcAgent = Just allNothing { acToolUseEnforcement = Just False } }
+        resolvedToolUseEnforcement cfg2 `shouldBe` False
+        let cfg3 = defaultRuntimeConfig { rcAgent = Just allNothing { acTaskCompletionGuidance = Just False } }
+        resolvedTaskCompletionGuidance cfg3 `shouldBe` False
 
     it "round-trips defaultRuntimeConfig (all Nothing)" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do

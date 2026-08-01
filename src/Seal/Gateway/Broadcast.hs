@@ -26,6 +26,7 @@ import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -96,15 +97,11 @@ broadcastReplyDelivered mBroker sid =
 -- (tests) is a no-op.
 broadcastAgentDefsChanged :: Maybe StreamBroker -> IO ()
 broadcastAgentDefsChanged mBroker =
-  case mBroker of
-    Nothing -> pure ()
-    Just broker -> SB.broadcastAgentDefsChanged broker
+  for_ mBroker SB.broadcastAgentDefsChanged
 
 -- | Push a @skills-changed@ signal to every WS subscriber. The frontend
 -- re-fetches GET /api/skills on receipt. 'Nothing' broker (tests) is a
 -- no-op.
 broadcastSkillsChanged :: Maybe StreamBroker -> IO ()
 broadcastSkillsChanged mBroker =
-  case mBroker of
-    Nothing -> pure ()
-    Just broker -> SB.broadcastSkillsChanged broker
+  for_ mBroker SB.broadcastSkillsChanged

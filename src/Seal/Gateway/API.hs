@@ -44,7 +44,8 @@ import Seal.Config.Paths (sessionMetaPath)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
-  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend, sendOutcomeJson )
+  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
+  , handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
@@ -71,7 +72,7 @@ import Seal.Tabs (TabsHandle, insertTabH, removeTabH, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), tlTabs, lookupTab)
 import Seal.Web.UiState
   ( LastOptions (..), UiState (..), UiStateHandle
-  , addCustomModel, getUiState, setLastOptions )
+  , addCustomModel, addRepoHistory, getUiState, setLastOptions )
 import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies the API needs (injected so the test can supply fakes).
@@ -148,6 +149,22 @@ apiApp deps req respond =
               outcome <- handleSend sendDeps sId msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
+    -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
+    -- workdir before the first turn (the web "set up repo" combo box calls
+    -- this). Shares the clone logic with the SETUP_REPO opcode via
+    -- 'cloneRepoIO'. Returns 200 {ok:true, target, status} on
+    -- cloned/noop, 409 on a conflict, 400 on an invalid url, 503 on a
+    -- clone failure. When 'adSend' is Nothing (tests without the full
+    -- runtime), returns a stub 200.
+    (m', ["api", "sessions", sid, "setup-repo"]) | m' == methodPost -> do
+      body <- collectBody req
+      case parseRepoUrl body of
+        Nothing -> respond (errJson status400 "missing or invalid 'url' field")
+        Just url -> case adSend deps of
+          Nothing -> respond (jsonOk (object ["ok" .= True, "target" .= ("" :: Text), "status" .= ("stubbed" :: Text)]))
+          Just sendDeps -> case mkSessionId sid of
+            Left e -> respond (errJson status400 ("invalid session id: " <> e))
+            Right sId -> respond =<< handleSetupRepoApi sendDeps sId url
     -- T11 STUB: PUT /api/sessions/:id/description — 204 (no persistence yet;
     -- 'SessionMeta' has no description field).
     (m', ["api", "sessions", _sid, "description"]) | m' == methodPut -> do
@@ -350,6 +367,14 @@ apiApp deps req respond =
       case A.decode body :: Maybe A.Value of
         Just v  -> respond =<< handleUiCustomModelAdd deps v
         Nothing -> respond (errJson status400 "invalid JSON body")
+    -- POST /api/ui/repos -> add a repo URL to the persisted history. Body:
+    -- { "url": "<url>" }. Idempotent + deduped + capped. The "set up repo"
+    -- combo box records a URL here on submit so the history populates.
+    (m', ["api", "ui", "repos"]) | m' == methodPost -> do
+      body <- collectBody req
+      case A.decode body :: Maybe A.Value of
+        Just v  -> respond =<< handleUiRepoAdd deps v
+        Nothing -> respond (errJson status400 "invalid JSON body")
     (m', ["api", "tabs", "new"]) | m' == methodPost -> do
       body <- collectBody req
       case A.decode body :: Maybe A.Value of
@@ -420,6 +445,31 @@ parseSendMessage body =
       Just (A.String t) -> t
       _                 -> ""
     _ -> ""
+
+-- | Parse the @url@ field from a POST /setup-repo body. Returns 'Nothing'
+-- on a missing/invalid body or a non-string @url@.
+parseRepoUrl :: BL.ByteString -> Maybe Text
+parseRepoUrl body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "url") o of
+      Just (A.String t) | not (T.null (T.strip t)) -> Just t
+      _ -> Nothing
+    _ -> Nothing
+
+-- | Handle @POST /api/sessions/:id/setup-repo@: build the response from the
+-- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
+-- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
+-- url, 500 on a capability/workdir failure.
+handleSetupRepoApi :: SendDeps -> SessionId -> Text -> IO Response
+handleSetupRepoApi sendDeps sId url = do
+  eRes <- handleSetupRepo sendDeps sId url
+  case eRes of
+    Left err -> pure (errJson status400 err)
+    Right msg ->
+      -- The opcode dispatched + recorded into the transcript. Return
+      -- ok:true with the opcode's message text so the frontend can show
+      -- it (and the user sees the result in the chat transcript too).
+      pure (jsonOk (object [ "ok" .= True, "message" .= msg ]))
 
 -- | Map an integer HTTP status code to a 'Status'. The send outcome carries
 -- an Int (so 'Seal.Gateway.Send' doesn't depend on @http-types@); this
@@ -952,12 +1002,18 @@ stampSkill sid v mExisting = do
         _                 -> Nothing
       description = fromMaybe "" (lookupStr "description")
       body        = fromMaybe "" (lookupStr "body")
+      mGroup      = T.strip <$> lookupStr "group"
+      group_      = case (mGroup, mExisting) of
+        (Just g, _) | not (T.null g) -> Just g
+        (Nothing, Just ex)           -> skGroup ex
+        _                            -> Nothing
       createdAt   = maybe now skCreatedAt mExisting
       session     = maybe (mkSystemSessionId "web") skSession mExisting
   pure Skill
     { skId          = sid
     , skDescription = description
     , skBody        = body
+    , skGroup       = group_
     , skCreatedAt   = createdAt
     , skUpdatedAt   = now
     , skSession     = session
@@ -984,6 +1040,7 @@ uiStateJson :: UiState -> Value
 uiStateJson s = object
   [ "last_options"  .= usLastOptions s
   , "custom_models" .= usCustomModels s
+  , "repo_history"  .= usRepoHistory s
   ]
 
 -- | Handle PUT /api/ui/state. The body is the @last_options@ object (the
@@ -1015,6 +1072,25 @@ parseModelField (A.Object o) = case KeyMap.lookup (Key.fromText "model") o of
   Just (A.String t) -> Just t
   _                -> Nothing
 parseModelField _ = Nothing
+
+-- | Handle POST /api/ui/repos. The body is @{"url":"<url>"}@. A
+-- blank/missing url is a no-op success (the frontend shouldn't send one,
+-- but the store is defensive).
+handleUiRepoAdd :: ApiDeps -> A.Value -> IO Response
+handleUiRepoAdd deps v = do
+  let mUrl = parseUrlField v
+  case mUrl of
+    Nothing -> pure (errJson status400 "missing 'url' field")
+    Just u  -> do
+      addRepoHistory (adUiState deps) u
+      pure (jsonOk (object ["ok" .= True]))
+
+-- | Parse the @url@ field from a JSON body.
+parseUrlField :: A.Value -> Maybe Text
+parseUrlField (A.Object o) = case KeyMap.lookup (Key.fromText "url") o of
+  Just (A.String t) -> Just t
+  _                 -> Nothing
+parseUrlField _ = Nothing
 
 -- | Parse the @harness_id@ field (the flavour-name or @custom:<binary>@
 -- encoding) into the tab's label.

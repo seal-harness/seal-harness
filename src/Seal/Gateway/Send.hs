@@ -13,6 +13,7 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , handleSetupRepo
   , ensureTabForSession
   , handleAnswerDelivery
   , handleAskCancel
@@ -43,16 +44,16 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Call (CallDispatcher)
+import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , WebConfig (..), rcWeb
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
@@ -72,6 +73,9 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend (SkillBackend)
+import Seal.Skills.Backend qualified as Skill
+import Seal.Skills.Prompt (injectAvailableSkills)
+import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -80,9 +84,12 @@ import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
-import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Opcode (OpResult (..), localBackend, opName)
+import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult, recordSetupRepoResult)
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -96,7 +103,6 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
@@ -344,21 +350,39 @@ loadSessionMeta paths sid = do
 -- neither is set. The auto-loaded skill (default @seal-usage@, the
 -- fresh-workdir contract) is appended so the model is oriented to its
 -- per-session workspace from turn one. Disabled by setting
--- @[skills] autoload = ""@ in @config.toml@.
+-- @[skills] autoload = ""@ in @config.toml@. The @\<available_skills\>@
+-- catalog (a grouped listing of all skill ids + descriptions) is then
+-- appended so the model discovers and uses skills; disabled by
+-- @[skills] available_skills = false@.
 resolveSystemPrompt
   :: AgentDefBackend
   -> SkillBackend
   -> Maybe Text
   -- ^ The resolved auto-load skill id ('Nothing' disables injection).
+  -> Bool
+  -- ^ Whether to inject the @\<available_skills\>@ catalog.
+  -> Bool
+  -- ^ Whether to inject the parallel tool-call guidance block.
+  -> Bool
+  -- ^ Whether to inject the tool-use enforcement guidance block.
+  -> Bool
+  -- ^ Whether to inject the task-completion guidance block.
   -> SessionMeta
   -> IO (Maybe Text)
-resolveSystemPrompt agentDefBackend skillBackend autoloadId meta = do
+resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
+                   parallel toolUse taskCompletion meta = do
   base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
            Nothing  -> pure Nothing
            Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-  injectAutoloadSkill skillBackend autoloadId base
+  -- Order: static guidance (stable) → autoload body → available-skills
+  -- catalog (volatile, last) — cache-friendly.
+  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
+  withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
+  if injectCatalog
+    then injectAvailableSkills skillBackend withAutoload
+    else pure withAutoload
 
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
@@ -403,8 +427,20 @@ plainTurn deps meta t = do
                   Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
                 agentDefBackend = bAgentDefs (sdBackends deps)
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+            -- Build the workdir-aware skill backend: repo-local skills
+            -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
+            -- Fail-closed: a workdir error → no workdir skills (the user ⊕
+            -- builtin union still applies).
+            workdirSkills <- case eWd of
+              Right wd -> Skill.workdirSkillBackend wd
+              Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+            let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
             let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-            mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
+                injectCatalog = either (const True) resolvedAvailableSkills eCfg
+                parallel = either (const True) resolvedParallelToolGuidance eCfg
+                toolUse = either (const True) resolvedToolUseEnforcement eCfg
+                taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
@@ -494,6 +530,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
+      , setupRepoOp wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -632,8 +669,16 @@ plainTurnWithCaps deps meta caps t = do
               Right wd -> WorkspaceRoot wd
               Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
             agentDefBackend = bAgentDefs (sdBackends deps)
-        let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-        mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
+        workdirSkills <- case eWd of
+          Right wd -> Skill.workdirSkillBackend wd
+          Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+        let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
+            autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+            injectCatalog = either (const True) resolvedAvailableSkills eCfg
+            parallel = either (const True) resolvedParallelToolGuidance eCfg
+            toolUse = either (const True) resolvedToolUseEnforcement eCfg
+            taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+        mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
@@ -695,7 +740,15 @@ webCallDispatcher deps callOpName val = do
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> do
-        recordSkillLoadResult tHandle callOpName val r (Just "web")
+        -- Record the opcode result into the transcript. SKILL_LOAD and
+        -- SETUP_REPO each have a dedicated recorder (SETUP_REPO records
+        -- both success AND failure so the user sees clone errors in the
+        -- chat, not just the request). Other opcodes are not recorded
+        -- here — their results surface via the turn's normal entry flow.
+        let opNm = case callOpName of OpName n -> n
+        if opNm == "SETUP_REPO"
+          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          else recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -801,7 +854,15 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
             (Nothing, Nothing)                -> Nothing
       let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-      injectAutoloadSkill (bSkills (sdBackends deps)) autoloadId basePrompt
+          injectCatalog = either (const True) resolvedAvailableSkills eCfg
+          parallel = either (const True) resolvedParallelToolGuidance eCfg
+          toolUse = either (const True) resolvedToolUseEnforcement eCfg
+          taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+          withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
+      withAutoload <- injectAutoloadSkill (bSkills (sdBackends deps)) autoloadId withGuidance
+      if injectCatalog
+        then injectAvailableSkills (bSkills (sdBackends deps)) withAutoload
+        else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
       let childWsRoot = case eChildWd of
@@ -828,6 +889,7 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
+            , setupRepoOp childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
@@ -911,6 +973,53 @@ broadcastAskResolved mBroker sid qid resolution =
         [ "id" .= askIdText qid
         , "resolution" .= resolution
         ]))
+
+-- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
+-- session's workdir before the first turn. The web "set up repo" combo box
+-- calls this. Rather than calling 'cloneRepoIO' directly (which is
+-- unaudited — a side channel that never appears in the transcript), this
+-- dispatches the real 'SETUP_REPO' opcode via 'webCallDispatcher'. The
+-- clone (and any failure) is therefore recorded in the session's
+-- transcript exactly like a model-invoked SETUP_REPO, so the user sees it
+-- in the chat and any error is visible there — not silent.
+--
+-- The 'srActive' ref is scoped to the target session for the duration of
+-- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
+-- reads 'srActive' to pick the transcript), then restored.
+--
+-- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
+-- with the opcode's text result (the clone/no-op/conflict/failure message)
+-- for the API layer to pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
+handleSetupRepo deps sid url =
+  case validateRepoUrl url of
+    Left err -> pure (Left ("invalid url: " <> err))
+    Right cleanUrl -> do
+      -- Scope srActive to the target session for the dispatch.
+      let sr = sdSession deps
+      activeBefore <- readIORef (srActive sr)
+      mMeta <- loadSessionMeta (sdPaths deps) sid
+      case mMeta of
+        Nothing -> pure (Left "session not found")
+        Just targetMeta -> do
+          writeIORef (srActive sr) targetMeta
+          -- Dispatch SETUP_REPO via the audited path (records into the
+          -- transcript + broadcasts the entry so the frontend sees it).
+          let dispatcher = webCallDispatcher deps
+          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+          -- Restore srActive.
+          writeIORef (srActive sr) activeBefore
+          case res of
+            Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
+            Right opRes ->
+              if orIsError opRes
+                then pure (Left (opResultText opRes))
+                else pure (Right (opResultText opRes))
+
+-- | Join the text parts of an 'OpResult' into a single message (the
+-- clone/no-op/conflict/failure text from SETUP_REPO).
+opResultText :: OpResult -> Text
+opResultText r = T.intercalate "\n" [ t | TrpText t <- orParts r ]
 
 -- | Deliver an answer to a pending question for a session. Returns 'True'
 -- if the answer was accepted (the question was pending and not yet

@@ -1932,7 +1932,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "writer" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Writer" "draft text" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1982,7 +1982,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "alpha" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Alpha" "body" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Alpha" "body" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2031,7 +2031,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         sid = case mkSkillId "gone" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Gone" "body" now now (mkSystemSessionId "manual")
+        seed = Skill sid "Gone" "body" Nothing now now (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2072,7 +2072,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         mkS n = case mkSkillId n of
-          Right sid -> Skill sid n "body" now now (mkSystemSessionId "manual")
+          Right sid -> Skill sid n "body" Nothing now now (mkSystemSessionId "manual")
           Left _    -> error "sid"
     Skill.sbCreate skills (mkS "zeta")
     Skill.sbCreate skills (mkS "alpha")
@@ -2246,6 +2246,43 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> error "could not decode GET body"
       let toText v = case v of { A.String t -> t; _ -> "" }
       map toText cms `shouldBe` ["claude-3-opus", "gpt-4o"]
+
+  it "POST /api/ui/repos appends and lists via GET" $
+    withSystemTempDirectory "seal-ui-repos" $ \tmp -> do
+      let paths = fakePaths { spState = tmp }
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      addReq <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("https://github.com/foo/bar" :: T.Text) ]))
+      addStatus <- runAppStatus app addReq
+      addStatus `shouldBe` 200
+      -- A second URL keeps both, most-recent first.
+      addReq2 <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("git@github.com:x/y" :: T.Text) ]))
+      _ <- runAppStatus app addReq2
+      -- A duplicate dedupes (moves to front).
+      addReq3 <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("https://github.com/foo/bar" :: T.Text) ]))
+      _ <- runAppStatus app addReq3
+      -- Reload from disk to prove persistence.
+      deps2 <- mkDepsFor paths
+      let app2 = apiApp deps2
+      (_, getBody) <- runAppBody app2 (testRequest methodGet ["api", "ui", "state"])
+      let rh = case A.decode getBody :: Maybe A.Value of
+            Just (A.Object o) -> case lookupK "repo_history" o of
+              Just (A.Array a) -> V.toList a
+              _               -> error "no repo_history array"
+            _ -> error "could not decode GET body"
+          toText v = case v of { A.String t -> t; _ -> "" }
+      map toText rh `shouldBe` ["https://github.com/foo/bar", "git@github.com:x/y"]
+
+  it "GET /api/ui/state includes repo_history as an empty array by default" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "ui", "state"])
+    let rh = case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "repo_history" o
+          _ -> Nothing
+    rh `shouldBe` Just (A.Array V.empty)
 
   -- ── Wired send path (adSend = Just SendDeps) ──────────────────────────
   -- A session that doesn't exist on disk returns 404. This exercises the

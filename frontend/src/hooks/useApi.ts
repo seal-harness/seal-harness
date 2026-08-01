@@ -743,13 +743,16 @@ export interface LastOptions {
   attachSession: string
   attachWindow: string
   attachManual: boolean
+  repo: string
 }
 
 /** The persisted UI state: the last-chosen options + the custom-model id
- *  history (most-recent first, deduped, capped server-side). */
+ *  history + the repo URL history (most-recent first, deduped, capped
+ *  server-side). */
 export interface UiState {
   last_options: LastOptions | null
   custom_models: string[]
+  repo_history: string[]
 }
 
 /** Fetch the persisted UI state. Returns null on any failure (the caller
@@ -786,6 +789,53 @@ export async function addCustomModel(model: string): Promise<boolean> {
     return res.ok
   } catch {
     return false
+  }
+}
+
+/** Add a repo URL to the persisted history. Best-effort; the server
+ *  dedupes + caps. Mirrors `addCustomModel`. */
+export async function addRepo(url: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/ui/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** The outcome of a setup-repo call. The backend dispatches the real
+ *  SETUP_REPO opcode (audited in the transcript), so the clone/failure
+ *  also appears in the chat. This shape is the REST response summary. */
+export interface SetupRepoResult {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+/** Clone a repo into a session's workdir before the first turn (the "set
+ *  up repo" combo box calls this right after creating a bare session).
+ *  The backend dispatches the SETUP_REPO opcode, so the clone (and any
+ *  failure) is recorded in the session transcript — visible in the chat,
+ *  not silent. Returns the structured result, or null on a network/parse
+ *  failure. */
+export async function setupRepo(sessionId: string, url: string): Promise<SetupRepoResult | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      return { ok: false, error: body?.error ?? `HTTP ${res.status}` }
+    }
+    return await res.json() as SetupRepoResult
+  } catch {
+    return null
   }
 }
 // ── Agent CRUD ──────────────────────────────────────────────────────────

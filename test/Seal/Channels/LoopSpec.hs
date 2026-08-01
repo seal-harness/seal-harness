@@ -161,6 +161,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           { skId = skillId
           , skDescription = "greeting skill"
           , skBody = "say hi warmly"
+          , skGroup = Nothing
           , skCreatedAt = aTime
           , skUpdatedAt = aTime
           , skSession = mkSystemSessionId "s1"

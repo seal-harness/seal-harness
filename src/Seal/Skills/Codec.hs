@@ -28,13 +28,13 @@ import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup)
 encodeSkill :: Skill -> Text
 encodeSkill s = encodeDoc fm (skBody s)
   where
-    fm = Map.fromList
+    fm = Map.fromList $
       [ ("id", skillIdText (skId s))
       , ("description", skDescription s)
       , ("created_at", isoTime (skCreatedAt s))
       , ("updated_at", isoTime (skUpdatedAt s))
       , ("session", sessionIdText (skSession s))
-      ]
+      ] ++ maybe [] (\g -> [("group", g)]) (skGroup s)
 
 -- | Decode a Markdown document into a 'Skill'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkSkillId'. Timestamps default to epoch 0 when
@@ -49,6 +49,7 @@ decodeSkill content =
         { skId = sid
         , skDescription = fromMaybe "" (fmLookup "description" fm)
         , skBody = body
+        , skGroup = fmLookup "group" fm
         , skCreatedAt = parseTime (fmLookup "created_at" fm)
         , skUpdatedAt = parseTime (fmLookup "updated_at" fm)
         , skSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))

@@ -17,6 +17,7 @@ module Seal.Web.UiState
   , getUiState
   , setLastOptions
   , addCustomModel
+  , addRepoHistory
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
@@ -44,6 +45,10 @@ data UiState = UiState
   , usCustomModels :: [Text]
     -- ^ Custom model ids the user has typed before, most-recent first,
     -- deduped. Kept small (capped at 'maxCustomModels') by 'addCustomModel'.
+  , usRepoHistory :: [Text]
+    -- ^ Repository URLs the user has "set up" before, most-recent first,
+    -- deduped. The "set up repo" combo box offers these as suggestions.
+    -- Kept small (capped at 'maxRepoHistory') by 'addRepoHistory'.
   } deriving stock (Eq, Show, Generic)
 
 -- | The last-chosen "new tab" form selection. Mirrors the frontend's
@@ -60,18 +65,24 @@ data LastOptions = LastOptions
   , loAttachSession :: Text
   , loAttachWindow  :: Text
   , loAttachManual  :: Bool
+  , loRepo          :: Text
+    -- ^ The last-entered repo URL for the "set up repo" combo box (empty
+    -- string = no repo). Persisted so the combo box reopens with the last
+    -- URL, and recorded into 'usRepoHistory' on submit.
   } deriving stock (Eq, Show, Generic)
 
 instance ToJSON UiState where
   toJSON s = object
     [ "last_options"  .= usLastOptions s
     , "custom_models" .= usCustomModels s
+    , "repo_history"  .= usRepoHistory s
     ]
 
 instance FromJSON UiState where
   parseJSON = withObject "UiState" $ \o -> UiState
     <$> o .:? "last_options"
     <*> o .:? "custom_models" .!= []
+    <*> o .:? "repo_history" .!= []
 
 instance ToJSON LastOptions where
   toJSON o = object
@@ -84,6 +95,7 @@ instance ToJSON LastOptions where
     , "attachSession"  .= loAttachSession o
     , "attachWindow"   .= loAttachWindow o
     , "attachManual"   .= loAttachManual o
+    , "repo"           .= loRepo o
     ]
 
 instance FromJSON LastOptions where
@@ -97,12 +109,18 @@ instance FromJSON LastOptions where
     <*> o .:? "attachSession"  .!= ""
     <*> o .:? "attachWindow"   .!= ""
     <*> o .:? "attachManual"   .!= False
+    <*> o .:? "repo"           .!= ""
 
 -- | The maximum number of custom model ids retained. Keeps the combobox
 -- list bounded — the user is unlikely to type more than 32 unique ids over
 -- time, and the list is for fast recall, not an audit log.
 maxCustomModels :: Int
 maxCustomModels = 32
+
+-- | The maximum number of repo URLs retained in the history. Same
+-- rationale as 'maxCustomModels'.
+maxRepoHistory :: Int
+maxRepoHistory = 32
 
 -- | A handle holding the in-memory copy + the on-disk path. The MVar
 -- serializes writes so concurrent PUTs don't interleave file writes.
@@ -151,11 +169,26 @@ addCustomModel h raw =
     -- Move @x@ to the front, drop any earlier occurrence, cap the tail.
     dedupe x xs = take maxCustomModels (x : filter (/= x) xs)
 
+-- | Add a repo URL to the history. Dedupes, trims, caps at
+-- 'maxRepoHistory' (most-recent first), and persists atomically. A blank
+-- URL is a no-op. Never throws.
+addRepoHistory :: UiStateHandle -> Text -> IO ()
+addRepoHistory h raw =
+  modifyMVar_ (uhState h) $ \s -> do
+    let trimmed = T.strip raw
+        next = if T.null trimmed
+                 then s
+                 else s { usRepoHistory = dedupe trimmed (usRepoHistory s) }
+    persistUiState (uhPath h) next
+    pure next
+  where
+    dedupe x xs = take maxRepoHistory (x : filter (/= x) xs)
+
 -- ── Internal: load/persist ─────────────────────────────────────────────
 
--- | The empty state: no last options, no custom models.
+-- | The empty state: no last options, no custom models, no repo history.
 emptyUiState :: UiState
-emptyUiState = UiState { usLastOptions = Nothing, usCustomModels = [] }
+emptyUiState = UiState { usLastOptions = Nothing, usCustomModels = [], usRepoHistory = [] }
 
 -- | Load the state file. Missing file → empty state. Unparseable → empty
 -- state + a stderr warning (the file is replaced on the next successful
