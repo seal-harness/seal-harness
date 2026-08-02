@@ -33,6 +33,7 @@ import Seal.Agent.Runtime.Delegation
   , ChildWorkerOutcome (..)
   )
 import Seal.Channel.Caps (ChannelCaps (..))
+import qualified Data.Default
 import Seal.Config.Paths (SealPaths, agentSessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
@@ -151,10 +152,8 @@ mkDelegateWorker deps def childSid task _hooks = do
     Right (prov, model) ->
       withTwoFileTranscript childDir $ \childTHandle -> do
         summaryRef <- newIORef (Nothing :: Maybe Text)
-        let capturingCaps = ChannelCaps
+        let capturingCaps = Data.Default.def
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
-              , ccPrompt = \_ -> pure ""  -- children don't prompt the human
-              , ccPromptSecret = \_ -> pure ""
               , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
         childReg <- dwdChildRegistry deps def childSid capturingCaps

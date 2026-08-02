@@ -6,6 +6,7 @@ import Test.Hspec
 import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps(..))
+import Data.Default (def)
 import Seal.Command.Spec
 
 -- ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ spec = describe "Seal.Command.Spec" $ do
 
     it "runCommandAction invokes the captured IO action" $ do
       ref <- newIORef ("" :: String)
-      let caps = ChannelCaps
+      let caps = def
             { ccSend         = writeIORef ref . show
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""

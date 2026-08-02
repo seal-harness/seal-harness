@@ -9,6 +9,7 @@ import Data.Text qualified as T
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Command.Call
   ( callCommandSpec
   , renderOpResult
@@ -27,7 +28,7 @@ import Seal.Providers.Class (ToolResultPart (..))
 recordingCaps :: IO (IORef [Text], ChannelCaps)
 recordingCaps = do
   ref <- newIORef []
-  pure (ref, ChannelCaps
+  pure (ref, def
     { ccSend = \t -> modifyIORef' ref (t :)
     , ccPrompt = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""

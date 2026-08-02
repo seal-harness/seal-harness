@@ -13,6 +13,7 @@ import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Skill (renderSkillInfo, renderSkillLine, skillCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
@@ -72,7 +73,7 @@ runSkillWith :: [Skill] -> CallDispatcher -> [String] -> FakeCaps -> IO ()
 runSkillWith skills dispatcher argv fc = do
   backend <- noneBackend
   mapM_ (sbCreate backend) skills
-  let caps = ChannelCaps
+  let caps = def
         { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
         , ccPrompt       = \_ -> pure ""
         , ccPromptSecret = \_ -> pure ""

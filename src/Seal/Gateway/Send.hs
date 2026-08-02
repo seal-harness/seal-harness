@@ -41,6 +41,7 @@ import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import qualified Data.Default
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
@@ -945,9 +946,8 @@ broadcastNewEntries mBroker paths sid model createdAt =
 -- fail-closed.
 webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
-webAskCaps mBroker store sid = ChannelCaps
-  { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
-  , ccPrompt = \q -> do
+webAskCaps mBroker store sid = Data.Default.def
+  { ccPrompt = \q -> do
       outcome <- askHuman store sid q (\qid ->
         case mBroker of
           Nothing -> pure ()
@@ -959,8 +959,6 @@ webAskCaps mBroker store sid = ChannelCaps
       pure (case outcome of
         Left _  -> "rejected"
         Right t -> t)
-  , ccPromptSecret = \_ -> pure ""  -- web: hidden prompts are a later phase
-  , ccStreaming    = True  -- web: streaming goes via WS broker, ccSend is a no-op
   }
 -- | Notify the broker that a pending question was resolved (answered or
 -- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a

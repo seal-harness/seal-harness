@@ -41,6 +41,7 @@ import System.FilePath ((</>))
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import qualified Data.Default
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
@@ -291,7 +292,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
   let histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
-      caps = ChannelCaps
+      caps = Data.Default.def
         { ccSend         = putStrLn . T.unpack
         , ccPrompt       = \prompt ->
             runInputT innerSettings $ do
@@ -301,7 +302,6 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
             runInputT innerSettings $ do
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
-        , ccStreaming    = True  -- CLI: incremental terminal output
         }
   -- Startup diagnostic: show which provider+model the active session will use
   -- for plain-text turns (resolved from config at session creation), and the
@@ -586,13 +586,12 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
             sessionDirPath' = sessionDir paths bgSid
         createDirectoryIfMissing True sessionDirPath'
         void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
-          let bgCaps = ChannelCaps
+          let bgCaps = Data.Default.def
                 { ccSend = ccSend caps
                 , ccPrompt = \q -> do
                     outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
-                , ccStreaming    = ccStreaming caps  -- inherit from parent (True for CLI)
                 }
               bgStartWiring = cliStartWiring bgSid
           eBgWd <- ensureSessionWorkdir paths bgSid

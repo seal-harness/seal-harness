@@ -13,6 +13,7 @@ import Data.IORef (IORef, modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 
 data FakeCaps = FakeCaps
   { fcSent   :: IORef [Text]   -- reversed accumulator; read via getSent
@@ -30,7 +31,7 @@ makeFakeCaps inputs = do
         case queue of
           []     -> fail "FakeCaps: scripted input queue exhausted"
           (x:xs) -> writeIORef inputRef xs $> x
-      caps = ChannelCaps
+      caps = def
         { ccSend         = \t -> modifyIORef sentRef (t :)
         , ccPrompt       = pop
         , ccPromptSecret = pop

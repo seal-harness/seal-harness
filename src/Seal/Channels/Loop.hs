@@ -70,6 +70,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (ChannelCaps (..))
+import qualified Data.Default
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
@@ -393,7 +394,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
 
 -- | Build the per-turn 'ChannelCaps' for a channel handle.
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
-mkHandleCaps h askReply sid = ChannelCaps
+mkHandleCaps h askReply sid = Data.Default.def
   { ccSend         = chSend h
   , ccPrompt       = \q -> do
       outcome <- askHuman askReply sid q (\_qid -> chSend h q)

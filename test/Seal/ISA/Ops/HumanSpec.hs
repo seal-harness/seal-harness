@@ -7,6 +7,7 @@ import Data.Text (pack)
 import Test.Hspec
 
 import Seal.Channel.Caps
+import Data.Default (def)
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Human
 import Seal.Providers.Class
@@ -19,7 +20,7 @@ runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 fakeCaps :: IORef [String] -> String -> ChannelCaps
-fakeCaps sent reply = ChannelCaps
+fakeCaps sent reply = def
   { ccSend = \t -> modifyIORef' sent (++ [show t])
   , ccPrompt = \_ -> pure (pack reply)
   , ccPromptSecret = \_ -> pure ""

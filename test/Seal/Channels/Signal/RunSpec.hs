@@ -17,6 +17,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channels.Signal.Run (runSignalLoop)
 import Seal.Channels.Signal.Transport (mkMockSignalTransport)
 import Seal.Command.Spec
@@ -122,7 +123,7 @@ spec = do
       appEnv <- mkEnv sigLogger defaultConfig
       approvals <- newApprovalCache
       let runOneTurn h ms body =
-            let handleCaps = ChannelCaps
+            let handleCaps = def
                   { ccSend = chSend h
                   , ccPrompt = \_ -> pure ""
                   , ccPromptSecret = \_ -> pure ""

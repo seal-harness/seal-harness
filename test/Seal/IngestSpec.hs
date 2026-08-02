@@ -9,6 +9,7 @@ import Options.Applicative (info, progDesc)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Command.Spec
   ( Availability (..)
   , CommandAction (..)
@@ -26,7 +27,7 @@ import Seal.Ingest
 
 -- | Records every 'ccSend' call (prepended; reverse for chronological order).
 recordingCaps :: IORef [Text] -> ChannelCaps
-recordingCaps ref = ChannelCaps
+recordingCaps ref = def
   { ccSend         = \t -> modifyIORef' ref (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""

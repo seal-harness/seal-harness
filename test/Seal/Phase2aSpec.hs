@@ -12,6 +12,7 @@ import Options.Applicative (info, progDesc)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channels.Class (Channel (..))
 import Seal.Command.Spec
   ( Availability (..)
@@ -58,7 +59,7 @@ testRegistry = mkRegistry [pingSpec]
 -- The command registry still speaks 'ChannelCaps' today; 2a does not change
 -- that. A later phase widens 'CommandAction' to take 'ChannelHandle'.
 handleCaps :: ChannelHandle -> ChannelCaps
-handleCaps h = ChannelCaps
+handleCaps h = def
   { ccSend         = chSend h
   , ccPrompt       = fmap (fromRight "") . chPrompt h
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h

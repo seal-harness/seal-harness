@@ -19,6 +19,7 @@ import Test.Hspec
 import qualified Data.Vector as V
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript, withTwoFileTranscript)
@@ -107,10 +108,8 @@ spec = describe "Seal.Agent.Loop" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     ran <- newIORef (0 :: Int)
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                     (const (Right ()))
                     (\_ _ -> do
@@ -156,10 +155,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "writes the conversation + entries to the two-file transcript" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         script =
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
@@ -211,10 +208,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-loop" $ \dir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           -- Two scripted responses: turn 1 replies "hi back"; turn 2 replies
           -- "ok". The script is consumed top-to-bottom across both turns.
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
@@ -267,10 +262,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-loop-debug" $ \dir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
@@ -338,10 +331,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-loop-recon" $ \dir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
@@ -443,10 +434,10 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
       (ran, uio) <- mkRecordUntrustedIO
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\q -> modifyIORef' prompts (++ [q]) >> pure "once")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t])
+                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "once"
+                   , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -483,10 +474,10 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
       (ran, uio) <- mkRecordUntrustedIO
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t])
+                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "rejected"
+                   , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -523,10 +514,10 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
       (ran, uio) <- mkRecordUntrustedIO
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t])
+                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant"
+                   , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Full
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -564,10 +555,10 @@ spec = describe "Seal.Agent.Loop" $ do
       sent <- newIORef ([] :: [Text])
       prompts <- newIORef ([] :: [Text])
       ran <- newIORef (0 :: Int)
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t])
+                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "rejected"
+                   , ccPromptSecret = \_ -> pure "" }
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                      (const (Right ()))
                      (\_ _ -> do
@@ -616,10 +607,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-log" $ \logDir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
@@ -658,10 +647,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-log" $ \logDir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
       (h, _) <- fakeTwoFileTranscript
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -705,10 +692,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "writes a provider error to the transcript as a response entry + assistant message" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
     (h, readState) <- fakeTwoFileTranscript
     let env = AgentEnv
                 { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
@@ -755,10 +740,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "retries a transient provider error twice then succeeds" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
     (h, _) <- fakeTwoFileTranscript
     -- Fail the first 2 calls (transport-style error), then succeed.
     ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
@@ -798,10 +781,8 @@ spec = describe "Seal.Agent.Loop" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     callCount <- newIORef (0 :: Int)
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
     (h, _) <- fakeTwoFileTranscript
     -- A provider that counts calls and always returns a 401 auth error.
     let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
@@ -839,10 +820,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-log" $ \logDir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
@@ -876,10 +855,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-log" $ \logDir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           -- A tool-use loop that never terminates: each response calls PING,
           -- so the loop runs until aeMaxTurns is hit.
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
@@ -932,10 +909,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "auto-continues when a text response is truncated (StopMaxTokens)" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         script =
           [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
@@ -978,10 +953,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "auto-continues when a truncated response yields no content blocks" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         script =
           [ CompletionResponse [] StopMaxTokens (Usage 1 4096)
           , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 50)
@@ -1021,10 +994,8 @@ spec = describe "Seal.Agent.Loop" $ do
   it "surfaces a truncation notice after 3 failed continuation attempts" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         -- Every response is truncated — the loop retries 3 times then gives
         -- up. 1 initial + 3 continuations = 4 scripted responses consumed.
         script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
@@ -1066,10 +1037,8 @@ spec = describe "Seal.Agent.Loop" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     calls <- newIORef (0 :: Int)
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         -- A provider that always truncates and counts calls.
         countingTrunc = SomeProvider (CountingTruncProvider calls)
     (h, _) <- fakeTwoFileTranscript
@@ -1108,10 +1077,8 @@ spec = describe "Seal.Agent.Loop" $ do
     approvals <- newApprovalCache
     sent <- newIORef ([] :: [Text])
     ran <- newIORef (0 :: Int)
-    let caps = ChannelCaps
-                 (\t -> modifyIORef' sent (++ [t]))
-                 (\_ -> pure "")
-                 (\_ -> pure "") True
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                     (const (Right ()))
                     (\_ _ -> do
@@ -1159,10 +1126,8 @@ spec = describe "Seal.Agent.Loop" $ do
     withSystemTempDirectory "seal-log" $ \logDir -> do
       approvals <- newApprovalCache
       sent <- newIORef ([] :: [Text])
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "") True
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
           script =
             [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
             , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
