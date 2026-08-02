@@ -115,6 +115,7 @@ library
         Seal.Session.Store
         Seal.Session.Workdir
         Seal.Session.Log
+        Seal.SourceControl.Repo
         Seal.Signal.Config
         Seal.Telegram.Config
         Seal.Security.Command
@@ -282,6 +283,9 @@ test-suite tests
       , warp
       , http-types
       , vector
+      , tomland
+      , validation-selective
+      , unordered-containers
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -386,6 +390,7 @@ test-suite tests
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
         Seal.Session.LockSpec
+        Seal.SourceControl.RepoSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
