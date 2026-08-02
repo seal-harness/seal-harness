@@ -113,6 +113,7 @@ import qualified Seal.ISA.Ops.RepoSpec
 import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
+import qualified Seal.SourceControl.RegistrySpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
 import qualified Seal.Phase6aSpec
@@ -255,6 +256,7 @@ main = hspec $ do
   Seal.ISA.Ops.AgentSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec
+  Seal.SourceControl.RegistrySpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec
   Seal.Phase6aSpec.spec
