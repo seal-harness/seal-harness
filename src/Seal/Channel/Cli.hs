@@ -41,7 +41,7 @@ import System.FilePath ((</>))
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
-import qualified Data.Default
+import Data.Default (def)
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
@@ -292,7 +292,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
   let histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
-      caps = Data.Default.def
+      caps = def
         { ccSend         = putStrLn . T.unpack
         , ccPrompt       = \prompt ->
             runInputT innerSettings $ do
@@ -377,15 +377,15 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
       -- Provider resolution honors the [delegation] provider/model/base_url
       -- override when set, else falls back to the def's provider/model
       -- (which itself falls back to the active session's when empty).
-      cliResolveChildProvider def = do
+      cliResolveChildProvider agentDef = do
         active <- readIORef (srActive sr)
-        let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-            fallBackModel = case adModel def of
+        let fallBackProvider = if T.null (adProvider agentDef) then smProvider active else adProvider agentDef
+            fallBackModel = case adModel agentDef of
               ModelId m | T.null m -> smModel active
                         | otherwise -> m
         resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-      cliChildSystemPrompt def task = do
-        let base = adSystem def
+      cliChildSystemPrompt agentDef task = do
+        let base = adSystem agentDef
             ctx  = ctContext task
             basePrompt = case (base, ctx) of
               (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
@@ -586,7 +586,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
             sessionDirPath' = sessionDir paths bgSid
         createDirectoryIfMissing True sessionDirPath'
         void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
-          let bgCaps = Data.Default.def
+          let bgCaps = def
                 { ccSend = ccSend caps
                 , ccPrompt = \q -> do
                     outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)

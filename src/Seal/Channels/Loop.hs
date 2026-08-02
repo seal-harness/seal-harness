@@ -70,7 +70,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (ChannelCaps (..))
-import qualified Data.Default
+import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
@@ -394,7 +394,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
 
 -- | Build the per-turn 'ChannelCaps' for a channel handle.
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
-mkHandleCaps h askReply sid = Data.Default.def
+mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
   , ccPrompt       = \q -> do
       outcome <- askHuman askReply sid q (\_qid -> chSend h q)
@@ -991,10 +991,10 @@ channelMintSession fallback = do
 -- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
 -- the default when the config section or the field is absent.
 unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
-unwrapOpt field webCfg def =
+unwrapOpt field webCfg agentDef =
   case webCfg of
-    Nothing   -> def
-    Just cfg  -> fromMaybe def (field cfg)
+    Nothing   -> agentDef
+    Just cfg  -> fromMaybe agentDef (field cfg)
 
 -- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
 -- section-absent case yields 'Nothing'; the section-present case yields the
@@ -1058,17 +1058,17 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
     , dwdChannel = channel
     }
   where
-    resolveChild def = do
+    resolveChild agentDef = do
       mParentMeta <- loadMeta paths parentSid
       now <- getCurrentTime
       let parent = fromMaybe (fallbackMeta now) mParentMeta
-          fallBackProvider = if T.null (adProvider def) then smProvider parent else adProvider def
-          fallBackModel = case adModel def of
+          fallBackProvider = if T.null (adProvider agentDef) then smProvider parent else adProvider agentDef
+          fallBackModel = case adModel agentDef of
             ModelId m | T.null m -> smModel parent
                       | otherwise -> m
       resolveDefProvider (cdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt def task = do
-      let base = adSystem def
+    childSystemPrompt agentDef task = do
+      let base = adSystem agentDef
           ctx  = ctContext task
           basePrompt = case (base, ctx) of
             (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)

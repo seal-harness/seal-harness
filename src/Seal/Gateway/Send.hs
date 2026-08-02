@@ -41,7 +41,7 @@ import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
-import qualified Data.Default
+import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
@@ -775,10 +775,10 @@ webMintSession fallback = do
 -- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
 -- the default when the config section or the field is absent.
 unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
-unwrapOpt field webCfg def =
+unwrapOpt field webCfg agentDef =
   case webCfg of
-    Nothing   -> def
-    Just cfg  -> fromMaybe def (field cfg)
+    Nothing   -> agentDef
+    Just cfg  -> fromMaybe agentDef (field cfg)
 
 -- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
 -- section-absent case yields 'Nothing'; the section-present case yields the
@@ -841,15 +841,15 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
     , dwdChannel = channel
     }
   where
-    resolveChild def = do
+    resolveChild agentDef = do
       active <- readIORef (srActive (sdSession deps))
-      let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-          fallBackModel = case adModel def of
+      let fallBackProvider = if T.null (adProvider agentDef) then smProvider active else adProvider agentDef
+          fallBackModel = case adModel agentDef of
             ModelId m | T.null m -> smModel active
                       | otherwise -> m
       resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt def task = do
-      let base = adSystem def
+    childSystemPrompt agentDef task = do
+      let base = adSystem agentDef
           ctx  = ctContext task
           basePrompt = case (base, ctx) of
             (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
@@ -946,7 +946,7 @@ broadcastNewEntries mBroker paths sid model createdAt =
 -- fail-closed.
 webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
-webAskCaps mBroker store sid = Data.Default.def
+webAskCaps mBroker store sid = def
   { ccPrompt = \q -> do
       outcome <- askHuman store sid q (\qid ->
         case mBroker of
