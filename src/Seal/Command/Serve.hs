@@ -180,7 +180,7 @@ runServeMain autonomy logger = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
         , agentCommandSpec (bAgentDefs backends) cfgPath
-        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
+        , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
         , newCommandSpec newDeps

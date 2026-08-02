@@ -308,7 +308,7 @@ runSignalMain autonomy logger = do
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
+        , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         ]
   case resolveSignalConfig (rcSignal cfg) Nothing of
