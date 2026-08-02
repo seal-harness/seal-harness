@@ -35,10 +35,29 @@ import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
-  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns )
+  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
+  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
+
+-- | The output-token cap sent to the provider on every completion request.
+-- Raised from 4096 to 8192 so tool-using agents (which often emit large
+-- tool-call inputs, e.g. embedding file contents into @task@ prompts) have
+-- headroom and are less likely to hit 'StopMaxTokens'. This alone does not
+-- fix truncation handling — the loop must still handle 'StopMaxTokens'
+-- explicitly (see 'go') — but it reduces the frequency.
+defaultMaxTokens :: Int
+defaultMaxTokens = 8192
+
+-- | The synthetic user message appended after a 'StopMaxTokens' truncation
+-- with no tool calls, asking the model to continue exactly where it left off
+-- without repeating prior text. Mirrors Hermes' @_get_continuation_prompt@.
+continuationPrompt :: Text
+continuationPrompt =
+  "[System: Your previous response was truncated by the output length \
+  \limit. Continue exactly where you left off. Do not restart or repeat \
+  \prior text. Finish the answer directly.]"
 
 -- | Build the request @erMeta@: a @channel@ key (always present, sourced
 -- from 'aeChannel' so every channel — including web/CLI with no
@@ -83,7 +102,7 @@ runTurn env userText = do
           , edSystem = Just (aeSystem env)
           , edTools = Just (registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env))
           , edToolChoice = Just ToolAuto
-          , edMaxTokens = Just 4096
+          , edMaxTokens = Just defaultMaxTokens
           }
         entry = EntryRecord
           { erId = ""
@@ -109,10 +128,10 @@ runTurn env userText = do
         liftIO after
       Nothing ->
         tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
-  go (aeMaxTurns env) turn0
+  go (aeMaxTurns env) 0 turn0
   where
-    go :: Int -> [Message] -> App ()
-    go 0 msgs = liftIO $ do
+    go :: Int -> Int -> [Message] -> App ()
+    go 0 _ msgs = liftIO $ do
       logMaxTurns (aeLogPath env)
       let stopMsg = "(stopped: reached the " <> T.pack (show (aeMaxTurns env))
             <> "-turn limit for this message. Ask again to continue, "
@@ -136,7 +155,7 @@ runTurn env userText = do
       tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
-    go n msgs = do
+    go n lenContinue msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
       let req = CompletionRequest
@@ -145,7 +164,7 @@ runTurn env userText = do
                   , crMessages = msgs
                   , crTools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
                   , crToolChoice = ToolAuto
-                  , crMaxTokens = 4096
+                  , crMaxTokens = defaultMaxTokens
                   }
       liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
       eresp <- liftIO (providerCompleteWithRetry (aeProvider env) req)
@@ -206,13 +225,78 @@ runTurn env userText = do
             aeOnEntry env
           let toolUses = [b | b@CbToolUse{} <- rsContent resp]
           if null toolUses
-            then liftIO $ do
-              tEnd <- getCurrentTime
-              logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd)
-              let ModelId m = aeModel env
-                  prefix    = aeProviderLabel env <> "/" <> m <> "> "
-              ccSend (aeCaps env)
-                   (prefix <> T.intercalate "\n" [t | CbText t <- rsContent resp])
+            then
+              -- No complete tool-call blocks. Two sub-cases:
+              --   (a) StopMaxTokens: the model was truncated mid-generation
+              --       (almost always mid-text or mid-tool-call-block, the
+              --       latter leaving no complete CbToolUse). Auto-continue
+              --       with a synthetic continuation prompt, capped at
+              --       'maxLengthContinueRetries'. After the cap, surface a
+              --       user-visible truncation notice and stop. This fixes
+              --       the "stopped suddenly with no response" silent-halt
+              --       bug where truncated output was shipped as a final
+              --       answer.
+              --   (b) any other stop reason (StopEnd / StopOther): a genuine
+              --       final text answer — emit it and finish the turn.
+              if rsStop resp == StopMaxTokens && lenContinue < maxLengthContinueRetries
+                then do
+                  liftIO (logTruncation (aeLogPath env) (lenContinue + 1))
+                  -- Append the partial assistant message (whatever text
+                  -- survived truncation) + a synthetic continuation user
+                  -- message, then re-loop. The model resumes from the
+                  -- partial text. Consume a turn (n - 1) so the max-turns
+                  -- guard still bounds total work.
+                  let assistantMsg = Message Assistant (rsContent resp)
+                      contMsg = textMsg User continuationPrompt
+                      conv2 = msgs <> [assistantMsg, contMsg]
+                  liftIO $ do
+                    now2 <- getCurrentTime
+                    let entry2 = EntryRecord
+                          { erId = ""
+                          , erTimestamp = now2
+                          , erKind = EKRequest
+                          , erConvLen = length conv2
+                          , erEnvelope = Nothing
+                          , erUsage = Nothing
+                          , erStop = Nothing
+                          , erDurationMs = Nothing
+                          , erHarness = Nothing
+                          , erCorrelation = Nothing
+                          , erMeta = Map.empty
+                          }
+                    tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv2 entry2)
+                    aeOnEntry env
+                  tEnd <- liftIO getCurrentTime
+                  liftIO (logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd))
+                  go (n - 1) (lenContinue + 1) conv2
+                else liftIO $ do
+                  tEnd <- getCurrentTime
+                  logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd)
+                  -- If we exhausted continuation retries on truncation,
+                  -- surface a clear truncation notice so the user knows the
+                  -- turn did not complete (instead of silently shipping an
+                  -- empty/partial reply as a final answer). The partial
+                  -- response entry was already recorded above; ccSend adds
+                  -- the notice for the CLI/Telegram/Signal channels.
+                  let texts = [t | CbText t <- rsContent resp]
+                      ModelId m = aeModel env
+                      prefix = aeProviderLabel env <> "/" <> m <> "> "
+                  if rsStop resp == StopMaxTokens
+                    then do
+                      logTruncationGiveUp (aeLogPath env)
+                      let notice = "(stopped: response truncated at the "
+                            <> T.pack (show defaultMaxTokens)
+                            <> "-token output limit after "
+                            <> T.pack (show maxLengthContinueRetries)
+                            <> " continuation attempts. Send any message to \
+                            \continue.)"
+                          combined = case texts of
+                            [] -> notice
+                            ts -> T.intercalate "\n" ts <> "\n\n" <> notice
+                      ccSend (aeCaps env) (prefix <> combined)
+                    else do
+                      ccSend (aeCaps env)
+                           (prefix <> T.intercalate "\n" texts)
             else do
               results <- mapM dispatchOne toolUses
               let assistantMsg = Message Assistant (rsContent resp)
@@ -241,7 +325,9 @@ runTurn env userText = do
                 aeOnEntry env
               tEnd <- liftIO getCurrentTime
               liftIO (logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd))
-              go (n - 1) (msgs <> [assistantMsg, resultMsg])
+              -- A successful tool-call turn made progress, so reset the
+              -- length-continuation counter.
+              go (n - 1) 0 (msgs <> [assistantMsg, resultMsg])
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do

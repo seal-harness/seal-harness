@@ -25,6 +25,9 @@ module Seal.Session.Log
   , logTurnError
   , logProviderError
   , logMaxTurns
+  , logTruncation
+  , logTruncationGiveUp
+  , maxLengthContinueRetries
   ) where
 
 import Control.Exception (catch, SomeException)
@@ -32,6 +35,13 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime, formatTime, defaultTimeLocale)
 import System.IO (withFile, IOMode (AppendMode), hPutStr)
+
+-- | Maximum number of auto-continuation retries when the provider returns
+-- 'StopMaxTokens' with no tool calls (text was truncated mid-generation).
+-- After this many retries the loop surfaces a user-visible truncation
+-- notice and stops. Mirrors Hermes' @length_continue_retries < 3@ cap.
+maxLengthContinueRetries :: Int
+maxLengthContinueRetries = 3
 
 -- | Append a single line to the session log. Best-effort: any IO error is
 -- swallowed. The line is prefixed with an ISO-8601 timestamp and the given
@@ -77,3 +87,21 @@ logProviderError mPath err =
 logMaxTurns :: Maybe FilePath -> IO ()
 logMaxTurns mPath =
   appendSessionLog mPath "WARN" "stopped: too many tool turns (hit aeMaxTurns)"
+
+-- | Log a @StopMaxTokens@ truncation that triggered an auto-continuation
+-- retry. @attempt@ is 1-based (1 = first retry requested). Mirrors Hermes'
+-- @↻ Requesting continuation (N/3)@ log line.
+logTruncation :: Maybe FilePath -> Int -> IO ()
+logTruncation mPath attempt =
+  appendSessionLog mPath "WARN"
+    ("response truncated (StopMaxTokens) - requesting continuation ("
+      <> T.pack (show attempt) <> "/" <> T.pack (show maxLengthContinueRetries) <> ")")
+
+-- | Log a @StopMaxTokens@ truncation after all continuation retries are
+-- exhausted. The loop surfaces a user-visible truncation notice and stops.
+logTruncationGiveUp :: Maybe FilePath -> IO ()
+logTruncationGiveUp mPath =
+  appendSessionLog mPath "WARN"
+    ("stopped: response remained truncated after "
+      <> T.pack (show maxLengthContinueRetries)
+      <> " continuation attempts")
