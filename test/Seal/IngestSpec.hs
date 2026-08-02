@@ -30,6 +30,7 @@ recordingCaps ref = ChannelCaps
   { ccSend         = \t -> modifyIORef' ref (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | The fake "ping" command: sends "pong" via 'ccSend'.

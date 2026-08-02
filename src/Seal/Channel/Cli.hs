@@ -301,6 +301,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
             runInputT innerSettings $ do
               mPass <- getPassword (Just '*') (T.unpack prompt)
               pure (maybe "" T.pack mPass)
+        , ccStreaming    = True  -- CLI: incremental terminal output
         }
   -- Startup diagnostic: show which provider+model the active session will use
   -- for plain-text turns (resolved from config at session creation), and the
@@ -591,6 +592,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
                     outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
+                , ccStreaming    = ccStreaming caps  -- inherit from parent (True for CLI)
                 }
               bgStartWiring = cliStartWiring bgSid
           eBgWd <- ensureSessionWorkdir paths bgSid

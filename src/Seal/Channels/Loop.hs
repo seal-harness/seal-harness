@@ -399,6 +399,7 @@ mkHandleCaps h askReply sid = ChannelCaps
       outcome <- askHuman askReply sid q (\_qid -> chSend h q)
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+  , ccStreaming    = chStreaming h
   }
 
 -- | Look up a tab by index in a 'TabList'.

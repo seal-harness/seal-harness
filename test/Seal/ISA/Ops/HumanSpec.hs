@@ -23,6 +23,7 @@ fakeCaps sent reply = ChannelCaps
   { ccSend = \t -> modifyIORef' sent (++ [show t])
   , ccPrompt = \_ -> pure (pack reply)
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 spec :: Spec

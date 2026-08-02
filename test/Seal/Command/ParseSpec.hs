@@ -193,6 +193,7 @@ spec = describe "Seal.Command.Parse" $ do
             { ccSend         = writeIORef ref
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
       case parseSlash testRegistry "/ping" of
         ParsedAction cmd -> do
@@ -206,6 +207,7 @@ spec = describe "Seal.Command.Parse" $ do
             { ccSend         = writeIORef ref
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
       case parseSlash testRegistry "/ping --loud" of
         ParsedAction cmd -> do

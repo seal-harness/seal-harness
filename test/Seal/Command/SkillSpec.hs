@@ -76,6 +76,7 @@ runSkillWith skills dispatcher argv fc = do
         { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
         , ccPrompt       = \_ -> pure ""
         , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
         }
   case execParserPure defaultPrefs (csParserInfo (skillCommandSpec backend dispatcher)) argv of
     Success act -> runCommandAction act caps

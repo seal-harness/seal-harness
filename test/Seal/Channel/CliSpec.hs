@@ -50,6 +50,7 @@ recordingCaps ref = ChannelCaps
   { ccSend         = \t -> modifyIORef' ref (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | A plain-text handler that never fires; used by the non-'PlainMessage' cases.

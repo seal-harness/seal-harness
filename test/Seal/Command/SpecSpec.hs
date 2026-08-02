@@ -95,6 +95,7 @@ spec = describe "Seal.Command.Spec" $ do
             { ccSend         = writeIORef ref . show
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
           act = CommandAction (`ccSend` "hello")
       runCommandAction act caps

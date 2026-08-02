@@ -120,6 +120,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
               outcome <- askHuman askReply sid q (\_qid -> chSend h q)
               pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+          , ccStreaming    = False  -- Signal: send accumulated text once, not per-delta
           }
     loop h handleCaps
   where

@@ -34,6 +34,7 @@ makeFakeCaps inputs = do
         { ccSend         = \t -> modifyIORef sentRef (t :)
         , ccPrompt       = pop
         , ccPromptSecret = pop
+  , ccStreaming    = True  -- tests: streaming by default
         }
   pure (FakeCaps sentRef inputRef, caps)
 

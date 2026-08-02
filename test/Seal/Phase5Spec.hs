@@ -152,7 +152,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
       reg <- buildRegistry cfgRoot workerRan sampleSession
       ref <- newIORef capstoneScript
       (tHandle, readTranscript) <- fakeTwoFileTranscript

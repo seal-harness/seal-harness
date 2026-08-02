@@ -134,6 +134,7 @@ recordCaps sent = ChannelCaps
   { ccSend        = \t -> modifyIORef' sent (++ [t])
   , ccPrompt      = \_ -> pure "yes"
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | Dispatch a single opcode through the full integration seam (authorize →
@@ -870,6 +871,7 @@ spec = describe "Seal.ISA.Integration" $ do
             { ccSend = \_ -> pure ()
             , ccPrompt = \_ -> pure "main"
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
           op = askHumanOp caps
           reg = Registry.mkRegistry [op]

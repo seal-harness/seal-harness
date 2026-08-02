@@ -12,4 +12,9 @@ data ChannelCaps = ChannelCaps
   { ccSend         :: Text -> IO ()   -- ^ Emit one line to the user
   , ccPrompt       :: Text -> IO Text -- ^ Visible prompt; returns typed line
   , ccPromptSecret :: Text -> IO Text -- ^ Hidden (no-echo) prompt
+  , ccStreaming    :: Bool
+  -- ^ Whether the channel wants per-delta sends during streaming (CLI,
+  -- web). When 'False' (Telegram, Signal), the loop skips per-delta
+  -- 'ccSend' and sends the accumulated text once at the end via the
+  -- normal stop path — avoiding a flood of per-token messages.
   }

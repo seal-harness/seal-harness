@@ -42,6 +42,7 @@ runAgentWith defs argv fc cfgPath = do
         { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
         , ccPrompt       = \_ -> pure ""
         , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
         }
   case execParserPure defaultPrefs (csParserInfo (agentCommandSpec backend cfgPath)) argv of
     Success act -> runCommandAction act caps

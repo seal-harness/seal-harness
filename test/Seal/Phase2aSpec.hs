@@ -62,6 +62,7 @@ handleCaps h = ChannelCaps
   { ccSend         = chSend h
   , ccPrompt       = fmap (fromRight "") . chPrompt h
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- ---------------------------------------------------------------------------

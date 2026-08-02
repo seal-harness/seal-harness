@@ -27,6 +27,7 @@ recordingCaps = do
     { ccSend = \t -> modifyIORef' ref (t :)
     , ccPrompt = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
     })
 
 -- | A dummy SealPaths for tests that don't need real session resolution.

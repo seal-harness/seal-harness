@@ -960,8 +960,8 @@ webAskCaps mBroker store sid = ChannelCaps
         Left _  -> "rejected"
         Right t -> t)
   , ccPromptSecret = \_ -> pure ""  -- web: hidden prompts are a later phase
+  , ccStreaming    = True  -- web: streaming goes via WS broker, ccSend is a no-op
   }
-
 -- | Notify the broker that a pending question was resolved (answered or
 -- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a
 -- no-op.

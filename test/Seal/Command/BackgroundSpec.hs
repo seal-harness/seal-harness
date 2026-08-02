@@ -20,6 +20,7 @@ recordingCaps = do
     { ccSend = \t -> modifyIORef' ref (t :)
     , ccPrompt = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
     })
 
 -- | A BgRunner that records the prompt it was given (no real turn). Used to

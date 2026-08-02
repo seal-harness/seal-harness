@@ -31,6 +31,7 @@ recordingCaps = do
     { ccSend = \t -> modifyIORef' ref (t :)
     , ccPrompt = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
     })
 
 -- | A fake CallDispatcher that records the (OpName, input-encoded) pairs and

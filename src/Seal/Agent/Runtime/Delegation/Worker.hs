@@ -155,6 +155,7 @@ mkDelegateWorker deps def childSid task _hooks = do
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
               , ccPrompt = \_ -> pure ""  -- children don't prompt the human
               , ccPromptSecret = \_ -> pure ""
+              , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
         childReg <- dwdChildRegistry deps def childSid capturingCaps
         childUio <- dwdMkUntrustedIO deps childSid

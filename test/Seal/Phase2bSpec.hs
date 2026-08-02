@@ -109,6 +109,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 { ccSend = chSend h
                 , ccPrompt = \_ -> pure ""
                 , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
                 }
               agentEnv = AgentEnv
                 { aeProvider = provider

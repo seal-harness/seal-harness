@@ -110,7 +110,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                     (const (Right ()))
                     (\_ _ -> do
@@ -159,7 +159,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         script =
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
@@ -214,7 +214,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           -- Two scripted responses: turn 1 replies "hi back"; turn 2 replies
           -- "ok". The script is consumed top-to-bottom across both turns.
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
@@ -270,7 +270,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
@@ -341,7 +341,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           script1 = [ CompletionResponse [CbText "hi back"] StopEnd (Usage 1 2) ]
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
@@ -446,7 +446,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "once")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -486,7 +486,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -526,7 +526,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Full
           reg = mkRegistry [shellExecOp wsRoot policy]
@@ -567,7 +567,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\q -> modifyIORef' prompts (++ [q]) >> pure "rejected")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                      (const (Right ()))
                      (\_ _ -> do
@@ -619,7 +619,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
@@ -661,7 +661,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
       (h, _) <- fakeTwoFileTranscript
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
@@ -708,7 +708,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
     (h, readState) <- fakeTwoFileTranscript
     let env = AgentEnv
                 { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
@@ -758,7 +758,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
     (h, _) <- fakeTwoFileTranscript
     -- Fail the first 2 calls (transport-style error), then succeed.
     ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
@@ -801,7 +801,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
     (h, _) <- fakeTwoFileTranscript
     -- A provider that counts calls and always returns a 401 auth error.
     let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
@@ -842,7 +842,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
@@ -879,7 +879,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           -- A tool-use loop that never terminates: each response calls PING,
           -- so the loop runs until aeMaxTurns is hit.
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
@@ -935,7 +935,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         script =
           [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
           , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
@@ -981,7 +981,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         script =
           [ CompletionResponse [] StopMaxTokens (Usage 1 4096)
           , CompletionResponse [CbText "recovered"] StopEnd (Usage 1 50)
@@ -1024,7 +1024,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         -- Every response is truncated — the loop retries 3 times then gives
         -- up. 1 initial + 3 continuations = 4 scripted responses consumed.
         script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
@@ -1069,7 +1069,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         -- A provider that always truncates and counts calls.
         countingTrunc = SomeProvider (CountingTruncProvider calls)
     (h, _) <- fakeTwoFileTranscript
@@ -1111,7 +1111,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = ChannelCaps
                  (\t -> modifyIORef' sent (++ [t]))
                  (\_ -> pure "")
-                 (\_ -> pure "")
+                 (\_ -> pure "") True
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                     (const (Right ()))
                     (\_ _ -> do
@@ -1162,7 +1162,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = ChannelCaps
                    (\t -> modifyIORef' sent (++ [t]))
                    (\_ -> pure "")
-                   (\_ -> pure "")
+                   (\_ -> pure "") True
           script =
             [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
             , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
