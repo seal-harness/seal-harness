@@ -295,6 +295,55 @@ spec = describe "Seal.ISA.Ops.File" $ do
       r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("adir" :: String)]))
       orIsError r `shouldBe` True
 
+  -- Character ceiling: files exceeding ~100K chars are rejected outright
+  -- when the caller is not paginating (no offset/limit). When the caller
+  -- IS paginating, the window is returned normally.
+
+  it "rejects a file exceeding the char ceiling without offset/limit" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      -- 1100 lines of ~104 chars each = ~114K chars (over 100K char ceiling),
+      -- ~115K bytes (under the 128K scan byte ceiling).
+      let ls = [T.replicate 100 "x" <> T.pack (show i) | i <- [1..1100 :: Int]]
+          body = unlinesStr ls
+      BS.writeFile (root </> "big.txt") body
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("big.txt" :: String)]))
+      orIsError r `shouldBe` True
+      case orParts r of
+        [TrpText msg] -> do
+          T.unpack msg `shouldContain` "exceeds the"
+          T.unpack msg `shouldContain` "char ceiling"
+          T.unpack msg `shouldContain` "offset/limit"
+        _ -> expectationFailure "expected a single TrpText part"
+
+  it "allows reading a file exceeding the char ceiling when paginating with limit" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      let ls = [T.replicate 100 "x" <> T.pack (show i) | i <- [1..1100 :: Int]]
+          body = unlinesStr ls
+      BS.writeFile (root </> "big.txt") body
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("big.txt" :: String)
+              , "limit" .= (10 :: Int)
+              ]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText out] -> T.unpack out `shouldContain` "more - read with offset="
+        _ -> expectationFailure "expected a single TrpText part"
+
+  it "allows reading a file exceeding the char ceiling when paginating with offset" $
+    withSystemTempDirectory "seal-ws" $ \root -> do
+      let ls = [T.replicate 100 "x" <> T.pack (show i) | i <- [1..1100 :: Int]]
+          body = unlinesStr ls
+      BS.writeFile (root </> "big.txt") body
+      let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+              [ "path" .= ("big.txt" :: String)
+              , "offset" .= (10 :: Int)
+              , "limit" .= (10 :: Int)
+              ]))
+      orIsError r `shouldBe` False
+
   describe "FILE_WRITE" $ do
 
     it "writes content to a file inside the workspace" $

@@ -29,9 +29,9 @@ import Seal.Core.Types
 import Seal.ISA.Opcode
 import Seal.Providers.Class
 import Seal.Security.Path
-import Seal.Text.LineFile (lwLines, lwTotal, lwTruncated, lwEnd, lwHasMore, renderWindow, windowLines)
-import Seal.Tools.Exec.UntrustedIO
 import Seal.Tools.Exec.Types (mkRemotePath)
+import Seal.Text.LineFile (lwLines, lwTotal, lwTruncated, lwEnd, lwHasMore, maxReadChars, renderWindow, windowLines)
+import Seal.Tools.Exec.UntrustedIO
 
 -- | Local schema for FILE_READ: required @path@ plus optional integer @offset@,
 -- @limit@, and @max_scan_bytes@. (A shared single-string schema helper cannot
@@ -50,14 +50,14 @@ fileReadSchema =
             [ "type" .= ("integer" :: Text)
             , "description" .=
                 ("0-based line index; the line displayed as N is offset N-1. \
-                 \Defaults to 0. Out-of-range or malformed values fall back to 0." :: Text)
+                 \Defaults to 0. Out-of-range or malformed values fall back to 0. \
+                 \Use offset+limit to paginate through files exceeding 100K chars." :: Text)
             ]
         , fromText "limit" .= object
             [ "type" .= ("integer" :: Text)
             , "description" .=
-                ("Maximum number of lines to return (clamped to the pager ceiling). \
-                 \Defaults to a pager-computed window size. Out-of-range or malformed \
-                 \values fall back to the default." :: Text)
+                ("Maximum number of lines to return (default 500, max 2000). \
+                 \Out-of-range or malformed values fall back to the default." :: Text)
             ]
         , fromText "max_scan_bytes" .= object
             [ "type" .= ("integer" :: Text)
@@ -65,9 +65,9 @@ fileReadSchema =
                 ("Per-call ceiling on the number of bytes scanned from the file, \
                  \clamped to the operator-configured upper bound. Defaults to that \
                  \operator bound. Out-of-range or malformed values fall back to the \
-                 \default; values above the operator bound are silently clamped down. \
-                 \A smaller value narrows the scan window but never widens the memory \
-                 \bound." :: Text)
+                 \default; values above the operator bound are silently clamped \
+                 \down. A smaller value narrows the scan window but never widens \
+                 \the memory bound." :: Text)
             ]
         ]
     , "required" .= (["path"] :: [Text])
@@ -172,22 +172,42 @@ fileReadOp _root operatorCeiling = UntrustedOpcode
                 True
                 recorded
             Right fullWin -> do
-              -- Apply the offset/limit windowing purely (the capability
-              -- returned a dynamic-page-sized window; the opcode re-windows
-              -- to the requested offset/limit). Preserve the total + truncated
-              -- flags from the capability's bounded read (so the footer
-              -- reflects the true file size + byte ceiling).
-              let win = windowLines defaultPageParams offset mLimit (lwLines fullWin)
-                  win' = win { lwTotal     = lwTotal fullWin
-                             , lwHasMore   = lwEnd win < lwTotal fullWin
-                                          || lwTruncated fullWin
-                             , lwTruncated = lwTruncated fullWin
-                             }
-              pure $ OpResult
-                [TrpText (renderWindow win')]
-                False
-                recorded
+              -- Character ceiling: if the file content exceeds maxReadChars
+              -- and the caller did not supply an explicit offset or limit,
+              -- reject outright (the model must paginate). When the caller
+              -- IS paginating, return the window normally. This mirrors
+              -- Hermes' read_file behavior.
+              let contentChars = sum (map T.length (lwLines fullWin))
+                  isPaginating = offset /= 0 || case mLimit of Just _ -> True; Nothing -> False
+              if contentChars > maxReadChars && not isPaginating
+                then pure $ OpResult
+                  [TrpText (T.pack (charCeilingMsg contentChars maxReadChars))]
+                  True
+                  recorded
+                else do
+                  -- Apply the offset/limit windowing purely (the capability
+                  -- returned a dynamic-page-sized window; the opcode re-windows
+                  -- to the requested offset/limit). Preserve the total +
+                  -- truncated flags from the capability's bounded read (so the
+                  -- footer reflects the true file size + byte ceiling).
+                  let win = windowLines defaultPageParams offset mLimit (lwLines fullWin)
+                      win' = win { lwTotal     = lwTotal fullWin
+                                 , lwHasMore   = lwEnd win < lwTotal fullWin
+                                              || lwTruncated fullWin
+                                 , lwTruncated = lwTruncated fullWin
+                                 }
+                  pure $ OpResult
+                    [TrpText (renderWindow win')]
+                    False
+                    recorded
   }
+
+-- | Error message for the character-ceiling rejection. Tells the model the
+-- file is too large for a single read and it must use offset/limit to chunk.
+charCeilingMsg :: Int -> Int -> String
+charCeilingMsg contentChars ceiling' =
+  "FILE_READ: file content (" <> show contentChars <> " chars) exceeds the "
+    <> show ceiling' <> "-char ceiling; use offset/limit to read it in chunks"
 
 -- | Resolve the per-call scan byte ceiling. The model's request (if any) is
 -- clamped to @[1, operatorCeiling]@; missing/malformed requests fall back to
