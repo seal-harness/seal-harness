@@ -43,7 +43,7 @@ import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -59,6 +59,7 @@ import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, rebindTabH, seedTabsHandle, snapshotTabs)
@@ -108,6 +109,11 @@ runServeMain autonomy logger = do
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
   backends <- newBackends cfgRoot repo
+  -- W4: the source-control repo registry handle (closes over
+  -- repos.toml). Built once at startup and threaded into ApiDeps for
+  -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on
+  -- each call so mutations from other processes are reflected.
+  repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -227,6 +233,8 @@ runServeMain autonomy logger = do
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
         , adBroker          = Just broker
         , adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
+        , adRepoRegistry     = repoRegH
+        , adConfigRepo       = repo
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

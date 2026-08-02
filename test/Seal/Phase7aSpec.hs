@@ -27,12 +27,14 @@ import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
+import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -49,6 +51,15 @@ runAppStatus app req = do
   mv <- newEmptyMVar
   _rr <- app req (\resp -> putMVar mv (statusCode (responseStatus resp)) >> pure ResponseReceived)
   takeMVar mv
+
+-- | A fake 'RepoRegistryHandle' (empty list, no-op mutate) for the Phase7a
+-- capstone's 'ApiDeps' literals — these tests don't exercise the repo CRUD
+-- path.
+fakeRepoRegistryHandle :: RepoRegistryHandle
+fakeRepoRegistryHandle = RepoRegistryHandle
+  { rrhList   = pure (Right [])
+  , rrhMutate = \_ -> pure (Right ())
+  }
 
 spec :: Spec
 spec = describe "Seal.Phase7aSpec" $ do
@@ -73,6 +84,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
+        , adRepoRegistry = fakeRepoRegistryHandle
+        , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -122,6 +135,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
+        , adRepoRegistry = fakeRepoRegistryHandle
+        , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

@@ -60,6 +60,7 @@ import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
 import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
@@ -179,6 +180,7 @@ mkDepsFor paths = do
   skills <- Skill.noneBackend
   activeRef <- newIORef fakeMeta
   uiState <- newUiStateHandle paths
+  repoRegH <- mkFakeRepoRegistryHandle
   let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
   pure ApiDeps
     { adSessionRuntime  = sr
@@ -193,7 +195,34 @@ mkDepsFor paths = do
     , adDefaultAgent    = pure Nothing
     , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = repoRegH
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
     }
+
+-- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
+-- registry and whose @rrhMutate@ always succeeds (no disk I/O). Used by
+-- tests that need an 'ApiDeps' but don't exercise the repo CRUD path.
+mkFakeRepoRegistryHandle :: IO RepoRegistryHandle
+mkFakeRepoRegistryHandle = pure fakeRepoRegistryHandle
+
+-- | The pure 'RepoRegistryHandle' value backing 'mkFakeRepoRegistryHandle'.
+-- Used by the inline @deps = ApiDeps {…}@ literals (which are in a pure
+-- @let@ context) so they don't need an IO action.
+fakeRepoRegistryHandle :: RepoRegistryHandle
+fakeRepoRegistryHandle = RepoRegistryHandle
+  { rrhList   = pure (Right [])
+  , rrhMutate = \_ -> pure (Right ())
+  }
+
+-- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns 'Left'
+-- (simulating a corrupt @repos.toml@). Used to assert GET /api/repos
+-- surfaces a corrupt registry as 500 (the AC5/S2 mitigation), NOT a silent
+-- empty list.
+mkCorruptRepoRegistryHandle :: IO RepoRegistryHandle
+mkCorruptRepoRegistryHandle = pure RepoRegistryHandle
+  { rrhList   = pure (Left "corrupt repos.toml: parse error")
+  , rrhMutate = \_ -> pure (Right ())
+  }
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
@@ -1523,6 +1552,8 @@ spec = describe "Seal.Gateway.API" $ do
                  , adDefaultAgent    = pure (Just "zoe")
                  , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1594,6 +1625,8 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1655,6 +1688,8 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1717,6 +1752,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1804,6 +1841,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1856,6 +1895,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1907,6 +1948,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1939,6 +1982,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -2023,6 +2068,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -2073,6 +2120,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -2122,6 +2171,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -2165,6 +2216,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -2179,6 +2232,385 @@ spec = describe "Seal.Gateway.API" $ do
             ids = map idOf xs
         ids `shouldBe` ["alpha", "zeta"]
       Nothing -> expectationFailure "expected a skills array"
+
+  -- ── Repo CRUD (W4) ───────────────────────────────────────────────────
+  -- The /api/repos surface: GET (list), POST (idempotent upsert, 201),
+  -- GET/:id, PUT/:id (200, 404 if missing), DELETE/:id (idempotent 204).
+  -- Validation: mkRepoId, urlShapeValid, host allow-list, parseVcsKind,
+  -- parseCredentialKind. A corrupt repos.toml surfaces as 500 (AC5/S2).
+  -- The credential object carries only vault key NAMES (never secret
+  -- bytes) — the no-secret-in-response guard asserts the descriptor never
+  -- leaks a token/value/secret/password field.
+  describe "/api/repos" $ do
+    -- Build an ApiDeps whose adRepoRegistry points at a REAL repos.toml
+    -- in a per-test temp dir (so upsert/remove persist across requests
+    -- within the test). The adConfigRepo is a nonexistent path — the
+    -- best-effort gitCommitAll is wrapped in try, so a missing repo is
+    -- harmless.
+    let mkRepoApp :: FilePath -> IO ApiDeps
+        mkRepoApp tmp = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          skills <- Skill.noneBackend
+          activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
+          repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+          pure ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = repoRegH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+            }
+
+    it "GET /api/repos returns 200 + [] when the registry is empty" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
+        status `shouldBe` 200
+        case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs `shouldBe` []
+          Nothing -> expectationFailure "expected a JSON array"
+
+    it "POST /api/repos creates a PAT repo (201) and GET /api/repos/:id returns it" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("myrepo" :: T.Text)
+            , "url"      .= ("git@github.com:owner/myrepo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("github_pat" :: T.Text)
+                ]
+            ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "id" o `shouldBe` Just (A.String "myrepo")
+            lookupK "url" o `shouldBe` Just (A.String "git@github.com:owner/myrepo.git")
+            lookupK "vcs_kind" o `shouldBe` Just (A.String "git")
+            case lookupK "credential" o of
+              Just (A.Object co) -> do
+                lookupK "kind" co `shouldBe` Just (A.String "pat")
+                lookupK "vault_key" co `shouldBe` Just (A.String "github_pat")
+                lookupK "username" co `shouldBe` Nothing
+              _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object for POST repo"
+        -- GET it back.
+        (_, body2) <- runAppBody app (testRequest methodGet ["api", "repos", "myrepo"])
+        case A.decode body2 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "myrepo")
+          _ -> expectationFailure "expected JSON object for GET repo"
+
+    it "POST /api/repos is idempotent upsert (same id, new url → 201 + updated)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        let postRepo urlStr = testPost ["api", "repos"]
+              (A.encode (A.object
+                [ "id"       .= ("r1" :: T.Text)
+                , "url"      .= (urlStr :: T.Text)
+                , "vcs_kind" .= ("github" :: T.Text)
+                , "credential" .= A.object
+                    [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+                ]))
+        req1 <- postRepo "https://github.com/owner/r1.git"
+        (st1, b1) <- runAppBody app req1
+        st1 `shouldBe` 201
+        case A.decode b1 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1.git")
+          _ -> expectationFailure "expected first POST body"
+        req2 <- postRepo "https://github.com/owner/r1-renamed.git"
+        (st2, b2) <- runAppBody app req2
+        st2 `shouldBe` 201
+        case A.decode b2 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1-renamed.git")
+          _ -> expectationFailure "expected second POST body"
+        -- GET reflects the updated url.
+        (_, b3) <- runAppBody app (testRequest methodGet ["api", "repos", "r1"])
+        case A.decode b3 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1-renamed.git")
+          _ -> expectationFailure "expected GET after upsert"
+
+    it "POST /api/repos with missing id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a bad id (slash) returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("bad/id" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with an empty url returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r2" :: T.Text)
+            , "url"      .= ("" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a malformed url (not SSH/HTTPS) returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r3" :: T.Text)
+            , "url"      .= ("not-a-url" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a disallowed host returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r4" :: T.Text)
+            , "url"      .= ("git@evil.com:owner/repo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with an unknown credential.kind returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r5" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("magic" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with machine_user but no username returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r6" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind" .= ("machine_user" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "PUT /api/repos/:id on a missing repo returns 404" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPut ["api", "repos", "ghost"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/ghost.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 404
+
+    it "PUT /api/repos/:id updates an existing repo (200 + updated descriptor)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("putr" :: T.Text)
+            , "url"      .= ("https://github.com/o/putr.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        putReq <- testPut ["api", "repos", "putr"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/putr-v2.git" :: T.Text)
+            , "vcs_kind" .= ("github" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("deploy_key" :: T.Text), "vault_key" .= ("dk" :: T.Text) ]
+            ]))
+        (st, body) <- runAppBody app putReq
+        st `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "id" o `shouldBe` Just (A.String "putr")
+            lookupK "url" o `shouldBe` Just (A.String "https://github.com/o/putr-v2.git")
+            lookupK "vcs_kind" o `shouldBe` Just (A.String "github")
+            case lookupK "credential" o of
+              Just (A.Object co) -> lookupK "kind" co `shouldBe` Just (A.String "deploy_key")
+              _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object for PUT repo"
+
+    it "DELETE /api/repos/:id returns 204 and is idempotent" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("delr" :: T.Text)
+            , "url"      .= ("https://github.com/o/delr.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        delReq1 <- testDelete ["api", "repos", "delr"]
+        st1 <- runAppStatus app delReq1
+        st1 `shouldBe` 204
+        -- GET → 404.
+        (_, body) <- runAppBody app (testRequest methodGet ["api", "repos", "delr"])
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+          _ -> expectationFailure "expected 404 object after delete"
+        -- Delete again → still 204 (idempotent).
+        delReq2 <- testDelete ["api", "repos", "delr"]
+        st2 <- runAppStatus app delReq2
+        st2 `shouldBe` 204
+
+    it "DELETE /api/repos/:id with a malformed id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testDelete ["api", "repos", "bad/id"]
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "GET /api/repos/:id with a malformed id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        (_, body) <- runAppBody app (testRequest methodGet ["api", "repos", "bad/id"])
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+          _ -> expectationFailure "expected 400 error object"
+
+    it "never leaks a secret value in the repo descriptor (vault_key is a NAME)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+            secretValue = "ghp_SUPERSECRET_never_in_response_12345"
+        -- POST a repo whose vault_key is a known name; the registry never
+        -- stores the secret VALUE, so no response field should match it.
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("sec" :: T.Text)
+            , "url"      .= ("https://github.com/o/sec.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind" .= ("machine_user" :: T.Text)
+                , "vault_key" .= ("github_token" :: T.Text)
+                , "username" .= ("bot-account" :: T.Text)
+                ]
+            ]))
+        (st, body) <- runAppBody app createReq
+        st `shouldBe` 201
+        let bodyText = T.pack (BC.unpack (BL.toStrict body))
+        -- The secret value must not appear anywhere in the response.
+        secretValue `T.isInfixOf` bodyText `shouldBe` False
+        -- The credential object carries the vault key NAME + username, and
+        -- has NO token/value/secret/password field.
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "credential" o of
+            Just (A.Object co) -> do
+              lookupK "vault_key" co `shouldBe` Just (A.String "github_token")
+              lookupK "username" co `shouldBe` Just (A.String "bot-account")
+              lookupK "token" co `shouldBe` Nothing
+              lookupK "value" co `shouldBe` Nothing
+              lookupK "secret" co `shouldBe` Nothing
+              lookupK "password" co `shouldBe` Nothing
+            _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object"
+        -- GET the list and the single repo — same guard.
+        (_, listBody) <- runAppBody app (testRequest methodGet ["api", "repos"])
+        let listText = T.pack (BC.unpack (BL.toStrict listBody))
+        secretValue `T.isInfixOf` listText `shouldBe` False
+        (_, oneBody) <- runAppBody app (testRequest methodGet ["api", "repos", "sec"])
+        let oneText = T.pack (BC.unpack (BL.toStrict oneBody))
+        secretValue `T.isInfixOf` oneText `shouldBe` False
+
+    it "GET /api/repos surfaces a corrupt repos.toml as 500 (NOT empty 200)" $ do
+      -- Build an ApiDeps whose adRepoRegistry returns Left on rrhList
+      -- (simulating a corrupt repos.toml). The handler must propagate the
+      -- error as 500, not silently return [].
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      skills <- Skill.noneBackend
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle mkPaths
+      corruptH <- mkCorruptRepoRegistryHandle
+      let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = corruptH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
+      status `shouldBe` 500
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+        _ -> expectationFailure "expected a 500 error JSON object"
 
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
@@ -2209,6 +2641,8 @@ spec = describe "Seal.Gateway.API" $ do
                 , adDefaultAgent    = pure Nothing
                 , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2434,6 +2868,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -2521,6 +2957,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -2640,6 +3078,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -2744,6 +3184,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

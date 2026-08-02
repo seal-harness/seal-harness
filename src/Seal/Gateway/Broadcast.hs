@@ -20,6 +20,7 @@ module Seal.Gateway.Broadcast
   , broadcastReplyDelivered
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
+  , broadcastReposChanged
   ) where
 
 import Data.Aeson (object, (.=))
@@ -34,7 +35,7 @@ import Data.Time (getCurrentTime)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
-import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged)
+import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
 import Seal.Gateway.Transcript (showIso)
 import Seal.Tabs (TabsHandle)
@@ -105,3 +106,10 @@ broadcastAgentDefsChanged mBroker =
 broadcastSkillsChanged :: Maybe StreamBroker -> IO ()
 broadcastSkillsChanged mBroker =
   for_ mBroker SB.broadcastSkillsChanged
+
+-- | Push a @repos-changed@ signal to every WS subscriber. The frontend
+-- re-fetches GET /api/repos on receipt. 'Nothing' broker (tests) is a
+-- no-op.
+broadcastReposChanged :: Maybe StreamBroker -> IO ()
+broadcastReposChanged mBroker =
+  for_ mBroker SB.broadcastReposChanged

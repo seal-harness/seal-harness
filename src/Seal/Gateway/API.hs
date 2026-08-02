@@ -12,6 +12,8 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
+import Control.Exception (SomeException, try)
+import Control.Monad (void)
 import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
@@ -41,12 +43,13 @@ import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (sessionMetaPath)
+import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
   , handleSetupRepo, sendOutcomeJson )
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
@@ -62,6 +65,11 @@ import Seal.Providers.Registry
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.SourceControl.Repo
+  ( RepoCredential, RepoId, SourceRepo (..), hostAllowed, mkRepoId
+  , parseCredentialKind, parseRepoHost, parseVcsKind, urlShapeValid )
+import Seal.SourceControl.Registry
+  ( RepoRegistryHandle (..), removeRepo, upsertRepo )
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
@@ -90,6 +98,8 @@ data ApiDeps = ApiDeps
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
   , adBroker          :: Maybe StreamBroker      -- ^ the WS broker for pushing @lists@ frames (W6 broadcast triggers); 'Nothing' in tests without a broker
   , adTabCloseNotifier :: TabCloseNotifier      -- ^ invoked after a tab is closed via the REST API so attached channels are notified; 'noTabCloseNotifier' in tests
+  , adRepoRegistry     :: RepoRegistryHandle    -- ^ for /api/repos CRUD (W4)
+  , adConfigRepo       :: ConfigRepo            -- ^ for the best-effort @gitCommitAll@ audit-commit of repos.toml after a mutation (W4)
   }
 
 -- | The REST API as a WAI Application.
@@ -334,6 +344,31 @@ apiApp deps req respond =
     -- not the skill existed). 400 on a malformed id.
     (m', ["api", "skills", sid]) | m' == methodDelete ->
       respond =<< handleSkillDelete deps sid
+    -- GET /api/repos -> all repos in the registry. A corrupt repos.toml
+    -- surfaces as 500 (NOT a silent empty list — the AC5/S2 mitigation).
+    (m', ["api", "repos"]) | m' == methodGet -> do
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
+        Left err -> respond (errJson status500 err)
+        Right rs -> respond (jsonLBS status200 (A.encode (map repoInfoJson rs)))
+    -- POST /api/repos -> create/replace a repo (idempotent upsert, 201).
+    (m', ["api", "repos"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleRepoCreate deps body
+    -- GET /api/repos/:id -> a single repo by id. 404 when absent, 400 on a
+    -- malformed id.
+    (m', ["api", "repos", rid]) | m' == methodGet ->
+      respond =<< handleRepoGet deps rid
+    -- PUT /api/repos/:id -> replace an existing repo (ids are stable; no
+    -- rename). 200 on success, 404 when the id doesn't already exist, 400
+    -- on a malformed id or invalid body.
+    (m', ["api", "repos", rid]) | m' == methodPut -> do
+      body <- collectBody req
+      respond =<< handleRepoUpdate deps rid body
+    -- DELETE /api/repos/:id -> remove a repo. Idempotent (204 whether or
+    -- not the repo existed). 400 on a malformed id.
+    (m', ["api", "repos", rid]) | m' == methodDelete ->
+      respond =<< handleRepoDelete deps rid
     -- T11: GET /api/providers -> the configured provider list. @isDefault@
     -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
     -- T11, so only @name@ is emitted.
@@ -1054,12 +1089,188 @@ parseSkillIdField (A.Object o) =
   case KeyMap.lookup (Key.fromText "id") o of
     Just (A.String t)
       | not (T.null (T.strip t)) -> case mkSkillId t of
-                                      Right sid -> Right sid
-                                      Left e    -> Left e
-      | otherwise                -> Left "id is empty"
+                                       Right sid -> Right sid
+                                       Left e    -> Left e
+       | otherwise                -> Left "id is empty"
     Just _                       -> Left "id must be a string"
     Nothing                      -> Left "id is required"
 parseSkillIdField _ = Left "id is required"
+
+-- ── Repo CRUD ─────────────────────────────────────────────────────────────
+
+-- | Map a 'SourceRepo' to the frontend's repo descriptor JSON. Uses the W1
+-- 'ToJSON SourceRepo' instance (the credential object carries only vault
+-- key /names/ + a public username — never secret bytes).
+repoInfoJson :: SourceRepo -> Value
+repoInfoJson = A.toJSON
+
+-- | Handle GET /api/repos/:id. Returns 200 + the repo on success, 404 when
+-- absent, 400 on a malformed id.
+handleRepoGet :: ApiDeps -> Text -> IO Response
+handleRepoGet deps ridTxt =
+  case mkRepoId ridTxt of
+    Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
+    Right rid -> do
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
+        Left err -> pure (errJson status500 err)
+        Right rs -> case findRepo rid rs of
+          Nothing -> pure (errJson status404 "repo not found")
+          Just r  -> pure (jsonOk (repoInfoJson r))
+
+-- | Handle POST /api/repos. The body carries @id@, @url@, @vcs_kind@, and a
+-- @credential@ object (@{kind, vault_key, username?}@). Validates the id
+-- ('mkRepoId'), URL shape ('urlShapeValid'), host allow-list
+-- ('parseRepoHost' + 'hostAllowed'), VCS kind, and credential kind. An
+-- existing repo with the same id is REPLACED (idempotent upsert, mirrors
+-- 'handleSkillCreate'). Returns 201 + the created descriptor. After a
+-- successful write, a best-effort @gitCommitAll@ audit-commits
+-- @repos.toml@ (a commit failure is swallowed — the registry write already
+-- succeeded) and a @repos-changed@ WS broadcast is fired.
+handleRepoCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleRepoCreate deps body =
+  case A.decode body :: Maybe A.Value of
+    Nothing -> pure (errJson status400 "invalid JSON body")
+    Just v  -> case parseRepoFromBody v of
+      Left e -> pure (errJson status400 e)
+      Right repo -> do
+        eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+        case eRes of
+          Left err -> pure (errJson status500 err)
+          Right _  -> do
+            bestEffortCommitRepos deps
+            broadcastReposChanged (adBroker deps)
+            pure (jsonCreated (repoInfoJson repo))
+
+-- | Handle PUT /api/repos/:id. The path id is authoritative; the body must
+-- carry @url@, @vcs_kind@, and @credential@ (the id may be omitted — it is
+-- taken from the path). The id must ALREADY exist (404 otherwise); ids are
+-- stable (no @new_id@ rename). Returns 200 + the updated descriptor on
+-- success. Same validation + best-effort commit + broadcast as Create.
+handleRepoUpdate :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleRepoUpdate deps ridTxt body =
+  case mkRepoId ridTxt of
+    Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
+    Right rid -> do
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
+        Left err -> pure (errJson status500 err)
+        Right rs
+          | not (any ((== rid) . srId) rs) -> pure (errJson status404 "repo not found")
+          | otherwise -> case A.decode body :: Maybe A.Value of
+              Nothing -> pure (errJson status400 "invalid JSON body")
+              Just v  -> case parseRepoWithId rid v of
+                Left e -> pure (errJson status400 e)
+                Right repo -> do
+                  eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+                  case eRes of
+                    Left err -> pure (errJson status500 err)
+                    Right _  -> do
+                      bestEffortCommitRepos deps
+                      broadcastReposChanged (adBroker deps)
+                      pure (jsonOk (repoInfoJson repo))
+
+-- | Handle DELETE /api/repos/:id. Idempotent: 204 whether or not the repo
+-- existed. 400 on a malformed id. Best-effort @gitCommitAll@ + broadcast
+-- after a successful mutation.
+handleRepoDelete :: ApiDeps -> Text -> IO Response
+handleRepoDelete deps ridTxt =
+  case mkRepoId ridTxt of
+    Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
+    Right rid -> do
+      _eRes <- rrhMutate (adRepoRegistry deps) (removeRepo rid)
+      case _eRes of
+        Left err -> pure (errJson status500 err)
+        Right _  -> do
+          bestEffortCommitRepos deps
+          broadcastReposChanged (adBroker deps)
+          pure noContent
+
+-- | Best-effort @gitCommitAll repos.toml@ after a registry mutation. The
+-- registry write already succeeded (atomic write+rename), so a commit
+-- failure (missing repo, git not on PATH, nothing to commit) is swallowed
+-- — wrapped in @try @SomeException@ so it never propagates to the HTTP
+-- response.
+bestEffortCommitRepos :: ApiDeps -> IO ()
+bestEffortCommitRepos deps =
+  void (try @SomeException (gitCommitAll (adConfigRepo deps) "repos.toml" "seal: update repo registry"))
+
+-- | Find a repo by id within a loaded list (the registry handle exposes
+-- only @rrhList@, so a single-repo lookup filters the whole list).
+findRepo :: RepoId -> [SourceRepo] -> Maybe SourceRepo
+findRepo rid = foldr (\r acc -> if srId r == rid then Just r else acc) Nothing
+
+-- | Parse a 'SourceRepo' from a POST /api/repos body. The @id@ field is
+-- authoritative and validated via 'mkRepoId'. Validates URL shape, host
+-- allow-list, VCS kind, and credential kind; returns a 'Left' error message
+-- on any validation failure.
+parseRepoFromBody :: A.Value -> Either Text SourceRepo
+parseRepoFromBody v@(A.Object o) = do
+  ridTxt <- case KeyMap.lookup (Key.fromText "id") o of
+    Just (A.String t) | not (T.null (T.strip t)) -> Right t
+    Just (A.String _) -> Left "id is empty"
+    Just _            -> Left "id must be a string"
+    Nothing           -> Left "id is required"
+  rid <- mkRepoId ridTxt
+  parseRepoWithId rid v
+parseRepoFromBody _ = Left "id is required"
+
+-- | Parse a 'SourceRepo' from a JSON body when the 'RepoId' is already
+-- known (e.g. taken from the PUT path). Validates @url@, @vcs_kind@, and
+-- @credential@. The @id@ field in the body (if present) is ignored — the
+-- path id wins.
+parseRepoWithId :: RepoId -> A.Value -> Either Text SourceRepo
+parseRepoWithId rid (A.Object o) = do
+  url <- case KeyMap.lookup (Key.fromText "url") o of
+    Just (A.String t) | not (T.null (T.strip t)) -> Right t
+    Just (A.String _) -> Left "url is empty"
+    Just _            -> Left "url must be a string"
+    Nothing           -> Left "url is required"
+  -- URL shape (SSH scp-form or HTTPS) — guards against malformed input
+  -- before the host allow-list check.
+  unlessRight (urlShapeValid url) "url is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+  -- Host allow-list (GitHub-first). A URL whose parsed host is not in
+  -- 'githubHosts' is rejected with 400.
+  host <- parseRepoHost url
+  unlessRight (hostAllowed host) ("host not allowed: " <> host)
+  vcsKindTxt <- case KeyMap.lookup (Key.fromText "vcs_kind") o of
+    Just (A.String t) | not (T.null (T.strip t)) -> Right t
+    Just (A.String _) -> Left "vcs_kind is empty"
+    Just _            -> Left "vcs_kind must be a string"
+    Nothing           -> Left "vcs_kind is required"
+  vcsKind <- parseVcsKind vcsKindTxt
+  cred <- case KeyMap.lookup (Key.fromText "credential") o of
+    Just (A.Object co) -> parseCredentialObj co
+    Just _             -> Left "credential must be an object"
+    Nothing            -> Left "credential is required"
+  Right SourceRepo { srId = rid, srUrl = url, srVcsKind = vcsKind, srCredential = cred }
+parseRepoWithId _ _ = Left "invalid JSON body"
+
+-- | Parse the @credential@ object (@{kind, vault_key, username?}@) into a
+-- 'RepoCredential' via 'parseCredentialKind'.
+parseCredentialObj :: KeyMap.KeyMap A.Value -> Either Text RepoCredential
+parseCredentialObj co = do
+  kind <- case KeyMap.lookup (Key.fromText "kind") co of
+    Just (A.String t) | not (T.null (T.strip t)) -> Right t
+    Just (A.String _) -> Left "credential.kind is empty"
+    Just _            -> Left "credential.kind must be a string"
+    Nothing           -> Left "credential.kind is required"
+  vaultKey <- case KeyMap.lookup (Key.fromText "vault_key") co of
+    Just (A.String t) | not (T.null (T.strip t)) -> Right t
+    Just (A.String _) -> Left "credential.vault_key is empty"
+    Just _            -> Left "credential.vault_key must be a string"
+    Nothing           -> Left "credential.vault_key is required"
+  mUsername <- case KeyMap.lookup (Key.fromText "username") co of
+    Just (A.String t) -> Right (Just t)
+    Just A.Null       -> Right Nothing
+    Just _            -> Left "credential.username must be a string"
+    Nothing           -> Right Nothing
+  parseCredentialKind kind vaultKey mUsername
+
+-- | Fail with @err@ when the predicate is @False@, otherwise pass through.
+unlessRight :: Bool -> Text -> Either Text ()
+unlessRight True _  = Right ()
+unlessRight False e = Left e
 
 -- | Encode the persisted 'UiState' for GET /api/ui/state. The shape mirrors
 -- the on-disk JSON: an object with @last_options@ (the LastOptions record)
