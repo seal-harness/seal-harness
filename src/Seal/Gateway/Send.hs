@@ -458,6 +458,7 @@ plainTurn deps meta t = do
                   (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                   Nothing
                   "web"
+                  (Just (replyFanout (sdReplies deps) sid))
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
               runApp appEnv (runTurn env t)
@@ -696,6 +697,7 @@ plainTurnWithCaps deps meta caps t = do
               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
               Nothing
               "web"
+              (Just (replyFanout (sdReplies deps) sid))
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
         result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
           runApp appEnv (runTurn env t)

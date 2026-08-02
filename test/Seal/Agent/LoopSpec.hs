@@ -144,12 +144,14 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
-    readIORef sent `shouldReturn` ["ollama/m> all done"]
+    -- Streaming: the final text "all done" is sent as a delta (no prefix).
+    readIORef sent `shouldReturn` ["all done"]
 
   it "writes the conversation + entries to the two-file transcript" $ do
     approvals <- newApprovalCache
@@ -181,6 +183,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -237,6 +240,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeDebugRequestsPath = Nothing
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       }
@@ -252,7 +256,7 @@ spec = describe "Seal.Agent.Loop" $ do
       -- (The provider also received the full history: assert that turn 2
       -- observed the prior conversation by checking the final assistant
       -- text is "ok" and nothing was duplicated into the output.)
-      readIORef sent `shouldReturn` ["ollama/m> hi back", "ollama/m> ok"]
+      readIORef sent `shouldReturn` ["hi back", "ok"]
 
   -- Debug-transcript: when aeDebugRequestsPath is set, each LLM request is
   -- written in full (including the complete message history) to requests.jsonl,
@@ -291,6 +295,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeDebugRequestsPath = Just reqPath
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       }
@@ -361,6 +366,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeDebugRequestsPath = Just reqPath
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
                       }
@@ -465,6 +471,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -504,6 +511,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -543,6 +551,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -593,6 +602,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -633,6 +643,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   }
@@ -672,6 +683,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   }
@@ -717,6 +729,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -768,6 +781,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -810,6 +824,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -850,6 +865,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -894,6 +910,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   }
@@ -944,6 +961,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -989,6 +1007,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -1030,6 +1049,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -1072,6 +1092,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -1124,6 +1145,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeDebugRequestsPath = Nothing
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
                 }
@@ -1167,6 +1189,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
                   }

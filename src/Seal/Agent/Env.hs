@@ -101,6 +101,16 @@ data AgentEnv = AgentEnv
     -- sidebar shows the session name immediately rather than after the
     -- first LLM response. 'Nothing' (the default) keeps the async
     -- 'tfwRecordAsync' write (no fsync latency at turn start).
+  , aeOnStop :: Maybe (Text -> IO ())
+    -- ^ When 'Just fanout', the loop calls @fanout text@ with the final
+    -- user-visible text at every stop branch (final answer, truncation
+    -- give-up, max-turns stop, provider error). This is the chat-channel
+    -- notification hook: wiring sites bind it to 'replyFanout' against the
+    -- session's 'ReplyRegistry' so every subscribed chat channel (Telegram,
+    -- Signal, …) attached to the tab receives the stop notice — not just
+    -- the arrival channel (which 'ccSend' covers). 'Nothing' (the default
+    -- for tests and the standalone CLI) means no fan-out; the arrival
+    -- channel alone is notified via 'ccSend'.
   , aeOnDemandSchemas :: Bool
     -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
     -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,

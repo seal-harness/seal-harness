@@ -146,6 +146,7 @@ spec = do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -175,7 +176,7 @@ spec = do
       -- hello routed → "hi from model" sent via the handle
       cap <- getCaptured
       map snd cap `shouldContain` ["pong"]
-      map snd cap `shouldContain` ["ollama/test> hi from model"]
+      map snd cap `shouldContain` ["hi from model"]
       all ((== "+15551234567") . fst) cap `shouldBe` True
       -- the transcript's request entry for hello carries channel=signal + conversationId
       (_, entries) <- readTranscript

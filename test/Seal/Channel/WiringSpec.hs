@@ -58,6 +58,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeDebugRequestsPath = Nothing
           , aeOnEntry = pure ()
           , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
           , aeOnDemandSchemas = False
           , aeLogPath = Nothing
           }
@@ -65,4 +66,4 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     env <- mkEnv logger defaultConfig
     handlePlain agentEnv env "hi"
     sent <- getSent fc
-    sent `shouldBe` ["ollama/test-model> hello from model"]
+    sent `shouldBe` ["hello from model"]

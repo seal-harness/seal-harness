@@ -129,6 +129,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                 }
@@ -158,7 +159,7 @@ spec = describe "Seal.Phase2bSpec" $ do
     -- /ping dispatched → pong sent via the handle
     map snd cap `shouldContain` ["pong"]
     -- hello routed → the model's reply sent via the handle
-    map snd cap `shouldContain` ["ollama/test> reply from model"]
+    map snd cap `shouldContain` ["reply from model"]
     -- all sends went to the allow-listed peer
     all ((== "+15551234567") . fst) cap `shouldBe` True
     -- the dropped env never reached the loop body (no send to +19999999999)
