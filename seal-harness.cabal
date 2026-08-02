@@ -115,8 +115,9 @@ library
         Seal.Session.Store
         Seal.Session.Workdir
          Seal.Session.Log
-         Seal.SourceControl.Repo
-         Seal.SourceControl.Registry
+          Seal.SourceControl.Repo
+          Seal.SourceControl.Registry
+         Seal.SourceControl.Clone
         Seal.Signal.Config
         Seal.Telegram.Config
         Seal.Security.Command
@@ -393,6 +394,7 @@ test-suite tests
         Seal.Session.LockSpec
         Seal.SourceControl.RepoSpec
         Seal.SourceControl.RegistrySpec
+        Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
