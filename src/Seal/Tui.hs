@@ -169,7 +169,7 @@ runTui autonomy logger = do
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH noTabCloseNotifier
+        , tabCommandSpec paths tabsH noTabCloseNotifier
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]

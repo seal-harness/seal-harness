@@ -12,12 +12,15 @@ module Seal.Command.Tab
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
+import System.Directory (doesFileExist)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
+import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (mkSessionId, sessionIdText)
+import Seal.Gateway.Transcript (firstUserMessageSnippet)
 import Seal.Handles.Tab (mkTabIndex, TabIndex, TabKind (..), tabIndexToChar)
 import Seal.Routing.Route (terseSynopsis)
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
@@ -39,13 +42,13 @@ noTabCloseNotifier _ = pure ()
 -- 'Seal.Routing.Route' as 'CurrentTab' (show the focused tab) BEFORE the
 -- registry is consulted, so this spec's parser only runs when a subcommand
 -- is present (@/tab list@, @/tab new@, etc.).
-tabCommandSpec :: TabsHandle -> TabCloseNotifier -> CommandSpec
-tabCommandSpec h closeNotifier = CommandSpec
+tabCommandSpec :: SealPaths -> TabsHandle -> TabCloseNotifier -> CommandSpec
+tabCommandSpec paths h closeNotifier = CommandSpec
   { csName         = CommandName "tab"
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Show current tab, or manage tabs (list/new/close/focus/resume/rename)"
-  , csParserInfo   = tabParserInfo h closeNotifier
+  , csParserInfo   = tabParserInfo paths h closeNotifier
   , csAvailability = AlwaysAvailable
   }
 
@@ -62,16 +65,16 @@ terseGrammarSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
 
-tabParserInfo :: TabsHandle -> TabCloseNotifier -> ParserInfo CommandAction
-tabParserInfo h closeNotifier =
-  info (tabParser h closeNotifier <**> helper)
+tabParserInfo :: SealPaths -> TabsHandle -> TabCloseNotifier -> ParserInfo CommandAction
+tabParserInfo paths h closeNotifier =
+  info (tabParser paths h closeNotifier <**> helper)
     (  progDesc "Manage tabs"
     <> header   "tab — manage tabs (new/list/close/focus/resume/rename)"
     )
 
-tabParser :: TabsHandle -> TabCloseNotifier -> Parser CommandAction
-tabParser h closeNotifier = hsubparser
-  $  command "list"   (info (pure (listCmd h))   (progDesc "List all tabs"))
+tabParser :: SealPaths -> TabsHandle -> TabCloseNotifier -> Parser CommandAction
+tabParser paths h closeNotifier = hsubparser
+  $  command "list"   (info (pure (listCmd paths h))   (progDesc "List all tabs"))
   <> command "new"    (info (newCmd h <$> optional kindArg)
                                  (progDesc "Create a new tab (default kind: ai)"))
   <> command "close"  (info (closeCmd h closeNotifier <$> tabIndexArg <*> forceFlag)
@@ -84,13 +87,31 @@ tabParser h closeNotifier = hsubparser
                                  (progDesc "Rename a tab by index"))
   <> metavar "COMMAND"
 
--- | The /tab list subcommand.
-listCmd :: TabsHandle -> CommandAction
-listCmd h = CommandAction $ \caps -> do
+-- | The /tab list subcommand. Resolves each tab's display name: the
+-- user-set label (if any), or the first user message snippet (matching
+-- the web frontend's 'sessionDisplayTitle' cascade) for session-backed
+-- tabs with no label.
+listCmd :: SealPaths -> TabsHandle -> CommandAction
+listCmd paths h = CommandAction $ \caps -> do
   tl <- snapshotTabs h
   if tabCount tl == 0
     then ccSend caps "no tabs"
-    else mapM_ (ccSend caps . renderTabLine) (tlTabs tl)
+    else do
+      names <- mapM (resolveTabName paths) (tlTabs tl)
+      mapM_ (ccSend caps . uncurry renderTabLine) (zip names (tlTabs tl))
+
+-- | Resolve a tab's display name. Returns 'Nothing' when no name is
+-- available (no label, no transcript, or a harness tab with no label).
+resolveTabName :: SealPaths -> Tab -> IO (Maybe Text)
+resolveTabName paths t
+  | Just label <- tLabel t = pure (Just label)
+  | BoundSession sid <- tRef t = do
+      let mp = sessionMetaPath paths sid
+      exists <- doesFileExist mp
+      if not exists
+        then pure Nothing
+        else firstUserMessageSnippet paths sid
+  | otherwise = pure Nothing
 
 -- | The /tab new subcommand. (For 6b the kind is informational; a session
 -- tab is the default. A harness tab needs the wizard — deferred.)
@@ -166,11 +187,12 @@ renameCmd h idx name = CommandAction $ \caps -> do
         Left e  -> ccSend caps ("rename failed: " <> e)
         Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " renamed to " <> name)
 
--- | One line per tab for /tab list.
-renderTabLine :: Tab -> Text
-renderTabLine t =
+-- | One line per tab for /tab list. The display name (label or snippet) is
+-- resolved by 'resolveTabName' and passed as 'mName'.
+renderTabLine :: Maybe Text -> Tab -> Text
+renderTabLine mName t =
   T.singleton (tabIndexToChar (tIndex t)) <> "  " <> kindText (tKind t)
-    <> maybe "" ("  " <>) (tLabel t)
+    <> maybe "" ("  " <>) mName
     <> "  " <> refText (tRef t)
   where
     kindText = T.pack . show
