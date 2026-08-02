@@ -44,6 +44,18 @@ import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
 import Seal.Security.Secrets (ApiKey, withApiKey)
 
+-- | Response timeout for Ollama @/api/chat@ requests, in microseconds.
+-- The 'newTlsManager' default is 90 seconds, which is too short for
+-- non-streaming requests to remote models proxied through the local Ollama
+-- daemon (e.g. @glm-5.2:cloud@): with a large context (49k+ input tokens)
+-- the model can take 74+ seconds to generate the full response before
+-- returning it in one shot. A 5-minute timeout gives generous headroom for
+-- large-context non-streaming generation. This is a per-request override
+-- (the manager's default is not changed, so other HTTP clients in the
+-- process keep their own timeouts).
+ollamaResponseTimeoutMicro :: Int
+ollamaResponseTimeoutMicro = 300_000_000  -- 5 minutes
+
 -- Data type ----------------------------------------------------------------
 
 data Ollama = Ollama
@@ -208,6 +220,21 @@ unreachableMsg base =
   "could not reach Ollama at " <> base
     <> " — is it running and the URL correct? (try: ollama serve)"
 
+-- | Render an 'HttpException' as a user-facing error. A response timeout
+-- (the model took longer than 'ollamaResponseTimeoutMicro' to generate)
+-- gets a distinct message so the user knows the daemon is running but the
+-- model was too slow — not that the daemon is down. Other transport errors
+-- (connection refused, etc.) use the generic 'unreachableMsg'.
+ollamaHttpExceptionMsg :: Text -> HttpException -> Text
+ollamaHttpExceptionMsg base = \case
+  HttpExceptionRequest _ ResponseTimeout ->
+    "Ollama response timed out after "
+      <> T.pack (show (ollamaResponseTimeoutMicro `div` 1_000_000))
+      <> "s — the model (likely a remote/cloud model with a large context) \
+         \took too long to respond. Try reducing the conversation context, \
+         \switching to a faster/local model, or send \"continue\" to retry."
+  _ -> unreachableMsg base
+
 -- HTTP round-trip ----------------------------------------------------------
 
 -- | POST {base}/api/chat with the given headers; decode, or return a key-safe
@@ -221,10 +248,11 @@ sendChat o hdrs cr = do
     let req = initReq
           { requestBody     = RequestBodyLBS (encode (encodeRequest cr))
           , requestHeaders  = hdrs
+          , responseTimeout  = responseTimeoutMicro ollamaResponseTimeoutMicro
           }
     httpLbs req (olManager o)
   case result of
-    Left (_ :: HttpException) -> pure (Left (unreachableMsg (olBaseUrl o)))
+    Left (e :: HttpException) -> pure (Left (ollamaHttpExceptionMsg (olBaseUrl o) e))
     Right resp -> do
       let code = statusCode (responseStatus resp)
       if code >= 200 && code <= 299
@@ -262,7 +290,7 @@ listTags mgr base hdrs = do
     initReq <- parseRequest (T.unpack ("GET " <> tagsUrl base))
     httpLbs initReq { requestHeaders = hdrs } mgr
   case result of
-    Left (_ :: HttpException) -> pure (Left (unreachableMsg base))
+    Left (e :: HttpException) -> pure (Left (ollamaHttpExceptionMsg base e))
     Right resp -> do
       let code = statusCode (responseStatus resp)
       if code >= 200 && code <= 299
