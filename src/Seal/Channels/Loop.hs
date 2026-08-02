@@ -749,7 +749,8 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                        (Just (sessionLogPath paths sid))
                        (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                        onUserMessage
-                       (smChannel meta))
+                       (smChannel meta)
+                       (Just (replyFanout (cdReplies deps) sid)))
                       { aeMessageSource = mSrc }
           eResult <- withExceptionLogging (cdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
             runApp appEnv (runTurn env t)

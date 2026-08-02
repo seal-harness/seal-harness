@@ -175,6 +175,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -190,7 +191,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       length msgs `shouldSatisfy` (> 0)
       length entries `shouldSatisfy` (>= 2)
       -- 4. The model saw the final text.
-      readIORef sent `shouldReturn` ["ollama/llama3> all four evolutionary mutations applied"]
+      readIORef sent `shouldReturn` ["all four evolutionary mutations applied"]
 
   it "AGENT_START runs synchronously and returns a summary (Trusted, no Audited log)" $
     withSystemTempDirectory "seal-phase5" $ \root -> do
