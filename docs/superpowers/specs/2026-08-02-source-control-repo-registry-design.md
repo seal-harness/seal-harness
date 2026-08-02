@@ -284,7 +284,7 @@ data CloneError
   = CloneVaultError VaultError          -- carries VaultLocked / VaultKeyNotFound distinctly
   | CloneNoCredentialForUrl Text        -- URL has no resolvable auth path
   | CloneUnsupportedVcs VcsKind
-  = CloneHostNotSupported Text          -- parsed host not in the allow-list (§5)
+  | CloneHostNotSupported Text          -- parsed host not in the allow-list (§5)
   | CloneGitFailed Int                  -- exit code ONLY; no stderr (§5)
 
 -- | The resolved, ready-to-run clone. Constructors NOT exported; the only
@@ -346,7 +346,7 @@ cloneRepo :: VaultHandle -> FilePath -> FilePath -> SourceRepo
   with env `GIT_ASKPASS=<helper-script> GIT_TERMINAL_PROMPT=0` and, for
   MachineUser, the helper echoes `<username>:<token>` (Basic auth) instead of
   just the token. The token-free URL means `ps`/`/proc/<pid>/cmdline` show no
-  secret.
+  secret; `GIT_ASKPASS`'s env value is a non-secret path.
 
 - `git@github.com:owner/repo.git` with `CredDeployKey { vaultKey }`:
   → `ClonePlanSshKey <ssh-url> vaultKey`. URL unchanged. At clone time:
@@ -573,10 +573,16 @@ and exfiltrate the token.
   git's credential prompt. `git clone -- https://github.com/owner/repo.git`
   (token-free URL). The token appears only (a) in the helper script's bytes on
   disk (0700, private dir, short-lived) and (b) on the pipe between the harness
-  and git — never in argv, never in the URL, never in the environment.
+  and git — never in argv, never in the URL. `GIT_ASKPASS=<path>` IS in the
+  child's environment, but the path is not a secret (the script is 0700 and
+  bracket-deleted); the *token* is not in the environment. (This is why
+  `GIT_CONFIG_GLOBAL=<file-with-token>` was rejected: that env var's target file
+  would carry the token, and env vars leak via `/proc/<pid>/environ` —
+  `GIT_ASKPASS`'s env value is just a non-secret path.)
 - DeployKey: the *key bytes* are in a 0600 keyfile (path in `GIT_SSH_COMMAND`'s
   env, but the bytes are not in argv); the keyfile is under `repoCloneStateDir`
-  (0700 parent, `O_EXCL` create, random suffix, bracket-deleted).
+  (0700 parent, `O_EXCL` create, random suffix, bracket-deleted). The
+  `GIT_SSH_COMMAND` env value contains the keyfile *path* (not the key bytes).
 
 **Residual (accepted):** the helper-script bytes and keyfile bytes are briefly
 on disk (0700, private dir). A co-resident process with the harness user's
