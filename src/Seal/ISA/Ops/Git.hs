@@ -34,6 +34,8 @@ module Seal.ISA.Ops.Git
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (parseMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -243,10 +245,16 @@ mkErr opNm msg =
 
 -- | Re-build the recorded object with @credential_kind@ + a status (for
 -- GIT_PUSH audit — secret-free; the credential_kind is a public string like
--- @pat@ / @deploy_key@ / @machine_user@, NOT the secret itself).
+-- @pat@ / @deploy_key@ / @machine_user@, NOT the secret itself). Merges
+-- into the base recorded object (which carries @workdir@ + @verb@) so the
+-- audit entry is complete: @{workdir, verb, credential_kind, status}@.
 recordWithCred :: Value -> Text -> Text -> Value
-recordWithCred _base credKind status =
-  object [ "credential_kind" .= credKind, "status" .= status ]
+recordWithCred base credKind status =
+  case base of
+    A.Object o -> A.Object
+      ( KM.insert "credential_kind" (A.String credKind)
+      ( KM.insert "status" (A.String status) o ) )
+    _ -> object [ "credential_kind" .= credKind, "status" .= status ]
 
 -- | Construct a 'ShellCommand', total on internally-built command strings.
 shellCmd :: Text -> ShellCommand

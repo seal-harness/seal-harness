@@ -82,6 +82,14 @@ sshExecArgv cfg cmd =
 -- remote @git@ can sign via the forwarded @SSH_AUTH_SOCK@. The @-A@ is
 -- opt-in per git-op — non-credential remote ops use 'sshExecArgv' (no
 -- @-A@) to keep the signing-oracle surface minimal (design §5.6).
+--
+-- TODO(future): wire 'runRemoteShellForwarding' into the remote arm of
+-- 'uioShellExecEnv' (UntrustedIO.hs) so deploy-key ops work on the remote
+-- untrusted executor. Currently the remote arm uses 'runRemoteShellText'
+-- (no @-A@), so deploy-key ops only work on the LOCAL executor (the local
+-- arm merges @SSH_AUTH_SOCK@ over the inherited env). The remote
+-- @-A@-wiring is the hardened path (the key never crosses) — tracked as
+-- a follow-up. PAT ops work on both executors (token in argv, no agent).
 sshExecArgvForwarding :: SshConfig -> Text -> [String]
 sshExecArgvForwarding cfg cmd =
   [ "ssh", "-A"
