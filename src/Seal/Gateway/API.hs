@@ -1808,7 +1808,7 @@ generateDeployKey vh vaultKey keyfilePath repoId = do
     Right _ -> do
       -- Run ssh-keygen to overwrite the encrypted keyfile + .pub.
       let args = ["-t", "ed25519", "-f", keyfilePath, "-N", T.unpack passphrase
-                 , "-C", "seal-deploy-key:" <> T.unpack repoId]
+                 , "-C", "seal-deploy-key-" <> T.unpack repoId]
       (ec, _out, err) <- readCreateProcessWithExitCode (proc "ssh-keygen" args) ""
       case ec of
         ExitSuccess -> do
