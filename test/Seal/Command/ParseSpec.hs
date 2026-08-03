@@ -10,6 +10,7 @@ import Test.QuickCheck
 import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps(..))
+import Data.Default (def)
 import Seal.Command.Spec
 import Seal.Command.Parse
 
@@ -189,10 +190,11 @@ spec = describe "Seal.Command.Parse" $ do
 
     it "/ping (no flags) -> ParsedAction" $ do
       ref <- newIORef ("" :: Text)
-      let caps = ChannelCaps
+      let caps = def
             { ccSend         = writeIORef ref
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
       case parseSlash testRegistry "/ping" of
         ParsedAction cmd -> do
@@ -202,10 +204,11 @@ spec = describe "Seal.Command.Parse" $ do
 
     it "/ping --loud -> ParsedAction that sends PONG!" $ do
       ref <- newIORef ("" :: Text)
-      let caps = ChannelCaps
+      let caps = def
             { ccSend         = writeIORef ref
             , ccPrompt       = \_ -> pure ""
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
       case parseSlash testRegistry "/ping --loud" of
         ParsedAction cmd -> do

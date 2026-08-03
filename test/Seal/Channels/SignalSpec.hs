@@ -103,11 +103,11 @@ spec = describe "Seal.Channels.Signal" $ do
       r <- chPrompt (toHandle ch) "q?"
       r `shouldBe` Left Deferred
 
-  it "chStreaming is True for Signal" $ do
+  it "chStreaming is False for Signal" $ do
     (transport, _) <- mkMockSignalTransport []
     logger <- testSealLogger
     withSignalChannel (AllowAll, 1998) acct transport logger $ \ch ->
-      chStreaming (toHandle ch) `shouldBe` True
+      chStreaming (toHandle ch) `shouldBe` False
 
 -- | Build the AllowList UserId for the test from a phone number.
 mkAllowedUserId :: Text -> UserId

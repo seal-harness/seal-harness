@@ -187,10 +187,12 @@ runTurn env userText = do
       -- Events are collected in an IORef so we can reconstruct the final
       -- ContentBlocks for the transcript entry after the stream completes.
       collectedRef <- liftIO (newIORef ([] :: [StreamEvent]))
+      let streamSends = ccStreaming (aeCaps env)
       let isTransient = isTransientError
       estream <- liftIO (providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
         case ev of
-          StreamTextChunk delta -> do
+          StreamTextChunk delta
+            | streamSends -> do
             ccSend (aeCaps env) delta
           _ -> pure ()
         modifyIORef' collectedRef (++ [ev])
@@ -222,7 +224,7 @@ runTurn env userText = do
         Right outcome -> do
           events <- liftIO (readIORef collectedRef)
           let resp = aggregateStreamEvents events outcome
-          handleResponse env tStart n lenContinue msgs resp True
+          handleResponse env tStart n lenContinue msgs resp streamSends
 
     -- | Handle a completed provider response: record it to the transcript,
     -- then branch on tool calls vs final text vs StopMaxTokens. When

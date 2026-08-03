@@ -203,6 +203,7 @@ library
         base >= 4.18 && < 5
       , aeson
       , base64-bytestring
+      , data-default
       , bytestring
       , configuration-tools
       , containers
@@ -259,6 +260,7 @@ test-suite tests
         base
       , seal-harness
       , QuickCheck
+      , data-default
       , aeson
       , async
       , bytestring

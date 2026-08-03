@@ -9,6 +9,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Parse (parseSlash, ParseOutcome (..))
 import Seal.Command.Spec (CommandAction(..), mkRegistry)
@@ -23,10 +24,11 @@ import Seal.Tabs.Types (Tab (..), TabList(..), TabRef(..), tabCount)
 recordingCaps :: IO (IORef [Text], ChannelCaps)
 recordingCaps = do
   ref <- newIORef []
-  pure (ref, ChannelCaps
+  pure (ref, def
     { ccSend = \t -> modifyIORef' ref (t :)
     , ccPrompt = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
     })
 
 -- | A dummy SealPaths for tests that don't need real session resolution.

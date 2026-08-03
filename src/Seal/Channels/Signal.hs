@@ -54,7 +54,7 @@ instance Channel SignalChannel where
     , chSendChunk    = sendRaw ch
     , chPrompt       = \_ -> pure (Left Deferred)   -- Signal can't answer inline
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = True
+    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
     , chReadSecret   = pure Nothing                  -- vault is reached via the vault handle
     , chReceive      = receiveFromInbox ch
     }
