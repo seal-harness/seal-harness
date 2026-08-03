@@ -257,6 +257,46 @@ export interface SkillInput {
   body?: string
 }
 
+// ── Source-control repo registry ─────────────────────────────────────────
+
+/** The credential kind for a source-control repo. */
+export type RepoCredentialKind = 'pat' | 'deploy_key' | 'machine_user'
+
+/** The credential descriptor stored in repos.toml — a vault key NAME, never
+ *  a secret value. The actual credential lives in the Seal vault. */
+export interface RepoCredential {
+  kind: RepoCredentialKind
+  vault_key: string
+  username?: string   // only for machine_user
+}
+
+/** A source-control repo returned by GET /api/repos + GET /api/repos/:id, and
+ *  accepted by POST /api/repos + PUT /api/repos/:id. Mirrors the backend
+ *  SourceRepo JSON (snake_case wire). No secret-value field ever appears. */
+export interface RepoInfo {
+  id: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+}
+
+/** The body for POST /api/repos + PUT /api/repos/:id. The id is required for
+ *  POST; PUT takes the id from the path. No new_id (ids are stable). */
+export interface RepoInput {
+  id?: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+}
+
+/** Human-readable label for each credential kind (mirrors the backend
+ *  credentialKindLabel + the /repo --cred help text). */
+export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
+  pat: 'Personal Access Token',
+  deploy_key: 'SSH Deploy Key',
+  machine_user: 'Bot Account',
+}
+
 // ── Transcript ─────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {

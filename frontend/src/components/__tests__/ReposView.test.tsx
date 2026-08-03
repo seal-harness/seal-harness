@@ -1,0 +1,187 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { ReposView } from '../ReposView'
+import type { RepoInfo } from '../../types'
+
+// ── Mocks ────────────────────────────────────────────────────────────────
+
+const createRepo = vi.fn(async (_input: unknown): Promise<RepoInfo | null> => null)
+const updateRepo = vi.fn(async (_id: string, _input: unknown): Promise<RepoInfo | null> => null)
+const deleteRepo = vi.fn(async (_id: string): Promise<boolean> => false)
+
+let reposState: RepoInfo[] = []
+let reposError = false
+let reposLoaded = true
+
+vi.mock('../../hooks/useApi', () => ({
+  createRepo: (input: unknown) => createRepo(input),
+  updateRepo: (id: string, input: unknown) => updateRepo(id, input),
+  deleteRepo: (id: string) => deleteRepo(id),
+  useRepos: () => ({
+    repos: reposState,
+    loaded: reposLoaded,
+    error: reposError,
+    refresh: vi.fn(),
+  }),
+}))
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+function makeRepo(overrides: Partial<RepoInfo> = {}): RepoInfo {
+  return {
+    id: 'myrepo',
+    url: 'git@github.com:owner/repo.git',
+    vcs_kind: 'github',
+    credential: { kind: 'pat', vault_key: 'GITHUB_PAT_MYREPO' },
+    ...overrides,
+  }
+}
+
+beforeEach(() => {
+  reposState = []
+  reposError = false
+  reposLoaded = true
+  createRepo.mockReset()
+  updateRepo.mockReset()
+  deleteRepo.mockReset()
+  createRepo.mockResolvedValue(null)
+  updateRepo.mockResolvedValue(null)
+  deleteRepo.mockResolvedValue(false)
+})
+
+afterEach(() => {
+  cleanup()
+})
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+describe('ReposView', () => {
+  it('renders an empty state when no repos exist', () => {
+    reposState = []
+    render(<ReposView />)
+    expect(screen.getByText(/No repos registered/i)).toBeTruthy()
+  })
+
+  it('renders a row per repo with a human-readable credential-kind badge', () => {
+    reposState = [
+      makeRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } }),
+      makeRepo({ id: 'other', url: 'git@github.com:owner/other.git', credential: { kind: 'deploy_key', vault_key: 'GH_DEPLOY' } }),
+    ]
+    render(<ReposView />)
+    expect(screen.getByTestId('repo-row-myrepo')).toBeTruthy()
+    expect(screen.getByTestId('repo-row-other')).toBeTruthy()
+    // Human-readable credential-kind label (NOT the raw enum).
+    expect(screen.getByText('Personal Access Token')).toBeTruthy()
+    expect(screen.getByText('SSH Deploy Key')).toBeTruthy()
+  })
+
+  it('shows the load error banner when error=true', () => {
+    reposError = true
+    render(<ReposView />)
+    expect(screen.getByTestId('repos-load-error')).toBeTruthy()
+  })
+
+  it('clicking New opens the create form', () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    expect(screen.getByTestId('repo-form-new')).toBeTruthy()
+    expect(screen.getByLabelText('Create repo')).toBeTruthy()
+  })
+
+  it('create POSTs /api/repos on a valid form', async () => {
+    createRepo.mockResolvedValue(makeRepo({ id: 'myrepo' }))
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
+    fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
+    // vcs_kind defaults to github; leave as-is.
+    fireEvent.change(document.getElementById('repo-vault-key') as HTMLInputElement, { target: { value: 'GITHUB_PAT_MYREPO' } })
+    fireEvent.click(screen.getByLabelText('Create repo'))
+    await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
+    const body = createRepo.mock.calls[0]![0] as { id?: string; url: string; vcs_kind: string; credential: { kind: string; vault_key: string } }
+    expect(body.id).toBe('myrepo')
+    expect(body.url).toBe('git@github.com:owner/repo.git')
+    expect(body.vcs_kind).toBe('github')
+    expect(body.credential.kind).toBe('pat')
+    expect(body.credential.vault_key).toBe('GITHUB_PAT_MYREPO')
+  })
+
+  it('create validates the id charset and surfaces an error for a bad id', () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'bad/id' } })
+    fireEvent.click(screen.getByLabelText('Create repo'))
+    expect(screen.getByTestId('repo-form-error')).toBeTruthy()
+    expect(createRepo).not.toHaveBeenCalled()
+  })
+
+  it('edit flow: clicking a row seeds the form; Save PUTs /api/repos/:id (id disabled)', async () => {
+    updateRepo.mockResolvedValue(makeRepo({ id: 'myrepo', url: 'git@github.com:owner/repo2.git' }))
+    reposState = [makeRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })]
+    render(<ReposView />)
+    fireEvent.click(screen.getByTestId('repo-row-myrepo'))
+    expect(screen.getByTestId('repo-form-myrepo')).toBeTruthy()
+    const idEl = document.getElementById('repo-id') as HTMLInputElement
+    // id is stable → disabled when editing.
+    expect(idEl.disabled).toBe(true)
+    expect(idEl.value).toBe('myrepo')
+    fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo2.git' } })
+    fireEvent.click(screen.getByLabelText('Save repo'))
+    await waitFor(() => expect(updateRepo).toHaveBeenCalledTimes(1))
+    expect(updateRepo.mock.calls[0]![0]).toBe('myrepo')
+    const body = updateRepo.mock.calls[0]![1] as { id?: string; new_id?: string; url: string; credential: { kind: string; vault_key: string } }
+    // No id/new_id in the PUT body — ids are stable.
+    expect(body.id).toBeUndefined()
+    expect(body.new_id).toBeUndefined()
+    expect(body.url).toBe('git@github.com:owner/repo2.git')
+  })
+
+  it('delete flow: trash → confirm → DELETE /api/repos/:id', async () => {
+    deleteRepo.mockResolvedValue(true)
+    reposState = [makeRepo({ id: 'myrepo' })]
+    render(<ReposView />)
+    fireEvent.click(screen.getByTestId('repo-row-myrepo'))
+    fireEvent.click(screen.getByLabelText('Delete repo'))
+    expect(screen.getByTestId('repo-delete-confirm')).toBeTruthy()
+    fireEvent.click(screen.getByText('Confirm delete'))
+    await waitFor(() => expect(deleteRepo).toHaveBeenCalledWith('myrepo'))
+  })
+
+  it('machine_user shows the username field; other kinds hide it', () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    // Select "Bot Account" (machine_user) → username field appears.
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'machine_user' } })
+    expect(document.getElementById('repo-username')).not.toBeNull()
+    // Switch back to "Personal Access Token" (pat) → username field hidden.
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    expect(document.getElementById('repo-username')).toBeNull()
+  })
+
+  it('has NO secret-value field (security invariant)', () => {
+    // The editor form must never render an input whose name/id suggests a
+    // secret VALUE (token/value/secret/password). The only credential
+    // inputs are vault_key (a vault key NAME) and username (a bot account
+    // name) — never the secret itself.
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    const pane = screen.getByTestId('repo-form-new')
+    const inputs = pane.querySelectorAll('input, textarea, select')
+    const forbiddenIds = ['token', 'value', 'secret', 'password', 'credential_value', 'cred_value', 'secret_value']
+    for (const el of inputs) {
+      const id = (el as HTMLElement).getAttribute('id') ?? ''
+      const name = (el as HTMLElement).getAttribute('name') ?? ''
+      for (const bad of forbiddenIds) {
+        expect(id.toLowerCase()).not.toContain(bad)
+        expect(name.toLowerCase()).not.toContain(bad)
+      }
+    }
+    // Sanity: the expected credential inputs ARE present.
+    expect(document.getElementById('repo-vault-key')).not.toBeNull()
+  })
+})

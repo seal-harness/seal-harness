@@ -6,6 +6,8 @@ import type {
   DiscoverableWindow,
   HarnessInfo,
   ProviderInfo,
+  RepoInfo,
+  RepoInput,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -1018,6 +1020,97 @@ export function useSkills() {
   }, [refresh])
 
   return { skills, loaded, error, refresh }
+}
+
+// ── Repo CRUD ───────────────────────────────────────────────────────────
+
+/** Fetch all source-control repos. Returns null on any failure. */
+export async function fetchRepos(): Promise<RepoInfo[] | null> {
+  return fetchJson<RepoInfo[]>('/api/repos')
+}
+
+/** Fetch a single repo by id. Returns null on any failure (including 404). */
+export async function fetchRepo(id: string): Promise<RepoInfo | null> {
+  return fetchJson<RepoInfo>(`/api/repos/${encodeURIComponent(id)}`)
+}
+
+/** Create a new source-control repo. The body must include `id`. Returns
+ *  the created repo on success, null on failure. */
+export async function createRepo(input: RepoInput): Promise<RepoInfo | null> {
+  try {
+    const res = await fetch('/api/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as RepoInfo
+  } catch {
+    return null
+  }
+}
+
+/** Replace an existing source-control repo. The id is taken from the path;
+ *  ids are stable so there is NO new_id field. Returns the updated repo on
+ *  success, null on failure. */
+export async function updateRepo(id: string, input: RepoInput): Promise<RepoInfo | null> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as RepoInfo
+  } catch {
+    return null
+  }
+}
+
+/** Delete a source-control repo by id. Returns true when the backend
+ *  accepted the delete (204 — idempotent). */
+export async function deleteRepo(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of source-control repos. Mirrors `useSkills`. Re-fetches
+ *  on the `repos-changed` WS invalidation frame. The `refresh` action
+ *  forces an immediate re-fetch so callers see their own mutations. */
+export function useRepos() {
+  const [repos, setRepos] = useState<RepoInfo[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchRepos().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setRepos(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  // Re-fetch when the WS signals repos changed (no polling).
+  useEffect(() => {
+    const unsub = streamClient().onReposChanged(() => refresh())
+    return unsub
+  }, [refresh])
+
+  return { repos, loaded, error, refresh }
 }
 
 // ── Default agent ────────────────────────────────────────────────────────

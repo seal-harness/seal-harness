@@ -122,6 +122,10 @@ export interface SkillsChangedEvent {
   type: 'skills-changed'
 }
 
+export interface ReposChangedEvent {
+  type: 'repos-changed'
+}
+
 export type ServerEvent =
   | HelloEvent
   | EntryEvent
@@ -135,6 +139,7 @@ export type ServerEvent =
   | AskResolvedEvent
   | AgentDefsChangedEvent
   | SkillsChangedEvent
+  | ReposChangedEvent
 
 // ── Client → Server ────────────────────────────────────────────────────
 
@@ -180,6 +185,8 @@ export interface StreamClient {
   onAgentDefsChanged(cb: () => void): () => void
   /** Subscribe to skills-changed invalidation signals (re-fetch /api/skills). */
   onSkillsChanged(cb: () => void): () => void
+  /** Subscribe to repos-changed invalidation signals (re-fetch /api/repos). */
+  onReposChanged(cb: () => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
 }
