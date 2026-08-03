@@ -418,7 +418,22 @@ export function ReposView() {
                   <button
                     type="button"
                     className="btn btn-ghost mt-1"
-                    onClick={() => void navigator.clipboard.writeText(selected.deploy_key_public ?? '')}
+                    onClick={() => {
+                      const text = selected.deploy_key_public ?? ''
+                      if (navigator.clipboard?.writeText) {
+                        void navigator.clipboard.writeText(text)
+                      } else {
+                        // Fallback for non-secure contexts (HTTP / non-localhost).
+                        const ta = document.createElement('textarea')
+                        ta.value = text
+                        ta.style.position = 'fixed'
+                        ta.style.opacity = '0'
+                        document.body.appendChild(ta)
+                        ta.select()
+                        try { document.execCommand('copy') } catch { /* noop */ }
+                        document.body.removeChild(ta)
+                      }
+                    }}
                     style={{ fontSize: 11 }}
                   >
                     Copy
