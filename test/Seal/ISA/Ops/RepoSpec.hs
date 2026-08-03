@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.RepoSpec (spec) where
 
+import Data.IORef (newIORef)
 import Data.Text qualified as T
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, withCurrentDirectory )
@@ -12,7 +13,32 @@ import Test.Hspec
 import Seal.ISA.Ops.Repo
   ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, validateRepoUrl )
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Clone (CloneDeps (..))
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
+import Seal.Tools.Ssh.Agent
+  ( SshAgentEnv (..), mkFakeSshAgentHandle )
+
+-- | Build a test 'CloneDeps' with a fake (empty) vault runtime, an empty
+-- repo registry (so @lookupRepoByUrl@ falls through to bare-URL clone —
+-- these tests clone public @file://@ repos with no credential), a fake
+-- ssh-agent (no real process), and the compile-time pinned GitHub host
+-- keys. The @keyfilesDir@ is per-test (a temp dir).
+mkTestCloneDeps :: FilePath -> IO CloneDeps
+mkTestCloneDeps keyfilesDir = do
+  createDirectoryIfMissing True keyfilesDir
+  vault <- makeFakeVaultRuntime []
+  callsRef <- newIORef []
+  let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+  pure CloneDeps
+    { cdVault = vault
+    , cdRepoReg = fakeRepoRegistryHandle
+    , cdSshAgent = agent
+    , cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , cdKeyfilesDir = keyfilesDir
+    }
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Repo" $ do
@@ -143,9 +169,10 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           callProcess "git" ["push", "origin", "HEAD"]
         -- Now cloneRepoIO into a fresh workdir.
         withSystemTempDirectory "seal-repo-wd" $ \wd -> do
+          deps <- mkTestCloneDeps (wd </> "keys")
           let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
               fileUrl = T.pack ("file://" <> bare)
-          res <- cloneRepoIO uio fileUrl
+          res <- cloneRepoIO deps uio fileUrl
           case res of
             CloneCloned name -> do
               name `shouldBe` "repo"
@@ -169,10 +196,11 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           callProcess "git" ["remote", "add", "origin", bare]
           callProcess "git" ["push", "origin", "HEAD"]
         withSystemTempDirectory "seal-repo-wd2" $ \wd -> do
+          deps <- mkTestCloneDeps (wd </> "keys")
           let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
               fileUrl = T.pack ("file://" <> bare)
-          _ <- cloneRepoIO uio fileUrl          -- first clone
-          res2 <- cloneRepoIO uio fileUrl        -- second → no-op
+          _ <- cloneRepoIO deps uio fileUrl          -- first clone
+          res2 <- cloneRepoIO deps uio fileUrl        -- second → no-op
           case res2 of
             CloneNoop name -> name `shouldBe` "repo"
             other -> expectationFailure ("expected CloneNoop, got " <> show other)
@@ -201,6 +229,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           callProcess "git" ["remote", "add", "origin", bare]
           callProcess "git" ["push", "origin", "HEAD"]
         withSystemTempDirectory "seal-repo-wd-scheme" $ \wd -> do
+          deps <- mkTestCloneDeps (wd </> "keys")
           let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
               urlWithGit = T.pack ("file://" <> bare)
               -- Same path without the trailing .git on the *bare dir*
@@ -208,8 +237,8 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
               -- normalization via a trailing slash, which
               -- normalizeRepoUrl strips.
               urlWithSlash = T.pack ("file://" <> bare <> "/")
-          _ <- cloneRepoIO uio urlWithGit
-          res2 <- cloneRepoIO uio urlWithSlash
+          _ <- cloneRepoIO deps uio urlWithGit
+          res2 <- cloneRepoIO deps uio urlWithSlash
           case res2 of
             CloneNoop _ -> pure ()
             other -> expectationFailure ("expected CloneNoop, got " <> show other)
@@ -240,18 +269,20 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           callProcess "git" ["remote", "add", "origin", bareA]
           callProcess "git" ["push", "origin", "HEAD"]
         withSystemTempDirectory "seal-repo-wd3" $ \wd -> do
+          deps <- mkTestCloneDeps (wd </> "keys")
           let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
               urlA = T.pack ("file://" <> bareA)
               urlB = T.pack ("file://" <> bareB)
-          _ <- cloneRepoIO uio urlA   -- clone A into <wd>/repo
+          _ <- cloneRepoIO deps uio urlA   -- clone A into <wd>/repo
           -- Now clone B, which also sanitizes to "repo" → conflict.
-          resB <- cloneRepoIO uio urlB
+          resB <- cloneRepoIO deps uio urlB
           case resB of
             CloneConflict _name existing -> existing `shouldBe` urlA
             other -> expectationFailure ("expected CloneConflict, got " <> show other)
 
     it "reports CloneFailed (not CloneCloned) when the clone errors — git's non-zero exit is returned as Right by uioShellExec, so the filesystem must be the source of truth" $
       withSystemTempDirectory "seal-repo-fail" $ \wd -> do
+        deps <- mkTestCloneDeps (wd </> "keys")
         let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
             -- A URL that parses but points at nothing cloneable: an
             -- SCP-style URL to a nonexistent host. git will fail with
@@ -259,7 +290,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             -- uioShellExec returns as Right (stderr text). cloneRepoIO
             -- must detect the missing <repo>/.git and report failure.
             badUrl = "git@nonexistent-host.invalid:foo/bar.git"
-        res <- cloneRepoIO uio badUrl
+        res <- cloneRepoIO deps uio badUrl
         case res of
           CloneFailed _ -> pure ()   -- expected
           other -> expectationFailure

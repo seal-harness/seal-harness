@@ -423,6 +423,7 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
+        Seal.TestHelpers.FakeRegistry
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec

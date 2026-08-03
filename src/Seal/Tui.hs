@@ -28,6 +28,7 @@ import Seal.Config.Paths
   , configFilePath
   , ensureSealDirs
   , getSealPaths
+  , reposFilePath
   , securityFilePath
   , vaultFilePath
   )
@@ -36,6 +37,7 @@ import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
@@ -162,6 +164,7 @@ runTui autonomy logger = do
             writeIORef activeRef newMeta
             pure oldSid
         }
+  repoReg <- mkRepoRegistryHandle (reposFilePath paths)
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
@@ -173,4 +176,4 @@ runTui autonomy logger = do
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]
-  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply logger
+  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger

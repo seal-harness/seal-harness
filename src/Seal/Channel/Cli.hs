@@ -53,7 +53,7 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
                           resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -108,6 +108,10 @@ import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
@@ -283,13 +287,20 @@ onDemandFromCfg eCfg =
 -- session on every turn so mid-session @\/model use@ changes take effect
 -- immediately.
 runCliTui
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> SessionRuntime
+  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
   -> AskReplyStore -> SealLogger -> IO ()
-runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger = do
+runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
-  let histFile       = spState paths </> "history"
+  let cloneDeps = Clone.CloneDeps
+        { Clone.cdVault = rt
+        , Clone.cdRepoReg = repoReg
+        , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+        , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+        , Clone.cdKeyfilesDir = repoKeysDir paths
+        }
+      histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = def
@@ -424,7 +435,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
               -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
               -- AGENT_INTERRUPT
               , shellExecOp childWsRoot cliSecurityPolicy
-              , setupRepoOp childWsRoot autonomy
+              , setupRepoOp cloneDeps childWsRoot autonomy
               , binExecOp childWsRoot cliSecurityPolicy binAllowList
               , processManageOp childWsRoot cliSecurityPolicy
               , fileWriteOp childWsRoot operatorCeiling
@@ -503,7 +514,7 @@ runCliTui paths rt pr sr registry chain backends tabsH autonomy askReply logger 
               , agentStopOp agentRuntime
               , agentInterruptOp agentRuntime
                , shellExecOp wsRoot cliSecurityPolicy
-               , setupRepoOp wsRoot autonomy
+               , setupRepoOp cloneDeps wsRoot autonomy
                , binExecOp wsRoot cliSecurityPolicy binAllowList
               , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling

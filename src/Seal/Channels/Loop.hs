@@ -87,7 +87,7 @@ import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -128,6 +128,10 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Prompt (injectAvailableSkills)
@@ -170,6 +174,7 @@ import Seal.Util.StrictIO (decodeFileStrict)
 data ChannelDeps = ChannelDeps
   { cdPaths      :: SealPaths
   , cdVault      :: VaultRuntime
+  , cdRepoReg    :: RepoRegistryHandle
   , cdProvider   :: ProviderRuntime
   , cdBackends   :: Backends
   , cdAutonomy   :: Policy.AutonomyLevel
@@ -206,18 +211,32 @@ data ChannelDeps = ChannelDeps
     -- startup via 'withSealLogger', threaded through all channel turns.
   }
 
+-- | Build 'Clone.CloneDeps' from a 'ChannelDeps' (the in-scope vault runtime
+-- + repo registry handle + paths). Used by the 2 'buildIsaRegistry' call
+-- sites + the 1 'buildChildRegistry' site in this module. The ssh-agent is
+-- real (production: 'mkRealSshAgentHandle (Just 300)'); the pinned host
+-- keys are compile-time-embedded.
+mkCloneDepsFromChannel :: ChannelDeps -> Clone.CloneDeps
+mkCloneDepsFromChannel deps = Clone.CloneDeps
+  { Clone.cdVault = cdVault deps
+  , Clone.cdRepoReg = cdRepoReg deps
+  , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+  , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+  , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
+  }
+
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
 -- given config loader. Used by 'Seal.Command.Serve' and the standalone
 -- entry points. The 'tabsH' is the shared/unified handle (W4).
 newChannelDeps
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> Backends
+  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
   -> ApprovalCache -> IO RuntimeConfig
   -> TabsHandle
   -> SealLogger
   -> IO ChannelDeps
-newChannelDeps paths vault provider backends autonomy broker
+newChannelDeps paths vault repoReg provider backends autonomy broker
                harnessReg tmux httpMgr approvals loadCfg tabsH logger = do
   cursors <- newCursorStore
   replies <- newReplyRegistry
@@ -225,6 +244,7 @@ newChannelDeps paths vault provider backends autonomy broker
   pure ChannelDeps
     { cdPaths      = paths
     , cdVault      = vault
+    , cdRepoReg    = repoReg
     , cdProvider   = provider
     , cdBackends   = backends
     , cdAutonomy   = autonomy
@@ -722,7 +742,7 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                 deps paths sid handleCaps untrustedIO appEnv eCfg
                 wsroot operatorCeiling (smChannel meta) isaReg
               isaReg = buildIsaRegistry
-                rt backends wsroot sid operatorCeiling autonomy
+                rt (mkCloneDepsFromChannel deps) backends wsroot sid operatorCeiling autonomy
                 (either (const Nothing) rcWeb eCfg)
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
@@ -891,7 +911,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg
         isaReg = buildIsaRegistry
-          (cdVault deps) (cdBackends deps) wsRoot sid operatorCeiling
+          (cdVault deps) (mkCloneDepsFromChannel deps) (cdBackends deps) wsRoot sid operatorCeiling
           (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
@@ -906,7 +926,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
 -- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set
 -- as the web and CLI paths.
 buildIsaRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
@@ -916,7 +936,7 @@ buildIsaRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
   -> ISA.Registry
-buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
+buildIsaRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -945,7 +965,7 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp wsRoot autonomy
+      , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -1111,7 +1131,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childWsRoot (cdAutonomy deps)
+            , setupRepoOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

@@ -55,6 +55,7 @@ import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs, ensureTabForSession)
 import Seal.Tabs.Types (TabRef (BoundSession), Tab (tRef), tlTabs)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps, getSent)
+import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Channels.Cursor (cursorLookup)
 
@@ -129,7 +130,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
     logger <- testSealLogger
-    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+    deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                     harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
@@ -188,7 +189,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
     logger <- testSealLogger
-    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+    deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                     harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "skillload-test")
@@ -303,7 +304,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
     logger <- testSealLogger
-    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+    deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                     harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     -- A tab inserted via the passed handle is visible through cdTabs —
     -- proving cdTabs IS the passed handle (unified, not a forked copy).
@@ -343,7 +344,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
     logger <- testSealLogger
-    deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+    deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                     harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
     let sid = either (error "sid") id (mkSessionId "w3-autotab")
     -- Simulate the channel auto-tab call (production code: Loop.hs runTurnOnSession)
@@ -456,7 +457,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
       logger <- testSealLogger
-      deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+      deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                         harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       let key = ("telegram", "conv-headless-test")
       meta <- createConversationSessionHeadless deps key Telegram
@@ -512,7 +513,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       fullSnap <- snapshotTabs tabsH
       length (tlTabs fullSnap) `shouldBe` 36
       logger <- testSealLogger
-      deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+      deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                         harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       let key = ("telegram", "conv-full-tabs-test")
       meta <- createConversationSession deps stubHandle key Telegram tabsH
@@ -560,7 +561,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       eventsRef <- newIORef ([] :: [BrokerEvent])
       _ <- subscribe broker (either (error "sid") id (mkSessionId "any")) (\e -> modifyIORef' eventsRef (e :))
       logger <- testSealLogger
-      deps <- newChannelDeps paths vaultRt pr backends Supervised (Just broker)
+      deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised (Just broker)
                         harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0
@@ -600,7 +601,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
       logger <- testSealLogger
-      deps <- newChannelDeps paths vaultRt pr backends Supervised Nothing
+      deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
                         harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) tabsH logger
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0

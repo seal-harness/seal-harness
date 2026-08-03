@@ -65,6 +65,7 @@ import Control.Exception (bracket, onException, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
+import Data.IORef (readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -80,9 +81,11 @@ import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..)
   , hostAllowed, parseRepoHost, repoIdText )
+import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
                                       , sahKill, sahStart) )
+import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 
 ----------------------------------------------------------------------------
 -- Errors
@@ -205,7 +208,10 @@ sshToHttps url
 --
 -- Carries:
 --
--- * @cdVault@ — the vault handle (yields the passphrase / PAT via 'vhGet').
+-- * @cdVault@ — the 'VaultRuntime' (yields the live 'VaultHandle' via
+--   'vrHandleRef' at runtime; fail-closed to 'CloneVaultError VaultLocked'
+--   if the vault is unconfigured/locked). Mirrors @secretGetOp rt@ which
+--   takes 'VaultRuntime', not the raw handle.
 -- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Per-op
 --   lifecycle: start → add-key → run → delete-all + kill.
 -- * @cdPinnedKnownHosts@ — compile-time-embedded GitHub host keys (public
@@ -215,7 +221,8 @@ sshToHttps url
 --   keyfiles (@~\/.seal\/state\/repos\/keys\/\<repo-id\>@). The encrypted
 --   keyfile lives only on the harness disk (ciphertext).
 data CloneDeps = CloneDeps
-  { cdVault           :: VaultHandle
+  { cdVault           :: VaultRuntime
+  , cdRepoReg         :: RepoRegistryHandle
   , cdSshAgent        :: SshAgentHandle
   , cdPinnedKnownHosts :: ByteString
   , cdKeyfilesDir     :: FilePath
@@ -298,91 +305,99 @@ resolveCloneTarget deps repo =
     Left e -> pure (Left e)
     Right plan -> case plan of
       ClonePlanExtraHeader httpsUrl vaultKey -> do
-        mtoken <- vhGet (cdVault deps) vaultKey
-        case mtoken of
-          Left ve -> pure (Left (CloneVaultError ve))
-          Right tokenBytes -> do
-            let header = renderPatHeader repo tokenBytes
-                envExtras = [("GIT_TERMINAL_PROMPT", "0")]
-                env = CloneEnv
-                  { ceUrl = httpsUrl
-                  , ceGitConfigArgs = ["-c", "http.extraHeader=" <> header]
-                  , ceSshCommand = Nothing
-                  , ceEnvExtras = envExtras
-                  , ceCleanup = pure ()
-                  }
-            pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
+        eVault <- resolveVaultHandle deps
+        case eVault of
+          Left e -> pure (Left e)
+          Right vault -> do
+            mtoken <- vhGet vault vaultKey
+            case mtoken of
+              Left ve -> pure (Left (CloneVaultError ve))
+              Right tokenBytes -> do
+                let header = renderPatHeader repo tokenBytes
+                    envExtras = [("GIT_TERMINAL_PROMPT", "0")]
+                    env = CloneEnv
+                      { ceUrl = httpsUrl
+                      , ceGitConfigArgs = ["-c", "http.extraHeader=" <> header]
+                      , ceSshCommand = Nothing
+                      , ceEnvExtras = envExtras
+                      , ceCleanup = pure ()
+                      }
+                pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
       ClonePlanSshKey sshUrl _vaultKey -> do
         -- The encrypted keyfile path: <keyfilesDir>/<repo-id>.
         let keyfilePath = cdKeyfilesDir deps </> keyfileBaseName repo
-        -- Fetch the passphrase from the vault (decrypts the keyfile).
-        mpass <- vhGet (cdVault deps) (cVaultKey (srCredential repo))
-        case mpass of
-          Left ve -> pure (Left (CloneVaultError ve))
-          Right passphrase -> do
-            -- Per-op agent lifecycle: start → add-key. The post-add phase
-            -- (writing known_hosts + building the env) is bracketed so a
-            -- throw (e.g. an IO error from writeKnownHostsTemp) STILL runs
-            -- sahDeleteAll + sahKill — the agent never leaks with the key
-            -- in memory (design §4.6: exactly one identity live at
-            -- forwarding time).
-            eStart <- sahStart (cdSshAgent deps)
-            case eStart of
-              Left msg -> pure (Left (CloneAgentError msg))
-              Right agentEnv -> do
-                eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
-                case eAdd of
-                  Left msg -> do
-                    -- Fail closed: delete-all + kill even on add failure
-                    -- (no key landed, but defense-in-depth).
-                    sahDeleteAll (cdSshAgent deps) agentEnv
-                    sahKill (cdSshAgent deps) agentEnv
-                    pure (Left (CloneAgentError msg))
-                  Right () -> do
-                    -- Write the per-op known_hosts temp file (public data)
-                    -- under the 0700 harness-private cdKeyfilesDir (NOT
-                    -- /tmp — TOCTOU: the path git reads must be
-                    -- tamper-resistant, not just the content). If this
-                    -- throws (IO error), the agent MUST still be cleaned
-                    -- up — 'onException' runs sahDeleteAll + sahKill
-                    -- before rethrowing, so the agent never leaks with the
-                    -- key in memory (design §4.6: exactly one identity
-                    -- live at forwarding time). The 'ctCleanup' on the
-                    -- returned CloneTarget runs the same cleanup again on
-                    -- 'withCloneTarget' exit (idempotent — the fake
-                    -- agent's delete/kill are no-ops on a dead agent; the
-                    -- known_hosts removeFile swallows NoSuchThing).
-                    (knownHostsPath, knownHostsCleanup) <-
-                      writeKnownHostsTemp (cdKeyfilesDir deps)
-                                           (cdPinnedKnownHosts deps)
-                      `onException` ( do
-                          sahDeleteAll (cdSshAgent deps) agentEnv
-                          sahKill (cdSshAgent deps) agentEnv )
-                    let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
-                        sshCmd = T.pack $
-                          "ssh"
-                          <> " -o IdentitiesOnly=yes"
-                          <> " -o StrictHostKeyChecking=yes"
-                          <> " -o BatchMode=yes"
-                          <> " -o UserKnownHostsFile=" <> knownHostsPath
-                        envExtras =
-                          [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
-                          , ("SSH_AGENT_PID", saeAgentPid agentEnv)
-                          , ("GIT_SSH_COMMAND", T.unpack sshCmd)
-                          , ("GIT_TERMINAL_PROMPT", "0")
-                          ]
-                        cleanup = do
-                          knownHostsCleanup
-                          sahDeleteAll (cdSshAgent deps) agentEnv
-                          sahKill (cdSshAgent deps) agentEnv
-                        env = CloneEnv
-                          { ceUrl = sshUrl
-                          , ceGitConfigArgs = []
-                          , ceSshCommand = Just sshCmd
-                          , ceEnvExtras = authEnv ++ envExtras
-                          , ceCleanup = cleanup
-                          }
-                    pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
+        eVault <- resolveVaultHandle deps
+        case eVault of
+          Left e -> pure (Left e)
+          Right vault -> do
+            -- Fetch the passphrase from the vault (decrypts the keyfile).
+            mpass <- vhGet vault (cVaultKey (srCredential repo))
+            case mpass of
+              Left ve -> pure (Left (CloneVaultError ve))
+              Right passphrase -> do
+                -- Per-op agent lifecycle: start → add-key. The post-add phase
+                -- (writing known_hosts + building the env) is bracketed so a
+                -- throw (e.g. an IO error from writeKnownHostsTemp) STILL runs
+                -- sahDeleteAll + sahKill — the agent never leaks with the key
+                -- in memory (design §4.6: exactly one identity live at
+                -- forwarding time).
+                eStart <- sahStart (cdSshAgent deps)
+                case eStart of
+                  Left msg -> pure (Left (CloneAgentError msg))
+                  Right agentEnv -> do
+                    eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
+                    case eAdd of
+                      Left msg -> do
+                        -- Fail closed: delete-all + kill even on add failure
+                        -- (no key landed, but defense-in-depth).
+                        sahDeleteAll (cdSshAgent deps) agentEnv
+                        sahKill (cdSshAgent deps) agentEnv
+                        pure (Left (CloneAgentError msg))
+                      Right () -> do
+                        -- Write the per-op known_hosts temp file (public data)
+                        -- under the 0700 harness-private cdKeyfilesDir (NOT
+                        -- /tmp — TOCTOU: the path git reads must be
+                        -- tamper-resistant, not just the content). If this
+                        -- throws (IO error), the agent MUST still be cleaned
+                        -- up — 'onException' runs sahDeleteAll + sahKill
+                        -- before rethrowing, so the agent never leaks with the
+                        -- key in memory (design §4.6: exactly one identity
+                        -- live at forwarding time). The 'ctCleanup' on the
+                        -- returned CloneTarget runs the same cleanup again on
+                        -- 'withCloneTarget' exit (idempotent — the fake
+                        -- agent's delete/kill are no-ops on a dead agent; the
+                        -- known_hosts removeFile swallows NoSuchThing).
+                        (knownHostsPath, knownHostsCleanup) <-
+                          writeKnownHostsTemp (cdKeyfilesDir deps)
+                                               (cdPinnedKnownHosts deps)
+                          `onException` ( do
+                              sahDeleteAll (cdSshAgent deps) agentEnv
+                              sahKill (cdSshAgent deps) agentEnv )
+                        let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
+                            sshCmd = T.pack $
+                              "ssh"
+                              <> " -o IdentitiesOnly=yes"
+                              <> " -o StrictHostKeyChecking=yes"
+                              <> " -o BatchMode=yes"
+                              <> " -o UserKnownHostsFile=" <> knownHostsPath
+                            envExtras =
+                              [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
+                              , ("SSH_AGENT_PID", saeAgentPid agentEnv)
+                              , ("GIT_SSH_COMMAND", T.unpack sshCmd)
+                              , ("GIT_TERMINAL_PROMPT", "0")
+                              ]
+                            cleanup = do
+                              knownHostsCleanup
+                              sahDeleteAll (cdSshAgent deps) agentEnv
+                              sahKill (cdSshAgent deps) agentEnv
+                            env = CloneEnv
+                              { ceUrl = sshUrl
+                              , ceGitConfigArgs = []
+                              , ceSshCommand = Just sshCmd
+                              , ceEnvExtras = authEnv ++ envExtras
+                              , ceCleanup = cleanup
+                              }
+                        pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
 
 -- | The base name of the encrypted keyfile for a 'SourceRepo' — the
 -- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2
@@ -390,6 +405,20 @@ resolveCloneTarget deps repo =
 -- @\<cdKeyfilesDir\>\/\<repo-id\>@.
 keyfileBaseName :: SourceRepo -> FilePath
 keyfileBaseName repo = T.unpack (repoIdText (srId repo))
+
+-- | Resolve the live 'VaultHandle' from the 'VaultRuntime' (mirrors
+-- @secretGetOp@'s pattern at @Seal.ISA.Ops.Secret:73@). Fail-closed to
+-- 'CloneVaultError VaultLocked' if the vault is unconfigured/locked (the
+-- 'IORef' holds 'Nothing'). This is the W3 evolution: @cdVault@ is now
+-- 'VaultRuntime' (not the raw 'VaultHandle') so the opcode can be built once
+-- at startup and the vault-locked state is surfaced per-op at run time
+-- (rather than crashing at startup or silently using a stale handle).
+resolveVaultHandle :: CloneDeps -> IO (Either CloneError VaultHandle)
+resolveVaultHandle deps = do
+  mh <- readIORef (vrHandleRef (cdVault deps))
+  pure $ case mh of
+    Nothing -> Left (CloneVaultError VaultLocked)
+    Just h  -> Right h
 
 -- | Render the @http.extraHeader@ value for a PAT/MachineUser: @Authorization:
 -- Basic \<base64(user:token)\>@. For 'CredPat' the "user" is

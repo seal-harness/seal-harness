@@ -52,7 +52,7 @@ import Seal.Config.File
   , WebConfig (..), rcWeb
   , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -109,6 +109,10 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -132,6 +136,7 @@ import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
 data SendDeps = SendDeps
   { sdPaths      :: SealPaths
   , sdVault      :: VaultRuntime
+  , sdRepoReg    :: RepoRegistryHandle
   , sdProvider   :: ProviderRuntime
   , sdSession    :: SessionRuntime
   , sdBackends   :: Backends
@@ -447,7 +452,7 @@ plainTurn deps meta t = do
                   deps paths sid caps untrustedIO appEnv eCfg
                   wsroot operatorCeiling "web"
                 isaReg = buildWebRegistry
-                  (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
+                  (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
@@ -493,7 +498,7 @@ plainTurn deps meta t = do
 -- \"harness\") and 'HfGeneric' flavour — the 6b wiring that resolves
 -- per-call session/window/flavour from the input is a later phase.
 buildWebRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
@@ -503,7 +508,7 @@ buildWebRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
+buildWebRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -532,7 +537,7 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp wsRoot autonomy
+      , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -686,7 +691,7 @@ plainTurnWithCaps deps meta caps t = do
               deps paths sid caps untrustedIO appEnv eCfg
               wsRoot operatorCeiling "web"
             isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
@@ -735,7 +740,7 @@ webCallDispatcher deps callOpName val = do
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling "web"
         isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
@@ -892,7 +897,7 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childWsRoot (sdAutonomy deps)
+            , setupRepoOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
@@ -973,6 +978,20 @@ broadcastAskResolved mBroker sid qid resolution =
         [ "id" .= askIdText qid
         , "resolution" .= resolution
         ]))
+
+-- | Build 'Clone.CloneDeps' from a 'SendDeps' (the in-scope vault runtime +
+-- repo registry handle + paths). Used by the 'buildWebRegistry' +
+-- 'buildChildRegistry' call sites. The ssh-agent is real (production:
+-- 'mkRealSshAgentHandle (Just 300)'); the pinned host keys are
+-- compile-time-embedded.
+mkCloneDepsFromSend :: SendDeps -> Clone.CloneDeps
+mkCloneDepsFromSend deps = Clone.CloneDeps
+  { Clone.cdVault = sdVault deps
+  , Clone.cdRepoReg = sdRepoReg deps
+  , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+  , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+  , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
+  }
 
 -- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
 -- session's workdir before the first turn. The web "set up repo" combo box

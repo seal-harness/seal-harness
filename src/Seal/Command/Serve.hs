@@ -61,9 +61,9 @@ import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.SourceControl.Clone (CloneError (..), lsRemoteRepo)
+import Seal.SourceControl.Clone (lsRemoteRepo)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
-import Seal.SourceControl.Registry (mkRepoRegistryHandle)
+import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
@@ -124,7 +124,7 @@ runServeMain autonomy logger = do
   -- non-blocking vault-key advisory. The vault handle (mHandle) may be
   -- 'Nothing' if the vault is not configured — in that case /repo test
   -- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.
-  let repoSeam = mkRepoTestSeam mHandle paths
+  let repoSeam = mkRepoTestSeam rt repoRegH paths
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -159,7 +159,7 @@ runServeMain autonomy logger = do
   -- reply registry, and write locks are created inside newChannelDeps.
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
   chanDeps <- newChannelDeps
-        paths rt pr backends autonomy (Just broker)
+        paths rt repoRegH pr backends autonomy (Just broker)
         reg tmuxR (Just mgr) approvals loadCfg tabsH logger
   let sr = SessionRuntime
              { srPaths      = paths
@@ -206,6 +206,7 @@ runServeMain autonomy logger = do
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdRepoReg    = repoRegH
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends
@@ -278,27 +279,29 @@ runServeMain autonomy logger = do
         Nothing   -> False
   runGateway gwCfg isRemote deps
 
--- | Build the /repo command's 'RepoTestSeam' from the live vault + paths.
--- When the vault is not configured ('Nothing'), @rtsLsRemote@ returns
--- 'CloneVaultError VaultLocked' (fail-closed — /repo test reports "vault
--- locked") and @rtsVaultList@ returns @Left VaultLocked@ (/repo info shows
--- the locked advisory). Mirrors how the rest of the app treats a missing
--- vault handle.
-mkRepoTestSeam :: Maybe VaultHandle -> SealPaths -> RepoTestSeam
-mkRepoTestSeam mHandle paths = RepoTestSeam
-  { rtsLsRemote  = case mHandle of
-      Nothing    -> \_ -> pure (Left (CloneVaultError VaultLocked))
-      Just vh    -> \repo ->
-        let deps = Clone.CloneDeps
-              { Clone.cdVault = vh
-              , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-              , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-              , Clone.cdKeyfilesDir = repoKeysDir paths
-              }
-        in lsRemoteRepo deps repo
-  , rtsVaultList = case mHandle of
-      Nothing    -> pure (Left VaultLocked)
-      Just vh    -> vhList vh
+-- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
+-- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
+-- 'VaultHandle'; when the vault is unconfigured/locked ('Nothing' in the
+-- ref), @rtsLsRemote@ fails closed to 'CloneVaultError VaultLocked' (via
+-- 'Clone.resolveVaultHandle') and @rtsVaultList@ returns 'Left VaultLocked'
+-- (/repo info shows the locked advisory). Mirrors 'vaultGetByName' in
+-- 'Seal.ISA.Ops.Secret'.
+mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> RepoTestSeam
+mkRepoTestSeam rt repoRegH paths = RepoTestSeam
+  { rtsLsRemote  = \repo ->
+      let deps = Clone.CloneDeps
+            { Clone.cdVault = rt
+            , Clone.cdRepoReg = repoRegH
+            , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+            , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+            , Clone.cdKeyfilesDir = repoKeysDir paths
+            }
+      in lsRemoteRepo deps repo
+  , rtsVaultList = do
+      mh <- readIORef (vrHandleRef rt)
+      case mh of
+        Nothing -> pure (Left VaultLocked)
+        Just vh -> vhList vh
   }
 
 -- | Open the vault if both recipient and identity are configured. Mirrors

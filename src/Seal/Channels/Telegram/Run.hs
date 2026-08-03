@@ -39,7 +39,7 @@ import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths
-  , securityFilePath, vaultFilePath )
+  , reposFilePath, securityFilePath, vaultFilePath )
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (UserId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -48,6 +48,7 @@ import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply (AskReplyStore, newApprovalCache, newAskReplyStore)
 import Seal.Ingest (PreprocessChain, emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle)
@@ -138,8 +139,9 @@ runTelegramMain autonomy logger = do
   let loadCfg = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
+  repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
   chanDeps <- newChannelDeps
-        paths rt pr backends autonomy Nothing
+        paths rt repoRegH pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg tabsH logger
   let registry = mkRegistry
         [ sessionCommandSpec sr

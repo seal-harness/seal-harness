@@ -25,6 +25,19 @@
 --     'uioShellExec'; the URL is validated to a safe charset so it cannot
 --     inject shell metacharacters into the @\/bin\/sh -c@ single-arg
 --     boundary.
+--
+-- Credential resolution (W3 — design §4.2/§4.3, rev 3): 'setupRepoOp' takes
+-- a 'CloneDeps' closed-over param (mirrors @secretGetOp (cdVault deps)@).
+-- 'cloneRepoIO' does @lookupRepoByUrl@ against the registry
+-- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
+-- credential via the no-disk seam ('Seal.SourceControl.Clone.resolveCloneTarget'
+-- using @cdVault@/@cdSshAgent@/@cdPinnedKnownHosts@/@cdKeyfilesDir@) and
+-- run @git clone@ via 'uioShellExecEnv' (deploy key: @SSH_AUTH_SOCK@ +
+-- @GIT_SSH_COMMAND@) or 'uioBinExecEnv' (PAT: @http.extraHeader@ argv) with
+-- the resolved env. If the URL is NOT registered, fall through to a
+-- bare-URL clone (public repos, backward-compat). Stays Untrusted;
+-- credential resolution via 'liftIO' in the trusted plane. NO
+-- @runLocal@/@BackendExec@.
 module Seal.ISA.Ops.Repo
   ( setupRepoOp
   , validateRepoUrl
@@ -39,6 +52,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Char (isAlphaNum)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -48,9 +62,14 @@ import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.SourceControl.Repo (normalizeRepoUrl)
+import Seal.SourceControl.Clone
+  ( CloneDeps (..), CloneEnv (..), renderCloneError, resolveCloneTarget
+  , withCloneTarget )
+import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO, renderUntrustedErr, uioShellExec)
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecEnv )
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Types.App (App)
 
@@ -59,8 +78,8 @@ import Seal.Types.App (App)
 -- @git clone@ into @\<workdir\>\/\<sanitized-repo-name\>@ via
 -- 'uioShellExec', after an idempotency check (read the existing remote).
 -- 'orRecorded': the url + target path + status (secret-free).
-setupRepoOp :: WorkspaceRoot -> AutonomyLevel -> Opcode
-setupRepoOp _wsRoot autonomy = UntrustedOpcode
+setupRepoOp :: CloneDeps -> WorkspaceRoot -> AutonomyLevel -> Opcode
+setupRepoOp deps _wsRoot autonomy = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
   , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent). Discover any skills it ships via the available-skills catalog on the next turn."
   , uoInSchema = setupRepoSchema
@@ -80,7 +99,7 @@ setupRepoOp _wsRoot autonomy = UntrustedOpcode
         Nothing -> pure (OpResult [TrpText "SETUP_REPO requires {url:string}"] True recorded)
         Just url -> case validateRepoUrl url of
           Left err -> pure (OpResult [TrpText ("SETUP_REPO: invalid url: " <> err)] True recorded)
-          Right url' -> runSetupRepo uio url' recorded
+          Right url' -> runSetupRepo deps uio url' recorded
   }
 
 setupRepoSchema :: Value
@@ -176,8 +195,17 @@ data CloneResult
 -- model-invoked 'SETUP_REPO' opcode and the web combo box's
 -- @POST /api/sessions/:id/setup-repo@ endpoint — both build the same
 -- 'UntrustedIO' (sandboxed to the session workdir) and call this.
-cloneRepoIO :: UntrustedIO -> Text -> IO CloneResult
-cloneRepoIO uio url = do
+--
+-- Credential resolution (W3): @lookupRepoByUrl@ against the registry
+-- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
+-- credential via the no-disk seam ('resolveCloneTarget' using @cdVault@/
+-- @cdSshAgent@/@cdPinnedKnownHosts@/@cdKeyfilesDir@) and run @git clone@
+-- via 'uioShellExecEnv' (deploy key: @SSH_AUTH_SOCK@ + @GIT_SSH_COMMAND@
+-- env) or 'uioBinExecEnv' (PAT: @http.extraHeader@ argv) with the resolved
+-- env. If the URL is NOT registered, fall through to a bare-URL clone
+-- (public repos, backward-compat).
+cloneRepoIO :: CloneDeps -> UntrustedIO -> Text -> IO CloneResult
+cloneRepoIO deps uio url = do
   let repoName = sanitizeRepoName url
       mCwdPath = case mkRemotePath "." of
         Right rp -> Just rp
@@ -195,19 +223,46 @@ cloneRepoIO uio url = do
                then pure (CloneNoop repoName)
                else pure (CloneConflict repoName existingUrl)
         else do
-          let cloneCmd = "git clone --depth 1 -- " <> shellQ cleanUrl <> " " <> shellQ repoName
-          cloneRes <- uioShellExec uio (shellCmd cloneCmd) mCwdPath
-          case cloneRes of
-            Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
-            Right _out ->
-              -- uioShellExec returns Right even on a non-zero git exit
-              -- (it surfaces stderr to the model for SHELL_EXEC). So we
-              -- can't trust the exit code here — verify the clone actually
-              -- landed by checking for <repoName>/.git. If absent, the
-              -- clone failed (e.g. SSH auth, bad URL, network); report
-              -- the failure with the clone's stdout/stderr so the user
-              -- knows why.
-              verifyClone uio repoName _out mCwdPath
+          -- Look up the URL in the repo registry. If registered, resolve
+          -- the credential via the no-disk seam; else fall through to a
+          -- bare-URL clone (public repos).
+          eRepos <- rrhList (cdRepoReg deps)
+          let mRepo = case eRepos of
+                Right repos -> lookupRepoByUrl cleanUrl (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
+                Left _       -> Nothing
+          case mRepo of
+            Just repo -> cloneWithCredential deps uio repo repoName mCwdPath
+            Nothing   -> cloneBareUrl uio cleanUrl repoName mCwdPath
+
+-- | Clone a registered repo via the no-disk seam (deploy key or PAT).
+-- Resolves the credential via 'resolveCloneTarget' + runs @git clone@ with
+-- the resolved env (deploy key: 'uioShellExecEnv'; PAT: 'uioBinExecEnv' —
+-- both merge the auth env over the inherited env).
+cloneWithCredential
+  :: CloneDeps -> UntrustedIO -> SourceRepo -> Text -> Maybe RemotePath
+  -> IO CloneResult
+cloneWithCredential deps uio repo repoName mCwdPath = do
+  eTarget <- resolveCloneTarget deps repo
+  case eTarget of
+    Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
+    Right target -> withCloneTarget target $ \env -> do
+      -- Build the git clone command with the resolved env + git config args.
+      let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
+          cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
+                     <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
+      cloneRes <- uioShellExecEnv uio (ceEnvExtras env) (shellCmd cloneCmd) mCwdPath
+      case cloneRes of
+        Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+        Right _out -> verifyClone uio repoName _out mCwdPath
+
+-- | Clone a bare URL (no credential — public repo, backward-compat).
+cloneBareUrl :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult
+cloneBareUrl uio cleanUrl repoName mCwdPath = do
+  let cloneCmd = "git clone --depth 1 -- " <> shellQ cleanUrl <> " " <> shellQ repoName
+  cloneRes <- uioShellExec uio (shellCmd cloneCmd) mCwdPath
+  case cloneRes of
+    Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+    Right _out -> verifyClone uio repoName _out mCwdPath
 
 -- | Verify a clone actually landed by checking for @<repoName>/.git@.
 -- 'uioShellExec' returns 'Right' even on non-zero exit (it surfaces
@@ -229,9 +284,9 @@ verifyClone uio repoName cloneOut mCwdPath = do
 
 -- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
 -- 'cloneRepoIO' with the audit 'orRecorded' payload).
-runSetupRepo :: UntrustedIO -> Text -> Value -> App OpResult
-runSetupRepo uio url recorded = do
-  res <- liftIO (cloneRepoIO uio url)
+runSetupRepo :: CloneDeps -> UntrustedIO -> Text -> Value -> App OpResult
+runSetupRepo deps uio url recorded = do
+  res <- liftIO (cloneRepoIO deps uio url)
   pure $ case res of
     CloneCloned repoName ->
       OpResult [TrpText ("Cloned " <> T.strip url <> " into " <> repoName <> " (shallow).")]
