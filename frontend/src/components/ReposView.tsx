@@ -30,7 +30,7 @@ const inputStyle: React.CSSProperties = {
 
 function Row({
   label, htmlFor, children, hint,
-}: { label: string; htmlFor: string; children: React.ReactNode; hint?: string }) {
+}: { label: string; htmlFor: string; children: React.ReactNode; hint?: React.ReactNode }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', alignItems: 'start', gap: 12 }}>
       <label htmlFor={htmlFor} style={labelStyle}>{label}</label>
@@ -50,6 +50,27 @@ function emptyInput(): RepoInput {
 
 function repoToInput(r: RepoInfo): RepoInput {
   return { id: r.id, url: r.url, vcs_kind: r.vcs_kind, credential: { ...r.credential } }
+}
+
+/** Extract the GitHub deploy-keys settings URL from a repo URL.
+ *  Returns null if the URL isn't a GitHub repo. Handles both
+ *  git@github.com:owner/repo.git and https://github.com/owner/repo.git. */
+function githubDeployKeysUrl(url: string): string | null {
+  // git@github.com:owner/repo.git → owner/repo.git
+  let path: string | null = null
+  if (url.startsWith('git@github.com:')) {
+    path = url.slice('git@github.com:'.length)
+  } else if (url.startsWith('https://github.com/')) {
+    path = url.slice('https://github.com/'.length)
+  } else if (url.startsWith('http://github.com/')) {
+    path = url.slice('http://github.com/'.length)
+  }
+  if (!path) return null
+  // Strip trailing .git
+  path = path.replace(/\.git$/, '')
+  // Remove trailing slash
+  path = path.replace(/\/$/, '')
+  return `https://github.com/${path}/settings/keys`
 }
 
 /** Auto-generate the vault key from the repo id + credential kind. The
@@ -396,8 +417,14 @@ export function ReposView() {
               </Row>
             )}
 
-            {!creating && selected?.deploy_key_public && (
-              <Row label="Deploy key" htmlFor="repo-deploy-key" hint="The public key for this repo's deploy key. Add it to your GitHub repo's Deploy Keys settings.">
+            {!creating && selected?.deploy_key_public && (() => {
+              const deployKeysUrl = githubDeployKeysUrl(selected.url)
+              return (
+              <Row label="Deploy key" htmlFor="repo-deploy-key" hint={
+                deployKeysUrl
+                  ? <>The public key for this repo's deploy key. Add it to your <a href={deployKeysUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>GitHub repo&apos;s Deploy Keys settings</a>.</>
+                  : 'The public key for this repo\'s deploy key. Add it to your repo\'s Deploy Keys settings.'
+              }>
                 <div>
                   <pre
                     data-testid="deploy-key-public"
@@ -440,7 +467,8 @@ export function ReposView() {
                   </button>
                 </div>
               </Row>
-            )}
+              )
+            })()}
 
             {formError && (
               <div
