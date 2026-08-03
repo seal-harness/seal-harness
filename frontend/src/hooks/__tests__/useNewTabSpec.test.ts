@@ -13,6 +13,7 @@ beforeEach(() => {
     if (url === '/api/providers') return new Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/providers/anthropic/models') return new Response(JSON.stringify([{ name: 'claude-sonnet-4', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/harnesses/discover') return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/repos') return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/state' && (!init || init.method === 'GET')) return new Response(JSON.stringify(uiStateResponse), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/state' && init?.method === 'PUT') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/custom-models' && init?.method === 'POST') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -87,10 +88,10 @@ describe('useNewTabSpec', () => {
     await waitFor(() => expect(result.current.customModels).toEqual(['claude-3-opus', 'gpt-4o']))
   })
 
-  it('loads repoHistory from the persisted UI state', async () => {
+  it('loads repoOptions from the persisted UI state', async () => {
     uiStateResponse = { last_options: null, custom_models: [], repo_history: ['https://github.com/foo/bar', 'git@host:x/y'] }
     const { result } = renderHook(() => useNewTabSpec())
-    await waitFor(() => expect(result.current.repoHistory).toEqual(['https://github.com/foo/bar', 'git@host:x/y']))
+    await waitFor(() => expect(result.current.repoOptions).toEqual(['https://github.com/foo/bar', 'git@host:x/y']))
   })
 
   it('restores the last-entered repo URL from last_options.repo', async () => {
@@ -146,6 +147,6 @@ describe('useNewTabSpec', () => {
       }
     })
     // The repo history is updated optimistically.
-    expect(result.current.repoHistory).toContain('https://github.com/foo/bar')
+    expect(result.current.repoOptions).toContain('https://github.com/foo/bar')
   })
 })

@@ -191,7 +191,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               id="provider-repo"
               value={spec.repo}
               onChange={spec.setRepo}
-              options={spec.repoHistory}
+              options={spec.repoOptions}
               placeholder="git URL (optional — cloned into the session before turn one)"
               testId="provider-repo-list"
             />
