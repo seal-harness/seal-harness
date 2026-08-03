@@ -33,7 +33,11 @@ function Row({
 }: { label: string; htmlFor: string; children: React.ReactNode; hint?: React.ReactNode }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', alignItems: 'start', gap: 12 }}>
-      <label htmlFor={htmlFor} style={labelStyle}>{label}</label>
+      {htmlFor ? (
+        <label htmlFor={htmlFor} style={labelStyle}>{label}</label>
+      ) : (
+        <span style={labelStyle}>{label}</span>
+      )}
       <div>
         {children}
         {hint && (
@@ -420,9 +424,9 @@ export function ReposView() {
             {!creating && selected?.deploy_key_public && (() => {
               const deployKeysUrl = githubDeployKeysUrl(selected.url)
               return (
-              <Row label="Deploy key" htmlFor="repo-deploy-key" hint={
+              <Row label="Deploy key" htmlFor="" hint={
                 deployKeysUrl
-                  ? <>The public key for this repo's deploy key. Add it to your <a href={deployKeysUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>GitHub repo&apos;s Deploy Keys settings</a>.</>
+                  ? <>The public key for this repo's deploy key. Add it to your <a href={deployKeysUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', textDecoration: 'underline' }}>GitHub repo&apos;s Deploy Keys settings</a>.</>
                   : 'The public key for this repo\'s deploy key. Add it to your repo\'s Deploy Keys settings.'
               }>
                 <div>
