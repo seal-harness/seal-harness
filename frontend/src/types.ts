@@ -278,6 +278,12 @@ export interface RepoInfo {
   url: string
   vcs_kind: 'git' | 'github'
   credential: RepoCredential
+  /** The deploy-key public key (present iff credential.kind == deploy_key
+   *  and the key was generated). Public data — safe to display. */
+  deploy_key_public?: string
+  /** The path to the encrypted keyfile on the harness disk (ciphertext).
+   *  Present iff credential.kind == deploy_key + key was generated. */
+  keyfile_path?: string
 }
 
 /** The body for POST /api/repos + PUT /api/repos/:id. The id is required for
@@ -287,6 +293,18 @@ export interface RepoInput {
   url: string
   vcs_kind: 'git' | 'github'
   credential: RepoCredential
+  /** If true AND credential.kind == deploy_key, the server generates a new
+   *  deploy keypair (ssh-keygen) + stores the encrypted keyfile + the
+   *  passphrase in the vault. The response carries the public key. */
+  generate_key?: boolean
+}
+
+/** The response from GET /api/repos/:id/deploy-key + POST
+ *  /api/repos/:id/deploy-key/generate: the public key + host-aware setup
+ *  instructions. No private key ever appears. */
+export interface DeployKeyInfo {
+  public_key: string
+  setup_instructions: string
 }
 
 /** Human-readable label for each credential kind (mirrors the backend

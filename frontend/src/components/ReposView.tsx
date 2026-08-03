@@ -132,6 +132,10 @@ export function ReposView() {
           vault_key: vaultKey,
           ...(form.credential.kind === 'machine_user' && username ? { username } : {}),
         },
+        // Auto-generate a deploy keypair when the credential kind is
+        // deploy_key (the server runs ssh-keygen + stores the encrypted
+        // keyfile + the passphrase in the vault).
+        ...(form.credential.kind === 'deploy_key' ? { generate_key: true } : {}),
       }
       const res = await createRepo(payload)
       setSubmitting(false)
@@ -359,6 +363,16 @@ export function ReposView() {
                 ))}
               </select>
             </Row>
+            {credKind === 'pat' && (
+              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
+                Note: deploy_key is preferred for lower exposure (PAT token is in memory during the clone).
+              </div>
+            )}
+            {credKind === 'machine_user' && (
+              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
+                Note: deploy_key is preferred for lower exposure (machine-user token is in memory during the clone).
+              </div>
+            )}
 
             <Row label="Vault key" htmlFor="repo-vault-key" hint="Store the credential in the vault under this key name. The secret value is never stored here or shown.">
               <input
@@ -383,6 +397,37 @@ export function ReposView() {
                   placeholder="bot-account"
                   autoComplete="off"
                 />
+              </Row>
+            )}
+
+            {!creating && selected?.deploy_key_public && (
+              <Row label="Deploy key" htmlFor="repo-deploy-key" hint="The public key for this repo's deploy key. Add it to your GitHub repo's Deploy Keys settings.">
+                <div>
+                  <pre
+                    data-testid="deploy-key-public"
+                    className="text-xs"
+                    style={{
+                      background: 'var(--bg-base)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 4,
+                      padding: 8,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-all',
+                      color: 'var(--text-primary)',
+                      margin: 0,
+                    }}
+                  >
+                    {selected.deploy_key_public}
+                  </pre>
+                  <button
+                    type="button"
+                    className="btn btn-ghost mt-1"
+                    onClick={() => void navigator.clipboard.writeText(selected.deploy_key_public ?? '')}
+                    style={{ fontSize: 11 }}
+                  >
+                    Copy
+                  </button>
+                </div>
               </Row>
             )}
 

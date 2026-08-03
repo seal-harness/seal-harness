@@ -3,6 +3,7 @@ import type {
   AgentDefInfo,
   AgentDefInput,
   AgentInfo,
+  DeployKeyInfo,
   DiscoverableWindow,
   HarnessInfo,
   ProviderInfo,
@@ -1075,6 +1076,25 @@ export async function deleteRepo(id: string): Promise<boolean> {
     return res.ok
   } catch {
     return false
+  }
+}
+
+/** Fetch the deploy-key public key + setup instructions for a repo.
+ *  Returns null on error (404 if the repo has no deploy key). */
+export async function fetchRepoDeployKey(id: string): Promise<DeployKeyInfo | null> {
+  return fetchJson<DeployKeyInfo>(`/api/repos/${encodeURIComponent(id)}/deploy-key`)
+}
+
+/** Regenerate the deploy key for a repo (rotation: new passphrase →
+ *  ssh-keygen overwrites the encrypted keyfile → new public key).
+ *  Returns the new DeployKeyInfo on success, null on error. */
+export async function regenerateDeployKey(id: string): Promise<DeployKeyInfo | null> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}/deploy-key/generate`, { method: 'POST' })
+    if (!res.ok) return null
+    return await res.json() as DeployKeyInfo
+  } catch {
+    return null
   }
 }
 
