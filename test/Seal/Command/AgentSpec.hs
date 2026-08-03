@@ -13,6 +13,7 @@ import Test.Hspec
 import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
 import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Command.Agent (agentCommandSpec, renderAgentInfo, renderAgentLine)
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
@@ -38,10 +39,11 @@ runAgentWith :: [AgentDef] -> [String] -> FakeCaps -> FilePath -> IO ()
 runAgentWith defs argv fc cfgPath = do
   backend <- noneBackend
   mapM_ (adbUpdate backend) defs
-  let caps = ChannelCaps
+  let caps = def
         { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
         , ccPrompt       = \_ -> pure ""
         , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
         }
   case execParserPure defaultPrefs (csParserInfo (agentCommandSpec backend cfgPath)) argv of
     Success act -> runCommandAction act caps

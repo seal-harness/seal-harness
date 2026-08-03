@@ -40,6 +40,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
   (newAgentRuntime)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Paging (defaultPageParams)
@@ -130,10 +131,11 @@ instance Provider ScriptProvider where
 
 -- | A 'ChannelCaps' that records sends into an IORef and returns "yes" on prompt.
 recordCaps :: IORef [Text] -> ChannelCaps
-recordCaps sent = ChannelCaps
+recordCaps sent = def
   { ccSend        = \t -> modifyIORef' sent (++ [t])
   , ccPrompt      = \_ -> pure "yes"
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | Dispatch a single opcode through the full integration seam (authorize →
@@ -866,10 +868,11 @@ spec = describe "Seal.ISA.Integration" $ do
 
   describe "ASK_HUMAN" $ do
     it "\"Ask the human which branch to use.\" -> ASK_HUMAN -> human's reply returned" $ do
-      let caps = ChannelCaps
+      let caps = def
             { ccSend = \_ -> pure ()
             , ccPrompt = \_ -> pure "main"
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
           op = askHumanOp caps
           reg = Registry.mkRegistry [op]

@@ -12,6 +12,7 @@ import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Command.Provider (ProviderRuntime (..))
@@ -46,10 +47,11 @@ metaWith p m =
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
 recordingCaps :: IORef [Text] -> ChannelCaps
-recordingCaps ref = ChannelCaps
+recordingCaps ref = def
   { ccSend         = \t -> modifyIORef' ref (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | A plain-text handler that never fires; used by the non-'PlainMessage' cases.

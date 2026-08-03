@@ -103,9 +103,9 @@ spec = describe "Seal.Channels.Telegram" $ do
       result <- chPrompt h "question?"
       result `shouldBe` Left Deferred
 
-  it "chStreaming is True for Telegram" $ do
+  it "chStreaming is False for Telegram" $ do
     (transport, _, _) <- mkMockTelegramTransport []
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
-      chStreaming h `shouldBe` True
+      chStreaming h `shouldBe` False

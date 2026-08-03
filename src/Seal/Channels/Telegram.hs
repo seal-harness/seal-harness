@@ -54,7 +54,7 @@ instance Channel TelegramChannel where
     , chSendChunk    = sendRaw ch
     , chPrompt       = \_ -> pure (Left Deferred)  -- Telegram can't answer inline
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = True
+    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
     , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
     }

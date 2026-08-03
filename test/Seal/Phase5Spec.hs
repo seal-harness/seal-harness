@@ -25,6 +25,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
   ( newAgentRuntime )
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
@@ -149,10 +150,8 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       ensureConfigRepo cfgRoot
       sent <- newIORef ([] :: [Text])
       workerRan <- newIORef (0 :: Int)
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "")
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
       reg <- buildRegistry cfgRoot workerRan sampleSession
       ref <- newIORef capstoneScript
       (tHandle, readTranscript) <- fakeTwoFileTranscript

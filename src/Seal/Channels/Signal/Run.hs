@@ -23,6 +23,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Katip (Severity (..), ls)
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
 import Seal.Logging.Logger (SealLogger, logIO)
@@ -109,7 +110,7 @@ runSignalLoop
 runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr plainHandler logger =
   withSignalChannel (allow, chunkLimit) account transport logger $ \ch -> do
     let h = toHandle ch
-        handleCaps = ChannelCaps
+        handleCaps = Data.Default.def
           { ccSend         = chSend h
           , ccPrompt       = \q -> do
               -- Bind the pending question to the active session so the
@@ -120,6 +121,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
               outcome <- askHuman askReply sid q (\_qid -> chSend h q)
               pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+          , ccStreaming    = False  -- Signal: send accumulated text once, not per-delta
           }
     loop h handleCaps
   where
