@@ -7,10 +7,12 @@ module Seal.TestHelpers.FakeVault
   , makeFakeVaultRuntime
   , makeLockedVaultRuntime
   , vaultRuntimeFromHandle
+  , fakeLockedVaultRuntime
   ) where
 
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -82,3 +84,16 @@ makeFakeVaultRuntime initial = makeFakeVault initial >>= vaultRuntimeFromHandle 
 -- 'CloneVaultError VaultLocked').
 makeLockedVaultRuntime :: IO VaultRuntime
 makeLockedVaultRuntime = vaultRuntimeFromHandle Nothing
+
+-- | A pure 'VaultRuntime' in the locked state (the 'IORef' holds 'Nothing').
+-- For inline 'ApiDeps' literals in a pure @let@ context that need
+-- @adVault@ but don't use the vault (the endpoints being tested don't
+-- touch deploy keys). The vault-locked state is harmless — the clone seam
+-- fails closed to 'CloneVaultError VaultLocked' which the tests don't
+-- exercise (they use non-deploy-key repos or stubs).
+fakeLockedVaultRuntime :: VaultRuntime
+fakeLockedVaultRuntime = unsafePerformIO vaultRuntimeFromHandleNothing
+  where
+    vaultRuntimeFromHandleNothing = vaultRuntimeFromHandle Nothing
+
+{-# NOINLINE fakeLockedVaultRuntime #-}

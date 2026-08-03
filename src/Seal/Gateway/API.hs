@@ -10,10 +10,13 @@ import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
+import Data.ByteString qualified as BS
+import Data.ByteString.Base64 qualified as B64
 import Data.ByteString.Lazy qualified as BL
 import Control.Exception (SomeException, try)
-import Control.Monad (void)
+import Control.Monad (void, replicateM)
 import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
@@ -24,6 +27,7 @@ import Data.Vector qualified as V
 
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.Read (decimal)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
@@ -32,7 +36,11 @@ import Network.HTTP.Types
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, removeFile)
+import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
+import System.Process (proc, readCreateProcessWithExitCode)
+import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
@@ -42,7 +50,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
-import Seal.Config.Paths (sessionMetaPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
@@ -66,10 +74,12 @@ import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.SourceControl.Repo
-  ( RepoCredential, RepoId, SourceRepo (..), hostAllowed, mkRepoId
-  , parseCredentialKind, parseRepoHost, parseVcsKind, urlShapeValid )
+  ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
+  , parseCredentialKind, parseRepoHost, parseVcsKind, repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
+import Seal.Security.Vault (VaultHandle (vhDelete, vhPut))
+import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
@@ -100,6 +110,8 @@ data ApiDeps = ApiDeps
   , adTabCloseNotifier :: TabCloseNotifier      -- ^ invoked after a tab is closed via the REST API so attached channels are notified; 'noTabCloseNotifier' in tests
   , adRepoRegistry     :: RepoRegistryHandle    -- ^ for /api/repos CRUD (W4)
   , adConfigRepo       :: ConfigRepo            -- ^ for the best-effort @gitCommitAll@ audit-commit of repos.toml after a mutation (W4)
+  , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
+  , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
   }
 
 -- | The REST API as a WAI Application.
@@ -369,6 +381,16 @@ apiApp deps req respond =
     -- not the repo existed). 400 on a malformed id.
     (m', ["api", "repos", rid]) | m' == methodDelete ->
       respond =<< handleRepoDelete deps rid
+    -- GET /api/repos/:id/deploy-key -> the deploy-key public key + setup
+    -- instructions (host-aware). 404 if the repo is absent or not a
+    -- deploy-key repo; 400 on a malformed id.
+    (m', ["api", "repos", rid, "deploy-key"]) | m' == methodGet ->
+      respond =<< handleRepoDeployKey deps rid
+    -- POST /api/repos/:id/deploy-key/generate -> rotation: generate a new
+    -- keypair (overwrites the encrypted keyfile + passphrase) + returns the
+    -- new public key + instructions. 404/400 as above.
+    (m', ["api", "repos", rid, "deploy-key", "generate"]) | m' == methodPost ->
+      respond =<< handleRepoDeployKeyGenerate deps rid
     -- T11: GET /api/providers -> the configured provider list. @isDefault@
     -- and @defaultModel@ are UI conveniences not threaded into 'ApiDeps' for
     -- T11, so only @name@ is emitted.
@@ -1134,13 +1156,46 @@ handleRepoCreate deps body =
     Just v  -> case parseRepoFromBody v of
       Left e -> pure (errJson status400 e)
       Right repo -> do
-        eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
-        case eRes of
-          Left err -> pure (errJson status500 err)
-          Right _  -> do
-            bestEffortCommitRepos deps
-            broadcastReposChanged (adBroker deps)
-            pure (jsonCreated (repoInfoJson repo))
+        -- Check for generate_key: true (iff credential.kind == deploy_key).
+        let genKey = case v of
+              A.Object o -> case KeyMap.lookup (Key.fromText "generate_key") o of
+                Just (A.Bool True) -> True
+                _                  -> False
+              _ -> False
+            isDeployKey = case srCredential repo of
+              CredDeployKey _ -> True
+              _              -> False
+        if genKey && isDeployKey
+          then do
+            -- Generate the keypair + store the repo with the public key.
+            mh <- readIORef (vrHandleRef (adVault deps))
+            case mh of
+              Nothing -> pure (errJson status500 "vault locked — run /vault unlock")
+              Just vh -> do
+                let keyfilePath = repoKeysDir (adPaths deps) </> T.unpack (repoIdText (srId repo))
+                    vaultKey = cVaultKey (srCredential repo)
+                eGen <- generateDeployKey vh vaultKey keyfilePath (repoIdText (srId repo))
+                case eGen of
+                  Left err -> pure (errJson status500 err)
+                  Right pub -> do
+                    let repo' = repo { srDeployKeyPublic = Just pub
+                                     , srKeyfilePath = Just (T.pack keyfilePath) }
+                    eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo')
+                    case eRes of
+                      Left err -> pure (errJson status500 err)
+                      Right _  -> do
+                        bestEffortCommitRepos deps
+                        broadcastReposChanged (adBroker deps)
+                        pure (jsonCreated (repoInfoJson repo'))
+          else do
+            -- Standard upsert (no key generation).
+            eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+            case eRes of
+              Left err -> pure (errJson status500 err)
+              Right _  -> do
+                bestEffortCommitRepos deps
+                broadcastReposChanged (adBroker deps)
+                pure (jsonCreated (repoInfoJson repo))
 
 -- | Handle PUT /api/repos/:id. The path id is authoritative; the body must
 -- carry @url@, @vcs_kind@, and @credential@ (the id may be omitted — it is
@@ -1178,13 +1233,40 @@ handleRepoDelete deps ridTxt =
   case mkRepoId ridTxt of
     Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
     Right rid -> do
-      _eRes <- rrhMutate (adRepoRegistry deps) (removeRepo rid)
-      case _eRes of
+      -- Look up the repo BEFORE deleting (to get the keyfile path + vault key
+      -- for cleanup).
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
         Left err -> pure (errJson status500 err)
-        Right _  -> do
-          bestEffortCommitRepos deps
-          broadcastReposChanged (adBroker deps)
-          pure noContent
+        Right rs -> do
+          let mRepo = findRepo rid rs
+          -- Delete the encrypted keyfile + .pub (if present) + the vault
+          -- passphrase (best-effort — swallow IO errors so a missing file
+          -- doesn't block the delete).
+          case mRepo of
+            Just repo | CredDeployKey vk <- srCredential repo -> do
+              -- Delete the encrypted keyfile + .pub.
+              case srKeyfilePath repo of
+                Just p -> void (try @SomeException (do
+                  let path = T.unpack p
+                  _ <- try @SomeException (removeFile path) :: IO (Either SomeException ())
+                  _ <- try @SomeException (removeFile (path <> ".pub")) :: IO (Either SomeException ())
+                  pure ()))
+                Nothing -> pure ()
+              -- Delete the passphrase from the vault (best-effort).
+              mh <- readIORef (vrHandleRef (adVault deps))
+              case mh of
+                Just vh -> void (try @SomeException (vhDelete vh vk))
+                Nothing -> pure ()
+            _ -> pure ()
+          -- Delete the repo from the registry.
+          _eRes <- rrhMutate (adRepoRegistry deps) (removeRepo rid)
+          case _eRes of
+            Left err -> pure (errJson status500 err)
+            Right _  -> do
+              bestEffortCommitRepos deps
+              broadcastReposChanged (adBroker deps)
+              pure noContent
 
 -- | Best-effort @gitCommitAll repos.toml@ after a registry mutation. The
 -- registry write already succeeded (atomic write+rename), so a commit
@@ -1622,7 +1704,127 @@ errJson :: Status -> Text -> Response
 errJson st msg = responseLBS st (corsHeaders <> [jsonHeader])
   (A.encode (object ["error" .= msg]))
 
--- | CORS headers (echo an allowed Origin).
+----------------------------------------------------------------------------
+-- Deploy-key generation endpoints (W5)
+----------------------------------------------------------------------------
+
+-- | The JSON shape returned by GET /api/repos/:id/deploy-key and POST
+-- /api/repos/:id/deploy-key/generate: @{public_key, setup_instructions}@.
+deployKeyInfoJson :: Text -> Text -> Value
+deployKeyInfoJson pubKey instructions =
+  object [ "public_key" .= pubKey, "setup_instructions" .= instructions ]
+
+-- | Host-aware setup instructions for a deploy key. GitHub repos get the
+-- GitHub-specific template; others get a generic fallback interpolating
+-- the URL + host.
+deployKeyInstructions :: Text -> Text
+deployKeyInstructions url =
+  case parseRepoHost url of
+    Right host | host == "github.com" ->
+      "Go to your GitHub repo → Settings → Deploy keys → Add deploy key. Paste the public key above. Do NOT check \"Allow write access\" unless you need push. The key is ready immediately — no further action needed."
+    Right host ->
+      "Add the public key above to your " <> host <> " repo's deploy-key settings. The key is ready immediately."
+    Left _ ->
+      "Add the public key above to your repo's deploy-key settings."
+
+-- | Handle GET /api/repos/:id/deploy-key. Returns 200 + the deploy-key
+-- public key + host-aware setup instructions. 404 if the repo is absent or
+-- not a deploy-key repo (srDeployKeyPublic is Nothing). 400 on a malformed id.
+handleRepoDeployKey :: ApiDeps -> Text -> IO Response
+handleRepoDeployKey deps ridTxt =
+  case mkRepoId ridTxt of
+    Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
+    Right rid -> do
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
+        Left err -> pure (errJson status500 err)
+        Right rs -> case findRepo rid rs of
+          Nothing -> pure (errJson status404 "repo not found")
+          Just r  -> case srDeployKeyPublic r of
+            Nothing -> pure (errJson status404 "repo has no deploy key (not a deploy-key repo, or key not generated)")
+            Just pk -> pure (jsonOk (deployKeyInfoJson pk (deployKeyInstructions (srUrl r))))
+
+-- | Handle POST /api/repos/:id/deploy-key/generate. Rotation: generate a
+-- new random 32-byte passphrase (base64) → vhPut under the SAME vault key
+-- name → ssh-keygen overwrites the encrypted keyfile → read the .pub →
+-- upsert the SourceRepo with the new srDeployKeyPublic. Returns 200 + the
+-- new public key + instructions. 404 if the repo is absent or not a
+-- deploy-key repo. 400 on a malformed id. 500 if the vault is locked or
+-- ssh-keygen fails.
+handleRepoDeployKeyGenerate :: ApiDeps -> Text -> IO Response
+handleRepoDeployKeyGenerate deps ridTxt =
+  case mkRepoId ridTxt of
+    Left e  -> pure (errJson status400 ("invalid repo id: " <> e))
+    Right rid -> do
+      eRepos <- rrhList (adRepoRegistry deps)
+      case eRepos of
+        Left err -> pure (errJson status500 err)
+        Right rs -> case findRepo rid rs of
+          Nothing -> pure (errJson status404 "repo not found")
+          Just r  -> case srCredential r of
+            CredDeployKey _ -> do
+              -- Resolve the vault handle.
+              mh <- readIORef (vrHandleRef (adVault deps))
+              case mh of
+                Nothing -> pure (errJson status500 "vault locked — run /vault unlock")
+                Just vh -> do
+                  -- Generate a new passphrase + overwrite the keyfile.
+                  let keyfilePath = T.unpack (fromMaybe (T.pack (repoKeysDir (adPaths deps) </> T.unpack (repoIdText rid))) (srKeyfilePath r))
+                      vaultKey = cVaultKey (srCredential r)
+                  eGen <- generateDeployKey vh vaultKey keyfilePath (repoIdText rid)
+                  case eGen of
+                    Left err -> pure (errJson status500 err)
+                    Right newPub -> do
+                      -- Upsert the repo with the new public key.
+                      let r' = r { srDeployKeyPublic = Just newPub
+                                 , srKeyfilePath = Just (T.pack keyfilePath) }
+                      eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo r')
+                      case eRes of
+                        Left err -> pure (errJson status500 err)
+                        Right _  -> do
+                          bestEffortCommitRepos deps
+                          broadcastReposChanged (adBroker deps)
+                          pure (jsonOk (deployKeyInfoJson newPub (deployKeyInstructions (srUrl r))))
+            _ -> pure (errJson status404 "repo is not a deploy-key repo")
+
+-- | Generate a new deploy keypair: random 32-byte passphrase (base64) →
+-- vhPut the passphrase under the vault key → ssh-keygen -t ed25519 -f
+-- <keyfilePath> -N "<passphrase>" -C "seal-deploy-key:<id>" → read the .pub
+-- file. Returns 'Just <pubkey>' on success, 'Left <err>' on failure. The
+-- encrypted keyfile is ciphertext (stays on the harness disk; the
+-- passphrase lives in the vault). The .pub is public data.
+generateDeployKey :: VaultHandle -> Text -> FilePath -> Text -> IO (Either Text Text)
+generateDeployKey vh vaultKey keyfilePath repoId = do
+  -- Generate a random 32-byte passphrase, base64-encoded.
+  rawPass <- randomByteString 32
+  let passphrase = TE.decodeUtf8Lenient (B64.encode rawPass)
+  -- Store the passphrase in the vault.
+  ePut <- vhPut vh vaultKey (TE.encodeUtf8 passphrase)
+  case ePut of
+    Left ve -> pure (Left ("vault put failed: " <> T.pack (show ve)))
+    Right _ -> do
+      -- Run ssh-keygen to overwrite the encrypted keyfile + .pub.
+      let args = ["-t", "ed25519", "-f", keyfilePath, "-N", T.unpack passphrase
+                 , "-C", "seal-deploy-key:" <> T.unpack repoId]
+      (ec, _out, err) <- readCreateProcessWithExitCode (proc "ssh-keygen" args) ""
+      case ec of
+        ExitSuccess -> do
+          -- Read the .pub file.
+          let pubPath = keyfilePath <> ".pub"
+          pubExists <- doesFileExist pubPath
+          if pubExists
+            then do
+              pubBytes <- BS.readFile pubPath
+              pure (Right (TE.decodeUtf8Lenient pubBytes))
+            else pure (Left "ssh-keygen succeeded but .pub file not found")
+        ExitFailure n -> pure (Left ("ssh-keygen failed (exit " <> T.pack (show n) <> "): " <> T.pack err))
+
+-- | Generate a random ByteString of the given length.
+randomByteString :: Int -> IO ByteString
+randomByteString n = BS.pack <$> replicateM n (randomRIO (0, 255))
+
+----------------------------------------------------------------------------
+-- CORS headers
 corsHeaders :: [Header]
 corsHeaders =
   [ (mkHN "Access-Control-Allow-Origin", "*")

@@ -55,6 +55,7 @@ import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
@@ -197,6 +198,8 @@ mkDepsFor paths = do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = repoRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
     }
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
@@ -1554,6 +1557,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1627,6 +1632,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1690,6 +1697,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1754,6 +1763,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1843,6 +1854,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1897,6 +1910,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1950,6 +1965,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1984,6 +2001,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -2070,6 +2089,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -2122,6 +2143,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -2173,6 +2196,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -2218,6 +2243,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -2272,6 +2299,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = repoRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
 
     it "GET /api/repos returns 200 + [] when the registry is empty" $
@@ -2604,6 +2633,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = corruptH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
@@ -2643,6 +2674,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2871,6 +2904,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -2961,6 +2996,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -3083,6 +3120,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -3190,6 +3229,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

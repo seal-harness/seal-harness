@@ -28,6 +28,7 @@ import Seal.Git.Repo (openConfigRepo)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
@@ -72,6 +73,8 @@ mkDeps = do
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry = repoRegH
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
     })
 
 spec :: Spec

@@ -36,6 +36,7 @@ import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
@@ -86,6 +87,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry = fakeRepoRegistryHandle
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -137,6 +140,8 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry = fakeRepoRegistryHandle
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

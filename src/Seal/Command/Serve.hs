@@ -248,6 +248,8 @@ runServeMain autonomy logger = do
         , adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , adRepoRegistry     = repoRegH
         , adConfigRepo       = repo
+        , adVault            = rt
+        , adPaths            = paths
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from
