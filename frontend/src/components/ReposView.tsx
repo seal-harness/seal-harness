@@ -442,6 +442,8 @@ export function ReposView() {
                       wordBreak: 'break-all',
                       color: 'var(--text-primary)',
                       margin: 0,
+                      cursor: 'default',
+                      userSelect: 'all',
                     }}
                   >
                     {selected.deploy_key_public}
