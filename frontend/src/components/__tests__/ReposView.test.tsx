@@ -97,7 +97,7 @@ describe('ReposView', () => {
     fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
     fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
     // vcs_kind defaults to github; leave as-is.
-    fireEvent.change(document.getElementById('repo-vault-key') as HTMLInputElement, { target: { value: 'GITHUB_PAT_MYREPO' } })
+    // vault_key is auto-generated from id + kind (no field for the user).
     fireEvent.click(screen.getByLabelText('Create repo'))
     await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
     const body = createRepo.mock.calls[0]![0] as { id?: string; url: string; vcs_kind: string; credential: { kind: string; vault_key: string } }
@@ -105,7 +105,8 @@ describe('ReposView', () => {
     expect(body.url).toBe('git@github.com:owner/repo.git')
     expect(body.vcs_kind).toBe('github')
     expect(body.credential.kind).toBe('pat')
-    expect(body.credential.vault_key).toBe('GITHUB_PAT_MYREPO')
+    // vault_key is auto-generated: seal-<kind>-<id>
+    expect(body.credential.vault_key).toBe('seal-pat-myrepo')
   })
 
   it('create validates the id charset and surfaces an error for a bad id', () => {
@@ -165,8 +166,8 @@ describe('ReposView', () => {
   it('has NO secret-value field (security invariant)', () => {
     // The editor form must never render an input whose name/id suggests a
     // secret VALUE (token/value/secret/password). The only credential
-    // inputs are vault_key (a vault key NAME) and username (a bot account
-    // name) — never the secret itself.
+    // input is username (a bot account name) — never the secret itself.
+    // The vault key is auto-generated from the repo id + credential kind.
     reposState = []
     render(<ReposView />)
     fireEvent.click(screen.getByLabelText('New repo'))
@@ -181,7 +182,7 @@ describe('ReposView', () => {
         expect(name.toLowerCase()).not.toContain(bad)
       }
     }
-    // Sanity: the expected credential inputs ARE present.
-    expect(document.getElementById('repo-vault-key')).not.toBeNull()
+    // Sanity: the vault-key field is NOT present (auto-generated, no UI).
+    expect(document.getElementById('repo-vault-key')).toBeNull()
   })
 })

@@ -52,6 +52,14 @@ function repoToInput(r: RepoInfo): RepoInput {
   return { id: r.id, url: r.url, vcs_kind: r.vcs_kind, credential: { ...r.credential } }
 }
 
+/** Auto-generate the vault key from the repo id + credential kind. The
+ *  vault key is deterministic (same id + kind → same key) so the user never
+ *  needs to type it. Pattern: `seal-<kind>-<id>` (e.g. `seal-pat-myrepo`,
+ *  `seal-deploy_key-myrepo`, `seal-machine_user-myrepo`). */
+function autoVaultKey(id: string, kind: RepoCredentialKind): string {
+  return `seal-${kind}-${id}`
+}
+
 // ── Component ───────────────────────────────────────────────────────────
 
 /** The source-control repos CRUD view. Lists every repo on the left; the
@@ -62,8 +70,9 @@ function repoToInput(r: RepoInfo): RepoInput {
  *
  *  SECURITY INVARIANT: the credential descriptor stored here is a vault
  *  key NAME only — the secret value lives in the Seal vault and is NEVER
- *  rendered in this UI. The editor exposes `credential.vault_key` (the key
- *  name) and `credential.username` (bot-account name only), never a
+ *  rendered in this UI. The vault key is auto-generated from the repo id +
+ *  credential kind (no user-facing field for it). The editor exposes
+ *  `credential.username` (bot-account name only, machine_user), never a
  *  token/secret/password field. */
 export function ReposView() {
   const { repos, loaded, error, refresh } = useRepos()
@@ -106,7 +115,6 @@ export function ReposView() {
     if (id.length === 0) return 'id is required'
     if (!/^[A-Za-z0-9_-]+$/.test(id)) return 'id must be [A-Za-z0-9_-]+ (no spaces, slashes, or dots)'
     if (!(form.url ?? '').trim()) return 'url is required'
-    if (!(form.credential.vault_key ?? '').trim()) return 'vault_key is required'
     if (form.credential.kind === 'machine_user' && !(form.credential.username ?? '').trim()) {
       return 'username is required for a Bot Account (machine_user)'
     }
@@ -120,7 +128,7 @@ export function ReposView() {
     setFormError(null)
     const trimmedId = (form.id ?? '').trim()
     const url = (form.url ?? '').trim()
-    const vaultKey = (form.credential.vault_key ?? '').trim()
+    const vaultKey = autoVaultKey(trimmedId, form.credential.kind)
     const username = form.credential.username?.trim()
     if (creating) {
       const payload: RepoInput = {
@@ -373,18 +381,6 @@ export function ReposView() {
                 Note: deploy_key is preferred for lower exposure (machine-user token is in memory during the clone).
               </div>
             )}
-
-            <Row label="Vault key" htmlFor="repo-vault-key" hint="Store the credential in the vault under this key name. The secret value is never stored here or shown.">
-              <input
-                id="repo-vault-key"
-                type="text"
-                value={form.credential.vault_key ?? ''}
-                onChange={(e) => setForm((f) => ({ ...f, credential: { ...f.credential, vault_key: e.target.value } }))}
-                style={inputStyle}
-                placeholder="GITHUB_PAT_MYREPO"
-                autoComplete="off"
-              />
-            </Row>
 
             {credKind === 'machine_user' && (
               <Row label="Username" htmlFor="repo-username" hint="The bot account username (machine_user only).">
