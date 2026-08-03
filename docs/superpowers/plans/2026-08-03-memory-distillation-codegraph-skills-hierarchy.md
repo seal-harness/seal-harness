@@ -38,7 +38,7 @@ Tencent's system has four genuinely good ideas buried in a TypeScript/Node.js co
 - **No web panel** (Tencent's "Memory Hub"). Our frontend (Phase 7) will render these features, not a separate panel.
 - **No TencentDB lock-in.** Everything is local SQLite + Markdown + git.
 - **No multi-agent team ACLs.** Trusted/untrusted is sufficient for now.
-- **No Wiki layer.** Our knowledge base (Obsidian vault + engram) already serves this purpose. CodeGraph is the higher-value addition.
+- **No Wiki layer.** Our knowledge base already serves this purpose. CodeGraph is the higher-value addition.
 - **No BM25 + vector + RRF hybrid retrieval (yet).** Start with FTS5 keyword search. Add vector search later if retrieval quality demands it. YAGNI.
 
 ### Where this fits in the roadmap
@@ -403,7 +403,7 @@ Implement the L0→L1→L2→L3 conversation distillation pipeline. Raw session 
 - **L3 (Persona)** — Long-term profile, stable patterns, high-level cognition. A single `~/.seal/config/memory/l3/persona.md` file with structured sections: User Narrative Profile, Archetype, Basic Information, Long-term Preferences, Interaction & Cognitive Protocol, Deep Insights & Evolution. Updated incrementally.
 
 **Pipeline:**
-- Runs as a background task after a session ends (or during idle periods).
+- Runs as a background task when a tab is closed (or during idle periods).
 - L1 extraction: One LLM call per batch of ~5 conversation turns. Extracts atoms with type/priority/source references.
 - L2 scenario consolidation: One LLM call after L1 processes new atoms. Organizes atoms into scenario files (max 15 scenarios, each ≤1500 chars). Uses file-based workspace (read/write Markdown files in a temp dir, like Tencent's scene_blocks approach).
 - L3 persona update: One LLM call after L2 completes (or every ~50 new L1 atoms). Incremental update of the persona.md file.
@@ -1309,7 +1309,7 @@ The cold-start import is a thin orchestration layer over existing capabilities:
 4. When indexing completes, the repo appears in `CODEGRAPH_LIST` results
 5. The model can immediately use `CODEGRAPH_SEARCH` and `CODEGRAPH_IMPACT`
 
-No Wiki layer (our KB + engram already serve this purpose). No conversation session import (our session transcripts are already in the right format for the distillation pipeline).
+No Wiki layer. No conversation session import (our session transcripts are already in the right format for the distillation pipeline).
 
 ### Tasks
 
@@ -1425,7 +1425,7 @@ git commit -m "feat(gateway): add repo-add API endpoint stub for CodeGraph cold-
 
 ## What We're Explicitly NOT Building
 
-- **No Wiki layer** — our KB + engram already serves this purpose
+- **No Wiki layer** — out of scope
 - **No vector embeddings** — start with FTS5 keyword search; add vector search later if retrieval quality demands it. YAGNI.
 - **No multi-agent team ACLs** — trusted/untrusted is sufficient. Add more levels later if needed.
 - **No web panel** — the frontend (Phase 7) will render these features, not a separate panel
