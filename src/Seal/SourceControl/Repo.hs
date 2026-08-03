@@ -89,10 +89,21 @@ data RepoCredential
   deriving stock (Eq, Show)
 
 data SourceRepo = SourceRepo
-  { srId         :: RepoId
-  , srUrl        :: Text
-  , srVcsKind    :: VcsKind
-  , srCredential :: RepoCredential
+  { srId               :: RepoId
+  , srUrl              :: Text
+  , srVcsKind          :: VcsKind
+  , srCredential       :: RepoCredential
+  , srDeployKeyPublic  :: Maybe Text
+    -- ^ The deploy-key public key (present iff 'srCredential' is
+    -- 'CredDeployKey' and the key was generated). Public data — safe to
+    -- return in API responses + render in the UI.
+  , srKeyfilePath      :: Maybe Text
+    -- ^ The path to the encrypted keyfile on the harness disk
+    -- (@repoKeysDir </> repo-id>@). The file is CIPHERTEXT (encrypted by
+    -- @ssh-keygen@ with a passphrase from the vault); it stays on the
+    -- harness disk and never leaves it. 'Nothing' for non-deploy-key
+    -- repos. Stored as 'Text' for TOML/JSON codec simplicity; converted to
+    -- 'FilePath' at the call site via 'T.unpack'.
   } deriving stock (Eq, Show)
 
 -- | The source-control repo registry: a keyed-by-id map of 'SourceRepo's.
@@ -178,6 +189,8 @@ repoCodec srId = SourceRepo srId
   <$> Toml.text "url"                                       .= srUrl
   <*> validatedTextCodec "vcs_kind" parseVcsKind vcsKindText .= srVcsKind
   <*> credentialCodec                                       .= srCredential
+  <*> Toml.dioptional (Toml.text "deploy_key_public")       .= srDeployKeyPublic
+  <*> Toml.dioptional (Toml.text "keyfile_path")            .= srKeyfilePath
 
 -- | Bidirectional tomland codec for the whole @[repos]@ table — a keyed-by-id
 -- map. Runs 'mkRepoId' on each decoded key (fail-closed: a bad key id → decode
@@ -437,21 +450,33 @@ lookupRepoByUrl query (RepoRegistry repos) =
 
 instance ToJSON SourceRepo where
   toJSON r = object
-    [ "id"          Aeson..= repoIdText (srId r)
-    , "url"         Aeson..= srUrl r
-    , "vcs_kind"    Aeson..= vcsKindText (srVcsKind r)
-    , "credential"  Aeson..= credentialToObject (srCredential r)
+    [ "id"                Aeson..= repoIdText (srId r)
+    , "url"               Aeson..= srUrl r
+    , "vcs_kind"          Aeson..= vcsKindText (srVcsKind r)
+    , "credential"        Aeson..= credentialToObject (srCredential r)
+    , "deploy_key_public" Aeson..= srDeployKeyPublic r
+    , "keyfile_path"      Aeson..= srKeyfilePath r
     ]
 
 instance FromJSON SourceRepo where
   parseJSON = withObject "SourceRepo" $ \o -> do
-    rid  <- o .:  "id"
-    url  <- o .:  "url"
-    kind <- o .:  "vcs_kind"
-    cred <- o .:  "credential"
+    rid    <- o .:  "id"
+    url    <- o .:  "url"
+    kind   <- o .:  "vcs_kind"
+    cred   <- o .:  "credential"
+    mPub   <- o .:? "deploy_key_public"
+    mPath  <- o .:? "keyfile_path"
     i  <- either (fail . T.unpack) pure (mkRepoId rid)
     vk <- either (fail . T.unpack) pure (parseVcsKind kind)
-    SourceRepo i url vk <$> parseCredentialFromObject cred
+    cred' <- parseCredentialFromObject cred
+    pure SourceRepo
+      { srId = i
+      , srUrl = url
+      , srVcsKind = vk
+      , srCredential = cred'
+      , srDeployKeyPublic = mPub
+      , srKeyfilePath = mPath
+      }
 
 credentialToObject :: RepoCredential -> Value
 credentialToObject c = object $ case c of

@@ -59,11 +59,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
 
   describe "planClone" $ do
     let rid = case mkRepoId "seal-harness" of Right i -> i; Left e -> error (T.unpack e)
-        patRepo url = SourceRepo rid url VcsGitHub (CredPat "GITHUB_PAT")
+        patRepo url = SourceRepo rid url VcsGitHub (CredPat "GITHUB_PAT") Nothing Nothing
         machineRepo url =
-          SourceRepo rid url VcsGitHub (CredMachineUser "GITHUB_MACHINEUSER" "acme-bot")
-        deployRepo url = SourceRepo rid url VcsGitHub (CredDeployKey "GITHUB_DEPLOYKEY")
-
+          SourceRepo rid url VcsGitHub (CredMachineUser "GITHUB_MACHINEUSER" "acme-bot") Nothing Nothing
+        deployRepo url = SourceRepo rid url VcsGitHub (CredDeployKey "GITHUB_DEPLOYKEY") Nothing Nothing
     it "PAT ssh URL → ClonePlanExtraHeader https-url" $
       planClone (patRepo "git@github.com:owner/repo.git")
         `shouldBe` Right (ClonePlanExtraHeader "https://github.com/owner/repo.git" "GITHUB_PAT")
@@ -85,7 +84,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         `shouldBe` Left (CloneNoCredentialForUrl "not-a-url")
 
     it "VcsGit (non-github) → CloneUnsupportedVcs VcsGit" $
-      let r = SourceRepo rid "git@github.com:o/r.git" VcsGit (CredPat "K")
+      let r = SourceRepo rid "git@github.com:o/r.git" VcsGit (CredPat "K") Nothing Nothing
       in planClone r `shouldBe` Left (CloneUnsupportedVcs VcsGit)
 
     it "already-https URL with PAT → ClonePlanExtraHeader same https-url" $
@@ -135,8 +134,8 @@ spec = describe "Seal.SourceControl.Clone" $ do
 
   describe "no-disk invariant (W2)" $ do
     let rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-        deployRepo url vk = SourceRepo rid1 url VcsGitHub (CredDeployKey vk)
-        patRepo url vk = SourceRepo rid1 url VcsGitHub (CredPat vk)
+        deployRepo url vk = SourceRepo rid1 url VcsGitHub (CredDeployKey vk) Nothing Nothing
+        patRepo url vk = SourceRepo rid1 url VcsGitHub (CredPat vk) Nothing Nothing
 
     it "deploy key: passphrase NOT on disk; encrypted keyfile IS on disk (ciphertext)" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
@@ -255,9 +254,8 @@ spec = describe "Seal.SourceControl.Clone" $ do
   describe "per-op scoping (W2)" $ do
     let rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
         rid2 = case mkRepoId "repo-b" of Right i -> i; Left _ -> error "bad id"
-        repo1 = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K1")
-        repo2 = SourceRepo rid2 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K2")
-
+        repo1 = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K1") Nothing Nothing
+        repo2 = SourceRepo rid2 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K2") Nothing Nothing
     it "two sequential ops → exactly one sahAddKey + sahDeleteAll + sahKill per op" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
         let keyfilesDir = homeDir </> ".seal/state/repos/keys"
@@ -346,7 +344,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
             passphrase :: ByteString
             passphrase = "SECRET-PASSPHRASE"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", passphrase)]
         callsRef <- newIORef []
@@ -392,7 +390,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         let token :: ByteString
             token = "ghp_SECRET_TOKEN_BYTES"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K_PAT")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K_PAT") Nothing Nothing
         vault <- makeFakeVaultRuntime [("K_PAT", token)]
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
@@ -430,7 +428,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
             username = "acme-bot" :: Text
             ridA = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
             repo = SourceRepo ridA "git@github.com:o/r.git" VcsGitHub
-                    (CredMachineUser "K_MU" username)
+                    (CredMachineUser "K_MU" username) Nothing Nothing
         vault <- makeFakeVaultRuntime [("K_MU", token)]
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
@@ -458,7 +456,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
   describe "vault error surfacing" $ do
     it "locked vault → Left (CloneVaultError VaultLocked)" $ do
       let rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K")
+          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K") Nothing Nothing
       withSystemTempDirectory "seal-keys" $ \keyfilesDir -> do
         vault <- makeLockedVaultRuntime
         callsRef <- newIORef []
@@ -477,7 +475,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
 
     it "missing key → Left (CloneVaultError (VaultKeyNotFound k))" $ do
       let rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "MISSING_KEY")
+          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "MISSING_KEY") Nothing Nothing
       withSystemTempDirectory "seal-keys" $ \keyfilesDir -> do
         vault <- makeFakeVaultRuntime []
         callsRef <- newIORef []
@@ -515,7 +513,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         createDirectoryIfMissing True keyfilesDir
         let keyfilePath = keyfilesDir </> "repo-a"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
@@ -545,7 +543,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         createDirectoryIfMissing True keyfilesDir
         let keyfilePath = keyfilesDir </> "repo-a"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
@@ -619,7 +617,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
   describe "renderPatHeader (non-UTF-8 token bytes — security fix MEDIUM 3)" $ do
     it "ASCII token: base64(user:token) round-trips" $ do
       let rid1 = case mkRepoId "x" of Right i -> i; Left _ -> error "bad id"
-          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K")
+          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K") Nothing Nothing
           token = "ghp_ASCII_TOKEN" :: ByteString
           header = renderPatHeader repo token
           expected = "Authorization: Basic "
@@ -628,7 +626,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
 
     it "non-UTF-8 token byte (0xFF) is base64-encoded verbatim (NOT corrupted)" $ do
       let rid1 = case mkRepoId "x" of Right i -> i; Left _ -> error "bad id"
-          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K")
+          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K") Nothing Nothing
           token = "secret" <> BS.singleton 0xFF <> "bytes" :: ByteString
           header = renderPatHeader repo token
           expected = "Authorization: Basic "
@@ -640,7 +638,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
 
     it "MachineUser uses cUsername as the Basic auth user" $ do
       let rid1 = case mkRepoId "x" of Right i -> i; Left _ -> error "bad id"
-          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredMachineUser "K" "acme-bot")
+          repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredMachineUser "K" "acme-bot") Nothing Nothing
           token = "tok" :: ByteString
           header = renderPatHeader repo token
           expected = "Authorization: Basic "
@@ -654,7 +652,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         createDirectoryIfMissing True keyfilesDir
         let keyfilePath = keyfilesDir </> "repo-a"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
@@ -682,7 +680,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         createDirectoryIfMissing True keyfilesDir
         let keyfilePath = keyfilesDir </> "repo-a"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
@@ -714,7 +712,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         -- fake to succeed — but we write it so the path is realistic).
         let keyfilePath = keyfilesDir </> "repo-a"
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
-            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K")
+            repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []

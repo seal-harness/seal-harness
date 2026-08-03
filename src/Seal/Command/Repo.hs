@@ -219,10 +219,12 @@ validateAdd rawId url rawVcs rawCred vaultKey mUsername = do
         else do
           cred <- parseCredentialKind rawCred vaultKey mUsername
           Right SourceRepo
-            { srId         = rid
-            , srUrl        = url
-            , srVcsKind    = vcs
-            , srCredential = cred
+            { srId               = rid
+            , srUrl              = url
+            , srVcsKind          = vcs
+            , srCredential       = cred
+            , srDeployKeyPublic  = Nothing
+            , srKeyfilePath      = Nothing
             }
 
 ----------------------------------------------------------------------------

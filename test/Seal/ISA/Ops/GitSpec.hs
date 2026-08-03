@@ -52,8 +52,8 @@ spec :: Spec
 spec = describe "Seal.ISA.Ops.Git" $ do
 
   let rid = case mkRepoId "myrepo" of Right i -> i; Left _ -> error "bad id"
-      deployRepo = SourceRepo rid "git@github.com:owner/repo.git" VcsGitHub (CredDeployKey "K_PASS")
-      patRepo = SourceRepo rid "https://github.com/owner/repo.git" VcsGitHub (CredPat "K_PAT")
+      deployRepo = SourceRepo rid "git@github.com:owner/repo.git" VcsGitHub (CredDeployKey "K_PASS") Nothing Nothing
+      patRepo = SourceRepo rid "https://github.com/owner/repo.git" VcsGitHub (CredPat "K_PAT") Nothing Nothing
       originUrl = "git@github.com:owner/repo.git"
       patOriginUrl = "https://github.com/owner/repo.git"
 

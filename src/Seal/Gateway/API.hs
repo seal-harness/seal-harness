@@ -1243,7 +1243,8 @@ parseRepoWithId rid (A.Object o) = do
     Just (A.Object co) -> parseCredentialObj co
     Just _             -> Left "credential must be an object"
     Nothing            -> Left "credential is required"
-  Right SourceRepo { srId = rid, srUrl = url, srVcsKind = vcsKind, srCredential = cred }
+  Right SourceRepo { srId = rid, srUrl = url, srVcsKind = vcsKind, srCredential = cred
+                   , srDeployKeyPublic = Nothing, srKeyfilePath = Nothing }
 parseRepoWithId _ _ = Left "invalid JSON body"
 
 -- | Parse the @credential@ object (@{kind, vault_key, username?}@) into a

@@ -23,7 +23,7 @@ import Seal.SourceControl.Registry
 mkRepo :: Text -> Text -> VcsKind -> RepoCredential -> (RepoId, SourceRepo)
 mkRepo rid url kind cred =
   case mkRepoId rid of
-    Right i  -> (i, SourceRepo i url kind cred)
+    Right i  -> (i, SourceRepo i url kind cred Nothing Nothing)
     Left err -> error ("bad fixed repo id in test: " <> T.unpack err)
 
 patRepo :: (RepoId, SourceRepo)

@@ -36,10 +36,12 @@ import Seal.TestHelpers.FakeCaps (FakeCaps (..), getSent, makeFakeCaps)
 repoPat :: SourceRepo
 repoPat = case mkRepoId "myrepo" of
   Right i -> SourceRepo
-    { srId         = i
-    , srUrl        = "git@github.com:o/r.git"
-    , srVcsKind    = VcsGitHub
-    , srCredential = CredPat "K"
+    { srId               = i
+    , srUrl              = "git@github.com:o/r.git"
+    , srVcsKind          = VcsGitHub
+    , srCredential       = CredPat "K"
+    , srDeployKeyPublic  = Nothing
+    , srKeyfilePath      = Nothing
     }
   Left e -> error ("invalid repo id: " <> T.unpack e)
 
@@ -47,10 +49,12 @@ repoPat = case mkRepoId "myrepo" of
 repoBot :: SourceRepo
 repoBot = case mkRepoId "botrepo" of
   Right i -> SourceRepo
-    { srId         = i
-    , srUrl        = "https://github.com/o/bot.git"
-    , srVcsKind    = VcsGitHub
-    , srCredential = CredMachineUser "BK" "bot"
+    { srId               = i
+    , srUrl              = "https://github.com/o/bot.git"
+    , srVcsKind          = VcsGitHub
+    , srCredential       = CredMachineUser "BK" "bot"
+    , srDeployKeyPublic  = Nothing
+    , srKeyfilePath      = Nothing
     }
   Left e -> error ("invalid repo id: " <> T.unpack e)
 
