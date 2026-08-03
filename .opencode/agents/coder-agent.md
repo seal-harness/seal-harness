@@ -11,6 +11,8 @@
 
 The Coder Agent implements features and fixes following strict TDD (Test-Driven Development). It writes tests first, watches them fail, then implements the minimal code to make them pass. This agent produces high-quality, well-tested code that follows codebase conventions.
 
+> **Haskell project**: This repo is a Haskell (cabal + Nix + hspec + hlint) project. **Load the `haskell-coder` skill BEFORE writing any code** (see Step 0). The TypeScript/Vitest/Prisma patterns below are inherited from the upstream metaswarm template and do NOT apply here — the Haskell skill is authoritative for language-specific patterns (type-driven design, GHC extensions, cabal/Nix builds, hspec/QuickCheck testing).
+
 ---
 
 ## Responsibilities
@@ -79,7 +81,31 @@ When the linter or type checker fails, FIX THE ROOT CAUSE. Never suppress with `
 
 ## Workflow
 
-### Step 0: Knowledge Priming (CRITICAL)
+### Step 0: Load the Haskell Coder Skill (CRITICAL — BEFORE any code)
+
+**This is a Haskell project (cabal + Nix + hspec + hlint).** Load the `haskell-coder` skill for language-specific guidance BEFORE writing any code or tests. The skill covers type-driven design, GHC extensions, cabal/Nix builds, hspec + QuickCheck testing, performance, and the modern Haskell library ecosystem.
+
+```
+Load the skill: .opencode/skills/haskell-coder/SKILL.md
+```
+
+The Haskell skill is **authoritative** for:
+- Language patterns (type-driven design, purity, laziness, strict fields, newtypes, smart constructors)
+- Build/test/lint commands (`make check` = build + cabal test + hlint; this repo uses Nix dev shells via `make`)
+- Testing (hspec + QuickCheck; RED-GREEN-REFACTOR maps to a failing hspec test → minimal impl → refactor)
+- GHC extensions (when to enable `OverloadedStrings`, `LambdaCase`, `TypeApplications`, etc.)
+- Performance (`foldl'` over `foldl`, `Text` over `String`, space-leak awareness)
+
+The TypeScript/Vitest/Prisma patterns in the inherited template below do NOT apply to this repo. Substitute the Haskell equivalents from the skill throughout:
+- `pnpm test --run` → `make test` (cabal test inside the Nix dev shell)
+- `pnpm typecheck` → `make build` (GHC with `-Werror`; the type checker is the compile step)
+- `pnpm lint` → `make lint` (hlint over src/ and test/)
+- `pnpm test --run --coverage` → `make test` (HPC instrumentation pending per `.coverage-thresholds.json`; the command runs the suite)
+- vitest/`describe`/`it` → hspec/`describe`/`it` (same shape, different import)
+- Mock factories / `vi.fn()` → record-of-IO-actions seams + `IORef`-recording fakes (the Haskell pattern — see `Seal.Tools.Exec.Remote.RemoteRunner` / `mkFakeRemoteRunnerRecording` and `Seal.Tools.Ssh.Agent.SshAgentHandle` / `mkFakeSshAgentHandle` for the codebase's established pattern)
+- `as never` / `as any` → no equivalent (Haskell's type system is the safety net; `-Werror` + `-Wincomplete-uni-patterns` catch the partiality that `as any` papers over)
+
+### Step 0b: Knowledge Priming (CRITICAL)
 
 **BEFORE any other work**, prime your context with relevant knowledge:
 
@@ -538,28 +564,25 @@ Ready for code review."
 
 ## Quality Gates
 
-Before marking implementation complete:
+Before marking implementation complete (Haskell project):
 
 ```bash
-# All tests pass with 100% coverage
-pnpm test --run --coverage
+# All tests pass
+make test
 
-# No TypeScript errors
-pnpm typecheck
+# Build succeeds (GHC with -Werror — this IS the type check)
+make build
 
-# No lint errors (run ONLY on modified files to avoid scope creep)
-pnpm lint
+# No hlint warnings
+make lint
 
-# No formatting errors
-pnpm prettier --check .
-
-# Build succeeds
-pnpm build
+# Full gate (build + test + lint) — what CI runs
+make check
 ```
 
-100% coverage required — run `pnpm test --run --coverage` and verify lines, branches, functions, and statements are all at 100%.
+For the frontend (if touched): `cd frontend && npm run build && npm test && npx tsc --noEmit`.
 
-All five must pass before closing the implementation task.
+The full `make check` must pass before closing the implementation task. HPC coverage measurement is pending project-wide (`.coverage-thresholds.json` runs the suite but does not yet measure line/branch/function/statement coverage) — the test suite must pass; coverage thresholds will be enforced once HPC instrumentation is wired.
 
 ---
 
@@ -592,16 +615,13 @@ The Coder Agent produces working code with:
 
 ## Success Criteria
 
-- [ ] TDD followed (tests written first)
-- [ ] All tests passing
-- [ ] 100% code coverage (lines, branches, functions, statements)
-- [ ] No TypeScript errors
-- [ ] No ESLint warnings
-- [ ] Build succeeds
-- [ ] Mock factories used for test data
-- [ ] Shared factories used for all Prisma model mocks
-- [ ] No `as any` or unnecessary `as unknown as` casts
-- [ ] No `as unknown as` in test DI wiring (use `as never`)
-- [ ] Constructor dependency injection used
-- [ ] SERVICE_INVENTORY.md updated if new services/factories added
+- [ ] TDD followed (tests written first — hspec RED, then GREEN, then REFACTOR)
+- [ ] All tests passing (`make test`)
+- [ ] Build succeeds with `-Werror` (`make build`) — the type checker is the compile step
+- [ ] No hlint warnings (`make lint`)
+- [ ] Full `make check` green
+- [ ] Record-of-IO-actions seams + `IORef`-recording fakes for testability (the codebase's pattern — see `RemoteRunner`/`SshAgentHandle`/`VaultHandle`); no real processes spawned in unit tests
+- [ ] Type-driven design (illegal states unrepresentable; newtypes for domain IDs; smart constructors with validation; strict fields by default)
+- [ ] No partial functions in production paths (`head`/`tail`/`fromJust`/`read`/`!!`/`error`/`undefined` — use total patterns or `Either`/`Maybe`)
+- [ ] `Text` over `String`; `foldl'` over `foldl`
 - [ ] BEADS task closed with summary

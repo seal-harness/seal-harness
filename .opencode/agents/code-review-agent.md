@@ -11,6 +11,8 @@
 
 The Code Review Agent performs thorough internal code review before changes are submitted as a PR. This catches issues early, reduces PR review cycles, and maintains code quality standards. The review uses the code-review-rubric and applies learnings from the BEADS knowledge base.
 
+> **Haskell project**: This repo is a Haskell (cabal + Nix + hspec + hlint) project. **Load the `haskell-reviewer` skill BEFORE reviewing any code** (see Step 0). The TypeScript/Vitest/Prisma patterns in the inherited template below do NOT apply here — the Haskell reviewer skill is authoritative for language-specific review criteria (totality, exhaustive patterns, type-driven design, performance pitfalls, idiomatic style).
+
 ---
 
 ## Operating Modes
@@ -85,7 +87,23 @@ Triggered when:
 
 ## Workflow
 
-### Step 0: Knowledge Priming (CRITICAL)
+### Step 0: Load the Haskell Reviewer Skill (CRITICAL — BEFORE any review)
+
+**This is a Haskell project (cabal + Nix + hspec + hlint).** Load the `haskell-reviewer` skill for language-specific review criteria BEFORE reviewing the diff. The skill covers correctness (totality, exhaustive patterns, no `error`/`undefined` in production, `unsafePerformIO` audit), types (illegal states unrepresentable, newtypes, smart constructors, strict fields), performance (`foldl'`/`foldl`, `Text`/`String`, space leaks), and idiomatic style.
+
+```
+Load the skill: .opencode/skills/haskell-reviewer/SKILL.md
+```
+
+The Haskell reviewer skill is **authoritative** for language-specific checks. The TypeScript/Vitest/Prisma checks in the inherited template below (no `as any`, mock factories, `pnpm typecheck`, 100% coverage) do NOT apply here — substitute the Haskell equivalents from the skill:
+- `pnpm typecheck` → `make build` (GHC with `-Werror`; the type checker is the compile step — verify the diff builds clean)
+- `pnpm lint` → `make lint` (hlint over src/ and test/ — verify no hints)
+- `pnpm test --run --coverage` → `make test` (hspec + QuickCheck; HPC coverage measurement pending)
+- No `as any` / `as unknown as` → no equivalent (Haskell's type system is the safety net; instead check for partial functions: `head`/`tail`/`fromJust`/`read`/`!!`/`error`/`undefined` — flag any in production paths)
+- Mock factories / `vi.fn()` → record-of-IO-actions seams + `IORef`-recording fakes (verify the codebase's pattern: `RemoteRunner`/`SshAgentHandle`/`VaultHandle`; real processes must NOT be spawned in unit tests)
+- 100% coverage → the test suite must pass (`make test`); HPC thresholds pending
+
+### Step 0b: Knowledge Priming (CRITICAL)
 
 **BEFORE any other work**, prime your context with relevant knowledge:
 
@@ -616,9 +634,13 @@ The Code Review Agent produces a structured review:
 ## Success Criteria
 
 - [ ] All changed files reviewed
+- [ ] `haskell-reviewer` skill loaded and applied (totality, exhaustive patterns, type-driven design, performance, idiomatic style)
+- [ ] No partial functions in production paths (`head`/`tail`/`fromJust`/`read`/`!!`/`error`/`undefined`)
+- [ ] No `unsafePerformIO` without a proof-of-correctness comment
+- [ ] `Text` over `String`; `foldl'` over `foldl`; no space leaks
+- [ ] Type-driven design (illegal states unrepresentable; newtypes for domain IDs; smart constructors; strict fields)
+- [ ] Record-of-IO-actions seams + `IORef`-recording fakes for testability (no real processes in unit tests)
 - [ ] Security patterns verified
-- [ ] Test coverage adequate
-- [ ] TypeScript strict compliance
-- [ ] Mock factories used (not manual mocks)
+- [ ] `make check` (build + test + lint) verified green by independent validation (never trust the coder's self-report)
 - [ ] BEADS task updated with findings
 - [ ] Knowledge captured if patterns discovered
