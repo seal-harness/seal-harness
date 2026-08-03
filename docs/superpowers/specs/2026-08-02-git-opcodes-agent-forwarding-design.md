@@ -193,18 +193,20 @@ Two mechanisms, both disk-free, one per credential family:
 
 **The key lifecycle (no disk anywhere):**
 1. **Generation** (at repo-create time, frontend-initiated, on the harness):
-   `ssh-keygen -t ed25519 -f - -N "" -C "seal-deploy-key:<repo-id>"` writes the
-   **private** key to stdout, but the **public** key goes to a file literally
-   named `-.pub` in the cwd (a quirk of `ssh-keygen -f -` — verified). The
-   harness captures the **private** key from stdout, **immediately reads AND
-   deletes `-.pub`** for the public key bytes, stores the private key in the
-   vault under a per-repo key name (e.g. `seal-deploy-key:<repo-id>`) via
-   `vhPut`, and returns the public key to the frontend. The `-.pub` cleanup is
-   explicit (a `bracket`-style `finally removeFile`); the no-disk test
-   asserts `-.pub` does not exist after generation. (Alternative considered:
-   generate into a temp dir; rejected — same disk-touch, more moving parts.
-   The capture-and-delete is the minimal mechanism.) No persistent keyfile on
-   disk.
+   **In-process ed25519 keygen via `crypton`** (`Crypto.PubKey.Ed25519` —
+   `generateSecretKey :: MonadRandom m => m SecretKey`, `toPublic :: SecretKey
+   -> PublicKey`; `crypton` is already a cabal dep). The harness generates the
+   keypair in memory, serializes both halves to the **OpenSSH key format**
+   (the `ssh-add`/`ssh-agent`-compatible `-----BEGIN OPENSSH PRIVATE KEY-----`
+   envelope + the `ssh-ed25519 AAAA...` public-key line) **in pure Haskell**
+   (the openssh-key-v1 format is documented; a small serializer lands in
+   `Seal.Tools.Ssh.Agent` or `Seal.SourceControl.GithubKeys`). The private key
+   bytes go to the vault via `vhPut`; the public key returns to the frontend.
+   **No `ssh-keygen` subprocess, no `-`/`-.pub` file on disk, fully portable.**
+   (The earlier `ssh-keygen -f -` approach was rejected: on OpenSSH 9.x
+   `-f -` writes the private key to a file literally named `-` on disk, not
+   stdout — verified. The in-process path is the only truly no-disk option
+   that produces OpenSSH-format keys `ssh-add` accepts.)
 2. **Loading** (at git-op time, on the harness): the harness uses a
    **per-op ssh-agent** (see §4.6 for why per-op, not session-scoped): start
    `ssh-agent`, `ssh-add -` reads the private key bytes from `vhGet` via
@@ -291,35 +293,55 @@ no-disk seam in §4.4.
 ### 4.2 Trust level of the new opcodes
 
 `SHELL_EXEC` is Untrusted (sandbox, interacts with the outside world). The
-new git opcodes run **in the trusted plane**: the harness resolves the
-credential (via `vhGet` + the harness ssh-agent) and executes git itself (via
-BIN_EXEC for PAT, via the SSH-executor for deploy-key-with-forwarding). This
-is a genuine trust-model shift: git remote ops move from "the agent runs git
-in the sandbox" to "the harness runs git, authenticating with a credential
-the sandbox never sees."
+new git opcodes **execute git on the untrusted machine** (the workdir lives
+there), so they must carry an `UntrustedIO` to reach it. By the ISA's
+capability-scoping rule (`Seal.ISA.Opcode`: a `TrustedOpcode` has NO
+`UntrustedIO` in scope — `toRun :: BackendExec -> Value -> App OpResult`
+where `BackendExec` only offers `runLocal :: IO a -> App a`), an opcode that
+runs git remotely **must be `UntrustedOpcode`** — there is no other way to
+obtain the `UntrustedIO` the SSH executor / sandbox needs. So:
 
-- **`SETUP_REPO`** (revised): stays **Untrusted** for the clone itself (the
-  clone is a filesystem-mutating op in the workdir), but the **credential
-  resolution + the auth injection happen in the trusted plane** before the
-  clone command is handed to the sandbox. Concretely: the harness looks up the
-  URL in the registry, resolves the credential, and either (a) for deploy
-  keys, sets `GIT_SSH_COMMAND` with a forwarded `SSH_AUTH_SOCK` env that the
-  sandboxed clone inherits, or (b) for PATs, rewrites the URL to HTTPS and
-  passes `http.extraHeader` via the clone's argv. The sandboxed `git clone`
-  runs with the auth available but never reads the key/token itself.
-- **`GIT_FETCH` / `GIT_PULL`**: **Trusted** (harness-internal, logged in the
-  session transcript). These read from a remote but don't mutate the
-  cross-session evolutionary state.
-- **`GIT_PUSH`**: **Audited** (Trusted + the unified cross-session
-  append-only log). `GIT_PUSH` mutates a remote repo, which transcends the
-  session — the ISA philosophy says cross-session mutations are Audited so
-  they're reconstructible from the global log. The push's audit entry records
-  the workdir, the remote URL (host-bound, allow-listed), the ref, and the
-  outcome (secret-free — never the token/key).
+- **`SETUP_REPO`** (revised): stays **Untrusted** (as today). The credential
+  resolution (vault read + ssh-agent lifecycle) happens via
+  `BackendExec.runLocal` (the Trusted-IO seam available to `UntrustedOpcode`
+  too — `uoRun` runs in `App`, which can `liftIO`) BEFORE the clone command is
+  handed to `uioShellExecEnv`/`uioBinExecEnv`. The sandboxed `git clone` runs
+  with the auth available (forwarded `SSH_AUTH_SOCK` + `GIT_SSH_COMMAND` env
+  for deploy keys; `http.extraHeader` argv for PATs) but never reads the
+  key/token itself.
+- **`GIT_FETCH` / `GIT_PULL` / `GIT_PUSH`** (new): **Untrusted** (they execute
+  git on the untrusted machine via `UntrustedIO`). Credential resolution in
+  the trusted plane via `runLocal` (same as SETUP_REPO). **`GIT_PUSH` is
+  Audited**: the `UntrustedOpcode` record has no `toTrust` field, BUT the
+  dispatcher can be extended to recognize an Audited Untrusted opcode (record
+  the audit entry via `runLocal` before/after the untrusted git run). The
+  cleanest path: the `GIT_PUSH` `uoRun` writes the audit entry itself via
+  `runLocal` (liftIO to the cross-session append-only log) before running the
+  untrusted `git push` — the audit happens in the trusted plane, the git in
+  the untrusted plane, within one opcode. (The design-gate CTO should confirm
+  whether this per-opcode audit-write is acceptable vs a dispatcher-level
+  `UntrustedAudited` variant; the recommendation is the per-opcode write —
+  smaller blast radius than a new Opcode constructor.)
 
-The design-gate security reviewer should weigh in on whether `GIT_PUSH` is
-Audited vs Trusted; the recommendation is Audited on the "transcends the
-session" principle, mirroring `CONFIG_UPDATE` / `SECRET_SAVE`.
+This is a genuine trust-model shift from "the agent runs git in the sandbox
+without auth" to "the harness resolves the credential in the trusted plane +
+injects auth into a sandboxed git run." The sandbox still runs git; the
+sandbox never sees the credential (only the forwarded socket / argv). The
+audit entry for `GIT_PUSH` records the push happened + the credential kind,
+secret-free.
+
+**The git opcodes need `VaultHandle` + `RepoRegistryHandle` at call time.**
+These are NOT currently on `Env` (`Seal.Types.Env` carries only logger +
+config). They ARE constructed in `Serve.hs` (the `VaultHandle` at line ~118;
+the `RepoRegistryHandle` built in W4 of PR #80) and threaded into `ApiDeps` +
+the channels. **W3 adds `VaultHandle` + `RepoRegistryHandle` to `Env`** (the
+`setupRepoOp`/`gitFetchOp`/etc. constructors take them as params, closed over
+at the wiring sites; `Env` is the clean way to make them available to `App`).
+`Env` is built in exactly one place (`mkEnv` in `Seal.Types.Env`), so the
+construction-site blast radius is small + contained. The `setupRepoOp`
+signature gains a `CloneDeps`-equivalent param (the 5 call sites —
+`Channels/Loop.hs:946,1112`; `Gateway/Send.hs:534,894`;
+`Channel/Cli.hs:426,505` — are updated in W3).
 
 ### 4.3 The opcodes
 
@@ -437,16 +459,24 @@ contains no `-A`; git-credential ops' argv contains `-A`. This prevents the
 "every remote op forwards the agent" regression the security reviewer flagged.
 
 **UntrustedIO env-override prerequisite.** The current `uioShellExec` /
-`uioBinExec` (`Seal.Tools.Exec.UntrustedIO`/`Untrusted`) does not thread
-env-override extras to the sandboxed process. `SETUP_REPO`'s sandboxed `git
-clone` must inherit `SSH_AUTH_SOCK` + `GIT_SSH_COMMAND` env. **W2 adds an
+`uioBinExec` (`Seal.Tools.Exec.UntrustedIO`/`Untrusted`) do not thread
+env-override extras to the sandboxed process. `SETUP_REPO`/`GIT_*`'s sandboxed
+git must inherit `SSH_AUTH_SOCK` + `GIT_SSH_COMMAND` env. **W2 adds an
 env-override seam to `UntrustedIO`** (`uioShellExecEnv :: [(String,String)] ->
-...` / `uioBinExecEnv`) — this is a prerequisite for W4. Called out as W2's
-first sub-task; the existing callers are updated to pass `[]` (no change in
-behavior). The local untrusted executor inherits the harness env by default
-(local sandbox shares the harness environment) — the env-override seam is
-still needed for the remote executor (the forwarded `SSH_AUTH_SOCK` is set
-on the untrusted machine by `ssh -A`, not inherited from the harness).
+ShellCommand -> Maybe RemotePath -> IO (...)` / `uioBinExecEnv`); existing
+callers pass `[]` (no behavior change).
+- **Local arm**: the extras are merged over `getEnvironment` on the
+  `CreateProcess.env` field (the child inherits PATH/HOME + the extras).
+- **Remote arm**: `ssh -A` forwards the AGENT SOCKET but does NOT forward
+  arbitrary env to the remote shell (and `SendEnv`/`SetEnv` require the
+  server's `sshd_config` `AcceptEnv`, which is `none` by default). The
+  portable mechanism is an **`env VAR=val ...` prefix in the command string**
+  the SSH executor sends: the remote `uioShellExecEnv`/`uioBinExecEnv`
+  prepend `env SSH_AUTH_SOCK=$SSH_AUTH_SOCK GIT_SSH_COMMAND='...' git ...` to
+  the command (the forwarded `SSH_AUTH_SOCK` from `-A` is referenced via
+  `$SSH_AUTH_SOCK` in the remote shell; `GIT_SSH_COMMAND` is set inline). No
+  `AcceptEnv` dependency. The recording fake captures the prefixed command
+  string (assertable).
 
 ### 4.5 URL normalization + registry lookup
 
@@ -818,36 +848,50 @@ anticipated: `Seal.ISA.Ops.Git`, `Seal.Tools.Ssh.Agent` (the
      stable arity.
    - **Human checkpoint: security review of the no-disk seam + per-op
      scoping + opt-in `-A` + pinned host keys.**
-3. **W3 — `SETUP_REPO` revision** (`Seal.ISA.Ops.Repo`): registry lookup +
-   credential injection (trusted plane, per-op agent) + the bare-URL
-   fallthrough. Update the `cloneRepoIO` callers (the setup-repo combo box
-   in `Seal.Gateway.API`, `/repo test` in `Seal.Command.Repo`) to build
-   `CloneDeps`.
+3. **W3 — `SETUP_REPO` revision + `Env` field additions** (`Seal.ISA.Ops.Repo`,
+   `Seal.Types.Env`): registry lookup + credential injection (trusted plane,
+   per-op agent) + the bare-URL fallthrough. **Add `VaultHandle` +
+   `RepoRegistryHandle` to `Env`** (built in `mkEnv`, the single constructor —
+   small blast radius; update the `Env {...}` literal there + thread the handles
+   from `Serve.hs` where they're already constructed). **`setupRepoOp`'s
+   signature gains a `CloneDeps`-equivalent param**; update the 5 call sites:
+   `Channels/Loop.hs:946,1112`; `Gateway/Send.hs:534,894`;
+   `Channel/Cli.hs:426,505`. Update the `cloneRepoIO` callers (the setup-repo
+   combo box in `Seal.Gateway.API`, `/repo test` in `Seal.Command.Repo`) to
+   build `CloneDeps`. Note: `SourceRepo` positional construction (the codec's
+   `SourceRepo srId <$> ...` + `FromJSON`) is NOT caught by
+   `-Wincomplete-record-updates` — a manual grep for `SourceRepo` construction
+   sites is required when W5 adds `srDeployKeyPublic`.
    - RED: `RepoSpec` failing test — registered deploy-key repo clones via
      the forwarded fake agent; registered PAT via `http.extraHeader`;
      unregistered URL falls through.
-   - GREEN: the revision. REFACTOR: share the `CloneDeps`-building helper.
+   - GREEN: the revision + `Env` fields + caller updates. REFACTOR: share
+     the `CloneDeps`-building helper.
 4. **W4 — `GIT_FETCH`/`GIT_PULL`/`GIT_PUSH` opcodes** (`Seal.ISA.Ops.Git`
-   new): trust levels (Trusted/Trusted/Audited); SSH-executor-`-A` (deploy
+   new): trust level **Untrusted** (they execute git on the untrusted machine
+   via `UntrustedIO` — a Trusted opcode has no `UntrustedIO` in scope, per
+   §4.2); `GIT_PUSH` audit entry written via `runLocal` before the untrusted
+   git run (secret-free, carries `credential_kind`); SSH-executor-`-A` (deploy
    key) / `http.extraHeader` argv (PAT); the origin-URL read via the SSH
-   executor; `GIT_PUSH` audit entry (secret-free, carries credential_kind).
+   executor.
    - RED: `GitSpec` failing test — happy path (registered repo, one opcode
      call → success, no retry); registry miss → error naming origin URL;
-     vault-locked → distinguishable; `GIT_PUSH` audit recorded secret-free;
-     per-op scoping (one add/delete/kill per op).
+     vault-locked → distinguishable; `GIT_PUSH` audit recorded secret-free +
+     carries `credential_kind`; per-op scoping (one add/delete/kill per op).
    - GREEN: the opcodes. REFACTOR: share the credential-resolution helper
      with `SETUP_REPO`.
 5. **W5 — Repo-create deploy-key generation + frontend** (`Seal.Gateway.API`
    `POST /api/repos` `generate_key`; `GET /api/repos/:id/deploy-key`;
    `POST /api/repos/:id/deploy-key/generate` rotation; `ReposView`):
-   `ssh-keygen -f -` (stdout private + `-.pub` read+delete); vault `vhPut`;
-   public key as `srDeployKeyPublic` field; host-aware instructions; the
-   frontend "Generate" flow.
+   **in-process ed25519 keygen via `crypton` + OpenSSH-format serialization**
+   (private→vault `vhPut`; public→`srDeployKeyPublic`); host-aware
+   instructions; the frontend "Generate" flow. NO `ssh-keygen` subprocess
+   (the `-f -` approach writes to disk — rejected).
    - RED: `ApiSpec` failing test — generate returns `RepoInfo`; `/deploy-key`
      returns public key + instructions; rotate returns new public key; no
-     private key in any response; `-.pub` deleted. `ReposView.test.tsx`
-     failing test — the Generate flow renders the public key + Copy + instructions;
-     private key never rendered; PAT advisory present.
+     private key in any response. `ReposView.test.tsx` failing test — the
+     Generate flow renders the public key + Copy + instructions; private key
+     never rendered; PAT advisory present.
    - GREEN: the generation + endpoints + frontend. REFACTOR: share the
      `ssh-keygen` `-.pub` cleanup helper.
 6. **W6 — `make check` + frontend gate + final review**: full `make check`
@@ -907,6 +951,26 @@ situation).
 14. **`BatchMode=yes` in `GIT_SSH_COMMAND`** — prevents an interactive
     prompt hang if the forwarded agent fails to auth (mirrors the
     harness↔untrusted channel).
+15. **In-process ed25519 keygen via `crypton`, NOT `ssh-keygen -f -`** — the
+    plan-gate feasibility review verified `ssh-keygen -f -` writes the
+    private key to a file named `-` on disk (not stdout) on OpenSSH 9.x,
+    which would violate the no-disk requirement. `crypton`'s
+    `Crypto.PubKey.Ed25519.generateSecretKey` generates the keypair in
+    memory; a pure-Haskell OpenSSH-format serializer produces the
+    `ssh-add`-compatible bytes. No subprocess, no disk, fully portable.
+16. **Git opcodes are Untrusted (NOT Trusted)** — the plan-gate found
+    `TrustedOpcode.toRun` has NO `UntrustedIO` in scope (only `BackendExec.runLocal`),
+    so an opcode that executes git on the untrusted machine MUST be
+    `UntrustedOpcode`. `GIT_PUSH`'s audit entry is written via `runLocal`
+    before the untrusted git run (per-opcode audit, not a new constructor).
+17. **Remote-arm env via `env VAR=val` prefix in the command string** —
+    `ssh -A` only forwards the agent socket (not arbitrary env); `SendEnv`/
+    `SetEnv` need server `AcceptEnv` (default `none`). The `env` prefix is
+    the portable, server-config-independent path.
+18. **`Env` gains `VaultHandle` + `RepoRegistryHandle`** — the opcodes run
+    in `App` (= `ReaderT Env`); `Env` is the clean way to expose them. `mkEnv`
+    is the single constructor (small blast radius). `setupRepoOp` gains a
+    `CloneDeps`-equivalent param; the 5 call sites enumerated (W3).
 
 ## 9. Acceptance Criteria
 
@@ -939,7 +1003,8 @@ situation).
 10. `-A` is opt-in per git-op (non-credentialed remote ops have no `-A` —
     verified by `RemoteSpec`).
 11. `make check` + frontend gate green; all new modules in
-    `exposed-modules`/`other-modules`; no `Env`/`SessionRuntime` field
+    `exposed-modules`/`other-modules`. `Env` gains `VaultHandle`/
+    `RepoRegistryHandle` (centralized in `mkEnv`); no `SessionRuntime` field
     additions (per-op `CloneDeps`).
 12. User-focused (S1-S3): register+generate+clone in one flow; push
     first-try with no retry; rotation under the same vault key name with
