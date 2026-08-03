@@ -92,7 +92,7 @@ import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
@@ -105,7 +105,7 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
@@ -124,6 +124,7 @@ import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
@@ -918,7 +919,11 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
-      Right r -> recordSkillLoadResult tHandle callOpName val r mChannel
+      Right r -> do
+        let opNm = case callOpName of OpName n -> n
+        if opNm == "GIT_PUSH"
+          then recordGitPushResult tHandle callOpName val r mChannel
+          else recordSkillLoadResult tHandle callOpName val r mChannel
       Left _  -> pure ()
     pure res
 
@@ -966,6 +971,9 @@ buildIsaRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCf
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
       , setupRepoOp cloneDeps wsRoot autonomy
+      , gitFetchOp cloneDeps wsRoot autonomy
+      , gitPullOp cloneDeps wsRoot autonomy
+      , gitPushOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -1132,6 +1140,9 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
             , setupRepoOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
+            , gitFetchOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
+            , gitPullOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
+            , gitPushOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

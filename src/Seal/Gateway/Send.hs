@@ -86,11 +86,12 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.ISA.Opcode (OpResult (..), localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult, recordSetupRepoResult)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult, recordSetupRepoResult)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -538,6 +539,9 @@ buildWebRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCf
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
       , setupRepoOp cloneDeps wsRoot autonomy
+      , gitFetchOp cloneDeps wsRoot autonomy
+      , gitPullOp cloneDeps wsRoot autonomy
+      , gitPushOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -756,7 +760,9 @@ webCallDispatcher deps callOpName val = do
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
           then recordSetupRepoResult tHandle callOpName val r (Just "web")
-          else recordSkillLoadResult tHandle callOpName val r (Just "web")
+          else if opNm == "GIT_PUSH"
+            then recordGitPushResult tHandle callOpName val r (Just "web")
+            else recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -898,6 +904,9 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
             , setupRepoOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
+            , gitFetchOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
+            , gitPullOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
+            , gitPushOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

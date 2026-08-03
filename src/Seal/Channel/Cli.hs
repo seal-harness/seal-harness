@@ -55,13 +55,13 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #else
@@ -83,6 +83,7 @@ import Seal.ISA.Ops.Agent
   , agentInterruptOp, AgentStartWiring (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -436,6 +437,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               -- AGENT_INTERRUPT
               , shellExecOp childWsRoot cliSecurityPolicy
               , setupRepoOp cloneDeps childWsRoot autonomy
+              , gitFetchOp cloneDeps childWsRoot autonomy
+              , gitPullOp cloneDeps childWsRoot autonomy
+              , gitPushOp cloneDeps childWsRoot autonomy
               , binExecOp childWsRoot cliSecurityPolicy binAllowList
               , processManageOp childWsRoot cliSecurityPolicy
               , fileWriteOp childWsRoot operatorCeiling
@@ -515,6 +519,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , agentInterruptOp agentRuntime
                , shellExecOp wsRoot cliSecurityPolicy
                , setupRepoOp cloneDeps wsRoot autonomy
+               , gitFetchOp cloneDeps wsRoot autonomy
+               , gitPullOp cloneDeps wsRoot autonomy
+               , gitPushOp cloneDeps wsRoot autonomy
                , binExecOp wsRoot cliSecurityPolicy binAllowList
               , processManageOp wsRoot cliSecurityPolicy
               , fileWriteOp wsRoot operatorCeiling
@@ -648,7 +655,11 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           callUio <- mkSessionUio sid
           res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
           case res of
-            Right r -> recordSkillLoadResult tHandle callOpName val r (Just "cli")
+            Right r -> do
+              let opNm = case callOpName of OpName n -> n
+              if opNm == "GIT_PUSH"
+                then recordGitPushResult tHandle callOpName val r (Just "cli")
+                else recordSkillLoadResult tHandle callOpName val r (Just "cli")
             Left _  -> pure ()
           pure res
       plainHandler t = do
