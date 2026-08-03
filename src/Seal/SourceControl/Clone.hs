@@ -65,7 +65,7 @@ import Control.Exception (bracket, onException, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
-import Data.IORef (readIORef)
+import Data.IORef (IORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -84,7 +84,7 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
-                                      , sahKill, sahStart) )
+                                      , sahStart) )
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 
 ----------------------------------------------------------------------------
@@ -212,8 +212,14 @@ sshToHttps url
 --   'vrHandleRef' at runtime; fail-closed to 'CloneVaultError VaultLocked'
 --   if the vault is unconfigured/locked). Mirrors @secretGetOp rt@ which
 --   takes 'VaultRuntime', not the raw handle.
--- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Per-op
---   lifecycle: start → add-key → run → delete-all + kill.
+-- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Shared agent:
+--   started once (lazily on first use, cached in 'cdAgentEnvRef'),
+--   reused across all ops. Per-op: @sahAddKey@ → run → @sahDeleteAll@
+--   (the per-op key scoping — exactly one key live at forwarding time).
+-- * @cdAgentEnvRef@ — caches the shared 'SshAgentEnv' (the socket + PID
+--   from the first @sahStart@ call). 'Nothing' until the first deploy-key
+--   op starts the agent. Subsequent ops reuse the cached env (no
+--   re-start).
 -- * @cdPinnedKnownHosts@ — compile-time-embedded GitHub host keys (public
 --   data, tamper-resistant via 'file-embed'). Written per-op to a temp
 --   @known_hosts@ file.
@@ -224,6 +230,7 @@ data CloneDeps = CloneDeps
   { cdVault           :: VaultRuntime
   , cdRepoReg         :: RepoRegistryHandle
   , cdSshAgent        :: SshAgentHandle
+  , cdAgentEnvRef     :: IORef (Maybe SshAgentEnv)
   , cdPinnedKnownHosts :: ByteString
   , cdKeyfilesDir     :: FilePath
   }
@@ -335,69 +342,61 @@ resolveCloneTarget deps repo =
             case mpass of
               Left ve -> pure (Left (CloneVaultError ve))
               Right passphrase -> do
-                -- Per-op agent lifecycle: start → add-key. The post-add phase
-                -- (writing known_hosts + building the env) is bracketed so a
-                -- throw (e.g. an IO error from writeKnownHostsTemp) STILL runs
-                -- sahDeleteAll + sahKill — the agent never leaks with the key
-                -- in memory (design §4.6: exactly one identity live at
-                -- forwarding time).
-                eStart <- sahStart (cdSshAgent deps)
-                case eStart of
-                  Left msg -> pure (Left (CloneAgentError msg))
-                  Right agentEnv -> do
-                    eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
-                    case eAdd of
-                      Left msg -> do
-                        -- Fail closed: delete-all + kill even on add failure
-                        -- (no key landed, but defense-in-depth).
-                        sahDeleteAll (cdSshAgent deps) agentEnv
-                        sahKill (cdSshAgent deps) agentEnv
-                        pure (Left (CloneAgentError msg))
-                      Right () -> do
-                        -- Write the per-op known_hosts temp file (public data)
-                        -- under the 0700 harness-private cdKeyfilesDir (NOT
-                        -- /tmp — TOCTOU: the path git reads must be
-                        -- tamper-resistant, not just the content). If this
-                        -- throws (IO error), the agent MUST still be cleaned
-                        -- up — 'onException' runs sahDeleteAll + sahKill
-                        -- before rethrowing, so the agent never leaks with the
-                        -- key in memory (design §4.6: exactly one identity
-                        -- live at forwarding time). The 'ctCleanup' on the
-                        -- returned CloneTarget runs the same cleanup again on
-                        -- 'withCloneTarget' exit (idempotent — the fake
-                        -- agent's delete/kill are no-ops on a dead agent; the
-                        -- known_hosts removeFile swallows NoSuchThing).
-                        (knownHostsPath, knownHostsCleanup) <-
-                          writeKnownHostsTemp (cdKeyfilesDir deps)
-                                               (cdPinnedKnownHosts deps)
-                          `onException` ( do
-                              sahDeleteAll (cdSshAgent deps) agentEnv
-                              sahKill (cdSshAgent deps) agentEnv )
-                        let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
-                            sshCmd = T.pack $
-                              "ssh"
-                              <> " -o IdentitiesOnly=yes"
-                              <> " -o StrictHostKeyChecking=yes"
-                              <> " -o BatchMode=yes"
-                              <> " -o UserKnownHostsFile=" <> knownHostsPath
-                            envExtras =
-                              [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
-                              , ("SSH_AGENT_PID", saeAgentPid agentEnv)
-                              , ("GIT_SSH_COMMAND", T.unpack sshCmd)
-                              , ("GIT_TERMINAL_PROMPT", "0")
-                              ]
-                            cleanup = do
-                              knownHostsCleanup
-                              sahDeleteAll (cdSshAgent deps) agentEnv
-                              sahKill (cdSshAgent deps) agentEnv
-                            env = CloneEnv
-                              { ceUrl = sshUrl
-                              , ceGitConfigArgs = []
-                              , ceSshCommand = Just sshCmd
-                              , ceEnvExtras = authEnv ++ envExtras
-                              , ceCleanup = cleanup
-                              }
-                        pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
+                -- Shared agent: start once (lazily on first deploy-key op),
+                -- cache the env in cdAgentEnvRef, reuse across all ops.
+                -- Per-op: sahAddKey → run → sahDeleteAll (no sahKill — the
+                -- agent persists). The per-op key scoping invariant holds:
+                -- exactly one key is live at forwarding time.
+                mCached <- readIORef (cdAgentEnvRef deps)
+                agentEnv <- case mCached of
+                  Just env -> pure env
+                  Nothing -> do
+                    eStart <- sahStart (cdSshAgent deps)
+                    case eStart of
+                      Left msg -> pure (error (T.unpack msg))
+                      Right env -> do
+                        writeIORef (cdAgentEnvRef deps) (Just env)
+                        pure env
+                -- Load the key into the shared agent (per-op).
+                eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
+                case eAdd of
+                  Left msg -> do
+                    -- Fail closed: delete-all even on add failure (defense-
+                    -- in-depth; no key landed).
+                    sahDeleteAll (cdSshAgent deps) agentEnv
+                    pure (Left (CloneAgentError msg))
+                  Right () -> do
+                    -- Write the per-op known_hosts temp file (public data).
+                    -- onException runs sahDeleteAll if this throws (the key
+                    -- is removed from the agent even on failure).
+                    (knownHostsPath, knownHostsCleanup) <-
+                      writeKnownHostsTemp (cdKeyfilesDir deps)
+                                           (cdPinnedKnownHosts deps)
+                        `onException` sahDeleteAll (cdSshAgent deps) agentEnv
+                    let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
+                        sshCmd = T.pack $
+                          "ssh"
+                          <> " -o IdentitiesOnly=yes"
+                          <> " -o StrictHostKeyChecking=yes"
+                          <> " -o BatchMode=yes"
+                          <> " -o UserKnownHostsFile=" <> knownHostsPath
+                        envExtras =
+                          [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
+                          , ("SSH_AGENT_PID", saeAgentPid agentEnv)
+                          , ("GIT_SSH_COMMAND", T.unpack sshCmd)
+                          , ("GIT_TERMINAL_PROMPT", "0")
+                          ]
+                        cleanup = do
+                          knownHostsCleanup
+                          sahDeleteAll (cdSshAgent deps) agentEnv
+                        env = CloneEnv
+                          { ceUrl = sshUrl
+                          , ceGitConfigArgs = []
+                          , ceSshCommand = Just sshCmd
+                          , ceEnvExtras = authEnv ++ envExtras
+                          , ceCleanup = cleanup
+                          }
+                    pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
 
 -- | The base name of the encrypted keyfile for a 'SourceRepo' — the
 -- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2

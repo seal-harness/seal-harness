@@ -27,7 +27,7 @@ import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -448,12 +448,13 @@ plainTurn deps meta t = do
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
             mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+            cloneDeps <- mkCloneDepsFromSend deps
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
                   wsroot operatorCeiling "web"
                 isaReg = buildWebRegistry
-                  (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsroot sid operatorCeiling
+                  (sdVault deps) cloneDeps (sdBackends deps) wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
@@ -690,12 +691,13 @@ plainTurnWithCaps deps meta caps t = do
             toolUse = either (const True) resolvedToolUseEnforcement eCfg
             taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
         mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+        cloneDeps <- mkCloneDepsFromSend deps
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
               wsRoot operatorCeiling "web"
             isaReg = buildWebRegistry
-              (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
@@ -739,12 +741,13 @@ webCallDispatcher deps callOpName val = do
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    cloneDeps <- mkCloneDepsFromSend deps
     let onDemand = either (const False) onDemandSchemas eCfg
         startWiring = webStartWiring
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling "web"
         isaReg = buildWebRegistry
-              (sdVault deps) (mkCloneDepsFromSend deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
@@ -879,6 +882,7 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
+      childCloneDeps <- mkCloneDepsFromSend deps
       let childWsRoot = case eChildWd of
             Right wd -> WorkspaceRoot wd
             Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -903,10 +907,10 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
-            , gitFetchOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
-            , gitPullOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
-            , gitPushOp (mkCloneDepsFromSend deps) childWsRoot (sdAutonomy deps)
+            , setupRepoOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitFetchOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPullOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPushOp childCloneDeps childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
@@ -993,14 +997,17 @@ broadcastAskResolved mBroker sid qid resolution =
 -- 'buildChildRegistry' call sites. The ssh-agent is real (production:
 -- 'mkRealSshAgentHandle (Just 300)'); the pinned host keys are
 -- compile-time-embedded.
-mkCloneDepsFromSend :: SendDeps -> Clone.CloneDeps
-mkCloneDepsFromSend deps = Clone.CloneDeps
-  { Clone.cdVault = sdVault deps
-  , Clone.cdRepoReg = sdRepoReg deps
-  , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-  , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-  , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
-  }
+mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
+mkCloneDepsFromSend deps = do
+  agentEnvRef <- newIORef Nothing
+  pure Clone.CloneDeps
+    { Clone.cdVault = sdVault deps
+    , Clone.cdRepoReg = sdRepoReg deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+    , Clone.cdAgentEnvRef = agentEnvRef
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
+    }
 
 -- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
 -- session's workdir before the first turn. The web "set up repo" combo box

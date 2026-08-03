@@ -17,6 +17,7 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -47,6 +48,11 @@ import Seal.Tools.Ssh.Agent
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
+
+-- | Create a fresh 'IORef' for 'cdAgentEnvRef' in a pure @let@ context.
+freshAgentEnvRef :: IORef (Maybe SshAgentEnv)
+freshAgentEnvRef = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE freshAgentEnvRef #-}
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Git" $ do
@@ -90,6 +96,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -104,7 +111,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
           OpResult parts True recorded -> do
             expectationFailure ("expected success, got error: " <> show parts <> " recorded=" <> show recorded)
 
-    it "per-op scoping: exactly one sahAddKey + sahDeleteAll + sahKill" $ do
+    it "per-op scoping: exactly one sahAddKey + sahDeleteAll (shared agent, no per-op kill)" $ do
       withSystemTempDirectory "seal-git" $ \dir -> do
         let keyfilesDir = dir </> "keys"
         createDirectoryIfMissing True keyfilesDir
@@ -117,6 +124,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -128,7 +136,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
         calls <- readIORef callsRef
         SahAddKey (keyfilesDir </> "myrepo") "passphrase" `elem` calls `shouldBe` True
         SahDeleteAll `elem` calls `shouldBe` True
-        SahKill `elem` calls `shouldBe` True
+        SahKill `elem` calls `shouldBe` False
 
   --------------------------------------------------------------------------
   -- Registry miss
@@ -147,6 +155,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -180,6 +189,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -213,6 +223,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -244,6 +255,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }
@@ -276,6 +288,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
+              , cdAgentEnvRef = freshAgentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               }

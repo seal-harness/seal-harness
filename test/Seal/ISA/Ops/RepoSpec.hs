@@ -31,11 +31,13 @@ mkTestCloneDeps keyfilesDir = do
   createDirectoryIfMissing True keyfilesDir
   vault <- makeFakeVaultRuntime []
   callsRef <- newIORef []
+  agentEnvRef <- newIORef Nothing
   let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
     { cdVault = vault
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
+    , cdAgentEnvRef = agentEnvRef
     , cdPinnedKnownHosts = pinnedGithubKnownHosts
     , cdKeyfilesDir = keyfilesDir
     }

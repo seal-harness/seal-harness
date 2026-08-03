@@ -20,7 +20,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
-import Data.IORef (readIORef)
+import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Text (Text)
@@ -294,10 +294,12 @@ runCliTui
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
+  agentEnvRef <- newIORef Nothing
   let cloneDeps = Clone.CloneDeps
         { Clone.cdVault = rt
         , Clone.cdRepoReg = repoReg
         , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+        , Clone.cdAgentEnvRef = agentEnvRef
         , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
         , Clone.cdKeyfilesDir = repoKeysDir paths
         }

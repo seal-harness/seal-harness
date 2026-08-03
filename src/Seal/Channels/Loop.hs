@@ -217,14 +217,17 @@ data ChannelDeps = ChannelDeps
 -- sites + the 1 'buildChildRegistry' site in this module. The ssh-agent is
 -- real (production: 'mkRealSshAgentHandle (Just 300)'); the pinned host
 -- keys are compile-time-embedded.
-mkCloneDepsFromChannel :: ChannelDeps -> Clone.CloneDeps
-mkCloneDepsFromChannel deps = Clone.CloneDeps
-  { Clone.cdVault = cdVault deps
-  , Clone.cdRepoReg = cdRepoReg deps
-  , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-  , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-  , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
-  }
+mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
+mkCloneDepsFromChannel deps = do
+  agentEnvRef <- newIORef Nothing
+  pure Clone.CloneDeps
+    { Clone.cdVault = cdVault deps
+    , Clone.cdRepoReg = cdRepoReg deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+    , Clone.cdAgentEnvRef = agentEnvRef
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
+    }
 
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
 -- given config loader. Used by 'Seal.Command.Serve' and the standalone
@@ -737,13 +740,14 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           mSystem'' <- if injectCatalog
                          then injectAvailableSkills sessionSkills mSystem'
                          else pure mSystem'
+          cloneDeps <- mkCloneDepsFromChannel deps
           let handleCaps = mkHandleCaps h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
                 deps paths sid handleCaps untrustedIO appEnv eCfg
                 wsroot operatorCeiling (smChannel meta) isaReg
               isaReg = buildIsaRegistry
-                rt (mkCloneDepsFromChannel deps) backends wsroot sid operatorCeiling autonomy
+                rt cloneDeps backends wsroot sid operatorCeiling autonomy
                 (either (const Nothing) rcWeb eCfg)
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
@@ -903,6 +907,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
     eWd <- ensureSessionWorkdir paths sid
+    cloneDeps <- mkCloneDepsFromChannel deps
     let wsRoot = case eWd of
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -912,7 +917,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg
         isaReg = buildIsaRegistry
-          (cdVault deps) (mkCloneDepsFromChannel deps) (cdBackends deps) wsRoot sid operatorCeiling
+          (cdVault deps) cloneDeps (cdBackends deps) wsRoot sid operatorCeiling
           (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
@@ -1115,6 +1120,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
+      childCloneDeps <- mkCloneDepsFromChannel deps
       let childWsRoot = case eChildWd of
             Right wd -> WorkspaceRoot wd
             Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -1139,10 +1145,10 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
-            , gitFetchOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
-            , gitPullOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
-            , gitPushOp (mkCloneDepsFromChannel deps) childWsRoot (cdAutonomy deps)
+            , setupRepoOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitFetchOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitPullOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitPushOp childCloneDeps childWsRoot (cdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

@@ -291,15 +291,17 @@ runServeMain autonomy logger = do
 -- 'Seal.ISA.Ops.Secret'.
 mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> RepoTestSeam
 mkRepoTestSeam rt repoRegH paths = RepoTestSeam
-  { rtsLsRemote  = \repo ->
+  { rtsLsRemote  = \repo -> do
+      agentEnvRef <- newIORef Nothing
       let deps = Clone.CloneDeps
             { Clone.cdVault = rt
             , Clone.cdRepoReg = repoRegH
             , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+            , Clone.cdAgentEnvRef = agentEnvRef
             , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
             , Clone.cdKeyfilesDir = repoKeysDir paths
             }
-      in lsRemoteRepo deps repo
+      lsRemoteRepo deps repo
   , rtsVaultList = do
       mh <- readIORef (vrHandleRef rt)
       case mh of
