@@ -36,9 +36,9 @@ import Network.HTTP.Types
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
   , requestMethod, responseLBS )
-import System.Directory (doesFileExist, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import System.Random (randomRIO)
 
@@ -1795,6 +1795,9 @@ handleRepoDeployKeyGenerate deps ridTxt =
 -- passphrase lives in the vault). The .pub is public data.
 generateDeployKey :: VaultHandle -> Text -> FilePath -> Text -> IO (Either Text Text)
 generateDeployKey vh vaultKey keyfilePath repoId = do
+  -- Ensure the parent directory exists (ssh-keygen won't create it).
+  let keyfilesDir = takeDirectory keyfilePath
+  createDirectoryIfMissing True keyfilesDir
   -- Generate a random 32-byte passphrase, base64-encoded.
   rawPass <- randomByteString 32
   let passphrase = TE.decodeUtf8Lenient (B64.encode rawPass)
