@@ -45,11 +45,8 @@ import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (createDirectoryIfMissing, removeFile)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, hClose, hFlush)
-import System.IO.Temp (openBinaryTempFile)
-import System.Posix.Files (setFileMode)
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, readCreateProcessWithExitCode
   , waitForProcess, withCreateProcess
@@ -145,14 +142,18 @@ mkRealSshAgentHandle mLifetime = SshAgentHandle
           Just env -> Right env
         Right (ExitFailure _n, _out, _err) -> Left "ssh-agent: non-zero exit"
   , sahAddKey = \env keyfile passphrase -> do
-      let askpassScript = "#!/bin/sh\necho " <> shellQuoteStr (TE.decodeUtf8Lenient passphrase) <> "\n"
-      (askpassPath, askpassCleanup) <- writeAskpassHelper askpassScript
-      let addEnv = [ ("SSH_ASKPASS", askpassPath)
-                   , ("SSH_ASKPASS_REQUIRE", "force")
-                   , ("DISPLAY", ":0")
-                   ] ++ saeGetAuthEnv env
-      eRes <- try @IOError (runProcessEnv addEnv "ssh-add" [keyfile] "")
-      askpassCleanup
+      -- Pipe the passphrase to ssh-add's stdin. On macOS, ssh-add reads
+      -- from the TTY when one is available, BUT when stdin is a pipe
+      -- (CreatePipe, not a TTY), it reads the passphrase from stdin.
+      -- SSH_ASKPASS_REQUIRE=never tells ssh-add to never use an SSH_ASKPASS
+      -- helper (so it falls back to stdin, not a GUI prompt). The passphrase
+      -- is piped + a trailing newline (ssh-add expects one).
+      -- NOTE: the SSH_ASKPASS + force approach was tried but macOS's
+      -- bundled ssh-add hangs despite SSH_ASKPASS_REQUIRE=force — it still
+      -- tries to read from the TTY. The stdin-pipe approach works reliably
+      -- because runProcessEnv uses std_in=CreatePipe (a pipe, not a TTY).
+      let addEnv = ("SSH_ASKPASS_REQUIRE", "never") : saeGetAuthEnv env
+      eRes <- try @IOError (runProcessEnv addEnv "ssh-add" [keyfile] (passphrase <> "\n"))
       pure $ case eRes of
         Left _ioErr -> Left "ssh-add: failed to start"
         Right (ExitSuccess, _out, _err) -> Right ()
@@ -203,32 +204,6 @@ readProcessCollect argv stdinStr =
   case argv of
     (p : as) -> readCreateProcessWithExitCode (proc p as) stdinStr
     []       -> error "readProcessCollect: empty argv (unreachable)"
-
-----------------------------------------------------------------------------
--- Askpass helper (write a tiny script that echoes the passphrase)
-----------------------------------------------------------------------------
-
--- | Write a tiny @SSH_ASKPASS@ helper script that echoes the passphrase.
--- The script is written to a temp file (0700), used once by @ssh-add@,
--- then removed. Portable: on macOS, @ssh-add@ reads the passphrase from
--- the TTY even when stdin is piped; @SSH_ASKPASS_REQUIRE=force@ forces it
--- to use the helper instead.
-writeAskpassHelper :: Text -> IO (FilePath, IO ())
-writeAskpassHelper script = do
-  let dir = "/tmp"
-  createDirectoryIfMissing True dir
-  (path, h) <- openBinaryTempFile dir "seal-askpass-"
-  BS.hPutStr h (TE.encodeUtf8 script)
-  hClose h
-  setFileMode path 0o700
-  let cleanup = do
-        _ <- try @IOError (removeFile path)
-        pure ()
-  pure (path, cleanup)
-
--- | Single-quote a value for a shell @echo@ command.
-shellQuoteStr :: Text -> Text
-shellQuoteStr t = "'" <> T.concatMap (\c -> if c == '\'' then "'\\''" else T.singleton c) t <> "'"
 
 ----------------------------------------------------------------------------
 -- Fake (records calls in an IORef; no real process)

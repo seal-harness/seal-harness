@@ -236,7 +236,6 @@ library
       , network
       , tomland
       , process
-      , temporary
       , unix
       , unordered-containers
       , validation-selective
