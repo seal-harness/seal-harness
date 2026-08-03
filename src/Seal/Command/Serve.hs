@@ -19,7 +19,6 @@ import Katip (Severity (..), ls)
 
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
-import qualified Seal.Security.Vault
 import qualified Data.Text.Encoding as TE
 import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -34,6 +33,7 @@ import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
+import Seal.Command.Repo (RepoTestSeam (..), repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
@@ -43,7 +43,7 @@ import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoCloneStateDir, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -58,7 +58,9 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
-import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
+import Seal.SourceControl.Clone (CloneError (..), lsRemoteRepo)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
@@ -114,6 +116,12 @@ runServeMain autonomy logger = do
   -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on
   -- each call so mutations from other processes are reflected.
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  -- W5: the /repo slash command's test seam. The ls-remote arm runs real
+  -- git against repoCloneStateDir; the vault-list arm backs the /repo info
+  -- non-blocking vault-key advisory. The vault handle (mHandle) may be
+  -- 'Nothing' if the vault is not configured — in that case /repo test
+  -- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.
+  let repoSeam = mkRepoTestSeam mHandle paths
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -190,6 +198,7 @@ runServeMain autonomy logger = do
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
         , newCommandSpec newDeps
+        , repoCommandSpec repoRegH repoSeam
         ]
       sendDeps = SendDeps
         { sdPaths      = paths
@@ -265,6 +274,22 @@ runServeMain autonomy logger = do
         Just uefc -> uefcMode uefc == "remote"
         Nothing   -> False
   runGateway gwCfg isRemote deps
+
+-- | Build the /repo command's 'RepoTestSeam' from the live vault + paths.
+-- When the vault is not configured ('Nothing'), @rtsLsRemote@ returns
+-- 'CloneVaultError VaultLocked' (fail-closed — /repo test reports "vault
+-- locked") and @rtsVaultList@ returns @Left VaultLocked@ (/repo info shows
+-- the locked advisory). Mirrors how the rest of the app treats a missing
+-- vault handle.
+mkRepoTestSeam :: Maybe VaultHandle -> SealPaths -> RepoTestSeam
+mkRepoTestSeam mHandle paths = RepoTestSeam
+  { rtsLsRemote  = case mHandle of
+      Nothing    -> \_ -> pure (Left (CloneVaultError VaultLocked))
+      Just vh    -> lsRemoteRepo vh (repoCloneStateDir paths)
+  , rtsVaultList = case mHandle of
+      Nothing    -> pure (Left VaultLocked)
+      Just vh    -> vhList vh
+  }
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
@@ -342,7 +367,7 @@ forkTelegramListener deps cfg registry = do
   mVaultToken <- case mh of
     Nothing -> pure Nothing
     Just vh -> do
-      r <- Seal.Security.Vault.vhGet vh Seal.Telegram.Config.telegramVaultKey
+      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
       pure $ case r of
         Right bs -> Just (TE.decodeUtf8 bs)
         Left _   -> Nothing

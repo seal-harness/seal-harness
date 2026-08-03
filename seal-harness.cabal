@@ -97,6 +97,7 @@ library
         Seal.Command.Session
         Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Repo
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
@@ -368,6 +369,7 @@ test-suite tests
         Seal.Command.SessionSpec
         Seal.Command.ServeSpec
         Seal.Command.SkillSpec
+        Seal.Command.RepoSpec
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec

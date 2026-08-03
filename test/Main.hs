@@ -51,6 +51,7 @@ import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SessionSpec
 import qualified Seal.Command.ServeSpec
 import qualified Seal.Command.SkillSpec
+import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
 import qualified Seal.Command.CallSpec
@@ -195,6 +196,7 @@ main = hspec $ do
   Seal.Command.SessionSpec.spec
   Seal.Command.ServeSpec.spec
   Seal.Command.SkillSpec.spec
+  Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
   Seal.Command.CallSpec.spec
