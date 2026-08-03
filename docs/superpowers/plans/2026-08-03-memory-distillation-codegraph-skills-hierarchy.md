@@ -41,20 +41,9 @@ Tencent's system has four genuinely good ideas buried in a TypeScript/Node.js co
 - **No Wiki layer.** Our knowledge base already serves this purpose. CodeGraph is the higher-value addition.
 - **No BM25 + vector + RRF hybrid retrieval (yet).** Start with FTS5 keyword search. Add vector search later if retrieval quality demands it. YAGNI.
 
-### Where this fits in the roadmap
-
-This plan is **Phase 5b** — it builds on the Phase 5 git-backed stores (DONE) and can proceed in parallel with Phase 6 (Harness+Tabs) and Phase 7 (Web). It does not block or depend on those phases. The cold-start import hook (Phase 5b-4) requires the web frontend's repo-add flow to exist, so it lands last or as a stub that gets wired in during Phase 7.
-
-```
-Phase 5b-1  Skills directory hierarchy (public/private/examples)
-Phase 5b-2  Layered memory distillation (L0→L1→L2→L3)
-Phase 5b-3  CodeGraph (code symbol/call-graph indexing)
-Phase 5b-4  Cold-start import (hook into repo-add)
-```
-
 ---
 
-## Phase 5b-1: Skills Directory Hierarchy
+## Phase 1: Skills Directory Hierarchy
 
 ### Objective
 
@@ -388,7 +377,7 @@ git commit -m "docs(skills): document three-tier hierarchy and SKILL_COPY in sea
 
 ---
 
-## Phase 5b-2: Layered Memory Distillation
+## Phase 2: Layered Memory Distillation
 
 ### Objective
 
@@ -1044,7 +1033,7 @@ git commit -m "feat(config): add [memory.distillation] and [memory.recall] confi
 
 ---
 
-## Phase 5b-3: CodeGraph
+## Phase 3: CodeGraph
 
 ### Objective
 
@@ -1091,7 +1080,7 @@ CREATE VIRTUAL TABLE symbols_fts USING fts5(name, doc_string, content=symbols);
 - `CODEGRAPH_IMPACT` — Given a symbol, find all callers (impact analysis)
 - `CODEGRAPH_LIST` — List indexed repos and their stats
 
-**Cold-start integration:** When a user adds a repo (via the frontend, Phase 7), `CODEGRAPH_INDEX` is called automatically. This is the cold-start hook (Phase 5b-4).
+**Cold-start integration:** When a user adds a repo (via the frontend, Phase 7), `CODEGRAPH_INDEX` is called automatically. This is the cold-start hook (Phase 4).
 
 ### Tasks
 
@@ -1294,7 +1283,7 @@ git commit -m "feat(isa): add CodeGraph opcodes (INDEX, SEARCH, IMPACT, LIST)"
 
 ---
 
-## Phase 5b-4: Cold-Start Import
+## Phase 4: Cold-Start Import
 
 ### Objective
 
