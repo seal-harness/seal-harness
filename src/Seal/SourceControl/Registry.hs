@@ -19,7 +19,6 @@ module Seal.SourceControl.Registry
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Functor ((<&>))
-import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
@@ -30,15 +29,7 @@ import Validation (Validation (..))
 import Toml qualified
 
 import Seal.SourceControl.Repo
-  ( RepoId, SourceRepo (..), normalizeReposTable, repoRegistryCodec )
-
-----------------------------------------------------------------------------
--- Types
-----------------------------------------------------------------------------
-
--- | The source-control repo registry: a keyed-by-id map of 'SourceRepo's.
-newtype RepoRegistry = RepoRegistry { rrRepos :: Map RepoId SourceRepo }
-  deriving stock (Eq, Show)
+  ( RepoId, SourceRepo (..), RepoRegistry (..), normalizeReposTable, repoRegistryCodec )
 
 ----------------------------------------------------------------------------
 -- Load / Save (mirror loadRuntimeConfig / saveRuntimeConfig)

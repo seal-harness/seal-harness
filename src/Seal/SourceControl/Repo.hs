@@ -20,6 +20,7 @@ module Seal.SourceControl.Repo
   ( VcsKind (..)
   , RepoCredential (..)
   , SourceRepo (..)
+  , RepoRegistry (..)
   , RepoId (..)
   , mkRepoId
   , repoIdText
@@ -27,6 +28,8 @@ module Seal.SourceControl.Repo
   , repoCodec
   , repoRegistryCodec
   , normalizeReposTable
+  , normalizeRepoUrl
+  , lookupRepoByUrl
   , parseRepoHost
   , hostAllowed
   , urlShapeValid
@@ -47,7 +50,8 @@ import Data.Aeson.Types (Parser)
 import Data.Bifunctor (first)
 import Data.HashMap.Strict qualified as HashMap
 import Data.Map.Strict (Map)
-import Data.Maybe (fromMaybe)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Validation (Validation (..))
@@ -90,6 +94,13 @@ data SourceRepo = SourceRepo
   , srVcsKind    :: VcsKind
   , srCredential :: RepoCredential
   } deriving stock (Eq, Show)
+
+-- | The source-control repo registry: a keyed-by-id map of 'SourceRepo's.
+-- Defined here (in the pure type module) so 'lookupRepoByUrl' can consume it
+-- without importing the IO-laden "Seal.SourceControl.Registry" (which would
+-- create a cycle). "Seal.SourceControl.Registry" re-exports it.
+newtype RepoRegistry = RepoRegistry { rrRepos :: Map RepoId SourceRepo }
+  deriving stock (Eq, Show)
 
 -- | Opaque repo key. Smart-constructed via 'mkRepoId'; the charset predicate
 -- guards every Map position. 'RepoId' is never used to construct a 'FilePath'
@@ -136,6 +147,10 @@ repoCredentialKindText CredMachineUser{} = "machine_user"
 -- | Build a 'RepoCredential' from a wire kind + a vault key name + an optional
 -- username. Validates that @machine_user@ carries a non-empty username and
 -- that the vault key is non-empty. Used by the REST API (W4) and slash UI (W5).
+--
+-- @account_key@ is a /reserved/ credential kind (a future constructor may add
+-- it; until then it fails-closed so a repo registered with @account_key@
+-- cannot decode — the registry MUST NOT silently accept an unknown kind).
 parseCredentialKind :: Text -> Text -> Maybe Text -> Either Text RepoCredential
 parseCredentialKind kind vaultKey mUsername
   | T.null vaultKey = Left "credential vault_key must be non-empty"
@@ -145,6 +160,7 @@ parseCredentialKind kind vaultKey mUsername
       case mUsername of
         Just u | not (T.null u) -> Right (CredMachineUser vaultKey u)
         _                       -> Left "machine_user requires a non-empty username"
+  | kind == "account_key" = Left "account_key credential kind is reserved (not yet supported)"
   | otherwise = Left ("unknown credential_kind: " <> kind)
 
 ----------------------------------------------------------------------------
@@ -352,12 +368,68 @@ parseRepoHost url
            else Right host
 
 -- | True iff the URL is non-empty AND matches one of the two supported shapes
--- (SSH @git@\<host\>:...@ or HTTPS @https://\<host\>/...@).
+-- (SSH @git\@\<host\>:...@ or HTTPS @https://\<host\>/...@).
 urlShapeValid :: Text -> Bool
 urlShapeValid url = not (T.null url) && (isSsh url || isHttps url)
   where
     isSsh u   = "git@" `T.isPrefixOf` u && T.isInfixOf ":" u
     isHttps u = "https://" `T.isPrefixOf` u || "http://" `T.isPrefixOf` u
+
+----------------------------------------------------------------------------
+-- URL normalization + registry lookup (W1 — shared with ISA.Ops.Repo)
+----------------------------------------------------------------------------
+
+-- | Normalize a repo URL to a canonical form for cross-scheme comparison.
+-- The same repo reached via different schemes (e.g.
+-- @git\@github.com:foo/bar.git@ vs @https://github.com/foo/bar.git@) should
+-- compare equal so 'lookupRepoByUrl' matches across forms. Normalization:
+--
+--   * strip a scheme (@https://@, @http://@, @git://@, @ssh://@, @file://@);
+--   * strip a leading @user\@@ (SCP-style);
+--   * replace the SCP-style @:@ separator with @/@;
+--   * strip a trailing @.git@;
+--   * strip trailing slashes;
+--   * lowercase (GitHub URLs are case-insensitive in host/path).
+--
+-- Returns the empty string only if the input is empty after trimming.
+-- Idempotent: @normalizeRepoUrl (normalizeRepoUrl u) == normalizeRepoUrl u@.
+normalizeRepoUrl :: Text -> Text
+normalizeRepoUrl raw =
+  let t1 = T.strip raw
+      -- Strip a scheme.
+      t2 = foldr (\s acc -> fromMaybe acc (T.stripPrefix s acc))
+                 t1 [ "https://", "http://", "git://", "ssh://", "file://" ]
+      -- Strip a leading user@ (SCP-style: git@host:path).
+      t3 = case T.breakOn "@" t2 of
+             (_, rest) | not (T.null rest) -> T.drop 1 rest
+             _ -> t2
+      -- Replace the SCP ':' separator with '/'. Only the FIRST ':'
+      -- (after the host) is the separator; later ':' would be port-like,
+      -- but a bare SCP url has exactly one ':'. If there's no '/', the
+      -- first ':' is host/path; if there's a '/' before the ':', it's
+      -- not SCP-style (e.g. ssh://host:port/path already had scheme
+      -- stripped, so unlikely) — leave it.
+      t4 = case T.breakOn ":" t3 of
+             (host, rest) | not (T.null rest), not (T.any (== '/') host) ->
+               host <> "/" <> T.drop 1 rest
+             _ -> t3
+      -- Strip trailing slashes, then a trailing .git, then any slash
+      -- that the .git-strip might have exposed (e.g. ".../repo.git/"
+      -- → ".../repo.git" → ".../repo"). Apply twice in case of a
+      -- ".../repo.git/."-like edge; the composition is idempotent.
+      stripTail t = T.dropWhileEnd (== '/') (fromMaybe t (T.stripSuffix ".git" (T.dropWhileEnd (== '/') t)))
+      t5 = stripTail t4
+  in T.toLower t5
+
+-- | Look up a 'SourceRepo' in a 'RepoRegistry' by URL, matching across
+-- scheme forms (SSH @git\@host:o/r.git@ ↔ HTTPS @https://host/o/r.git@ ↔
+-- @https://host/o/r@). Both the query URL and each 'srUrl' are normalized
+-- via 'normalizeRepoUrl' before comparison. Pure.
+lookupRepoByUrl :: Text -> RepoRegistry -> Maybe SourceRepo
+lookupRepoByUrl query (RepoRegistry repos) =
+  let q = normalizeRepoUrl query
+  in listToMaybe
+       [ r | r <- Map.elems repos, normalizeRepoUrl (srUrl r) == q ]
 
 ----------------------------------------------------------------------------
 -- JSON descriptor (for the REST API in W4)

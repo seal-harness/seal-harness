@@ -383,6 +383,89 @@ spec = describe "Seal.SourceControl.Repo" $ do
         let r = SourceRepo i url kind cred
         in (decode (encode r) :: Maybe SourceRepo) === Just r
 
+  --------------------------------------------------------------------------
+  -- W1: lookupRepoByUrl (cross-scheme URL matching)
+  --------------------------------------------------------------------------
+  describe "lookupRepoByUrl" $ do
+    let (crossSchemeId, sshRepo) = mkRepo "cross-scheme"
+          "git@github.com:seal-harness/seal-harness.git"
+          VcsGitHub
+          (CredDeployKey "K")
+        (crossHttpsId, httpsRepo) = mkRepo "cross-https"
+          "https://github.com:acme/other.git"
+          VcsGitHub
+          (CredPat "K")
+        (trailingId, trailingRepo) = mkRepo "trailing"
+          "https://github.com:example/project"
+          VcsGitHub
+          (CredPat "K")
+        reg = RepoRegistry (Map.fromList
+                [ (crossSchemeId, sshRepo)
+                , (crossHttpsId,  httpsRepo)
+                , (trailingId,     trailingRepo)
+                ])
+    it "finds an SSH-registered repo via its HTTPS form" $
+      lookupRepoByUrl "https://github.com/seal-harness/seal-harness.git" reg
+        `shouldBe` Just sshRepo
+    it "finds an SSH-registered repo via its HTTPS form without trailing .git" $
+      lookupRepoByUrl "https://github.com/seal-harness/seal-harness" reg
+        `shouldBe` Just sshRepo
+    it "finds an HTTPS-registered repo via its SSH form" $
+      lookupRepoByUrl "git@github.com:acme/other.git" reg
+        `shouldBe` Just httpsRepo
+    it "finds a repo registered without .git via its .git form" $
+      lookupRepoByUrl "https://github.com/example/project.git" reg
+        `shouldBe` Just trailingRepo
+    it "returns Nothing for an unregistered repo" $
+      lookupRepoByUrl "git@github.com:other/other.git" reg
+        `shouldBe` Nothing
+    it "returns Nothing for an empty registry" $
+      lookupRepoByUrl "git@github.com:seal-harness/seal-harness.git" (RepoRegistry Map.empty)
+        `shouldBe` Nothing
+
+  --------------------------------------------------------------------------
+  -- W1: normalizeRepoUrl (shared — lives in SourceControl.Repo now)
+  --------------------------------------------------------------------------
+  describe "normalizeRepoUrl (shared)" $ do
+    it "strips https:// scheme" $
+      normalizeRepoUrl "https://github.com/o/r.git" `shouldBe` "github.com/o/r"
+    it "strips SSH scp-form user@ and converts : to /" $
+      normalizeRepoUrl "git@github.com:o/r.git" `shouldBe` "github.com/o/r"
+    it "strips trailing .git without a trailing slash" $
+      normalizeRepoUrl "https://github.com/o/r" `shouldBe` "github.com/o/r"
+    it "lowercases the result" $
+      normalizeRepoUrl "https://GitHub.com/O/R.git" `shouldBe` "github.com/o/r"
+    it "treats SSH and HTTPS forms of the same repo as equal" $
+      normalizeRepoUrl "git@github.com:o/r.git"
+        `shouldBe` normalizeRepoUrl "https://github.com/o/r.git"
+
+  --------------------------------------------------------------------------
+  -- W1: CredAccountKey codec fail-closed (reserved constructor)
+  --------------------------------------------------------------------------
+  describe "account_key codec fail-closed" $ do
+    it "parseCredentialKind rejects account_key" $
+      parseCredentialKind "account_key" "K" Nothing `shouldSatisfy` isLeft
+    it "TOML credentialCodec rejects credential_kind = account_key" $ do
+      let txt = T.unlines
+            [ "[repos.bad]"
+            , "url = \"git@github.com:o/r.git\""
+            , "vcs_kind = \"github\""
+            , "credential_kind = \"account_key\""
+            , "vault_key = \"K\""
+            ]
+      decodeText txt `shouldSatisfy` isFailure
+    it "FromJSON rejects credential.kind = account_key" $ do
+      let v = object
+            [ "id" .= ("x" :: Text)
+            , "url" .= ("https://github.com/o/r.git" :: Text)
+            , "vcs_kind" .= ("github" :: Text)
+            , "credential" .= object
+                [ "kind" .= ("account_key" :: Text)
+                , "vault_key" .= ("K" :: Text)
+                ]
+            ]
+      (decode (encode (v :: Value)) :: Maybe SourceRepo) `shouldBe` Nothing
+
 ----------------------------------------------------------------------------
 -- QuickCheck helpers
 ----------------------------------------------------------------------------
