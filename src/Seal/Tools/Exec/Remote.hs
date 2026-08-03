@@ -8,8 +8,11 @@
 -- confirm a new host key, so adoption fail-closes).
 module Seal.Tools.Exec.Remote
   ( sshExecArgv
+  , sshExecArgvForwarding
   , runRemoteShell
+  , runRemoteShellForwarding
   , runRemoteWithStdin
+  , runRemoteWithStdinForwarding
   , RemoteRunner (..)
   , mkRealRemoteRunner
   , mkFakeRemoteRunner
@@ -44,9 +47,44 @@ import Seal.Tools.Exec.Types
 -- as the remote user's default shell, but the command string is a single
 -- argv element (ssh itself passes it to the remote shell, but the
 -- *local* argv is fixed, no shell wrapping).
+--
+-- Agent forwarding is OFF (no @-A@) — this is the default for all
+-- non-credential ops (SHELL_EXEC, file writes, process ops). Git-credential
+-- ops (clone/fetch/pull/push with a deploy key) use 'sshExecArgvForwarding'
+-- to opt in to @-A@ so the forwarded @SSH_AUTH_SOCK@ reaches the remote
+-- @git@. A blanket @-A@ would widen the signing-oracle surface; opt-in
+-- per git-op is the security-critical invariant (design §5.6, W2 DoD).
 sshExecArgv :: SshConfig -> Text -> [String]
 sshExecArgv cfg cmd =
   [ "ssh"
+  , "-o", "StrictHostKeyChecking=yes"
+  , "-o", "BatchMode=yes"
+  , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
+  ]
+  <> portArg
+  <> identityArg
+  <> [ userAtHost
+     , "--"
+     , T.unpack cmd
+     ]
+  where
+    userAtHost = T.unpack (getSshUser (scUser cfg)) <> "@"
+                 <> T.unpack (getSshHost (scHost cfg))
+    portArg = case scPort cfg of
+      22 -> []
+      p  -> ["-p", show p]
+    identityArg = case scIdentity cfg of
+      Nothing -> []
+      Just f  -> ["-i", f]
+
+-- | Variant of 'sshExecArgv' that adds @-A@ (forward the agent). Used by
+-- git-credential ops (clone/fetch/pull/push with a deploy key) so the
+-- remote @git@ can sign via the forwarded @SSH_AUTH_SOCK@. The @-A@ is
+-- opt-in per git-op — non-credential remote ops use 'sshExecArgv' (no
+-- @-A@) to keep the signing-oracle surface minimal (design §5.6).
+sshExecArgvForwarding :: SshConfig -> Text -> [String]
+sshExecArgvForwarding cfg cmd =
+  [ "ssh", "-A"
   , "-o", "StrictHostKeyChecking=yes"
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
@@ -134,10 +172,19 @@ mkRealRemoteRunner = RemoteRunner
 
 -- | Run a shell command via the remote SSH executor. The command is a
 -- validated 'ShellCommand' (NUL rejected). Returns the stdout or a
--- structured 'ExecError'.
+-- structured 'ExecError'. Agent forwarding is OFF (no @-A@) — use
+-- 'runRemoteShellForwarding' for git-credential ops.
 runRemoteShell :: RemoteRunner -> SshConfig -> ShellCommand -> IO (Either ExecError Text)
 runRemoteShell runner cfg cmd =
   let argv = sshExecArgv cfg (textShellCommand cmd)
+  in runRemote runner argv
+
+-- | Variant of 'runRemoteShell' that forwards the agent (@-A@). Used by
+-- git-credential ops (clone/fetch/pull/push with a deploy key).
+runRemoteShellForwarding
+  :: RemoteRunner -> SshConfig -> ShellCommand -> IO (Either ExecError Text)
+runRemoteShellForwarding runner cfg cmd =
+  let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
   in runRemote runner argv
 
 -- | Run a shell command via the remote SSH executor WITH a stdin payload.
@@ -145,12 +192,23 @@ runRemoteShell runner cfg cmd =
 -- 'UntrustedIO' arm for file writes (the file content goes over the SSH
 -- channel, never interpolated into the command string, so content with
 -- quotes/backticks/@$()@ is safe). The argv is the same fixed
--- 'sshExecArgv' shape; the stdin is a runtime parameter.
+-- 'sshExecArgv' shape; the stdin is a runtime parameter. Agent forwarding
+-- is OFF — use 'runRemoteWithStdinForwarding' for git-credential ops.
 runRemoteWithStdin
   :: RemoteRunner -> SshConfig -> ShellCommand -> ByteString
   -> IO (Either ExecError Text)
 runRemoteWithStdin runner cfg cmd stdinBytes =
   let argv = sshExecArgv cfg (textShellCommand cmd)
+  in runRemoteStdin runner argv stdinBytes
+
+-- | Variant of 'runRemoteWithStdin' that forwards the agent (@-A@). Used
+-- by git-credential ops that pipe stdin (e.g. writing @known_hosts@ over
+-- SSH before a clone with a deploy key).
+runRemoteWithStdinForwarding
+  :: RemoteRunner -> SshConfig -> ShellCommand -> ByteString
+  -> IO (Either ExecError Text)
+runRemoteWithStdinForwarding runner cfg cmd stdinBytes =
+  let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
   in runRemoteStdin runner argv stdinBytes
 
 -- | A fake 'RemoteRunner' that always returns a canned result (the

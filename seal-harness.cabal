@@ -118,22 +118,24 @@ library
          Seal.Session.Log
           Seal.SourceControl.Repo
           Seal.SourceControl.Registry
-         Seal.SourceControl.Clone
-        Seal.Signal.Config
-        Seal.Telegram.Config
-        Seal.Security.Command
-        Seal.Security.Crypto
-        Seal.Security.Path
-        Seal.Security.Policy
-        Seal.Security.Secrets
-        Seal.Security.Vault
-        Seal.Security.Vault.Age
-        Seal.Text.LineFile
-        Seal.Tools.Args
-        Seal.Tools.Exec.Remote
-        Seal.Tools.Exec.Types
-        Seal.Tools.Exec.Untrusted
-        Seal.Tools.Exec.UntrustedIO
+          Seal.SourceControl.Clone
+          Seal.SourceControl.GithubKeys
+         Seal.Signal.Config
+         Seal.Telegram.Config
+         Seal.Security.Command
+         Seal.Security.Crypto
+         Seal.Security.Path
+         Seal.Security.Policy
+         Seal.Security.Secrets
+         Seal.Security.Vault
+         Seal.Security.Vault.Age
+         Seal.Text.LineFile
+         Seal.Tools.Args
+         Seal.Tools.Exec.Remote
+         Seal.Tools.Exec.Types
+         Seal.Tools.Exec.Untrusted
+         Seal.Tools.Exec.UntrustedIO
+         Seal.Tools.Ssh.Agent
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -264,6 +266,7 @@ test-suite tests
         base
       , seal-harness
       , QuickCheck
+      , base64-bytestring
       , data-default
       , aeson
       , async

@@ -337,6 +337,8 @@ renderRepoTestError = \case
     "host " <> h <> " not supported (only github.com is supported in this pass)"
   CloneGitFailed n ->
     "git ls-remote failed (exit " <> T.pack (show n) <> ")"
+  CloneAgentError msg ->
+    "ssh-agent error: " <> msg
 
 ----------------------------------------------------------------------------
 -- Renderers

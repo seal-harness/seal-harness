@@ -1,79 +1,88 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | Source-control clone seam — credential-injected @git clone@ / @git
--- ls-remote@ with the token NEVER in argv, the URL, or the environment (design
--- §4.4, §5). This is the most security-sensitive module in the repo-registry
--- feature.
+-- | Source-control clone seam — the W2 no-disk design (design §4.1, §4.4,
+-- §4.6, §5). The credential mechanism (rev 3): the encrypted keyfile lives
+-- on the harness disk (ciphertext); the passphrase lives in the vault;
+-- per-op @ssh-agent@ decrypts the keyfile into memory using the passphrase
+-- piped to @ssh-add@'s stdin; @ssh -A@ forwards the @SSH_AUTH_SOCK@ to the
+-- untrusted machine; after the op, @ssh-add -D@ + @ssh-agent -k@.
 --
--- Security invariants (enforced by construction — the human checkpoint after
--- W3 reviews these):
+-- Security invariants (enforced by construction — the W2 self-reviewed
+-- checkpoint audits these):
 --
--- 1. Token/key bytes NEVER appear in argv, the URL, or the @GIT_SSH_COMMAND@
---    env value. For PAT / MachineUser the token lives only in a 0700
---    @GIT_ASKPASS@ helper script under 'repoCloneStateDir' (the env carries
---    only the non-secret @GIT_ASKPASS=<path>@); for DeployKey the key bytes
---    live only in a 0600 keyfile (the env @GIT_SSH_COMMAND@ carries the path,
---    not the bytes).
+-- 1. **No un-encrypted secret on disk, on either machine.** The encrypted
+--    keyfile under @cdKeyfilesDir@ IS permitted (ciphertext — same category
+--    as the age-encrypted vault file). The cleartext key exists only in:
+--    the vault (age-encrypted at rest) → harness process memory (@vhGet@)
+--    → ssh-agent memory (@ssh-add@ decrypts the encrypted keyfile using the
+--    passphrase piped to its stdin) → signing requests over the forwarded
+--    agent socket. The untrusted machine only ever sees the forwarded
+--    @SSH_AUTH_SOCK@.
 --
--- 2. Temp files (ASKPASS helper, deploy-key keyfile, @known_hosts@) live under
---    'repoCloneStateDir' (a 0700 private dir, NEVER @/tmp@), created with
---    @O_EXCL@-style create + immediate @fchmod@ 0600/0700 + a random suffix,
---    and are @bracket@-cleaned on success AND failure.
+-- 2. **Per-op agent lifecycle.** Each clone/git-op gets a fresh
+--    @ssh-agent@ via 'withCloneTarget' (bracket semantics): start →
+--    @sahAddKey <enc-keyfile> <passphrase>@ → run → @sahDeleteAll@ +
+--    @sahKill@. Exactly one identity is live at forwarding time (the
+--    security-critical scoping — design §4.6).
 --
--- 3. The host allow-list (§5.2) is enforced clone-time in 'planClone'
---    ('CloneHostNotSupported'), defense-in-depth on top of write-time
---    validation.
+-- 3. **PAT (fallback) uses @http.extraHeader@ in argv (memory, no file).**
+--    The token lives only in the git config args (in-memory argv); it is
+--    NEVER written to disk. The token-in-untrusted-memory residual is
+--    documented (deploy keys preferred).
 --
--- 4. 'CloneGitFailed' carries the exit code ONLY — no stderr (§5.4: git can
---    echo a token-bearing URL in stderr on auth failure).
+-- 4. **Pinned @known_hosts@ (public data).** 'cdPinnedKnownHosts' is the
+--    compile-time-embedded GitHub host keys (tamper-resistant via
+--    'file-embed'). Per-op it is written to a temp @known_hosts@ file
+--    (0644, public data, bracket-cleaned) and referenced by
+--    @UserKnownHostsFile=@ in @GIT_SSH_COMMAND@. @StrictHostKeyChecking=yes@
+--    (NOT @accept-new@ / @/dev/null@ — §5.3: MITM defense).
 --
--- 5. 'withCloneTarget' is CPS (mirrors 'Seal.Security.Secrets.withApiKey'):
+-- 5. **The encrypted keyfile never leaves the harness.** The untrusted
+--    machine never sees the keyfile (encrypted or otherwise) — only the
+--    forwarded @SSH_AUTH_SOCK@ via @ssh -A@.
+--
+-- 6. **'CloneGitFailed' carries the exit code ONLY — no stderr** (§5.4:
+--    git can echo a token-bearing URL in stderr on auth failure).
+--
+-- 7. **'withCloneTarget' is CPS** (mirrors 'Seal.Security.Secrets.withApiKey'):
 --    the authenticated bits are scoped to the continuation and the cleanup
 --    always runs (bracket semantics).
---
--- 6. The ASKPASS helper is prompt-aware (§5.1): git invokes
---    @$GIT_ASKPASS \<prompt>@ TWICE for an HTTPS challenge — once with a
---    @Username for …@ prompt and once with @Password for …@. A single-value
---    "echo the token" helper LEAVES the username prompt unanswered and (with
---    @GIT_TERMINAL_PROMPT=0@) the clone fails. The helper branches on
---    @argv[1]@: PAT returns @x-access-token@ for Username + the token for
---    Password; MachineUser returns @cUsername@ for Username + the token for
---    Password.
 module Seal.SourceControl.Clone
   ( CloneError (..)
   , ClonePlan (..)
   , CloneTarget
   , CloneEnv (..)
+  , CloneDeps (..)
   , planClone
   , resolveCloneTarget
   , withCloneTarget
   , cloneRepo
   , lsRemoteRepo
   , renderCloneError
+  , renderPatHeader
   ) where
 
-import Control.Exception (bracket)
-import Control.Monad (unless)
+import Control.Exception (bracket, onException, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.Char (ord)
+import Data.ByteString.Base64 qualified as B64
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Numeric (showHex)
-import System.Directory
-  ( createDirectoryIfMissing, doesFileExist, removeFile )
+import System.Directory (createDirectoryIfMissing, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (hClose, openBinaryTempFile)
 import System.Posix.Files (setFileMode)
-import System.Posix.Types (FileMode)
-import System.Random (randomRIO)
 
 import Seal.Git.Repo (readProcessBinaryCwdEnv)
 import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..)
-  , hostAllowed, parseRepoHost )
+  , hostAllowed, parseRepoHost, repoIdText )
+import Seal.Tools.Ssh.Agent
+  ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
+                                      , sahKill, sahStart) )
 
 ----------------------------------------------------------------------------
 -- Errors
@@ -96,6 +105,9 @@ data CloneError
   | CloneHostNotSupported Text
     -- ^ The parsed host is not in the allow-list (defense-in-depth on top of
     -- write-time validation).
+  | CloneAgentError Text
+    -- ^ The per-op ssh-agent lifecycle failed (start, add-key, etc.). The
+    -- cleartext key never made it to the agent — fail closed.
   | CloneGitFailed Int
     -- ^ @git@ exited non-zero. Carries the exit code ONLY — NO stderr (§5.4).
   deriving stock (Eq, Show)
@@ -117,6 +129,8 @@ renderCloneError = \case
     "unsupported VCS: " <> T.pack (show v)
   CloneHostNotSupported h ->
     "host " <> h <> " not supported (only github.com is supported in this pass)"
+  CloneAgentError msg ->
+    "ssh-agent error: " <> msg
   CloneGitFailed n ->
     "git failed (exit " <> T.pack (show n) <> ")"
 
@@ -129,10 +143,12 @@ renderCloneError = \case
 data ClonePlan
   = ClonePlanExtraHeader Text Text
     -- ^ Token-free HTTPS URL + the vault key name (PAT / MachineUser). The
-    -- token is fetched at clone time and written to a 0700 ASKPASS helper.
+    -- token is fetched at clone time and passed via @http.extraHeader@ in
+    -- the git argv (memory, no file).
   | ClonePlanSshKey Text Text
-    -- ^ SSH URL (host-bound) + the vault key name (DeployKey). The key bytes
-    -- are fetched at clone time and written to a 0600 keyfile.
+    -- ^ SSH URL (host-bound) + the vault key name (DeployKey). The
+    -- /passphrase/ is fetched at clone time and piped to @ssh-add@'s stdin;
+    -- the encrypted keyfile is read from @cdKeyfilesDir@ by @ssh-add@.
   deriving stock (Eq, Show)
 
 -- | Decide the clone strategy for a 'SourceRepo' (pure, no IO, no vault).
@@ -179,6 +195,33 @@ sshToHttps url
   | otherwise = url
 
 ----------------------------------------------------------------------------
+-- CloneDeps — the closed-over opcode param (W2)
+----------------------------------------------------------------------------
+
+-- | The per-op credential dependencies, passed as a closed-over param to
+-- 'resolveCloneTarget' / 'cloneRepo' / 'lsRemoteRepo' (mirrors
+-- @secretGetOp (cdVault deps)@ at @Channels/Loop.hs:1094@ — NOT via
+-- 'Env'/'mkEnv'; the codebase proved 'Env' is the wrong vehicle).
+--
+-- Carries:
+--
+-- * @cdVault@ — the vault handle (yields the passphrase / PAT via 'vhGet').
+-- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Per-op
+--   lifecycle: start → add-key → run → delete-all + kill.
+-- * @cdPinnedKnownHosts@ — compile-time-embedded GitHub host keys (public
+--   data, tamper-resistant via 'file-embed'). Written per-op to a temp
+--   @known_hosts@ file.
+-- * @cdKeyfilesDir@ — the harness-private dir holding the encrypted
+--   keyfiles (@~\/.seal\/state\/repos\/keys\/\<repo-id\>@). The encrypted
+--   keyfile lives only on the harness disk (ciphertext).
+data CloneDeps = CloneDeps
+  { cdVault           :: VaultHandle
+  , cdSshAgent        :: SshAgentHandle
+  , cdPinnedKnownHosts :: ByteString
+  , cdKeyfilesDir     :: FilePath
+  }
+
+----------------------------------------------------------------------------
 -- CloneTarget / CloneEnv (opaque, redacted Show, CPS-scoped)
 ----------------------------------------------------------------------------
 
@@ -195,27 +238,28 @@ instance Show CloneTarget where
   show _ = "CloneTarget <redacted>"
 
 -- | The environment passed to @git@. 'ceUrl' is the TOKEN-FREE URL;
--- 'ceEnvExtras' carries only non-secret env values (@GIT_ASKPASS=<path>@ for
--- PAT/MachineUser, @GIT_SSH_COMMAND=<ssh-cmd-with-keyfile-path>@ for
--- DeployKey, @GIT_TERMINAL_PROMPT=0@ always). The secret bytes live only in
--- the temp files referenced by those paths, never in the env values
--- themselves.
+-- 'ceEnvExtras' carries only non-secret values (@SSH_AUTH_SOCK@ +
+-- @GIT_SSH_COMMAND@ for deploy keys, @GIT_TERMINAL_PROMPT=0@ always). The
+-- secret bytes (the passphrase for deploy keys, the token for PATs) live
+-- only in the ssh-agent's memory (deploy keys) or the git argv
+-- (@http.extraHeader@ for PATs — memory, no file).
 data CloneEnv = CloneEnv
   { ceUrl :: Text
     -- ^ The token-free URL passed to @git clone@ / @git ls-remote@.
   , ceGitConfigArgs :: [Text]
-    -- ^ Extra @-c@ config args (currently @[]@ — we use @GIT_ASKPASS@, not
-    -- @http.extraHeader@, to keep the token out of argv).
+    -- ^ Extra @-c@ config args. PAT/MachineUser: @["-c",
+    -- "http.extraHeader=Authorization: Basic \<base64\>"]@ (memory, no
+    -- file). DeployKey: @[]@ (uses the agent, not extraHeader).
   , ceSshCommand :: Maybe Text
-    -- ^ @GIT_SSH_COMMAND@ value (deploy-key only). Carries the keyfile PATH,
-    -- not the key bytes.
+    -- ^ @GIT_SSH_COMMAND@ value (deploy-key only). Carries the pinned
+    -- @known_hosts@ PATH, not the key bytes (the key is in the agent).
   , ceEnvExtras :: [(String, String)]
     -- ^ Env overrides MERGED over the inherited environment. Carries
-    -- @GIT_ASKPASS@ / @GIT_SSH_COMMAND@ / @GIT_TERMINAL_PROMPT@ — only
+    -- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ / @GIT_TERMINAL_PROMPT@ — only
     -- non-secret values (paths + "0").
   , ceCleanup :: IO ()
-    -- ^ Removes the temp keyfile + ASKPASS helper. Run by 'withCloneTarget'
-    -- after the continuation (bracket semantics — runs on success AND
+    -- ^ Removes the per-op @known_hosts@ temp file + kills the agent. Run
+    -- by 'withCloneTarget' after the continuation (bracket — on success AND
     -- failure).
   }
 
@@ -231,156 +275,201 @@ withCloneTarget target k =
 ----------------------------------------------------------------------------
 
 -- | Resolve a 'SourceRepo' to a 'CloneTarget' — fetches the secret bytes
--- from the vault and writes the temp files (ASKPASS helper for PAT/MachineUser,
--- keyfile for DeployKey) under @repoCloneStateDir@. The temp files are created
--- with a random-suffix name + immediate @fchmod@ (§5.5) and are
--- @bracket@-cleaned via 'withCloneTarget'.
+-- from the vault, runs the per-op ssh-agent lifecycle (deploy keys), and
+-- writes the per-op @known_hosts@ temp file (public data, bracket-cleaned).
 --
--- The parent @repoCloneStateDir@ is created 0700 if absent. NEVER writes
--- under @/tmp@.
+-- For deploy keys: @sahStart@ → @sahAddKey <enc-keyfile> <passphrase>@
+-- (passphrase from the vault, piped to @ssh-add@'s stdin via the fake/real
+-- 'SshAgentHandle'). The agent decrypts the encrypted keyfile into memory.
+-- On any agent failure → 'CloneAgentError' (fail closed — the cleartext key
+-- never made it to the agent).
+--
+-- For PAT/MachineUser: the token is fetched from the vault and base64-encoded
+-- into @http.extraHeader=Authorization: Basic \<base64(user:token)\>@ (for
+-- MachineUser, the username is the public @cUsername@). The header lives
+-- only in 'ceGitConfigArgs' (memory, no file).
+--
+-- The per-op @known_hosts@ temp file is written under a random-suffix name
+-- (§5.5) and @bracket@-cleaned via 'withCloneTarget'.
 resolveCloneTarget
-  :: VaultHandle -> FilePath -> SourceRepo -> IO (Either CloneError CloneTarget)
-resolveCloneTarget vault repoCloneStateDir repo =
+  :: CloneDeps -> SourceRepo -> IO (Either CloneError CloneTarget)
+resolveCloneTarget deps repo =
   case planClone repo of
     Left e -> pure (Left e)
-    Right plan -> do
-      createDirectoryIfMissing True repoCloneStateDir
-      setFileMode repoCloneStateDir 0o700
-      case plan of
-        ClonePlanExtraHeader httpsUrl vaultKey -> do
-          mtoken <- vhGet vault vaultKey
-          case mtoken of
-            Left ve -> pure (Left (CloneVaultError ve))
-            Right tokenBytes -> do
-              let cred = srCredential repo
-                  helperBytes = renderAskpassHelper cred tokenBytes
-              helperPath <- writePrivateTempFile
-                repoCloneStateDir "askpass-" 0o700 helperBytes
-              let envExtras =
-                    [ ("GIT_ASKPASS", helperPath)
-                    , ("GIT_TERMINAL_PROMPT", "0")
-                    ]
-                  cleanup = removeFile helperPath
-                  env = CloneEnv
-                    { ceUrl = httpsUrl
-                    , ceGitConfigArgs = []
-                    , ceSshCommand = Nothing
-                    , ceEnvExtras = envExtras
-                    , ceCleanup = cleanup
-                    }
-              pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
-        ClonePlanSshKey sshUrl vaultKey -> do
-          mkey <- vhGet vault vaultKey
-          case mkey of
-            Left ve -> pure (Left (CloneVaultError ve))
-            Right keyBytes -> do
-              keyPath <- writePrivateTempFile
-                repoCloneStateDir "ssh-key-" 0o600 keyBytes
-              let knownHosts = repoCloneStateDir </> "known_hosts"
-              knownExists <- doesFileExist knownHosts
-              unless knownExists $ do
-                BS.writeFile knownHosts BS.empty
-                setFileMode knownHosts 0o600
-              let sshCmd = T.pack $
-                    "ssh -i " <> keyPath
-                    <> " -o IdentitiesOnly=yes"
-                    <> " -o StrictHostKeyChecking=accept-new"
-                    <> " -o UserKnownHostsFile=" <> knownHosts
-                  envExtras =
-                    [ ("GIT_SSH_COMMAND", T.unpack sshCmd)
-                    , ("GIT_TERMINAL_PROMPT", "0")
-                    ]
-                  cleanup = removeFile keyPath
-                  env = CloneEnv
-                    { ceUrl = sshUrl
-                    , ceGitConfigArgs = []
-                    , ceSshCommand = Just sshCmd
-                    , ceEnvExtras = envExtras
-                    , ceCleanup = cleanup
-                    }
-              pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
+    Right plan -> case plan of
+      ClonePlanExtraHeader httpsUrl vaultKey -> do
+        mtoken <- vhGet (cdVault deps) vaultKey
+        case mtoken of
+          Left ve -> pure (Left (CloneVaultError ve))
+          Right tokenBytes -> do
+            let header = renderPatHeader repo tokenBytes
+                envExtras = [("GIT_TERMINAL_PROMPT", "0")]
+                env = CloneEnv
+                  { ceUrl = httpsUrl
+                  , ceGitConfigArgs = ["-c", "http.extraHeader=" <> header]
+                  , ceSshCommand = Nothing
+                  , ceEnvExtras = envExtras
+                  , ceCleanup = pure ()
+                  }
+            pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
+      ClonePlanSshKey sshUrl _vaultKey -> do
+        -- The encrypted keyfile path: <keyfilesDir>/<repo-id>.
+        let keyfilePath = cdKeyfilesDir deps </> keyfileBaseName repo
+        -- Fetch the passphrase from the vault (decrypts the keyfile).
+        mpass <- vhGet (cdVault deps) (cVaultKey (srCredential repo))
+        case mpass of
+          Left ve -> pure (Left (CloneVaultError ve))
+          Right passphrase -> do
+            -- Per-op agent lifecycle: start → add-key. The post-add phase
+            -- (writing known_hosts + building the env) is bracketed so a
+            -- throw (e.g. an IO error from writeKnownHostsTemp) STILL runs
+            -- sahDeleteAll + sahKill — the agent never leaks with the key
+            -- in memory (design §4.6: exactly one identity live at
+            -- forwarding time).
+            eStart <- sahStart (cdSshAgent deps)
+            case eStart of
+              Left msg -> pure (Left (CloneAgentError msg))
+              Right agentEnv -> do
+                eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
+                case eAdd of
+                  Left msg -> do
+                    -- Fail closed: delete-all + kill even on add failure
+                    -- (no key landed, but defense-in-depth).
+                    sahDeleteAll (cdSshAgent deps) agentEnv
+                    sahKill (cdSshAgent deps) agentEnv
+                    pure (Left (CloneAgentError msg))
+                  Right () -> do
+                    -- Write the per-op known_hosts temp file (public data)
+                    -- under the 0700 harness-private cdKeyfilesDir (NOT
+                    -- /tmp — TOCTOU: the path git reads must be
+                    -- tamper-resistant, not just the content). If this
+                    -- throws (IO error), the agent MUST still be cleaned
+                    -- up — 'onException' runs sahDeleteAll + sahKill
+                    -- before rethrowing, so the agent never leaks with the
+                    -- key in memory (design §4.6: exactly one identity
+                    -- live at forwarding time). The 'ctCleanup' on the
+                    -- returned CloneTarget runs the same cleanup again on
+                    -- 'withCloneTarget' exit (idempotent — the fake
+                    -- agent's delete/kill are no-ops on a dead agent; the
+                    -- known_hosts removeFile swallows NoSuchThing).
+                    (knownHostsPath, knownHostsCleanup) <-
+                      writeKnownHostsTemp (cdKeyfilesDir deps)
+                                           (cdPinnedKnownHosts deps)
+                      `onException` ( do
+                          sahDeleteAll (cdSshAgent deps) agentEnv
+                          sahKill (cdSshAgent deps) agentEnv )
+                    let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
+                        sshCmd = T.pack $
+                          "ssh"
+                          <> " -o IdentitiesOnly=yes"
+                          <> " -o StrictHostKeyChecking=yes"
+                          <> " -o BatchMode=yes"
+                          <> " -o UserKnownHostsFile=" <> knownHostsPath
+                        envExtras =
+                          [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
+                          , ("SSH_AGENT_PID", saeAgentPid agentEnv)
+                          , ("GIT_SSH_COMMAND", T.unpack sshCmd)
+                          , ("GIT_TERMINAL_PROMPT", "0")
+                          ]
+                        cleanup = do
+                          knownHostsCleanup
+                          sahDeleteAll (cdSshAgent deps) agentEnv
+                          sahKill (cdSshAgent deps) agentEnv
+                        env = CloneEnv
+                          { ceUrl = sshUrl
+                          , ceGitConfigArgs = []
+                          , ceSshCommand = Just sshCmd
+                          , ceEnvExtras = authEnv ++ envExtras
+                          , ceCleanup = cleanup
+                          }
+                    pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
 
-----------------------------------------------------------------------------
--- GIT_ASKPASS helper (prompt-aware — critical correctness, §5.1)
-----------------------------------------------------------------------------
+-- | The base name of the encrypted keyfile for a 'SourceRepo' — the
+-- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2
+-- defense-in-depth). The keyfile lives at
+-- @\<cdKeyfilesDir\>\/\<repo-id\>@.
+keyfileBaseName :: SourceRepo -> FilePath
+keyfileBaseName repo = T.unpack (repoIdText (srId repo))
 
--- | Render the prompt-aware @GIT_ASKPASS@ helper shell script. git invokes
--- @$GIT_ASKPASS \<prompt>@ TWICE for an HTTPS credential challenge:
+-- | Render the @http.extraHeader@ value for a PAT/MachineUser: @Authorization:
+-- Basic \<base64(user:token)\>@. For 'CredPat' the "user" is
+-- @x-access-token@; for 'CredMachineUser' it's the public @cUsername@. The
+-- header lives only in the git argv (memory, no file).
 --
--- * once with @Username for 'https://github.com': @ (argv[1] starts with
---   "Username") → PAT prints @x-access-token@; MachineUser prints @cUsername@.
--- * once with @Password for 'https://github.com': @ (argv[1] starts with
---   "Password") → both print the token bytes.
+-- The base64 is computed over the RAW @user:token@ bytes (NOT a UTF-8
+-- round-trip through 'Text') — a vault token containing non-UTF-8 bytes
+-- (rare for GitHub PATs which are ASCII, but possible for MachineUser
+-- tokens or future cred types) is base64-encoded verbatim, avoiding the
+-- U+FFFD corruption that 'TE.decodeUtf8Lenient' would introduce before
+-- base64. The base64 output is pure ASCII, so the final
+-- 'TE.decodeUtf8Lenient' is lossless.
+renderPatHeader :: SourceRepo -> ByteString -> Text
+renderPatHeader repo tokenBytes =
+  let userBytes = case srCredential repo of
+        CredPat _            -> "x-access-token"
+        CredMachineUser _ u  -> TE.encodeUtf8 u
+        CredDeployKey _       -> "x-access-token"
+      basic = userBytes <> ":" <> tokenBytes
+      encoded = B64.encode basic
+  in "Authorization: Basic " <> TE.decodeUtf8Lenient encoded
+
+----------------------------------------------------------------------------
+-- Private temp file writer (random suffix + O_EXCL — §5.5)
+----------------------------------------------------------------------------
+
+-- | Write a temp @known_hosts@ file (public data — the pinned GitHub host
+-- keys) under the harness-private @parentDir@ (the 0700 @cdKeyfilesDir@)
+-- with a random-suffix name via 'openBinaryTempFile' (which uses @O_EXCL@
+-- under the hood — prevents a symlink-race / TOCTOU attack on the path git
+-- reads: an attacker cannot pre-plant a symlink at the chosen path because
+-- @O_EXCL@ fails if the file already exists). The file is 0600 (private —
+-- the content is public but the path git reads must be tamper-resistant, so
+-- we don't make it world-readable). Returns the path + a cleanup action
+-- (removes the file). 'bracket'-cleaned via the post-add bracket in
+-- 'resolveCloneTarget'.
 --
--- A single-value "echo the token" helper FAILS (leaves the username prompt
--- unanswered; @GIT_TERMINAL_PROMPT=0@ prevents fallback). The script branches
--- on @argv[1]@ via a @case@. The values are single-quote-escaped (replace @'@
--- with @'\''@) and embedded in the 0700 script — the same exposure level as
--- the keyfile (0700 in a 0700 private dir, bracket-deleted).
-renderAskpassHelper :: RepoCredential -> ByteString -> ByteString
-renderAskpassHelper cred tokenBytes =
-  TE.encodeUtf8 (T.pack script)
-  where
-    usernameVal = case cred of
-      CredPat _            -> "x-access-token"
-      CredMachineUser _ u  -> u
-      CredDeployKey _       -> "x-access-token"
-    tokenVal = TE.decodeUtf8Lenient tokenBytes
-    script = unlines
-      [ "#!/bin/sh"
-      , "case \"$1\" in"
-      , "  Username*) echo '" <> escapeSingle usernameVal <> "';;"
-      , "  Password*) echo '" <> escapeSingle tokenVal <> "';;"
-      , "esac"
-      ]
-
--- | Single-quote-escape a value for embedding in a shell @'…'@ literal:
--- replace @'@ with @'\\''@ (close-quote, escaped-quote, reopen-quote — the
--- standard POSIX idiom). A single unescaped quote would break out of the
--- literal and enable command injection in the 0700 ASKPASS helper. PAT
--- tokens/usernames are typically @[A-Za-z0-9_]@ / base64-ish so this rarely
--- fires, but it MUST be correct for defense in depth.
-escapeSingle :: Text -> String
-escapeSingle = go . T.unpack
-  where
-    go []          = []
-    go ('\'' : xs) = '\'' : '\\' : '\'' : go xs
-    go (c : xs)    = c : go xs
-
-----------------------------------------------------------------------------
--- Private temp file writer (random suffix + fchmod, §5.5)
-----------------------------------------------------------------------------
-
--- | Write a private temp file under @parent@ (a 0700 private dir). The
--- filename is @prefix@ + a random hex suffix; the file is written then
--- immediately @fchmod@-ed to @mode@. The random suffix prevents prediction
--- (§5.5); the 0700 parent closes the symlink race. The caller is responsible
--- for bracket-cleanup (the path is returned).
-writePrivateTempFile
-  :: FilePath -> String -> FileMode -> ByteString -> IO FilePath
-writePrivateTempFile parent prefix mode bytes = do
-  suffix <- randomRIO (0x10000000 :: Int, 0xFFFFFFFF :: Int)
-  let path = parent </> (prefix <> showHex suffix "")
-  BS.writeFile path bytes
-  setFileMode path mode
-  pure path
+-- Security rationale: the path git reads via @UserKnownHostsFile=@ must be
+-- integrity-protected, not just the content. A @/tmp@ location would be
+-- world-writable + symlink-raceable; a local attacker could swap the file
+-- between our write and git's read, planting an attacker-controlled host
+-- key → MITM the next git SSH connection. The 0700 @cdKeyfilesDir@ closes
+-- the race (only the harness user can write there) + @O_EXCL@ closes the
+-- symlink plant (the open fails if the path already exists).
+writeKnownHostsTemp :: FilePath -> ByteString -> IO (FilePath, IO ())
+writeKnownHostsTemp parentDir contents = do
+  createDirectoryIfMissing True parentDir
+  (path, h) <- openBinaryTempFile parentDir "seal-known-hosts-"
+  BS.hPutStr h contents
+  hClose h
+  setFileMode path 0o600
+  -- Idempotent cleanup: the bracket release in 'resolveCloneTarget' AND
+  -- 'withCloneTarget' both call this (the bracket release runs first on
+  -- success, then 'ctCleanup' runs again — the second 'removeFile' would
+  -- throw NoSuchThing). Swallow the IOException so double-cleanup is safe.
+  let cleanup = do
+        _ <- try @IOError (removeFile path)
+        pure ()
+  pure (path, cleanup)
 
 ----------------------------------------------------------------------------
 -- cloneRepo / lsRemoteRepo
 ----------------------------------------------------------------------------
 
 -- | @git clone@ a 'SourceRepo' into @destDir@ using the resolved credential.
--- The token NEVER appears in argv, the URL, or the env (only the non-secret
--- @GIT_ASKPASS=<path>@ is in env). On non-zero exit → 'CloneGitFailed' with
--- the exit code ONLY (stderr is DROPPED — §5.4). Cleanup runs via
--- 'withCloneTarget' (bracket — on success AND failure).
+-- The token/passphrase NEVER appears in argv, the URL, or the env (only
+-- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ / @http.extraHeader@ — non-secret
+-- paths + the base64-encoded Basic header which is in argv, in memory). On
+-- non-zero exit → 'CloneGitFailed' with the exit code ONLY (stderr is
+-- DROPPED — §5.4). Cleanup runs via 'withCloneTarget' (bracket — on success
+-- AND failure).
 cloneRepo
-  :: VaultHandle -> FilePath -> FilePath -> SourceRepo -> IO (Either CloneError ())
-cloneRepo vault cloneStateDir destDir repo =
-  resolveCloneTarget vault cloneStateDir repo >>= \case
+  :: CloneDeps -> FilePath -> SourceRepo -> IO (Either CloneError ())
+cloneRepo deps destDir repo =
+  resolveCloneTarget deps repo >>= \case
     Left e -> pure (Left e)
     Right target -> withCloneTarget target $ \env -> do
-      let gitArgs = ["clone", "--", T.unpack (ceUrl env), destDir]
+      let gitArgs = ceGitConfigArgsList env
+                     <> ["clone", "--", T.unpack (ceUrl env), destDir]
       (ec, _out, _err) <-
         readProcessBinaryCwdEnv Nothing (ceEnvExtras env) "git" gitArgs BS.empty
       pure $ case ec of
@@ -392,12 +481,13 @@ cloneRepo vault cloneStateDir destDir repo =
 -- (@<sha>\\t<ref>@ — W5 echoes it). On non-zero exit → 'CloneGitFailed' with
 -- the exit code ONLY (no stderr).
 lsRemoteRepo
-  :: VaultHandle -> FilePath -> SourceRepo -> IO (Either CloneError Text)
-lsRemoteRepo vault cloneStateDir repo =
-  resolveCloneTarget vault cloneStateDir repo >>= \case
+  :: CloneDeps -> SourceRepo -> IO (Either CloneError Text)
+lsRemoteRepo deps repo =
+  resolveCloneTarget deps repo >>= \case
     Left e -> pure (Left e)
     Right target -> withCloneTarget target $ \env -> do
-      let gitArgs = ["ls-remote", "--", T.unpack (ceUrl env)]
+      let gitArgs = ceGitConfigArgsList env
+                     <> ["ls-remote", "--", T.unpack (ceUrl env)]
       (ec, out, _err) <-
         readProcessBinaryCwdEnv Nothing (ceEnvExtras env) "git" gitArgs BS.empty
       pure $ case ec of
@@ -407,4 +497,9 @@ lsRemoteRepo vault cloneStateDir repo =
     firstLine bs =
       let l = BS.takeWhile (/= nl) bs
       in TE.decodeUtf8Lenient l
-    nl = fromIntegral (ord '\n')
+    nl = 10  -- '\n'
+
+-- | Render 'ceGitConfigArgs' as a list of 'String' for the git argv. Each
+-- element is already a complete argv token (@-c@ / @http.extraHeader=...@).
+ceGitConfigArgsList :: CloneEnv -> [String]
+ceGitConfigArgsList env = map T.unpack (ceGitConfigArgs env)

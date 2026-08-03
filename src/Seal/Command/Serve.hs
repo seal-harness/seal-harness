@@ -43,7 +43,7 @@ import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoCloneStateDir, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -60,8 +60,11 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (CloneError (..), lsRemoteRepo)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, rebindTabH, seedTabsHandle, snapshotTabs)
@@ -285,7 +288,14 @@ mkRepoTestSeam :: Maybe VaultHandle -> SealPaths -> RepoTestSeam
 mkRepoTestSeam mHandle paths = RepoTestSeam
   { rtsLsRemote  = case mHandle of
       Nothing    -> \_ -> pure (Left (CloneVaultError VaultLocked))
-      Just vh    -> lsRemoteRepo vh (repoCloneStateDir paths)
+      Just vh    -> \repo ->
+        let deps = Clone.CloneDeps
+              { Clone.cdVault = vh
+              , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
+              , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , Clone.cdKeyfilesDir = repoKeysDir paths
+              }
+        in lsRemoteRepo deps repo
   , rtsVaultList = case mHandle of
       Nothing    -> pure (Left VaultLocked)
       Just vh    -> vhList vh

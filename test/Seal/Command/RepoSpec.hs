@@ -96,6 +96,7 @@ capsFrom fc = ChannelCaps
   { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = False
   }
 
 -- | Parse argv against the /repo command and run the resulting action.
