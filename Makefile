@@ -36,7 +36,7 @@ frontend-install: ## Install frontend npm dependencies if missing
 	@cd frontend && [ -d node_modules ] || npm install
 
 serve: frontend-install ## Rebuild the frontend, then launch the seal gateway and web server (pass flags via ARGS, e.g. make serve ARGS="--yolo")
-	@cd frontend && npm run build
+	@cd frontend && VITE_WS_PORT=$${VITE_WS_PORT:-9091} npm run build
 	$(NIX) cabal run -v0 seal -- serve $(ARGS)
 
 tui: ## Launch the interactive terminal UI (equivalent to `seal tui`)
