@@ -1035,19 +1035,35 @@ export async function fetchRepo(id: string): Promise<RepoInfo | null> {
   return fetchJson<RepoInfo>(`/api/repos/${encodeURIComponent(id)}`)
 }
 
+/** The outcome of a repo create/update mutation. On success `repo` carries
+ *  the descriptor returned by the backend; on failure `error` carries the
+ *  backend's error message (or a fallback) so the UI can surface it instead
+ *  of a generic "save failed" string. */
+export type RepoMutationResult =
+  | { ok: true; repo: RepoInfo }
+  | { ok: false; error: string }
+
+/** Read the backend's `{"error": "..."}` body, falling back to the HTTP
+ *  status text when the body is missing or unparseable. */
+async function repoMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
 /** Create a new source-control repo. The body must include `id`. Returns
- *  the created repo on success, null on failure. */
-export async function createRepo(input: RepoInput): Promise<RepoInfo | null> {
+ *  the created repo on success, or the backend's error message on failure. */
+export async function createRepo(input: RepoInput): Promise<RepoMutationResult> {
   try {
     const res = await fetch('/api/repos', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     })
-    if (!res.ok) return null
-    return await res.json() as RepoInfo
+    if (!res.ok) return { ok: false, error: await repoMutationError(res) }
+    return { ok: true, repo: await res.json() as RepoInfo }
   } catch {
-    return null
+    return { ok: false, error: 'network error' }
   }
 }
 

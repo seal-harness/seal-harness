@@ -2,10 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { ReposView } from '../ReposView'
 import type { RepoInfo } from '../../types'
+import type { RepoMutationResult } from '../../hooks/useApi'
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
-const createRepo = vi.fn(async (_input: unknown): Promise<RepoInfo | null> => null)
+const createRepo = vi.fn(async (_input: unknown): Promise<RepoMutationResult> => ({ ok: false, error: 'network error' }))
 const updateRepo = vi.fn(async (_id: string, _input: unknown): Promise<RepoInfo | null> => null)
 const deleteRepo = vi.fn(async (_id: string): Promise<boolean> => false)
 
@@ -44,7 +45,7 @@ beforeEach(() => {
   createRepo.mockReset()
   updateRepo.mockReset()
   deleteRepo.mockReset()
-  createRepo.mockResolvedValue(null)
+  createRepo.mockResolvedValue({ ok: false, error: 'network error' })
   updateRepo.mockResolvedValue(null)
   deleteRepo.mockResolvedValue(false)
 })
@@ -90,7 +91,7 @@ describe('ReposView', () => {
   })
 
   it('create POSTs /api/repos on a valid form', async () => {
-    createRepo.mockResolvedValue(makeRepo({ id: 'myrepo' }))
+    createRepo.mockResolvedValue({ ok: true, repo: makeRepo({ id: 'myrepo' }) })
     reposState = []
     render(<ReposView />)
     fireEvent.click(screen.getByLabelText('New repo'))
@@ -107,6 +108,19 @@ describe('ReposView', () => {
     expect(body.credential.kind).toBe('pat')
     // vault_key is auto-generated: seal-<kind>-<id>
     expect(body.credential.vault_key).toBe('seal-pat-myrepo')
+  })
+
+  it('create surfaces the backend error when the save fails', async () => {
+    createRepo.mockResolvedValue({ ok: false, error: 'disallowed host: evil.example' })
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
+    fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@evil.example/o.git' } })
+    fireEvent.click(screen.getByLabelText('Create repo'))
+    await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('repo-form-error')).toBeTruthy()
+    expect(screen.getByText(/disallowed host: evil\.example/)).toBeTruthy()
   })
 
   it('create validates the id charset and surfaces an error for a bad id', () => {

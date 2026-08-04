@@ -711,10 +711,25 @@ describe('Repo CRUD', () => {
   it('createRepo POSTs /api/repos with the input body', async () => {
     setNextResponse({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } }, 201)
     const res = await createRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
-    expect(res?.id).toBe('myrepo')
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.repo.id).toBe('myrepo')
     const call = fetchCalls.find((c) => c.url === '/api/repos' && c.init?.method === 'POST')
     expect(call).toBeTruthy()
     expect(JSON.parse(call!.init!.body as string)).toEqual({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+  })
+
+  it('createRepo surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'disallowed host: evil.example' }, 400)
+    const res = await createRepo({ id: 'myrepo', url: 'git@evil.example/o.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('disallowed host: evil.example')
+  })
+
+  it('createRepo falls back to HTTP status when the body has no error', async () => {
+    setNextResponse('oops', 500)
+    const res = await createRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('HTTP 500')
   })
 
   it('updateRepo PUTs /api/repos/:id (id from path; no new_id)', async () => {

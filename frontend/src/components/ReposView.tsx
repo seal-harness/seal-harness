@@ -172,12 +172,12 @@ export function ReposView() {
       }
       const res = await createRepo(payload)
       setSubmitting(false)
-      if (res) {
+      if (res.ok) {
         refresh()
         setCreating(false)
-        setEditing(res.id)
+        setEditing(res.repo.id)
       } else {
-        setFormError('Save failed — check the id is unique and the backend is reachable.')
+        setFormError(res.error)
       }
     } else if (editing) {
       // PUT: id from path; ids are stable — NO new_id.
