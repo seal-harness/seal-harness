@@ -33,6 +33,9 @@ module Seal.Tools.Ssh.Agent
   , mkRealSshAgentHandle
   , mkFakeSshAgentHandle
   , FakeAgentCall (..)
+  , agentCreateProcess_close_fds
+  , addKeyCreateProcess_close_fds
+  , killCreateProcess_close_fds
   ) where
 
 import Control.Exception (try)
@@ -170,16 +173,55 @@ mkRealSshAgentHandle = SshAgentHandle
   , sahGetAuthEnv = saeGetAuthEnv
   }
 
+-- | The 'CreateProcess' for @ssh-agent -s@ (sahStart). Exposed for the
+-- FD-leak regression test (#88): @close_fds = True@ ensures ssh-agent does
+-- NOT inherit seal's TCP sockets (the WS stream port) + transcript file
+-- handles. Without this, a crashed seal leaves ssh-agent holding the
+-- gateway's ports hostage.
+agentCreateProcess :: [String] -> CreateProcess
+agentCreateProcess argv =
+  case argv of
+    (p : as) -> mkCloseFds (proc p as)
+    []       -> error "agentCreateProcess: empty argv (unreachable)"
+  where
+    mkCloseFds cp = cp { close_fds = True }
+
+-- | The 'CreateProcess' for @ssh-add@ (sahAddKey / sahDeleteAll).
+addKeyCreateProcess :: [(String, String)] -> String -> [String] -> CreateProcess
+addKeyCreateProcess env program args =
+  (proc program args) { close_fds = True, std_in = CreatePipe
+                      , std_out = CreatePipe, std_err = CreatePipe
+                      , env = Just env }
+
+-- | The 'CreateProcess' for @ssh-agent -k@ (sahKill).
+killCreateProcess :: [(String, String)] -> CreateProcess
+killCreateProcess env =
+  (proc "ssh-agent" ["-k"]) { close_fds = True
+                             , std_in = CreatePipe
+                             , std_out = CreatePipe
+                             , std_err = CreatePipe
+                             , env = Just env }
+
+-- | Test-visible projections of the 'close_fds' field (the FD-leak
+-- regression test asserts these are 'True').
+agentCreateProcess_close_fds :: Bool
+agentCreateProcess_close_fds =
+  close_fds (agentCreateProcess ["ssh-agent", "-s"])
+
+addKeyCreateProcess_close_fds :: Bool
+addKeyCreateProcess_close_fds =
+  close_fds (addKeyCreateProcess [] "ssh-add" ["-D"])
+
+killCreateProcess_close_fds :: Bool
+killCreateProcess_close_fds = close_fds (killCreateProcess [])
+
 -- | Run a process with a given env + stdin 'ByteString', capturing
 -- stdout/stderr as 'Text'.
 runProcessEnv
   :: [(String, String)] -> String -> [String] -> ByteString
   -> IO (ExitCode, Text, Text)
 runProcessEnv env program args stdinBytes = do
-  let cp = (proc program args)
-          { std_in = CreatePipe, std_out = CreatePipe
-          , std_err = CreatePipe, env = Just env
-          }
+  let cp = addKeyCreateProcess env program args
   withCreateProcess cp $ \mIn mOut mErr ph -> do
     case mIn of
       Just hIn -> do
@@ -201,7 +243,7 @@ runProcessEnv env program args stdinBytes = do
 readProcessCollect :: [String] -> String -> IO (ExitCode, String, String)
 readProcessCollect argv stdinStr =
   case argv of
-    (p : as) -> readCreateProcessWithExitCode (proc p as) stdinStr
+    (_ : _) -> readCreateProcessWithExitCode (agentCreateProcess argv) stdinStr
     []       -> error "readProcessCollect: empty argv (unreachable)"
 
 ----------------------------------------------------------------------------

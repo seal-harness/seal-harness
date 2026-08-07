@@ -407,6 +407,7 @@ test-suite tests
         Seal.SourceControl.RegistrySpec
         Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
+        Seal.Tools.Ssh.AgentSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
         Seal.Tools.Exec.UntrustedIORemoteSpec
