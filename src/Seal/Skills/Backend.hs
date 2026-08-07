@@ -14,11 +14,13 @@ module Seal.Skills.Backend
   , markdownSkillBackend
   , unionSkillBackend
   , workdirSkillBackend
+  , workdirSkillConventions
   , tripleUnionSkillBackend
   , encodeSkill
   , decodeSkill
+  , listAgentSkillsDir
+  , decodeAgentSkill
   ) where
-
 import Control.Monad (forM, forM_)
 import Data.IORef
 import Data.List (sortOn)
@@ -28,19 +30,21 @@ import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Time (UTCTime (..))
+import Data.Time.Calendar (fromGregorian)
+import Data.Time.Clock (secondsToDiffTime)
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , listDirectory, removeFile, renameFile )
 import System.FilePath (takeDirectory, (</>), (<.>))
 import System.Posix.Files (setFileMode)
 
+import Seal.Core.Types (mkSystemSessionId)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
-import Seal.Skills.Builtins (builtinSkillMap)
 import Seal.Skills.Codec (decodeSkill, encodeSkill)
-import Seal.Skills.Types (Skill (..), SkillId (..), skillIdText)
-
--- | The skill store capability. Each operation is IO (the Markdown backend
--- writes to disk + git); 'sbList' returns all skills sorted by id.
+import Seal.Skills.Builtins (builtinSkillMap)
+import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
+import Seal.Store.Markdown (decodeDoc, fmLookup)
 data SkillBackend = SkillBackend
   { sbCreate :: Skill -> IO ()
   -- ^ Insert or replace a skill by id (writes the file + auto-commits).
@@ -104,8 +108,6 @@ unionSkillBackend user = SkillBackend
           Nothing -> pure (Map.lookup sid builtinSkillMap)
     , sbList   = do
         userSkills <- sbList user
-        -- User skills keyed by id; built-in entries fill in the ids the
-        -- user hasn't overridden. Sorted by id for deterministic output.
         let userMap = Map.fromList [(skId s, s) | s <- userSkills]
             merged = Map.union userMap builtinSkillMap
         pure (Map.elems merged)
@@ -116,16 +118,21 @@ unionSkillBackend user = SkillBackend
 -- | The conventional skill directories a cloned repo may carry, checked in
 -- order per repo. The first match per convention wins (a repo should only
 -- use one). Top-level only — no recursion into the repo.
+--
+-- @.skills@ follows the [agentskills.io](https://agentskills.io)
+-- specification: each subdirectory contains a @SKILL.md@ file with YAML
+-- frontmatter (@name@, @description@) + Markdown body. The other
+-- conventions use Seal's native flat/grouped @.md@ layout.
 workdirSkillConventions :: [FilePath]
-workdirSkillConventions = [ ".seal/skills", ".claude/skills", "agents/skills" ]
+workdirSkillConventions = [ ".skills", ".seal/skills", ".claude/skills", "agents/skills" ]
 
 -- | A read-only 'SkillBackend' that scans a session workdir for skills
 -- shipped by cloned repositories. For each top-level directory in the
 -- workdir (a cloned repo), it checks the conventional skill locations
--- (@.seal\/skills\/@, @.claude\/skills\/@, @agents\/skills\/@) and loads
--- any skills there (using the grouped-layout enumeration from
--- 'listSkills'). Skills are stamped with 'skGroup' from their subdirectory
--- as usual.
+-- (@.skills\/@, @.seal\/skills\/@, @.claude\/skills\/@, @agents\/skills\/@)
+-- and loads any skills there. The @.skills@ convention uses the
+-- agentskills.io directory-based format (@\<name\>\/SKILL.md@); the others
+-- use Seal's native flat/grouped @.md@ layout.
 --
 -- This backend is /read-only/: 'sbCreate'/'sbUpdate'/'sbDelete' are no-ops
 -- (repo-local skills are immutable from the model's perspective — the
@@ -152,17 +159,18 @@ workdirSkillBackend workdir = pure SkillBackend
 -- all top-level directories (cloned repos) in @workdir@. The
 -- alphabetically-first repo wins on id collisions (deterministic). Missing
 -- @workdir@ or empty workdirs yield @[]@.
+--
+-- For the @.skills@ convention, skills are loaded from the agentskills.io
+-- directory format (each subdirectory contains a @SKILL.md@). For the
+-- other conventions, skills are loaded from Seal's native flat/grouped
+-- @.md@ layout.
 listWorkdirSkills :: FilePath -> IO [Skill]
 listWorkdirSkills workdir = do
   exists <- doesDirectoryExist workdir
   if not exists
     then pure []
     else do
-      -- Top-level dirs only (each is a cloned repo); listSubdirs already
-      -- filters hidden dirs and sorts, so the alphabetical-first repo
-      -- wins on id collisions.
       dirs <- listSubdirs workdir
-      -- For each repo dir, gather skills from every convention.
       perRepo <- forM dirs $ \repo -> do
         let repoDir = workdir </> repo
         concat <$> forM workdirSkillConventions (\conv -> do
@@ -170,12 +178,16 @@ listWorkdirSkills workdir = do
           cExists <- doesDirectoryExist convDir
           if not cExists
             then pure []
-            else do
-              x <- listTopLevelSkills convDir
-              y <- listGroupedSkills convDir
-              pure (catMaybes (x ++ y)))
-      -- Merge with alphabetical-first-repo-wins: insert left-to-right,
-      -- keeping the existing entry on collision (Map.insertWith const old).
+            else if conv == ".skills"
+                   then do
+                     -- agentskills.io format: subdirectories with SKILL.md
+                     agentSkills <- listAgentSkillsDir convDir
+                     pure (catMaybes agentSkills)
+                   else do
+                     -- Seal native format: flat/grouped .md files
+                     x <- listTopLevelSkills convDir
+                     y <- listGroupedSkills convDir
+                     pure (catMaybes (x ++ y)))
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)
@@ -208,17 +220,13 @@ tripleUnionSkillBackend workdir user = SkillBackend
         userSkills <- sbList user
         let wdMap   = Map.fromList [(skId s, s) | s <- wdSkills]
             userMap = Map.fromList [(skId s, s) | s <- userSkills]
-            -- workdir wins (Map.union is left-biased), then user wins
-            -- over built-in.
             merged = Map.union wdMap (Map.union userMap builtinSkillMap)
         pure (Map.elems merged)
     , sbUpdate = sbUpdate user
     , sbDelete = sbDelete user
     }
 
--- | The filename for a skill in the flat layout: @\<id\>.md@. Used for
--- 'sbRead' (which must probe both the flat and grouped layouts, since a
--- skill's group may not be known at read time).
+-- | The filename for a skill in the flat layout: @\<id\>.md@.
 skillFile :: FilePath -> SkillId -> FilePath
 skillFile dir sid = dir </> T.unpack (skillIdText sid) <.> "md"
 
@@ -232,14 +240,6 @@ skillPath root skill =
     Just g | not (T.null (T.strip g)) ->
       root </> T.unpack (T.strip g) </> T.unpack (skillIdText (skId skill)) <.> "md"
     _ -> skillFile root (skId skill)
-
--- | Encode a 'Skill' as a Markdown document (frontmatter + body).
--- Re-exported from 'Seal.Skills.Codec' for backward compatibility.
--- (See 'Seal.Skills.Codec' for the implementation.)
-
--- | Decode a Markdown document into a 'Skill'.
--- Re-exported from 'Seal.Skills.Codec' for backward compatibility.
--- (See 'Seal.Skills.Codec' for the implementation.)
 
 -- | Write one skill to disk (atomic) and auto-commit. Honors 'skGroup':
 -- a grouped skill is written under @\<root\>\/\<group\>\/\<id\>.md@ (the
@@ -271,11 +271,9 @@ writeSkill root repo s = do
 -- frontmatter redundantly declares a group.
 readSkill :: FilePath -> SkillId -> IO (Maybe Skill)
 readSkill root sid = do
-  -- 1. Probe group subdirectories (grouped layout).
   groups <- listSubdirs root
   found <- firstMatchM [ readAndStampGroup root (g </> base) (Just (T.pack g))
                        | g <- groups ]
-  -- 2. Fall back to the flat layout.
   case found of
     Just s  -> pure (Just s)
     Nothing -> readAndStampGroup root base Nothing
@@ -297,9 +295,8 @@ readAndStampGroup root rel mGroup = do
         Nothing -> pure Nothing
         Just s  -> pure (Just (stampGroup s))
   where
-    -- Fill skGroup from the directory when the frontmatter didn't set one.
     stampGroup s = case skGroup s of
-      Just _  -> s                      -- frontmatter wins
+      Just _  -> s
       Nothing -> s { skGroup = mGroup }
 
 -- | Enumerate the immediate subdirectories of @dir@ (non-recursive, no
@@ -377,8 +374,6 @@ listGroupedSkills dir = do
 -- is deleted from the root. If a file exists in both, both are removed.
 deleteSkill :: FilePath -> ConfigRepo -> SkillId -> IO ()
 deleteSkill dir repo sid = do
-  -- Search grouped subdirs first, then the flat path. Delete every match
-  -- (a skill should only exist in one place, but we clean up any orphans).
   groups <- listSubdirs dir
   let groupedPaths = [ dir </> g </> base | g <- groups ]
       flatPath     = skillFile dir sid
@@ -386,12 +381,10 @@ deleteSkill dir repo sid = do
   candidates <- filterM' doesFileExist (groupedPaths ++ [flatPath])
   forM_ candidates $ \path -> do
     removeFile path
-    -- Compute the repo-relative path for the commit message context.
     let rel = "skills" </> fromMaybe base (stripRoot dir path)
     _ <- gitCommitAll repo rel ("seal: SKILL delete " <> skillIdText sid)
     pure ()
   where
-    -- Strip the skills-root prefix from a path for the git rel path.
     stripRoot r p =
       let r' = dropTrailingSlash r
           p' = dropTrailingSlash p
@@ -400,3 +393,54 @@ deleteSkill dir repo sid = do
            else Nothing
     dropTrailingSlash = reverse . dropWhile (== '/') . reverse
     isPrefixPath pre s = take (length pre) s == pre
+
+----------------------------------------------------------------------------
+-- agentskills.io format support
+----------------------------------------------------------------------------
+
+-- | Enumerate skills in agentskills.io directory format: each subdirectory
+-- of @dir@ contains a @SKILL.md@ file with YAML frontmatter (@name@,
+-- @description@) + Markdown body. Returns one 'Maybe Skill' per
+-- subdirectory ('Nothing' for malformed/missing @SKILL.md@). The skill id
+-- is taken from the @name@ frontmatter field (which the spec requires to
+-- match the parent directory name). The skill group is set to 'Nothing'
+-- (agentskills.io has no group concept; the directory name IS the id).
+listAgentSkillsDir :: FilePath -> IO [Maybe Skill]
+listAgentSkillsDir dir = do
+  exists <- doesDirectoryExist dir
+  if not exists
+    then pure []
+    else do
+      subdirs <- listSubdirs dir
+      forM subdirs $ \subdir -> do
+        let skillMdPath = dir </> subdir </> "SKILL.md"
+        mdExists <- doesFileExist skillMdPath
+        if not mdExists
+          then pure Nothing
+          else do
+            content <- TIO.readFile skillMdPath
+            pure (decodeAgentSkill content)
+
+-- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter
+-- uses @name@ (required, maps to 'skId') and @description@ (required, maps
+-- to 'skDescription'). The body after the frontmatter becomes 'skBody'.
+-- Timestamps default to epoch zero (repo-local skills have no provenance
+-- timestamps). The session is set to a system "manual" session (matching
+-- the DirScheme agent def pattern).
+decodeAgentSkill :: Text -> Maybe Skill
+decodeAgentSkill content =
+  case decodeDoc content of
+    (fm, body) -> do
+      nameT <- fmLookup "name" fm
+      sid  <- either (const Nothing) Just (mkSkillId nameT)
+      Just Skill
+        { skId = sid
+        , skDescription = fromMaybe "" (fmLookup "description" fm)
+        , skBody = body
+        , skGroup = Nothing
+        , skCreatedAt = agentSkillEpoch
+        , skUpdatedAt = agentSkillEpoch
+        , skSession = mkSystemSessionId "manual"
+        }
+  where
+    agentSkillEpoch = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)

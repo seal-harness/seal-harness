@@ -1,3 +1,7 @@
+---
+kind: agents
+---
+
 # Seal Harness — AGENTS.md
 
 > **Purpose:** A compact guide for any contributor (human or AI agent) starting
@@ -146,7 +150,8 @@ seal-harness/
 │   └── superpowers/
 │       ├── specs/        Approved designs (the "what" and "why")
 │       └── plans/        Detailed TDD implementation plans
-└── .opencode/            OpenCode agent/skill config (haskell-coder, haskell-reviewer, etc.)
+├── .agents/             .agents Protocol config (agents, skills, agents.md)
+└── .opencode/            OpenCode config (symlinks to .agents/, commands, opencode.json)
 ```
 
 ### Key Design Decisions
@@ -537,5 +542,5 @@ behavior is in question, the README and design docs are the source of truth.
 | `src/Seal/Agent/Loop.hs` | The turn loop — the agent's main execution cycle |
 | `src/Seal/Core/Types.hs` | Core vocabulary (TrustLevel, OpName, SessionId) |
 | `docs/superpowers/plans/2026-06-28-seal-harness-roadmap.md` | The master roadmap |
-| `.opencode/skills/haskell-coder/SKILL.md` | Full Haskell coding conventions |
-| `.opencode/skills/haskell-reviewer/SKILL.md` | Code review checklist |
+| `.agents/skills/haskell-coder/SKILL.md` | Full Haskell coding conventions |
+| `.agents/skills/haskell-reviewer/SKILL.md` | Code review checklist |

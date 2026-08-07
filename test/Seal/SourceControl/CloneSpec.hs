@@ -22,8 +22,6 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.IORef
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.List (isPrefixOf, tails)
@@ -32,14 +30,15 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , listDirectory )
+  , getTemporaryDirectory, listDirectory )
 import System.FilePath ((</>))
-import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Temp (createTempDirectory, withSystemTempDirectory)
 import System.Posix.Files
   ( fileMode, getFileStatus, intersectFileModes, ownerModes )
 import Test.Hspec
 
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
 import Seal.SourceControl.Clone
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Repo
@@ -50,13 +49,23 @@ import Seal.Tools.Exec.UntrustedIO (mergeEnv)
 import Seal.Tools.Ssh.Agent
   ( FakeAgentCall (..), SshAgentEnv (..), mkFakeSshAgentHandle )
 
--- | Create a fresh 'IORef' for 'cdAgentEnvRef' in a pure @let@ context.
--- Each call creates a NEW IORef (the @NOINLINE@ prevents GHC from CSE'ing
--- multiple calls into one shared IORef, which would cause the agent env
--- to leak across tests). Used only in test CloneDeps literals.
-freshAgentRegistry :: IORef (Map Text SshAgentEnv)
-freshAgentRegistry = unsafePerformIO (newIORef Map.empty)
+-- | Create a fresh 'AgentRegistryHandle' for 'cdAgentRegistry' in a pure
+-- @let@ context. Each call creates a NEW handle backed by a fresh temp
+-- directory (the @NOINLINE@ prevents GHC from CSE'ing multiple calls into
+-- one shared handle, which would cause the agent env to leak across
+-- tests). Used only in test CloneDeps literals.
+freshAgentRegistry :: AgentRegistryHandle
+freshAgentRegistry = unsafePerformIO (mkAgentRegistryHandle =<< createTempDir)
 {-# NOINLINE freshAgentRegistry #-}
+
+-- | Create a fresh temp directory for the agent registry (best-effort
+-- cleanup is not needed — the temp dir is under the system temp root and
+-- will be swept by the OS; each test gets its own dir so registries don't
+-- collide).
+createTempDir :: IO FilePath
+createTempDir = do
+  sysTmp <- getTemporaryDirectory
+  createTempDirectory sysTmp "seal-agentreg-test-"
 
 ----------------------------------------------------------------------------
 -- Spec
@@ -276,13 +285,13 @@ spec = describe "Seal.SourceControl.Clone" $ do
         BS.writeFile keyfilePath encryptedKeyfile
         vault <- makeFakeVaultRuntime [("K_PASS", passphrase)]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Map.empty
+        agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentRegistry = agentEnvRef
+              , cdAgentRegistry = agentRegH
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               , cdIsRemote = True
@@ -337,13 +346,13 @@ spec = describe "Seal.SourceControl.Clone" $ do
           , ("K2", "passphrase-2")
           ]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Map.empty
+        agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentRegistry = agentEnvRef
+              , cdAgentRegistry = agentRegH
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               , cdIsRemote = False
@@ -373,13 +382,13 @@ spec = describe "Seal.SourceControl.Clone" $ do
           [ ("K1", "passphrase-1")
           ]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Map.empty
+        agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentRegistry = agentEnvRef
+              , cdAgentRegistry = agentRegH
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               , cdIsRemote = False
@@ -803,7 +812,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Map.empty
+        agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             -- Point cdKeyfilesDir at a FILE (not a dir) so the
             -- writeKnownHostsTemp call (after sahAddKey succeeds) throws
@@ -815,7 +824,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentRegistry = agentEnvRef
+              , cdAgentRegistry = agentRegH
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilePath  -- a FILE, not a dir
               , cdIsRemote = False

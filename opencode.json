@@ -1,10 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": [".opencode/OPENCODE.md"],
+  "instructions": [
+    ".opencode/OPENCODE.md"
+  ],
   "command": {
     "setup": {
       "template": "{file:.opencode/commands/setup.md}",
-      "description": "Interactive project setup — detects your project, configures metaswarm, writes project-local files"
+      "description": "Interactive project setup \u2014 detects your project, configures metaswarm, writes project-local files"
     },
     "start-task": {
       "template": "{file:.opencode/commands/start-task.md}",
@@ -32,11 +34,11 @@
     },
     "handoff": {
       "template": "{file:.opencode/commands/handoff.md}",
-      "description": "Analyze the session and write a self-contained handoff document so a fresh agent can resume the work — outputs a single \"Read XXX.md and do YYY.\" sentence"
+      "description": "Analyze the session and write a self-contained handoff document so a fresh agent can resume the work \u2014 outputs a single \"Read XXX.md and do YYY.\" sentence"
     },
     "status": {
       "template": "{file:.opencode/commands/status.md}",
-      "description": "Show metaswarm diagnostic information — installation state, project setup, BEADS plugin status, external tools, coverage config"
+      "description": "Show metaswarm diagnostic information \u2014 installation state, project setup, BEADS plugin status, external tools, coverage config"
     },
     "handle-pr-comments": {
       "template": "{file:.opencode/commands/handle-pr-comments.md}",
@@ -49,195 +51,233 @@
   },
   "agent": {
     "issue-orchestrator": {
-      "description": "Main coordinator per issue — spawns sub-agents, runs 4-phase execution loop",
+      "description": "Main coordinator per issue \u2014 spawns sub-agents, runs 4-phase execution loop",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/issue-orchestrator.md}",
+      "prompt": "{file:.agents/agents/issue-orchestrator/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "allow" }
+        "task": {
+          "*": "allow"
+        }
       }
     },
     "architect-agent": {
       "description": "Reviews technical architecture and creates implementation plans",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/architect-agent.md}",
+      "prompt": "{file:.agents/agents/architect-agent/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "allow" }
+        "task": {
+          "*": "allow"
+        }
       }
     },
     "swarm-coordinator-agent": {
       "description": "Meta-orchestrator managing multiple issues/epics in parallel across worktrees",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/swarm-coordinator-agent.md}",
+      "prompt": "{file:.agents/agents/swarm-coordinator-agent/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "allow" }
+        "task": {
+          "*": "allow"
+        }
       }
     },
     "coder-agent": {
       "description": "TDD implementation of features and fixes",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/coder-agent.md}",
+      "prompt": "{file:.agents/agents/coder-agent/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "allow" }
+        "task": {
+          "*": "allow"
+        }
       }
     },
     "test-automator-agent": {
       "description": "Test writing and coverage analysis",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/test-automator-agent.md}",
+      "prompt": "{file:.agents/agents/test-automator-agent/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "allow" }
+        "task": {
+          "*": "allow"
+        }
       }
     },
     "researcher-agent": {
       "description": "Codebase exploration and prior art research",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/researcher-agent.md}",
+      "prompt": "{file:.agents/agents/researcher-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "allow",
         "webfetch": "allow",
         "websearch": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "code-review-agent": {
       "description": "Internal code review before PR creation",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/code-review-agent.md}",
+      "prompt": "{file:.agents/agents/code-review-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "cto-agent": {
       "description": "Plan review and architectural guidance",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/cto-agent.md}",
+      "prompt": "{file:.agents/agents/cto-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "designer-agent": {
       "description": "UX, API design, and developer experience review",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/designer-agent.md}",
+      "prompt": "{file:.agents/agents/designer-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "product-manager-agent": {
       "description": "Use case validation and user benefit review",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/product-manager-agent.md}",
+      "prompt": "{file:.agents/agents/product-manager-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "security-auditor-agent": {
       "description": "Security vulnerability detection and OWASP compliance",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/security-auditor-agent.md}",
+      "prompt": "{file:.agents/agents/security-auditor-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "security-design-agent": {
       "description": "Security review of designs before implementation",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/security-design-agent.md}",
+      "prompt": "{file:.agents/agents/security-design-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "customer-service-agent": {
       "description": "User issue investigation and support (read-only)",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/customer-service-agent.md}",
+      "prompt": "{file:.agents/agents/customer-service-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "sre-agent": {
       "description": "Production system monitoring and incident response (read-only)",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/sre-agent.md}",
+      "prompt": "{file:.agents/agents/sre-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "deny",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "metrics-agent": {
       "description": "Collect, aggregate, and report on agent swarm performance",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/metrics-agent.md}",
+      "prompt": "{file:.agents/agents/metrics-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "knowledge-curator-agent": {
       "description": "Knowledge extraction and curation",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/knowledge-curator-agent.md}",
+      "prompt": "{file:.agents/agents/knowledge-curator-agent/agent.md}",
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "pr-shepherd-agent": {
       "description": "PR lifecycle management through to merge",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/pr-shepherd-agent.md}",
+      "prompt": "{file:.agents/agents/pr-shepherd-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "release-engineer-agent": {
       "description": "Safe delivery of approved code from merge through production verification",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/release-engineer-agent.md}",
+      "prompt": "{file:.agents/agents/release-engineer-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     },
     "slack-coordinator-agent": {
       "description": "Human-agent communication bridge via Slack",
       "mode": "subagent",
-      "prompt": "{file:.opencode/agents/slack-coordinator-agent.md}",
+      "prompt": "{file:.agents/agents/slack-coordinator-agent/agent.md}",
       "permission": {
         "edit": "deny",
         "bash": "allow",
-        "task": { "*": "deny" }
+        "task": {
+          "*": "deny"
+        }
       }
     }
   }

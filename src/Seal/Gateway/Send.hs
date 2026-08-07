@@ -27,8 +27,7 @@ import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Map.Strict qualified as Map
+import Data.IORef (readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -38,7 +37,7 @@ import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 
-import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
+import Seal.Agent.Def.Backend (AgentDefBackend, adbRead, workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
@@ -53,7 +52,7 @@ import Seal.Config.File
   , WebConfig (..), rcWeb
   , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -113,6 +112,7 @@ import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
@@ -437,7 +437,6 @@ plainTurn deps meta t = do
             let wsroot = case eWd of
                   Right wd -> WorkspaceRoot wd
                   Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-                agentDefBackend = bAgentDefs (sdBackends deps)
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
             -- Build the workdir-aware skill backend: repo-local skills
             -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
@@ -446,8 +445,13 @@ plainTurn deps meta t = do
             workdirSkills <- case eWd of
               Right wd -> Skill.workdirSkillBackend wd
               Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+            workdirAgentDefs <- case eWd of
+              Right wd -> workdirAgentDefBackend wd
+              Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
             let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
-            let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+                sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
+                agentDefBackend = bAgentDefs sessionBackends
+                autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
                 injectCatalog = either (const True) resolvedAvailableSkills eCfg
                 parallel = either (const True) resolvedParallelToolGuidance eCfg
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
@@ -457,9 +461,9 @@ plainTurn deps meta t = do
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
-                  wsroot operatorCeiling "web"
+                  wsroot operatorCeiling "web" sessionBackends
                 isaReg = buildWebRegistry
-                  (sdVault deps) cloneDeps (sdBackends deps) wsroot sid operatorCeiling
+                  (sdVault deps) cloneDeps sessionBackends wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
@@ -685,11 +689,15 @@ plainTurnWithCaps deps meta caps t = do
         let wsRoot = case eWd of
               Right wd -> WorkspaceRoot wd
               Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-            agentDefBackend = bAgentDefs (sdBackends deps)
         workdirSkills <- case eWd of
           Right wd -> Skill.workdirSkillBackend wd
           Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+        workdirAgentDefs <- case eWd of
+          Right wd -> workdirAgentDefBackend wd
+          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
         let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
+            sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
+            agentDefBackend = bAgentDefs sessionBackends
             autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
             injectCatalog = either (const True) resolvedAvailableSkills eCfg
             parallel = either (const True) resolvedParallelToolGuidance eCfg
@@ -700,9 +708,9 @@ plainTurnWithCaps deps meta caps t = do
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
-              wsRoot operatorCeiling "web"
+              wsRoot operatorCeiling "web" sessionBackends
             isaReg = buildWebRegistry
-              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
@@ -747,12 +755,16 @@ webCallDispatcher deps callOpName val = do
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     cloneDeps <- mkCloneDepsFromSend deps
+    workdirAgentDefs <- case eWd of
+          Right wd -> workdirAgentDefBackend wd
+          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
     let onDemand = either (const False) onDemandSchemas eCfg
+        sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
         startWiring = webStartWiring
-          deps paths sid caps untrustedIO appEnv eCfg
-          wsRoot operatorCeiling "web"
+              deps paths sid caps untrustedIO appEnv eCfg
+              wsRoot operatorCeiling "web" sessionBackends
         isaReg = buildWebRegistry
-              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
@@ -810,10 +822,10 @@ unwrapOptMaybe = maybe Nothing
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> AgentStartWiring
-webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel =
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> Backends -> AgentStartWiring
+webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
   AgentStartWiring
-    { aswDefBackend = bAgentDefs (sdBackends deps)
+    { aswDefBackend = bAgentDefs sessionBackends
     , aswRuntime = bRuntime (sdBackends deps)
     , aswConfig = do
         eCfg' <- loadRuntimeConfig (prConfigPath (sdProvider deps))
@@ -1004,12 +1016,12 @@ broadcastAskResolved mBroker sid qid resolution =
 -- compile-time-embedded.
 mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
 mkCloneDepsFromSend deps = do
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (sdPaths deps))
   pure Clone.CloneDeps
     { Clone.cdVault = sdVault deps
     , Clone.cdRepoReg = sdRepoReg deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdAgentRegistry = agentRegH
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
     , Clone.cdIsRemote = sdIsRemote deps

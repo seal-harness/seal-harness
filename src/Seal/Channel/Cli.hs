@@ -20,8 +20,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef)
-import Data.Map.Strict qualified as Map
+import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import Data.Text (Text)
@@ -54,7 +53,7 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
                           resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -112,6 +111,7 @@ import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
@@ -295,7 +295,7 @@ runCliTui
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
@@ -303,7 +303,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         { Clone.cdVault = rt
         , Clone.cdRepoReg = repoReg
         , Clone.cdSshAgent = mkRealSshAgentHandle
-        , Clone.cdAgentRegistry = agentEnvRef
+        , Clone.cdAgentRegistry = agentRegH
         , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
         , Clone.cdKeyfilesDir = repoKeysDir paths
         , Clone.cdIsRemote = isRemote
@@ -459,7 +459,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       -- Build the AGENT_START wiring for a given parent sid. The worker
       -- builder is fixed across turns (it closes over the per-turn
       -- helpers above); only the parent sid varies.
-      cliStartWiring sid =
+      cliStartWiring sid sessionBackends =
         let delegateDeps = DelegationWorkerDeps
               { dwdPaths = paths
               , dwdParentSid = sid
@@ -480,7 +480,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               eCfg' <- loadRuntimeConfig (prConfigPath pr)
               pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
         in AgentStartWiring
-          { aswDefBackend = agentDefBackend
+          { aswDefBackend = bAgentDefs sessionBackends
           , aswRuntime = agentRuntime
           , aswConfig = delegationCfg
           , aswPauseFlag = bSpawnPauseFlag backends
@@ -496,7 +496,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       -- describe/list ops close over the registry they belong to (let-knot).
       -- `tHandle` is NOT closed over here — the dispatcher threads it at call
       -- time.
-      cliIsaReg sid startWiring caps' wsRoot =
+      cliIsaReg sid startWiring caps' wsRoot sessionBackends =
         let reg = ISA.mkRegistry
               (baseOps reg ++ if onDemand
                                 then [opcodeDescribeOp reg, opcodeListOp reg]
@@ -513,10 +513,10 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , skillLoadOp skillBackend
               , skillListOp skillBackend
               , skillDeleteOp skillBackend
-              , agentDefWriteOp agentDefBackend sid
-              , agentDefReadOp agentDefBackend
-              , agentDefListOp agentDefBackend
-              , agentDefDeleteOp agentDefBackend
+              , agentDefWriteOp (bAgentDefs sessionBackends) sid
+              , agentDefReadOp (bAgentDefs sessionBackends)
+              , agentDefListOp (bAgentDefs sessionBackends)
+              , agentDefDeleteOp (bAgentDefs sessionBackends)
               , agentInstancesOp agentRuntime
               , agentStartOp startWiring
               , agentStatusOp agentRuntime
@@ -546,9 +546,13 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       -- workdir-aware backend (repo-local skills discovered by SETUP_REPO
       -- ⊕ user ⊕ builtin, workdir-wins).
       resolveSystem meta mWd = do
+        workdirAgentDefs <- case mWd of
+          Just wd -> Def.workdirAgentDefBackend wd
+          Nothing -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+        let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
         base <- case smAgent meta of
           Nothing  -> pure Nothing
-          Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+          Just aid -> maybe Nothing adSystem <$> Def.adbRead sessionAgentDefs aid
         cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
         workdirSkills <- case mWd of
           Just wd -> Skill.workdirSkillBackend wd
@@ -575,12 +579,17 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
           eWd <- ensureSessionWorkdir paths sid
+          workdirAgentDefs <- case eWd of
+            Right wd -> Def.workdirAgentDefBackend wd
+            Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
           let wsRoot = case eWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
               mWd = either (const Nothing) Just eWd
-              startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps wsRoot
+              sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
+              sessionBackends = backends { bAgentDefs = sessionAgentDefs }
+              startWiring = cliStartWiring sid sessionBackends
+              isaReg = cliIsaReg sid startWiring caps wsRoot sessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
@@ -616,13 +625,17 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
                 }
-              bgStartWiring = cliStartWiring bgSid
           eBgWd <- ensureSessionWorkdir paths bgSid
+          bgWorkdirAgentDefs <- case eBgWd of
+                Right wd -> Def.workdirAgentDefBackend wd
+                Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
           let bgWsRoot = case eBgWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
               bgMwd = either (const Nothing) Just eBgWd
-              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot
+              bgSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend bgWorkdirAgentDefs agentDefBackend }
+              bgStartWiring = cliStartWiring bgSid bgSessionBackends
+              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot bgSessionBackends
           tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
           eprov <- resolveSessionProvider pr meta
           case eprov of
@@ -651,11 +664,15 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
           eWd <- ensureSessionWorkdir paths sid
+          callWorkdirAgentDefs <- case eWd of
+                Right wd -> Def.workdirAgentDefBackend wd
+                Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
           let wsRoot = case eWd of
                 Right wd -> WorkspaceRoot wd
                 Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-              startWiring = cliStartWiring sid
-              isaReg = cliIsaReg sid startWiring caps wsRoot
+              callSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend callWorkdirAgentDefs agentDefBackend }
+              startWiring = cliStartWiring sid callSessionBackends
+              isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           callUio <- mkSessionUio sid
           res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)

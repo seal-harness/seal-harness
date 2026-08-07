@@ -2,7 +2,6 @@
 module Seal.ISA.Ops.RepoSpec (spec) where
 
 import Data.IORef (newIORef)
-import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, withCurrentDirectory )
@@ -14,6 +13,7 @@ import Test.Hspec
 import Seal.ISA.Ops.Repo
   ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, validateRepoUrl )
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
@@ -32,13 +32,13 @@ mkTestCloneDeps keyfilesDir = do
   createDirectoryIfMissing True keyfilesDir
   vault <- makeFakeVaultRuntime []
   callsRef <- newIORef []
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle keyfilesDir
   let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
     { cdVault = vault
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
-    , cdAgentRegistry = agentEnvRef
+    , cdAgentRegistry = agentRegH
     , cdPinnedKnownHosts = pinnedGithubKnownHosts
     , cdKeyfilesDir = keyfilesDir
     , cdIsRemote = False
