@@ -423,13 +423,23 @@ resolveCloneTarget deps repo =
                     (knownHostsPath, knownHostsCleanup) <-
                       writeKnownHostsTemp (cdKeyfilesDir deps)
                                            (cdPinnedKnownHosts deps)
+                    -- NOTE: IdentitiesOnly is intentionally omitted from
+                    -- GIT_SSH_COMMAND. On macOS, the bundled /usr/bin/ssh
+                    -- suppresses agent-offered keys when
+                    -- IdentitiesOnly=yes is set and no -i flag is passed
+                    -- — it only tries identity files, not the agent.
+                    -- Without this flag, ssh tries agent keys first (which
+                    -- is what we want — the per-op agent holds exactly one
+                    -- deploy key). The per-op agent scoping invariant
+                    -- (exactly one key live at forwarding time) replaces
+                    -- what IdentitiesOnly would enforce.
                     let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
-                        sshCmd = T.pack $
-                          "ssh"
-                          <> " -o IdentitiesOnly=yes"
+                        sshCmd = T.pack
+                          ( "ssh"
                           <> " -o StrictHostKeyChecking=yes"
                           <> " -o BatchMode=yes"
                           <> " -o UserKnownHostsFile=" <> knownHostsPath
+                          )
                         envExtras =
                           [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)
                           , ("SSH_AGENT_PID", saeAgentPid agentEnv)

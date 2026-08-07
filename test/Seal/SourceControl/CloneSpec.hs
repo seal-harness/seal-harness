@@ -432,7 +432,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
             Nothing -> expectationFailure "no GIT_SSH_COMMAND"
             Just sshCmd -> do
               "StrictHostKeyChecking=yes" `T.isInfixOf` T.pack sshCmd `shouldBe` True
-              "IdentitiesOnly=yes" `T.isInfixOf` T.pack sshCmd `shouldBe` True
+              "IdentitiesOnly=yes" `T.isInfixOf` T.pack sshCmd `shouldBe` False
               "BatchMode=yes" `T.isInfixOf` T.pack sshCmd `shouldBe` True
               -- The passphrase is NOT in the GIT_SSH_COMMAND
               passphrase `BS.isInfixOf` TE.encodeUtf8 (T.pack sshCmd) `shouldBe` False
