@@ -22,6 +22,9 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.IORef
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.List (isPrefixOf, tails)
 import Data.Text (Text)
@@ -51,9 +54,9 @@ import Seal.Tools.Ssh.Agent
 -- Each call creates a NEW IORef (the @NOINLINE@ prevents GHC from CSE'ing
 -- multiple calls into one shared IORef, which would cause the agent env
 -- to leak across tests). Used only in test CloneDeps literals.
-freshAgentEnvRef :: IORef (Maybe SshAgentEnv)
-freshAgentEnvRef = unsafePerformIO (newIORef Nothing)
-{-# NOINLINE freshAgentEnvRef #-}
+freshAgentRegistry :: IORef (Map Text SshAgentEnv)
+freshAgentRegistry = unsafePerformIO (newIORef Map.empty)
+{-# NOINLINE freshAgentRegistry #-}
 
 ----------------------------------------------------------------------------
 -- Spec
@@ -165,9 +168,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         result <- resolveCloneTarget deps repo
         case result of
@@ -201,9 +205,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         result <- resolveCloneTarget deps repo
         case result of
@@ -234,9 +239,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         result <- resolveCloneTarget deps repo
         case result of
@@ -257,6 +263,56 @@ spec = describe "Seal.SourceControl.Clone" $ do
                 -- The passphrase is NOT in the known_hosts file
                 passphrase `BS.isInfixOf` content `shouldBe` False
 
+    it "deploy key (remote): no local known_hosts file, ceKnownHostsContent set, no SSH_AUTH_SOCK in extras" $
+      withSystemTempDirectory "seal-home" $ \homeDir -> do
+        let keyfilesDir = homeDir </> ".seal/state/repos/keys"
+        createDirectoryIfMissing True keyfilesDir
+        let keyfilePath = keyfilesDir </> "repo-a"
+            encryptedKeyfile :: ByteString
+            encryptedKeyfile = "-----BEGIN OPENSSH PRIVATE KEY-----\nciphertext\n-----END OPENSSH PRIVATE KEY-----"
+            passphrase :: ByteString
+            passphrase = "SUPERSECRET-PASSPHRASE-BYTES"
+            repo = deployRepo "git@github.com:o/r.git" "K_PASS"
+        BS.writeFile keyfilePath encryptedKeyfile
+        vault <- makeFakeVaultRuntime [("K_PASS", passphrase)]
+        callsRef <- newIORef []
+        agentEnvRef <- newIORef Map.empty
+        let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+            deps = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = fakeRepoRegistryHandle
+              , cdSshAgent = agent
+              , cdAgentRegistry = agentEnvRef
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = True
+              }
+        result <- resolveCloneTarget deps repo
+        case result of
+          Left e -> expectationFailure ("expected Right, got Left: " <> show e)
+          Right target -> withCloneTarget target $ \env -> do
+            -- No ceKnownHostsContent (simple approach: remote uses its
+            -- own known_hosts).
+            ceKnownHostsContent env `shouldBe` Nothing
+            -- SSH_AUTH_SOCK + SSH_AGENT_PID ARE in the env extras (for
+            -- the LOCAL ssh -A process; the remote arm extracts them for
+            -- local env + strips from the remote env prefix).
+            lookup "SSH_AUTH_SOCK" (ceEnvExtras env) `shouldSatisfy` isJust
+            lookup "SSH_AGENT_PID" (ceEnvExtras env) `shouldSatisfy` isJust
+            -- No GIT_SSH_COMMAND (the remote git clone uses the default
+            -- ssh + the forwarded agent).
+            lookup "GIT_SSH_COMMAND" (ceEnvExtras env) `shouldBe` Nothing
+            -- GIT_TERMINAL_PROMPT is set.
+            lookup "GIT_TERMINAL_PROMPT" (ceEnvExtras env) `shouldBe` Just "0"
+            -- No local known_hosts temp file was written.
+            keyfilesContents <- listDirectory keyfilesDir
+            let knownHostsTemps = filter ("seal-known-hosts-" `isPrefixOf`) keyfilesContents
+            knownHostsTemps `shouldBe` []
+            -- The passphrase is NOT on disk.
+            files <- collectAllFiles keyfilesDir
+            let fileContents = map snd files
+            any (passphrase `BS.isInfixOf`) fileContents `shouldBe` False
+
   --------------------------------------------------------------------------
   -- W2 security test 2: per-op scoping
   -- (two sequential ops → exactly one sahAddKey + sahDeleteAll + sahKill
@@ -268,7 +324,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         rid2 = case mkRepoId "repo-b" of Right i -> i; Left _ -> error "bad id"
         repo1 = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K1") Nothing Nothing
         repo2 = SourceRepo rid2 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K2") Nothing Nothing
-    it "two sequential ops → one sahStart (shared), then sahAddKey + sahDeleteAll per op" $
+    it "two distinct repos → one sahStart + one sahAddKey per repo, no sahDeleteAll" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
         let keyfilesDir = homeDir </> ".seal/state/repos/keys"
         createDirectoryIfMissing True keyfilesDir
@@ -281,65 +337,64 @@ spec = describe "Seal.SourceControl.Clone" $ do
           , ("K2", "passphrase-2")
           ]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Nothing
+        agentEnvRef <- newIORef Map.empty
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = agentEnvRef
+              , cdAgentRegistry = agentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
-        -- Op 1
+        -- Op 1 (repo1: start + addkey)
         Right t1 <- resolveCloneTarget deps repo1
         withCloneTarget t1 $ \_env -> pure ()
-        -- Op 2 (reuses the shared agent — no second Start)
+        -- Op 2 (repo2: start + addkey — separate agent)
         Right t2 <- resolveCloneTarget deps repo2
         withCloneTarget t2 $ \_env -> pure ()
-        -- Shared agent: Start once, then per-op AddKey + DeleteAll (no Kill).
+        -- One-agent-per-repo: Start + AddKey per repo, no DeleteAll.
         calls <- readIORef callsRef
         calls `shouldBe`
           [ SahStart
           , SahAddKey kf1 "passphrase-1"
-          , SahDeleteAll
+          , SahStart
           , SahAddKey kf2 "passphrase-2"
-          , SahDeleteAll
           ]
 
-    it "never two keys live at once (delete+kill before next start)" $
+    it "same repo reused → no second sahStart or sahAddKey (cached agent)" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
         let keyfilesDir = homeDir </> ".seal/state/repos/keys"
         createDirectoryIfMissing True keyfilesDir
         let kf1 = keyfilesDir </> "repo-a"
-            kf2 = keyfilesDir </> "repo-b"
         BS.writeFile kf1 "ciphertext-1"
-        BS.writeFile kf2 "ciphertext-2"
         vault <- makeFakeVaultRuntime
           [ ("K1", "passphrase-1")
-          , ("K2", "passphrase-2")
           ]
         callsRef <- newIORef []
+        agentEnvRef <- newIORef Map.empty
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = agentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
-        -- Op 1 (shared agent: start → add → run → delete)
+        -- Op 1 (start + addkey)
         Right t1 <- resolveCloneTarget deps repo1
         withCloneTarget t1 $ \_env -> pure ()
-        -- Op 2 (reuses agent: add → run → delete; no re-start)
-        Right t2 <- resolveCloneTarget deps repo2
+        -- Op 2 (same repo: cached agent — no start, no addkey)
+        Right t2 <- resolveCloneTarget deps repo1
         withCloneTarget t2 $ \_env -> pure ()
-        -- The shared-agent invariant: each SahDeleteAll comes BEFORE the
-        -- next SahAddKey — so there's never a window where two keys are live.
         calls <- readIORef callsRef
-        let deleteBeforeNextAdd = checkDeleteBeforeNextAdd calls
-        deleteBeforeNextAdd `shouldBe` True
+        calls `shouldBe`
+          [ SahStart
+          , SahAddKey kf1 "passphrase-1"
+          ]
 
   --------------------------------------------------------------------------
   -- deploy-key env (SSH_AUTH_SOCK + GIT_SSH_COMMAND, no key bytes)
@@ -363,9 +418,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
@@ -409,9 +465,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
@@ -448,9 +505,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
@@ -478,9 +536,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         result <- resolveCloneTarget deps repo
         case result of
@@ -498,9 +557,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         result <- resolveCloneTarget deps repo
         case result of
@@ -537,9 +597,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         knownHostsRef <- newIORef ""
@@ -568,9 +629,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         knownHostsRef <- newIORef ""
@@ -585,10 +647,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
         unless (null knownHostsPath) $ do
           exists <- doesFileExist knownHostsPath
           exists `shouldBe` False
-        -- The agent was killed + delete-all'd even on failure
+        -- In the one-agent-per-repo model, sahDeleteAll is NOT called
+        -- per-op (the key persists for the repo's lifetime). No SahKill
+        -- per-op either (kill is harness-shutdown-only).
         calls <- readIORef callsRef
-        SahDeleteAll `elem` calls `shouldBe` True
-        -- No SahKill per-op (shared agent; kill is shutdown-only).
+        SahDeleteAll `elem` calls `shouldBe` False
         SahKill `elem` calls `shouldBe` False
 
   --------------------------------------------------------------------------
@@ -605,9 +668,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         -- Compile-time check: the record compiles
         cdKeyfilesDir deps `shouldBe` keyfilesDir
@@ -680,9 +744,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
@@ -709,9 +774,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
         Right target <- resolveCloneTarget deps repo
         withCloneTarget target $ \env -> do
@@ -737,7 +803,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
         callsRef <- newIORef []
-        agentEnvRef <- newIORef Nothing
+        agentEnvRef <- newIORef Map.empty
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             -- Point cdKeyfilesDir at a FILE (not a dir) so the
             -- writeKnownHostsTemp call (after sahAddKey succeeds) throws
@@ -749,9 +815,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
               { cdVault = vault
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
-              , cdAgentEnvRef = agentEnvRef
+              , cdAgentRegistry = agentEnvRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilePath  -- a FILE, not a dir
+              , cdIsRemote = False
               }
         -- resolveCloneTarget throws (the bracket catches), so we use try.
         (_ :: Either SomeException (Either CloneError CloneTarget)) <-
@@ -761,9 +828,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
         SahStart `elem` calls `shouldBe` True
         -- The keyfile path passed to sahAddKey is cdKeyfilesDir </> "repo-a".
         SahAddKey (keyfilePath </> "repo-a") "passphrase" `elem` calls `shouldBe` True
-        -- The onException ran sahDeleteAll despite the throw (shared agent:
-        -- no sahKill per-op; the agent persists, but the key is removed).
-        SahDeleteAll `elem` calls `shouldBe` True
+        -- In the one-agent-per-repo model, sahDeleteAll is NOT called
+        -- on a post-add throw (the agent + key persist in the registry;
+        -- a retry will find the cached agent). No sahKill per-op.
+        SahDeleteAll `elem` calls `shouldBe` False
         SahKill `elem` calls `shouldBe` False
 
 ----------------------------------------------------------------------------
@@ -798,15 +866,3 @@ extractKnownHostsPath sshCmd =
           rest = drop (length needle) match
       in takeWhile (/= ' ') rest
 
--- | Check that each SahDeleteAll in the call list comes before the next
--- SahAddKey. This ensures there's never a window where two keys are live
--- at once in the shared agent.
-checkDeleteBeforeNextAdd :: [FakeAgentCall] -> Bool
-checkDeleteBeforeNextAdd = go Nothing
-  where
-    go _ [] = True
-    go _ (SahStart : rest) = go Nothing rest
-    go (Just _) (SahAddKey _ _ : _rest) = False  -- key already live → bad
-    go Nothing (SahAddKey k p : rest) = go (Just (k, p)) rest
-    go _ (SahDeleteAll : rest) = go Nothing rest  -- delete clears the key
-    go _ (SahKill : rest) = go Nothing rest

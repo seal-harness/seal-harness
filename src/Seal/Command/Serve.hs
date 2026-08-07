@@ -10,6 +10,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (filterM)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -42,7 +43,8 @@ import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
+import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
@@ -158,9 +160,12 @@ runServeMain autonomy logger = do
   -- can be shared with the web send handler (SendDeps). The cursor store,
   -- reply registry, and write locks are created inside newChannelDeps.
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
+      isRemoteExec = case untrustedExecConfigFromSecurity secCfg of
+        Just uec -> uecMode uec == UemRemote
+        Nothing  -> False
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg tabsH logger
+        reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -225,6 +230,7 @@ runServeMain autonomy logger = do
         , sdLocks       = cdLocks chanDeps
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
+        , sdIsRemote    = isRemoteExec
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
@@ -292,14 +298,15 @@ runServeMain autonomy logger = do
 mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> RepoTestSeam
 mkRepoTestSeam rt repoRegH paths = RepoTestSeam
   { rtsLsRemote  = \repo -> do
-      agentEnvRef <- newIORef Nothing
+      agentEnvRef <- newIORef Map.empty
       let deps = Clone.CloneDeps
             { Clone.cdVault = rt
             , Clone.cdRepoReg = repoRegH
-            , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-            , Clone.cdAgentEnvRef = agentEnvRef
+            , Clone.cdSshAgent = mkRealSshAgentHandle
+            , Clone.cdAgentRegistry = agentEnvRef
             , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
             , Clone.cdKeyfilesDir = repoKeysDir paths
+            , Clone.cdIsRemote = False
             }
       lsRemoteRepo deps repo
   , rtsVaultList = do

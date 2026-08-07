@@ -21,7 +21,8 @@ import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -294,14 +295,18 @@ runCliTui
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
-  agentEnvRef <- newIORef Nothing
-  let cloneDeps = Clone.CloneDeps
+  agentEnvRef <- newIORef Map.empty
+  eCfg <- loadRuntimeConfig (prConfigPath pr)
+  eSecCfg <- loadSecurityConfig (securityFilePath paths)
+  let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
+      cloneDeps = Clone.CloneDeps
         { Clone.cdVault = rt
         , Clone.cdRepoReg = repoReg
-        , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-        , Clone.cdAgentEnvRef = agentEnvRef
+        , Clone.cdSshAgent = mkRealSshAgentHandle
+        , Clone.cdAgentRegistry = agentEnvRef
         , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
         , Clone.cdKeyfilesDir = repoKeysDir paths
+        , Clone.cdIsRemote = isRemote
         }
       histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
@@ -325,8 +330,6 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
   appEnv <- mkEnv logger defaultConfig
-  eCfg <- loadRuntimeConfig (prConfigPath pr)
-  eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
       -- Per-session untrusted IO: creates the workdir (local or remote)
       -- and constructs the handle. Handles both mode=local and

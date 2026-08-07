@@ -28,6 +28,7 @@ import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -196,6 +197,10 @@ data SendDeps = SendDeps
   , sdLogger :: SealLogger
     -- ^ The shared logger for structured katip logging. Built once at
     -- startup via 'withSealLogger'.
+  , sdIsRemote :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode from the security config). Threaded into 'CloneDeps' so the
+    -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -995,18 +1000,19 @@ broadcastAskResolved mBroker sid qid resolution =
 -- | Build 'Clone.CloneDeps' from a 'SendDeps' (the in-scope vault runtime +
 -- repo registry handle + paths). Used by the 'buildWebRegistry' +
 -- 'buildChildRegistry' call sites. The ssh-agent is real (production:
--- 'mkRealSshAgentHandle (Just 300)'); the pinned host keys are
+-- 'mkRealSshAgentHandle'); the pinned host keys are
 -- compile-time-embedded.
 mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
 mkCloneDepsFromSend deps = do
-  agentEnvRef <- newIORef Nothing
+  agentEnvRef <- newIORef Map.empty
   pure Clone.CloneDeps
     { Clone.cdVault = sdVault deps
     , Clone.cdRepoReg = sdRepoReg deps
-    , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-    , Clone.cdAgentEnvRef = agentEnvRef
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentEnvRef
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
+    , Clone.cdIsRemote = sdIsRemote deps
     }
 
 -- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the

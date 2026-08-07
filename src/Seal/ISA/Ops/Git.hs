@@ -55,7 +55,7 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedErr, UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecEnv )
+  ( UntrustedErr, UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecGitEnv )
 import Seal.Tools.Exec.Types (mkRemotePath)
 import Seal.Types.App (App)
 
@@ -231,7 +231,7 @@ runGitCommand uio env gitVerb workdir mRefspec = do
       gitConfigArgs = T.unwords (ceGitConfigArgs env)
       refspecArg = maybe "" (\r -> " " <> shellQ r) mRefspec
       cmd = T.strip ("git " <> gitConfigArgs <> " " <> gitVerb <> refspecArg)
-  uioShellExecEnv uio (ceEnvExtras env) (shellCmd cmd) mCwdPath
+  uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cmd) mCwdPath
 
 ----------------------------------------------------------------------------
 -- Helpers

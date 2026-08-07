@@ -69,7 +69,7 @@ import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (.
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecEnv )
+  ( UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecGitEnv )
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Types.App (App)
 
@@ -211,7 +211,8 @@ cloneRepoIO deps uio url = do
         Right rp -> Just rp
         Left _   -> Nothing
       checkCmd = "if [ -d " <> shellQ repoName <> "/.git ]; then git -C "
-                 <> shellQ repoName <> " config --get remote.origin.url; else echo __NONE__; fi"
+                 <> shellQ repoName <> " config --get remote.origin.url; else rm -rf "
+                 <> shellQ repoName <> "; echo __NONE__; fi"
   checkRes <- uioShellExec uio (shellCmd checkCmd) mCwdPath
   case checkRes of
     Left err -> pure (CloneFailed ("idempotency check failed: " <> renderUntrustedErr err))
@@ -246,11 +247,10 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
   case eTarget of
     Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
     Right target -> withCloneTarget target $ \env -> do
-      -- Build the git clone command with the resolved env + git config args.
       let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
           cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
                      <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
-      cloneRes <- uioShellExecEnv uio (ceEnvExtras env) (shellCmd cloneCmd) mCwdPath
+      cloneRes <- uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
       case cloneRes of
         Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
         Right _out -> verifyClone uio repoName _out mCwdPath

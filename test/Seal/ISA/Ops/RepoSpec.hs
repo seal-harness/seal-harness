@@ -2,6 +2,7 @@
 module Seal.ISA.Ops.RepoSpec (spec) where
 
 import Data.IORef (newIORef)
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, withCurrentDirectory )
@@ -31,15 +32,16 @@ mkTestCloneDeps keyfilesDir = do
   createDirectoryIfMissing True keyfilesDir
   vault <- makeFakeVaultRuntime []
   callsRef <- newIORef []
-  agentEnvRef <- newIORef Nothing
+  agentEnvRef <- newIORef Map.empty
   let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
     { cdVault = vault
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
-    , cdAgentEnvRef = agentEnvRef
+    , cdAgentRegistry = agentEnvRef
     , cdPinnedKnownHosts = pinnedGithubKnownHosts
     , cdKeyfilesDir = keyfilesDir
+    , cdIsRemote = False
     }
 
 spec :: Spec

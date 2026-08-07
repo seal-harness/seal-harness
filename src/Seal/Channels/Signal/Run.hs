@@ -15,7 +15,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -42,7 +42,7 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
@@ -306,7 +306,7 @@ runSignalMain autonomy logger = do
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH logger
+        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr

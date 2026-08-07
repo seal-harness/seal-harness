@@ -17,6 +17,8 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -50,9 +52,9 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 
 -- | Create a fresh 'IORef' for 'cdAgentEnvRef' in a pure @let@ context.
-freshAgentEnvRef :: IORef (Maybe SshAgentEnv)
-freshAgentEnvRef = unsafePerformIO (newIORef Nothing)
-{-# NOINLINE freshAgentEnvRef #-}
+freshAgentRegistry :: IORef (Map Text SshAgentEnv)
+freshAgentRegistry = unsafePerformIO (newIORef Map.empty)
+{-# NOINLINE freshAgentRegistry #-}
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Git" $ do
@@ -96,9 +98,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just originUrl) (Right "fetch output")
             op = gitFetchOp deps (WorkspaceRoot dir) Full
@@ -111,22 +114,24 @@ spec = describe "Seal.ISA.Ops.Git" $ do
           OpResult parts True recorded -> do
             expectationFailure ("expected success, got error: " <> show parts <> " recorded=" <> show recorded)
 
-    it "per-op scoping: exactly one sahAddKey + sahDeleteAll (shared agent, no per-op kill)" $ do
+    it "per-repo scoping: one sahStart + sahAddKey, no sahDeleteAll (one-agent-per-repo)" $ do
       withSystemTempDirectory "seal-git" $ \dir -> do
         let keyfilesDir = dir </> "keys"
         createDirectoryIfMissing True keyfilesDir
         BS.writeFile (keyfilesDir </> "myrepo") "ciphertext"
         vault <- makeFakeVaultRuntime [("K_PASS", "passphrase")]
         callsRef <- newIORef []
+        agentRegRef <- newIORef Map.empty
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             repoReg = fakeRepoReg [deployRepo]
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = agentRegRef
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just originUrl) (Right "fetch output")
             op = gitFetchOp deps (WorkspaceRoot dir) Full
@@ -135,7 +140,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
         _ <- runApp appEnv (uoRun op uio input)
         calls <- readIORef callsRef
         SahAddKey (keyfilesDir </> "myrepo") "passphrase" `elem` calls `shouldBe` True
-        SahDeleteAll `elem` calls `shouldBe` True
+        SahDeleteAll `elem` calls `shouldBe` False
         SahKill `elem` calls `shouldBe` False
 
   --------------------------------------------------------------------------
@@ -155,9 +160,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just "git@github.com:other/repo.git") (Right "")
             op = gitFetchOp deps (WorkspaceRoot dir) Full
@@ -189,9 +195,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just originUrl) (Right "")
             op = gitFetchOp deps (WorkspaceRoot dir) Full
@@ -223,9 +230,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just originUrl) (Right "push output")
             op = gitPushOp deps (WorkspaceRoot dir) Full
@@ -255,9 +263,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             -- A uio that fails the git push (returns Left UeExec)
             uio = fakeUioErr (Just originUrl)
@@ -288,9 +297,10 @@ spec = describe "Seal.ISA.Ops.Git" $ do
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentEnvRef = freshAgentEnvRef
+              , cdAgentRegistry = freshAgentRegistry
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
               }
             uio = fakeUio (Just patOriginUrl) (Right "pull output")
             op = gitPullOp deps (WorkspaceRoot dir) Full
@@ -339,6 +349,7 @@ fakeUio mOrigin gitResult = stubUio
       Just url -> Right url
       Nothing  -> Right "")
   , uioShellExecEnv = \_env _cmd _mCwd -> pure gitResult
+  , uioShellExecGitEnv = \_env _kh _cmd _mCwd -> pure gitResult
   }
 
 -- | A fake 'UntrustedIO' where the git fetch/pull/push fails (returns
@@ -349,6 +360,7 @@ fakeUioErr mOrigin = stubUio
       Just url -> Right url
       Nothing  -> Right "")
   , uioShellExecEnv = \_env _cmd _mCwd -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecGitEnv = \_env _kh _cmd _mCwd -> pure (Left (UeExec ExecNotImplemented))
   }
 
 -- | A stub 'UntrustedIO' that fail-closes on every method (the fake
@@ -364,6 +376,7 @@ stubUio = UntrustedIO
   , uioProcessKill = \_ -> pure (Left (UeExec ExecNotImplemented))
   , uioSearchFiles = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioBinExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
   }
 

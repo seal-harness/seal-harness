@@ -2888,6 +2888,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLocks       = error "sdLocks: unused on the 404 path"
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             , sdLogger      = error "sdLogger: unused on the 404 path"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2980,6 +2981,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLocks       = testLocks
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3104,6 +3106,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3213,6 +3216,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

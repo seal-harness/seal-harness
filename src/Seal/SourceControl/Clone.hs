@@ -61,11 +61,13 @@ module Seal.SourceControl.Clone
   , renderPatHeader
   ) where
 
-import Control.Exception (bracket, onException, try)
+import Control.Exception (bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.IORef (IORef, readIORef, writeIORef)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -230,9 +232,21 @@ data CloneDeps = CloneDeps
   { cdVault           :: VaultRuntime
   , cdRepoReg         :: RepoRegistryHandle
   , cdSshAgent        :: SshAgentHandle
-  , cdAgentEnvRef     :: IORef (Maybe SshAgentEnv)
+  , cdAgentRegistry   :: IORef (Map Text SshAgentEnv)
+    -- ^ One-agent-per-repo registry, keyed by the repo's vault key. Each
+    -- unique repo gets its own @ssh-agent@ process, started lazily on
+    -- first use. The agent + key persist for the harness lifetime (no
+    -- per-op @sahDeleteAll@). At shutdown, @sahKill@ is called for each
+    -- agent in the registry.
   , cdPinnedKnownHosts :: ByteString
   , cdKeyfilesDir     :: FilePath
+  , cdIsRemote        :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode). When 'True', the deploy-key clone path uses @ssh -A@ agent
+    -- forwarding with no @GIT_SSH_COMMAND@ (the remote @git clone@ uses
+    -- the default @ssh@ + the forwarded agent + the remote machine's
+    -- default @known_hosts@). When 'False', the local path writes a
+    -- per-op @known_hosts@ temp file + uses @GIT_SSH_COMMAND@.
   }
 
 ----------------------------------------------------------------------------
@@ -270,7 +284,17 @@ data CloneEnv = CloneEnv
   , ceEnvExtras :: [(String, String)]
     -- ^ Env overrides MERGED over the inherited environment. Carries
     -- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ / @GIT_TERMINAL_PROMPT@ — only
-    -- non-secret values (paths + "0").
+    -- non-secret values (paths + "0"). On the remote executor (deploy
+    -- key), @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ are OMITTED (the forwarded
+    -- agent via @ssh -A@ replaces them) and @GIT_SSH_COMMAND@ carries no
+    -- @UserKnownHostsFile=@ path (the remote arm writes the known_hosts
+    -- to a remote temp file + rewrites the command).
+  , ceKnownHostsContent :: Maybe ByteString
+    -- ^ The pinned @known_hosts@ content (public data) for the REMOTE
+    -- deploy-key path. 'Just' the bytes when @cdIsRemote@ + deploy key;
+    -- 'Nothing' otherwise (the local arm writes its own temp file). The
+    -- remote arm of 'uioShellExecGitEnv' writes this to a remote temp
+    -- file + rewrites @GIT_SSH_COMMAND@ to reference it.
   , ceCleanup :: IO ()
     -- ^ Removes the per-op @known_hosts@ temp file + kills the agent. Run
     -- by 'withCloneTarget' after the continuation (bracket — on success AND
@@ -327,52 +351,78 @@ resolveCloneTarget deps repo =
                       , ceGitConfigArgs = ["-c", "http.extraHeader=" <> header]
                       , ceSshCommand = Nothing
                       , ceEnvExtras = envExtras
+                      , ceKnownHostsContent = Nothing
                       , ceCleanup = pure ()
                       }
                 pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
       ClonePlanSshKey sshUrl _vaultKey -> do
         -- The encrypted keyfile path: <keyfilesDir>/<repo-id>.
         let keyfilePath = cdKeyfilesDir deps </> keyfileBaseName repo
+            vaultKey = cVaultKey (srCredential repo)
         eVault <- resolveVaultHandle deps
         case eVault of
           Left e -> pure (Left e)
           Right vault -> do
             -- Fetch the passphrase from the vault (decrypts the keyfile).
-            mpass <- vhGet vault (cVaultKey (srCredential repo))
+            mpass <- vhGet vault vaultKey
             case mpass of
               Left ve -> pure (Left (CloneVaultError ve))
               Right passphrase -> do
-                -- Shared agent: start once (lazily on first deploy-key op),
-                -- cache the env in cdAgentEnvRef, reuse across all ops.
-                -- Per-op: sahAddKey → run → sahDeleteAll (no sahKill — the
-                -- agent persists). The per-op key scoping invariant holds:
-                -- exactly one key is live at forwarding time.
-                mCached <- readIORef (cdAgentEnvRef deps)
-                agentEnv <- case mCached of
+                -- One-agent-per-repo: look up the registry by vault key.
+                -- If cached, reuse the agent (skip start + addkey). If
+                -- not, start a new agent + load the key once, then cache.
+                registry <- readIORef (cdAgentRegistry deps)
+                agentEnv <- case Map.lookup vaultKey registry of
                   Just env -> pure env
                   Nothing -> do
                     eStart <- sahStart (cdSshAgent deps)
                     case eStart of
                       Left msg -> pure (error (T.unpack msg))
                       Right env -> do
-                        writeIORef (cdAgentEnvRef deps) (Just env)
-                        pure env
-                -- Load the key into the shared agent (per-op).
-                eAdd <- sahAddKey (cdSshAgent deps) agentEnv keyfilePath passphrase
-                case eAdd of
-                  Left msg -> do
-                    -- Fail closed: delete-all even on add failure (defense-
-                    -- in-depth; no key landed).
-                    sahDeleteAll (cdSshAgent deps) agentEnv
-                    pure (Left (CloneAgentError msg))
-                  Right () -> do
-                    -- Write the per-op known_hosts temp file (public data).
-                    -- onException runs sahDeleteAll if this throws (the key
-                    -- is removed from the agent even on failure).
+                        eAdd <- sahAddKey (cdSshAgent deps) env keyfilePath passphrase
+                        case eAdd of
+                          Left msg -> do
+                            -- Fail closed: delete-all even on add failure.
+                            sahDeleteAll (cdSshAgent deps) env
+                            pure (error (T.unpack msg))
+                          Right () -> do
+                            writeIORef (cdAgentRegistry deps)
+                              (Map.insert vaultKey env registry)
+                            pure env
+                -- Build the CloneEnv. The key stays loaded (no per-op
+                -- sahDeleteAll); the cleanup is a no-op (the agent is
+                -- killed at harness shutdown, not per-op).
+                if cdIsRemote deps
+                  then do
+                    -- REMOTE deploy-key path (simple approach matching the
+                    -- verified working command): no GIT_SSH_COMMAND, no
+                    -- remote known_hosts file. The remote git clone uses
+                    -- the default ssh + the forwarded agent (via ssh -A)
+                    -- + the remote machine's default known_hosts. The
+                    -- SSH_AUTH_SOCK/SSH_AGENT_PID are in ceEnvExtras for
+                    -- the LOCAL ssh -A process (the remote arm extracts
+                    -- them for local env + strips from remote env prefix).
+                    let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
+                        envExtras =
+                          authEnv ++
+                          [ ("GIT_TERMINAL_PROMPT", "0")
+                          ]
+                        env = CloneEnv
+                          { ceUrl = sshUrl
+                          , ceGitConfigArgs = []
+                          , ceSshCommand = Nothing
+                          , ceEnvExtras = envExtras
+                          , ceKnownHostsContent = Nothing
+                          , ceCleanup = pure ()
+                          }
+                    pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
+                  else do
+                    -- LOCAL deploy-key path: write the per-op
+                    -- @known_hosts@ temp file (public data) to the
+                    -- harness-private @cdKeyfilesDir@.
                     (knownHostsPath, knownHostsCleanup) <-
                       writeKnownHostsTemp (cdKeyfilesDir deps)
                                            (cdPinnedKnownHosts deps)
-                        `onException` sahDeleteAll (cdSshAgent deps) agentEnv
                     let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
                         sshCmd = T.pack $
                           "ssh"
@@ -386,17 +436,15 @@ resolveCloneTarget deps repo =
                           , ("GIT_SSH_COMMAND", T.unpack sshCmd)
                           , ("GIT_TERMINAL_PROMPT", "0")
                           ]
-                        cleanup = do
-                          knownHostsCleanup
-                          sahDeleteAll (cdSshAgent deps) agentEnv
                         env = CloneEnv
                           { ceUrl = sshUrl
                           , ceGitConfigArgs = []
                           , ceSshCommand = Just sshCmd
                           , ceEnvExtras = authEnv ++ envExtras
-                          , ceCleanup = cleanup
+                          , ceKnownHostsContent = Nothing
+                          , ceCleanup = knownHostsCleanup
                           }
-                    pure (Right CloneTarget { ctEnv = env, ctCleanup = cleanup })
+                    pure (Right CloneTarget { ctEnv = env, ctCleanup = knownHostsCleanup })
 
 -- | The base name of the encrypted keyfile for a 'SourceRepo' — the
 -- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2

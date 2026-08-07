@@ -6,29 +6,27 @@
 -- @ssh-agent@ / @ssh-add@ (unit-test-speed; no process spawning in the
 -- test suite).
 --
--- Security model (shared agent, per-op key scoping):
+-- Security model (one agent per repo, key persists for the harness lifetime):
 --
---   * The agent is started ONCE (at startup or lazily on first use) and
---     kept alive for the session. The @-t <lifetime>@ flag is
---     defense-in-depth: the agent forgets keys after @lifetime@ seconds
---     even if @sahDeleteAll@ is skipped.
---   * @sahAddKey@ runs @ssh-add <keyfile>@ per-op, loading exactly one
---     key into the shared agent. The passphrase is supplied via an
---     @SSH_ASKPASS@ helper script + @SSH_ASKPASS_REQUIRE=force@ (portable:
---     works on macOS where stdin piping doesn't bypass the TTY). The
---     agent decrypts the encrypted keyfile into memory; the cleartext
---     key lives only in agent memory.
---   * @sahDeleteAll@ runs @ssh-add -D@ per-op (forgets all keys) — this is
---     the per-op scoping invariant: exactly one key is live at forwarding
---     time. Even though the agent process persists, the key is removed
---     after the op.
+--   * Each unique repo (identified by its vault key) gets its own
+--     @ssh-agent -s@ process, started lazily on first use. The agent
+--     persists until the harness shuts down (no @-t@ lifetime, no
+--     per-op @sahDeleteAll@).
+--   * @sahAddKey@ runs @ssh-add <keyfile>@ once per repo (when the agent
+--     is first started). The passphrase is supplied via an
+--     @SSH_ASKPASS@ helper script + @SSH_ASKPASS_REQUIRE=force@. The
+--     helper script reads the passphrase from the @SEAL_ASKPASS_SECRET@
+--     environment variable — the script itself contains NO secret, so it
+--     can be written to a temp file without violating the "no secret on
+--     disk" requirement. The passphrase flows: vault (encrypted at rest)
+--     → Haskell process memory → @ssh-add@'s env → askpass helper's
+--     inherited env → stdout → @ssh-add@. Never touches disk.
 --   * @sahGetAuthEnv@ yields the @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ env to
---     forward to the untrusted git run.
+--     forward to the untrusted git run (via @ssh -A@ agent forwarding).
 --
 -- The untrusted machine NEVER sees the keyfile (encrypted or otherwise) —
--- only the forwarded @SSH_AUTH_SOCK@ via @ssh -A@ (the W2 opt-in
--- 'ForwardAgent' flag on 'sshExecArgv'). The agent keeps passwords in
--- memory, not on disk, which makes attacks significantly harder.
+-- only the forwarded @SSH_AUTH_SOCK@ via @ssh -A@. The agent keeps
+-- passwords in memory, not on disk.
 module Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..)
   , SshAgentHandle (..)
@@ -45,7 +43,7 @@ import Data.List (isInfixOf, isPrefixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (createDirectoryIfMissing, removeFile)
+import System.Directory (removeFile)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, hClose, hFlush)
 import System.IO.Temp (openBinaryTempFile)
@@ -62,7 +60,7 @@ import System.Process
 -- | The shared agent environment — the @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@
 -- values to forward to the untrusted git run (via the env-override seam on
 -- 'UntrustedIO' / the @-A@ flag on 'sshExecArgv'). Built once when the
--- agent starts; reused across all ops in the session.
+-- agent starts; reused across all ops for that repo.
 data SshAgentEnv = SshAgentEnv
   { saeAuthSock :: String
   , saeAgentPid :: String
@@ -72,28 +70,27 @@ data SshAgentEnv = SshAgentEnv
 -- calls; the smart constructors wire the real or fake implementation.
 -- The constructor is NOT exported — only the smart constructors are.
 --
--- The lifecycle is shared-agent, per-op-key:
---   @sahStart@ (once) → per-op: @sahAddKey@ → run → @sahDeleteAll@.
--- The agent process persists across ops; only the key is loaded/removed
--- per-op (the per-op scoping invariant — exactly one key live at
--- forwarding time).
+-- The lifecycle is one-agent-per-repo:
+--   @sahStart@ (once per repo) → @sahAddKey@ (once per repo) → run.
+-- The agent process + key persist for the harness lifetime; @sahKill@
+-- is called at shutdown.
 data SshAgentHandle = SshAgentHandle
   { sahStart      :: IO (Either Text SshAgentEnv)
-    -- ^ Start the shared @ssh-agent -s -t <lifetime>@ (once, at startup
-    -- or lazily on first use). Parse @SSH_AUTH_SOCK@ /
-    -- @SSH_AGENT_PID@ from its stdout. Returns the env to reuse across
-    -- all ops.
+    -- ^ Start @ssh-agent -s@ (once per repo, lazily on first use). Parse
+    -- @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ from its stdout.
   , sahAddKey     :: SshAgentEnv -> FilePath -> ByteString -> IO (Either Text ())
     -- ^ @ssh-add <keyfile>@: the passphrase (the 'ByteString') is supplied
-    -- via an @SSH_ASKPASS@ helper script +
-    -- @SSH_ASKPASS_REQUIRE=force@ (portable: works on macOS). The keyfile
-    -- path is the arg. The agent decrypts the encrypted keyfile into
-    -- memory. Called per-op.
+    -- via an @SSH_ASKPASS@ helper script that reads it from the
+    -- @SEAL_ASKPASS_SECRET@ environment variable (no secret on disk). The
+    -- agent decrypts the encrypted keyfile into memory. Called once per
+    -- repo (when the agent is first started).
   , sahDeleteAll  :: SshAgentEnv -> IO ()
-    -- ^ @ssh-add -D@ — forget all keys. Called per-op (after the git run).
+    -- ^ @ssh-add -D@ — forget all keys. Not called per-op in the
+    -- one-agent-per-repo model; retained for fail-closed cleanup on
+    -- @sahAddKey@ failure.
   , sahKill       :: SshAgentEnv -> IO ()
-    -- ^ @ssh-agent -k@ — terminate the agent. Called once at shutdown (NOT
-    -- per-op).
+    -- ^ @ssh-agent -k@ — terminate the agent. Called once at harness
+    -- shutdown.
   , sahGetAuthEnv :: SshAgentEnv -> [(String, String)]
     -- ^ The @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ env to forward.
   }
@@ -128,15 +125,13 @@ parseAgentEnv out = do
 ----------------------------------------------------------------------------
 
 -- | The real @ssh-agent@ / @ssh-add@ implementation. Spawns a real agent
--- process once (the @-t <lifetime>@ is defense-in-depth: the agent forgets
--- keys after @lifetime@ seconds even if @sahDeleteAll@ is skipped). Per-op,
--- @sahAddKey@ loads one key + @sahDeleteAll@ removes it.
-mkRealSshAgentHandle :: Maybe Int -> SshAgentHandle
-mkRealSshAgentHandle mLifetime = SshAgentHandle
+-- process per repo (no @-t@ lifetime — the key persists for the harness
+-- lifetime). @sahAddKey@ loads the key once per repo using an env-var
+-- askpass helper (no secret on disk).
+mkRealSshAgentHandle :: SshAgentHandle
+mkRealSshAgentHandle = SshAgentHandle
   { sahStart = do
-      let agentArgv = case mLifetime of
-            Nothing -> ["ssh-agent", "-s"]
-            Just lt -> ["ssh-agent", "-s", "-t", show lt]
+      let agentArgv = ["ssh-agent", "-s"]
       eRes <- try @IOError (readProcessCollect agentArgv "")
       pure $ case eRes of
         Left _ioErr -> Left "ssh-agent: failed to start (unreachable)"
@@ -145,21 +140,17 @@ mkRealSshAgentHandle mLifetime = SshAgentHandle
           Just env -> Right env
         Right (ExitFailure _n, _out, _err) -> Left "ssh-agent: non-zero exit"
   , sahAddKey = \env keyfile passphrase -> do
-      -- On macOS, ssh-add reads the passphrase from the TTY even when stdin
-      -- is piped (the bundled /usr/bin/ssh-add opens /dev/tty directly,
-      -- ignoring a piped stdin — the stdin-pipe approach hangs when seal
-      -- serve runs attached to a terminal). The portable fix: write a
-      -- tiny askpass helper script (0700) that echoes the passphrase, set
-      -- SSH_ASKPASS=<path> + SSH_ASKPASS_REQUIRE=force (forces ssh-add to
-      -- use the helper for ALL passphrase input, regardless of DISPLAY or
-      -- a TTY). The helper is a temp file under /tmp, used once, then
-      -- removed. Verified working on macOS arm64e /usr/bin/ssh-add.
-      let askpassScript = "#!/bin/sh\necho " <> shellQuoteStr (TE.decodeUtf8Lenient passphrase) <> "\n"
-      (askpassPath, askpassCleanup) <- writeAskpassHelper askpassScript
-      let addEnv = [ ("SSH_ASKPASS", askpassPath)
-                   , ("SSH_ASKPASS_REQUIRE", "force")
-                   , ("DISPLAY", ":0")
-                   ] ++ saeGetAuthEnv env
+      -- The askpass helper script contains NO secret — it reads the
+      -- passphrase from the SEAL_ASKPASS_SECRET environment variable.
+      -- The passphrase flows: Haskell memory → ssh-add's env → askpass
+      -- helper's inherited env → stdout → ssh-add. Never touches disk.
+      -- The script is written to a 0700 temp file, used once, then removed.
+      (askpassPath, askpassCleanup) <- writeAskpassHelper
+      let addEnv =
+            [ ("SSH_ASKPASS", askpassPath)
+            , ("SSH_ASKPASS_REQUIRE", "force")
+            , ("SEAL_ASKPASS_SECRET", T.unpack (TE.decodeUtf8Lenient passphrase))
+            ] ++ saeGetAuthEnv env
       eRes <- try @IOError (runProcessEnv addEnv "ssh-add" [keyfile] "")
       askpassCleanup
       pure $ case eRes of
@@ -214,20 +205,19 @@ readProcessCollect argv stdinStr =
     []       -> error "readProcessCollect: empty argv (unreachable)"
 
 ----------------------------------------------------------------------------
--- Askpass helper (write a tiny script that echoes the passphrase)
+-- Askpass helper (generic script that reads passphrase from env var)
 ----------------------------------------------------------------------------
 
--- | Write a tiny @SSH_ASKPASS@ helper script that echoes the passphrase.
--- The script is written to a temp file (0700), used once by @ssh-add@,
--- then removed. This is the portable non-interactive approach: on macOS,
--- @ssh-add@ reads the passphrase from the TTY even when stdin is piped;
--- @SSH_ASKPASS_REQUIRE=force@ forces it to use the helper instead.
-writeAskpassHelper :: Text -> IO (FilePath, IO ())
-writeAskpassHelper script = do
-  let dir = "/tmp"
-  createDirectoryIfMissing True dir
-  (path, h) <- openBinaryTempFile dir "seal-askpass-"
-  BS.hPutStr h (TE.encodeUtf8 script)
+-- | Write a generic @SSH_ASKPASS@ helper script that reads the passphrase
+-- from the @SEAL_ASKPASS_SECRET@ environment variable. The script contains
+-- NO secret — only the env var *name*. It can be written to a temp file
+-- without violating the "no secret on disk" requirement. The temp file is
+-- 0700 (private), used once by @ssh-add@, then removed.
+writeAskpassHelper :: IO (FilePath, IO ())
+writeAskpassHelper = do
+  let script = "#!/bin/sh\necho $SEAL_ASKPASS_SECRET\n"
+  (path, h) <- openBinaryTempFile "/tmp" "seal-askpass-"
+  BS.hPutStr h (TE.encodeUtf8 (T.pack script))
   hClose h
   setFileMode path 0o700
   let cleanup = do
@@ -235,17 +225,12 @@ writeAskpassHelper script = do
         pure ()
   pure (path, cleanup)
 
--- | Single-quote a value for a shell @echo@ command: @echo '<val>@ with
--- embedded @'@ escaped via the POSIX @'\''@ idiom.
-shellQuoteStr :: Text -> Text
-shellQuoteStr t = "'" <> T.concatMap (\c -> if c == '\'' then "'\\''" else T.singleton c) t <> "'"
-
  ----------------------------------------------------------------------------
 -- Fake (records calls in an IORef; no real process)
 ----------------------------------------------------------------------------
 
--- | A recorded fake call (for the per-op scoping test — assert exactly one
--- @SahAddKey@ + one @SahDeleteAll@ per op; @SahStart@ once at startup).
+-- | A recorded fake call (for the per-repo scoping test — assert exactly one
+-- @SahStart@ + one @SahAddKey@ per repo; no per-op @SahDeleteAll@).
 data FakeAgentCall
   = SahStart
   | SahAddKey FilePath ByteString

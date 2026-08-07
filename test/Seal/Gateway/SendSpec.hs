@@ -111,6 +111,7 @@ mkSendDeps paths providerRef = do
         , sdLocks       = testLocks
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
+        , sdIsRemote    = False
         }
   pure sendDeps
 

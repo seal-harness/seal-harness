@@ -52,6 +52,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -207,6 +208,12 @@ data ChannelDeps = ChannelDeps
     -- ^ Load the current config (re-read per turn so config changes take
     -- effect without a restart). Used for default provider/model/agent
     -- when creating a new session for a conversation.
+  , cdIsRemote    :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode from the security config). Set once at startup from
+    -- @isJust (untrustedExecConfigFromSecurity secCfg)@. Threaded into
+    -- 'CloneDeps' so the deploy-key clone path knows to use agent
+    -- forwarding (@ssh -A@) + a remote @known_hosts@ temp file.
   , cdLogger      :: SealLogger
     -- ^ The shared logger for structured katip logging. Built once at
     -- startup via 'withSealLogger', threaded through all channel turns.
@@ -215,18 +222,19 @@ data ChannelDeps = ChannelDeps
 -- | Build 'Clone.CloneDeps' from a 'ChannelDeps' (the in-scope vault runtime
 -- + repo registry handle + paths). Used by the 2 'buildIsaRegistry' call
 -- sites + the 1 'buildChildRegistry' site in this module. The ssh-agent is
--- real (production: 'mkRealSshAgentHandle (Just 300)'); the pinned host
+-- real (production: 'mkRealSshAgentHandle'); the pinned host
 -- keys are compile-time-embedded.
 mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
 mkCloneDepsFromChannel deps = do
-  agentEnvRef <- newIORef Nothing
+  agentEnvRef <- newIORef Map.empty
   pure Clone.CloneDeps
     { Clone.cdVault = cdVault deps
     , Clone.cdRepoReg = cdRepoReg deps
-    , Clone.cdSshAgent = mkRealSshAgentHandle (Just 300)
-    , Clone.cdAgentEnvRef = agentEnvRef
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentEnvRef
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
+    , Clone.cdIsRemote = cdIsRemote deps
     }
 
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
@@ -237,11 +245,12 @@ newChannelDeps
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
   -> ApprovalCache -> IO RuntimeConfig
+  -> Bool
   -> TabsHandle
   -> SealLogger
   -> IO ChannelDeps
 newChannelDeps paths vault repoReg provider backends autonomy broker
-               harnessReg tmux httpMgr approvals loadCfg tabsH logger = do
+               harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger = do
   cursors <- newCursorStore
   replies <- newReplyRegistry
   locks   <- newSessionLocks
@@ -262,6 +271,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
     , cdLocks       = locks
     , cdTabs        = tabsH
     , cdConfig      = loadCfg
+    , cdIsRemote    = isRemote
     , cdLogger      = logger
     }
 

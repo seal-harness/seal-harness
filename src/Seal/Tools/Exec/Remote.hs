@@ -23,9 +23,11 @@ import Control.Exception (try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.IO (hClose)
 import System.Process
@@ -83,13 +85,13 @@ sshExecArgv cfg cmd =
 -- opt-in per git-op — non-credential remote ops use 'sshExecArgv' (no
 -- @-A@) to keep the signing-oracle surface minimal (design §5.6).
 --
--- TODO(future): wire 'runRemoteShellForwarding' into the remote arm of
--- 'uioShellExecEnv' (UntrustedIO.hs) so deploy-key ops work on the remote
--- untrusted executor. Currently the remote arm uses 'runRemoteShellText'
--- (no @-A@), so deploy-key ops only work on the LOCAL executor (the local
--- arm merges @SSH_AUTH_SOCK@ over the inherited env). The remote
--- @-A@-wiring is the hardened path (the key never crosses) — tracked as
--- a follow-up. PAT ops work on both executors (token in argv, no agent).
+-- The remote arm of 'uioShellExecGitEnv' (UntrustedIO.hs) uses this via
+-- 'runRemoteShellForwarding' for deploy-key ops. The @SSH_AUTH_SOCK@ /
+-- @SSH_AGENT_PID@ are stripped from the env prefix (the forwarded socket
+-- replaces them) and the @known_hosts@ content is written to a remote
+-- temp file so @GIT_SSH_COMMAND@'s @UserKnownHostsFile=@ resolves on the
+-- remote machine. PAT ops work on both executors (token in argv, no
+-- agent).
 sshExecArgvForwarding :: SshConfig -> Text -> [String]
 sshExecArgvForwarding cfg cmd =
   [ "ssh", "-A"
@@ -129,6 +131,11 @@ sshExecArgvForwarding cfg cmd =
 data RemoteRunner = RemoteRunner
   { runRemote      :: [String] -> IO (Either ExecError Text)
   , runRemoteStdin :: [String] -> ByteString -> IO (Either ExecError Text)
+  , runRemoteEnv   :: [(String, String)] -> [String] -> IO (Either ExecError Text)
+    -- ^ Run an argv with local env overrides MERGED over the inherited
+    -- environment. Used by the deploy-key remote clone path: the local
+    -- @ssh -A@ process needs the SEAL agent's @SSH_AUTH_SOCK@ (not the
+    -- ambient one) so the forwarded agent has the deploy key loaded.
   }
 
 -- | The real SSH runner via 'System.Process'. Fail-closed: any IOError or
@@ -137,20 +144,25 @@ data RemoteRunner = RemoteRunner
 -- failure, never bypassed).
 mkRealRemoteRunner :: RemoteRunner
 mkRealRemoteRunner = RemoteRunner
-  { runRemote      = runReal Nothing
-  , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) argv
+  { runRemote      = runReal Nothing []
+  , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) [] argv
+  , runRemoteEnv   = runReal Nothing
   }
   where
-    runReal :: Maybe ByteString -> [String] -> IO (Either ExecError Text)
-    runReal mStdin argv = do
+    runReal :: Maybe ByteString -> [(String, String)] -> [String] -> IO (Either ExecError Text)
+    runReal mStdin envExtras argv = do
       let (program, args) = case argv of
             (p : as) -> (p, as)
             []       -> error "runReal: empty argv (unreachable)"
           cp0 = (proc program args)
                   { std_out = CreatePipe, std_err = CreatePipe }
-          cp = case mStdin of
+          cp1 = case mStdin of
             Nothing -> cp0 { std_in = NoStream }
             Just _  -> cp0 { std_in = CreatePipe }
+      mEnv <- case envExtras of
+        [] -> pure Nothing
+        xs -> Just <$> mergeEnvReal xs
+      let cp = cp1 { env = mEnv }
       res <- try @IOError
              (withCreateProcess cp $ \mIn mOut mErr ph -> do
                 -- Pipe the stdin payload (if any) to the process and close
@@ -226,6 +238,7 @@ mkFakeRemoteRunner :: Either ExecError Text -> RemoteRunner
 mkFakeRemoteRunner canned = RemoteRunner
   { runRemote      = \_argv -> pure canned
   , runRemoteStdin = \_argv _stdin -> pure canned
+  , runRemoteEnv   = \_env _argv -> pure canned
   }
 
 -- | A fake 'RemoteRunner' that records every call's argv + stdin into an
@@ -245,4 +258,14 @@ mkFakeRemoteRunnerRecording ref canned = RemoteRunner
   , runRemoteStdin = \argv stdin -> do
       modifyIORef' ref (++ [(argv, Just stdin)])
       pure canned
+  , runRemoteEnv = \_env argv -> do
+      modifyIORef' ref (++ [(argv, Nothing)])
+      pure canned
   }
+
+-- | Merge env overrides over the inherited environment (overrides win).
+-- Mirrors 'mergeEnv' in 'UntrustedIO.hs' but kept local to avoid a
+-- circular import.
+mergeEnvReal :: [(String, String)] -> IO [(String, String)]
+mergeEnvReal overrides =
+  Map.toList . Map.union (Map.fromList overrides) . Map.fromList <$> getEnvironment
