@@ -10,6 +10,41 @@ your first PR.
 
 ---
 
+---
+
+## The Human-Authorship Rule (read this first)
+
+**Things that have to be read by humans must be written by humans.** A human
+needs to have read the whole thing and is explicitly vouching for the contents.
+
+This is the most important rule in this project. It governs which artifacts AI
+agents may produce autonomously and which require explicit human authorship and
+vouching.
+
+### Code does not have to be read by humans
+
+Code, for the most part, does not have to be read by humans anymore. That
+doesn't mean we don't have humans who read the code — it just means it's not
+*mandatory*. AI agents may write, modify, and refactor code autonomously
+subject to the gates defined elsewhere in this document (tests pass, lint clean,
+CI green).
+
+### GitHub issues, design docs, and human-facing prose MUST be human-authored
+
+GitHub issues, on the other hand, **do** have to be read by humans. The harness
+gives LLMs access to the physical world. *"Pure functions can't cause the AI
+apocalypse."* Harness design and features are absolutely, 100% security- and
+mission-critical for humans to approve.
+
+Humans don't have to review the code necessarily. But it is crucial that we
+make **design choices** that give us very high confidence that untrusted code
+cannot compromise the trusted harness machine and violate invariants (deleting
+audit code for instance). The design decisions — what the harness can do,
+what it refuses to do, where the trust boundary sits — those are human
+decisions, human-authored, human-vouched.
+
+**In short:** AI writes code. Humans write the rules the code must follow.
+
 ## Ground rules
 
 ### 1. Clean-room implementation (non-negotiable)
