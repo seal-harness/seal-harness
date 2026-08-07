@@ -1,3 +1,11 @@
+---
+id: pr-shepherd-agent
+name: Pr Shepherd Agent
+description: "PR lifecycle management through to merge"
+role: delegation-target
+enabled: true
+---
+
 # PR Shepherd Agent
 
 **Type**: `pr-shepherd-agent`

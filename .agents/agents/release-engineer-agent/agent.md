@@ -1,3 +1,11 @@
+---
+id: release-engineer-agent
+name: Release Engineer Agent
+description: "Safe delivery of approved code from merge through production verification"
+role: delegation-target
+enabled: true
+---
+
 # Release Engineer Agent
 
 **Type**: `release-engineer-agent`

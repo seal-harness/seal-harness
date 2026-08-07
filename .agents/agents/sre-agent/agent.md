@@ -1,3 +1,11 @@
+---
+id: sre-agent
+name: Sre Agent
+description: "Production system monitoring and incident response (read-only)"
+role: delegation-target
+enabled: true
+---
+
 # SRE Agent
 
 **Type**: `sre-agent`

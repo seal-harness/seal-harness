@@ -1,3 +1,11 @@
+---
+id: knowledge-curator-agent
+name: Knowledge Curator Agent
+description: "Knowledge extraction and curation"
+role: delegation-target
+enabled: true
+---
+
 # Knowledge Curator Agent
 
 **Type**: `learning-curator-agent`

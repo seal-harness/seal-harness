@@ -1,3 +1,11 @@
+---
+id: security-auditor-agent
+name: Security Auditor Agent
+description: "Security vulnerability detection and OWASP compliance"
+role: delegation-target
+enabled: true
+---
+
 # Security Auditor Agent
 
 **Type**: `security-auditor-agent`

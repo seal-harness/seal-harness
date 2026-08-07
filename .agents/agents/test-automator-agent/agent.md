@@ -1,3 +1,11 @@
+---
+id: test-automator-agent
+name: Test Automator Agent
+description: "Test writing and coverage analysis"
+role: delegation-target
+enabled: true
+---
+
 # Test Automator Agent
 
 **Type**: `test-writer-agent`

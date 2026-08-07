@@ -1,3 +1,11 @@
+---
+id: metrics-agent
+name: Metrics Agent
+description: "Collect, aggregate, and report on agent swarm performance"
+role: delegation-target
+enabled: true
+---
+
 # Metrics Agent
 
 **Type**: `metrics-agent`

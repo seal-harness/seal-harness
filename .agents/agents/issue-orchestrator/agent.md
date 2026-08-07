@@ -1,3 +1,11 @@
+---
+id: issue-orchestrator
+name: Issue Orchestrator
+description: "Main coordinator per issue — spawns sub-agents, runs 4-phase execution loop"
+role: delegation-target
+enabled: true
+---
+
 # Issue Orchestrator Agent
 
 **Type**: `issue-orchestrator`

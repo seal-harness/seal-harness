@@ -1,3 +1,11 @@
+---
+id: cto-agent
+name: Cto Agent
+description: "Plan review and architectural guidance"
+role: delegation-target
+enabled: true
+---
+
 # CTO Agent
 
 **Type**: `cto-agent`

@@ -1,3 +1,11 @@
+---
+id: designer-agent
+name: Designer Agent
+description: "UX, API design, and developer experience review"
+role: delegation-target
+enabled: true
+---
+
 # Designer Agent
 
 **Type**: `designer-agent`

@@ -1,3 +1,11 @@
+---
+id: swarm-coordinator-agent
+name: Swarm Coordinator Agent
+description: "Meta-orchestrator managing multiple issues/epics in parallel across worktrees"
+role: delegation-target
+enabled: true
+---
+
 # Swarm Coordinator Agent
 
 ## Role

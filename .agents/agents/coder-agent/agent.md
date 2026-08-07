@@ -1,3 +1,11 @@
+---
+id: coder-agent
+name: Coder Agent
+description: "TDD implementation of features and fixes"
+role: delegation-target
+enabled: true
+---
+
 # Coder Agent
 
 **Type**: `coder-agent`

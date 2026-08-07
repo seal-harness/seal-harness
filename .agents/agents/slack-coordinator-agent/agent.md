@@ -1,3 +1,11 @@
+---
+id: slack-coordinator-agent
+name: Slack Coordinator Agent
+description: "Human-agent communication bridge via Slack"
+role: delegation-target
+enabled: true
+---
+
 # Slack Coordinator Agent
 
 **Type**: `swarm-coordinator` (Slack interface specialization)

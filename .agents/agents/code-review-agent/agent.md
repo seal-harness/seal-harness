@@ -1,3 +1,11 @@
+---
+id: code-review-agent
+name: Code Review Agent
+description: "Internal code review before PR creation"
+role: delegation-target
+enabled: true
+---
+
 # Code Review Agent
 
 **Type**: `code-review-agent`

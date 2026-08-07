@@ -1,3 +1,11 @@
+---
+id: researcher-agent
+name: Researcher Agent
+description: "Codebase exploration and prior art research"
+role: delegation-target
+enabled: true
+---
+
 # Researcher Agent
 
 **Type**: `researcher-agent`

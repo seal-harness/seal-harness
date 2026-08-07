@@ -1,3 +1,11 @@
+---
+id: customer-service-agent
+name: Customer Service Agent
+description: "User issue investigation and support (read-only)"
+role: delegation-target
+enabled: true
+---
+
 # Customer Service Agent
 
 **Type**: `customer-service-agent`

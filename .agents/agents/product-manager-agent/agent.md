@@ -1,3 +1,11 @@
+---
+id: product-manager-agent
+name: Product Manager Agent
+description: "Use case validation and user benefit review"
+role: delegation-target
+enabled: true
+---
+
 # Product Manager Agent
 
 **Type**: `product-manager-agent`

@@ -1,3 +1,11 @@
+---
+id: security-design-agent
+name: Security Design Agent
+description: "Security review of designs before implementation"
+role: delegation-target
+enabled: true
+---
+
 # Security Design Agent
 
 **Type**: `security-design-agent`

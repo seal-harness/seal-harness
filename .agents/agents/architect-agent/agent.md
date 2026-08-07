@@ -1,3 +1,11 @@
+---
+id: architect-agent
+name: Architect Agent
+description: "Reviews technical architecture and creates implementation plans"
+role: delegation-target
+enabled: true
+---
+
 # Architect Agent
 
 **Type**: `architect-agent`
