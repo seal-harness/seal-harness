@@ -27,7 +27,8 @@ import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -52,7 +53,7 @@ import Seal.Config.File
   , WebConfig (..), rcWeb
   , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -86,11 +87,12 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.ISA.Opcode (OpResult (..), localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult, recordSetupRepoResult)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult, recordSetupRepoResult)
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -109,6 +111,10 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -132,6 +138,7 @@ import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
 data SendDeps = SendDeps
   { sdPaths      :: SealPaths
   , sdVault      :: VaultRuntime
+  , sdRepoReg    :: RepoRegistryHandle
   , sdProvider   :: ProviderRuntime
   , sdSession    :: SessionRuntime
   , sdBackends   :: Backends
@@ -190,6 +197,10 @@ data SendDeps = SendDeps
   , sdLogger :: SealLogger
     -- ^ The shared logger for structured katip logging. Built once at
     -- startup via 'withSealLogger'.
+  , sdIsRemote :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode from the security config). Threaded into 'CloneDeps' so the
+    -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -442,12 +453,13 @@ plainTurn deps meta t = do
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
             mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+            cloneDeps <- mkCloneDepsFromSend deps
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
                   wsroot operatorCeiling "web"
                 isaReg = buildWebRegistry
-                  (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
+                  (sdVault deps) cloneDeps (sdBackends deps) wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
@@ -493,7 +505,7 @@ plainTurn deps meta t = do
 -- \"harness\") and 'HfGeneric' flavour — the 6b wiring that resolves
 -- per-call session/window/flavour from the input is a later phase.
 buildWebRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
@@ -503,7 +515,7 @@ buildWebRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
+buildWebRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -532,7 +544,10 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp wsRoot autonomy
+      , setupRepoOp cloneDeps wsRoot autonomy
+      , gitFetchOp cloneDeps wsRoot autonomy
+      , gitPullOp cloneDeps wsRoot autonomy
+      , gitPushOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -681,12 +696,13 @@ plainTurnWithCaps deps meta caps t = do
             toolUse = either (const True) resolvedToolUseEnforcement eCfg
             taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
         mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+        cloneDeps <- mkCloneDepsFromSend deps
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
               wsRoot operatorCeiling "web"
             isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
@@ -730,12 +746,13 @@ webCallDispatcher deps callOpName val = do
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    cloneDeps <- mkCloneDepsFromSend deps
     let onDemand = either (const False) onDemandSchemas eCfg
         startWiring = webStartWiring
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling "web"
         isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps (sdBackends deps) wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
@@ -751,7 +768,9 @@ webCallDispatcher deps callOpName val = do
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
           then recordSetupRepoResult tHandle callOpName val r (Just "web")
-          else recordSkillLoadResult tHandle callOpName val r (Just "web")
+          else if opNm == "GIT_PUSH"
+            then recordGitPushResult tHandle callOpName val r (Just "web")
+            else recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -868,6 +887,7 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
+      childCloneDeps <- mkCloneDepsFromSend deps
       let childWsRoot = case eChildWd of
             Right wd -> WorkspaceRoot wd
             Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -892,7 +912,10 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childWsRoot (sdAutonomy deps)
+            , setupRepoOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitFetchOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPullOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPushOp childCloneDeps childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
@@ -973,6 +996,24 @@ broadcastAskResolved mBroker sid qid resolution =
         [ "id" .= askIdText qid
         , "resolution" .= resolution
         ]))
+
+-- | Build 'Clone.CloneDeps' from a 'SendDeps' (the in-scope vault runtime +
+-- repo registry handle + paths). Used by the 'buildWebRegistry' +
+-- 'buildChildRegistry' call sites. The ssh-agent is real (production:
+-- 'mkRealSshAgentHandle'); the pinned host keys are
+-- compile-time-embedded.
+mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
+mkCloneDepsFromSend deps = do
+  agentEnvRef <- newIORef Map.empty
+  pure Clone.CloneDeps
+    { Clone.cdVault = sdVault deps
+    , Clone.cdRepoReg = sdRepoReg deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
+    , Clone.cdIsRemote = sdIsRemote deps
+    }
 
 -- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
 -- session's workdir before the first turn. The web "set up repo" combo box

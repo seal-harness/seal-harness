@@ -28,6 +28,7 @@ data CommandGroup
   | GroupSkills
   | GroupAgent
   | GroupTools
+  | GroupRepos
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data Availability

@@ -15,7 +15,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -42,8 +42,8 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Types (mkSessionId)
@@ -58,6 +58,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, lookupByRef)
 import Seal.Security.Vault qualified as Vault
@@ -302,9 +303,10 @@ runSignalMain autonomy logger = do
   let loadCfg = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
+  repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
   chanDeps <- newChannelDeps
-        paths rt pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH logger
+        paths rt repoRegH pr backends autonomy Nothing
+        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr

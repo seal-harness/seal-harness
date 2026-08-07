@@ -53,6 +53,7 @@ class StreamClientImpl implements StreamClient {
   private askResolvedListeners = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
   private agentDefsChangedListeners = new Set<() => void>()
   private skillsChangedListeners = new Set<() => void>()
+  private reposChangedListeners = new Set<() => void>()
 
   constructor(url: string) {
     this.url = url
@@ -136,6 +137,13 @@ class StreamClientImpl implements StreamClient {
     this.skillsChangedListeners.add(cb)
     return () => {
       this.skillsChangedListeners.delete(cb)
+    }
+  }
+
+  onReposChanged(cb: () => void): () => void {
+    this.reposChangedListeners.add(cb)
+    return () => {
+      this.reposChangedListeners.delete(cb)
     }
   }
 
@@ -282,6 +290,9 @@ class StreamClientImpl implements StreamClient {
         break
       case 'skills-changed':
         for (const cb of this.skillsChangedListeners) cb()
+        break
+      case 'repos-changed':
+        for (const cb of this.reposChangedListeners) cb()
         break
       case 'replay-end':
         if (

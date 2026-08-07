@@ -6,6 +6,7 @@ import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
+import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
 import {
   useSendMessage,
@@ -58,6 +59,7 @@ function sectionFromPath(): TopSection {
   const path = window.location.pathname
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
+  if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   return 'sessions'
 }
 
@@ -777,6 +779,8 @@ export default function App() {
         <AgentsView />
       ) : section === 'skills' ? (
         <SkillsView />
+      ) : section === 'repos' ? (
+        <ReposView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar

@@ -24,6 +24,7 @@ function fakeClient(): StreamClient & {
   const askResolvedCbs = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
   const agentDefsChangedCbs = new Set<() => void>()
   const skillsChangedCbs = new Set<() => void>()
+  const reposChangedCbs = new Set<() => void>()
   let lastError: string | null = null
   return {
     status: 'live' as StreamClient['status'],
@@ -36,6 +37,7 @@ function fakeClient(): StreamClient & {
     onAskResolved: (cb) => { askResolvedCbs.add(cb); return () => { askResolvedCbs.delete(cb) } },
     onAgentDefsChanged: (cb) => { agentDefsChangedCbs.add(cb); return () => { agentDefsChangedCbs.delete(cb) } },
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
+    onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
     lastError: () => lastError,
     // test drivers:
     pushLists: (s) => { for (const cb of listsCbs) cb(s) },

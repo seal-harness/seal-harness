@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
+import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
@@ -46,10 +46,13 @@ export interface NewTabSpec {
   /** The current repo URL in the form. Empty string = no repo. */
   repo: string
   setRepo: (v: string) => void
-  /** Repo URLs the user has "set up" before, most-recent first, deduped.
-   *  Loaded from the persisted UI state on mount; the combobox offers these
-   *  as suggestions. Populated by `recordRepo` on submit. */
-  repoHistory: string[]
+  /** Repo URLs offered as "Set up repo" combobox suggestions: registered
+   *  repo URLs (from /api/repos — the Repos tab) first, then the persisted
+   *  history (previously-used URLs), deduped. */
+  repoOptions: string[]
+  /** Force a re-fetch of the registered repos (e.g. after the Repos tab
+   *  adds/removes a repo). */
+  refreshRepos: () => void
 
   // Harness
   flavour: HarnessFlavour
@@ -99,6 +102,10 @@ export function useNewTabSpec(): NewTabSpec {
   // combobox offers these as suggestions; `recordRepo` appends on submit.
   const [repo, setRepo] = useState<string>('')
   const [repoHistory, setRepoHistory] = useState<string[]>([])
+  // Registered repos from /api/repos — their URLs are offered as "Set up
+  // repo" suggestions alongside the persisted history. The hook re-fetches
+  // on the `repos-changed` WS invalidation frame (same as the Repos tab).
+  const { repos: registeredRepos, refresh: refreshRepos } = useRepos()
   // When lastOptions restores a provider+model, the model-fetch effect
   // would normally clobber the restored model with the provider's default.
   // `pendingRestoreModel` holds the restored model id so the fetch effect
@@ -306,7 +313,14 @@ export function useNewTabSpec(): NewTabSpec {
     provider, setProvider,
     model, setModel, models, modelsLoading, useCustomModel, handleModelSelectChange,
     customModels,
-    repo, setRepo, repoHistory,
+    repo, setRepo,
+    // Merge registered repo URLs with persisted history (deduped,
+    // registered repos first so they're at the top of the dropdown).
+    repoOptions: [
+      ...registeredRepos.map((r) => r.url),
+      ...repoHistory.filter((u) => !registeredRepos.some((r) => r.url === u)),
+    ],
+    refreshRepos,
     flavour, setFlavour,
     customBinary, setCustomBinary,
     attachSession, setAttachSession,

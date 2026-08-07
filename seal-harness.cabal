@@ -97,6 +97,7 @@ library
         Seal.Command.Session
         Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Repo
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
@@ -114,22 +115,27 @@ library
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
-        Seal.Session.Log
-        Seal.Signal.Config
-        Seal.Telegram.Config
-        Seal.Security.Command
-        Seal.Security.Crypto
-        Seal.Security.Path
-        Seal.Security.Policy
-        Seal.Security.Secrets
-        Seal.Security.Vault
-        Seal.Security.Vault.Age
-        Seal.Text.LineFile
-        Seal.Tools.Args
-        Seal.Tools.Exec.Remote
-        Seal.Tools.Exec.Types
-        Seal.Tools.Exec.Untrusted
-        Seal.Tools.Exec.UntrustedIO
+         Seal.Session.Log
+          Seal.SourceControl.Repo
+          Seal.SourceControl.Registry
+          Seal.SourceControl.Clone
+          Seal.SourceControl.GithubKeys
+         Seal.Signal.Config
+         Seal.Telegram.Config
+         Seal.Security.Command
+         Seal.Security.Crypto
+         Seal.Security.Path
+         Seal.Security.Policy
+         Seal.Security.Secrets
+         Seal.Security.Vault
+         Seal.Security.Vault.Age
+         Seal.Text.LineFile
+         Seal.Tools.Args
+         Seal.Tools.Exec.Remote
+         Seal.Tools.Exec.Types
+         Seal.Tools.Exec.Untrusted
+         Seal.Tools.Exec.UntrustedIO
+         Seal.Tools.Ssh.Agent
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -174,9 +180,10 @@ library
         Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
-        Seal.ISA.Ops.Skills
-        Seal.ISA.Ops.Repo
-        Seal.ISA.Ops.Agent
+         Seal.ISA.Ops.Skills
+         Seal.ISA.Ops.Repo
+         Seal.ISA.Ops.Git
+         Seal.ISA.Ops.Agent
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
         Seal.Memory.Types
@@ -229,6 +236,7 @@ library
       , network
       , tomland
       , process
+      , temporary
       , unix
       , unordered-containers
       , validation-selective
@@ -260,6 +268,7 @@ test-suite tests
         base
       , seal-harness
       , QuickCheck
+      , base64-bytestring
       , data-default
       , aeson
       , async
@@ -284,6 +293,9 @@ test-suite tests
       , warp
       , http-types
       , vector
+      , tomland
+      , validation-selective
+      , unordered-containers
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -334,6 +346,7 @@ test-suite tests
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
+        Seal.ISA.Ops.GitSpec
         Seal.ISA.Ops.AgentSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec
@@ -364,6 +377,7 @@ test-suite tests
         Seal.Command.SessionSpec
         Seal.Command.ServeSpec
         Seal.Command.SkillSpec
+        Seal.Command.RepoSpec
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec
@@ -388,6 +402,9 @@ test-suite tests
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
         Seal.Session.LockSpec
+        Seal.SourceControl.RepoSpec
+        Seal.SourceControl.RegistrySpec
+        Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
@@ -409,6 +426,7 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
+        Seal.TestHelpers.FakeRegistry
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec

@@ -21,6 +21,7 @@ vi.mock('../lib/streamClient', () => {
     onAskResolved: () => unsub,
     onAgentDefsChanged: () => unsub,
     onSkillsChanged: () => unsub,
+    onReposChanged: () => unsub,
     lastError: () => null,
   }
   return { streamClient: () => client }

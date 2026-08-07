@@ -101,6 +101,10 @@ streamApp guard broker pending = do
             sendTextData conn (A.encode (object
               [ "type" .= ("skills-changed" :: Text)
               ]))
+          sendEvent BeReposChanged =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("repos-changed" :: Text)
+              ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
       -- Send an initial lists snapshot AFTER subscribing so this connection

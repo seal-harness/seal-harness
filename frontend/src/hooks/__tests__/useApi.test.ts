@@ -1,5 +1,36 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
+
+// Mock the WS singleton so hooks that subscribe to invalidation frames
+// (useAgentDefs/useSkills/useRepos) never attempt a real WS connection,
+// AND so the useRepos WS test can capture + invoke the repos-changed
+// callback. The factory returns a SINGLE stable client (the hooks use
+// `streamClient()` as a dep — a fresh object each call would re-trigger
+// their effects every render and loop). The per-frame listener sets let
+// a test fire a synthetic invalidation.
+const reposChangedCbs = new Set<() => void>()
+vi.mock('../../lib/streamClient', () => {
+  const unsub = () => {}
+  const client = {
+    status: 'closed' as const,
+    focus: () => {},
+    onEntry: () => unsub,
+    onActivity: () => unsub,
+    onLists: () => unsub,
+    onStatusChange: () => unsub,
+    onAsk: () => unsub,
+    onAskResolved: () => unsub,
+    onAgentDefsChanged: () => unsub,
+    onSkillsChanged: () => unsub,
+    onReposChanged: (cb: () => void) => {
+      reposChangedCbs.add(cb)
+      return () => { reposChangedCbs.delete(cb) }
+    },
+    lastError: () => null,
+  }
+  return { streamClient: () => client }
+})
+
 import {
   useHarnesses,
   useRecentSessions,
@@ -34,6 +65,7 @@ let nextResponse: Response = new Response('{}', { status: 200, headers: { 'Conte
 
 beforeEach(() => {
   fetchCalls.length = 0
+  reposChangedCbs.clear()
   nextResponse = new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     fetchCalls.push({ url, init })
@@ -644,5 +676,138 @@ describe('useSkills', () => {
     setNextResponse('err', 500)
     const { result } = renderHook(() => useSkills())
     await waitFor(() => expect(result.current.error).toBe(true))
+  })
+})
+
+// ── Repo CRUD ───────────────────────────────────────────────────────────
+
+import {
+  fetchRepos,
+  fetchRepo,
+  createRepo,
+  updateRepo,
+  deleteRepo,
+  useRepos,
+} from '../useApi'
+
+describe('Repo CRUD', () => {
+  it('fetchRepos GETs /api/repos', async () => {
+    setNextResponse([
+      { id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } },
+    ])
+    const res = await fetchRepos()
+    expect(res).toHaveLength(1)
+    expect(res![0]!.id).toBe('myrepo')
+    expect(res![0]!.credential.kind).toBe('pat')
+  })
+
+  it('fetchRepo GETs /api/repos/:id', async () => {
+    setNextResponse({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    const res = await fetchRepo('myrepo')
+    expect(res?.id).toBe('myrepo')
+    expect(fetchCalls.some((c) => c.url === '/api/repos/myrepo')).toBe(true)
+  })
+
+  it('createRepo POSTs /api/repos with the input body', async () => {
+    setNextResponse({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } }, 201)
+    const res = await createRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.repo.id).toBe('myrepo')
+    const call = fetchCalls.find((c) => c.url === '/api/repos' && c.init?.method === 'POST')
+    expect(call).toBeTruthy()
+    expect(JSON.parse(call!.init!.body as string)).toEqual({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+  })
+
+  it('createRepo surfaces the backend error on a 400', async () => {
+    setNextResponse({ error: 'disallowed host: evil.example' }, 400)
+    const res = await createRepo({ id: 'myrepo', url: 'git@evil.example/o.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('disallowed host: evil.example')
+  })
+
+  it('createRepo falls back to HTTP status when the body has no error', async () => {
+    setNextResponse('oops', 500)
+    const res = await createRepo({ id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error).toBe('HTTP 500')
+  })
+
+  it('updateRepo PUTs /api/repos/:id (id from path; no new_id)', async () => {
+    setNextResponse({ id: 'myrepo', url: 'git@github.com:owner/repo2.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    const res = await updateRepo('myrepo', { url: 'git@github.com:owner/repo2.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } })
+    expect(res?.url).toBe('git@github.com:owner/repo2.git')
+    const call = fetchCalls.find((c) => c.url === '/api/repos/myrepo' && c.init?.method === 'PUT')
+    expect(call).toBeTruthy()
+    const body = JSON.parse(call!.init!.body as string) as { id?: string; new_id?: string; url: string }
+    expect(body.id).toBeUndefined()
+    expect(body.new_id).toBeUndefined()
+    expect(body.url).toBe('git@github.com:owner/repo2.git')
+  })
+
+  it('deleteRepo DELETEs /api/repos/:id and returns true on 204', async () => {
+    nextResponse = new Response(null, { status: 204 })
+    const ok = await deleteRepo('gone')
+    expect(ok).toBe(true)
+    const call = fetchCalls.find((c) => c.url === '/api/repos/gone' && c.init?.method === 'DELETE')
+    expect(call).toBeTruthy()
+  })
+
+  it('deleteRepo returns false on a 500', async () => {
+    setNextResponse('err', 500)
+    const ok = await deleteRepo('bad')
+    expect(ok).toBe(false)
+  })
+})
+
+describe('useRepos', () => {
+  it('fetches GET /api/repos on mount and populates state', async () => {
+    setNextResponse([
+      { id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } },
+    ])
+    const { result } = renderHook(() => useRepos())
+    await waitFor(() => expect(result.current.repos).toHaveLength(1))
+    expect(result.current.repos[0]!.id).toBe('myrepo')
+    expect(result.current.loaded).toBe(true)
+    expect(result.current.error).toBe(false)
+  })
+
+  it('sets error=true on a 500', async () => {
+    setNextResponse('err', 500)
+    const { result } = renderHook(() => useRepos())
+    await waitFor(() => expect(result.current.error).toBe(true))
+  })
+
+  it('refresh() triggers a re-fetch', async () => {
+    setNextResponse([
+      { id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } },
+    ])
+    const { result } = renderHook(() => useRepos())
+    await waitFor(() => expect(result.current.repos).toHaveLength(1))
+    const initialCalls = fetchCalls.length
+    act(() => result.current.refresh())
+    await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+
+  it('re-fetches when the repos-changed WS frame fires', async () => {
+    // First response: one repo. Second response: two repos.
+    setNextResponse([
+      { id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } },
+    ])
+    const { result } = renderHook(() => useRepos())
+    await waitFor(() => expect(result.current.repos).toHaveLength(1))
+    const initialCalls = fetchCalls.length
+
+    // Swap the response for the next fetch (the WS-triggered re-fetch).
+    setNextResponse([
+      { id: 'myrepo', url: 'git@github.com:owner/repo.git', vcs_kind: 'github', credential: { kind: 'pat', vault_key: 'GITHUB_PAT' } },
+      { id: 'other', url: 'git@github.com:owner/other.git', vcs_kind: 'github', credential: { kind: 'deploy_key', vault_key: 'GH_DEPLOY' } },
+    ])
+
+    // Fire the repos-changed invalidation (mirrors the WS frame dispatch).
+    act(() => {
+      for (const cb of reposChangedCbs) cb()
+    })
+    await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+    await waitFor(() => expect(result.current.repos).toHaveLength(2))
   })
 })

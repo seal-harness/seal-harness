@@ -257,6 +257,64 @@ export interface SkillInput {
   body?: string
 }
 
+// ── Source-control repo registry ─────────────────────────────────────────
+
+/** The credential kind for a source-control repo. */
+export type RepoCredentialKind = 'pat' | 'deploy_key' | 'machine_user'
+
+/** The credential descriptor stored in repos.toml — a vault key NAME, never
+ *  a secret value. The actual credential lives in the Seal vault. */
+export interface RepoCredential {
+  kind: RepoCredentialKind
+  vault_key: string
+  username?: string   // only for machine_user
+}
+
+/** A source-control repo returned by GET /api/repos + GET /api/repos/:id, and
+ *  accepted by POST /api/repos + PUT /api/repos/:id. Mirrors the backend
+ *  SourceRepo JSON (snake_case wire). No secret-value field ever appears. */
+export interface RepoInfo {
+  id: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+  /** The deploy-key public key (present iff credential.kind == deploy_key
+   *  and the key was generated). Public data — safe to display. */
+  deploy_key_public?: string
+  /** The path to the encrypted keyfile on the harness disk (ciphertext).
+   *  Present iff credential.kind == deploy_key + key was generated. */
+  keyfile_path?: string
+}
+
+/** The body for POST /api/repos + PUT /api/repos/:id. The id is required for
+ *  POST; PUT takes the id from the path. No new_id (ids are stable). */
+export interface RepoInput {
+  id?: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+  /** If true AND credential.kind == deploy_key, the server generates a new
+   *  deploy keypair (ssh-keygen) + stores the encrypted keyfile + the
+   *  passphrase in the vault. The response carries the public key. */
+  generate_key?: boolean
+}
+
+/** The response from GET /api/repos/:id/deploy-key + POST
+ *  /api/repos/:id/deploy-key/generate: the public key + host-aware setup
+ *  instructions. No private key ever appears. */
+export interface DeployKeyInfo {
+  public_key: string
+  setup_instructions: string
+}
+
+/** Human-readable label for each credential kind (mirrors the backend
+ *  credentialKindLabel + the /repo --cred help text). */
+export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
+  pat: 'Personal Access Token',
+  deploy_key: 'SSH Deploy Key',
+  machine_user: 'Bot Account',
+}
+
 // ── Transcript ─────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {

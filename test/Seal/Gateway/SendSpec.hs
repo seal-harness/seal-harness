@@ -28,6 +28,7 @@ import Seal.Providers.Class
 import Seal.Command.Spec (mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
+import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
@@ -91,6 +92,7 @@ mkSendDeps paths providerRef = do
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdRepoReg    = fakeRepoRegistryHandle
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends
@@ -109,6 +111,7 @@ mkSendDeps paths providerRef = do
         , sdLocks       = testLocks
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
+        , sdIsRemote    = False
         }
   pure sendDeps
 

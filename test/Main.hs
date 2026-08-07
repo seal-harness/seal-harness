@@ -51,6 +51,7 @@ import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SessionSpec
 import qualified Seal.Command.ServeSpec
 import qualified Seal.Command.SkillSpec
+import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
 import qualified Seal.Command.CallSpec
@@ -110,8 +111,12 @@ import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
+import qualified Seal.ISA.Ops.GitSpec
 import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.ISA.Ops.RegistrySpec
+import qualified Seal.SourceControl.RepoSpec
+import qualified Seal.SourceControl.RegistrySpec
+import qualified Seal.SourceControl.CloneSpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
 import qualified Seal.Phase6aSpec
@@ -192,6 +197,7 @@ main = hspec $ do
   Seal.Command.SessionSpec.spec
   Seal.Command.ServeSpec.spec
   Seal.Command.SkillSpec.spec
+  Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
   Seal.Command.CallSpec.spec
@@ -251,8 +257,12 @@ main = hspec $ do
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
+  Seal.ISA.Ops.GitSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
+  Seal.SourceControl.RepoSpec.spec
+  Seal.SourceControl.RegistrySpec.spec
+  Seal.SourceControl.CloneSpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec
   Seal.Phase6aSpec.spec

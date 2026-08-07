@@ -52,6 +52,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -87,12 +88,12 @@ import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), securityFilePath, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
@@ -105,7 +106,7 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
@@ -124,10 +125,15 @@ import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Prompt (injectAvailableSkills)
@@ -170,6 +176,7 @@ import Seal.Util.StrictIO (decodeFileStrict)
 data ChannelDeps = ChannelDeps
   { cdPaths      :: SealPaths
   , cdVault      :: VaultRuntime
+  , cdRepoReg    :: RepoRegistryHandle
   , cdProvider   :: ProviderRuntime
   , cdBackends   :: Backends
   , cdAutonomy   :: Policy.AutonomyLevel
@@ -201,30 +208,56 @@ data ChannelDeps = ChannelDeps
     -- ^ Load the current config (re-read per turn so config changes take
     -- effect without a restart). Used for default provider/model/agent
     -- when creating a new session for a conversation.
+  , cdIsRemote    :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode from the security config). Set once at startup from
+    -- @isJust (untrustedExecConfigFromSecurity secCfg)@. Threaded into
+    -- 'CloneDeps' so the deploy-key clone path knows to use agent
+    -- forwarding (@ssh -A@) + a remote @known_hosts@ temp file.
   , cdLogger      :: SealLogger
     -- ^ The shared logger for structured katip logging. Built once at
     -- startup via 'withSealLogger', threaded through all channel turns.
   }
 
+-- | Build 'Clone.CloneDeps' from a 'ChannelDeps' (the in-scope vault runtime
+-- + repo registry handle + paths). Used by the 2 'buildIsaRegistry' call
+-- sites + the 1 'buildChildRegistry' site in this module. The ssh-agent is
+-- real (production: 'mkRealSshAgentHandle'); the pinned host
+-- keys are compile-time-embedded.
+mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
+mkCloneDepsFromChannel deps = do
+  agentEnvRef <- newIORef Map.empty
+  pure Clone.CloneDeps
+    { Clone.cdVault = cdVault deps
+    , Clone.cdRepoReg = cdRepoReg deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
+    , Clone.cdIsRemote = cdIsRemote deps
+    }
+
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
 -- given config loader. Used by 'Seal.Command.Serve' and the standalone
 -- entry points. The 'tabsH' is the shared/unified handle (W4).
 newChannelDeps
-  :: SealPaths -> VaultRuntime -> ProviderRuntime -> Backends
+  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
   -> ApprovalCache -> IO RuntimeConfig
+  -> Bool
   -> TabsHandle
   -> SealLogger
   -> IO ChannelDeps
-newChannelDeps paths vault provider backends autonomy broker
-               harnessReg tmux httpMgr approvals loadCfg tabsH logger = do
+newChannelDeps paths vault repoReg provider backends autonomy broker
+               harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger = do
   cursors <- newCursorStore
   replies <- newReplyRegistry
   locks   <- newSessionLocks
   pure ChannelDeps
     { cdPaths      = paths
     , cdVault      = vault
+    , cdRepoReg    = repoReg
     , cdProvider   = provider
     , cdBackends   = backends
     , cdAutonomy   = autonomy
@@ -238,6 +271,7 @@ newChannelDeps paths vault provider backends autonomy broker
     , cdLocks       = locks
     , cdTabs        = tabsH
     , cdConfig      = loadCfg
+    , cdIsRemote    = isRemote
     , cdLogger      = logger
     }
 
@@ -716,13 +750,14 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
           mSystem'' <- if injectCatalog
                          then injectAvailableSkills sessionSkills mSystem'
                          else pure mSystem'
+          cloneDeps <- mkCloneDepsFromChannel deps
           let handleCaps = mkHandleCaps h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
                 deps paths sid handleCaps untrustedIO appEnv eCfg
                 wsroot operatorCeiling (smChannel meta) isaReg
               isaReg = buildIsaRegistry
-                rt backends wsroot sid operatorCeiling autonomy
+                rt cloneDeps backends wsroot sid operatorCeiling autonomy
                 (either (const Nothing) rcWeb eCfg)
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
@@ -882,6 +917,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
     eWd <- ensureSessionWorkdir paths sid
+    cloneDeps <- mkCloneDepsFromChannel deps
     let wsRoot = case eWd of
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -891,14 +927,18 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           deps paths sid caps untrustedIO appEnv eCfg
           wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg
         isaReg = buildIsaRegistry
-          (cdVault deps) (cdBackends deps) wsRoot sid operatorCeiling
+          (cdVault deps) cloneDeps (cdBackends deps) wsRoot sid operatorCeiling
           (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
-      Right r -> recordSkillLoadResult tHandle callOpName val r mChannel
+      Right r -> do
+        let opNm = case callOpName of OpName n -> n
+        if opNm == "GIT_PUSH"
+          then recordGitPushResult tHandle callOpName val r mChannel
+          else recordSkillLoadResult tHandle callOpName val r mChannel
       Left _  -> pure ()
     pure res
 
@@ -906,7 +946,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
 -- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set
 -- as the web and CLI paths.
 buildIsaRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
@@ -916,7 +956,7 @@ buildIsaRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
   -> ISA.Registry
-buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
+buildIsaRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -945,7 +985,10 @@ buildIsaRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp wsRoot autonomy
+      , setupRepoOp cloneDeps wsRoot autonomy
+      , gitFetchOp cloneDeps wsRoot autonomy
+      , gitPullOp cloneDeps wsRoot autonomy
+      , gitPushOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -1087,6 +1130,7 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
+      childCloneDeps <- mkCloneDepsFromChannel deps
       let childWsRoot = case eChildWd of
             Right wd -> WorkspaceRoot wd
             Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -1111,7 +1155,10 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childWsRoot (cdAutonomy deps)
+            , setupRepoOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitFetchOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitPullOp childCloneDeps childWsRoot (cdAutonomy deps)
+            , gitPushOp childCloneDeps childWsRoot (cdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg

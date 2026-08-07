@@ -39,15 +39,19 @@ module Seal.Tools.Exec.UntrustedIO
   , lineWindowFromText
   , buildRgCmd
   , shellQuote
+  , renderEnvPrefix
+  , mergeEnv
   ) where
 
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
 import Data.Char (isDigit)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory (renameFile)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess
@@ -65,7 +69,8 @@ import Seal.Tools.Args
   , mkShellCommand, textBinArg, textBinName, textSearchPattern, textShellCommand
   )
 import Seal.Tools.Exec.Remote
-  ( RemoteRunner (..), runRemoteShell, sshExecArgv
+  ( RemoteRunner (..), runRemoteShell
+  , runRemoteStdin, sshExecArgv, sshExecArgvForwarding
   )
 import Seal.Tools.Exec.Types
   ( ExecError (..), RemotePath, SshConfig (..), getRemotePath
@@ -125,6 +130,41 @@ data UntrustedIO = UntrustedIO
     -- <path>@). The path defaults to the workspace root. The result
     -- count is bounded by the operator ceiling. Returns matching lines
     -- or error.
+
+  , uioShellExecEnv :: [(String, String)] -> ShellCommand -> Maybe RemotePath
+                   -> IO (Either UntrustedErr Text)
+    -- ^ Like 'uioShellExec' but with env overrides MERGED over the
+    -- inherited environment (local arm) / @env VAR=val@-prefixed into the
+    -- command string (remote arm — portable: @ssh -A@ only forwards the
+    -- agent socket; @SendEnv@/@SetEnv@ need server @AcceptEnv@ which is
+    -- @none@ by default). Used by the git-credential opcodes to inject
+    -- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ for deploy-key ops (the
+    -- forwarded agent + pinned @known_hosts@, never the key bytes).
+
+  , uioShellExecGitEnv :: [(String, String)] -> Maybe BS.ByteString
+                   -> ShellCommand -> Maybe RemotePath
+                   -> IO (Either UntrustedErr Text)
+    -- ^ Like 'uioShellExecEnv' but with an optional @known_hosts@
+    -- content payload for the REMOTE deploy-key path. When the content
+    -- is 'Just' the remote arm: (1) writes it to a remote temp file via
+    -- @ssh ... -- tee <path>@, (2) rewrites @GIT_SSH_COMMAND@ in the
+    -- extras to add @UserKnownHostsFile=<remote temp path>@, (3) uses
+    -- @ssh -A@ (agent forwarding) so the remote @git@ can sign via the
+    -- forwarded @SSH_AUTH_SOCK@, (4) strips @SSH_AUTH_SOCK@ /
+    -- @SSH_AGENT_PID@ from the @env@ prefix (the forwarded socket
+    -- replaces them), (5) cleans up the remote temp file after. The
+    -- local arm ignores the content (the local temp file is already
+    -- written by 'resolveCloneTarget') + delegates to
+    -- 'uioShellExecEnv'. Used by 'cloneWithCredential' + 'runGitCommand'
+    -- for deploy-key ops (the only credential kind that needs the
+    -- agent + known_hosts).
+
+  , uioBinExecEnv :: [(String, String)] -> BinName -> [BinArg]
+                 -> IO (Either UntrustedErr Text)
+    -- ^ Like 'uioBinExec' but with env overrides (same merge strategy as
+    -- 'uioShellExecEnv'). Used by the PAT clone path (@http.extraHeader@
+    -- is an argv element, but the env override is still needed for
+    -- @GIT_TERMINAL_PROMPT=0@).
   }
 
 -- | Write mode for 'uioWriteFile': truncate + create (@'WMWrite'@, the
@@ -265,6 +305,21 @@ mkLocalUntrustedIO wsRoot =
         Right sp -> case mkShellCommand (buildRgCmd pat (Just sp)) of
           Left _   -> pure (Left (UeExec ExecNotImplemented))
           Right sh -> uioShellExec (mkLocalUntrustedIO wsRoot) sh Nothing
+  , uioShellExecEnv = \extras cmd mCwd ->
+      let argv = ["/bin/sh", "-c", T.unpack (textShellCommand cmd)]
+      in case mCwd of
+           Nothing -> runLocalFixedArgvEnv False argv (Just wsRootPath) extras
+           Just rp -> case mkSafePathRemote wsRoot (T.unpack (getRemotePath rp)) of
+             Left pe  -> pure (Left (UePath pe))
+             Right sp -> runLocalFixedArgvEnv False argv (Just (getSafePath sp)) extras
+  , uioShellExecGitEnv = \extras _knownHosts cmd mCwd ->
+      -- Local arm: the known_hosts temp file is already written by
+      -- resolveCloneTarget (cdIsRemote=False path); ignore the content
+      -- + delegate to uioShellExecEnv.
+      uioShellExecEnv (mkLocalUntrustedIO wsRoot) extras cmd mCwd
+  , uioBinExecEnv = \extras bin bargs ->
+      let argv = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
+      in runLocalFixedArgvEnv True argv (Just wsRootPath) extras
   }
 
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
@@ -327,21 +382,38 @@ patchLocal sp patch = do
 -- (the binary is not on PATH) when True; otherwise 127 is a normal
 -- command-not-found failure, returned via 'Right' with the exit code
 -- annotation. Any 'IOException' becomes 'Left ExecNotImplemented'.
+-- No env overrides — delegates to 'runLocalFixedArgvEnv' with @[]@.
 runLocalFixedArgv
   :: Bool -> [String] -> Maybe String -> IO (Either UntrustedErr Text)
-runLocalFixedArgv treat127AsMissing argv mCwd = do
+runLocalFixedArgv treat127AsMissing argv mCwd =
+  runLocalFixedArgvEnv treat127AsMissing argv mCwd []
+
+-- | Run a fixed-argv program locally with env overrides. The @extras@
+-- are MERGED over the inherited environment ('getEnvironment'): the
+-- process inherits the harness env (PATH, HOME, etc.) plus the overrides
+-- (e.g. @SSH_AUTH_SOCK@, @GIT_SSH_COMMAND@, @GIT_TERMINAL_PROMPT=0@). This
+-- is the local-arm env-override seam (W2) — the secret-free auth env for
+-- deploy-key ops. The overrides are NEVER secret bytes (only paths +
+-- non-secret values); the secret lives only in the forwarded agent's
+-- memory.
+runLocalFixedArgvEnv
+  :: Bool -> [String] -> Maybe String -> [(String, String)]
+  -> IO (Either UntrustedErr Text)
+runLocalFixedArgvEnv treat127AsMissing argv mCwd extras = do
   let (program, args) = case argv of
         (p : as) -> (p, as)
-        []       -> error "runLocalFixedArgv: empty argv (unreachable)"
+        []       -> error "runLocalFixedArgvEnv: empty argv (unreachable)"
+  inherited <- getEnvironment
+  let env' = Just (mergeEnv inherited extras)
       cp = (proc program args)
-             { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
-             , cwd = mCwd
-             }
+              { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
+              , cwd = mCwd, env = env'
+              }
   res <- try @IOException
          (withCreateProcess cp $ \_ mOut mErr ph -> do
             (hOut, hErr) <- case (mOut, mErr) of
               (Just a, Just b) -> pure (a, b)
-              _                -> error "runLocalFixedArgv: pipe creation failed (unreachable)"
+              _                -> error "runLocalFixedArgvEnv: pipe creation failed (unreachable)"
             out <- TE.decodeUtf8 <$> BS.hGetContents hOut
             err <- TE.decodeUtf8 <$> BS.hGetContents hErr
             ec  <- waitForProcess ph
@@ -352,6 +424,24 @@ runLocalFixedArgv treat127AsMissing argv mCwd = do
     Right (ExitFailure 127, _, _)
       | treat127AsMissing           -> Left (UeExec ExecNotImplemented)
     Right (ExitFailure n, out, err) -> Right (formatExitResult n out err)
+
+-- | Merge env overrides over the inherited environment. The @overrides@
+-- WIN on collision (per-op auth env must shadow any ambient value — e.g.
+-- a user's ambient @SSH_AUTH_SOCK@ must NOT override the per-op agent's
+-- socket, or git would sign with the user's ambient agent keys, breaking
+-- the per-op scoping invariant in design §4.6). The result is sorted by
+-- key for a deterministic order (mainly for test assertions —
+-- @CreateProcess.env@ is order-insensitive but a stable order makes the
+-- recording-fake + no-disk tests' diffs readable).
+--
+-- Implementation: @Map.union left right@ keeps @left@ on collision; putting
+-- @overrides@ as @left@ makes overrides win. Mirrors
+-- 'Seal.Git.Repo.readProcessBinaryCwdEnv' (which uses
+-- @Map.union (Map.fromList extras) (Map.fromList inherited)@ — same
+-- extras-win semantics).
+mergeEnv :: [(String, String)] -> [(String, String)] -> [(String, String)]
+mergeEnv inherited overrides =
+  Map.toList (Map.union (Map.fromList overrides) (Map.fromList inherited))
 
 -- | Format a non-zero exit result for the tool-call consumer. Combines
 -- stdout and stderr (if non-empty) and annotates the exit code.
@@ -467,6 +557,53 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
        in case mkSafePathRemote (wsRootFromCfg sshCfg) mRel of
             Left pe  -> pure (Left (UePath pe))
             Right sp -> runRemoteShellText runner sshCfg (buildRgCmd pat (Just sp))
+    , uioShellExecEnv = \extras cmd mCwd ->
+       let prefixCd p = "cd " <> shellQuote p <> " && "
+           envPrefix  = T.pack (renderEnvPrefix extras)
+       in case mCwd of
+         Nothing -> runRemoteShellText runner sshCfg
+                      (T.pack (prefixCd wsRootPath) <> envPrefix
+                               <> T.pack (T.unpack (textShellCommand cmd)))
+         Just rp ->
+           case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of
+             Left pe  -> pure (Left (UePath pe))
+             Right sp ->
+               let cdCmd = "cd " <> shellQuote (getSafePath sp) <> " && "
+               in runRemoteShellText runner sshCfg (T.pack cdCmd <> envPrefix <> T.pack (T.unpack (textShellCommand cmd)))
+    , uioShellExecGitEnv = \extras _mKnownHosts cmd mCwd ->
+        -- Remote deploy-key path (simple approach): ssh -A forwards the
+        -- SEAL agent to the remote machine. The remote git clone uses the
+        -- default ssh + the forwarded agent + the remote machine's default
+        -- known_hosts. No GIT_SSH_COMMAND, no remote known_hosts file.
+        -- Strip SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix
+        -- (the forwarded agent replaces them). Keep them in the LOCAL
+        -- ssh -A process env so the right agent is forwarded.
+        let localEnv = [ (k, v) | (k, v) <- extras
+                      , k == "SSH_AUTH_SOCK" || k == "SSH_AGENT_PID"
+                      ]
+            remoteExtras = [ (k, v) | (k, v) <- extras
+                           , k /= "SSH_AUTH_SOCK"
+                           , k /= "SSH_AGENT_PID"
+                           ]
+            remoteEnvPrefix = T.pack (renderEnvPrefix remoteExtras)
+        in case mCwd of
+          Nothing ->
+            let prefixCd = "cd " <> shellQuote wsRootPath <> " && "
+                fullCmd = T.pack prefixCd <> remoteEnvPrefix <> T.pack (T.unpack (textShellCommand cmd))
+            in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd
+          Just rp ->
+            case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of
+              Left pe  -> pure (Left (UePath pe))
+              Right sp ->
+                let cdCmd = "cd " <> shellQuote (getSafePath sp) <> " && "
+                    fullCmd = T.pack cdCmd <> remoteEnvPrefix <> T.pack (T.unpack (textShellCommand cmd))
+                in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd
+    , uioBinExecEnv = \extras bin bargs ->
+       let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
+           envPrefix = T.pack (renderEnvPrefix extras)
+           cdPart = T.pack ("cd " <> shellQuote wsRootPath <> " && ")
+           cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
+       in runRemoteShellText runner sshCfg (cdPart <> envPrefix <> cmd)
    }
 
 -- | A stub remote executor that fails-closed on every method (preserving
@@ -483,6 +620,9 @@ mkRemoteUntrustedIOStub = UntrustedIO
   , uioProcessList =             pure (Left (UeExec ExecNotImplemented))
   , uioProcessKill = \_         -> pure (Left (UeExec ExecNotImplemented))
   , uioSearchFiles = \_ _ _     -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecEnv = \_ _ _    -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExecEnv   = \_ _ _    -> pure (Left (UeExec ExecNotImplemented))
   }
 
 -- | The workspace root for remote confinement. The 'SshConfig' carries
@@ -506,6 +646,19 @@ shellQuote s = "'" <> go s <> "'"
     go ('\'':rest) = "'\\''" <> go rest
     go (c:rest)    = c : go rest
 
+-- | Render the env-override prefix for the remote arm: @env VAR='val'
+-- VAR2='val2' @ (each value single-quoted via 'shellQuote' so a value
+-- containing spaces / quotes / @$()@ is passed as a single token — the
+-- @env@ command sets them before the command runs). The @env@ prefix is
+-- portable (@ssh -A@ only forwards the agent socket; @SendEnv@/@SetEnv@
+-- need server @AcceptEnv@ which is @none@ by default — design §4.4). The
+-- caller appends the command after the prefix.
+renderEnvPrefix :: [(String, String)] -> String
+renderEnvPrefix extras =
+  if null extras
+    then ""
+    else "env " <> unwords [ k <> "=" <> shellQuote v | (k, v) <- extras ] <> " "
+
 -- | Smart-construct a 'ShellCommand', lifting a parse failure into an
 -- 'UntrustedErr' (defensive — the inputs are already validated, so this
 -- only fires on a NUL that slipped through). Returns 'Left' so the caller
@@ -514,6 +667,22 @@ shellCmd :: Text -> Either UntrustedErr ShellCommand
 shellCmd t = case mkShellCommand t of
   Left _  -> Left (UeExec ExecNotImplemented)
   Right c -> Right c
+
+-- | Like 'runRemoteShellForwardingText' but with local env overrides
+-- (MERGED over the inherited environment). Used by the remote deploy-key
+-- clone path so the local @ssh -A@ process uses the SEAL agent's
+-- @SSH_AUTH_SOCK@ (not the ambient one) — the forwarded agent then has
+-- the deploy key loaded.
+runRemoteShellForwardingEnvText
+  :: RemoteRunner -> SshConfig -> [(String, String)] -> Text
+  -> IO (Either UntrustedErr Text)
+runRemoteShellForwardingEnvText runner cfg localEnv cmdText =
+  case shellCmd cmdText of
+    Left e    -> pure (Left e)
+    Right cmd -> do
+      let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
+      res <- runRemoteEnv runner localEnv argv
+      pure (either (Left . UeExec) Right res)
 
 -- | Run a remote shell command built from a 'Text' command string. The
 -- 'shellCmd' parse failure is lifted to 'UeExec'; the 'runRemoteShell'

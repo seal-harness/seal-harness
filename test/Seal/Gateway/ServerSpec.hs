@@ -22,10 +22,13 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Command.Tab (noTabCloseNotifier)
+import Seal.Git.Repo (openConfigRepo)
 import System.FilePath ((</>))
 import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
@@ -51,6 +54,10 @@ mkDeps = do
   activeRef <- newIORef fakeMeta
   uiState <- newUiStateHandle fakePaths
   let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
+      repoRegH = RepoRegistryHandle
+        { rrhList   = pure (Right [])
+        , rrhMutate = \_ -> pure (Right ())
+        }
   pure (ApiDeps
     { adSessionRuntime = sr
     , adTabsHandle = tabsH
@@ -64,6 +71,10 @@ mkDeps = do
     , adDefaultAgent = pure Nothing
     , adBroker = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry = repoRegH
+    , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
     })
 
 spec :: Spec

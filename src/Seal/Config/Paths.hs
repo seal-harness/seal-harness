@@ -6,6 +6,9 @@ module Seal.Config.Paths
   , configFilePath
   , vaultFilePath
   , securityFilePath
+  , reposFilePath
+  , repoCloneStateDir
+  , repoKeysDir
   , sessionsRoot
   , sessionDir
   , sessionMetaPath
@@ -104,6 +107,28 @@ vaultFilePath paths = spConfig paths </> "vault" </> "vault.age"
 -- vault settings). Mode 0600, owned by the harness user.
 securityFilePath :: SealPaths -> FilePath
 securityFilePath paths = spHome paths </> "security.toml"
+
+-- | Absolute path to the source-control repo registry TOML file:
+-- @\<config\>\/repos.toml@.
+reposFilePath :: SealPaths -> FilePath
+reposFilePath paths = spConfig paths </> "repos.toml"
+
+-- | Private state dir for clone-time temp files (GIT_ASKPASS helper scripts,
+-- deploy-key keyfiles, managed known_hosts). Security invariants: created
+-- mode @0700@, never under @\/tmp@ (so secrets never touch a world-writable
+-- temp dir), never version-controlled (so secret bytes never land in git).
+repoCloneStateDir :: SealPaths -> FilePath
+repoCloneStateDir paths = spState paths </> "repos"
+
+-- | The harness-private dir holding the encrypted deploy-key keyfiles (rev 3
+-- of the design: the encrypted keyfile stays on the harness disk as
+-- ciphertext; the passphrase lives in the vault; @ssh-add@ decrypts the
+-- keyfile into agent memory at git-op time using the passphrase piped to its
+-- stdin). Path: @\<state\>\/repos\/keys@. Created mode @0700@ by the caller
+-- (the @ssh-keygen@ invocation in W5 creates it on first key generation).
+-- The encrypted keyfile is the per-repo artifact named by 'repoIdText'.
+repoKeysDir :: SealPaths -> FilePath
+repoKeysDir paths = repoCloneStateDir paths </> "keys"
 
 -- | Root directory holding one subdirectory per session: @\<state\>\/sessions@.
 sessionsRoot :: SealPaths -> FilePath

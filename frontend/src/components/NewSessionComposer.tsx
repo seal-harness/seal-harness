@@ -138,7 +138,7 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
             id="ns-repo"
             value={spec.repo}
             onChange={spec.setRepo}
-            options={spec.repoHistory}
+            options={spec.repoOptions}
             placeholder="git URL (optional — cloned into the session before turn one)"
             testId="ns-repo-list"
           />

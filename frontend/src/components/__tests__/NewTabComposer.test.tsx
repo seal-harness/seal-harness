@@ -40,7 +40,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     customModels: [],
     repo: '',
     setRepo: vi.fn(),
-    repoHistory: [],
+    repoOptions: [], refreshRepos: () => {},
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
