@@ -39,6 +39,7 @@ module Seal.Tools.Ssh.Agent
   ) where
 
 import Control.Exception (try)
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.=), (.:))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
@@ -68,6 +69,20 @@ data SshAgentEnv = SshAgentEnv
   { saeAuthSock :: String
   , saeAgentPid :: String
   }
+  deriving stock (Eq, Show)
+
+-- | JSON codec for persistence (the agent registry serializes these to
+-- @~\/.seal\/state\/ssh-agents\/registry.json@). The values are non-secret
+-- (a socket path + PID); the key material lives only in the agent's memory.
+instance ToJSON SshAgentEnv where
+  toJSON env = object [ "auth_sock" .= saeAuthSock env
+                      , "agent_pid" .= saeAgentPid env ]
+
+instance FromJSON SshAgentEnv where
+  parseJSON = withObject "SshAgentEnv" $ \o -> do
+    sock <- o .: "auth_sock"
+    pid  <- o .: "agent_pid"
+    pure SshAgentEnv { saeAuthSock = sock, saeAgentPid = pid }
 
 -- | The capability seam. Each field is an IO action the clone/git opcode
 -- calls; the smart constructors wire the real or fake implementation.

@@ -118,6 +118,7 @@ library
          Seal.Session.Log
           Seal.SourceControl.Repo
           Seal.SourceControl.Registry
+          Seal.SourceControl.AgentRegistry
           Seal.SourceControl.Clone
           Seal.SourceControl.GithubKeys
          Seal.Signal.Config
@@ -405,6 +406,7 @@ test-suite tests
         Seal.Session.LockSpec
         Seal.SourceControl.RepoSpec
         Seal.SourceControl.RegistrySpec
+        Seal.SourceControl.AgentRegistrySpec
         Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
         Seal.Tools.Ssh.AgentSpec
