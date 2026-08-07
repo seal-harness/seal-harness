@@ -17,6 +17,10 @@
 > **Status:** Pre-alpha. Active design and development.
 > This is a harness designed from the ground up for security and reliability
 > around the SealOp Instruction Set Architecture (ISA).
+**Seal's mission is to provide guarantees where guarantees are needed.**
+
+**Seals get the job done!**
+
 
 **Every agent action bears the Seal.**
 
