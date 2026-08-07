@@ -37,6 +37,8 @@
 module Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
   , noneBackend
+  , workdirAgentDefBackend
+  , unionAgentDefBackend
   , markdownAgentDefBackend
   , encodeAgentDef
   , decodeAgentDef
@@ -494,3 +496,105 @@ parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%
 -- | The epoch fallback for missing/unparseable timestamps.
 epochZero :: UTCTime
 epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
+----------------------------------------------------------------------------
+-- Workdir-scoped agent def backend (for .agents/ discovery from cloned repos)
+----------------------------------------------------------------------------
+
+-- | The conventional agent-def directories a cloned repo may carry.
+-- @.agents@ is the primary convention (mirrors @.skills@ for the
+-- agentskills.io format). The others are back-compat.
+workdirAgentDefConventions :: [FilePath]
+workdirAgentDefConventions = [ ".agents", ".seal/agents", "agents" ]
+
+-- | A read-only 'AgentDefBackend' that scans a session workdir for agent
+-- definitions shipped by cloned repositories. For each top-level directory
+-- in the workdir (a cloned repo), it checks the conventional agent-def
+-- locations (@.agents\/@, @.seal\/agents\/@, @agents\/@) and loads any
+-- agent defs there using the existing hybrid flat + DirScheme discovery
+-- ('listAgentDefs').
+--
+-- This backend is /read-only/: 'adbUpdate'/'adbDelete' are no-ops (repo-local
+-- agent defs are immutable from the model's perspective). 'adbRead' scans
+-- on every call (workdirs are small). Within-workdir collisions (two repos
+-- ship a def with the same id): the alphabetically-first repo wins
+-- (deterministic; same as the skill backend's policy).
+workdirAgentDefBackend :: FilePath -> IO AgentDefBackend
+workdirAgentDefBackend workdir = pure AgentDefBackend
+    { adbRead   = \aid -> do
+        defs <- listWorkdirAgentDefs workdir
+        pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+    , adbUpdate = \_ -> pure ()
+    , adbList   = listWorkdirAgentDefs workdir
+    , adbDelete = \_ -> pure ()
+    }
+
+-- | Enumerate every agent def found under the conventional locations across
+-- all top-level directories (cloned repos) in @workdir@. The
+-- alphabetically-first repo wins on id collisions (deterministic). Missing
+-- @workdir@ or empty workdirs yield @[]@.
+listWorkdirAgentDefs :: FilePath -> IO [AgentDef]
+listWorkdirAgentDefs workdir = do
+  exists <- doesDirectoryExist workdir
+  if not exists
+    then pure []
+    else do
+      dirs <- listWorkdirSubdirs workdir
+      perRepo <- forM dirs $ \repo -> do
+        let repoDir = workdir </> repo
+        concat <$> forM workdirAgentDefConventions (\conv -> do
+          let convDir = repoDir </> conv
+          cExists <- doesDirectoryExist convDir
+          if not cExists
+            then pure []
+            else listAgentDefs convDir)
+      let merge m [] = m
+          merge m (d:ds) = merge (Map.insertWith (\_new old -> old) (adId d) d m) ds
+          merged = merge Map.empty (concat perRepo)
+      pure (Map.elems merged)
+
+-- | Enumerate the immediate subdirectories of @dir@ (non-recursive, no
+-- hidden dirs), sorted for deterministic output. Mirrors the same function
+-- in 'Seal.Skills.Backend' (kept local to avoid a cross-module dependency).
+listWorkdirSubdirs :: FilePath -> IO [FilePath]
+listWorkdirSubdirs dir = do
+  exists <- doesDirectoryExist dir
+  if not exists
+    then pure []
+    else do
+      entries <- listDirectory dir
+      let visible = [e | e <- entries, not ("." `isPrefixOfStr` e)]
+      filterM'' (doesDirectoryExist . (dir </>)) (sortOn id visible)
+  where
+    isPrefixOfStr p s = take (length p) s == p
+
+-- | Local 'filterM' (mirrors the one in 'Seal.Skills.Backend').
+filterM'' :: (a -> IO Bool) -> [a] -> IO [a]
+filterM'' _ []     = pure []
+filterM'' f (x:xs) = do
+  ok <- f x
+  rest <- filterM'' f xs
+  pure (if ok then x : rest else rest)
+
+-- | A union of a workdir 'AgentDefBackend' (repo-local agent defs) and a
+-- user 'AgentDefBackend' (the on-disk @~/.seal/config/agents/@ store).
+-- Workdir-wins on id collisions: workdir shadows user. Reads check
+-- workdir first, then user. Listing merges both with workdir winning on
+-- collision. Writes go to the /user/ backend only (repo-local defs are
+-- immutable from the model's perspective).
+unionAgentDefBackend :: AgentDefBackend -> AgentDefBackend -> AgentDefBackend
+unionAgentDefBackend workdir user = AgentDefBackend
+    { adbRead   = \aid -> do
+        mWd <- adbRead workdir aid
+        case mWd of
+          Just d  -> pure (Just d)
+          Nothing -> adbRead user aid
+    , adbUpdate = adbUpdate user
+    , adbList   = do
+        wdDefs  <- adbList workdir
+        userDefs <- adbList user
+        let wdMap   = Map.fromList [(adId d, d) | d <- wdDefs]
+            userMap = Map.fromList [(adId d, d) | d <- userDefs]
+            merged  = Map.union wdMap userMap
+        pure (Map.elems merged)
+    , adbDelete = adbDelete user
+    }

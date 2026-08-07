@@ -300,6 +300,7 @@ test-suite tests
     other-modules:
         Seal.Core.ChannelKindSpec
         Seal.Core.MessageSourceSpec
+        Seal.RepoDiscoverySpec
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec

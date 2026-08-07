@@ -133,6 +133,7 @@ import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
+import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
@@ -287,6 +288,7 @@ main = hspec $ do
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
+  Seal.RepoDiscoverySpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
   Seal.Logging.LoggerSpec.spec
