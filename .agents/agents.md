@@ -18,7 +18,7 @@ hash-chained) IS the audit log. All derived state is rebuilt from transcript
 replay.
 
 **Mission:** Provide guarantees where guarantees are needed. The insecure path
-is harder to write than the secure path. That's the point.
+is harder to write than the secure path.
 
 **License:** FSL-1.1-MIT (source-available, converts to MIT two years per version).
 
@@ -50,14 +50,14 @@ human-vouched. AI writes code. Humans write the rules the code must follow.
 
 ### 4. TDD
 
-Red-green methodology. Write the failing test first, watch it fail, implement
-the minimum, watch it pass, commit. Security-critical pure functions get
-QuickCheck properties.
+Red-green methodology. Write the failing test first, watch it fail, commit the
+failure, implement the minimum, watch it pass, commit. Security-critical pure
+functions get QuickCheck properties.
 
 ### 5. No git force pushes. Ever.
 
 ### 6. When starting work on a new feature, check out a new branch first
-(e.g. `git checkout -b feat/<name>`).
+(e.g. `git checkout -b <name>`).
 
 ---
 
@@ -80,6 +80,8 @@ make run ARGS="--help"
 make serve      # rebuild frontend + launch gateway
 make ghci       # GHCi session on the library
 make shell      # drop into interactive dev shell
+
+make serve ARGS="--yolo" # Run the server with --yolo (safe if you have configured an external execution server)
 ```
 
 Raw equivalents:
@@ -184,7 +186,7 @@ local executor entirely.
 
 ## The ISA (Instruction Set Architecture)
 
-The ISA defines 77 opcodes in 16 groups. Every opcode is classified by **trust
+The ISA defines opcodes in groups. Every opcode is classified by **trust
 level**:
 
 | Trust Level | What it means | Where it runs |
