@@ -27,8 +27,7 @@ import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Map.Strict qualified as Map
+import Data.IORef (readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -53,7 +52,7 @@ import Seal.Config.File
   , WebConfig (..), rcWeb
   , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -113,6 +112,7 @@ import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
@@ -1016,12 +1016,12 @@ broadcastAskResolved mBroker sid qid resolution =
 -- compile-time-embedded.
 mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
 mkCloneDepsFromSend deps = do
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (sdPaths deps))
   pure Clone.CloneDeps
     { Clone.cdVault = sdVault deps
     , Clone.cdRepoReg = sdRepoReg deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdAgentRegistry = agentRegH
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
     , Clone.cdIsRemote = sdIsRemote deps

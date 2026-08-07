@@ -21,6 +21,7 @@ module Seal.SourceControl.AgentRegistry
   , arUpsert
   , arRemove
   , arLoad
+  , arIsLive
   , arProbeAndSweep
   , probeAgent
   , AgentStatus (..)
@@ -37,6 +38,8 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesFileExist, renameFile)
@@ -90,6 +93,11 @@ data AgentRegistryHandle = AgentRegistryHandle
   , arhCache  :: IORef (Maybe AgentRegistry)
     -- ^ In-memory cache of the last-loaded registry (avoids re-reading the
     -- file on every 'arLoad' when no writes have occurred in between).
+  , arhLive   :: IORef (Set Text)
+    -- ^ Keys of agents started in THIS process (not loaded from disk).
+    -- Reuse of a live agent skips the liveness probe (the agent was just
+    -- started — it's alive). Only agents loaded from a prior process's
+    -- persisted registry are probed.
   }
 
 -- | The registry file name (lives inside 'arhDir').
@@ -103,10 +111,12 @@ mkAgentRegistryHandle :: FilePath -> IO AgentRegistryHandle
 mkAgentRegistryHandle dir = do
   lock  <- newMVar ()
   cache <- newIORef Nothing
+  live  <- newIORef Set.empty
   pure AgentRegistryHandle
     { arhDir = dir
     , arhLock = lock
     , arhCache = cache
+    , arhLive = live
     }
 
 ----------------------------------------------------------------------------
@@ -153,13 +163,16 @@ saveToDisk dir m = do
 -- Mutation (lock-serialized)
 ----------------------------------------------------------------------------
 
--- | Insert or overwrite an agent entry (keyed by vault key).
+-- | Insert or overwrite an agent entry (keyed by vault key). Also marks
+-- the agent as live in this process (so subsequent reuse skips the liveness
+-- probe).
 arUpsert :: AgentRegistryHandle -> Text -> SshAgentEnv -> IO ()
 arUpsert h key env = withMVar (arhLock h) $ \_ -> do
   m <- loadFromDisk (arhDir h)
   let m' = Map.insert key env m
   saveToDisk (arhDir h) m'
   writeIORef (arhCache h) (Just (AgentRegistry m'))
+  modifyIORef' (arhLive h) (Set.insert key)
 
 -- | Remove an agent entry (no-op if absent).
 arRemove :: AgentRegistryHandle -> Text -> IO ()
@@ -168,6 +181,11 @@ arRemove h key = withMVar (arhLock h) $ \_ -> do
   let m' = Map.delete key m
   saveToDisk (arhDir h) m'
   writeIORef (arhCache h) (Just (AgentRegistry m'))
+  modifyIORef' (arhLive h) (Set.delete key)
+
+-- | Check if an agent was started in THIS process (live, no probe needed).
+arIsLive :: AgentRegistryHandle -> Text -> IO Bool
+arIsLive h key = Set.member key <$> readIORef (arhLive h)
 
 ----------------------------------------------------------------------------
 -- Probe + Sweep (liveness check + GC dead entries)

@@ -20,8 +20,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
-import Data.IORef (newIORef, readIORef)
-import Data.Map.Strict qualified as Map
+import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import Data.Text (Text)
@@ -54,7 +53,7 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
                           resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Git.Repo (ConfigRepo (..))
@@ -112,6 +111,7 @@ import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
@@ -295,7 +295,7 @@ runCliTui
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
   active0 <- readIORef (srActive sr)
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
@@ -303,7 +303,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         { Clone.cdVault = rt
         , Clone.cdRepoReg = repoReg
         , Clone.cdSshAgent = mkRealSshAgentHandle
-        , Clone.cdAgentRegistry = agentEnvRef
+        , Clone.cdAgentRegistry = agentRegH
         , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
         , Clone.cdKeyfilesDir = repoKeysDir paths
         , Clone.cdIsRemote = isRemote

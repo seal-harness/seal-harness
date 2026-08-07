@@ -10,7 +10,6 @@ import Control.Concurrent (forkIO)
 import Control.Monad (filterM)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
@@ -45,7 +44,7 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -65,6 +64,7 @@ import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
@@ -85,6 +85,11 @@ runServeMain :: AutonomyLevel -> SealLogger -> IO ()
 runServeMain autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
+  -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
+  -- a crashed/killed seal process so their stale entries don't accumulate
+  -- (#88). Live agents are reused (the key is still loaded).
+  startupAgentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep startupAgentRegH
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
@@ -126,7 +131,7 @@ runServeMain autonomy logger = do
   -- non-blocking vault-key advisory. The vault handle (mHandle) may be
   -- 'Nothing' if the vault is not configured — in that case /repo test
   -- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.
-  let repoSeam = mkRepoTestSeam rt repoRegH paths
+  repoSeam <- mkRepoTestSeam rt repoRegH paths
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -295,20 +300,21 @@ runServeMain autonomy logger = do
 -- 'Clone.resolveVaultHandle') and @rtsVaultList@ returns 'Left VaultLocked'
 -- (/repo info shows the locked advisory). Mirrors 'vaultGetByName' in
 -- 'Seal.ISA.Ops.Secret'.
-mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> RepoTestSeam
-mkRepoTestSeam rt repoRegH paths = RepoTestSeam
-  { rtsLsRemote  = \repo -> do
-      agentEnvRef <- newIORef Map.empty
-      let deps = Clone.CloneDeps
-            { Clone.cdVault = rt
-            , Clone.cdRepoReg = repoRegH
-            , Clone.cdSshAgent = mkRealSshAgentHandle
-            , Clone.cdAgentRegistry = agentEnvRef
-            , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-            , Clone.cdKeyfilesDir = repoKeysDir paths
-            , Clone.cdIsRemote = False
-            }
-      lsRemoteRepo deps repo
+mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> IO RepoTestSeam
+mkRepoTestSeam rt repoRegH paths = do
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  pure RepoTestSeam
+    { rtsLsRemote  = \repo -> do
+        let deps = Clone.CloneDeps
+              { Clone.cdVault = rt
+              , Clone.cdRepoReg = repoRegH
+              , Clone.cdSshAgent = mkRealSshAgentHandle
+              , Clone.cdAgentRegistry = agentRegH
+              , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , Clone.cdKeyfilesDir = repoKeysDir paths
+              , Clone.cdIsRemote = False
+              }
+        lsRemoteRepo deps repo
   , rtsVaultList = do
       mh <- readIORef (vrHandleRef rt)
       case mh of

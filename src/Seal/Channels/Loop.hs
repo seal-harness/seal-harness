@@ -52,7 +52,6 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -88,7 +87,7 @@ import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -132,6 +131,7 @@ import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
@@ -226,12 +226,12 @@ data ChannelDeps = ChannelDeps
 -- keys are compile-time-embedded.
 mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
 mkCloneDepsFromChannel deps = do
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (cdPaths deps))
   pure Clone.CloneDeps
     { Clone.cdVault = cdVault deps
     , Clone.cdRepoReg = cdRepoReg deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdAgentRegistry = agentRegH
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
     , Clone.cdIsRemote = cdIsRemote deps
