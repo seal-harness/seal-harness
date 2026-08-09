@@ -16,9 +16,9 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.ByteString.Lazy qualified as BL
 import Control.Exception (SomeException, try)
-import Control.Monad (void, replicateM)
+import Control.Monad (void, replicateM, when)
 import Data.CaseInsensitive qualified as CI
-import Data.Either (fromRight)
+import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
@@ -42,7 +42,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import System.Random (randomRIO)
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend, unionAgentDefBackend, deriveAgentsMdId)
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
 import Seal.Core.AllowList (AllowList (..))
@@ -50,7 +50,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sessionWorkdir)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, parseApprovalScope, pendingForSession )
@@ -187,7 +187,24 @@ apiApp deps req respond =
           Nothing -> respond (jsonOk (object ["ok" .= True, "target" .= ("" :: Text), "status" .= ("stubbed" :: Text)]))
           Just sendDeps -> case mkSessionId sid of
             Left e -> respond (errJson status400 ("invalid session id: " <> e))
-            Right sId -> respond =<< handleSetupRepoApi sendDeps sId url
+            Right sId -> do
+              -- Broadcast agent-defs-changed after a successful SETUP_REPO so
+              -- the frontend's session-scoped Agent dropdown re-fetches (the
+              -- clone may have introduced repo-local .agents/ defs). The
+              -- existing BeAgentDefsChanged event is reused (§3.6).
+              eRes <- handleSetupRepo sendDeps sId url
+              when (isRight eRes) $
+                broadcastAgentDefsChanged (adBroker deps)
+              respond (handleSetupRepoResponse eRes)
+    -- GET /api/sessions/:id/agents — the session-scoped agent-defs list
+    -- (workdir ⊕ user, workdir-wins). Returns 200 + AgentInfo[] with
+    -- isDefault per §3.2 (user default_agent > repo agents.md > none);
+    -- 404 for an unknown session (no session.json). The frontend's
+    -- Session setup Agent dropdown populates from this (W3).
+    (m', ["api", "sessions", sid, "agents"]) | m' == methodGet -> do
+      case mkSessionId sid of
+        Left e -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> respond =<< handleSessionAgents deps sId
     -- PUT /api/sessions/:id/description — set or clear the user-set
     -- display title for a session (the chat-header pencil). Body:
     -- {"description":"<text>"} (empty/missing/whitespace clears it).
@@ -525,16 +542,14 @@ parseRepoUrl body =
 -- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
 -- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
 -- url, 500 on a capability/workdir failure.
-handleSetupRepoApi :: SendDeps -> SessionId -> Text -> IO Response
-handleSetupRepoApi sendDeps sId url = do
-  eRes <- handleSetupRepo sendDeps sId url
+handleSetupRepoResponse :: Either Text Text -> Response
+handleSetupRepoResponse eRes =
   case eRes of
-    Left err -> pure (errJson status400 err)
-    Right msg ->
-      -- The opcode dispatched + recorded into the transcript. Return
-      -- ok:true with the opcode's message text so the frontend can show
-      -- it (and the user sees the result in the chat transcript too).
-      pure (jsonOk (object [ "ok" .= True, "message" .= msg ]))
+    Left err -> errJson status400 err
+    -- The opcode dispatched + recorded into the transcript. Return
+    -- ok:true with the opcode's message text so the frontend can show
+    -- it (and the user sees the result in the chat transcript too).
+    Right msg -> jsonOk (object [ "ok" .= True, "message" .= msg ])
 
 -- | Map an integer HTTP status code to a 'Status'. The send outcome carries
 -- an Int (so 'Seal.Gateway.Send' doesn't depend on @http-types@); this
@@ -716,6 +731,50 @@ handleSessionDescription deps sid body =
       ok <- updateSessionDescription (srPaths (adSessionRuntime deps)) sid mDesc
       if ok then triggerBroadcast deps >> pure (jsonOk (object ["ok" .= True]))
             else pure (errJson status404 "session not found")
+
+-- | Handle GET /api/sessions/:id/agents — the session-scoped agent-defs
+-- list (workdir ⊕ user, workdir-wins). Returns 200 + the unioned
+-- @AgentInfo[]@ with @isDefault@ per §3.2:
+--
+--   1. If the user's configured @default_agent@ resolves (id is in the
+--      union), that def is @isDefault=true@.
+--   2. Else if @agents-md@ (the repo's @.agents\/agents.md@) is in the
+--      union, it is @isDefault=true@ (the repo default fallback).
+--   3. Else no entry is marked default.
+--
+-- 404 for an unknown session (no @session.json@). 200 + user-only defs for
+-- a known session with an empty/missing workdir (the workdir contributes
+-- @[]@). Reuses 'agentInfoJson' for the wire shape so the frontend's
+-- 'AgentInfo'/'AgentDefInfo' types deserialize unchanged.
+handleSessionAgents :: ApiDeps -> SessionId -> IO Response
+handleSessionAgents deps sid = do
+  let paths = srPaths (adSessionRuntime deps)
+      metaPath = sessionMetaPath paths sid
+  exists <- doesFileExist metaPath
+  if not exists
+    then pure (errJson status404 "session not found")
+    else do
+      let wd = sessionWorkdir paths sid
+      workdirBackend <- workdirAgentDefBackend wd
+      let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)
+      defs <- adbList unionBackend
+      mDefaultId <- adDefaultAgent deps
+      -- §3.2 algorithm: user default_agent > repo agents.md > none.
+      let mUserDefault = mDefaultId >>= rightToMaybe . mkAgentDefId
+          mEffectiveDefault
+            | userDefaultResolves defs mUserDefault = mUserDefault
+            | Just agentsMd <- agentsMdInUnion defs = Just agentsMd
+            | otherwise = Nothing
+      pure (jsonLBS status200 (A.encode (map (agentInfoJson (fmap agentDefIdText mEffectiveDefault)) defs)))
+  where
+    userDefaultResolves ds (Just aid) = any ((== aid) . adId) ds
+    userDefaultResolves _ Nothing = False
+    agentsMdInUnion ds =
+      case rightToMaybe (mkAgentDefId deriveAgentsMdId) of
+        Just aid | any ((== aid) . adId) ds -> Just aid
+        _ -> Nothing
+    rightToMaybe (Right a) = Just a
+    rightToMaybe (Left _) = Nothing
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is

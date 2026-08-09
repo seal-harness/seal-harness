@@ -2,6 +2,7 @@
 {-# LANGUAGE LambdaCase #-}
 module Seal.Gateway.ApiSpec (spec) where
 
+import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
 import Control.Monad (replicateM_, void)
@@ -25,7 +26,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -2845,6 +2846,99 @@ spec = describe "Seal.Gateway.API" $ do
           Just (A.String s) -> s `shouldBe` "20260719-120000-001"
           _ -> expectationFailure "expected session_id string"
       _ -> expectationFailure "expected JSON object"
+
+  describe "/api/sessions/:id/agents (session-scoped agent defs)" $ do
+    -- Build a session.json + a workdir with a repo carrying
+    -- .agents/agents.md + a sub-agent, plus a user agent-def backend with
+    -- one def. Returns an Application ready to query. The temp dir lives
+    -- for the test's duration (manual cleanup via the returned IO action).
+    let mkSessionAgentsApp :: IO (Application, T.Text)
+        mkSessionAgentsApp = do
+          -- Use a fixed temp dir under /tmp (cleaned at start; OS cleans /tmp).
+          let tmp = "/tmp/seal-api-session-agents-test"
+              stateRoot = tmp </> "state"
+              cacheRoot = tmp </> "cache"
+              sessionRoot = stateRoot </> "sessions"
+          void (try (removeDirectoryRecursive tmp) :: IO (Either SomeException ()))
+          createDirectoryIfMissing True stateRoot
+          createDirectoryIfMissing True cacheRoot
+          createDirectoryIfMissing True sessionRoot
+          let sidTxt = "20260809-120000-sag"
+              sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          -- Persist a session.json so the 404 check passes.
+          let meta = fakeMeta { smId = sid }
+          saveSessionMeta (fakePaths { spState = stateRoot, spCache = cacheRoot }) meta
+          -- Build the workdir with a repo carrying .agents/ (protocol).
+          let wd = cacheRoot </> "workdirs" </> T.unpack sidTxt
+              repoDir = wd </> "my-repo"
+          createDirectoryIfMissing True (repoDir </> ".agents" </> "agents" </> "foo-agent")
+          writeFile (repoDir </> ".agents" </> "agents.md")
+            "---\nkind: agents\n---\nProject guidelines.\n"
+          writeFile (repoDir </> ".agents" </> "agents" </> "foo-agent" </> "agent.md")
+            "---\nname: Foo\nprovider: ollama\n---\nYou are foo.\n"
+          -- A user agent-def backend with one def "user-agent".
+          userAdb <- noneBackend
+          case mkAgentDefId "user-agent" of
+            Right uid -> adbUpdate userAdb (AgentDef
+              { adId = uid, adName = "User Agent", adProvider = ""
+              , adModel = ModelId "", adSystem = Just "user prompt"
+              , adTools = AllowAll
+              , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
+              , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
+              , adSession = mkSystemSessionId "manual" })
+            Left _ -> expectationFailure "invalid user-agent id"
+          -- Build ApiDeps with the user backend + no default_agent.
+          tabsH <- newTabsHandle
+          reg <- newHarnessRegistry
+          uiState <- newUiStateHandle fakePaths
+          skillsBackend <- Skill.noneBackend
+          repoRegH <- mkFakeRepoRegistryHandle
+          activeRef <- newIORef meta
+          let paths = fakePaths { spState = stateRoot, spCache = cacheRoot }
+              sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime = sr, adTabsHandle = tabsH
+                , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
+                , adAgentDefs = userAdb, adSkills = skillsBackend
+                , adProviders = pure knownProviders, adUiState = uiState
+                , adSend = Nothing, adDefaultAgent = pure Nothing
+                , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
+                , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+                }
+          pure (apiApp deps, sidTxt)
+
+    it "returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/" $ do
+      (app, sid) <- mkSessionAgentsApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let names = [ n | A.Object o <- V.toList xs
+                          , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o] ]
+          -- Workdir defs: agents-md, foo-agent. User def: user-agent.
+          names `shouldContain` ["agents-md", "foo-agent", "user-agent"]
+        _ -> expectationFailure "expected a JSON array"
+
+    it "marks agents-md as default when no user default_agent is configured (§3.2 case b)" $ do
+      (app, sid) <- mkSessionAgentsApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let defaults = [ (n, isDef)
+                       | A.Object o <- V.toList xs
+                       , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o]
+                       , Just (A.Bool isDef) <- [KeyMap.lookup (Key.fromText "isDefault") o]
+                       ]
+          -- Exactly one entry is marked default: agents-md.
+          filter snd defaults `shouldBe` [("agents-md", True)]
+        _ -> expectationFailure "expected a JSON array"
+
+    it "returns 404 for an unknown session id" $ do
+      app <- apiApp <$> mkDepsFor fakePaths
+      status <- runAppStatus app (testRequest methodGet ["api", "sessions", "99999999-000000-nope", "agents"])
+      status `shouldBe` 404
 
   it "sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id" $ do
     let (code, val) = sendOutcomeJson (SendSlash "/help output" Nothing)
