@@ -49,6 +49,7 @@ module Seal.Agent.Def.Backend
   , defaultDirAgentConfig
   , dirAgentConfigCodec
   , parseDirAgentConfig
+  , deriveAgentsMdId
   ) where
 
 import Control.Exception qualified as Exc
@@ -82,6 +83,7 @@ import Toml qualified
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText, isValidAgentDefId)
 import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+import Seal.Security.Path (WorkspaceRoot (..), mkSafePath, getSafePath)
 import Seal.Security.Policy (AllowList (..))
 import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList, splitFrontmatterRaw)
 
@@ -278,6 +280,30 @@ truncateSection limit txt
   | otherwise =
       T.take limit txt
         <> "\n[...truncated at " <> T.pack (show limit) <> " chars...]"
+
+-- | Read a file for the protocol scan (§3.8): reject files larger than
+-- 'maxBootstrapFileBytes' (defense-in-depth against OOM / huge symlink
+-- targets), then read + truncate to 'defaultSectionCharLimit'. Returns
+-- 'Nothing' on missing file, oversize, or read error. Mirrors the size
+-- guards in 'readSection' but for whole-file (not section-wise) reads.
+readBoundedFile :: FilePath -> IO (Maybe Text)
+readBoundedFile path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      size <- getFileSize path
+      if size > maxBootstrapFileBytes
+        then pure Nothing
+        else do
+          raw <- Exc.try (TIO.readFile path) :: IO (Either Exc.IOException Text)
+          case raw of
+            Left _ -> pure Nothing
+            Right txt ->
+              let trimmed = T.dropWhileEnd Char.isSpace txt
+              in if T.null (T.strip trimmed)
+                   then pure Nothing
+                   else pure (Just (truncateSection defaultSectionCharLimit trimmed))
 
 -- | Read a single bootstrap section file, applying size/empty/truncation
 -- rules. Returns 'Nothing' when the file is missing, empty
@@ -506,18 +532,44 @@ epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
 workdirAgentDefConventions :: [FilePath]
 workdirAgentDefConventions = [ ".agents", ".seal/agents", "agents" ]
 
+-- | The synthetic 'AgentDefId' text for the project-level @.agents/agents.md@
+-- (the @.agents Protocol@ project instructions file). The @-md@ suffix makes
+-- accidental collision with a subdir name unlikely; the existing
+-- flat-wins-on-conflict rule ('readAgentDef') is the real guard. The suffix
+-- is the invariant pinned by the QuickCheck property (§3.1).
+deriveAgentsMdId :: Text
+deriveAgentsMdId = "agents-md"
+
+-- | The friendly display name for the project-level @agents.md@ when its
+-- frontmatter has no @name@ field (so the synthetic id never leaks to the
+-- UI — §3.1).
+projectAgentsMdDisplayName :: Text
+projectAgentsMdDisplayName = "Project (agents.md)"
+
 -- | A read-only 'AgentDefBackend' that scans a session workdir for agent
 -- definitions shipped by cloned repositories. For each top-level directory
 -- in the workdir (a cloned repo), it checks the conventional agent-def
--- locations (@.agents\/@, @.seal\/agents\/@, @agents\/@) and loads any
--- agent defs there using the existing hybrid flat + DirScheme discovery
--- ('listAgentDefs').
+-- locations (@.agents\/@, @.seal\/agents\/@, @agents\/@).
+--
+-- For @.agents\/@, the [.agents Protocol](https://dotagentsprotocol.com) is
+-- recognized: when @.agents\/@ contains @agents.md@ OR an @agents\/@
+-- subdirectory, it is treated as a **protocol root** — the project-level
+-- @.agents\/agents.md@ is loaded as an agent def (id @agents-md@), and each
+-- @.agents\/agents\/\<id\>\/agent.md@ sub-agent is loaded (id = subdir name
+-- or frontmatter @id@). Otherwise @.agents\/@ falls back to the legacy
+-- hybrid flat + DirScheme discovery ('listAgentDefs') for back-compat.
+--
+-- @.seal\/agents@ and @agents@ always use the legacy discovery.
 --
 -- This backend is /read-only/: 'adbUpdate'/'adbDelete' are no-ops (repo-local
 -- agent defs are immutable from the model's perspective). 'adbRead' scans
 -- on every call (workdirs are small). Within-workdir collisions (two repos
 -- ship a def with the same id): the alphabetically-first repo wins
 -- (deterministic; same as the skill backend's policy).
+--
+-- Every file open in the protocol scan goes through 'mkSafePath' anchored at
+-- the repo's @.agents\/@ directory (symlink-escape confinement — §3.8) and
+-- is size-capped at 'maxBootstrapFileBytes' + 'truncateSection'.
 workdirAgentDefBackend :: FilePath -> IO AgentDefBackend
 workdirAgentDefBackend workdir = pure AgentDefBackend
     { adbRead   = \aid -> do
@@ -546,11 +598,143 @@ listWorkdirAgentDefs workdir = do
           cExists <- doesDirectoryExist convDir
           if not cExists
             then pure []
-            else listAgentDefs convDir)
+            else
+              -- Dispatch: .agents/ is protocol-aware; the rest use legacy.
+              if conv == ".agents"
+                then listAgentsDotAgents convDir
+                else listAgentDefs convDir)
       let merge m [] = m
           merge m (d:ds) = merge (Map.insertWith (\_new old -> old) (adId d) d m) ds
           merged = merge Map.empty (concat perRepo)
       pure (Map.elems merged)
+
+-- | Dispatch for the @.agents\/@ convention dir: protocol-root detection
+-- (§3.3). When @.agents\/@ contains @agents.md@ OR an @agents\/@
+-- subdirectory, scan the protocol allow-list (@agents\/@ sub-agents +
+-- @agents.md@ project def); otherwise fall back to legacy 'listAgentDefs'
+-- (DirScheme with @SOUL.md@\/@AGENTS.md@ bootstrap files).
+listAgentsDotAgents :: FilePath -> IO [AgentDef]
+listAgentsDotAgents agentsDir = do
+  isProto <- isProtocolRoot agentsDir
+  if isProto
+    then listProtocolAgentDefs agentsDir
+    else listAgentDefs agentsDir
+
+-- | The detection predicate (§3.3): @.agents\/@ is a protocol root iff it
+-- contains @agents.md@ (a file) OR an @agents\/@ subdirectory.
+isProtocolRoot :: FilePath -> IO Bool
+isProtocolRoot agentsDir = do
+  hasAgentsMd <- doesFileExist (agentsDir </> "agents.md")
+  hasAgentsSub <- doesDirectoryExist (agentsDir </> "agents")
+  pure (hasAgentsMd || hasAgentsSub)
+
+-- | The protocol allow-list scan (§3.3). Scans only @agents\/\<id\>\/agent.md@
+-- (sub-agents) + @agents.md@ (project def). Skips everything else
+-- (@skills\/@, @tasks\/@, @memories\/@, @mcp.json@). Every file open goes
+-- through 'mkSafePath' anchored at @agentsDir@ (§3.8) and is size-capped.
+listProtocolAgentDefs :: FilePath -> IO [AgentDef]
+listProtocolAgentDefs agentsDir = do
+  -- The project-level agents.md (id agents-md).
+  mProject <- loadProjectAgentDef agentsDir
+  -- Sub-agents under agents/<id>/agent.md.
+  let agentsSub = agentsDir </> "agents"
+  subExists <- doesDirectoryExist agentsSub
+  subDefs <- if not subExists
+    then pure []
+    else do
+      entries <- listDirectory agentsSub
+      let candidate e = do
+            let full = agentsSub </> e
+            isDir <- doesDirectoryExist full
+            pure (if isDir && isValidAgentDefId (T.pack e) then Just e else Nothing)
+      mEntries <- mapM candidate (sortOn id entries)
+      catMaybes <$> mapM (loadProtocolSubAgent agentsDir . T.pack) (catMaybes mEntries)
+  let allDefs = catMaybes [mProject] <> subDefs
+  pure (sortOn (agentDefIdText . adId) allDefs)
+
+-- | Load the project-level @.agents\/agents.md@ as an 'AgentDef' with id
+-- @agents-md@ (§3.1). The system prompt is the @agents.md@ body (frontmatter
+-- stripped). Frontmatter @name@ → @adName@; absent → the friendly
+-- 'projectAgentsMdDisplayName'. @provider@/@model@ honored when present.
+-- Returns 'Nothing' when the file is missing, unconfined (SafePath), or
+-- unparseable.
+loadProjectAgentDef :: FilePath -> IO (Maybe AgentDef)
+loadProjectAgentDef agentsDir = do
+  let rel = "agents.md"
+  ePath <- mkSafePath (WorkspaceRoot agentsDir) rel
+  case ePath of
+    Left _ -> pure Nothing  -- symlink escape or missing → skip
+    Right safePath -> do
+      let path = getSafePath safePath
+      mContent <- readBoundedFile path
+      pure (mContent >>= decodeProjectAgentsMd)
+
+-- | Decode the project-level @agents.md@ frontmatter + body into an
+-- 'AgentDef' (id @agents-md@). Frontmatter @kind@/@name@/@provider@/@model@
+-- honored; @kind@ is not required (its presence doesn't gate discovery —
+-- @agents.md@ is the canonical project instructions file regardless).
+decodeProjectAgentsMd :: Text -> Maybe AgentDef
+decodeProjectAgentsMd content =
+  case decodeDoc content of
+    (fm, body) ->
+      case mkAgentDefId deriveAgentsMdId of
+        Left _ -> Nothing
+        Right aid -> Just AgentDef
+          { adId = aid
+          , adName = fromMaybe projectAgentsMdDisplayName (fmLookup "name" fm)
+          , adProvider = fromMaybe "" (fmLookup "provider" fm)
+          , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
+          , adSystem = if T.null body then Nothing else Just body
+          , adTools = decodeTools fm
+          , adCreatedAt = epochZero
+          , adUpdatedAt = epochZero
+          , adSession = mkSystemSessionId "manual"
+          }
+
+-- | Load one protocol sub-agent from @agents\/\<id\>\/agent.md@ (§3.3). The
+-- id is the subdir name, unless frontmatter @id@ is present and valid (then
+-- frontmatter wins; invalid frontmatter @id@ → fall back to subdir name +
+-- warning). @enabled: false@ → 'Nothing' (skipped). Every file open goes
+-- through 'mkSafePath' anchored at @agentsDir@ (§3.8).
+loadProtocolSubAgent :: FilePath -> Text -> IO (Maybe AgentDef)
+loadProtocolSubAgent agentsDir subDirName = do
+  let rel = "agents" </> T.unpack subDirName </> "agent.md"
+  ePath <- mkSafePath (WorkspaceRoot agentsDir) rel
+  case ePath of
+    Left _ -> pure Nothing  -- symlink escape or missing → skip
+    Right safePath -> do
+      let path = getSafePath safePath
+      mContent <- readBoundedFile path
+      pure (mContent >>= \content -> decodeProtocolAgentMd subDirName content)
+
+-- | Decode a protocol @agent.md@ frontmatter + body into an 'AgentDef'.
+-- The id is the subdir name, unless frontmatter @id@ is present and valid
+-- (then frontmatter wins). @enabled@ absent → enabled (appears); explicit
+-- @enabled: false@ → 'Nothing' (skipped per §3.3). Frontmatter
+-- @name@/@provider@/@model@ honored when present.
+decodeProtocolAgentMd :: Text -> Text -> Maybe AgentDef
+decodeProtocolAgentMd subDirName content =
+  case decodeDoc content of
+    (fm, body) ->
+      case fmLookup "enabled" fm of
+        Just v | T.strip v == "false" -> Nothing  -- disabled → skip
+        _ ->
+          let idText = fromMaybe subDirName (fmLookup "id" fm >>= validId)
+          in case mkAgentDefId idText of
+               Left _ -> Nothing
+               Right aid -> Just AgentDef
+                 { adId = aid
+                 , adName = fromMaybe idText (fmLookup "name" fm)
+                 , adProvider = fromMaybe "" (fmLookup "provider" fm)
+                 , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
+                 , adSystem = if T.null body then Nothing else Just body
+                 , adTools = decodeTools fm
+                 , adCreatedAt = epochZero
+                 , adUpdatedAt = epochZero
+                 , adSession = mkSystemSessionId "manual"
+                 }
+  where
+    validId t = if isValidAgentDefId t then Just t else Nothing
 
 -- | Enumerate the immediate subdirectories of @dir@ (non-recursive, no
 -- hidden dirs), sorted for deterministic output. Mirrors the same function
