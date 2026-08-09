@@ -10,7 +10,7 @@ import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
 import {
   useSendMessage,
-  useAgents,
+  useSessionAgents,
   useTabs,
   useRecentSessions,
   useArchivedSessions,
@@ -227,7 +227,6 @@ export default function App() {
   const thinkingSessionIds = wsLive ? wsLists.thinkingSessionIds
     : usePollLists ? polledLists.thinkingSessionIds
     : []
-  const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
   const [section, setSection] = useState<TopSection>(sectionFromPath)
@@ -296,6 +295,12 @@ export default function App() {
     currentSessionId = pinnedSessionIdRef.current
   }
 
+  // Session-scoped agent defs (workdir ⊕ user, workdir-wins). When a session
+  // is focused, fetches /api/sessions/:id/agents (repo-local defs surface);
+  // otherwise fetches /api/agents (the global user store). Called
+  // unconditionally after `currentSessionId` is resolved (rules-of-hooks).
+  const { agents } = useSessionAgents(currentSessionId)
+
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   // `useTranscriptStream` is the SOLE source of transcript entries. It
   // performs the HTTP seed fetch + the WS subscription + the merge, so we
@@ -330,13 +335,22 @@ export default function App() {
   // next render once `agents` is available.
   useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
 
-  // Initialize selectedAgent from the default agent once agents load. We
-  // consult GET /api/agents/default directly (not the polled list's
-  // isDefault flag) so a just-changed default is reflected immediately —
-  // the polled list may still carry the stale isDefault for up to
-  // POLL_INTERVAL after a PUT /api/agents/default.
+  // Initialize selectedAgent from the default agent once agents load. When
+  // a session is focused, the `agents` list is the session-scoped union
+  // (workdir ⊕ user) and `isDefault` reflects §3.2 (user default_agent > repo
+  // agents.md > none) — so we read it directly. When no session is focused,
+  // `agents` is the global user store and we consult GET /api/agents/default
+  // (the user-configured default) so a just-changed default is reflected
+  // immediately (the polled list may lag by up to POLL_INTERVAL).
   useEffect(() => {
     if (selectedAgent !== null || agents.length === 0) return
+    if (currentSessionId) {
+      // Session-scoped: trust the endpoint's isDefault (§3.2).
+      const def = agents.find((a) => a.isDefault)
+      setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
+      return
+    }
+    // Global: consult the configured default via the dedicated endpoint.
     let cancelled = false
     void (async () => {
       const defId = await fetchDefaultAgent()
@@ -345,7 +359,7 @@ export default function App() {
       setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
     })()
     return () => { cancelled = true }
-  }, [agents, selectedAgent])
+  }, [agents, selectedAgent, currentSessionId])
 
   // Apply an agent change for the focused session: update local state AND
   // persist the binding to the backend so the next /send turn picks up the

@@ -1131,7 +1131,7 @@ function SessionSetup({
             <option value="">None</option>
             {agents.map((a) => (
               <option key={a.name} value={a.name}>
-                {a.name}{a.isDefault ? ' (default)' : ''}
+                {a.displayName ?? a.name}{a.isDefault ? ' (default)' : ''}
               </option>
             ))}
           </select>

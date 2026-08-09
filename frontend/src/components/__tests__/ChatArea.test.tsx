@@ -996,3 +996,46 @@ describe('providerFromRuntime', () => {
     expect(providerFromRuntime(undefined)).toBeNull()
   })
 })
+
+describe('SessionSetup Agent dropdown', () => {
+  // SessionSetup renders when messages=[] and onSend/agents/onAgentChange/
+  // onCustomPromptFile are all provided (the "new session, pick an agent" view).
+  function renderSessionSetup(agents: { name: string; isDefault: boolean; displayName?: string }[]) {
+    return render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={agents}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+      />,
+    )
+  }
+
+  it('renders repo-local agent displayNames when present (agents-md → "Project (agents.md)")', () => {
+    renderSessionSetup([
+      { name: 'agents-md', isDefault: true, displayName: 'Project (agents.md)' },
+      { name: 'foo-agent', isDefault: false, displayName: 'Foo Agent' },
+    ])
+    // The dropdown renders displayName for the label; the synthetic id
+    // 'agents-md' never leaks to the UI.
+    expect(screen.getByText('Project (agents.md) (default)')).toBeTruthy()
+    expect(screen.getByText('Foo Agent')).toBeTruthy()
+    expect(screen.queryByText('agents-md')).toBeNull()
+  })
+
+  it('falls back to name when displayName is absent', () => {
+    renderSessionSetup([{ name: 'bare-agent', isDefault: false }])
+    expect(screen.getByText('bare-agent')).toBeTruthy()
+  })
+
+  it('marks the isDefault entry with "(default)" in the label', () => {
+    renderSessionSetup([
+      { name: 'a', isDefault: false },
+      { name: 'b', isDefault: true },
+    ])
+    expect(screen.getByText('b (default)')).toBeTruthy()
+    expect(screen.getByText('a')).toBeTruthy()
+  })
+})
