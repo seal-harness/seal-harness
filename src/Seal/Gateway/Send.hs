@@ -18,6 +18,7 @@ module Seal.Gateway.Send
   , handleAnswerDelivery
   , handleAskCancel
   , webCallDispatcher
+  , webAskCaps
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
@@ -58,7 +59,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessi
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
-  , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
+  , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
@@ -982,14 +983,15 @@ broadcastNewEntries mBroker paths sid model createdAt =
 webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
 webAskCaps mBroker store sid = def
-  { ccPrompt = \(AskPrompt q _opts) -> do
-      outcome <- askHuman store sid q (\qid ->
+  { ccPrompt = \(AskPrompt q opts) -> do
+      outcome <- askHumanWithOptions store sid q opts (\qid ->
         case mBroker of
           Nothing -> pure ()
           Just broker ->
             broadcast broker (BeAsk sid (object
               [ "id" .= askIdText qid
               , "question" .= q
+              , "options" .= opts
               ])))
       pure (case outcome of
         Left _  -> "rejected"
