@@ -655,17 +655,141 @@ function ResultPreview({ text, isError }: { text: string; isError?: boolean }) {
   )
 }
 
+/** The ASK_HUMAN question form: renders one button per offered option (label
+ *  + description, vertical stack) plus an "Other" free-text textarea. The
+ *  human clicks a button or types + submits; the chosen text is delivered
+ *  via onAnswerText. Keyboard: Enter submits the textarea (Shift+Enter =
+ *  newline), Escape cancels. Render condition (AC13):
+ *  `opcode === "ASK_HUMAN" && options.length > 0` — the confirmation gate
+ *  (also ASK_HUMAN by opcode name but with no options) does NOT render this.
+ *  XSS-safe: label/description are React text children, never
+ *  dangerouslySetInnerHTML. */
+function AskHumanForm({
+  pendingQuestion,
+  onAnswerText,
+  onCancel,
+}: {
+  pendingQuestion: PendingQuestion
+  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
+  onCancel?: (qid: string) => void
+}) {
+  const [otherText, setOtherText] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const opts = pendingQuestion.options ?? []
+
+  const submit = (answer: string) => {
+    if (!onAnswerText || submitting) return
+    setSubmitting(true)
+    setError(null)
+    const result = onAnswerText(pendingQuestion.id, answer)
+    if (result && typeof result.then === 'function') {
+      void result.then((accepted) => {
+        if (!accepted) {
+          setSubmitting(false)
+          setError('Answer failed — try again')
+        }
+      })
+    } else {
+      // void return (older callback) — assume success; the WS ask_resolved
+      // unmounts the form.
+      setSubmitting(false)
+    }
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      const trimmed = otherText.trim()
+      if (trimmed) submit(trimmed)
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      onCancel?.(pendingQuestion.id)
+    }
+  }
+
+  const btnStyle = (color: string): React.CSSProperties => ({
+    background: 'var(--bg-sunken)',
+    border: `1px solid ${color}`,
+    color: color,
+  })
+
+  return (
+    <div data-testid="ask-human-form" className="rounded-md p-3 flex flex-col gap-2" style={{ background: 'rgba(124,108,246,0.06)', border: '1px solid var(--accent-primary)' }}>
+      <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+        {pendingQuestion.question}
+      </div>
+      <div className="flex flex-col gap-2">
+        {opts.map((opt, i) => (
+          <button
+            key={`${opt.label}-${i}`}
+            type="button"
+            role="radio"
+            aria-checked={false}
+            disabled={submitting}
+            className="rounded-lg px-3 py-2 text-left"
+            style={{ ...btnStyle('var(--accent-primary)'), width: '100%' }}
+            onClick={() => submit(opt.label)}
+          >
+            <div className="text-sm font-semibold">{opt.label}</div>
+            {opt.description && (
+              <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{opt.description}</div>
+            )}
+          </button>
+        ))}
+      </div>
+      <div className="flex flex-col gap-1">
+        <textarea
+          className="rounded-lg px-3 py-2 text-sm resize-none"
+          style={{ background: 'var(--bg-sunken)', border: '1px solid var(--border)', color: 'var(--text-primary)', outline: 'none', minHeight: '40px', width: '100%' }}
+          placeholder="Type your own answer…"
+          value={otherText}
+          disabled={submitting}
+          onChange={(e) => setOtherText(e.target.value)}
+          onKeyDown={onKeyDown}
+          rows={1}
+        />
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded-lg text-xs font-medium"
+            style={btnStyle('var(--accent-primary)')}
+            disabled={submitting || !otherText.trim()}
+            onClick={() => submit(otherText.trim())}
+          >
+            Submit
+          </button>
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded-lg text-xs font-medium"
+            style={btnStyle('var(--text-muted)')}
+            disabled={submitting}
+            onClick={() => onCancel?.(pendingQuestion.id)}
+          >
+            Cancel
+          </button>
+          {error && (
+            <span className="text-xs" style={{ color: 'var(--needs-input)' }}>{error}</span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ToolCallBlock({
   tc,
   anchorId,
   pendingQuestion,
   onAnswer,
+  onAnswerText,
   onCancel,
 }: {
   tc: ToolCallInfo
   anchorId: string
   pendingQuestion?: PendingQuestion
   onAnswer?: (qid: string, scope: string) => void
+  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -747,7 +871,7 @@ function ToolCallBlock({
           {hasResult && tc.result !== undefined && (
             <ResultPreview text={tc.result} isError={failed} />
           )}
-          {isPending && pendingQuestion && onAnswer && onCancel && (
+          {isPending && pendingQuestion && onAnswer && onCancel && (pendingQuestion.options === undefined || pendingQuestion.options.length === 0) && (
             <div data-testid="inline-approval" className="rounded-md p-3" style={{ background: 'rgba(255,193,7,0.06)', border: '1px solid var(--needs-input)' }}>
               <div className="text-xs font-semibold mb-2" style={{ color: 'var(--needs-input)' }}>
                 {'\u26A0'} Confirmation required
@@ -767,6 +891,9 @@ function ToolCallBlock({
                 </button>
               </div>
             </div>
+          )}
+          {isPending && pendingQuestion && (pendingQuestion.options?.length ?? 0) > 0 && onAnswerText && onCancel && (
+            <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
           )}
           {!hasResult && !isPending && (
             <div className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
@@ -830,10 +957,18 @@ function ToolDefsCollapsed({ block, anchorId }: { block: ToolDefsBlock; anchorId
   )
 }
 
-/** Check whether a pending question matches a tool call. The pending
- *  question's text has the format "Allow <NAME> <JSON>? [y/N] " — parse
- *  the name + input JSON and compare against the tool call's name + input. */
+/** Check whether a pending question matches a tool call. For the
+ *  confirmation gate, the pending question's text has the format
+ *  "Allow <NAME> <JSON>? [y/N] " — parse the name + input JSON and compare
+ *  against the tool call's name + input. For ASK_HUMAN with options, match
+ *  by opcode name (the question text is the agent's free-form question, not
+ *  the "Allow …?" format). The oldest-unmatched correlation (≥2 ASK_HUMAN
+ *  tool calls) is handled by the caller (MessageBlock) via the
+ *  matchedQuestionIds set. */
 function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
+  // ASK_HUMAN with options: match by opcode name (AC13/AC14).
+  if (tc.name === 'ASK_HUMAN' && pq.options && pq.options.length > 0) return true
+  // Confirmation gate: match via the "Allow <NAME> <JSON>?" regex.
   const m = pq.question.match(/^Allow\s+(\S+)\s+(\{.*\})\?/)
   if (!m) return false
   const opName = m[1]!
@@ -851,25 +986,38 @@ function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
 function MessageBlock({
   block,
   pendingQuestions,
+  matchedQuestionIds,
   onAnswer,
+  onAnswerText,
   onCancel,
 }: {
   block: MessageContent
   pendingQuestions?: PendingQuestion[]
+  matchedQuestionIds: Set<string>
   onAnswer?: (qid: string, scope: string) => void
+  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   if (block.toolCall) {
-    // Match this tool call to a pending question (if any). The pending
-    // question's text has the format "Allow <NAME> <JSON>? [y/N] " — parse
-    // the name + input and match against the tool call.
-    const pq = pendingQuestions?.find((q) => matchesToolCall(q, block.toolCall!))
+    // Match this tool call to a pending question. For the confirmation gate
+    // (the "Allow <NAME> <JSON>?" format), match via the regex. For
+    // ASK_HUMAN with options, match by opcode name (oldest-unmatched — the
+    // matchedQuestionIds set tracks which questions have already been
+    // claimed by an earlier tool call in this message, so ≥2 ASK_HUMAN tool
+    // calls each match a distinct question, AC14).
+    const pq = pendingQuestions?.find((q) => {
+      if (matchedQuestionIds.has(q.id)) return false
+      const matched = matchesToolCall(q, block.toolCall!)
+      if (matched) matchedQuestionIds.add(q.id)
+      return matched
+    })
     return (
       <ToolCallBlock
         tc={block.toolCall}
         anchorId={block.id ?? `tc-${block.toolCall.id}`}
         pendingQuestion={pq}
         onAnswer={onAnswer}
+        onAnswerText={onAnswerText}
         onCancel={onCancel}
       />
     )
@@ -936,6 +1084,7 @@ const ChatMessage = memo(function ChatMessage({
   sending,
   pendingQuestions,
   onAnswer,
+  onAnswerText,
   onCancel,
 }: {
   message: Message
@@ -943,12 +1092,18 @@ const ChatMessage = memo(function ChatMessage({
   sending?: boolean
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
+  onAnswerText?: (qid: string, answer: string) => Promise<boolean> | void
   onCancel?: (qid: string) => void
 }) {
   const anchorId = `msg-${message.id}`
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
   const [jsonOpen, setJsonOpen] = useState(false)
+  // Track which pending-question IDs have been matched to a tool call in
+  // this message's blocks, so ≥2 ASK_HUMAN tool calls each match a distinct
+  // (oldest-unmatched) question (AC14). Cleared on every render (rebuilt as
+  // the blocks map runs).
+  const matchedQuestionIds = useRef<Set<string>>(new Set())
 
   // Transient slash-command output bubble. Rendered in a muted, distinct
   // "command output" style with a "not saved" label so the user can tell it
@@ -1038,12 +1193,15 @@ const ChatMessage = memo(function ChatMessage({
         )}
       </div>
       <div className="text-sm" style={{ lineHeight: 'var(--leading-relaxed)' }}>
+        {(() => { matchedQuestionIds.current = new Set(); return null })()}
         {message.blocks.map((block, i) => (
           <MessageBlock
             key={block.id ?? i}
             block={block}
             pendingQuestions={pendingQuestions}
+            matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
+            onAnswerText={onAnswerText}
             onCancel={onCancel}
           />
         ))}
@@ -1776,6 +1934,7 @@ export function ChatArea({
   onModelChange,
   pendingQuestions,
   onAnswerQuestion,
+  onAnswerQuestionText,
   onCancelQuestion,
 }: {
   selectedAgent: Agent
@@ -1848,6 +2007,10 @@ export function ChatArea({
   /** Called when the human submits an approval scope for a pending
    *  question. The scope is "once", "for_session", "always", or "rejected". */
   onAnswerQuestion?: (qid: string, scope: string) => void
+  /** Called when the human submits a free-text answer (a chosen option's
+   *  label or a typed "Other" reply) to a pending ASK_HUMAN question.
+   *  Returns a promise that resolves true when accepted, false otherwise. */
+  onAnswerQuestionText?: (qid: string, answer: string) => Promise<boolean> | void
   /** Called when the human dismisses a pending question. */
   onCancelQuestion?: (qid: string) => void
 }) {
@@ -2094,6 +2257,7 @@ export function ChatArea({
                     sending={sending}
                     pendingQuestions={pendingQuestions}
                     onAnswer={onAnswerQuestion}
+                    onAnswerText={onAnswerQuestionText}
                     onCancel={onCancelQuestion}
                   />
                 </Profiler>

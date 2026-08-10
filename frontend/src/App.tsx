@@ -26,6 +26,7 @@ import {
   releaseHarness,
   destroyHarness,
   answerQuestion,
+  answerQuestionText,
   cancelQuestion,
   type SendResult,
   type NewTabResponse,
@@ -908,6 +909,10 @@ export default function App() {
               pendingQuestions={pendingQuestions}
               onAnswerQuestion={(qid, ans) => {
                 if (currentSessionId) void answerQuestion(currentSessionId, qid, ans)
+              }}
+              onAnswerQuestionText={(qid, answer) => {
+                if (currentSessionId) return answerQuestionText(currentSessionId, qid, answer)
+                return Promise.resolve(false)
               }}
               onCancelQuestion={(qid) => {
                 if (currentSessionId) void cancelQuestion(currentSessionId, qid)

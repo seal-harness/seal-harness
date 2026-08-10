@@ -1039,3 +1039,192 @@ describe('SessionSetup Agent dropdown', () => {
     expect(screen.getByText('a')).toBeTruthy()
   })
 })
+
+// ── AskHumanForm (W8) ─────────────────────────────────────────────────────
+
+describe('AskHumanForm', () => {
+  function makeAskMessage(opts: { label: string; description?: string }[], overrides: Partial<Message> = {}): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question: 'which branch?', options: opts },
+        },
+      }],
+      rawJson: '{}',
+      ...overrides,
+    }
+  }
+
+  function makePendingQuestion(opts: { label: string; description?: string }[], overrides: Partial<{ id: string; question: string; createdAt: string; options: { label: string; description?: string }[] }> = {}): {
+    id: string; question: string; createdAt: string; options: { label: string; description?: string }[]
+  } {
+    return {
+      id: 'q1',
+      question: 'which branch?',
+      createdAt: new Date().toISOString(),
+      options: opts,
+      ...overrides,
+    }
+  }
+
+  it('renders one button per option + the Other textarea', () => {
+    const messages = [makeAskMessage([
+      { label: 'main', description: 'the default branch' },
+      { label: 'develop', description: 'the integration branch' },
+    ])]
+    const pendingQuestions = [makePendingQuestion([
+      { label: 'main', description: 'the default branch' },
+      { label: 'develop', description: 'the integration branch' },
+    ])]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    expect(screen.getByText('main')).toBeTruthy()
+    expect(screen.getByText('develop')).toBeTruthy()
+    expect(screen.getByText('the default branch')).toBeTruthy()
+    expect(screen.getByPlaceholderText('Type your own answer…')).toBeTruthy()
+  })
+
+  it('clicking a stock button calls onAnswerQuestionText with the label', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByText('main'))
+    expect(onAnswerText).toHaveBeenCalledWith('q1', 'main')
+  })
+
+  it('typing + Enter submits the Other textarea', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
+    fireEvent.change(ta, { target: { value: 'my custom answer' } })
+    fireEvent.keyDown(ta, { key: 'Enter' })
+    expect(onAnswerText).toHaveBeenCalledWith('q1', 'my custom answer')
+  })
+
+  it('Shift+Enter inserts a newline (does NOT submit)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
+    fireEvent.change(ta, { target: { value: 'line1' } })
+    fireEvent.keyDown(ta, { key: 'Enter', shiftKey: true })
+    expect(onAnswerText).not.toHaveBeenCalled()
+  })
+
+  it('Escape cancels (calls onCancelQuestion)', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    const onCancel = vi.fn()
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={onCancel}
+      />,
+    )
+    const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
+    fireEvent.keyDown(ta, { key: 'Escape' })
+    expect(onCancel).toHaveBeenCalledWith('q1')
+  })
+
+  it('does NOT render the form for the confirmation gate (no options)', () => {
+    // A confirmation-gate question: "Allow SHELL_EXEC {...}? [y/N] " — no options.
+    const messages: Message[] = [{
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'SHELL_EXEC',
+          input: { command: 'ls' },
+        },
+      }],
+      rawJson: '{}',
+    }]
+    const pendingQuestions = [{
+      id: 'q1',
+      question: 'Allow SHELL_EXEC {"command":"ls"}? [y/N] ',
+      createdAt: new Date().toISOString(),
+    }]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestion={() => {}}
+        onCancelQuestion={() => {}}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+      />,
+    )
+    // The inline-approval panel renders (not the AskHumanForm).
+    expect(screen.getByTestId('inline-approval')).toBeTruthy()
+    expect(screen.queryByTestId('ask-human-form')).toBeNull()
+  })
+
+  it('XSS: a label with HTML is rendered as literal text (no <img>)', () => {
+    const xssLabel = '<img src=x onerror=alert(1)>'
+    const messages = [makeAskMessage([{ label: xssLabel }])]
+    const pendingQuestions = [makePendingQuestion([{ label: xssLabel }])]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The label is rendered as text, not as HTML — no <img> element.
+    expect(screen.queryByRole('img')).toBeNull()
+    expect(screen.getByText(xssLabel)).toBeTruthy()
+  })
+})
