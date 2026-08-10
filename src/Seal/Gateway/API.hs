@@ -53,9 +53,10 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sessionWorkdir)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
-  ( askIdText, parseApprovalScope, pendingForSession, PendingQuestionInfo (..) )
+  ( askIdText, pendingForSession, PendingQuestionInfo (..) )
 import Seal.Gateway.Send
-  ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
+  ( SendDeps (..), handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
+  , handleAskCancel, handleSend
   , handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
@@ -260,27 +261,32 @@ apiApp deps req respond =
         Nothing -> respond (jsonLBS status200 (A.encode ([] :: [Value])))
         Just _sendDeps -> respond =<< handleListQuestions deps sid
     -- POST /api/sessions/:id/questions/:qid/answer -> deliver the operator's
-    -- approval scope to a pending confirmation question, unblocking the
-    -- agent-loop thread. Body: {"scope":"once|for_session|always|rejected"}.
-    -- Returns 200 {ok:true, accepted:true} when the answer was accepted (the
-    -- question was pending), or 200 {ok:true, accepted:false} when the
-    -- question was already answered, cancelled, or unknown. A malformed ask
-    -- id or scope yields 400.
+    -- approval scope OR a free-text answer to a pending ASK_HUMAN question,
+    -- unblocking the agent-loop thread. Body: {"scope":"once|for_session|
+    -- always|rejected"} (the confirmation gate) OR {"answer":"<text>"} (an
+    -- ASK_HUMAN reply — a chosen option label or a typed "Other"). Both
+    -- fields present → 400 (ambiguous); neither → 400. Returns 200
+    -- {ok:true, accepted:true} when the answer was accepted, or
+    -- {ok:true, accepted:false} when already answered/cancelled/unknown.
+    -- A malformed ask id or body yields 400.
     (m', ["api", "sessions", sid, "questions", qid, "answer"]) | m' == methodPost -> do
       body <- collectBody req
       case adSend deps of
         Nothing -> respond (errJson status501 "ask/reply not wired")
         Just sendDeps -> case mkSessionId sid of
           Left e -> respond (errJson status400 ("invalid session id: " <> e))
-          Right sId -> case parseScopeBody body of
-            Nothing -> respond (errJson status400 "missing or invalid 'scope' field")
-            Just scopeTxt -> case parseApprovalScope scopeTxt of
-              Left e -> respond (errJson status400 e)
-              Right scope -> do
-                eRes <- handleAnswerDelivery sendDeps sId qid scope
-                case eRes of
-                  Left e     -> respond (errJson status400 e)
-                  Right acc -> respond (jsonOk (object ["ok" .= True, "accepted" .= acc]))
+          Right sId -> case parseAnswerBody body of
+            Left e -> respond (errJson status400 e)
+            Right (Left scope) -> do
+              eRes <- handleAnswerDelivery sendDeps sId qid scope
+              case eRes of
+                Left e     -> respond (errJson status400 e)
+                Right acc -> respond (jsonOk (object ["ok" .= True, "accepted" .= acc]))
+            Right (Right answerText) -> do
+              eRes <- handleAnswerTextDelivery sendDeps sId qid answerText
+              case eRes of
+                Left e     -> respond (errJson status400 e)
+                Right acc -> respond (jsonOk (object ["ok" .= True, "accepted" .= acc]))
     -- POST /api/sessions/:id/questions/:qid/cancel -> cancel a pending
     -- ASK_HUMAN question (the operator dismissed it). Returns 200
     -- {ok:true, cancelled:true} when the question was pending and is now
@@ -1626,9 +1632,9 @@ handleTranscript deps sidTxt =
     msDiff a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)
 
 -- | Handle GET /api/sessions/:id/questions. Returns the session's pending
--- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@), oldest
--- first. Requires 'adSend' (the 'AskReplyStore' lives on 'SendDeps'); returns
--- @[]@ when unwired or the session id is invalid.
+-- ASK_HUMAN questions as JSON objects (@id@/@question@/@createdAt@/@meta?@/
+-- @options?@), oldest first. Requires 'adSend' (the 'AskReplyStore' lives on
+-- 'SendDeps'); returns @[]@ when unwired or the session id is invalid.
 handleListQuestions :: ApiDeps -> Text -> IO Response
 handleListQuestions deps sidTxt =
   case mkSessionId sidTxt of
@@ -1640,28 +1646,18 @@ handleListQuestions deps sidTxt =
         let vals = map questionJson pending
         pure (jsonLBS status200 (A.encode vals))
   where
-    questionJson info = case pqiMeta info of
-      Nothing -> object
-        [ "id" .= askIdText (pqiId info)
-        , "question" .= pqiQuestion info
-        , "createdAt" .= pqiCreatedAt info
-        ]
-      Just meta -> object
-        [ "id" .= askIdText (pqiId info)
-        , "question" .= pqiQuestion info
-        , "createdAt" .= pqiCreatedAt info
-        , "meta" .= meta
-        ]
-
--- | Parse the @scope@ field from a POST .../questions/:qid/answer body.
--- Returns 'Nothing' when the body is missing/invalid or the field is absent.
-parseScopeBody :: BL.ByteString -> Maybe Text
-parseScopeBody body =
-  case A.decode body :: Maybe A.Value of
-    Just (A.Object o) -> case KeyMap.lookup (Key.fromText "scope") o of
-      Just (A.String t) -> Just t
-      _                 -> Nothing
-    _ -> Nothing
+    questionJson info =
+      let base = [ "id" .= askIdText (pqiId info)
+                 , "question" .= pqiQuestion info
+                 , "createdAt" .= pqiCreatedAt info
+                 ]
+          withMeta = case pqiMeta info of
+            Nothing -> base
+            Just m  -> base ++ ["meta" .= m]
+          withOptions = case pqiOptions info of
+            [] -> withMeta
+            os -> withMeta ++ ["options" .= os]
+      in object withOptions
 
 -- | Map an 'AgentDef' to the frontend's 'AgentInfo' JSON shape. @isDefault@
 -- is a UI convenience resolved by id against the configured

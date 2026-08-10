@@ -16,6 +16,8 @@ module Seal.Gateway.Send
   , handleSetupRepo
   , ensureTabForSession
   , handleAnswerDelivery
+  , handleAnswerTextDelivery
+  , parseAnswerBody
   , handleAskCancel
   , webCallDispatcher
   , webAskCaps
@@ -27,6 +29,8 @@ import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -60,7 +64,7 @@ import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
-  , approvalScopeText )
+  , approvalScopeText, parseApprovalScope )
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
@@ -1092,6 +1096,49 @@ handleAnswerDelivery deps sid qidTxt scope =
       when accepted $
         broadcastAskResolved (sdBroker deps) sid qid "answered"
       pure (Right accepted)
+
+-- | Deliver a free-text answer (a chosen option's label or a typed "Other"
+-- reply) to a pending ASK_HUMAN question. The 'ApprovalScope' is always
+-- 'ScopeOnce' (ASK_HUMAN replies are never cached). Returns 'True' if the
+-- answer was accepted. Broadcasts 'BeAskResolved' so the frontend dismisses
+-- the question. A 'Left' parse error is returned for a malformed ask id.
+handleAnswerTextDelivery
+  :: SendDeps -> SessionId -> Text -> Text -> IO (Either Text Bool)
+handleAnswerTextDelivery deps sid qidTxt answerText =
+  case parseAskId qidTxt of
+    Left e -> pure (Left e)
+    Right qid -> do
+      let reply = AskReply ScopeOnce answerText
+      accepted <- deliverAnswer (sdAskReply deps) qid reply
+      when accepted $
+        broadcastAskResolved (sdBroker deps) sid qid "answered"
+      pure (Right accepted)
+
+-- | Parse the POST .../questions/:qid/answer body. Accepts EITHER
+-- @{scope: "once|for_session|always|rejected"}@ (the confirmation gate) OR
+-- @{answer: "<text>"}@ (ASK_HUMAN). Returns 'Right (Left scope)' for the
+-- scope path, 'Right (Right answerText)' for the answer path. 'Left' with
+-- an error message when both fields are present (ambiguous), neither is
+-- present, or a value is malformed. This is the explicit both-reject parser
+-- (gate: Security #6) — a body with both @scope@ and @answer@ is rejected
+-- with 400, NOT silently delivering @answer@ with @scope@ semantics.
+parseAnswerBody :: BL.ByteString -> Either Text (Either ApprovalScope Text)
+parseAnswerBody body =
+  case A.decode body :: Maybe A.Value of
+    Just (A.Object o) ->
+      let mScope  = KeyMap.lookup (Key.fromText "scope") o
+          mAnswer = KeyMap.lookup (Key.fromText "answer") o
+      in case (mScope, mAnswer) of
+        (Just (A.String t), Nothing) ->
+          case parseApprovalScope t of
+            Right scope -> Right (Left scope)
+            Left e -> Left e
+        (Nothing, Just (A.String t)) -> Right (Right t)
+        (Just _, Just _) -> Left "ambiguous: send either {scope} or {answer}, not both"
+        (Nothing, Nothing) -> Left "missing 'scope' or 'answer' field"
+        (Just _, Nothing) -> Left "invalid 'scope' field (expected a string)"
+        (Nothing, Just _) -> Left "invalid 'answer' field (expected a string)"
+    _ -> Left "invalid JSON body"
 
 -- | Cancel a pending question for a session. Returns 'True' if the question
 -- was pending and is now cancelled. Broadcasts 'BeAskResolved' so the
