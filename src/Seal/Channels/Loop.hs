@@ -97,7 +97,8 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, askHuman, deliverNextAnswer )
+  ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswer
+  , formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
@@ -430,8 +431,9 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
-  , ccPrompt       = \(AskPrompt q _opts) -> do
-      outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+  , ccPrompt       = \(AskPrompt q opts) -> do
+      outcome <- askHumanWithOptions askReply sid q opts
+                   (\_qid -> chSend h (formatQuestionWithOptions q opts))
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
   , ccStreaming    = chStreaming h

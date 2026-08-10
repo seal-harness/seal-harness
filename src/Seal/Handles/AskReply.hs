@@ -59,6 +59,7 @@ module Seal.Handles.AskReply
   , validateOptions
   , askHumanWithOptions
   , PendingQuestionInfo (..)
+  , formatQuestionWithOptions
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -223,6 +224,32 @@ validateOptions opts
       | otherwise           = Right (opt : acc)
       where
         labelBytes = BS.length (TE.encodeUtf8 lbl)
+
+-- | Format a question + its options as a numbered list for chat channels
+-- (Signal, CLI TUI). When the options are non-empty, the format is:
+--
+-- @
+-- \<question\>
+--
+-- 1) main — the default branch
+-- 2) develop — ...
+--
+-- Reply with a number or type your own answer.
+-- @
+--
+-- When the options are empty, just the question text (today's behavior).
+-- Pure (no IO).
+formatQuestionWithOptions :: Text -> [QuestionOption] -> Text
+formatQuestionWithOptions question [] = question
+formatQuestionWithOptions question opts =
+  question
+  <> "\n\n"
+  <> T.intercalate "\n" (zipWith formatLine [1 :: Int ..] opts)
+  <> "\n\nReply with a number or type your own answer."
+  where
+    formatLine n (QuestionOption lbl desc)
+      | T.null desc = T.pack (show n <> ") ") <> lbl
+      | otherwise   = T.pack (show n <> ") ") <> lbl <> " — " <> desc
 
 -- | One pending question: the session it belongs to, the question text, the
 -- timestamp it was minted, optional metadata (opcode name + input for the

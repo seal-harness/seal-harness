@@ -118,8 +118,8 @@ import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel 
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, deliverNextAnswerAny, askHuman
-  , newApprovalCache )
+  ( ApprovalCache, AskReplyStore, deliverNextAnswerAny
+  , askHumanWithOptions, formatQuestionWithOptions, newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
@@ -313,9 +313,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = def
         { ccSend         = putStrLn . T.unpack
-        , ccPrompt       = \(AskPrompt prompt _opts) ->
+        , ccPrompt       = \(AskPrompt prompt opts) ->
             runInputT innerSettings $ do
-              mLine <- getInputLine (T.unpack prompt)
+              mLine <- getInputLine (T.unpack (formatQuestionWithOptions prompt opts))
               pure (maybe "" T.pack mLine)
         , ccPromptSecret = \prompt ->
             runInputT innerSettings $ do
@@ -620,8 +620,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
           let bgCaps = def
                 { ccSend = ccSend caps
-                , ccPrompt = \(AskPrompt q _opts) -> do
-                    outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
+                , ccPrompt = \(AskPrompt q opts) -> do
+                    outcome <- askHumanWithOptions askReply bgSid q opts
+                                 (\_qid -> ccSend caps (formatQuestionWithOptions q opts))
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
                 }

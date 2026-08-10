@@ -51,8 +51,8 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply
-  ( AskReplyStore, askHuman, deliverNextAnswer, newApprovalCache
-  , newAskReplyStore )
+  ( AskReplyStore, askHumanWithOptions, deliverNextAnswer
+  , newApprovalCache, newAskReplyStore, formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
@@ -113,13 +113,14 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
     let h = toHandle ch
         handleCaps = Data.Default.def
           { ccSend         = chSend h
-          , ccPrompt       = \(AskPrompt q _opts) -> do
+          , ccPrompt       = \(AskPrompt q opts) -> do
               -- Bind the pending question to the active session so the
               -- next inbound message from the peer (delivered via
               -- 'deliverNextAnswer' in the loop below) unblocks this thread.
               meta <- readIORef (srActive sr)
               let sid = smId meta
-              outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+              outcome <- askHumanWithOptions askReply sid q opts
+                           (\_qid -> chSend h (formatQuestionWithOptions q opts))
               pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
           , ccStreaming    = False  -- Signal: send accumulated text once, not per-delta
