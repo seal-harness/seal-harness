@@ -849,12 +849,23 @@ already exists, Slice 3 adds `reply_markup` to its existing `sendMessage`.)
    [1..length opts]`) resolves to the indexed label via
    `deliverNextAnswerResolved` (single STM transaction, no TOCTOU race); a
    non-numeric or out-of-range reply is delivered as-is ("Other").
-8. **AC8** — The Telegram channel renders an inline keyboard with one
-   button per option; `callback_data` = 8-char `AskId` prefix + `:` +
-   label; a button tap routes via `deliverAnswer` (by-id, NOT FIFO) +
-   `answerCallbackQuery` acknowledges the spinner; a typed reply routes
-   via `deliverNextAnswerResolved`. `tgSendWithKeyboard` does NOT set
-   `parse_mode`.
+ 8. **AC8** — The Telegram channel renders an inline keyboard with one
+    button per option; `callback_data` = 8-char `AskId` prefix + `:` +
+    label; a button tap routes via `deliverAnswer` (by-id, NOT FIFO); a
+    typed reply routes via `deliverNextAnswerResolved`.
+    `tgSendWithKeyboard` does NOT set `parse_mode`.
+    **Amended (Slice 3 v1):** The inline keyboard rendering in `ccPrompt` +
+    the `answerCallbackQuery` acknowledgment are **deferred to a follow-up**.
+    The `ChannelHandle` doesn't expose the raw Telegram chat id (needed for
+    `tgSendWithKeyboard`), and the `callback_query_id` isn't threaded through
+    `chReceive` (needed for `answerCallbackQuery`). The transport layer
+    (`TelegramButton`, `tgSendWithKeyboardViaApi`, `answerCallbackQueryViaApi`,
+    `parseTelegramUpdate` callback_query parsing) IS built (W1) — the
+    follow-up threads the chat id + callback_query_id through the channel
+    handle. The `onTelegramCallback` hook (by-id delivery) IS wired (W3).
+    For v1, the Telegram channel uses the generic numbered-list rendering
+    (from Slice 2) — the human types a number (resolved by
+    `deliverNextAnswerResolved`).
 9. **AC9** — `cabal build all` is `-Werror` clean (the `ccPrompt` arity
    migration compiles across all 5 channels + tests); `cabal test` green
    (including new QuickCheck properties + Vitest); `hlint src/ test/` clean.
