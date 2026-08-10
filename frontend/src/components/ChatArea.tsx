@@ -794,9 +794,14 @@ function ToolCallBlock({
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
-  const [expanded, setExpanded] = useState(targeted || pendingQuestion !== undefined)
+  // Auto-expand for the confirmation gate (inline-approval panel lives inside
+  // the expanded section). For ASK_HUMAN-with-options, the AskHumanForm
+  // renders OUTSIDE the collapsible part (attached to the box, always
+  // visible), so the box stays collapsed for conciseness.
+  const hasOptions = (pendingQuestion?.options?.length ?? 0) > 0
+  const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions))
 
-  useEffect(() => { if (targeted || pendingQuestion) setExpanded(true) }, [targeted, pendingQuestion])
+  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions])
 
   const summary = toolCallSummary(tc.input)
   const inputJson = (() => {
@@ -892,14 +897,20 @@ function ToolCallBlock({
               </div>
             </div>
           )}
-          {isPending && pendingQuestion && (pendingQuestion.options?.length ?? 0) > 0 && onAnswerText && onCancel && (
-            <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
-          )}
           {!hasResult && !isPending && (
             <div className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
               Awaiting result\u2026
             </div>
           )}
+        </div>
+      )}
+      {/* The AskHumanForm renders OUTSIDE the collapsible section, attached
+          to the box but always visible — so the tool-call box can stay
+          collapsed for conciseness (AC13: opcode === 'ASK_HUMAN' &&
+          options.length > 0). */}
+      {isPending && pendingQuestion && (pendingQuestion.options?.length ?? 0) > 0 && onAnswerText && onCancel && (
+        <div className="px-3 pb-3">
+          <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
         </div>
       )}
     </div>
