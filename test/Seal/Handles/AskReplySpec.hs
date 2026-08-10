@@ -4,16 +4,20 @@ module Seal.Handles.AskReplySpec (spec) where
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (uncons)
+import Data.Either (isLeft)
+import Data.List (nub, uncons)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Test.Hspec
+import Test.QuickCheck
 
 import Seal.Core.Types (mkSessionId)
 import qualified Seal.Core.Types as CT (SessionId)
 import Seal.Handles.AskReply
   ( ApprovalScope (..), AskOutcome (..), AskReply (..), askHuman, askIdText
   , cancelAsk, cancelSessionAsks, deliverAnswer, deliverNextAnswer, lookupAsk
-  , newAskReplyStore, parseAskId, pendingForSession )
+  , newAskReplyStore, parseAskId, pendingForSession
+  , QuestionOption (..), validateOptions )
 
 -- | A valid UUID v4 text for tests that need a pre-known id (not minted).
 dummyUuidText :: Text
@@ -285,3 +289,49 @@ spec = describe "Seal.Handles.AskReply" $ do
 
     it "rejects an empty string" $ do
       parseAskId "" `shouldBe` Left "invalid AskId: "
+
+  describe "QuestionOption validation" $ do
+    let genLabel = do
+          n <- chooseInt (1, 64)
+          chars <- vectorOf n (elements (['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9'] ++ "-_/."))
+          pure (T.pack chars)
+        genDesc = do
+          chars <- listOf (elements (['a'..'z'] ++ " "))
+          pure (T.pack chars)
+        genOption = QuestionOption <$> genLabel <*> genDesc
+        genOptions = chooseInt (1, 8) >>= \n -> vectorOf n genOption
+        genUniqueOptions = genOptions `suchThat` \opts ->
+          let labels = map qoLabel opts in length labels == length (nub labels)
+
+    it "accepts a valid non-empty list of unique-label options" $
+      property $ forAll genUniqueOptions $ \opts ->
+        validateOptions opts == Right opts
+
+    it "rejects an empty list" $
+      validateOptions [] `shouldBe` Left "options must be non-empty"
+
+    it "rejects a list longer than 8" $ do
+      let opts = [QuestionOption (T.pack ("l" <> show n)) "" | n <- [1 :: Int .. 9]]
+      validateOptions opts `shouldSatisfy` isLeft
+
+    it "rejects an empty label" $
+      validateOptions [QuestionOption "" "desc"] `shouldSatisfy` isLeft
+
+    it "rejects a label exceeding 64 bytes" $ do
+      let longLabel = T.replicate 65 "x"
+      validateOptions [QuestionOption longLabel ""] `shouldSatisfy` isLeft
+
+    it "rejects a label whose UTF-8 encoding exceeds 64 bytes (non-ASCII)" $ do
+      let longUnicode = T.replicate 33 "é"
+      validateOptions [QuestionOption longUnicode ""] `shouldSatisfy` isLeft
+
+    it "rejects duplicate labels (case-sensitive)" $
+      validateOptions
+        [ QuestionOption "main" "first"
+        , QuestionOption "main" "second"
+        ]
+        `shouldSatisfy` isLeft
+
+    it "rejects a description exceeding 200 chars" $ do
+      let longDesc = T.replicate 201 "d"
+      validateOptions [QuestionOption "ok" longDesc] `shouldSatisfy` isLeft

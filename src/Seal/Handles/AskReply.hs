@@ -53,6 +53,8 @@ module Seal.Handles.AskReply
   , lookupAsk
   , checkApproval
   , recordApproval
+  , QuestionOption (..)
+  , validateOptions
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -60,16 +62,19 @@ import Control.Concurrent.STM
   ( TMVar, TVar, atomically, modifyTVar', newEmptyTMVarIO, newTVarIO, readTVar, readTVarIO
   , takeTMVar, tryPutTMVar, writeTVar, tryReadTMVar )
 import Control.Monad (void)
-import Data.Aeson (Value, ToJSON (..))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.!=), (.=))
+import Data.Aeson.Key (fromText)
 import Data.Bits ((.&.), (.|.), complement)
+import Data.ByteString qualified as BS
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.List (sortBy)
+import Data.List (nub, sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Data.UUID.Types qualified as U
 import Data.Word (Word64)
@@ -155,6 +160,64 @@ data AskReply = AskReply
   { arScope :: ApprovalScope
   , arText  :: Text
   } deriving stock (Eq, Show)
+
+-- | One discrete choice offered to the human alongside an @ASK_HUMAN@
+-- question. The 'qoLabel' is the value returned to the agent when the human
+-- picks this choice; the 'qoDescription' is a one-line explanation shown
+-- alongside the button (may be empty). Labels MUST be non-empty, ≤ 64
+-- bytes (UTF-8), and unique within one question's offer set — enforced by
+-- 'validateOptions'.
+data QuestionOption = QuestionOption
+  { qoLabel       :: !Text
+  , qoDescription :: !Text
+  } deriving stock (Eq, Show, Generic)
+
+-- | ToJSON for 'QuestionOption' — encodes as @{label, description}@ (the
+-- 'qo' field prefix stripped so the wire shape matches the LLM schema + the
+-- frontend 'QuestionOption' type).
+instance ToJSON QuestionOption where
+  toJSON (QuestionOption lbl desc) = object
+    [ fromText "label" .= lbl
+    , fromText "description" .= desc
+    ]
+
+-- | FromJSON for 'QuestionOption' — decodes from @{label, description}@.
+-- 'description' defaults to empty when absent.
+instance FromJSON QuestionOption where
+  parseJSON = withObject "QuestionOption" $ \o -> QuestionOption
+    <$> o .: fromText "label"
+    <*> o .:? fromText "description" .!= ""
+
+-- | Validate a list of 'QuestionOption's for an @ASK_HUMAN@ invocation.
+-- Pure (no IO); returns 'Right' the validated list on success, 'Left' an
+-- error message on failure. Rules:
+--
+-- 1. Non-empty list (1 ≤ length).
+-- 2. At most 8 options.
+-- 3. Each 'qoLabel' non-empty and ≤ 64 bytes (UTF-8; 'Data.Text.length'
+--    counts code points, so we measure bytes explicitly to bound non-ASCII).
+-- 4. Each 'qoDescription' ≤ 200 chars.
+-- 5. Labels unique within the list (case-sensitive).
+validateOptions :: [QuestionOption] -> Either Text [QuestionOption]
+validateOptions [] = Left "options must be non-empty"
+validateOptions opts
+  | length opts > 8 = Left "options must be at most 8"
+  | otherwise = case foldr checkOpt (Right []) opts of
+      Left e -> Left e
+      Right _ ->
+        let labels = map qoLabel opts
+        in if length labels /= length (nub labels)
+             then Left "option labels must be unique"
+             else Right opts
+  where
+    checkOpt _ (Left e) = Left e
+    checkOpt opt@(QuestionOption lbl desc) (Right acc)
+      | T.null lbl          = Left "option label must be non-empty"
+      | labelBytes > 64     = Left ("option label exceeds 64 bytes: " <> lbl)
+      | T.length desc > 200 = Left ("option description exceeds 200 chars: " <> qoLabel opt)
+      | otherwise           = Right (opt : acc)
+      where
+        labelBytes = BS.length (TE.encodeUtf8 lbl)
 
 -- | One pending question: the session it belongs to, the question text, the
 -- timestamp it was minted, optional metadata (opcode name + input for the
