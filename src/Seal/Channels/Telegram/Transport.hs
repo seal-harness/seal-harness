@@ -8,11 +8,14 @@
 module Seal.Channels.Telegram.Transport
   ( TelegramTransport (..)
   , TelegramUpdate (..)
+  , TelegramButton (..)
   , BotCommand (..)
   , mkMockTelegramTransport
   , mkRealTelegramTransport
   , parseTelegramUpdate
   , chunkMessage
+  , tgSendWithKeyboardViaApi
+  , answerCallbackQueryViaApi
   ) where
 
 import Control.Concurrent.STM
@@ -52,6 +55,10 @@ data TelegramTransport = TelegramTransport
     -- close/failure (the reader thread stops).
   , tgSend        :: Text -> Text -> IO ()
     -- ^ Send a message: chat id, body. Calls the Bot API @sendMessage@.
+  , tgSendWithKeyboard :: Text -> Text -> [[TelegramButton]] -> IO ()
+    -- ^ Send a message with an inline keyboard: chat id, body, keyboard
+    -- rows. Calls @sendMessage@ with @reply_markup@. Does NOT set
+    -- @parse_mode@ (gate: Security #3 — plain text).
   , tgSetCommands :: [BotCommand] -> IO ()
     -- ^ Register the bot's command menu via @setMyCommands@ (auto-completion).
   , tgClose       :: IO ()
@@ -65,17 +72,39 @@ data BotCommand = BotCommand
   , bcDescription :: Text   -- ^ short description, ≤ 256 chars
   } deriving stock (Eq, Show)
 
+-- | One inline-keyboard button: the visible text + the callback_data (sent
+-- back to the bot when the human taps the button). The callback_data is
+-- @\"<8hexAskIdPrefix>:<label>\"@ (≤ 64 bytes; the label byte-bound is 55).
+data TelegramButton = TelegramButton
+  { tbText         :: !Text
+  , tbCallbackData :: !Text
+  } deriving stock (Eq, Show)
+
+-- | ToJSON for 'TelegramButton' — encodes as @{\"text\":..., \"callback_data\":...}@.
+instance A.ToJSON TelegramButton where
+  toJSON (TelegramButton txt cbd) = A.object
+    [ "text" A..= txt
+    , "callback_data" A..= cbd
+    ]
+
 -- | A parsed inbound Telegram update: the conversation id (from chat.id),
 -- the sender's user id (from from.id), and the message body. The
 -- conversation id is server-derived from authenticated transport metadata
 -- (the Telegram @chat.id@ field), never read from the message body. The
 -- raw @chatId@ is also carried so the channel can address replies without
 -- stripping the @tg:@ conversation-id prefix.
+--
+-- When the update is a @callback_query@ (a button tap), 'tuCallbackData'
+-- is @Just data@ + 'tuCallbackId' is @Just id@; 'tuBody' is the
+-- callback_data (the loop uses it to route). When the update is a regular
+-- @message@, both are @Nothing@ + 'tuBody' is the message text.
 data TelegramUpdate = TelegramUpdate
   { tuConversationId :: ConversationId
   , tuChatId          :: Text
   , tuSender          :: UserId
   , tuBody            :: Text
+  , tuCallbackData    :: Maybe Text  -- ^ @Just data@ for callback_query; @Nothing@ for message
+  , tuCallbackId      :: Maybe Text  -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@ for message
   } deriving stock (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -102,6 +131,7 @@ mkMockTelegramTransport scripted = do
               Just u  -> pure (Right u)
               Nothing -> pure (Left "telegram inbox empty")
         , tgSend = \c b -> modifyIORef' capRef ((c, b) :)
+        , tgSendWithKeyboard = \_c _b _kb -> pure ()  -- mock: no-op (tests can capture via a separate ref if needed)
         , tgSetCommands = writeIORef cmdRef
         , tgClose = pure ()
         }
@@ -133,6 +163,7 @@ mkRealTelegramTransport token mgr = do
   pure TelegramTransport
     { tgReceive = fillAndReceive buffer offsetRef
     , tgSend = sendViaApi mgr token
+    , tgSendWithKeyboard = tgSendWithKeyboardViaApi mgr token
     , tgSetCommands = \cmds -> do
         eRes <- setMyCommandsViaApi mgr token cmds
         case eRes of
@@ -212,17 +243,29 @@ updateId v =
       _ -> Left "update missing update_id"
     _ -> Left "update not an object"
 
--- | Parse a raw Telegram update into a 'TelegramUpdate'. Extracts the
--- @message.chat.id@ (conversation id), @message.from.id@ (sender), and
--- @message.text@ (body). Skips non-message updates (no @message@ field)
--- with a 'Left'.
+-- | Parse a raw Telegram update into a 'TelegramUpdate'. Handles two shapes:
+--
+-- 1. @message@ — a regular text message. 'tuCallbackData'/'tuCallbackId' are
+--    @Nothing@; 'tuBody' is the message text.
+-- 2. @callback_query@ — a button tap on an inline keyboard.
+--    'tuCallbackData' is @Just data@ (the callback_data); 'tuCallbackId' is
+--    @Just id@ (the callback_query id, for answerCallbackQuery);
+--    'tuBody' is the callback_data (the loop routes by it); the chat id +
+--    sender come from @callback_query.message.chat@ / @callback_query.from@.
+--
+-- Skips non-message/non-callback updates with a 'Left'.
 parseTelegramUpdate :: Value -> Either Text TelegramUpdate
 parseTelegramUpdate v =
   case v of
-    A.Object o -> do
-      msg <- case KeyMap.lookup (Key.fromString "message") o of
-        Just m  -> Right m
-        Nothing -> Left "update has no message field"
+    A.Object o ->
+      case KeyMap.lookup (Key.fromString "callback_query") o of
+        Just cq -> parseCallbackQuery cq
+        Nothing -> case KeyMap.lookup (Key.fromString "message") o of
+          Just m  -> parseMessage m
+          Nothing -> Left "update has no message or callback_query field"
+    _ -> Left "update not an object"
+  where
+    parseMessage msg =
       case msg of
         A.Object mo -> do
           chatId <- requireChatId mo
@@ -236,9 +279,47 @@ parseTelegramUpdate v =
             , tuChatId          = chatId
             , tuSender          = sender
             , tuBody            = body
+            , tuCallbackData    = Nothing
+            , tuCallbackId      = Nothing
             }
         _ -> Left "message not an object"
-    _ -> Left "update not an object"
+    parseCallbackQuery cq =
+      case cq of
+        A.Object cqo -> do
+          -- callback_query has: id, from, message (with chat), data
+          callbackId <- case KeyMap.lookup (Key.fromString "id") cqo of
+            Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
+            _ -> Left "callback_query.id missing"
+          callbackData <- case KeyMap.lookup (Key.fromString "data") cqo of
+            Just (A.String t) -> Right t
+            _ -> Left "callback_query.data missing"
+          -- chat.id comes from callback_query.message.chat.id
+          msg <- case KeyMap.lookup (Key.fromString "message") cqo of
+            Just m -> Right m
+            Nothing -> Left "callback_query has no message field"
+          case msg of
+            A.Object mo -> do
+              chatId <- requireChatId mo
+              cid <- case mkConversationId ("tg:" <> chatId) of
+                Right c -> Right c
+                Left err -> Left ("conversation id construction failed: " <> err)
+              sender <- case KeyMap.lookup (Key.fromString "from") cqo of
+                Just (A.Object fo) -> case KeyMap.lookup (Key.fromString "id") fo of
+                  Just (A.Number n) -> case mkUserId (T.pack (show (round n :: Int))) of
+                    Right u  -> Right u
+                    Left err -> Left ("telegram callback sender not a valid UserId: " <> err)
+                  _ -> Left "callback_query.from.id missing"
+                _ -> Left "callback_query.from field missing"
+              Right TelegramUpdate
+                { tuConversationId = cid
+                , tuChatId          = chatId
+                , tuSender          = sender
+                , tuBody            = callbackData
+                , tuCallbackData    = Just callbackData
+                , tuCallbackId      = Just callbackId
+                }
+            _ -> Left "callback_query.message not an object"
+        _ -> Left "callback_query not an object"
 
 -- | Extract @chat.id@ from a message object. Telegram chat ids are integers;
 -- we stringify them for the conversation id prefix.
@@ -280,6 +361,55 @@ sendViaApi mgr token chatId body = do
       let payload = A.object
             [ "chat_id" A..= chatId
             , "text"   A..= body
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Send a message with an inline keyboard via the Bot API @sendMessage@.
+-- The payload includes @reply_markup: {inline_keyboard: ...}@. **MUST NOT
+-- set @parse_mode@** (gate: Security #3 — the question text and button
+-- labels are plain text; no markdown/HTML interpretation). The keyboard is
+-- an array of rows, each row an array of 'TelegramButton'.
+tgSendWithKeyboardViaApi :: Manager -> Text -> Text -> Text -> [[TelegramButton]] -> IO ()
+tgSendWithKeyboardViaApi mgr token chatId body keyboard = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
+  case eReq of
+    Left ex -> globalLogIO WarningS ("telegram send+keyboard: request error: " <> ls (T.pack (show ex)))
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "text"   A..= body
+            , "reply_markup" A..= A.object
+                [ "inline_keyboard" A..= map (map A.toJSON) keyboard
+                ]
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Acknowledge a callback_query via the Bot API @answerCallbackQuery@.
+-- Stops the button's loading spinner. Best-effort (logs on failure, never
+-- throws). The @callback_query_id@ is from the inbound update's
+-- 'tuCallbackId'. (Deferred from the v1 inbound path — the
+-- callback_query_id is not currently threaded through the channel loop;
+-- this function is ready for the follow-up.)
+answerCallbackQueryViaApi :: Manager -> Text -> Text -> IO ()
+answerCallbackQueryViaApi mgr token callbackQueryId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/answerCallbackQuery")))
+  case eReq of
+    Left _ -> pure ()  -- best-effort: log nothing (no logger in scope)
+    Right req0 -> do
+      let payload = A.object
+            [ "callback_query_id" A..= callbackQueryId
             ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)

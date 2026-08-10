@@ -37,6 +37,8 @@ mkTestUpdate chatId senderId body =
        , tuChatId          = chatId
        , tuSender          = uid
        , tuBody            = body
+       , tuCallbackData    = Nothing
+       , tuCallbackId      = Nothing
        }
 
 spec :: Spec
