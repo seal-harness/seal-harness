@@ -367,8 +367,13 @@ export default function App() {
         // Select the isDefault entry when it's new (just arrived) or when
         // nothing is selected yet. Don't clobber an explicit user choice
         // when the isDefault entry is unchanged (a stale re-broadcast).
+        // When the isDefault entry is NEW, also bind it to the backend so
+        // its system prompt is injected on turn one (mirrors handleAgentChange).
         if (prevDefaultRef.current !== defName || selectedAgent === null) {
-          if (selectedAgent !== defName) setSelectedAgent(defName)
+          if (selectedAgent !== defName) {
+            setSelectedAgent(defName)
+            void setSessionAgent(currentSessionId, defName)
+          }
         }
       } else if (selectedAgent === null) {
         // No isDefault yet (workdir still empty): pick a fallback.
