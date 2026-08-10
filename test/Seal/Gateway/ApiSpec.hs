@@ -2850,10 +2850,11 @@ spec = describe "Seal.Gateway.API" $ do
   describe "/api/sessions/:id/agents (session-scoped agent defs)" $ do
     -- Build a session.json + a workdir with a repo carrying
     -- .agents/agents.md + a sub-agent, plus a user agent-def backend with
-    -- one def. Returns an Application ready to query. The temp dir lives
-    -- for the test's duration (manual cleanup via the returned IO action).
-    let mkSessionAgentsApp :: IO (Application, T.Text)
-        mkSessionAgentsApp = do
+    -- one def. @mDefault@ sets the configured default_agent (Nothing = none).
+    -- Returns an Application ready to query. The temp dir lives for the
+    -- test's duration (manual cleanup at start).
+    let mkSessionAgentsApp :: Maybe T.Text -> IO (Application, T.Text)
+        mkSessionAgentsApp mDefault = do
           -- Use a fixed temp dir under /tmp (cleaned at start; OS cleans /tmp).
           let tmp = "/tmp/seal-api-session-agents-test"
               stateRoot = tmp </> "state"
@@ -2887,7 +2888,7 @@ spec = describe "Seal.Gateway.API" $ do
               , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
               , adSession = mkSystemSessionId "manual" })
             Left _ -> expectationFailure "invalid user-agent id"
-          -- Build ApiDeps with the user backend + no default_agent.
+          -- Build ApiDeps with the user backend + the configured default.
           tabsH <- newTabsHandle
           reg <- newHarnessRegistry
           uiState <- newUiStateHandle fakePaths
@@ -2901,7 +2902,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
                 , adAgentDefs = userAdb, adSkills = skillsBackend
                 , adProviders = pure knownProviders, adUiState = uiState
-                , adSend = Nothing, adDefaultAgent = pure Nothing
+                , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
@@ -2909,7 +2910,7 @@ spec = describe "Seal.Gateway.API" $ do
           pure (apiApp deps, sidTxt)
 
     it "returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/" $ do
-      (app, sid) <- mkSessionAgentsApp
+      (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
       case A.decode body :: Maybe A.Value of
@@ -2920,8 +2921,8 @@ spec = describe "Seal.Gateway.API" $ do
           names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
         _ -> expectationFailure "expected a JSON array"
 
-    it "marks agents-md as default when no user default_agent is configured (§3.2 case b)" $ do
-      (app, sid) <- mkSessionAgentsApp
+    it "marks agents-md as default when no user default_agent is configured" $ do
+      (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
       case A.decode body :: Maybe A.Value of
@@ -2933,6 +2934,23 @@ spec = describe "Seal.Gateway.API" $ do
                        ]
           -- Exactly one entry is marked default: my-repo--agents-md.
           filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
+        _ -> expectationFailure "expected a JSON array"
+
+    it "repo agents.md wins over a configured user default_agent (repo > user precedence)" $ do
+      (app, sid) <- mkSessionAgentsApp (Just "user-agent")
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let defaults = [ (n, isDef)
+                       | A.Object o <- V.toList xs
+                       , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o]
+                       , Just (A.Bool isDef) <- [KeyMap.lookup (Key.fromText "isDefault") o]
+                       ]
+          -- The repo's agents-md wins (repo > user default_agent); the
+          -- user's configured default (user-agent) is NOT marked default.
+          filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
+          defaults `shouldNotSatisfy` (("user-agent", True) `elem`)
         _ -> expectationFailure "expected a JSON array"
 
     it "returns 404 for an unknown session id" $ do

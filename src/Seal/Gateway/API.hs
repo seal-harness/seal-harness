@@ -759,11 +759,14 @@ handleSessionAgents deps sid = do
       let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)
       defs <- adbList unionBackend
       mDefaultId <- adDefaultAgent deps
-      -- §3.2 algorithm: user default_agent > repo agents.md > none.
+      -- Precedence: repo agents.md > user default_agent > none. The repo's
+      -- project-level agents.md is the initial selection when it exists
+      -- (it carries the project's intended persona); the user's configured
+      -- default_agent is the fallback when no repo agents.md is present.
       let mUserDefault = mDefaultId >>= rightToMaybe . mkAgentDefId
           mEffectiveDefault
-            | userDefaultResolves defs mUserDefault = mUserDefault
             | Just agentsMd <- agentsMdInUnion defs = Just agentsMd
+            | userDefaultResolves defs mUserDefault = mUserDefault
             | otherwise = Nothing
       pure (jsonLBS status200 (A.encode (map (agentInfoJson (fmap agentDefIdText mEffectiveDefault)) defs)))
   where
