@@ -1,10 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Channel.Caps
   ( ChannelCaps(..)
+  , AskPrompt(..)
   ) where
 
 import Data.Default (Default (..))
 import Data.Text (Text)
+
+import Seal.Handles.AskReply (QuestionOption (..))
+
+-- | A structured prompt for 'ccPrompt': the question text plus the offered
+-- 'QuestionOption's (empty for open-ended questions and the confirmation
+-- gate). Channels render the options in the richest way their transport
+-- supports (web: buttons + "Other" textarea; Signal/CLI: numbered list;
+-- Telegram: inline keyboard) and return the human's chosen text.
+data AskPrompt = AskPrompt
+  { apQuestion :: !Text
+  , apOptions  :: ![QuestionOption]
+  }
 
 -- | A channel's interaction capabilities as a record of IO functions
 -- (house style: no type class; callers receive the handle and call fields
@@ -12,7 +25,7 @@ import Data.Text (Text)
 -- is always interactive.
 data ChannelCaps = ChannelCaps
   { ccSend         :: Text -> IO ()   -- ^ Emit one line to the user
-  , ccPrompt       :: Text -> IO Text -- ^ Visible prompt; returns typed line
+  , ccPrompt       :: AskPrompt -> IO Text -- ^ Visible prompt; returns typed line
   , ccPromptSecret :: Text -> IO Text -- ^ Hidden (no-echo) prompt
   , ccStreaming    :: Bool
   -- ^ Whether the channel wants per-delta sends during streaming (CLI,
