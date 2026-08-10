@@ -40,7 +40,7 @@ import System.FilePath ((</>))
 import Seal.Agent.Def.Backend (AgentDefBackend, adbRead, workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
@@ -982,7 +982,7 @@ broadcastNewEntries mBroker paths sid model createdAt =
 webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
 webAskCaps mBroker store sid = def
-  { ccPrompt = \q -> do
+  { ccPrompt = \(AskPrompt q _opts) -> do
       outcome <- askHuman store sid q (\qid ->
         case mBroker of
           Nothing -> pure ()

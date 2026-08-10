@@ -40,7 +40,7 @@ import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
@@ -313,7 +313,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = def
         { ccSend         = putStrLn . T.unpack
-        , ccPrompt       = \prompt ->
+        , ccPrompt       = \(AskPrompt prompt _opts) ->
             runInputT innerSettings $ do
               mLine <- getInputLine (T.unpack prompt)
               pure (maybe "" T.pack mLine)
@@ -620,7 +620,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
           let bgCaps = def
                 { ccSend = ccSend caps
-                , ccPrompt = \q -> do
+                , ccPrompt = \(AskPrompt q _opts) -> do
                     outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps

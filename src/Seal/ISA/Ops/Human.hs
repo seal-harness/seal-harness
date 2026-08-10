@@ -66,6 +66,6 @@ askHumanOp caps = TrustedOpcode
       maybe (Left "ASK_HUMAN requires {question:string}") (const (Right ())) . strField "question"
   , toRun = \_ v -> do
       let q = fromMaybe "" (strField "question" v)
-      ans <- liftIO (ccPrompt caps q)
+      ans <- liftIO (ccPrompt caps (AskPrompt q []))
       pure (OpResult [TrpText ans] False Null)
   }

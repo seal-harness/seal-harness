@@ -11,7 +11,7 @@ import Data.Either (fromRight)
 import Options.Applicative (info, progDesc)
 import Test.Hspec
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channels.Class (Channel (..))
 import Seal.Command.Spec
@@ -61,7 +61,7 @@ testRegistry = mkRegistry [pingSpec]
 handleCaps :: ChannelHandle -> ChannelCaps
 handleCaps h = def
   { ccSend         = chSend h
-  , ccPrompt       = fmap (fromRight "") . chPrompt h
+  , ccPrompt       = \(AskPrompt q _) -> fmap (fromRight "") (chPrompt h q)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
   , ccStreaming    = True  -- tests: streaming by default
   }

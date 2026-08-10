@@ -22,7 +22,7 @@ import Options.Applicative
 import System.Info (os)
 import System.Process (callProcess)
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Providers.Anthropic.OAuth
   ( buildAuthorizeUrl, exchangeCode, newPkce, parsePastedCode, serializeTokens )
 import Seal.Command.Spec
@@ -176,7 +176,7 @@ addCmd pr lbl = CommandAction $ \caps ->
 addOllama :: ProviderRuntime -> ChannelCaps -> VaultHandle -> KnownProvider -> IO ()
 addOllama pr caps vh kp = do
   urlIn <- ccPrompt caps
-             ("Ollama base URL [" <> defaultOllamaBaseUrl <> "] (blank = default): ")
+             (AskPrompt ("Ollama base URL [" <> defaultOllamaBaseUrl <> "] (blank = default): ") [])
   let mUrl = if T.null (T.strip urlIn) then Nothing else Just (T.strip urlIn)
   keyIn <- ccPromptSecret caps "Ollama API key (blank for local): "
   keyRes <-
@@ -263,7 +263,7 @@ loginCmd pr lbl = CommandAction $ \caps ->
         ccSend caps "Open this URL, approve access, then paste the code shown:"
         ccSend caps url
         openBrowser url
-        pasted <- ccPrompt caps "code: "
+        pasted <- ccPrompt caps (AskPrompt "code: " [])
         let (code, state) = parsePastedCode pasted
         eTokens <- exchangeCode (prManager pr) pkce code state
         case eTokens of

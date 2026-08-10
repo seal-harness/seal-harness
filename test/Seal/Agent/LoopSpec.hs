@@ -18,7 +18,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import qualified Data.Vector as V
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
@@ -436,7 +436,7 @@ spec = describe "Seal.Agent.Loop" $ do
       (ran, uio) <- mkRecordUntrustedIO
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t])
-                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "once"
+                   , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "once"
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
@@ -476,7 +476,7 @@ spec = describe "Seal.Agent.Loop" $ do
       (ran, uio) <- mkRecordUntrustedIO
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t])
-                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "rejected"
+                   , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "rejected"
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
@@ -516,7 +516,7 @@ spec = describe "Seal.Agent.Loop" $ do
       (ran, uio) <- mkRecordUntrustedIO
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t])
-                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "irrelevant"
+                   , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "irrelevant"
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Full
@@ -557,7 +557,7 @@ spec = describe "Seal.Agent.Loop" $ do
       ran <- newIORef (0 :: Int)
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t])
-                   , ccPrompt = \q -> modifyIORef' prompts (++ [q]) >> pure "rejected"
+                   , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "rejected"
                    , ccPromptSecret = \_ -> pure "" }
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
                      (const (Right ()))

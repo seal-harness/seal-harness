@@ -25,7 +25,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
@@ -387,7 +387,7 @@ runTurn env userText = do
                           pure (Right ())
                         Nothing -> do
                           let prompt = buildConfirmationPrompt opName' input'
-                          reply <- liftIO (ccPrompt (aeCaps env) prompt)
+                          reply <- liftIO (ccPrompt (aeCaps env) (AskPrompt prompt []))
                           let scope = parseScopeReply reply
                           liftIO (recordApproval (aeApprovals env) (aeSession env) opName' scope)
                           recordApprovalEvidence opName' input' scope

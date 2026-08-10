@@ -22,7 +22,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
@@ -113,7 +113,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
     let h = toHandle ch
         handleCaps = Data.Default.def
           { ccSend         = chSend h
-          , ccPrompt       = \q -> do
+          , ccPrompt       = \(AskPrompt q _opts) -> do
               -- Bind the pending question to the active session so the
               -- next inbound message from the peer (delivered via
               -- 'deliverNextAnswer' in the loop below) unblocks this thread.
