@@ -47,6 +47,8 @@ module Seal.Handles.AskReply
   , deliverAnswer
   , deliverNextAnswer
   , deliverNextAnswerAny
+  , deliverNextAnswerResolved
+  , deliverNextAnswerResolvedAny
   , cancelAsk
   , cancelSessionAsks
   , pendingForSession
@@ -77,6 +79,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR (decimal)
 import Data.Time (UTCTime, getCurrentTime)
 import Data.UUID.Types qualified as U
 import Data.Word (Word64)
@@ -485,6 +488,77 @@ deliverNextAnswerAny store ans = do
               writeTVar (arsPending store) (Map.delete (paId pa) m)
               >> pure Nothing
   pure (case mQid of Just _ -> True; Nothing -> False)
+
+-- | Resolve a 1-based numeric index into the pending ask's 'paOptions'.
+-- If the body (after 'T.strip') is a decimal 'Int' in @[1..length opts]@,
+-- return the indexed option's 'qoLabel'; otherwise return the body as-is.
+-- Pure (safe inside STM).
+resolveOptionIndex :: Text -> [QuestionOption] -> Text
+resolveOptionIndex body opts =
+  let stripped = T.strip body
+  in case TR.decimal stripped of
+       Right (n, rest) | T.null rest && n >= 1 && n <= length opts ->
+         qoLabel (opts !! (n - 1))
+       _ -> body
+
+-- | Like 'deliverNextAnswer' but resolves a 1-based numeric index into the
+-- oldest pending ask's 'paOptions' to the indexed option's label. The
+-- resolution + the delivery happen in the /same/ STM transaction (gate:
+-- Architect #4, Security #2 — eliminates the TOCTOU race + the double-read
+-- of the original @resolveStockIndex@ design). 'T.strip' is applied before
+-- parsing; @02@ → 2 is accepted. Out-of-range numbers, non-numeric text,
+-- and asks with no options are delivered as-is ("Other"). Returns
+-- @(deliveredText, accepted)@.
+deliverNextAnswerResolved :: AskReplyStore -> SessionId -> Text -> IO (Text, Bool)
+deliverNextAnswerResolved store sid body = do
+  mResult <- atomically $ do
+    m <- readTVar (arsPending store)
+    let matching = filter (\pa -> paSession pa == sid)
+                  $ sortByCreatedAt (Map.elems m)
+    case matching of
+      [] -> pure Nothing
+      pa : _ ->
+        let resolved = resolveOptionIndex body (paOptions pa)
+            slot = paSlot pa
+            reply' = AskReply ScopeOnce resolved
+        in do
+          won <- tryPutTMVar slot (Right reply')
+          if won
+            then writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, True))
+            else writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, False))
+  pure (case mResult of
+    Just (resolved, accepted) -> (resolved, accepted)
+    Nothing                   -> (body, False))
+
+-- | The session-agnostic counterpart of 'deliverNextAnswerResolved' (mirrors
+-- 'deliverNextAnswerAny'). Finds the oldest pending ask across /all/ sessions
+-- (FIFO by 'paCreatedAt'), resolves a numeric index to the indexed label
+-- (same 'resolveOptionIndex' logic), delivers, returns @(deliveredText,
+-- accepted)@. Used by the CLI TUI's foreground REPL
+-- ('Seal.Channel.Cli':716) where one input stream serves the active session
+-- plus any @/bg@ background sessions.
+deliverNextAnswerResolvedAny :: AskReplyStore -> Text -> IO (Text, Bool)
+deliverNextAnswerResolvedAny store body = do
+  mResult <- atomically $ do
+    m <- readTVar (arsPending store)
+    case sortByCreatedAt (Map.elems m) of
+      [] -> pure Nothing
+      pa : _ ->
+        let resolved = resolveOptionIndex body (paOptions pa)
+            slot = paSlot pa
+            reply' = AskReply ScopeOnce resolved
+        in do
+          won <- tryPutTMVar slot (Right reply')
+          if won
+            then writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, True))
+            else writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, False))
+  pure (case mResult of
+    Just (resolved, accepted) -> (resolved, accepted)
+    Nothing                   -> (body, False))
 
 -- | 'True' if the question was pending and is now cancelled.
 cancelAsk :: AskReplyStore -> AskId -> IO Bool

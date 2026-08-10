@@ -18,7 +18,8 @@ import Seal.Handles.AskReply
   , cancelAsk, cancelSessionAsks, deliverAnswer, deliverNextAnswer, lookupAsk
   , newAskReplyStore, parseAskId, pendingForSession
   , QuestionOption (..), validateOptions
-  , askHumanWithOptions, PendingQuestionInfo (..), AskId (..) )
+  , askHumanWithOptions, PendingQuestionInfo (..), AskId (..)
+  , deliverNextAnswerResolved, deliverNextAnswerResolvedAny )
 
 -- | A valid UUID v4 text for tests that need a pre-known id (not minted).
 dummyUuidText :: Text
@@ -358,3 +359,122 @@ spec = describe "Seal.Handles.AskReply" $ do
     it "rejects a description exceeding 200 chars" $ do
       let longDesc = T.replicate 201 "d"
       validateOptions [QuestionOption "ok" longDesc] `shouldSatisfy` isLeft
+
+  describe "deliverNextAnswerResolved (FIFO + numeric resolution)" $ do
+    let opts = [ QuestionOption "main" "the default branch"
+               , QuestionOption "develop" "the integration branch"
+               , QuestionOption "release" "the release branch"
+               ]
+
+    it "resolves a 1-based numeric index to the option label" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done r
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "2"
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+      r <- takeMVar done
+      r `shouldBe` Right "develop"
+
+    it "resolves ' 2 ' (whitespace) to the 2nd label after T.strip" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done r
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid " 2 "
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+
+    it "resolves '02' (leading zero) to the 2nd label" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "02"
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+      takeMVar done
+
+    it "delivers an out-of-range number as-is ('Other')" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "99"
+      accepted `shouldBe` True
+      delivered `shouldBe` "99"
+      takeMVar done
+
+    it "delivers non-numeric text as-is ('Other')" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "my custom answer"
+      accepted `shouldBe` True
+      delivered `shouldBe` "my custom answer"
+      takeMVar done
+
+    it "delivers text as-is when the ask has no options (open-ended)" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHuman store sid "open?" (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "anything"
+      accepted `shouldBe` True
+      delivered `shouldBe` "anything"
+      takeMVar done
+
+    it "returns (body, False) when no question is pending" $ do
+      store <- newAskReplyStore 0
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "2"
+      accepted `shouldBe` False
+      delivered `shouldBe` "2"
+
+  describe "deliverNextAnswerResolvedAny (session-agnostic FIFO + numeric resolution)" $ do
+    let opts = [ QuestionOption "main" "default"
+               , QuestionOption "develop" "integration"
+               ]
+
+    it "resolves a numeric index across all sessions (session-agnostic)" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "1"
+      accepted `shouldBe` True
+      delivered `shouldBe` "main"
+      takeMVar done
+
+    it "delivers non-numeric text as-is across all sessions" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid2 "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "custom"
+      accepted `shouldBe` True
+      delivered `shouldBe` "custom"
+      takeMVar done
+
+    it "returns (body, False) when no question is pending" $ do
+      store <- newAskReplyStore 0
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "2"
+      accepted `shouldBe` False
+      delivered `shouldBe` "2"
