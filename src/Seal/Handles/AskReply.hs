@@ -49,6 +49,7 @@ module Seal.Handles.AskReply
   , deliverNextAnswerAny
   , deliverNextAnswerResolved
   , deliverNextAnswerResolvedAny
+  , findByAskIdPrefix
   , cancelAsk
   , cancelSessionAsks
   , pendingForSession
@@ -634,6 +635,18 @@ pendingForSession store sid =
               })
   . filter (\pa -> paSession pa == sid)
   . Map.elems <$> readTVarIO (arsPending store)
+
+-- | Find a pending ask by an 8-hex prefix of its 'AskId'. Used by the
+-- Telegram inbound path: the @callback_data@ is @\"<8hex>:<label>\"@, and
+-- this scans the session's pending asks for one whose 'askIdText' starts
+-- with the prefix. Returns 'Nothing' if no match (the body was not a
+-- callback — fall through to 'deliverNextAnswerResolved').
+findByAskIdPrefix :: AskReplyStore -> SessionId -> Text -> IO (Maybe AskId)
+findByAskIdPrefix store sid prefix = do
+  ps <- pendingForSession store sid
+  pure (case filter (T.isPrefixOf prefix . askIdText . pqiId) ps of
+    [] -> Nothing
+    info : _ -> Just (pqiId info))
 
 -- | Look up a single pending question by id (for the delivery path to
 -- | validate). Returns 'Nothing' if the id is unknown or already answered.

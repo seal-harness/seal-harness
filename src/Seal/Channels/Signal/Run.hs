@@ -85,7 +85,7 @@ runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
     Right transport -> do
       let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
-      runChannelLoop deps withCh plainHandler registry chain askReply tabsH
+      runChannelLoop deps withCh plainHandler registry chain askReply tabsH Nothing Nothing
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
 -- pulls @(MessageSource, body)@ from 'chReceive', classifies via

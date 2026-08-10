@@ -10,20 +10,29 @@ module Seal.Channels.Telegram.Run
   , runTelegramMain
   ) where
 
+import Data.Char (isDigit)
 import Data.Either (fromRight)
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe, isJust)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
 
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
+import Seal.Channel.Caps (ChannelCaps)
+import Seal.Core.Types (SessionId)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier, mkHandleCaps)
+import Seal.Handles.AskReply
+  ( AskReplyStore, newApprovalCache, newAskReplyStore
+  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix )
+import Seal.Handles.Channel (ChannelHandle (..))
+import Seal.Channels.Telegram.Transport
+  ( TelegramTransport (..), mkRealTelegramTransport, tgSetCommands )
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
-import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
@@ -45,7 +54,6 @@ import Seal.Core.MessageSource (UserId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
-import Seal.Handles.AskReply (AskReplyStore, newApprovalCache, newAskReplyStore)
 import Seal.Ingest (PreprocessChain, emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
@@ -76,6 +84,7 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
       plainHandler h = plainTurn deps h askReply
   tabsH <- newTabsHandle
   runChannelLoop deps withCh plainHandler registry chain askReply tabsH
+    (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply))
 
 -- | Full @seal telegram@ startup wiring: paths -> config -> vault -> session
 -- -> backends -> registry -> spawn the Telegram channel -> run the loop.
@@ -183,3 +192,37 @@ tryOpenVault paths cfg logger =
                 }
           Just <$> Vault.openVault vcfg enc
     _ -> pure Nothing
+
+-- | Build a 'ChannelCaps' for the Telegram channel. For v1, this uses the
+-- same numbered-list rendering as Signal/CLI ('formatQuestionWithOptions'
+-- via 'chSend h'). The inline keyboard ('tgSendWithKeyboard') is deferred
+-- to a follow-up: the 'ChannelHandle' doesn't expose the raw Telegram chat
+-- id (needed for 'tgSendWithKeyboard'), and 'answerCallbackQuery' is also
+-- deferred (the 'callback_query_id' is not threaded through
+-- 'chReceive'). The 'onTelegramCallback' hook (below) IS wired so that
+-- callback_data from a button tap (if a keyboard is ever sent) routes
+-- by-id. The inline keyboard + answerCallbackQuery will be added in a
+-- follow-up that threads the chat id + callback_query_id through the
+-- channel handle.
+mkTelegramHandleCaps :: TelegramTransport -> ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
+mkTelegramHandleCaps _transport = mkHandleCaps
+
+-- | The callback handler for Telegram: parses the @callback_data@
+-- (@\"<8hex>:<label>\"@), finds the pending ask by the 8-hex prefix, and
+-- delivers the label by-id via 'deliverAnswer'. Returns 'True' if the body
+-- was a callback + delivered; 'False' if not (fall through to
+-- 'deliverNextAnswerResolved').
+onTelegramCallback :: AskReplyStore -> SessionId -> Text -> IO Bool
+onTelegramCallback store sid body =
+  case T.splitOn ":" body of
+    [prefix, label]
+      | T.length prefix == 8 && T.all isHexChar prefix -> do
+          mQid <- findByAskIdPrefix store sid prefix
+          case mQid of
+            Just qid -> do
+              _accepted <- deliverAnswer store qid (AskReply ScopeOnce label)
+              pure True
+            Nothing -> pure False
+    _ -> pure False
+  where
+    isHexChar c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
