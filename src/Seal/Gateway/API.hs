@@ -53,7 +53,7 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sessionWorkdir)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
-  ( askIdText, parseApprovalScope, pendingForSession )
+  ( askIdText, parseApprovalScope, pendingForSession, PendingQuestionInfo (..) )
 import Seal.Gateway.Send
   ( SendDeps (..), handleAnswerDelivery, handleAskCancel, handleSend
   , handleSetupRepo, sendOutcomeJson )
@@ -1640,16 +1640,16 @@ handleListQuestions deps sidTxt =
         let vals = map questionJson pending
         pure (jsonLBS status200 (A.encode vals))
   where
-    questionJson (qid, question, createdAt, mMeta) = case mMeta of
+    questionJson info = case pqiMeta info of
       Nothing -> object
-        [ "id" .= askIdText qid
-        , "question" .= question
-        , "createdAt" .= createdAt
+        [ "id" .= askIdText (pqiId info)
+        , "question" .= pqiQuestion info
+        , "createdAt" .= pqiCreatedAt info
         ]
       Just meta -> object
-        [ "id" .= askIdText qid
-        , "question" .= question
-        , "createdAt" .= createdAt
+        [ "id" .= askIdText (pqiId info)
+        , "question" .= pqiQuestion info
+        , "createdAt" .= pqiCreatedAt info
         , "meta" .= meta
         ]
 

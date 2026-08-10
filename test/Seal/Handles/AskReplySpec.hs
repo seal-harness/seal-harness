@@ -17,7 +17,8 @@ import Seal.Handles.AskReply
   ( ApprovalScope (..), AskOutcome (..), AskReply (..), askHuman, askIdText
   , cancelAsk, cancelSessionAsks, deliverAnswer, deliverNextAnswer, lookupAsk
   , newAskReplyStore, parseAskId, pendingForSession
-  , QuestionOption (..), validateOptions )
+  , QuestionOption (..), validateOptions
+  , askHumanWithOptions, PendingQuestionInfo (..), AskId (..) )
 
 -- | A valid UUID v4 text for tests that need a pre-known id (not minted).
 dummyUuidText :: Text
@@ -25,9 +26,9 @@ dummyUuidText = "12345678-1234-4234-8234-123456789012"
 
 -- | Extract the first pending question (id, text) from a non-empty list,
 -- failing the test if the list is empty.
-firstPending :: [(a, Text, b, c)] -> (a, Text)
+firstPending :: [PendingQuestionInfo] -> (AskId, Text)
 firstPending ps = case uncons ps of
-  Just ((qid, q, _, _), _) -> (qid, q)
+  Just (info, _) -> (pqiId info, pqiQuestion info)
   Nothing -> error "firstPending: empty list (test invariant violation)"
 
 -- | Safe session-id construction for tests (the literal is known-valid).
@@ -237,7 +238,7 @@ spec = describe "Seal.Handles.AskReply" $ do
       -- The questions are all present (the exact order depends on
       -- getCurrentTime resolution; the FIFO delivery test covers ordering
       -- via deliverNextAnswer which is the real consumer).
-      map (\(_, q, _, _) -> q) ps `shouldMatchList` ["q1?", "q2?", "q3?"]
+      map pqiQuestion ps `shouldMatchList` ["q1?", "q2?", "q3?"]
       cancelSessionAsks store sid
       _ <- takeMVar d1 :: IO ()
       _ <- takeMVar d2 :: IO ()
@@ -289,6 +290,28 @@ spec = describe "Seal.Handles.AskReply" $ do
 
     it "rejects an empty string" $ do
       parseAskId "" `shouldBe` Left "invalid AskId: "
+
+  describe "askHumanWithOptions" $ do
+    it "registers a pending ask with options surfacing in pendingForSession" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      let opts = [ QuestionOption "main" "the default branch"
+                 , QuestionOption "develop" "the integration branch"
+                 ]
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      ps <- pendingForSession store sid
+      length ps `shouldBe` 1
+      case ps of
+        [info] -> do
+          pqiQuestion info `shouldBe` "which branch?"
+          pqiOptions info `shouldBe` opts
+          _cancelled <- cancelAsk store (pqiId info)
+          pure ()
+        _ -> error "expected exactly one pending ask"
+      takeMVar done
 
   describe "QuestionOption validation" $ do
     let genLabel = do

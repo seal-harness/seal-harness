@@ -55,6 +55,8 @@ module Seal.Handles.AskReply
   , recordApproval
   , QuestionOption (..)
   , validateOptions
+  , askHumanWithOptions
+  , PendingQuestionInfo (..)
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -221,6 +223,7 @@ validateOptions opts
 
 -- | One pending question: the session it belongs to, the question text, the
 -- timestamp it was minted, optional metadata (opcode name + input for the
+-- confirmation gate), the offered options (for @ASK_HUMAN@; empty for the
 -- confirmation gate), and the answer slot. The slot carries 'Left' on
 -- cancel/timeout, 'Right' on a delivered answer.
 data PendingAsk = PendingAsk
@@ -229,8 +232,21 @@ data PendingAsk = PendingAsk
   , paQuestion  :: Text
   , paCreatedAt :: UTCTime
   , paMeta      :: Maybe Value  -- ^ opcode name + input (for the confirmation gate); Nothing for ASK_HUMAN
+  , paOptions   :: [QuestionOption]  -- ^ offered options (for ASK_HUMAN); empty for open-ended + the confirmation gate
   , paSlot      :: TMVar (Either AskOutcome AskReply)
   }
+
+-- | A read-only view of a pending question for medium rendering (the web
+-- frontend polls this via GET @/api/sessions/:id/questions@; the WS @ask@
+-- event carries the same fields). Does /not/ expose the answer slot.
+data PendingQuestionInfo = PendingQuestionInfo
+  { pqiId        :: !AskId
+  , pqiSession   :: !SessionId
+  , pqiQuestion  :: !Text
+  , pqiCreatedAt :: !UTCTime
+  , pqiMeta      :: !(Maybe Value)
+  , pqiOptions   :: ![QuestionOption]
+  } deriving stock (Eq, Show)
 
 -- | The shared, in-process store. STM-backed: a 'TVar' of pending questions
 -- keyed by 'AskId'. The timeout (microseconds; 0 = block indefinitely) bounds
@@ -302,7 +318,7 @@ askHuman
   -> (AskId -> IO ())  -- ^ the medium-specific notify callback
   -> IO (Either AskOutcome Text)
 askHuman store sid question notify = do
-  r <- askHumanWithMeta store sid question Nothing notify
+  r <- askHumanCore store sid question Nothing [] notify
   pure (case r of
     Left o   -> Left o
     Right ar -> Right (arText ar))
@@ -318,12 +334,43 @@ askHumanWithMeta
   -> Maybe Value   -- ^ optional metadata (opcode name + input)
   -> (AskId -> IO ())  -- ^ the medium-specific notify callback
   -> IO (Either AskOutcome AskReply)
-askHumanWithMeta store sid question meta notify = do
+askHumanWithMeta store sid question meta =
+  askHumanCore store sid question meta []
+
+-- | Like 'askHuman' but carries the offered 'QuestionOption's in the
+-- 'PendingAsk'. The options are surfaced in the WS @ask@ event + the
+-- @GET .../questions@ REST route so the frontend can render one button per
+-- option. The @notify@ callback fires before the blocking wait so the medium
+-- can surface the question + options immediately. Returns the human's typed
+-- reply (a chosen option's label or a free-text "Other" reply).
+askHumanWithOptions
+  :: AskReplyStore
+  -> SessionId
+  -> Text              -- ^ the question text
+  -> [QuestionOption]  -- ^ the offered options (validated by the opcode before this call)
+  -> (AskId -> IO ())  -- ^ the medium-specific notify callback
+  -> IO (Either AskOutcome Text)
+askHumanWithOptions store sid question opts notify = do
+  r <- askHumanCore store sid question Nothing opts notify
+  pure (case r of
+    Left o   -> Left o
+    Right ar -> Right (arText ar))
+
+-- | The shared core for 'askHuman'/'askHumanWithMeta'/'askHumanWithOptions'.
+askHumanCore
+  :: AskReplyStore
+  -> SessionId
+  -> Text              -- ^ the question text
+  -> Maybe Value       -- ^ optional metadata (opcode name + input)
+  -> [QuestionOption]  -- ^ offered options (empty for open-ended + the confirmation gate)
+  -> (AskId -> IO ())  -- ^ the medium-specific notify callback
+  -> IO (Either AskOutcome AskReply)
+askHumanCore store sid question meta opts notify = do
   qid <- newAskId
   slot <- newEmptyTMVarIO
   now <- getCurrentTime
   let pa = PendingAsk { paId = qid, paSession = sid, paQuestion = question
-                      , paCreatedAt = now, paMeta = meta, paSlot = slot }
+                      , paCreatedAt = now, paMeta = meta, paOptions = opts, paSlot = slot }
   atomically (modifyTVar' (arsPending store) (Map.insert qid pa))
   notify qid
   timeoutUs <- readIORef (arsTimeoutUs store)
@@ -470,12 +517,20 @@ cancelSessionAsks store sid = do
 -- | to render open questions on reconnect (the web frontend polls this via
 -- | GET /api/sessions/:id/questions). Does /not/ expose the answer slot.
 -- | Includes the metadata (opcode name + input) when present so the frontend
--- | can display it.
+-- | can display it, and the offered options (for @ASK_HUMAN@) so the frontend
+-- | can render one button per option.
 pendingForSession
   :: AskReplyStore -> SessionId
-  -> IO [(AskId, Text, UTCTime, Maybe Value)]
+  -> IO [PendingQuestionInfo]
 pendingForSession store sid =
-  map (\pa -> (paId pa, paQuestion pa, paCreatedAt pa, paMeta pa))
+  map (\pa -> PendingQuestionInfo
+              { pqiId = paId pa
+              , pqiSession = paSession pa
+              , pqiQuestion = paQuestion pa
+              , pqiCreatedAt = paCreatedAt pa
+              , pqiMeta = paMeta pa
+              , pqiOptions = paOptions pa
+              })
   . filter (\pa -> paSession pa == sid)
   . Map.elems <$> readTVarIO (arsPending store)
 
