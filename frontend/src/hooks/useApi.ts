@@ -3,9 +3,12 @@ import type {
   AgentDefInfo,
   AgentDefInput,
   AgentInfo,
+  DeployKeyInfo,
   DiscoverableWindow,
   HarnessInfo,
   ProviderInfo,
+  RepoInfo,
+  RepoInput,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -15,8 +18,9 @@ import type {
   TranscriptEntry,
 } from '../types'
 import * as perf from '../lib/perf'
+import { streamClient } from '../lib/streamClient'
 
-const POLL_INTERVAL = 3000
+export const POLL_INTERVAL = 3000
 
 /** Raw `/api/tabs` (and WS `lists`) wire shape: the backend emits the health
  *  fields in snake_case. `index`/`kind`/`label`/`status`/`session_id` are
@@ -75,9 +79,9 @@ export function mapDiscoverableWindow(wire: DiscoverableWindowWire): Discoverabl
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T | null> {
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return null
     return await res.json() as T
   } catch {
@@ -110,7 +114,7 @@ export function useHarnesses() {
   return { harnesses, error }
 }
 
-export function useRecentSessions() {
+export function useRecentSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -125,15 +129,16 @@ export function useRecentSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
 
-export function useTabs() {
+export function useTabs(disabled = false) {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -148,10 +153,11 @@ export function useTabs() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   // `refresh` lets callers force an immediate poll instead of waiting for
   // the next interval — the new-tab compose-send flow uses this so the
@@ -159,7 +165,7 @@ export function useTabs() {
   return { tabs, error, refresh: poll }
 }
 
-export function useArchivedSessions() {
+export function useArchivedSessions(disabled = false) {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [error, setError] = useState(false)
 
@@ -174,10 +180,11 @@ export function useArchivedSessions() {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { sessions, error }
 }
@@ -210,7 +217,7 @@ interface ListsWire {
   thinkingSessionIds?: string[]
 }
 
-export function useListsPoll(): ListsPollResult {
+export function useListsPoll(disabled = false): ListsPollResult {
   const [tabs, setTabs] = useState<TabInfo[]>([])
   const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([])
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
@@ -233,10 +240,11 @@ export function useListsPoll(): ListsPollResult {
   }, [])
 
   useEffect(() => {
+    if (disabled) return
     poll()
     const id = setInterval(poll, POLL_INTERVAL)
     return () => clearInterval(id)
-  }, [poll])
+  }, [poll, disabled])
 
   return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, error, refresh: poll }
 }
@@ -502,16 +510,71 @@ export async function cancelQuestion(sessionId: string, askId: string): Promise<
 export function useAgents() {
   const [agents, setAgents] = useState<AgentInfo[]>([])
 
-  useEffect(() => {
-    const load = () => {
-      fetchJson<AgentInfo[]>('/api/agents').then((data) => {
-        if (Array.isArray(data)) setAgents(data)
-      })
-    }
-    load()
-    const id = setInterval(load, POLL_INTERVAL)
-    return () => clearInterval(id)
+  const load = useCallback(() => {
+    fetchJson<AgentInfo[]>('/api/agents').then((data) => {
+      if (Array.isArray(data)) setAgents(data)
+    })
   }, [])
+
+  // Initial fetch on mount.
+  useEffect(() => { load() }, [load])
+
+  // Re-fetch when the WS signals agent defs changed (no polling).
+  useEffect(() => {
+    const unsub = streamClient().onAgentDefsChanged(() => load())
+    return unsub
+  }, [load])
+
+  return { agents }
+}
+
+/** Fetch the session-scoped agent-defs list (workdir ⊕ user, workdir-wins).
+ *  Returns the same `AgentInfo[]` shape as `/api/agents` (with `displayName`
+ *  so the dropdown can show a friendly name for repo-local defs like
+ *  `agents-md`). Used by the Session setup Agent dropdown (W3). */
+export async function fetchSessionAgents(sessionId: string): Promise<AgentInfo[] | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/agents`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return Array.isArray(data) ? (data as AgentInfo[]) : null
+  } catch {
+    return null
+  }
+}
+
+/** A session-scoped variant of `useAgents`. When `sessionId` is non-null,
+ *  fetches `GET /api/sessions/:id/agents` (the workdir-aware union); when
+ *  null, fetches `GET /api/agents` (the global user store) — so the hook is
+ *  always valid and App.tsx can call it unconditionally (rules-of-hooks).
+ *  Re-fetches on `sessionId` change (with AbortController cancellation) and
+ *  on the `onAgentDefsChanged` WS event (so a SETUP_REPO clone triggers a
+ *  re-fetch via the backend's `broadcastAgentDefsChanged`). */
+export function useSessionAgents(sessionId: string | null) {
+  const [agents, setAgents] = useState<AgentInfo[]>([])
+
+  const load = useCallback((sid: string | null, signal?: AbortSignal) => {
+    const url = sid
+      ? `/api/sessions/${encodeURIComponent(sid)}/agents`
+      : '/api/agents'
+    fetchJson<AgentInfo[]>(url, signal).then((data) => {
+      if (Array.isArray(data)) setAgents(data)
+    }).catch(() => { /* aborted or network error — leave stale */ })
+  }, [])
+
+  // Re-fetch when the session id changes (abort the in-flight previous fetch).
+  useEffect(() => {
+    const controller = new AbortController()
+    load(sessionId, controller.signal)
+    return () => { controller.abort() }
+  }, [sessionId, load])
+
+  // Re-fetch when the WS signals agent defs changed (SETUP_REPO completion,
+  // user-store agent-def mutations). No polling.
+  useEffect(() => {
+    const unsub = streamClient().onAgentDefsChanged(() => load(sessionId))
+    return unsub
+  }, [sessionId, load])
 
   return { agents }
 }
@@ -734,13 +797,16 @@ export interface LastOptions {
   attachSession: string
   attachWindow: string
   attachManual: boolean
+  repo: string
 }
 
 /** The persisted UI state: the last-chosen options + the custom-model id
- *  history (most-recent first, deduped, capped server-side). */
+ *  history + the repo URL history (most-recent first, deduped, capped
+ *  server-side). */
 export interface UiState {
   last_options: LastOptions | null
   custom_models: string[]
+  repo_history: string[]
 }
 
 /** Fetch the persisted UI state. Returns null on any failure (the caller
@@ -777,6 +843,53 @@ export async function addCustomModel(model: string): Promise<boolean> {
     return res.ok
   } catch {
     return false
+  }
+}
+
+/** Add a repo URL to the persisted history. Best-effort; the server
+ *  dedupes + caps. Mirrors `addCustomModel`. */
+export async function addRepo(url: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/ui/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** The outcome of a setup-repo call. The backend dispatches the real
+ *  SETUP_REPO opcode (audited in the transcript), so the clone/failure
+ *  also appears in the chat. This shape is the REST response summary. */
+export interface SetupRepoResult {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+/** Clone a repo into a session's workdir before the first turn (the "set
+ *  up repo" combo box calls this right after creating a bare session).
+ *  The backend dispatches the SETUP_REPO opcode, so the clone (and any
+ *  failure) is recorded in the session transcript — visible in the chat,
+ *  not silent. Returns the structured result, or null on a network/parse
+ *  failure. */
+export async function setupRepo(sessionId: string, url: string): Promise<SetupRepoResult | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => null)
+      return { ok: false, error: body?.error ?? `HTTP ${res.status}` }
+    }
+    return await res.json() as SetupRepoResult
+  } catch {
+    return null
   }
 }
 // ── Agent CRUD ──────────────────────────────────────────────────────────
@@ -864,10 +977,11 @@ export function useAgentDefs() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals agent defs changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onAgentDefsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { agents, loaded, error, refresh }
 }
@@ -951,12 +1065,139 @@ export function useSkills() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Re-fetch when the WS signals skills changed (no polling).
   useEffect(() => {
-    const id = setInterval(() => setRefreshCount((c) => c + 1), POLL_INTERVAL)
-    return () => clearInterval(id)
-  }, [])
+    const unsub = streamClient().onSkillsChanged(() => refresh())
+    return unsub
+  }, [refresh])
 
   return { skills, loaded, error, refresh }
+}
+
+// ── Repo CRUD ───────────────────────────────────────────────────────────
+
+/** Fetch all source-control repos. Returns null on any failure. */
+export async function fetchRepos(): Promise<RepoInfo[] | null> {
+  return fetchJson<RepoInfo[]>('/api/repos')
+}
+
+/** Fetch a single repo by id. Returns null on any failure (including 404). */
+export async function fetchRepo(id: string): Promise<RepoInfo | null> {
+  return fetchJson<RepoInfo>(`/api/repos/${encodeURIComponent(id)}`)
+}
+
+/** The outcome of a repo create/update mutation. On success `repo` carries
+ *  the descriptor returned by the backend; on failure `error` carries the
+ *  backend's error message (or a fallback) so the UI can surface it instead
+ *  of a generic "save failed" string. */
+export type RepoMutationResult =
+  | { ok: true; repo: RepoInfo }
+  | { ok: false; error: string }
+
+/** Read the backend's `{"error": "..."}` body, falling back to the HTTP
+ *  status text when the body is missing or unparseable. */
+async function repoMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new source-control repo. The body must include `id`. Returns
+ *  the created repo on success, or the backend's error message on failure. */
+export async function createRepo(input: RepoInput): Promise<RepoMutationResult> {
+  try {
+    const res = await fetch('/api/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await repoMutationError(res) }
+    return { ok: true, repo: await res.json() as RepoInfo }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Replace an existing source-control repo. The id is taken from the path;
+ *  ids are stable so there is NO new_id field. Returns the updated repo on
+ *  success, null on failure. */
+export async function updateRepo(id: string, input: RepoInput): Promise<RepoInfo | null> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return null
+    return await res.json() as RepoInfo
+  } catch {
+    return null
+  }
+}
+
+/** Delete a source-control repo by id. Returns true when the backend
+ *  accepted the delete (204 — idempotent). */
+export async function deleteRepo(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Fetch the deploy-key public key + setup instructions for a repo.
+ *  Returns null on error (404 if the repo has no deploy key). */
+export async function fetchRepoDeployKey(id: string): Promise<DeployKeyInfo | null> {
+  return fetchJson<DeployKeyInfo>(`/api/repos/${encodeURIComponent(id)}/deploy-key`)
+}
+
+/** Regenerate the deploy key for a repo (rotation: new passphrase →
+ *  ssh-keygen overwrites the encrypted keyfile → new public key).
+ *  Returns the new DeployKeyInfo on success, null on error. */
+export async function regenerateDeployKey(id: string): Promise<DeployKeyInfo | null> {
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(id)}/deploy-key/generate`, { method: 'POST' })
+    if (!res.ok) return null
+    return await res.json() as DeployKeyInfo
+  } catch {
+    return null
+  }
+}
+
+/** Polled list of source-control repos. Mirrors `useSkills`. Re-fetches
+ *  on the `repos-changed` WS invalidation frame. The `refresh` action
+ *  forces an immediate re-fetch so callers see their own mutations. */
+export function useRepos() {
+  const [repos, setRepos] = useState<RepoInfo[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchRepos().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setRepos(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  // Re-fetch when the WS signals repos changed (no polling).
+  useEffect(() => {
+    const unsub = streamClient().onReposChanged(() => refresh())
+    return unsub
+  }, [refresh])
+
+  return { repos, loaded, error, refresh }
 }
 
 // ── Default agent ────────────────────────────────────────────────────────

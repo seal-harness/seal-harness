@@ -47,10 +47,20 @@ skillIdText (SkillId t) = t
 -- | One agent skill. The body is agent-visible data (not a vault secret); it is
 -- recorded in full in both the session transcript and the Audited log.
 -- 'skSession' is the originating session (provenance).
+--
+-- 'skGroup' is an optional category for display grouping in the
+-- @\<available_skills\>@ catalog. It is derived from the on-disk parent
+-- directory name (@config\/skills\/\<group\>\/\<id\>.md@) and may be
+-- overridden via a @group:@ frontmatter key. 'Nothing' means the skill
+-- belongs to the default (ungrouped) section. The skill /id/ stays flat
+-- regardless of group (the charset predicate forbids @\/@), so group is
+-- purely display metadata — opcodes, file mapping, and lookups all key
+-- on 'skId'.
 data Skill = Skill
   { skId          :: SkillId
   , skDescription :: Text
   , skBody        :: Text
+  , skGroup       :: Maybe Text
   , skCreatedAt   :: UTCTime
   , skUpdatedAt   :: UTCTime
   , skSession     :: SessionId

@@ -6,7 +6,7 @@ import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 
 import Seal.Tools.Exec.Types
-import Seal.Tools.Exec.Remote
+import Seal.Tools.Exec.Remote (sshExecArgv, sshExecArgvForwarding)
 import Seal.TestHelpers.Arbitrary ()  -- Arbitrary Text
 
 spec :: Spec
@@ -60,6 +60,42 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
       let cfg = sshCfg
           argv = sshExecArgv cfg (cmd :: Text)
       in "-c" `notElem` argv
+
+  -- -----------------------------------------------------------------------
+  -- W2: opt-in -A invariant (design §5.6)
+  -- -----------------------------------------------------------------------
+  describe "sshExecArgv opt-in -A invariant (W2)" $ do
+
+    it "sshExecArgv (non-credential ops) contains NO -A" $ do
+      let argv = sshExecArgv sshCfg "echo hi"
+      "-A" `shouldNotSatisfy` (`elem` argv)
+
+    it "sshExecArgvForwarding (git-credential ops) contains -A" $ do
+      let argv = sshExecArgvForwarding sshCfg "git clone -- git@github.com:o/r.git"
+      "-A" `shouldSatisfy` (`elem` argv)
+
+    it "sshExecArgvForwarding still pins StrictHostKeyChecking + UserKnownHostsFile" $ do
+      let argv = sshExecArgvForwarding sshCfg "git fetch"
+      checkAdjacentPair argv "StrictHostKeyChecking" "yes"
+      checkAdjacentPair argv "UserKnownHostsFile" (scKnownHosts sshCfg)
+      checkAdjacentPair argv "BatchMode" "yes"
+
+    it "sshExecArgvForwarding preserves the @--@ separator + command" $ do
+      let argv = sshExecArgvForwarding sshCfg "git push origin main"
+      argv `shouldSatisfy` elem "--"
+      argv `shouldSatisfy` elem "git push origin main"
+
+    it "sshExecArgvForwarding uses the fixed program path ssh" $ do
+      let argv = sshExecArgvForwarding sshCfg "git fetch"
+      case argv of
+        (prog : _) -> prog `shouldBe` "ssh"
+        [] -> expectationFailure "ssh argv is empty"
+
+    prop "sshExecArgv NEVER includes -A (any command)" $ \cmd ->
+      "-A" `notElem` sshExecArgv sshCfg (cmd :: Text)
+
+    prop "sshExecArgvForwarding ALWAYS includes -A (any command)" $ \cmd ->
+      "-A" `elem` sshExecArgvForwarding sshCfg (cmd :: Text)
 
   describe "host-key mismatch (spec §7 row 3)" $ do
 

@@ -71,6 +71,9 @@ paginate params offset mLimit items =
        }
 
 -- | 'PageParams' used everywhere in this milestone.
--- @PageParams { ppFloor = 10, ppCeiling = 200, ppCoeff = 4.0 }@.
+-- @PageParams { ppFloor = 500, ppCeiling = 2000, ppCoeff = 0.0 }@.
+-- A flat 500-line default (matching Hermes' read_file), with a 2000-line
+-- hard ceiling. @ppCoeff = 0@ means @pageSize = clamp 500 2000 0 = 500@
+-- regardless of total line count — no dynamic sqrt scaling.
 defaultPageParams :: PageParams
-defaultPageParams = PageParams { ppFloor = 10, ppCeiling = 200, ppCoeff = 4.0 }
+defaultPageParams = PageParams { ppFloor = 500, ppCeiling = 2000, ppCoeff = 0.0 }

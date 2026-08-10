@@ -6,10 +6,11 @@ import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
 import { SkillsView } from './components/SkillsView'
+import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
 import {
   useSendMessage,
-  useAgents,
+  useSessionAgents,
   useTabs,
   useRecentSessions,
   useArchivedSessions,
@@ -58,6 +59,7 @@ function sectionFromPath(): TopSection {
   const path = window.location.pathname
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
+  if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   return 'sessions'
 }
 
@@ -158,30 +160,37 @@ const DEFAULT_AGENT: Agent = { id: 'seal', name: 'Seal Harness', status: 'idle',
 export default function App() {
   // ── List streams ──────────────────────────────────────────────────────
   // 3-tier precedence (W7):
-  //   1. WS `lists` frame is primary. "WS live" means a `lists` frame has
-  //      arrived in this connection (tracked by `wsListsReceived`; reset on
-  //      reconnect). When live, all four fields come from the WS frame.
+  //   1. WS `lists` frame (primary) — `wsLists.received` flips true on the
+  //      first frame (even if empty). When live, all four fields come from
+  //      the WS frame and ALL REST polling hooks are disabled (zero XHRs).
   //   2. Else `useListsPoll()` (GET /api/lists) is the REST fallback —
-  //      always active (polls on mount regardless of WS state), selected
+  //      polls every 3s when WS is not live AND /api/lists is not in error.
   //      when WS is not live AND /api/lists is not in error.
   //   3. Else (older server without /api/lists) the legacy three-poll
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
   //      final fallback.
   const wsLists = useListsStream()
-  const polledLists = useListsPoll()
-  const polledTabs = useTabs()
-  const polledRecent = useRecentSessions()
-  const polledArchived = useArchivedSessions()
-  // wsListsReceived flips true on the first WS lists frame, resets on
-  // reconnect (so a stale closed-frame state doesn't suppress the poll).
-  const [wsListsReceived, setWsListsReceived] = useState(false)
-  useEffect(() => {
-    if (wsLists.tabs.length > 0 || wsLists.recentSessions.length > 0) {
-      setWsListsReceived(true)
-    }
-  }, [wsLists.tabs.length, wsLists.recentSessions.length])
-  const wsLive = wsListsReceived
+  // wsLive tracks whether the WS `lists` frame is delivering data. The hook's
+  // `received` flag flips on the first frame regardless of content (a quiet
+  // server sends empty arrays), so REST polling stops the moment WS connects.
+  const wsLive = wsLists.received
+
+  // ── Fallback polling (only when WS is NOT live) ──────────────────────
+  // When WS is delivering `lists` frames, all REST polling hooks are
+  // disabled — zero XHRs. When WS drops or hasn't connected yet, the
+  // fallback hooks poll every 3s. The 3-tier precedence:
+  //   1. WS `lists` frame (primary) — wsLive = true
+  //   2. GET /api/lists (REST fallback) — !wsLive && !polledLists.error
+  //   3. Legacy 3-poll hooks (final fallback) — !wsLive && polledLists.error
+  const polledLists = useListsPoll(wsLive)
   const usePollLists = !wsLive && !polledLists.error
+  // Legacy hooks are only needed when /api/lists is unavailable (older
+  // server). When usePollLists is true, /api/lists is the source. When
+  // wsLive is true, WS is the source and ALL polling is disabled.
+  const legacyDisabled = wsLive || usePollLists
+  const polledTabs = useTabs(legacyDisabled)
+  const polledRecent = useRecentSessions(legacyDisabled)
+  const polledArchived = useArchivedSessions(legacyDisabled)
   // Optimistic first-message-snippet overlay keyed by session id. Set on
   // send so a freshly-created tab's label updates immediately (before the
   // backend's next `lists` frame arrives with the persisted snippet).
@@ -218,12 +227,16 @@ export default function App() {
   const thinkingSessionIds = wsLive ? wsLists.thinkingSessionIds
     : usePollLists ? polledLists.thinkingSessionIds
     : []
-  const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
   const [section, setSection] = useState<TopSection>(sectionFromPath)
   const [selectedId, setSelectedId] = useState<string | null>(selectedIdFromPath)
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
+  // Tracks the previous isDefault agent name so the default-resolution
+  // effect only overrides the selection when the isDefault entry is NEW
+  // (e.g. the repo agents-md arriving after SETUP_REPO), not on every
+  // agents re-broadcast (which would clobber an explicit user choice).
+  const prevDefaultRef = useRef<string | null>(null)
   const [customPromptFile, setCustomPromptFile] = useState<{ name: string; content: string } | null>(null)
 
   // Optimistic strip: hide an archived session from the sidebar immediately.
@@ -249,8 +262,49 @@ export default function App() {
   // loads providers/models on mount regardless of which composer opens).
   const composerSpec = useNewTabSpec()
 
+  // ── Preserve the focused session across tab-list mutations ──────────────
+  // When the backend removes a tab above the focused one it compacts the
+  // remaining tab indices, so a `tab:<idx>` selection goes stale — it would
+  // either point at a different tab or resolve to nothing. Track the focused
+  // tab's session_id; on the next tabs update, re-select that session's new
+  // tab index (or fall back to `session:<id>` if the tab was closed but the
+  // session survives). This preserves the displayed transcript across a
+  // sibling close.
+  const pinnedSessionIdRef = useRef<string | null>(null)
+  // Track the selectedId we last pinned for. When `tabs` mutates but the
+  // selection is unchanged (a backend compact/close), we MUST NOT re-read the
+  // tab at the old index — that index now holds a different session, and
+  // overwriting the pin would defeat the re-selection below.
+  const lastPinnedSelectedIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (selectedId === lastPinnedSelectedIdRef.current) return
+    lastPinnedSelectedIdRef.current = selectedId
+    if (!selectedId?.startsWith('tab:')) {
+      pinnedSessionIdRef.current = null
+      return
+    }
+    const idx = parseInt(selectedId.slice('tab:'.length), 10)
+    const t = tabs.find((tab) => tab.index === idx)
+    pinnedSessionIdRef.current = t?.session_id ?? null
+  }, [selectedId, tabs])
+
   // ── Resolve focused session ────────────────────────────────────────────
-  const currentSessionId = sessionIdFromSelection(selectedId, tabs)
+  // Fall back to the pinned session id when a `tab:<idx>` selection goes
+  // stale (the backend compacted the tab list but the re-selection effect
+  // below hasn't run yet for this render). Without the fallback,
+  // `currentSessionId` would momentarily be `null`, clearing the transcript
+  // and forcing a re-fetch + "Loading..." flash even though the focused
+  // session never changed. The pin holds the session id across that window.
+  let currentSessionId = sessionIdFromSelection(selectedId, tabs)
+  if (currentSessionId === null && selectedId?.startsWith('tab:')) {
+    currentSessionId = pinnedSessionIdRef.current
+  }
+
+  // Session-scoped agent defs (workdir ⊕ user, workdir-wins). When a session
+  // is focused, fetches /api/sessions/:id/agents (repo-local defs surface);
+  // otherwise fetches /api/agents (the global user store). Called
+  // unconditionally after `currentSessionId` is resolved (rules-of-hooks).
+  const { agents } = useSessionAgents(currentSessionId)
 
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   // `useTranscriptStream` is the SOLE source of transcript entries. It
@@ -284,24 +338,61 @@ export default function App() {
   // the session's bound agent) instead of inheriting the previous
   // session's selection. The default-agent effect below re-runs on the
   // next render once `agents` is available.
-  useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
+  useEffect(() => { setSelectedAgent(null); prevDefaultRef.current = null }, [currentSessionId])
 
-  // Initialize selectedAgent from the default agent once agents load. We
-  // consult GET /api/agents/default directly (not the polled list's
-  // isDefault flag) so a just-changed default is reflected immediately —
-  // the polled list may still carry the stale isDefault for up to
-  // POLL_INTERVAL after a PUT /api/agents/default.
+  // Initialize selectedAgent from the default agent once agents load. When
+  // a session is focused, the `agents` list is the session-scoped union
+  // (workdir ⊕ user) and `isDefault` reflects the precedence (repo
+  // agents.md > user default_agent > none) — so we read it directly. When no
+  // session is focused, `agents` is the global user store and we consult
+  // GET /api/agents/default (the user-configured default) so a just-changed
+  // default is reflected immediately (the polled list may lag by up to
+  // POLL_INTERVAL).
+  //
+  // The effect re-runs when `agents` changes so the repo agents-md (which
+  // arrives AFTER the async SETUP_REPO clone, via the onAgentDefsChanged
+  // broadcast) overrides the initial fallback selection. To avoid
+  // clobbering an explicit user choice, the override only fires when the
+  // isDefault entry is NEW (wasn't in the previous agents list) — tracked
+  // via prevDefaultRef. Once the user explicitly picks an agent, subsequent
+  // isDefault re-arrivals (e.g. WS invalidation) don't override it.
   useEffect(() => {
-    if (selectedAgent !== null || agents.length === 0) return
+    if (agents.length === 0) return
+    const def = agents.find((a) => a.isDefault)
+    const defName = def?.name ?? null
+    if (currentSessionId) {
+      // Session-scoped: trust the endpoint's isDefault (repo agents.md
+      // > user default_agent > none).
+      if (defName) {
+        // Select the isDefault entry when it's new (just arrived) or when
+        // nothing is selected yet. Don't clobber an explicit user choice
+        // when the isDefault entry is unchanged (a stale re-broadcast).
+        // When the isDefault entry is NEW, also bind it to the backend so
+        // its system prompt is injected on turn one (mirrors handleAgentChange).
+        if (prevDefaultRef.current !== defName || selectedAgent === null) {
+          if (selectedAgent !== defName) {
+            setSelectedAgent(defName)
+            void setSessionAgent(currentSessionId, defName)
+          }
+        }
+      } else if (selectedAgent === null) {
+        // No isDefault yet (workdir still empty): pick a fallback.
+        setSelectedAgent(agents[0]?.name ?? null)
+      }
+      prevDefaultRef.current = defName
+      return
+    }
+    // Global: consult the configured default via the dedicated endpoint.
+    if (selectedAgent !== null) return
     let cancelled = false
     void (async () => {
       const defId = await fetchDefaultAgent()
       if (cancelled) return
-      const def = defId ? agents.find((a) => a.name === defId) : undefined
-      setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
+      const d = defId ? agents.find((a) => a.name === defId) : undefined
+      setSelectedAgent(d?.name ?? agents[0]?.name ?? null)
     })()
     return () => { cancelled = true }
-  }, [agents, selectedAgent])
+  }, [agents, selectedAgent, currentSessionId])
 
   // Apply an agent change for the focused session: update local state AND
   // persist the binding to the backend so the next /send turn picks up the
@@ -351,31 +442,10 @@ export default function App() {
     }
   }, [])
 
-  // ── Preserve the focused session across tab-list mutations ──────────────
-  // When the backend removes a tab above the focused one it compacts the
-  // remaining tab indices, so a `tab:<idx>` selection goes stale — it would
-  // either point at a different tab or resolve to nothing. Track the focused
-  // tab's session_id; on the next tabs update, re-select that session's new
-  // tab index (or fall back to `session:<id>` if the tab was closed but the
-  // session survives). This preserves the displayed transcript across a
-  // sibling close.
-  const pinnedSessionIdRef = useRef<string | null>(null)
-  // Track the selectedId we last pinned for. When `tabs` mutates but the
-  // selection is unchanged (a backend compact/close), we MUST NOT re-read the
-  // tab at the old index — that index now holds a different session, and
-  // overwriting the pin would defeat the re-selection below.
-  const lastPinnedSelectedIdRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (selectedId === lastPinnedSelectedIdRef.current) return
-    lastPinnedSelectedIdRef.current = selectedId
-    if (!selectedId?.startsWith('tab:')) {
-      pinnedSessionIdRef.current = null
-      return
-    }
-    const idx = parseInt(selectedId.slice('tab:'.length), 10)
-    const t = tabs.find((tab) => tab.index === idx)
-    pinnedSessionIdRef.current = t?.session_id ?? null
-  }, [selectedId, tabs])
+  // Re-selection effect: after a backend compact/close the `tab:<idx>`
+  // selection resolves to a different session (or nothing). Re-select the
+  // pinned session's new tab index, or fall back to `session:<id>` when the
+  // tab is gone but the session survives in Recent Sessions.
   useEffect(() => {
     const pinned = pinnedSessionIdRef.current
     if (!pinned || !selectedId?.startsWith('tab:')) return
@@ -629,15 +699,30 @@ export default function App() {
       // without this the session would start unbound and the agent's
       // system prompt would never be injected on the first turn. The
       // user can still override via the SessionSetup dropdown.
+      //
+      // When a repo URL was entered, the repo's .agents/agents.md (if any)
+      // should be the default — skip the auto-bind so the SessionSetup
+      // dropdown's pre-selection (the repo agents-md, which arrives after
+      // the async SETUP_REPO clone) takes over. The onAgentDefsChanged
+      // re-fetch + the default-resolution effect handle the re-selection.
       if (res.session_id) {
         const sid = res.session_id
-        // Consult GET /api/agents/default directly so a just-changed
-        // default is honored even when the polled `agents` list still
-        // carries the stale isDefault flag.
-        void (async () => {
-          const defId = await fetchDefaultAgent()
-          if (defId) void setSessionAgent(sid, defId)
-        })()
+        const repoUrl = composerSpec.repo.trim()
+        if (repoUrl) {
+          // Repo session: defer to the SessionSetup dropdown's pre-selection
+          // (the repo agents-md, which arrives after SETUP_REPO). The
+          // default-resolution effect picks it up when the
+          // onAgentDefsChanged broadcast fires.
+          void setSessionAgent(sid, null)
+        } else {
+          // No repo: consult GET /api/agents/default directly so a
+          // just-changed default is honored even when the polled `agents`
+          // list still carries the stale isDefault flag.
+          void (async () => {
+            const defId = await fetchDefaultAgent()
+            if (defId) void setSessionAgent(sid, defId)
+          })()
+        }
       }
     }
   }, [syncPath])
@@ -756,6 +841,8 @@ export default function App() {
         <AgentsView />
       ) : section === 'skills' ? (
         <SkillsView />
+      ) : section === 'repos' ? (
+        <ReposView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar

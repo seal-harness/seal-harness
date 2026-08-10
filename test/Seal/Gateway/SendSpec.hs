@@ -17,6 +17,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
@@ -27,6 +28,7 @@ import Seal.Providers.Class
 import Seal.Command.Spec (mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
+import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
@@ -58,6 +60,7 @@ instance Provider ScriptProvider where
 -- update in the test: `baseDeps { sdTabsHandle = tabsH }`).
 mkSendDeps :: SealPaths -> IORef [CompletionResponse] -> IO SendDeps
 mkSendDeps paths providerRef = do
+  logger <- testSealLogger
   let configRoot = spConfig paths
       stateRoot  = spState paths
       sessionRoot = stateRoot </> "sessions"
@@ -73,7 +76,7 @@ mkSendDeps paths providerRef = do
   approvals <- newApprovalCache
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
       resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
@@ -89,6 +92,7 @@ mkSendDeps paths providerRef = do
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdRepoReg    = fakeRepoRegistryHandle
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends
@@ -106,6 +110,8 @@ mkSendDeps paths providerRef = do
         , sdReplies     = testReplies
         , sdLocks       = testLocks
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
+        , sdLogger      = logger
+        , sdIsRemote    = False
         }
   pure sendDeps
 
@@ -114,7 +120,7 @@ seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 spec :: Spec
@@ -200,7 +206,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH noTabCloseNotifier] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
         outcome <- handleSend sendDeps sid "/tab list"
@@ -293,7 +299,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         providerRef <- newIORef []
         baseDeps <- mkSendDeps paths providerRef
         tabsH <- newTabsHandle
-        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec tabsH noTabCloseNotifier] }
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier] }
             sid = mkSid "20260701-120000-108"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing

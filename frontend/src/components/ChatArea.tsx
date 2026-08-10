@@ -108,6 +108,50 @@ function useFragmentAnchor<T extends HTMLElement>(anchorId: string | undefined, 
   return targeted
 }
 
+/** Copy-session-id button for the chat header. Renders a small ID-style
+ *  icon; clicking copies the session id to the clipboard with a brief
+ *  "Copied!" tooltip as feedback. Uses the same copyTextToClipboard helper
+ *  as the permalink and JSON-copy buttons elsewhere in this file. */
+function CopySessionIdButton({ sessionId }: { sessionId: string }) {
+  const [copied, setCopied] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => { if (timeoutRef.current) clearTimeout(timeoutRef.current) }, [])
+
+  const onClick = async () => {
+    const ok = await copyTextToClipboard(sessionId)
+    if (ok) {
+      setCopied(true)
+      if (timeoutRef.current) clearTimeout(timeoutRef.current)
+      timeoutRef.current = setTimeout(() => setCopied(false), 1500)
+    }
+  }
+
+  return (
+    <button
+      className="header-scroll-btn"
+      title={copied ? 'Copied!' : `Copy session ID: ${sessionId}`}
+      aria-label={copied ? 'Session ID copied to clipboard' : 'Copy session ID to clipboard'}
+      onClick={onClick}
+    >
+      {copied ? (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <path d="M3 8 L7 12 L13 4" />
+        </svg>
+      ) : (
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <rect x="5" y="5" width="8" height="8" rx="1.5" />
+          <path d="M3 11 V3.5 A1.5 1.5 0 0 1 4.5 2 H11" />
+        </svg>
+      )}
+    </button>
+  )
+}
+
 /** Best-effort clipboard copy that survives non-secure contexts. Returns a
  *  Promise<boolean> that resolves true if either the modern Clipboard API
  *  or the legacy execCommand path succeeded. */
@@ -1087,7 +1131,7 @@ function SessionSetup({
             <option value="">None</option>
             {agents.map((a) => (
               <option key={a.name} value={a.name}>
-                {a.name}{a.isDefault ? ' (default)' : ''}
+                {a.displayName ?? a.name}{a.isDefault ? ' (default)' : ''}
               </option>
             ))}
           </select>
@@ -1373,19 +1417,24 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
     if (e.direction === 'request') {
       const parsed = tryParsePayload(e.payload)
       if (parsed) {
-        // SKILL_LOAD result entries (EKHarness with op.name="SKILL_LOAD"
-        // and a "result" key in the payload, recorded by the backend's
-        // recordSkillLoadResult after the opcode runs). Render as a
-        // collapsible ToolCallBlock — collapsed by default showing
-        // "SKILL_LOAD" + the skill id; expanded shows the skill body.
-        // This is the /skill load user-command surface: the slash bubble
-        // shows only the echo line ($ /skill load <id>); the skill body
-        // lives in this transcript entry so it persists across reloads.
+        // Opcode result entries (EKHarness with an "op.name" and a
+        // "result" key in the payload, recorded by the backend after the
+        // opcode runs). Render as a collapsible ToolCallBlock — collapsed
+        // by default showing the opcode name + a one-line summary;
+        // expanded shows the full input/result. SKILL_LOAD carries the
+        // skill body in result.body; SETUP_REPO carries status/target
+        // (and, on failure, the error text is in the conversation message).
         const opName = (parsed.op as { name?: string } | undefined)?.name
         if (opName === 'SKILL_LOAD' && parsed.result) {
           const input = parsed.input as { id?: string } | undefined
           const result = parsed.result as { body?: string; description?: string; id?: string } | undefined
           const body = result?.body ?? ''
+          // The originating channel label (e.g. "telegram", "web", "cli"),
+          // stamped into the entry's erMeta by the backend's
+          // recordSkillLoadResult and shipped as a top-level `channel` field
+          // on the TranscriptEntry. Surfaced in the source label so the user
+          // can tell how/why the skill was loaded ("Skill · telegram").
+          const channel = e.channel
           const tc: ToolCallInfo = {
             id: 'skillload-' + e.id,
             name: 'SKILL_LOAD',
@@ -1396,10 +1445,44 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-skillload',
             entryId: e.id,
-            agentName: 'Skill',
+            agentName: channel ? `Skill · ${channel}` : 'Skill',
             agentStatus: 'completed',
             timestamp: ts,
             blocks: [{ id: 'tc-skillload-' + e.id, toolCall: tc }],
+            rawJson,
+          })
+          continue
+        }
+        if (opName === 'SETUP_REPO' && parsed.result) {
+          // SETUP_REPO result entry — render as a tool-call box so the
+          // clone/no-op/conflict/failure is visible in the chat (not just
+          // the raw transcript). The result carries {status, target}; on
+          // failure the error text is in the conversation message, so the
+          // box shows the status + target as a one-line summary.
+          const input = parsed.input as { url?: string } | undefined
+          const result = parsed.result as { status?: string; target?: string } | undefined
+          const status = result?.status ?? ''
+          const target = result?.target ?? ''
+          const summary = status === 'cloned' ? `Cloned into ${target}`
+                        : status === 'noop' ? `Repo already exists — ${target}`
+                        : status === 'conflict' ? `Conflict at ${target}`
+                        : status === 'failed' ? 'Clone failed'
+                        : status
+          const channel = e.channel
+          const tc: ToolCallInfo = {
+            id: 'setuprepo-' + e.id,
+            name: 'SETUP_REPO',
+            input: input ?? {},
+            result: summary,
+            resultIsError: status === 'failed' || status === 'conflict',
+          }
+          messages.push({
+            id: e.id + '-setuprepo',
+            entryId: e.id,
+            agentName: channel ? `Repo · ${channel}` : 'Repo',
+            agentStatus: status === 'failed' ? 'idle' : 'completed',
+            timestamp: ts,
+            blocks: [{ id: 'tc-setuprepo-' + e.id, toolCall: tc }],
             rawJson,
           })
           continue
@@ -1473,7 +1556,12 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-user',
                 entryId: e.id,
-                agentName: 'You',
+                // Surface the originating channel (e.g. "telegram", "web")
+                // in the source label so the user can tell where a message
+                // came from. The channel is stamped into the request
+                // entry's erMeta by runTurn's requestMeta and shipped as
+                // a top-level `channel` field on the TranscriptEntry.
+                agentName: e.channel ? `You · ${e.channel}` : 'You',
                 agentStatus: 'completed',
                 timestamp: ts,
                 blocks: [{ id: 'u-' + e.id, text: textParts }],
@@ -1918,6 +2006,7 @@ export function ChatArea({
         })()}
         {messages.length > 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
+            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title="Scroll to top of transcript"
@@ -1945,6 +2034,11 @@ export function ChatArea({
                 <path d="M3 6 L8 11 L13 6" />
               </svg>
             </button>
+          </div>
+        )}
+        {selectedSession && messages.length === 0 && (
+          <div className="ml-auto flex items-center gap-1 shrink-0">
+            <CopySessionIdButton sessionId={selectedSession.id} />
           </div>
         )}
       </div>

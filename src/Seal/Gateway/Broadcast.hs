@@ -18,12 +18,16 @@ module Seal.Gateway.Broadcast
   ( broadcastListsSnapshot
   , broadcastHarnessStatus
   , broadcastReplyDelivered
+  , broadcastAgentDefsChanged
+  , broadcastSkillsChanged
+  , broadcastReposChanged
   ) where
 
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -31,6 +35,7 @@ import Data.Time (getCurrentTime)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
 import Seal.Gateway.Transcript (showIso)
 import Seal.Tabs (TabsHandle)
@@ -86,3 +91,25 @@ broadcastReplyDelivered mBroker sid =
         [ "kind" .= ("reply-delivered" :: Text)
         , "timestamp" .= T.pack (showIso now)
         ]))
+
+-- | Push an @agent-defs-changed@ signal to every WS subscriber. The
+-- frontend re-fetches GET /api/agents on receipt (invalidation, not
+-- payload — the full list is too large to inline). 'Nothing' broker
+-- (tests) is a no-op.
+broadcastAgentDefsChanged :: Maybe StreamBroker -> IO ()
+broadcastAgentDefsChanged mBroker =
+  for_ mBroker SB.broadcastAgentDefsChanged
+
+-- | Push a @skills-changed@ signal to every WS subscriber. The frontend
+-- re-fetches GET /api/skills on receipt. 'Nothing' broker (tests) is a
+-- no-op.
+broadcastSkillsChanged :: Maybe StreamBroker -> IO ()
+broadcastSkillsChanged mBroker =
+  for_ mBroker SB.broadcastSkillsChanged
+
+-- | Push a @repos-changed@ signal to every WS subscriber. The frontend
+-- re-fetches GET /api/repos on receipt. 'Nothing' broker (tests) is a
+-- no-op.
+broadcastReposChanged :: Maybe StreamBroker -> IO ()
+broadcastReposChanged mBroker =
+  for_ mBroker SB.broadcastReposChanged

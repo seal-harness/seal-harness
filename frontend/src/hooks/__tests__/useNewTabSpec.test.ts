@@ -4,18 +4,20 @@ import { useNewTabSpec } from '../useNewTabSpec'
 
 // The persisted UI state to return from GET /api/ui/state. Tests can override
 // via `setUiStateResponse`.
-let uiStateResponse: unknown = { last_options: null, custom_models: [] }
+let uiStateResponse: unknown = { last_options: null, custom_models: [], repo_history: [] }
 
 beforeEach(() => {
-  uiStateResponse = { last_options: null, custom_models: [] }
+  uiStateResponse = { last_options: null, custom_models: [], repo_history: [] }
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (url === '/api/agents') return new Response(JSON.stringify([{ name: 'dev', isDefault: true }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/providers') return new Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/providers/anthropic/models') return new Response(JSON.stringify([{ name: 'claude-sonnet-4', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/harnesses/discover') return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/repos') return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/state' && (!init || init.method === 'GET')) return new Response(JSON.stringify(uiStateResponse), { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/state' && init?.method === 'PUT') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
     if (url === '/api/ui/custom-models' && init?.method === 'POST') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    if (url === '/api/ui/repos' && init?.method === 'POST') return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
     return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
   }))
 })
@@ -81,9 +83,25 @@ describe('useNewTabSpec', () => {
   })
 
   it('loads customModels from the persisted UI state', async () => {
-    uiStateResponse = { last_options: null, custom_models: ['claude-3-opus', 'gpt-4o'] }
+    uiStateResponse = { last_options: null, custom_models: ['claude-3-opus', 'gpt-4o'], repo_history: [] }
     const { result } = renderHook(() => useNewTabSpec())
     await waitFor(() => expect(result.current.customModels).toEqual(['claude-3-opus', 'gpt-4o']))
+  })
+
+  it('loads repoOptions from the persisted UI state', async () => {
+    uiStateResponse = { last_options: null, custom_models: [], repo_history: ['https://github.com/foo/bar', 'git@host:x/y'] }
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.repoOptions).toEqual(['https://github.com/foo/bar', 'git@host:x/y']))
+  })
+
+  it('restores the last-entered repo URL from last_options.repo', async () => {
+    uiStateResponse = {
+      last_options: { kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4', useCustomModel: false, flavour: 'claude-code', customBinary: '', attachSession: '', attachWindow: '', attachManual: false, repo: 'https://github.com/foo/bar' },
+      custom_models: [],
+      repo_history: [],
+    }
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.repo).toBe('https://github.com/foo/bar'))
   })
 
   it('persistOnSubmit PUTs last_options and records the custom model', async () => {
@@ -112,5 +130,23 @@ describe('useNewTabSpec', () => {
     })
     // The custom-model list is updated optimistically.
     expect(result.current.customModels).toContain('claude-3-opus-20240229')
+  })
+
+  it('persistOnSubmit records the repo URL to history when one is entered', async () => {
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.model).toBe('claude-sonnet-4'))
+    act(() => result.current.setRepo('https://github.com/foo/bar'))
+    act(() => result.current.persistOnSubmit())
+    await waitFor(() => {
+      const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+      const addRepo = calls.find(([u, init]) => u === '/api/ui/repos' && init?.method === 'POST')
+      expect(addRepo).toBeTruthy()
+      if (addRepo) {
+        const body = JSON.parse((addRepo[1]!.body as string))
+        expect(body.url).toBe('https://github.com/foo/bar')
+      }
+    })
+    // The repo history is updated optimistically.
+    expect(result.current.repoOptions).toContain('https://github.com/foo/bar')
   })
 })

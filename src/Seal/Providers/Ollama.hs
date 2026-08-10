@@ -16,18 +16,25 @@ module Seal.Providers.Ollama
   , ollamaHeaders
   , ollamaErrorText
   , unreachableMsg
+  , ollamaHttpExceptionMsg
   , encodeRequest
+  , encodeStreamRequest
   , decodeResponse
+  , decodeStreamChunk
+  , StreamChunkState (..)
+  , initialStreamChunkState
   , countToolCalls
   , claimToolCallIds
   ) where
 
 import Control.Exception (try)
+import Control.Monad (void, unless)
 import Data.Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson.Types (Parser, parseEither)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, atomicModifyIORef')
 import Data.Maybe (fromMaybe)
@@ -43,6 +50,18 @@ import Network.HTTP.Types.Header (RequestHeaders)
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
 import Seal.Security.Secrets (ApiKey, withApiKey)
+
+-- | Response timeout for Ollama @/api/chat@ requests, in microseconds.
+-- The 'newTlsManager' default is 90 seconds, which is too short for
+-- non-streaming requests to remote models proxied through the local Ollama
+-- daemon (e.g. @glm-5.2:cloud@): with a large context (49k+ input tokens)
+-- the model can take 74+ seconds to generate the full response before
+-- returning it in one shot. A 5-minute timeout gives generous headroom for
+-- large-context non-streaming generation. This is a per-request override
+-- (the manager's default is not changed, so other HTTP clients in the
+-- process keep their own timeouts).
+ollamaResponseTimeoutMicro :: Int
+ollamaResponseTimeoutMicro = 300_000_000  -- 5 minutes
 
 -- Data type ----------------------------------------------------------------
 
@@ -107,6 +126,14 @@ encodeRequest cr = object $
       maybe []
         (\s -> [object ["role" .= ("system" :: Text), "content" .= s]])
         (crSystem cr)
+
+-- | Like 'encodeRequest' but with @"stream" .= True@. Used by 'streamComplete'
+-- for the streaming HTTP request.
+encodeStreamRequest :: CompletionRequest -> Value
+encodeStreamRequest cr =
+  case encodeRequest cr of
+    Object o -> Object (KeyMap.insert "stream" (Bool True) o)
+    other    -> other
 
 -- | Flatten one provider-agnostic message into zero or more Ollama messages.
 -- A User message becomes a "user" message (its text, if any) followed by one
@@ -192,6 +219,88 @@ stopFromDone (Just "stop")   = StopEnd
 stopFromDone Nothing         = StopEnd
 stopFromDone (Just other)    = StopOther other
 
+-- Streaming chunk decoding --------------------------------------------------
+
+-- | Accumulator state for decoding Ollama streaming NDJSON chunks into
+-- 'StreamEvent's. Ollama streams one JSON object per line; each carries
+-- incremental @message.content@ (text deltas) and, when the model emits tool
+-- calls, a complete @tool_calls@ array in a single chunk (Ollama does not
+-- stream tool-call arguments incrementally — the whole array appears at
+-- once). The state tracks which tool ids have already been emitted so we
+-- only fire 'StreamToolStart'/'StreamToolEnd' once per tool.
+data StreamChunkState = StreamChunkState
+  { scsToolIndex :: Int
+    -- ^ The next tool-call index to assign (Ollama tool calls carry no id;
+    -- we synthesize @call_\<i\>@ sequentially, matching the non-streaming path).
+  , scsSeenToolIds :: [ToolCallId]
+    -- ^ Tool ids already emitted via 'StreamToolStart'/'StreamToolEnd', so
+    -- we don't re-emit them if the same chunk is processed twice or if
+    -- subsequent chunks repeat the tool_calls array.
+  }
+
+-- | Initial streaming state (no tools seen yet).
+initialStreamChunkState :: StreamChunkState
+initialStreamChunkState = StreamChunkState 0 []
+
+-- | Decode one Ollama streaming NDJSON chunk into zero or more 'StreamEvent's,
+-- threading the accumulator state. A single chunk can carry:
+--
+--   * @message.content@ (a text delta) → 'StreamTextChunk'
+--   * @message.tool_calls@ (complete tool calls) → 'StreamToolStart' +
+--     'StreamToolEnd' per tool (Ollama emits these as complete objects, not
+--     incremental deltas)
+--   * @done == true@ → 'StreamDone' with stop reason + usage
+--
+-- Returns the updated state alongside the events.
+decodeStreamChunk
+  :: StreamChunkState -> Value -> Either Text (StreamChunkState, [StreamEvent])
+decodeStreamChunk st = mapLeft T.pack . parseEither (parseStreamChunk st)
+  where mapLeft f = either (Left . f) Right
+
+parseStreamChunk :: StreamChunkState -> Value -> Parser (StreamChunkState, [StreamEvent])
+parseStreamChunk st = withObject "ollama stream chunk" $ \o -> do
+  done <- o .:? "done" .!= False
+  if done
+    then do
+      doneReason <- o .:? "done_reason"
+      promptTok  <- o .:? "prompt_eval_count" .!= 0
+      evalTok    <- o .:? "eval_count" .!= 0
+      let stop = stopFromDone doneReason
+      pure (st, [StreamDone stop (Usage promptTok evalTok)])
+    else do
+      msgVal <- o .:? "message" .!= object []
+      (content, rawCalls) <- parseMsgFields msgVal
+      let textEvents = [StreamTextChunk content | not (T.null content)]
+          (st', toolEvents) = foldl processTool (st, []) rawCalls
+      pure (st', textEvents <> toolEvents)
+  where
+    processTool (s, evs) rawCall = case parseEither parseToolCallRaw rawCall of
+      Left _ -> (s, evs)
+      Right (mTcid, name, args) ->
+        let tcid = fromMaybe (ToolCallId ("call_" <> T.pack (show (scsToolIndex s)))) mTcid
+        in if tcid `elem` scsSeenToolIds s
+          then (s, evs)  -- already emitted; skip duplicate
+          else
+            let s' = s { scsToolIndex = scsToolIndex s + 1
+                       , scsSeenToolIds = tcid : scsSeenToolIds s
+                       }
+            in (s', evs <> [StreamToolStart tcid name, StreamToolEnd tcid name args])
+
+parseMsgFields :: Value -> Parser (Text, [Value])
+parseMsgFields = withObject "stream message" $ \msg -> do
+  content <- msg .:? "content" .!= ""
+  rawCalls <- msg .:? "tool_calls" .!= ([] :: [Value])
+  pure (content, rawCalls)
+
+parseToolCallRaw :: Value -> Parser (Maybe ToolCallId, OpName, Value)
+parseToolCallRaw = withObject "tool_call" $ \o -> do
+  fn   <- o .: "function"
+  name <- fn .: "name"
+  args <- fn .:? "arguments" .!= object []
+  mId  <- o .:? "id" .!= ("" :: Text)
+  let mTcid = if T.null mId then Nothing else Just (ToolCallId mId)
+  pure (mTcid, OpName name, args)
+
 -- Error rendering ----------------------------------------------------------
 
 -- | Render a non-2xx Ollama response, key-safely (the body carries no secret).
@@ -208,6 +317,21 @@ unreachableMsg base =
   "could not reach Ollama at " <> base
     <> " — is it running and the URL correct? (try: ollama serve)"
 
+-- | Render an 'HttpException' as a user-facing error. A response timeout
+-- (the model took longer than 'ollamaResponseTimeoutMicro' to generate)
+-- gets a distinct message so the user knows the daemon is running but the
+-- model was too slow — not that the daemon is down. Other transport errors
+-- (connection refused, etc.) use the generic 'unreachableMsg'.
+ollamaHttpExceptionMsg :: Text -> HttpException -> Text
+ollamaHttpExceptionMsg base = \case
+  HttpExceptionRequest _ ResponseTimeout ->
+    "Ollama response timed out after "
+      <> T.pack (show (ollamaResponseTimeoutMicro `div` 1_000_000))
+      <> "s — the model (likely a remote/cloud model with a large context) \
+         \took too long to respond. Try reducing the conversation context, \
+         \switching to a faster/local model, or send \"continue\" to retry."
+  _ -> unreachableMsg base
+
 -- HTTP round-trip ----------------------------------------------------------
 
 -- | POST {base}/api/chat with the given headers; decode, or return a key-safe
@@ -221,10 +345,11 @@ sendChat o hdrs cr = do
     let req = initReq
           { requestBody     = RequestBodyLBS (encode (encodeRequest cr))
           , requestHeaders  = hdrs
+          , responseTimeout  = responseTimeoutMicro ollamaResponseTimeoutMicro
           }
     httpLbs req (olManager o)
   case result of
-    Left (_ :: HttpException) -> pure (Left (unreachableMsg (olBaseUrl o)))
+    Left (e :: HttpException) -> pure (Left (ollamaHttpExceptionMsg (olBaseUrl o) e))
     Right resp -> do
       let code = statusCode (responseStatus resp)
       if code >= 200 && code <= 299
@@ -262,7 +387,7 @@ listTags mgr base hdrs = do
     initReq <- parseRequest (T.unpack ("GET " <> tagsUrl base))
     httpLbs initReq { requestHeaders = hdrs } mgr
   case result of
-    Left (_ :: HttpException) -> pure (Left (unreachableMsg base))
+    Left (e :: HttpException) -> pure (Left (ollamaHttpExceptionMsg base e))
     Right resp -> do
       let code = statusCode (responseStatus resp)
       if code >= 200 && code <= 299
@@ -286,6 +411,107 @@ instance Provider Ollama where
   listModels o = withHeaders o (listTags (olManager o) (olBaseUrl o))
   complete o cr =
     withHeaders o (\hdrs -> sendChat o hdrs cr)
+  streamComplete o cr k =
+    withHeaders o (\hdrs -> sendChatStream o hdrs cr k)
+
+-- | POST {base}/api/chat with @stream:true@ and stream NDJSON chunks to the
+-- callback. Uses 'withResponse' (incremental body reading) instead of
+-- 'httpLbs' (whole body), so the first chunk arrives as soon as the model
+-- starts generating — avoiding the 90s response timeout that plagued
+-- non-streaming requests to remote/cloud models.
+sendChatStream
+  :: Ollama -> RequestHeaders -> CompletionRequest
+  -> (StreamEvent -> IO Bool)
+  -> IO (Either Text StreamOutcome)
+sendChatStream o hdrs cr k = do
+  result <- try $ do
+    initReq <- parseRequest (T.unpack ("POST " <> chatUrl (olBaseUrl o)))
+    let req = initReq
+          { requestBody     = RequestBodyLBS (encode (encodeStreamRequest cr))
+          , requestHeaders  = hdrs
+          , responseTimeout  = responseTimeoutMicro ollamaResponseTimeoutMicro
+          }
+    withResponse req (olManager o) $ \resp -> do
+      let code = statusCode (responseStatus resp)
+      if code >= 200 && code <= 299
+        then streamBody (responseBody resp)
+        else do
+          -- Non-2xx: read the body for the error message and return it
+          -- directly (not via an exception).
+          body <- brReadSome (responseBody resp) 4096
+          let errTxt = ollamaErrorText code
+                (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict body))
+          pure (Left errTxt)
+  case result of
+    Left (e :: HttpException) -> pure (Left (ollamaHttpExceptionMsg (olBaseUrl o) e))
+    Right inner -> pure inner
+  where
+    -- Read the response body chunk by chunk, decode each line as a JSON
+    -- chunk, emit StreamEvents to the callback. Returns False immediately if
+    -- the callback returns False (abort). Accumulates the final stop+usage
+    -- from the StreamDone event.
+    streamBody body = go BS.empty initialStreamChunkState
+      where
+        go buf st' = do
+          chunk <- brRead body
+          if BS.null chunk
+            then -- Stream ended without a done chunk; flush any remaining
+                 -- buffer as a text chunk and treat as a clean stop.
+                 do unless (BS.null buf) $
+                      do (_, events) <- processBuffer buf st'
+                         void (emitEvents events)
+                    pure (Right (StreamOutcome StopEnd (Usage 0 0)))
+            else do
+              let combined = buf <> chunk
+                  ls = BS.split 10 combined  -- split on '\n'
+              if BS.null (last ls)
+                then do
+                  -- trailing newline → all complete lines
+                  let lines' = filter (not . BS.null) (init ls)
+                  mOut <- processLines st' lines'
+                  case mOut of
+                    Just outcome -> pure (Right outcome)
+                    Nothing -> go BS.empty st'
+                else do
+                  -- no trailing newline → last element is a partial line
+                  let lines' = filter (not . BS.null) (init ls)
+                      partial = last ls
+                  mOut <- processLines st' lines'
+                  case mOut of
+                    Just outcome -> pure (Right outcome)
+                    Nothing -> go partial st'
+    -- Decode a batch of complete lines, threading state. Returns Just
+    -- outcome if a StreamDone was encountered (or the callback aborted),
+    -- Nothing to continue reading.
+    processLines _ [] = pure Nothing
+    processLines st' (l:ls) =
+      case eitherDecodeStrict l of
+        Left _ -> processLines st' ls  -- skip malformed line
+        Right v -> case decodeStreamChunk st' v of
+          Left _ -> processLines st' ls
+          Right (st'', events) -> do
+            mOut <- emitEvents events
+            case mOut of
+              Just outcome -> pure (Just outcome)
+              Nothing -> processLines st'' ls
+    -- Emit events to the callback; return Just outcome if StreamDone or
+    -- callback returned False (abort → treat as clean stop).
+    emitEvents [] = pure Nothing
+    emitEvents (e:es) = do
+      continue <- k e
+      if not continue
+        then pure (Just (StreamOutcome StopEnd (Usage 0 0)))
+        else case e of
+          StreamDone stop usage -> pure (Just (StreamOutcome stop usage))
+          _ -> emitEvents es
+    -- Process a raw buffer (used for the final flush when the stream ends
+    -- without a newline). Returns (state, events).
+    processBuffer buf st' =
+      case eitherDecodeStrict buf of
+        Left _ -> pure (st', [])
+        Right v -> case decodeStreamChunk st' v of
+          Left _ -> pure (st', [])
+          Right r -> pure r
 
 -- | Run @k@ with request headers built from the optional key; the key bytes
 -- live only inside the 'withApiKey' continuation.

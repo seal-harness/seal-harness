@@ -18,15 +18,18 @@ module Seal.Git.Repo
   , gitCommit
   , gitCommitAll
   , gitHasCommits
+  , readProcessBinaryCwdEnv
   ) where
 
 import Control.Exception (try, SomeException)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hClose, hFlush)
@@ -137,7 +140,7 @@ runGit root args = do
 -- 'ByteString' stdin, capturing stdout and stderr as strict 'ByteString's.
 -- Used by the git seam (commit messages may carry non-ASCII bytes).
 readProcessBinaryCwd :: Maybe FilePath -> FilePath -> [String] -> ByteString
-                    -> IO (ExitCode, ByteString, ByteString)
+                     -> IO (ExitCode, ByteString, ByteString)
 readProcessBinaryCwd mCwd cmdPath args input =
   withCreateProcess
     ( (proc cmdPath args)
@@ -148,6 +151,46 @@ readProcessBinaryCwd mCwd cmdPath args input =
       (hIn, hOut, hErr) <- case (mIn, mOut, mErr) of
         (Just a, Just b, Just c) -> pure (a, b, c)
         _ -> error "readProcessBinaryCwd: pipe creation failed (unreachable)"
+      BS.hPutStr hIn input
+      hFlush hIn
+      hClose hIn
+      out <- BS.hGetContents hOut
+      err <- BS.hGetContents hErr
+      ec  <- waitForProcess ph
+      let !_ = BS.length out
+          !_ = BS.length err
+      pure (ec, out, err)
+
+-- | Like 'readProcessBinaryCwd' but with an explicit environment override.
+-- The given @[(String,String)]@ is MERGED over the current process
+-- environment ('System.Environment.getEnvironment'), so the child still
+-- inherits @PATH@, @HOME@, etc. Used by the clone seam
+-- ('Seal.SourceControl.Clone') to inject @GIT_ASKPASS@ / @GIT_SSH_COMMAND@ /
+-- @GIT_TERMINAL_PROMPT@ without re-implementing 'withCreateProcess'.
+--
+-- Security invariant: the @extras@ MUST carry only non-secret values (paths
+-- + flags) — the clone seam ensures the secret bytes live only in the temp
+-- files referenced by those paths, never in the env values themselves.
+readProcessBinaryCwdEnv
+  :: Maybe FilePath
+  -> [(String, String)]
+  -> FilePath
+  -> [String]
+  -> ByteString
+  -> IO (ExitCode, ByteString, ByteString)
+readProcessBinaryCwdEnv mCwd extras cmdPath args input = do
+  inherited <- getEnvironment
+  let mergedEnv = Map.toList (Map.union (Map.fromList extras) (Map.fromList inherited))
+  withCreateProcess
+    ( (proc cmdPath args)
+        { cwd = mCwd
+        , env = Just mergedEnv
+        , std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe
+        }
+    ) $ \mIn mOut mErr ph -> do
+      (hIn, hOut, hErr) <- case (mIn, mOut, mErr) of
+        (Just a, Just b, Just c) -> pure (a, b, c)
+        _ -> error "readProcessBinaryCwdEnv: pipe creation failed (unreachable)"
       BS.hPutStr hIn input
       hFlush hIn
       hClose hIn

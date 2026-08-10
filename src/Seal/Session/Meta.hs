@@ -37,6 +37,13 @@ data SessionMeta = SessionMeta
     -- bound 'smAgent' (set to the agent def's id) or a one-off uploaded
     -- file (set to the file's frontmatter @id@, or the filename when the
     -- file has no frontmatter). 'Nothing' when no agent is active.
+  , smDescription :: Maybe Text
+    -- ^ A user-set display title for the session (the chat-header pencil).
+    -- 'Nothing' means no explicit title; the UI then falls back to the
+    -- auto-summary, first-message snippet, or agent name. Persisted to
+    -- @session.json@ so it survives restarts and propagates to the
+    -- sidebar (which reads the live session list, not a client-side
+    -- override).
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
   } deriving stock (Eq, Show)
@@ -50,6 +57,7 @@ instance ToJSON SessionMeta where
     , "agent"       .= smAgent m
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
+    , "description" .= smDescription m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
     ]
@@ -63,5 +71,6 @@ instance FromJSON SessionMeta where
     <*> o .:? "agent"
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
+    <*> o .:? "description"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

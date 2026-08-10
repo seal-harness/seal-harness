@@ -27,13 +27,16 @@ import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
+import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
 
 fakePaths :: SealPaths
@@ -42,13 +45,22 @@ fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", s
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "capstone" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 runAppStatus :: Application -> Request -> IO Int
 runAppStatus app req = do
   mv <- newEmptyMVar
   _rr <- app req (\resp -> putMVar mv (statusCode (responseStatus resp)) >> pure ResponseReceived)
   takeMVar mv
+
+-- | A fake 'RepoRegistryHandle' (empty list, no-op mutate) for the Phase7a
+-- capstone's 'ApiDeps' literals — these tests don't exercise the repo CRUD
+-- path.
+fakeRepoRegistryHandle :: RepoRegistryHandle
+fakeRepoRegistryHandle = RepoRegistryHandle
+  { rrhList   = pure (Right [])
+  , rrhMutate = \_ -> pure (Right ())
+  }
 
 spec :: Spec
 spec = describe "Seal.Phase7aSpec" $ do
@@ -73,6 +85,10 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
+        , adRepoRegistry = fakeRepoRegistryHandle
+        , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -80,7 +96,8 @@ spec = describe "Seal.Phase7aSpec" $ do
 
   it "a WS client connects, receives hello + a broadcastLists event" $ do
     broker <- newStreamBroker 10
-    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10 }
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
         port = 18095
     _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
     threadDelay 200000
@@ -90,6 +107,8 @@ spec = describe "Seal.Phase7aSpec" $ do
           case A.decode hello :: Maybe A.Value of
             Just _ -> pure ()
             Nothing -> error "expected hello JSON"
+          -- The server sends an initial lists snapshot after hello.
+          _lists <- receiveData conn :: IO BL.ByteString
           broadcastLists broker (A.object ["tabs" A..= ([] :: [String])])
           threadDelay 100000
           msg <- receiveData conn :: IO BL.ByteString
@@ -119,6 +138,10 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adDefaultAgent = pure Nothing
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
+        , adRepoRegistry = fakeRepoRegistryHandle
+        , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+    , adVault = fakeLockedVaultRuntime
+    , adPaths = fakePaths
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

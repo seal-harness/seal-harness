@@ -26,6 +26,7 @@ module Seal.Session.Lock
   , replySubscribe
   , replyUnsubscribe
   , replyFanout
+  , replyFanoutMessage
   , replySubscriberCount
   , replyMigrateAll
   ) where
@@ -39,10 +40,12 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
-import System.IO (hPutStrLn, stderr)
+import Data.Text qualified as T
 
+import Katip (Severity (..), ls)
 import Seal.Core.Types (SessionId)
 import Seal.Handles.Channel (ChannelHandle (..))
+import Seal.Logging.Global (globalLogIO)
 
 -- ---------------------------------------------------------------------------
 -- Write locks
@@ -88,32 +91,43 @@ withSessionLock (SessionLocks tv) sid action = do
 data ReplySink = ReplySink
   { rsHandle :: ChannelHandle
   , rsGuard  :: IORef (Maybe SessionId)
+  , rsLabel  :: Text
   }
 
 -- | The per-session reply registry. Maps each 'SessionId' to the set of
 -- 'ReplySink's that should receive replies for that session. STM-backed
--- so subscribe/unsubscribe/fan-out are race-safe.
+-- so subscribe/unsubscribe/fan-out are race-safe. Multiple channels of
+-- DIFFERENT kinds can subscribe to the same session (e.g. a Telegram
+-- handle and a Signal handle both following the same tab); re-subscribing
+-- a channel of the same kind replaces the old handle for that kind.
 newtype ReplyRegistry = ReplyRegistry (TVar (Map SessionId [ReplySink]))
 
 -- | Build a new empty reply registry.
 newReplyRegistry :: IO ReplyRegistry
 newReplyRegistry = ReplyRegistry <$> newTVarIO Map.empty
 
--- | Subscribe a 'ChannelHandle' to a session's replies. Replaces any
--- existing subscribers for the session (each turn re-subscribes the same
--- handle; the last one wins). This prevents duplicate deliveries from
--- 'replyFanout' when multiple turns on the same session re-subscribe the
--- same handle. The handle is associated with an 'IORef' guard (returned
--- to the caller) so it can be later unsubscribed.
+-- | Subscribe a 'ChannelHandle' to a session's replies. Subscribers
+-- accumulate per channel kind: a new subscription for the same
+-- @chLabel@ replaces the old handle for that kind (so re-subscribing the
+-- same Telegram conversation updates its handle without creating a
+-- duplicate), but a DIFFERENT channel kind (e.g. Signal) is preserved.
+-- This lets a session be followed by one handle per append-only channel
+-- simultaneously, enabling cross-channel message mirroring. The handle is
+-- associated with an 'IORef' guard (returned to the caller) so it can be
+-- later unsubscribed.
 replySubscribe
   :: ReplyRegistry -> ChannelHandle -> SessionId
   -> IO (IORef (Maybe SessionId))
 replySubscribe (ReplyRegistry tv) h sid = do
   guard <- newIORef (Just sid)
-  let sink = ReplySink h guard
+  let sink = ReplySink h guard (chLabel h)
   atomically $ do
     m <- readTVar tv
-    writeTVar tv (Map.insert sid [sink] m)
+    let sinks = Map.findWithDefault [] sid m
+        -- Drop any existing sink with the same channel label (replace
+        -- same-kind), then prepend the new one.
+        sinks' = sink : filter (\s -> rsLabel s /= rsLabel sink) sinks
+    writeTVar tv (Map.insert sid sinks' m)
   pure guard
 
 -- | Unsubscribe a handle from a session. The 'IORef' guard must match
@@ -145,7 +159,31 @@ replyFanout (ReplyRegistry tv) sid text = do
     mapM_ (\sink -> safeSend (rsHandle sink) text) sinks
   where
     safeSend h t = chSend h t `catch` \e ->
-      hPutStrLn stderr ("reply fanout: send failed: " <> show (e :: IOException))
+      globalLogIO WarningS ("reply fanout: send failed: " <> ls (T.pack (show (e :: IOException))))
+
+-- | Fan out a user message to every 'ChannelHandle' subscribed to a
+-- session EXCEPT the channel that sent the message (identified by its
+-- @excludeLabel@). Each receiving channel gets the message prefixed with
+-- the sender's channel label in brackets (e.g. @"[telegram] hi"@), so
+-- the user can see which channel the message originated from. This is
+-- the cross-channel message-mirroring primitive: every user message sent
+-- on any append-only channel is mirrored to all OTHER subscribed
+-- append-only channels. The web frontend is NOT in the registry (it
+-- sees the message directly via the transcript), so it is excluded by
+-- construction. Errors are logged and swallowed.
+replyFanoutMessage
+  :: ReplyRegistry -> SessionId -> Text -> Text -> IO ()
+replyFanoutMessage (ReplyRegistry tv) sid senderLabel text = do
+  m <- readTVarIO tv
+  for_ (Map.lookup sid m) $ \sinks ->
+    mapM_ (\sink ->
+      if rsLabel sink == senderLabel
+        then pure ()  -- don't mirror back to the sender
+        else safeSend (rsHandle sink) ("[" <> senderLabel <> "] " <> text))
+      sinks
+  where
+    safeSend h t = chSend h t `catch` \e ->
+      globalLogIO WarningS ("message fanout: send failed: " <> ls (T.pack (show (e :: IOException))))
 
 -- | The number of channels currently subscribed to a session's replies.
 -- Used by the web send path to decide whether the last assistant reply

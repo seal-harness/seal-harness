@@ -50,6 +50,7 @@ library
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Util.AesonUtils
+        Seal.Util.StrictIO
         Seal.Routing.Route
         Seal.Transcript.Types
         Seal.Transcript.Conv
@@ -96,6 +97,7 @@ library
         Seal.Command.Session
         Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Repo
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
@@ -113,22 +115,28 @@ library
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
-        Seal.Session.Log
-        Seal.Signal.Config
-        Seal.Telegram.Config
-        Seal.Security.Command
-        Seal.Security.Crypto
-        Seal.Security.Path
-        Seal.Security.Policy
-        Seal.Security.Secrets
-        Seal.Security.Vault
-        Seal.Security.Vault.Age
-        Seal.Text.LineFile
-        Seal.Tools.Args
-        Seal.Tools.Exec.Remote
-        Seal.Tools.Exec.Types
-        Seal.Tools.Exec.Untrusted
-        Seal.Tools.Exec.UntrustedIO
+         Seal.Session.Log
+          Seal.SourceControl.Repo
+          Seal.SourceControl.Registry
+          Seal.SourceControl.AgentRegistry
+          Seal.SourceControl.Clone
+          Seal.SourceControl.GithubKeys
+         Seal.Signal.Config
+         Seal.Telegram.Config
+         Seal.Security.Command
+         Seal.Security.Crypto
+         Seal.Security.Path
+         Seal.Security.Policy
+         Seal.Security.Secrets
+         Seal.Security.Vault
+         Seal.Security.Vault.Age
+         Seal.Text.LineFile
+         Seal.Tools.Args
+         Seal.Tools.Exec.Remote
+         Seal.Tools.Exec.Types
+         Seal.Tools.Exec.Untrusted
+         Seal.Tools.Exec.UntrustedIO
+         Seal.Tools.Ssh.Agent
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -156,6 +164,7 @@ library
         Seal.Vault.Commands
         Seal.Agent.Env
         Seal.Agent.Loop
+        Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
         Seal.Agent.Runtime.Registry
@@ -172,8 +181,10 @@ library
         Seal.ISA.Ops.Harness
         Seal.ISA.Ops.Secret
         Seal.ISA.Ops.Memory
-        Seal.ISA.Ops.Skills
-        Seal.ISA.Ops.Agent
+         Seal.ISA.Ops.Skills
+         Seal.ISA.Ops.Repo
+         Seal.ISA.Ops.Git
+         Seal.ISA.Ops.Agent
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
         Seal.Memory.Types
@@ -182,7 +193,12 @@ library
         Seal.Skills.Codec
         Seal.Skills.Backend
         Seal.Skills.Autoload
+        Seal.Skills.Prompt
         Seal.Skills.Builtins
+        Seal.Logging.Logger
+        Seal.Logging.ChannelContext
+        Seal.Logging.Exceptions
+        Seal.Logging.Global
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -195,9 +211,11 @@ library
         base >= 4.18 && < 5
       , aeson
       , base64-bytestring
+      , data-default
       , bytestring
       , configuration-tools
       , containers
+      , conduit
       , crypton
       , directory
       , exceptions
@@ -219,12 +237,14 @@ library
       , network
       , tomland
       , process
+      , temporary
       , unix
       , unordered-containers
       , validation-selective
       , vector
-      , random
-      , uuid-types
+        , random
+        , retry
+        , uuid-types
       , wai
       , warp
       , websockets
@@ -249,6 +269,8 @@ test-suite tests
         base
       , seal-harness
       , QuickCheck
+      , base64-bytestring
+      , data-default
       , aeson
       , async
       , bytestring
@@ -258,6 +280,7 @@ test-suite tests
       , hspec
       , http-client
       , http-client-tls
+      , katip
       , optparse-applicative
       , stm
       , temporary
@@ -271,10 +294,14 @@ test-suite tests
       , warp
       , http-types
       , vector
+      , tomland
+      , validation-selective
+      , unordered-containers
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
         Seal.Core.MessageSourceSpec
+        Seal.RepoDiscoverySpec
         Seal.Core.AllowListSpec
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
@@ -312,12 +339,16 @@ test-suite tests
         Seal.Skills.TypesSpec
         Seal.Skills.BackendSpec
         Seal.Skills.AutoloadSpec
+        Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec
         Seal.Agent.Def.TypesSpec
         Seal.Agent.Def.BackendSpec
+        Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
+        Seal.ISA.Ops.RepoSpec
+        Seal.ISA.Ops.GitSpec
         Seal.ISA.Ops.AgentSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec
@@ -348,6 +379,7 @@ test-suite tests
         Seal.Command.SessionSpec
         Seal.Command.ServeSpec
         Seal.Command.SkillSpec
+        Seal.Command.RepoSpec
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec
@@ -371,7 +403,13 @@ test-suite tests
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
+        Seal.Session.LockSpec
+        Seal.SourceControl.RepoSpec
+        Seal.SourceControl.RegistrySpec
+        Seal.SourceControl.AgentRegistrySpec
+        Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
+        Seal.Tools.Ssh.AgentSpec
         Seal.Tools.Exec.TypesSpec
         Seal.Tools.Exec.UntrustedSpec
         Seal.Tools.Exec.UntrustedIORemoteSpec
@@ -392,6 +430,7 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
+        Seal.TestHelpers.FakeRegistry
         Seal.TestHelpers.FakeVault
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
@@ -412,3 +451,5 @@ test-suite tests
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
         Seal.ISA.RegistrySpec
+        Seal.Logging.LoggerSpec
+        Seal.Logging.ExceptionsSpec

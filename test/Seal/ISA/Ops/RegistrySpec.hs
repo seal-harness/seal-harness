@@ -16,9 +16,10 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A trivial trusted opcode with a recognizable schema, so the describe
 -- opcode has something concrete to render.

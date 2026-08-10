@@ -40,6 +40,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
   (newAgentRuntime)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Paging (defaultPageParams)
@@ -89,6 +90,7 @@ import Seal.Tools.Exec.UntrustedIO
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.Browser (browserClickOp, browserOpenOp, browserReadOp,
                          noBrowserDriver)
@@ -100,7 +102,7 @@ import Seal.Web.Search (WebSearchConfig (..), webSearchOp, SearchProvider (Provi
 -- ---------------------------------------------------------------------------
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A minimal 'WebSearchConfig' for tests: no manager (fail-closed),
 -- 'ProviderParallel' default, empty allow-list, no vault/key.
@@ -129,10 +131,11 @@ instance Provider ScriptProvider where
 
 -- | A 'ChannelCaps' that records sends into an IORef and returns "yes" on prompt.
 recordCaps :: IORef [Text] -> ChannelCaps
-recordCaps sent = ChannelCaps
+recordCaps sent = def
   { ccSend        = \t -> modifyIORef' sent (++ [t])
   , ccPrompt      = \_ -> pure "yes"
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | Dispatch a single opcode through the full integration seam (authorize →
@@ -240,7 +243,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    mkRemoteUntrustedIOStub caps sid 8 Nothing Full approvals Nothing (pure ()) Nothing False Nothing
+                    mkRemoteUntrustedIOStub caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)
@@ -865,10 +868,11 @@ spec = describe "Seal.ISA.Integration" $ do
 
   describe "ASK_HUMAN" $ do
     it "\"Ask the human which branch to use.\" -> ASK_HUMAN -> human's reply returned" $ do
-      let caps = ChannelCaps
+      let caps = def
             { ccSend = \_ -> pure ()
             , ccPrompt = \_ -> pure "main"
             , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
             }
           op = askHumanOp caps
           reg = Registry.mkRegistry [op]

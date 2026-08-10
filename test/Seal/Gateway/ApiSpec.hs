@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 module Seal.Gateway.ApiSpec (spec) where
 
+import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
 import Control.Monad (replicateM_, void)
@@ -24,7 +26,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -54,16 +56,19 @@ import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
 import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (BoundSession, BoundHarness))
+import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -86,7 +91,7 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -177,6 +182,7 @@ mkDepsFor paths = do
   skills <- Skill.noneBackend
   activeRef <- newIORef fakeMeta
   uiState <- newUiStateHandle paths
+  repoRegH <- mkFakeRepoRegistryHandle
   let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
   pure ApiDeps
     { adSessionRuntime  = sr
@@ -191,7 +197,36 @@ mkDepsFor paths = do
     , adDefaultAgent    = pure Nothing
     , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = repoRegH
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
     }
+
+-- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
+-- registry and whose @rrhMutate@ always succeeds (no disk I/O). Used by
+-- tests that need an 'ApiDeps' but don't exercise the repo CRUD path.
+mkFakeRepoRegistryHandle :: IO RepoRegistryHandle
+mkFakeRepoRegistryHandle = pure fakeRepoRegistryHandle
+
+-- | The pure 'RepoRegistryHandle' value backing 'mkFakeRepoRegistryHandle'.
+-- Used by the inline @deps = ApiDeps {…}@ literals (which are in a pure
+-- @let@ context) so they don't need an IO action.
+fakeRepoRegistryHandle :: RepoRegistryHandle
+fakeRepoRegistryHandle = RepoRegistryHandle
+  { rrhList   = pure (Right [])
+  , rrhMutate = \_ -> pure (Right ())
+  }
+
+-- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns 'Left'
+-- (simulating a corrupt @repos.toml@). Used to assert GET /api/repos
+-- surfaces a corrupt registry as 500 (the AC5/S2 mitigation), NOT a silent
+-- empty list.
+mkCorruptRepoRegistryHandle :: IO RepoRegistryHandle
+mkCorruptRepoRegistryHandle = pure RepoRegistryHandle
+  { rrhList   = pure (Left "corrupt repos.toml: parse error")
+  , rrhMutate = \_ -> pure (Right ())
+  }
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
@@ -428,7 +463,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -458,7 +493,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -489,7 +524,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -512,7 +547,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -552,7 +587,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -936,12 +971,85 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 200
 
-  it "PUT /api/sessions/<sid>/description returns 204" $ do
+  it "PUT /api/sessions/<sid>/description returns 200 {ok:true}, persists the description, and surfaces it in /api/sessions" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-050"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "description"]
+        (A.encode (A.object [ "description" .= ("my tab name" :: T.Text) ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "ok" o `shouldBe` Just (A.Bool True)
+        other -> error ("unexpected description body: " ++ show other)
+      -- The description was persisted to session.json.
+      mMeta <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
+      smDescription <$> mMeta `shouldBe` Just (Just "my tab name")
+      -- The new label surfaces in the session listing (the sidebar reads
+      -- this — the bug was that the sidebar + a refresh lost the name).
+      (_, listingBody) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      let arr = case A.decode listingBody :: Maybe A.Value of
+            Just (A.Array v) -> V.toList v
+            _                -> error "expected an array"
+          ours = filter (\case A.Object o -> lookupK "id" o == Just (A.String sidTxt); _ -> False) arr
+      length ours `shouldBe` 1
+      case ours of
+        [A.Object o] -> lookupK "description" o `shouldBe` Just (A.String "my tab name")
+        _            -> expectationFailure "expected exactly one matching session"
+
+  it "PUT /api/sessions/<sid>/description with an empty/whitespace body clears the description" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-052"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0))
+                  { smDescription = Just "old name" }
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "description"]
+        (A.encode (A.object [ "description" .= ("   " :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      mMeta <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
+      smDescription <$> mMeta `shouldBe` Just Nothing
+
+  it "PUT /api/sessions/<sid>/description returns 404 when the session has no session.json" $ do
     app <- mkApp
-    req <- testPut ["api", "sessions", "sess1", "description"]
+    req <- testPut ["api", "sessions", "missing", "description"]
       (A.encode (A.object [ "description" .= ("new" :: T.Text) ]))
     status <- runAppStatus app req
-    status `shouldBe` 204
+    status `shouldBe` 404
+
+  it "PUT /api/sessions/<sid>/description returns 400 on invalid JSON" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-053"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      req <- testPut ["api", "sessions", sidTxt, "description"] "{not json"
+      status <- runAppStatus app req
+      status `shouldBe` 400
 
   it "PUT /api/sessions/<sid>/archived returns 200 {ok:true} and moves the session to /archived" $
     withSystemTempDirectory "seal-api" $ \stateDir -> do
@@ -950,7 +1058,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1030,7 +1138,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1061,7 +1169,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1086,7 +1194,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1112,7 +1220,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1151,7 +1259,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1169,7 +1277,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1194,7 +1302,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1212,7 +1320,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1245,7 +1353,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) (Just "one-off") Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) (Just "one-off") Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1272,7 +1380,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) Nothing Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" (Just aid) Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1297,7 +1405,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just "one-off") Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just "one-off") Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1322,7 +1430,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1345,7 +1453,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
@@ -1372,7 +1480,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "You are a helpful agent with no frontmatter."
@@ -1397,7 +1505,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "my-uploaded-agent")
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "my-uploaded-agent") Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1448,6 +1556,10 @@ spec = describe "Seal.Gateway.API" $ do
                  , adDefaultAgent    = pure (Just "zoe")
                  , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1519,6 +1631,10 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1580,6 +1696,10 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1642,6 +1762,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1729,6 +1853,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1781,6 +1909,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1832,6 +1964,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -1864,6 +2000,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -1932,7 +2072,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "writer" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Writer" "draft text" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Writer" "draft text" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1948,6 +2088,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -1982,7 +2126,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         sid = case mkSkillId "alpha" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Alpha" "body" oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = Skill sid "Alpha" "body" Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1998,6 +2142,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -2031,7 +2179,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         sid = case mkSkillId "gone" of Right x -> x; Left _ -> error "sid"
-        seed = Skill sid "Gone" "body" now now (mkSystemSessionId "manual")
+        seed = Skill sid "Gone" "body" Nothing now now (mkSystemSessionId "manual")
     Skill.sbCreate skills seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2047,6 +2195,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -2072,7 +2224,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         mkS n = case mkSkillId n of
-          Right sid -> Skill sid n "body" now now (mkSystemSessionId "manual")
+          Right sid -> Skill sid n "body" Nothing now now (mkSystemSessionId "manual")
           Left _    -> error "sid"
     Skill.sbCreate skills (mkS "zeta")
     Skill.sbCreate skills (mkS "alpha")
@@ -2090,6 +2242,10 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -2104,6 +2260,389 @@ spec = describe "Seal.Gateway.API" $ do
             ids = map idOf xs
         ids `shouldBe` ["alpha", "zeta"]
       Nothing -> expectationFailure "expected a skills array"
+
+  -- ── Repo CRUD (W4) ───────────────────────────────────────────────────
+  -- The /api/repos surface: GET (list), POST (idempotent upsert, 201),
+  -- GET/:id, PUT/:id (200, 404 if missing), DELETE/:id (idempotent 204).
+  -- Validation: mkRepoId, urlShapeValid, host allow-list, parseVcsKind,
+  -- parseCredentialKind. A corrupt repos.toml surfaces as 500 (AC5/S2).
+  -- The credential object carries only vault key NAMES (never secret
+  -- bytes) — the no-secret-in-response guard asserts the descriptor never
+  -- leaks a token/value/secret/password field.
+  describe "/api/repos" $ do
+    -- Build an ApiDeps whose adRepoRegistry points at a REAL repos.toml
+    -- in a per-test temp dir (so upsert/remove persist across requests
+    -- within the test). The adConfigRepo is a nonexistent path — the
+    -- best-effort gitCommitAll is wrapped in try, so a missing repo is
+    -- harmless.
+    let mkRepoApp :: FilePath -> IO ApiDeps
+        mkRepoApp tmp = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          skills <- Skill.noneBackend
+          activeRef <- newIORef fakeMeta
+          uiState <- newUiStateHandle mkPaths
+          repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+          let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+          pure ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = repoRegH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
+            }
+
+    it "GET /api/repos returns 200 + [] when the registry is empty" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
+        status `shouldBe` 200
+        case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs `shouldBe` []
+          Nothing -> expectationFailure "expected a JSON array"
+
+    it "POST /api/repos creates a PAT repo (201) and GET /api/repos/:id returns it" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("myrepo" :: T.Text)
+            , "url"      .= ("git@github.com:owner/myrepo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("github_pat" :: T.Text)
+                ]
+            ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "id" o `shouldBe` Just (A.String "myrepo")
+            lookupK "url" o `shouldBe` Just (A.String "git@github.com:owner/myrepo.git")
+            lookupK "vcs_kind" o `shouldBe` Just (A.String "git")
+            case lookupK "credential" o of
+              Just (A.Object co) -> do
+                lookupK "kind" co `shouldBe` Just (A.String "pat")
+                lookupK "vault_key" co `shouldBe` Just (A.String "github_pat")
+                lookupK "username" co `shouldBe` Nothing
+              _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object for POST repo"
+        -- GET it back.
+        (_, body2) <- runAppBody app (testRequest methodGet ["api", "repos", "myrepo"])
+        case A.decode body2 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "id" o `shouldBe` Just (A.String "myrepo")
+          _ -> expectationFailure "expected JSON object for GET repo"
+
+    it "POST /api/repos is idempotent upsert (same id, new url → 201 + updated)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        let postRepo urlStr = testPost ["api", "repos"]
+              (A.encode (A.object
+                [ "id"       .= ("r1" :: T.Text)
+                , "url"      .= (urlStr :: T.Text)
+                , "vcs_kind" .= ("github" :: T.Text)
+                , "credential" .= A.object
+                    [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+                ]))
+        req1 <- postRepo "https://github.com/owner/r1.git"
+        (st1, b1) <- runAppBody app req1
+        st1 `shouldBe` 201
+        case A.decode b1 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1.git")
+          _ -> expectationFailure "expected first POST body"
+        req2 <- postRepo "https://github.com/owner/r1-renamed.git"
+        (st2, b2) <- runAppBody app req2
+        st2 `shouldBe` 201
+        case A.decode b2 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1-renamed.git")
+          _ -> expectationFailure "expected second POST body"
+        -- GET reflects the updated url.
+        (_, b3) <- runAppBody app (testRequest methodGet ["api", "repos", "r1"])
+        case A.decode b3 :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "url" o `shouldBe` Just (A.String "https://github.com/owner/r1-renamed.git")
+          _ -> expectationFailure "expected GET after upsert"
+
+    it "POST /api/repos with missing id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a bad id (slash) returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("bad/id" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with an empty url returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r2" :: T.Text)
+            , "url"      .= ("" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a malformed url (not SSH/HTTPS) returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r3" :: T.Text)
+            , "url"      .= ("not-a-url" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with a disallowed host returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r4" :: T.Text)
+            , "url"      .= ("git@evil.com:owner/repo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with an unknown credential.kind returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r5" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("magic" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "POST /api/repos with machine_user but no username returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r6" :: T.Text)
+            , "url"      .= ("https://github.com/o/r.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind" .= ("machine_user" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "PUT /api/repos/:id on a missing repo returns 404" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPut ["api", "repos", "ghost"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/ghost.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 404
+
+    it "PUT /api/repos/:id updates an existing repo (200 + updated descriptor)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("putr" :: T.Text)
+            , "url"      .= ("https://github.com/o/putr.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        putReq <- testPut ["api", "repos", "putr"]
+          (A.encode (A.object
+            [ "url"      .= ("https://github.com/o/putr-v2.git" :: T.Text)
+            , "vcs_kind" .= ("github" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("deploy_key" :: T.Text), "vault_key" .= ("dk" :: T.Text) ]
+            ]))
+        (st, body) <- runAppBody app putReq
+        st `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "id" o `shouldBe` Just (A.String "putr")
+            lookupK "url" o `shouldBe` Just (A.String "https://github.com/o/putr-v2.git")
+            lookupK "vcs_kind" o `shouldBe` Just (A.String "github")
+            case lookupK "credential" o of
+              Just (A.Object co) -> lookupK "kind" co `shouldBe` Just (A.String "deploy_key")
+              _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object for PUT repo"
+
+    it "DELETE /api/repos/:id returns 204 and is idempotent" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("delr" :: T.Text)
+            , "url"      .= ("https://github.com/o/delr.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        delReq1 <- testDelete ["api", "repos", "delr"]
+        st1 <- runAppStatus app delReq1
+        st1 `shouldBe` 204
+        -- GET → 404.
+        (_, body) <- runAppBody app (testRequest methodGet ["api", "repos", "delr"])
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+          _ -> expectationFailure "expected 404 object after delete"
+        -- Delete again → still 204 (idempotent).
+        delReq2 <- testDelete ["api", "repos", "delr"]
+        st2 <- runAppStatus app delReq2
+        st2 `shouldBe` 204
+
+    it "DELETE /api/repos/:id with a malformed id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testDelete ["api", "repos", "bad/id"]
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "GET /api/repos/:id with a malformed id returns 400" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        (_, body) <- runAppBody app (testRequest methodGet ["api", "repos", "bad/id"])
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+          _ -> expectationFailure "expected 400 error object"
+
+    it "never leaks a secret value in the repo descriptor (vault_key is a NAME)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+            secretValue = "ghp_SUPERSECRET_never_in_response_12345"
+        -- POST a repo whose vault_key is a known name; the registry never
+        -- stores the secret VALUE, so no response field should match it.
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("sec" :: T.Text)
+            , "url"      .= ("https://github.com/o/sec.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind" .= ("machine_user" :: T.Text)
+                , "vault_key" .= ("github_token" :: T.Text)
+                , "username" .= ("bot-account" :: T.Text)
+                ]
+            ]))
+        (st, body) <- runAppBody app createReq
+        st `shouldBe` 201
+        let bodyText = T.pack (BC.unpack (BL.toStrict body))
+        -- The secret value must not appear anywhere in the response.
+        secretValue `T.isInfixOf` bodyText `shouldBe` False
+        -- The credential object carries the vault key NAME + username, and
+        -- has NO token/value/secret/password field.
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "credential" o of
+            Just (A.Object co) -> do
+              lookupK "vault_key" co `shouldBe` Just (A.String "github_token")
+              lookupK "username" co `shouldBe` Just (A.String "bot-account")
+              lookupK "token" co `shouldBe` Nothing
+              lookupK "value" co `shouldBe` Nothing
+              lookupK "secret" co `shouldBe` Nothing
+              lookupK "password" co `shouldBe` Nothing
+            _ -> expectationFailure "expected credential object"
+          _ -> expectationFailure "expected JSON object"
+        -- GET the list and the single repo — same guard.
+        (_, listBody) <- runAppBody app (testRequest methodGet ["api", "repos"])
+        let listText = T.pack (BC.unpack (BL.toStrict listBody))
+        secretValue `T.isInfixOf` listText `shouldBe` False
+        (_, oneBody) <- runAppBody app (testRequest methodGet ["api", "repos", "sec"])
+        let oneText = T.pack (BC.unpack (BL.toStrict oneBody))
+        secretValue `T.isInfixOf` oneText `shouldBe` False
+
+    it "GET /api/repos surfaces a corrupt repos.toml as 500 (NOT empty 200)" $ do
+      -- Build an ApiDeps whose adRepoRegistry returns Left on rrhList
+      -- (simulating a corrupt repos.toml). The handler must propagate the
+      -- error as 500, not silently return [].
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      adb   <- noneBackend
+      skills <- Skill.noneBackend
+      activeRef <- newIORef fakeMeta
+      uiState <- newUiStateHandle mkPaths
+      corruptH <- mkCorruptRepoRegistryHandle
+      let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = corruptH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
+      status `shouldBe` 500
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
+        _ -> expectationFailure "expected a 500 error JSON object"
 
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
@@ -2134,6 +2673,10 @@ spec = describe "Seal.Gateway.API" $ do
                 , adDefaultAgent    = pure Nothing
                 , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2247,6 +2790,43 @@ spec = describe "Seal.Gateway.API" $ do
       let toText v = case v of { A.String t -> t; _ -> "" }
       map toText cms `shouldBe` ["claude-3-opus", "gpt-4o"]
 
+  it "POST /api/ui/repos appends and lists via GET" $
+    withSystemTempDirectory "seal-ui-repos" $ \tmp -> do
+      let paths = fakePaths { spState = tmp }
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      addReq <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("https://github.com/foo/bar" :: T.Text) ]))
+      addStatus <- runAppStatus app addReq
+      addStatus `shouldBe` 200
+      -- A second URL keeps both, most-recent first.
+      addReq2 <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("git@github.com:x/y" :: T.Text) ]))
+      _ <- runAppStatus app addReq2
+      -- A duplicate dedupes (moves to front).
+      addReq3 <- testPost ["api", "ui", "repos"]
+        (A.encode (A.object [ "url" .= ("https://github.com/foo/bar" :: T.Text) ]))
+      _ <- runAppStatus app addReq3
+      -- Reload from disk to prove persistence.
+      deps2 <- mkDepsFor paths
+      let app2 = apiApp deps2
+      (_, getBody) <- runAppBody app2 (testRequest methodGet ["api", "ui", "state"])
+      let rh = case A.decode getBody :: Maybe A.Value of
+            Just (A.Object o) -> case lookupK "repo_history" o of
+              Just (A.Array a) -> V.toList a
+              _               -> error "no repo_history array"
+            _ -> error "could not decode GET body"
+          toText v = case v of { A.String t -> t; _ -> "" }
+      map toText rh `shouldBe` ["https://github.com/foo/bar", "git@github.com:x/y"]
+
+  it "GET /api/ui/state includes repo_history as an empty array by default" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "ui", "state"])
+    let rh = case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "repo_history" o
+          _ -> Nothing
+    rh `shouldBe` Just (A.Array V.empty)
+
   -- ── Wired send path (adSend = Just SendDeps) ──────────────────────────
   -- A session that doesn't exist on disk returns 404. This exercises the
   -- handleSend -> loadSessionMeta -> Nothing path without needing a real
@@ -2266,6 +2846,117 @@ spec = describe "Seal.Gateway.API" $ do
           Just (A.String s) -> s `shouldBe` "20260719-120000-001"
           _ -> expectationFailure "expected session_id string"
       _ -> expectationFailure "expected JSON object"
+
+  describe "/api/sessions/:id/agents (session-scoped agent defs)" $ do
+    -- Build a session.json + a workdir with a repo carrying
+    -- .agents/agents.md + a sub-agent, plus a user agent-def backend with
+    -- one def. @mDefault@ sets the configured default_agent (Nothing = none).
+    -- Returns an Application ready to query. The temp dir lives for the
+    -- test's duration (manual cleanup at start).
+    let mkSessionAgentsApp :: Maybe T.Text -> IO (Application, T.Text)
+        mkSessionAgentsApp mDefault = do
+          -- Use a fixed temp dir under /tmp (cleaned at start; OS cleans /tmp).
+          let tmp = "/tmp/seal-api-session-agents-test"
+              stateRoot = tmp </> "state"
+              cacheRoot = tmp </> "cache"
+              sessionRoot = stateRoot </> "sessions"
+          void (try (removeDirectoryRecursive tmp) :: IO (Either SomeException ()))
+          createDirectoryIfMissing True stateRoot
+          createDirectoryIfMissing True cacheRoot
+          createDirectoryIfMissing True sessionRoot
+          let sidTxt = "20260809-120000-sag"
+              sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          -- Persist a session.json so the 404 check passes.
+          let meta = fakeMeta { smId = sid }
+          saveSessionMeta (fakePaths { spState = stateRoot, spCache = cacheRoot }) meta
+          -- Build the workdir with a repo carrying .agents/ (protocol).
+          let wd = cacheRoot </> "workdirs" </> T.unpack sidTxt
+              repoDir = wd </> "my-repo"
+          createDirectoryIfMissing True (repoDir </> ".agents" </> "agents" </> "foo-agent")
+          writeFile (repoDir </> ".agents" </> "agents.md")
+            "---\nkind: agents\n---\nProject guidelines.\n"
+          writeFile (repoDir </> ".agents" </> "agents" </> "foo-agent" </> "agent.md")
+            "---\nname: Foo\nprovider: ollama\n---\nYou are foo.\n"
+          -- A user agent-def backend with one def "user-agent".
+          userAdb <- noneBackend
+          case mkAgentDefId "user-agent" of
+            Right uid -> adbUpdate userAdb (AgentDef
+              { adId = uid, adName = "User Agent", adProvider = ""
+              , adModel = ModelId "", adSystem = Just "user prompt"
+              , adTools = AllowAll
+              , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
+              , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
+              , adSession = mkSystemSessionId "manual" })
+            Left _ -> expectationFailure "invalid user-agent id"
+          -- Build ApiDeps with the user backend + the configured default.
+          tabsH <- newTabsHandle
+          reg <- newHarnessRegistry
+          uiState <- newUiStateHandle fakePaths
+          skillsBackend <- Skill.noneBackend
+          repoRegH <- mkFakeRepoRegistryHandle
+          activeRef <- newIORef meta
+          let paths = fakePaths { spState = stateRoot, spCache = cacheRoot }
+              sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+              deps = ApiDeps
+                { adSessionRuntime = sr, adTabsHandle = tabsH
+                , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
+                , adAgentDefs = userAdb, adSkills = skillsBackend
+                , adProviders = pure knownProviders, adUiState = uiState
+                , adSend = Nothing, adDefaultAgent = pure mDefault
+                , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
+                , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+                }
+          pure (apiApp deps, sidTxt)
+
+    it "returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/" $ do
+      (app, sid) <- mkSessionAgentsApp Nothing
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let names = [ n | A.Object o <- V.toList xs
+                          , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o] ]
+          -- Workdir defs: my-repo--agents-md, my-repo--foo-agent. User def: user-agent.
+          names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
+        _ -> expectationFailure "expected a JSON array"
+
+    it "marks agents-md as default when no user default_agent is configured" $ do
+      (app, sid) <- mkSessionAgentsApp Nothing
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let defaults = [ (n, isDef)
+                       | A.Object o <- V.toList xs
+                       , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o]
+                       , Just (A.Bool isDef) <- [KeyMap.lookup (Key.fromText "isDefault") o]
+                       ]
+          -- Exactly one entry is marked default: my-repo--agents-md.
+          filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
+        _ -> expectationFailure "expected a JSON array"
+
+    it "repo agents.md wins over a configured user default_agent (repo > user precedence)" $ do
+      (app, sid) <- mkSessionAgentsApp (Just "user-agent")
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let defaults = [ (n, isDef)
+                       | A.Object o <- V.toList xs
+                       , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o]
+                       , Just (A.Bool isDef) <- [KeyMap.lookup (Key.fromText "isDefault") o]
+                       ]
+          -- The repo's agents-md wins (repo > user default_agent); the
+          -- user's configured default (user-agent) is NOT marked default.
+          filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
+          defaults `shouldNotSatisfy` (("user-agent", True) `elem`)
+        _ -> expectationFailure "expected a JSON array"
+
+    it "returns 404 for an unknown session id" $ do
+      app <- apiApp <$> mkDepsFor fakePaths
+      status <- runAppStatus app (testRequest methodGet ["api", "sessions", "99999999-000000-nope", "agents"])
+      status `shouldBe` 404
 
   it "sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id" $ do
     let (code, val) = sendOutcomeJson (SendSlash "/help output" Nothing)
@@ -2290,6 +2981,7 @@ spec = describe "Seal.Gateway.API" $ do
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
             , sdVault      = error "sdVault: unused on the 404 path"
+            , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = error "sdProvider: unused on the 404 path"
             , sdSession    = sr
             , sdBackends   = error "sdBackends: unused on the 404 path"
@@ -2307,6 +2999,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the 404 path"
             , sdLocks       = error "sdLocks: unused on the 404 path"
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
+            , sdLogger      = error "sdLogger: unused on the 404 path"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2321,6 +3015,10 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -2376,6 +3074,7 @@ spec = describe "Seal.Gateway.API" $ do
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt
+            , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -2393,6 +3092,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = testReplies
             , sdLocks       = testLocks
             , sdTabsHandle  = tabsH
+            , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2407,6 +3108,10 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -2494,6 +3199,7 @@ spec = describe "Seal.Gateway.API" $ do
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt
+            , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -2511,6 +3217,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdTabsHandle  = tabsH
+            , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2525,6 +3233,10 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -2597,6 +3309,7 @@ spec = describe "Seal.Gateway.API" $ do
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt
+            , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -2614,6 +3327,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
             , sdTabsHandle  = tabsH
+            , sdLogger      = error "sdLogger: set below"
+            , sdIsRemote    = False
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -2628,6 +3343,10 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

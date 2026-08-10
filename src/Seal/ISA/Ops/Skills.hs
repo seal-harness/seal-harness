@@ -21,7 +21,7 @@ module Seal.ISA.Ops.Skills
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
-  ( Value, object, withObject, (.:), (.=) )
+  ( Value, object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
@@ -60,13 +60,24 @@ descriptionField v = fromMaybe "" (parseMaybe (withObject "in" (.: "description"
 bodyField :: Value -> Text
 bodyField v = fromMaybe "" (parseMaybe (withObject "in" (.: "body")) v)
 
+-- | Extract the optional @group@ string field. 'Nothing' when absent or
+-- empty (after stripping). A skill's group controls its on-disk location
+-- (@config\/skills\/\<group\>\/\<id\>.md@) and its display grouping in the
+-- @\<available_skills\>@ catalog.
+groupField :: Value -> Maybe Text
+groupField v = do
+  raw <- parseMaybe (withObject "in" (.:? "group")) v
+  t <- raw
+  let t' = T.strip t
+  if T.null t' then Nothing else Just t'
+
 -- | SKILL_WRITE: upsert a skill by id. If the skill already exists, its
--- description and body are updated (the original 'skSession' provenance and
--- 'skCreatedAt' are preserved; only 'skUpdatedAt' is bumped); if not, a
--- fresh skill is created with the current session as provenance. The
--- description and body are recorded in full (agent-visible data);
--- 'orRecorded' carries the id + op name + description + body + @was_new@
--- (secret-free).
+-- description, body, and group are updated (the original 'skSession'
+-- provenance and 'skCreatedAt' are preserved; only 'skUpdatedAt' is
+-- bumped); if not, a fresh skill is created with the current session as
+-- provenance. The description and body are recorded in full (agent-visible
+-- data); 'orRecorded' carries the id + op name + description + body +
+-- @was_new@ (secret-free).
 skillWriteOp :: SkillBackend -> SessionId -> Opcode
 skillWriteOp backend session = TrustedOpcode
   { toName = OpName "SKILL_WRITE"
@@ -87,6 +98,10 @@ skillWriteOp backend session = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "description" .= ("The skill body (Markdown). Agent-visible." :: Text)
               ]
+          , fromText "group" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional category for grouping in the available-skills catalog. When set, the skill is stored under config/skills/<group>/<id>.md; when omitted, the skill keeps its existing group (or is ungrouped on create)." :: Text)
+              ]
           ]
       , "required" .= (["id", "description", "body"] :: [Text])
       ]
@@ -94,6 +109,7 @@ skillWriteOp backend session = TrustedOpcode
   , toAuthorize = maybe (Left "SKILL_WRITE requires {id:string}") checkId . idField
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
+          mNewGroup = groupField v
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid skill id"] True (object []))
         Just sid -> do
@@ -104,6 +120,9 @@ skillWriteOp backend session = TrustedOpcode
                   ( existing
                       { skDescription = descriptionField v
                       , skBody = bodyField v
+                      , skGroup = case mNewGroup of
+                          Just g  -> Just g
+                          Nothing -> skGroup existing
                       , skUpdatedAt = now
                       }
                   , False
@@ -113,6 +132,7 @@ skillWriteOp backend session = TrustedOpcode
                       { skId = sid
                       , skDescription = descriptionField v
                       , skBody = bodyField v
+                      , skGroup = mNewGroup
                       , skCreatedAt = now
                       , skUpdatedAt = now
                       , skSession = session
@@ -124,6 +144,7 @@ skillWriteOp backend session = TrustedOpcode
                 [ "id" .= skillIdText sid
                 , "description" .= skDescription skill
                 , "body" .= skBody skill
+                , "group" .= skGroup skill
                 , "created_at" .= skCreatedAt skill
                 , "updated_at" .= skUpdatedAt skill
                 , "session" .= skSession skill
@@ -160,6 +181,7 @@ skillLoadOp backend = TrustedOpcode
                     [ "id" .= skillIdText sid
                     , "description" .= skDescription s
                     , "body" .= skBody s
+                    , "group" .= skGroup s
                     , "updated_at" .= skUpdatedAt s
                     , "session" .= skSession s
                     ]
@@ -215,7 +237,10 @@ skillListOp backend = TrustedOpcode
       let rendered = case allSkills of
             [] -> "(no skills defined)"
             _  -> T.intercalate "\n"
-                    [ skillIdText (skId s) <> ": " <> skDescription s | s <- allSkills ]
+                    [ skillIdText (skId s)
+                        <> maybe "" (\g -> " [" <> g <> "]") (skGroup s)
+                        <> ": " <> skDescription s
+                    | s <- allSkills ]
           recorded = object
             [ "count" .= length allSkills
             , "ids" .= fmap (skillIdText . skId) allSkills

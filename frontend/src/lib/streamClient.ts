@@ -51,6 +51,9 @@ class StreamClientImpl implements StreamClient {
   private listsListeners = new Set<(snapshot: ListsSnapshot) => void>()
   private askListeners = new Set<(sid: string, ask: { id: string; question: string }) => void>()
   private askResolvedListeners = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
+  private agentDefsChangedListeners = new Set<() => void>()
+  private skillsChangedListeners = new Set<() => void>()
+  private reposChangedListeners = new Set<() => void>()
 
   constructor(url: string) {
     this.url = url
@@ -120,6 +123,27 @@ class StreamClientImpl implements StreamClient {
     this.askResolvedListeners.add(cb)
     return () => {
       this.askResolvedListeners.delete(cb)
+    }
+  }
+
+  onAgentDefsChanged(cb: () => void): () => void {
+    this.agentDefsChangedListeners.add(cb)
+    return () => {
+      this.agentDefsChangedListeners.delete(cb)
+    }
+  }
+
+  onSkillsChanged(cb: () => void): () => void {
+    this.skillsChangedListeners.add(cb)
+    return () => {
+      this.skillsChangedListeners.delete(cb)
+    }
+  }
+
+  onReposChanged(cb: () => void): () => void {
+    this.reposChangedListeners.add(cb)
+    return () => {
+      this.reposChangedListeners.delete(cb)
     }
   }
 
@@ -260,6 +284,15 @@ class StreamClientImpl implements StreamClient {
         ) {
           for (const cb of this.askResolvedListeners) cb(event.sessionId, event.ask)
         }
+        break
+      case 'agent-defs-changed':
+        for (const cb of this.agentDefsChangedListeners) cb()
+        break
+      case 'skills-changed':
+        for (const cb of this.skillsChangedListeners) cb()
+        break
+      case 'repos-changed':
+        for (const cb of this.reposChangedListeners) cb()
         break
       case 'replay-end':
         if (

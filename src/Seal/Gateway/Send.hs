@@ -13,6 +13,7 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , handleSetupRepo
   , ensureTabForSession
   , handleAnswerDelivery
   , handleAskCancel
@@ -20,7 +21,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (catch, fromException, finally, SomeException)
+import Control.Exception (finally)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
@@ -31,39 +32,37 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
 
-import Seal.Agent.Def.Backend (AgentDefBackend, adbRead)
+import Seal.Agent.Def.Backend (AgentDefBackend, adbRead, workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Call (CallDispatcher)
+import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , WebConfig (..), rcWeb
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHuman, askIdText, cancelAsk, deliverAnswer, parseAskId
   , approvalScopeText )
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps, TranscriptError (..))
+import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.Session.Log (logTurnError)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
@@ -75,6 +74,9 @@ import Seal.ISA.Ops.Skills
   ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend (SkillBackend)
+import Seal.Skills.Backend qualified as Skill
+import Seal.Skills.Prompt (injectAvailableSkills)
+import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
@@ -83,9 +85,13 @@ import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
-import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
+import Seal.ISA.Opcode (OpResult (..), localBackend, opName)
+import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult, recordSetupRepoResult)
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
+import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
+import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
@@ -99,23 +105,31 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), SomeProvider)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Session.Lock
-  ( ReplyRegistry, replyFanout, replySubscriberCount, SessionLocks, withSessionLock )
+  ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
+  , SessionLocks, withSessionLock )
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
+import Seal.Logging.Logger (SealLogger)
+import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
 
 -- | The dependencies the send handler needs (the agent-loop plumbing). Built
 -- once in 'Seal.Command.Serve.runServeMain' and shared across requests. The
@@ -124,6 +138,7 @@ import Seal.Vault.Commands (VaultRuntime (..))
 data SendDeps = SendDeps
   { sdPaths      :: SealPaths
   , sdVault      :: VaultRuntime
+  , sdRepoReg    :: RepoRegistryHandle
   , sdProvider   :: ProviderRuntime
   , sdSession    :: SessionRuntime
   , sdBackends   :: Backends
@@ -179,6 +194,13 @@ data SendDeps = SendDeps
     -- successful turn (W2 invariant 2: any message sent to a session with
     -- no active tab creates one). Sourced from server-validated 'SessionMeta'
     -- only — never from raw client strings.
+  , sdLogger :: SealLogger
+    -- ^ The shared logger for structured katip logging. Built once at
+    -- startup via 'withSealLogger'.
+  , sdIsRemote :: Bool
+    -- ^ Whether the untrusted executor runs commands over SSH (remote
+    -- mode from the security config). Threaded into 'CloneDeps' so the
+    -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
@@ -237,14 +259,12 @@ handleSend deps sid rawText = do
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        er <- plainTurn deps meta t `catch` \e -> do
-          let msg = T.pack (show (e :: SomeException))
-          logTurnError (Just (sessionLogPath (sdPaths deps) (smId meta))) msg
-          hPutStrLn stderr ("[send] plainTurn threw: " <> T.unpack msg)
-          pure (Left ("internal error: " <> msg))
+        er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) (smId meta))) "plainTurn" $
+          plainTurn deps meta t
         case er of
           Left err -> pure (SendError 500 err)
-          Right () -> do
+          Right (Left err) -> pure (SendError 500 err)
+          Right (Right ()) -> do
             ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure SendAssistant
@@ -333,8 +353,7 @@ loadSessionMeta paths sid = do
   exists <- doesFileExist mp
   if not exists
     then pure Nothing
-    else do
-      (A.decode <$> BL.readFile mp) :: IO (Maybe SessionMeta)
+    else decodeFileStrict mp :: IO (Maybe SessionMeta)
 
 -- | Resolve the system prompt for a web turn. An ad-hoc
 -- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
@@ -343,21 +362,39 @@ loadSessionMeta paths sid = do
 -- neither is set. The auto-loaded skill (default @seal-usage@, the
 -- fresh-workdir contract) is appended so the model is oriented to its
 -- per-session workspace from turn one. Disabled by setting
--- @[skills] autoload = ""@ in @config.toml@.
+-- @[skills] autoload = ""@ in @config.toml@. The @\<available_skills\>@
+-- catalog (a grouped listing of all skill ids + descriptions) is then
+-- appended so the model discovers and uses skills; disabled by
+-- @[skills] available_skills = false@.
 resolveSystemPrompt
   :: AgentDefBackend
   -> SkillBackend
   -> Maybe Text
   -- ^ The resolved auto-load skill id ('Nothing' disables injection).
+  -> Bool
+  -- ^ Whether to inject the @\<available_skills\>@ catalog.
+  -> Bool
+  -- ^ Whether to inject the parallel tool-call guidance block.
+  -> Bool
+  -- ^ Whether to inject the tool-use enforcement guidance block.
+  -> Bool
+  -- ^ Whether to inject the task-completion guidance block.
   -> SessionMeta
   -> IO (Maybe Text)
-resolveSystemPrompt agentDefBackend skillBackend autoloadId meta = do
+resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
+                   parallel toolUse taskCompletion meta = do
   base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
            Nothing  -> pure Nothing
            Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-  injectAutoloadSkill skillBackend autoloadId base
+  -- Order: static guidance (stable) → autoload body → available-skills
+  -- catalog (volatile, last) — cache-friendly.
+  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
+  withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
+  if injectCatalog
+    then injectAvailableSkills skillBackend withAutoload
+    else pure withAutoload
 
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
@@ -383,9 +420,15 @@ plainTurn deps meta t = do
       -- Thinking. Paired with the idle signal below (run on every exit
       -- path of the lock bracket via 'finally').
       broadcastHarnessStatus (sdBroker deps) sid "thinking"
+      -- Cross-channel message mirroring: fan out the web user's message
+      -- to every append-only channel subscribed to this session, prefixed
+      -- with "[web]". The web frontend sees the message directly (it's
+      -- the sender), so it is excluded by the "web" label (no chat channel
+      -- has that label, so all subscribed channels receive the mirror).
+      replyFanoutMessage (sdReplies deps) sid "web" t
       turnResult <- withSessionLock (sdLocks deps) sid
            (withTwoFileTranscript sessionDirPath (\tHandle -> do
-            appEnv <- mkEnv defaultConfig
+            appEnv <- mkEnv (sdLogger deps) defaultConfig
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
             let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -394,16 +437,33 @@ plainTurn deps meta t = do
             let wsroot = case eWd of
                   Right wd -> WorkspaceRoot wd
                   Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-                agentDefBackend = bAgentDefs (sdBackends deps)
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-            let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-            mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
+            -- Build the workdir-aware skill backend: repo-local skills
+            -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
+            -- Fail-closed: a workdir error → no workdir skills (the user ⊕
+            -- builtin union still applies).
+            workdirSkills <- case eWd of
+              Right wd -> Skill.workdirSkillBackend wd
+              Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+            workdirAgentDefs <- case eWd of
+              Right wd -> workdirAgentDefBackend wd
+              Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+            let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
+                sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
+                agentDefBackend = bAgentDefs sessionBackends
+                autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+                injectCatalog = either (const True) resolvedAvailableSkills eCfg
+                parallel = either (const True) resolvedParallelToolGuidance eCfg
+                toolUse = either (const True) resolvedToolUseEnforcement eCfg
+                taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+            cloneDeps <- mkCloneDepsFromSend deps
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps untrustedIO appEnv eCfg
-                  wsroot operatorCeiling
+                  wsroot operatorCeiling "web" sessionBackends
                 isaReg = buildWebRegistry
-                  (sdVault deps) (sdBackends deps) wsroot sid operatorCeiling
+                  (sdVault deps) cloneDeps sessionBackends wsroot sid operatorCeiling
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
@@ -414,17 +474,11 @@ plainTurn deps meta t = do
                   onDemand
                   (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                   Nothing
+                  "web"
+                  (Just (replyFanout (sdReplies deps) sid))
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-            result <- (Right <$> runApp appEnv (runTurn env t))
-              `catch` \e -> do
-                let msg = case fromException e of
-                      Just (TranscriptError te) ->
-                        "transcript error: " <> te
-                      Nothing -> T.pack (show e)
-                let logPath = Just (sessionLogPath paths sid)
-                logTurnError logPath msg
-                hPutStrLn stderr ("[send] turn failed: " <> T.unpack msg)
-                pure (Left msg)
+            result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
+              runApp appEnv (runTurn env t)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
             pure result))
       -- Signal the turn end so the web sidebar transitions the tab back to
@@ -455,7 +509,7 @@ plainTurn deps meta t = do
 -- \"harness\") and 'HfGeneric' flavour — the 6b wiring that resolves
 -- per-call session/window/flavour from the input is a later phase.
 buildWebRegistry
-  :: VaultRuntime -> Backends -> WorkspaceRoot -> SessionId -> Int
+  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
@@ -465,7 +519,7 @@ buildWebRegistry
   -> ChannelCaps
   -> Bool                     -- ^ on-demand schemas
   -> ISA.Registry
-buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
+buildWebRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                  startWiring harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -494,6 +548,10 @@ buildWebRegistry rt backends wsRoot sid operatorCeiling autonomy webCfg
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
+      , setupRepoOp cloneDeps wsRoot autonomy
+      , gitFetchOp cloneDeps wsRoot autonomy
+      , gitPullOp cloneDeps wsRoot autonomy
+      , gitPushOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -619,8 +677,10 @@ plainTurnWithCaps deps meta caps t = do
           sid = smId meta
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
+      -- Cross-channel message mirroring (see plainTurn for the rationale).
+      replyFanoutMessage (sdReplies deps) sid "web" t
       withTwoFileTranscript sessionDirPath (\tHandle -> do
-        appEnv <- mkEnv defaultConfig
+        appEnv <- mkEnv (sdLogger deps) defaultConfig
         eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
         eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
         let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -629,15 +689,28 @@ plainTurnWithCaps deps meta caps t = do
         let wsRoot = case eWd of
               Right wd -> WorkspaceRoot wd
               Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-            agentDefBackend = bAgentDefs (sdBackends deps)
-        let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-        mSystem <- resolveSystemPrompt agentDefBackend (bSkills (sdBackends deps)) autoloadId meta
+        workdirSkills <- case eWd of
+          Right wd -> Skill.workdirSkillBackend wd
+          Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+        workdirAgentDefs <- case eWd of
+          Right wd -> workdirAgentDefBackend wd
+          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+        let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
+            sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
+            agentDefBackend = bAgentDefs sessionBackends
+            autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+            injectCatalog = either (const True) resolvedAvailableSkills eCfg
+            parallel = either (const True) resolvedParallelToolGuidance eCfg
+            toolUse = either (const True) resolvedToolUseEnforcement eCfg
+            taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+        mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+        cloneDeps <- mkCloneDepsFromSend deps
         let onDemand = either (const False) onDemandSchemas eCfg
             startWiring = webStartWiring
               deps paths sid caps untrustedIO appEnv eCfg
-              wsRoot operatorCeiling
+              wsRoot operatorCeiling "web" sessionBackends
             isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
               (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
               caps onDemand
@@ -648,16 +721,11 @@ plainTurnWithCaps deps meta caps t = do
               onDemand
               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
               Nothing
+              "web"
+              (Just (replyFanout (sdReplies deps) sid))
         tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        result <- (Right <$> runApp appEnv (runTurn env t))
-          `catch` \e -> do
-            let msg = case fromException e of
-                  Just (TranscriptError te) ->
-                    "transcript error: " <> te
-                  Nothing -> T.pack (show e)
-            logTurnError (Just (sessionLogPath paths sid)) msg
-            hPutStrLn stderr ("[send] turn (withCaps) failed: " <> T.unpack msg)
-            pure (Left msg)
+        result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
+          runApp appEnv (runTurn env t)
         broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
         pure result)
 
@@ -676,7 +744,7 @@ webCallDispatcher deps callOpName val = do
       sessionDirPath = sessionDir paths sid
   createDirectoryIfMissing True sessionDirPath
   withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    appEnv <- mkEnv defaultConfig
+    appEnv <- mkEnv (sdLogger deps) defaultConfig
     eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
@@ -686,12 +754,17 @@ webCallDispatcher deps callOpName val = do
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    cloneDeps <- mkCloneDepsFromSend deps
+    workdirAgentDefs <- case eWd of
+          Right wd -> workdirAgentDefBackend wd
+          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
     let onDemand = either (const False) onDemandSchemas eCfg
+        sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
         startWiring = webStartWiring
-          deps paths sid caps untrustedIO appEnv eCfg
-          wsRoot operatorCeiling
+              deps paths sid caps untrustedIO appEnv eCfg
+              wsRoot operatorCeiling "web" sessionBackends
         isaReg = buildWebRegistry
-              (sdVault deps) (sdBackends deps) wsRoot sid operatorCeiling
+              (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
               (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
@@ -699,7 +772,17 @@ webCallDispatcher deps callOpName val = do
     res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
     case res of
       Right r -> do
-        recordSkillLoadResult tHandle callOpName val r
+        -- Record the opcode result into the transcript. SKILL_LOAD and
+        -- SETUP_REPO each have a dedicated recorder (SETUP_REPO records
+        -- both success AND failure so the user sees clone errors in the
+        -- chat, not just the request). Other opcodes are not recorded
+        -- here — their results surface via the turn's normal entry flow.
+        let opNm = case callOpName of OpName n -> n
+        if opNm == "SETUP_REPO"
+          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          else if opNm == "GIT_PUSH"
+            then recordGitPushResult tHandle callOpName val r (Just "web")
+            else recordSkillLoadResult tHandle callOpName val r (Just "web")
         -- Broadcast the newly-recorded transcript entry (e.g. the
         -- SKILL_LOAD result entry) so the web frontend's WS stream
         -- receives it live. Without this, the skill-load tool-call box
@@ -723,10 +806,10 @@ webMintSession fallback = do
 -- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
 -- the default when the config section or the field is absent.
 unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
-unwrapOpt field webCfg def =
+unwrapOpt field webCfg agentDef =
   case webCfg of
-    Nothing   -> def
-    Just cfg  -> fromMaybe def (field cfg)
+    Nothing   -> agentDef
+    Just cfg  -> fromMaybe agentDef (field cfg)
 
 -- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
 -- section-absent case yields 'Nothing'; the section-present case yields the
@@ -739,10 +822,10 @@ unwrapOptMaybe = maybe Nothing
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> AgentStartWiring
-webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling =
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> Backends -> AgentStartWiring
+webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
   AgentStartWiring
-    { aswDefBackend = bAgentDefs (sdBackends deps)
+    { aswDefBackend = bAgentDefs sessionBackends
     , aswRuntime = bRuntime (sdBackends deps)
     , aswConfig = do
         eCfg' <- loadRuntimeConfig (prConfigPath (sdProvider deps))
@@ -751,7 +834,7 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling
+    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel
     }
 
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
@@ -764,9 +847,9 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
   :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text
   -> AgentWorkerBuilder
-webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling =
+webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling channel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
@@ -786,17 +869,18 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
     , dwdChildRegistry = buildChildRegistry
     , dwdChildSystemPrompt = childSystemPrompt
     , dwdOnEntry = pure ()  -- web child onEntry: no live broadcast (would need the broker + child sid)
+    , dwdChannel = channel
     }
   where
-    resolveChild def = do
+    resolveChild agentDef = do
       active <- readIORef (srActive (sdSession deps))
-      let fallBackProvider = if T.null (adProvider def) then smProvider active else adProvider def
-          fallBackModel = case adModel def of
+      let fallBackProvider = if T.null (adProvider agentDef) then smProvider active else adProvider agentDef
+          fallBackModel = case adModel agentDef of
             ModelId m | T.null m -> smModel active
                       | otherwise -> m
       resolveDefProvider (sdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt def task = do
-      let base = adSystem def
+    childSystemPrompt agentDef task = do
+      let base = adSystem agentDef
           ctx  = ctContext task
           basePrompt = case (base, ctx) of
             (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
@@ -804,9 +888,18 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
             (Nothing, Nothing)                -> Nothing
       let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-      injectAutoloadSkill (bSkills (sdBackends deps)) autoloadId basePrompt
+          injectCatalog = either (const True) resolvedAvailableSkills eCfg
+          parallel = either (const True) resolvedParallelToolGuidance eCfg
+          toolUse = either (const True) resolvedToolUseEnforcement eCfg
+          taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+          withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
+      withAutoload <- injectAutoloadSkill (bSkills (sdBackends deps)) autoloadId withGuidance
+      if injectCatalog
+        then injectAvailableSkills (bSkills (sdBackends deps)) withAutoload
+        else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
       eChildWd <- ensureSessionWorkdir paths childSid
+      childCloneDeps <- mkCloneDepsFromSend deps
       let childWsRoot = case eChildWd of
             Right wd -> WorkspaceRoot wd
             Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
@@ -831,6 +924,10 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
             , fileWriteOp childWsRoot operatorCeiling
             , filePatchOp childWsRoot
             , shellExecOp childWsRoot securityPolicy
+            , setupRepoOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitFetchOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPullOp childCloneDeps childWsRoot (sdAutonomy deps)
+            , gitPushOp childCloneDeps childWsRoot (sdAutonomy deps)
             , binExecOp childWsRoot securityPolicy binAllowList
             , processManageOp childWsRoot securityPolicy
             , webFetchOp webFetchCfg
@@ -884,9 +981,8 @@ broadcastNewEntries mBroker paths sid model createdAt =
 -- fail-closed.
 webAskCaps
   :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
-webAskCaps mBroker store sid = ChannelCaps
-  { ccSend = \_ -> pure ()  -- web: replies surface via transcript poll
-  , ccPrompt = \q -> do
+webAskCaps mBroker store sid = def
+  { ccPrompt = \q -> do
       outcome <- askHuman store sid q (\qid ->
         case mBroker of
           Nothing -> pure ()
@@ -898,9 +994,7 @@ webAskCaps mBroker store sid = ChannelCaps
       pure (case outcome of
         Left _  -> "rejected"
         Right t -> t)
-  , ccPromptSecret = \_ -> pure ""  -- web: hidden prompts are a later phase
   }
-
 -- | Notify the broker that a pending question was resolved (answered or
 -- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a
 -- no-op.
@@ -914,6 +1008,71 @@ broadcastAskResolved mBroker sid qid resolution =
         [ "id" .= askIdText qid
         , "resolution" .= resolution
         ]))
+
+-- | Build 'Clone.CloneDeps' from a 'SendDeps' (the in-scope vault runtime +
+-- repo registry handle + paths). Used by the 'buildWebRegistry' +
+-- 'buildChildRegistry' call sites. The ssh-agent is real (production:
+-- 'mkRealSshAgentHandle'); the pinned host keys are
+-- compile-time-embedded.
+mkCloneDepsFromSend :: SendDeps -> IO Clone.CloneDeps
+mkCloneDepsFromSend deps = do
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (sdPaths deps))
+  pure Clone.CloneDeps
+    { Clone.cdVault = sdVault deps
+    , Clone.cdRepoReg = sdRepoReg deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentRegH
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (sdPaths deps)
+    , Clone.cdIsRemote = sdIsRemote deps
+    }
+
+-- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
+-- session's workdir before the first turn. The web "set up repo" combo box
+-- calls this. Rather than calling 'cloneRepoIO' directly (which is
+-- unaudited — a side channel that never appears in the transcript), this
+-- dispatches the real 'SETUP_REPO' opcode via 'webCallDispatcher'. The
+-- clone (and any failure) is therefore recorded in the session's
+-- transcript exactly like a model-invoked SETUP_REPO, so the user sees it
+-- in the chat and any error is visible there — not silent.
+--
+-- The 'srActive' ref is scoped to the target session for the duration of
+-- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
+-- reads 'srActive' to pick the transcript), then restored.
+--
+-- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
+-- with the opcode's text result (the clone/no-op/conflict/failure message)
+-- for the API layer to pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
+handleSetupRepo deps sid url =
+  case validateRepoUrl url of
+    Left err -> pure (Left ("invalid url: " <> err))
+    Right cleanUrl -> do
+      -- Scope srActive to the target session for the dispatch.
+      let sr = sdSession deps
+      activeBefore <- readIORef (srActive sr)
+      mMeta <- loadSessionMeta (sdPaths deps) sid
+      case mMeta of
+        Nothing -> pure (Left "session not found")
+        Just targetMeta -> do
+          writeIORef (srActive sr) targetMeta
+          -- Dispatch SETUP_REPO via the audited path (records into the
+          -- transcript + broadcasts the entry so the frontend sees it).
+          let dispatcher = webCallDispatcher deps
+          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+          -- Restore srActive.
+          writeIORef (srActive sr) activeBefore
+          case res of
+            Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
+            Right opRes ->
+              if orIsError opRes
+                then pure (Left (opResultText opRes))
+                else pure (Right (opResultText opRes))
+
+-- | Join the text parts of an 'OpResult' into a single message (the
+-- clone/no-op/conflict/failure text from SETUP_REPO).
+opResultText :: OpResult -> Text
+opResultText r = T.intercalate "\n" [ t | TrpText t <- orParts r ]
 
 -- | Deliver an answer to a pending question for a session. Returns 'True'
 -- if the answer was accepted (the question was pending and not yet
@@ -962,7 +1121,7 @@ fanoutLastReply replies mBroker paths sid = do
   if not exists
     then pure ()
     else do
-      raw <- TIO.readFile convPath
+      raw <- readFileTextStrict convPath
       let lines' = filter (not . T.null) (T.lines raw)
           msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
       for_ (lastAssistantText msgs) $ \reply -> do

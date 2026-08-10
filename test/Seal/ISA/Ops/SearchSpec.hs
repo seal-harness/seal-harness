@@ -20,9 +20,10 @@ import Seal.Tools.Exec.UntrustedIO
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
+import Seal.Logging.Logger (testSealLogger)
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 -- | A fake 'UntrustedIO' whose 'uioSearchFiles' records the pattern + path
 -- and returns canned output.

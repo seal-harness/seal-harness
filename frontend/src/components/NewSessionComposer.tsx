@@ -4,7 +4,7 @@ import {
   CUSTOM_MODEL_VALUE,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
-import { createBareSession, type NewBareSessionResponse } from '../hooks/useApi'
+import { createBareSession, setupRepo, type NewBareSessionResponse } from '../hooks/useApi'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -34,16 +34,36 @@ interface NewSessionComposerProps {
 export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionComposerProps) {
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const [submitting, setSubmitting] = useState(false)
+  const [repoWarning, setRepoWarning] = useState<string | null>(null)
 
   const handleSubmit = async () => {
     if (spec.validationError) return
     setSubmitting(true)
+    setRepoWarning(null)
     const res = await createBareSession({ provider: spec.provider, model: spec.model.trim() })
-    setSubmitting(false)
     if (res) {
+      // If the user entered a repo URL, dispatch SETUP_REPO into the
+      // session's transcript (audited — visible in the chat, not a silent
+      // side channel). A clone failure does NOT block the session, and
+      // the error is recorded in the transcript (the SETUP_REPO entry
+      // shows the full failure message). The repo is recorded to history
+      // via persistOnSubmit regardless of clone success. Navigate to the
+      // session so the user sees the SETUP_REPO result (or error) in the
+      // chat transcript.
+      const repoUrl = spec.repo.trim()
+      if (repoUrl) {
+        const result = await setupRepo(res.session_id, repoUrl)
+        if (!result || !result.ok) {
+          // Surface a short warning here too, but still navigate so the
+          // full error is visible in the transcript.
+          const reason = result?.error ?? 'network error'
+          setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
+        }
+      }
       spec.persistOnSubmit()
       onSubmit(res)
     }
+    setSubmitting(false)
   }
 
   return (
@@ -112,6 +132,17 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
             />
           </Row>
         )}
+
+        <Row label="Set up repo" htmlFor="ns-repo">
+          <CustomModelCombobox
+            id="ns-repo"
+            value={spec.repo}
+            onChange={spec.setRepo}
+            options={spec.repoOptions}
+            placeholder="git URL (optional — cloned into the session before turn one)"
+            testId="ns-repo-list"
+          />
+        </Row>
       </div>
 
       {spec.validationError && (
@@ -120,6 +151,15 @@ export function NewSessionComposer({ spec, onSubmit, onCancel }: NewSessionCompo
           style={{ fontSize: 12, color: 'var(--needs-input)' }}
         >
           {spec.validationError}
+        </div>
+      )}
+
+      {repoWarning && (
+        <div
+          data-testid="composer-repo-warning"
+          style={{ fontSize: 12, color: 'var(--needs-input)' }}
+        >
+          {repoWarning}
         </div>
       )}
 
@@ -180,13 +220,14 @@ function Row({
 //    new-session composer is self-contained without reaching into
 //    NewTabComposer's private helpers). ────────────────────────────────
 function CustomModelCombobox({
-  id, value, onChange, options, placeholder,
+  id, value, onChange, options, placeholder, testId,
 }: {
   id: string
   value: string
   onChange: (v: string) => void
   options: string[]
   placeholder?: string
+  testId?: string
 }) {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(-1)
@@ -259,7 +300,7 @@ function CustomModelCombobox({
         <div
           className="composer-combobox-popup"
           role="listbox"
-          data-testid="ns-provider-model-custom-list"
+          data-testid={testId ?? 'ns-provider-model-custom-list'}
           style={{
             position: 'fixed',
             left: rect.left,

@@ -18,11 +18,12 @@ module Seal.Session.Store
   , initSessionMeta
   , updateSessionAgent
   , updateSessionSystemOverride
+  , updateSessionDescription
   , SessionRuntime (..)
   ) where
 
 import Control.Monad (filterM, forM, unless, when)
-import Data.Aeson (decode, encode)
+import Data.Aeson (encode)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef)
 import Data.List (sortOn)
@@ -36,7 +37,9 @@ import Data.Time
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , listDirectory, removeFile, renameFile )
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeBaseName)
+import System.IO
+  ( hClose, openBinaryTempFile )
 import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
@@ -48,6 +51,7 @@ import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The mutable active-session ref plus the paths the commands need.
 data SessionRuntime = SessionRuntime
@@ -80,6 +84,7 @@ newSessionMeta _paths provider model channel mAgent = do
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -89,15 +94,20 @@ newSession paths provider model channel mAgent = do
   saveSessionMeta paths meta
   pure meta
 
--- | Persist @session.json@ atomically: dir 0700, write @.tmp@, chmod 0600, rename.
+-- | Persist @session.json@ atomically: dir 0700, write a unique temp file,
+-- chmod 0600, rename. The temp file is unique per call (via 'openBinaryTempFile')
+-- so concurrent saves from multiple threads (channel loop + gateway API +
+-- /model command) don't collide on a shared @.tmp@ path ("resource busy"
+-- / "does not exist" rename race). The rename is atomic on POSIX.
 saveSessionMeta :: SealPaths -> SessionMeta -> IO ()
 saveSessionMeta paths meta = do
   let dir  = sessionDir paths (smId meta)
       path = sessionMetaPath paths (smId meta)
-      tmp  = path <> ".tmp"
   createDirectoryIfMissing True dir
   setFileMode dir 0o700
-  BL.writeFile tmp (encode meta)
+  (tmp, h) <- openBinaryTempFile dir (takeBaseName path <> ".tmp")
+  BL.hPut h (encode meta)
+  hClose h
   setFileMode tmp 0o600
   renameFile tmp path
 
@@ -120,7 +130,7 @@ listSessions paths = do
             marker = root </> e </> "archived"
         ok <- doesFileExist mp
         archived <- doesFileExist marker
-        if not ok || archived then pure Nothing else decode <$> BL.readFile mp
+        if not ok || archived then pure Nothing else decodeFileStrict mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
 
 -- | All archived sessions (those with an @archived@ marker file), newest
@@ -142,7 +152,7 @@ listArchivedSessions paths = do
             marker = root </> e </> "archived"
         ok <- doesFileExist mp
         archived <- doesFileExist marker
-        if not ok || not archived then pure Nothing else decode <$> BL.readFile mp
+        if not ok || not archived then pure Nothing else decodeFileStrict mp
       pure (sortOn (Down . smLastActive) (catMaybes metas))
 
 -- | Set or clear the archived flag on a session by creating/removing the
@@ -247,7 +257,7 @@ updateSessionAgent paths sid mAgent = do
   if not exists
     then pure False
     else do
-      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
@@ -289,7 +299,7 @@ updateSessionSystemOverride paths sid mOverride mFallbackName = do
   if not exists
     then pure False
     else do
-      mMeta <- decode <$> BL.readFile mp :: IO (Maybe SessionMeta)
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
@@ -306,6 +316,35 @@ updateSessionSystemOverride paths sid mOverride mFallbackName = do
                   meta { smSystemOverride = Nothing }
           saveSessionMeta paths next
           pure True
+
+-- | Update (or clear) the user-set display description for a session.
+-- 'Nothing' clears it (the UI then falls back to the auto-summary /
+-- first-message snippet / agent name); 'Just t' sets it (a blank or
+-- all-whitespace string is normalized to 'Nothing' so the caller can pass
+-- the raw input). Returns 'False' when the session's @session.json@ can't
+-- be found or parsed; 'True' on a successful write. Only touches
+-- 'smDescription' — all other fields (agent binding, override, etc.) are
+-- preserved.
+updateSessionDescription :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionDescription paths sid mDesc = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smDescription = normalized }
+          saveSessionMeta paths next
+          pure True
+  where
+    normalized = case mDesc of
+      Just t
+        | not (T.null (T.strip t)) -> Just t
+        | otherwise                -> Nothing
+      Nothing                      -> Nothing
 
 -- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
 -- Returns 'Nothing' when the file has no frontmatter or no @id@ key.

@@ -17,6 +17,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channels.Signal.Run (runSignalLoop)
 import Seal.Channels.Signal.Transport (mkMockSignalTransport)
 import Seal.Command.Spec
@@ -44,6 +45,7 @@ import Seal.Types.App (runApp)
 import Seal.Types.Command (Command (..), pCommand)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Ingest (emptyChain)
 
 -- A scripted provider that replies "hi from model" to any plain text.
@@ -117,13 +119,15 @@ spec = do
           sid      = either (error "sid") id (mkSessionId "sig-test")
           isaReg   = ISA.mkRegistry []
           allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
-      appEnv <- mkEnv defaultConfig
+      sigLogger <- testSealLogger
+      appEnv <- mkEnv sigLogger defaultConfig
       approvals <- newApprovalCache
       let runOneTurn h ms body =
-            let handleCaps = ChannelCaps
+            let handleCaps = def
                   { ccSend = chSend h
                   , ccPrompt = \_ -> pure ""
                   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
                   }
                 agentEnv = AgentEnv
                   { aeProvider = provider
@@ -137,12 +141,14 @@ spec = do
                   , aeCaps = handleCaps
                   , aeSession = sid
                   , aeMaxTurns = 4
+                  , aeChannel = "signal"
                   , aeMessageSource = Just ms
                   , aeAutonomy = Full
                   , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -152,7 +158,7 @@ spec = do
             Nothing -> pure ()
       tabsH <- newTabsHandle
       askReply <- newAskReplyStore 0
-      let meta = SessionMeta sid "ollama" "test" "signal" Nothing Nothing Nothing
+      let meta = SessionMeta sid "ollama" "test" "signal" Nothing Nothing Nothing Nothing
                    (UTCTime (fromGregorian 2026 1 1) 0)
                    (UTCTime (fromGregorian 2026 1 1) 0)
       activeRef <- newIORef meta
@@ -162,7 +168,8 @@ spec = do
             , srConfigPath = ""
             , srActive = activeRef
             }
-      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+      sigLogger2 <- testSealLogger
+      runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler sigLogger2
       -- The plain turn is forked so the loop can keep receiving; give the
       -- forked thread a moment to finish its runTurn + chSend before reading
       -- the captured sends.
@@ -171,7 +178,7 @@ spec = do
       -- hello routed → "hi from model" sent via the handle
       cap <- getCaptured
       map snd cap `shouldContain` ["pong"]
-      map snd cap `shouldContain` ["ollama/test> hi from model"]
+      map snd cap `shouldContain` ["hi from model"]
       all ((== "+15551234567") . fst) cap `shouldBe` True
       -- the transcript's request entry for hello carries channel=signal + conversationId
       (_, entries) <- readTranscript

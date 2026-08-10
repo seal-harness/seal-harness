@@ -11,9 +11,14 @@ export function useListsStream(client?: StreamClient) {
   const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([])
   const [tabSessions, setTabSessions] = useState<SessionInfo[]>([])
   const [thinkingSessionIds, setThinkingSessionIds] = useState<string[]>([])
+  // Flips true on the FIRST `lists` frame, regardless of content. App.tsx
+  // uses this to switch from REST polling to WS push — the frame may carry
+  // empty arrays on a quiet server, so we can't key off non-empty lengths.
+  const [received, setReceived] = useState(false)
 
   useEffect(() => {
     const unsub = sc.onLists((snapshot: ListsSnapshot) => {
+      setReceived(true)
       // The WS `lists` frame carries tabs as raw backend JSON (`TabInfoWire`,
       // snake_case health fields). Normalize to the camelCase TabInfo shape
       // the UI renders, mirroring the REST `/api/tabs` boundary in useTabs.
@@ -31,5 +36,5 @@ export function useListsStream(client?: StreamClient) {
     return unsub
   }, [sc])
 
-  return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds }
+  return { tabs, recentSessions, archivedSessions, tabSessions, thinkingSessionIds, received }
 }

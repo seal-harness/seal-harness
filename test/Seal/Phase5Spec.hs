@@ -25,6 +25,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
   ( newAgentRuntime )
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
@@ -50,6 +51,7 @@ import Seal.Skills.Backend qualified as Skill
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.Env (mkEnv)
 
 -- | A provider that returns a scripted list of responses, one per call.
@@ -64,7 +66,7 @@ instance Provider ScriptProvider where
       []     -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 runTestApp :: App a -> IO a
-runTestApp act = do env <- mkEnv defaultConfig; runApp env act
+runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
 sampleSession :: SessionId
 sampleSession = mkSystemSessionId "s1"
@@ -148,10 +150,8 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       ensureConfigRepo cfgRoot
       sent <- newIORef ([] :: [Text])
       workerRan <- newIORef (0 :: Int)
-      let caps = ChannelCaps
-                   (\t -> modifyIORef' sent (++ [t]))
-                   (\_ -> pure "")
-                   (\_ -> pure "")
+      let caps = def
+                   { ccSend = \t -> modifyIORef' sent (++ [t]) }
       reg <- buildRegistry cfgRoot workerRan sampleSession
       ref <- newIORef capstoneScript
       (tHandle, readTranscript) <- fakeTwoFileTranscript
@@ -167,12 +167,14 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeCaps = caps
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
+                  , aeChannel = "test"
                   , aeMessageSource = Nothing
                   , aeAutonomy = Full
                 , aeApprovals = approvals
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   }
@@ -188,7 +190,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       length msgs `shouldSatisfy` (> 0)
       length entries `shouldSatisfy` (>= 2)
       -- 4. The model saw the final text.
-      readIORef sent `shouldReturn` ["ollama/llama3> all four evolutionary mutations applied"]
+      readIORef sent `shouldReturn` ["all four evolutionary mutations applied"]
 
   it "AGENT_START runs synchronously and returns a summary (Trusted, no Audited log)" $
     withSystemTempDirectory "seal-phase5" $ \root -> do

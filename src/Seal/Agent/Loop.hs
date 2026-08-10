@@ -7,12 +7,14 @@ module Seal.Agent.Loop
   ) where
 
 import Control.Exception (SomeException, catch)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BLC
+import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -20,7 +22,6 @@ import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import qualified System.IO as IO
 
 import Seal.Agent.Env (AgentEnv (..))
-import Seal.Core.ChannelKind (channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
@@ -34,21 +35,46 @@ import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Log
-  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns )
+  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
+  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries )
 import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Types.App (App)
 
--- | Fold the 'aeMessageSource' into the request @erMeta@: a @channel@
--- key carrying the 'ChannelKind' text tag, and a @conversationId@ key
--- carrying the server-derived conversation id. 'Nothing' (the CLI TUI
--- path) yields an empty map, leaving the transcript unchanged.
-requestMeta :: Maybe MessageSource -> Map.Map Text Value
-requestMeta Nothing = Map.empty
-requestMeta (Just ms) = Map.fromList
-  [ ("channel", String (channelKindToText (msChannelKind ms)))
-  , ("conversationId", String (conversationIdText (msConversationId ms)))
-  ]
+-- | The output-token cap sent to the provider on every completion request.
+-- Raised from 4096 to 8192 so tool-using agents (which often emit large
+-- tool-call inputs, e.g. embedding file contents into @task@ prompts) have
+-- headroom and are less likely to hit 'StopMaxTokens'. This alone does not
+-- fix truncation handling — the loop must still handle 'StopMaxTokens'
+-- explicitly (see 'go') — but it reduces the frequency.
+defaultMaxTokens :: Int
+defaultMaxTokens = 8192
+
+-- | The synthetic user message appended after a 'StopMaxTokens' truncation
+-- with no tool calls, asking the model to continue exactly where it left off
+-- without repeating prior text. Mirrors Hermes' @_get_continuation_prompt@.
+continuationPrompt :: Text
+continuationPrompt =
+  "[System: Your previous response was truncated by the output length \
+  \limit. Continue exactly where you left off. Do not restart or repeat \
+  \prior text. Finish the answer directly.]"
+
+-- | Build the request @erMeta@: a @channel@ key (always present, sourced
+-- from 'aeChannel' so every channel — including web/CLI with no
+-- 'MessageSource' — is attributed) plus a @conversationId@ key when
+-- 'aeMessageSource' is present (carrying the server-derived conversation
+-- id for channels that have one). This is the single place channel
+-- provenance is stamped into the transcript, so every turn is attributed
+-- regardless of the source channel.
+requestMeta :: Text -> Maybe MessageSource -> Map.Map Text Value
+requestMeta channel mSrc =
+  Map.fromList
+    ([ ("channel", String channel)
+     ] <> conversationIdField)
+  where
+    conversationIdField = case mSrc of
+      Nothing -> []
+      Just ms -> [("conversationId", String (conversationIdText (msConversationId ms)))]
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
@@ -76,7 +102,7 @@ runTurn env userText = do
           , edSystem = Just (aeSystem env)
           , edTools = Just (registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env))
           , edToolChoice = Just ToolAuto
-          , edMaxTokens = Just 4096
+          , edMaxTokens = Just defaultMaxTokens
           }
         entry = EntryRecord
           { erId = ""
@@ -89,7 +115,7 @@ runTurn env userText = do
           , erDurationMs = Nothing
           , erHarness = Nothing
           , erCorrelation = Nothing
-          , erMeta = requestMeta (aeMessageSource env)
+          , erMeta = requestMeta (aeChannel env) (aeMessageSource env)
           }
     -- When a caller wants to react to the user message being durable
     -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows
@@ -102,10 +128,20 @@ runTurn env userText = do
         liftIO after
       Nothing ->
         tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
-  go (aeMaxTurns env) turn0
+  go (aeMaxTurns env) 0 turn0
   where
-    go :: Int -> [Message] -> App ()
-    go 0 msgs = liftIO $ do
+    -- | Fan out the final user-visible text to every chat channel subscribed
+    -- to the session ('aeOnStop'). This does NOT call 'ccSend' (the arrival
+    -- channel); the stop branches handle that separately, guarded by
+    -- 'alreadySentText' so the arrival channel doesn't get double-delivered
+    -- when text was already streamed.
+    notifyStop :: Text -> IO ()
+    notifyStop text =
+      case aeOnStop env of
+        Just fanout -> fanout text
+        Nothing     -> pure ()
+    go :: Int -> Int -> [Message] -> App ()
+    go 0 _ msgs = liftIO $ do
       logMaxTurns (aeLogPath env)
       let stopMsg = "(stopped: reached the " <> T.pack (show (aeMaxTurns env))
             <> "-turn limit for this message. Ask again to continue, "
@@ -129,7 +165,8 @@ runTurn env userText = do
       tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
       aeOnEntry env
       ccSend (aeCaps env) stopMsg
-    go n msgs = do
+      notifyStop stopMsg
+    go n lenContinue msgs = do
       liftIO (logTurnStart (aeLogPath env) n)
       tStart <- liftIO getCurrentTime
       let req = CompletionRequest
@@ -138,61 +175,96 @@ runTurn env userText = do
                   , crMessages = msgs
                   , crTools = registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env)
                   , crToolChoice = ToolAuto
-                  , crMaxTokens = 4096
+                  , crMaxTokens = defaultMaxTokens
                   }
       liftIO (appendDebugRequest (aeDebugRequestsPath env) req)
-      eresp <- liftIO (providerComplete (aeProvider env) req)
-      case eresp of
+      -- Stream the completion, aggregating events into ContentBlocks. Text
+      -- deltas are broadcast live via ccSend (CLI/Telegram/Signal) so the
+      -- user sees incremental output. This replaces the blocking
+      -- providerCompleteWithRetry call — the first token arrives in ~2s
+      -- instead of waiting for the entire response (which could take 74+s
+      -- for large contexts on remote models, hitting the 90s timeout).
+      -- Events are collected in an IORef so we can reconstruct the final
+      -- ContentBlocks for the transcript entry after the stream completes.
+      collectedRef <- liftIO (newIORef ([] :: [StreamEvent]))
+      let streamSends = ccStreaming (aeCaps env)
+      let isTransient = isTransientError
+      estream <- liftIO (providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
+        case ev of
+          StreamTextChunk delta
+            | streamSends -> do
+            ccSend (aeCaps env) delta
+          _ -> pure ()
+        modifyIORef' collectedRef (++ [ev])
+        pure True))
+      case estream of
         Left err -> liftIO $ do
           logProviderError (aeLogPath env) err
-          ccSend (aeCaps env) ("provider error: " <> err)
-        Right resp -> do
-          -- Record the provider response. Safe because CompletionResponse only
-          -- contains CbText and CbToolUse blocks (model output + tool-call
-          -- INPUTS). It never contains CbToolResult, so a vault secret value
-          -- cannot appear here. The assistant message is appended to the
-          -- conversation file; the response metadata (usage / stop) goes to
-          -- the entries file.
-          liftIO $ do
-            now <- getCurrentTime
-            let assistantMsg = Message Assistant (rsContent resp)
-                conv = msgs <> [assistantMsg]
-                entry = EntryRecord
-                  { erId = ""
-                  , erTimestamp = now
-                  , erKind = EKResponse
-                  , erConvLen = length conv
-                  , erEnvelope = Nothing
-                  , erUsage = Just (rsUsage resp)
-                  , erStop = Just (rsStop resp)
-                  , erDurationMs = Nothing
-                  , erHarness = Nothing
-                  , erCorrelation = Nothing
-                  , erMeta = Map.empty
-                  }
-            tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
-            aeOnEntry env
-          let toolUses = [b | b@CbToolUse{} <- rsContent resp]
-          if null toolUses
-            then liftIO $ do
-              tEnd <- getCurrentTime
-              logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd)
-              let ModelId m = aeModel env
-                  prefix    = aeProviderLabel env <> "/" <> m <> "> "
-              ccSend (aeCaps env)
-                   (prefix <> T.intercalate "\n" [t | CbText t <- rsContent resp])
-            else do
-              results <- mapM dispatchOne toolUses
+          let errMsg = "provider error: " <> err
+              assistantMsg = Message Assistant [CbText errMsg]
+              conv = msgs <> [assistantMsg]
+          now <- getCurrentTime
+          let entry = EntryRecord
+                { erId = ""
+                , erTimestamp = now
+                , erKind = EKResponse
+                , erConvLen = length conv
+                , erEnvelope = Nothing
+                , erUsage = Nothing
+                , erStop = Nothing
+                , erDurationMs = Nothing
+                , erHarness = Nothing
+                , erCorrelation = Nothing
+                , erMeta = Map.empty
+                }
+          tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)
+          aeOnEntry env
+          ccSend (aeCaps env) errMsg
+          notifyStop errMsg
+        Right outcome -> do
+          events <- liftIO (readIORef collectedRef)
+          let resp = aggregateStreamEvents events outcome
+          handleResponse env tStart n lenContinue msgs resp streamSends
+
+    -- | Handle a completed provider response: record it to the transcript,
+    -- then branch on tool calls vs final text vs StopMaxTokens. When
+    -- @alreadySentText@ is True, the text was already streamed live via
+    -- ccSend (streaming path) — don't re-send the full text, only send the
+    -- prefix / truncation notice if applicable.
+    handleResponse :: AgentEnv -> UTCTime -> Int -> Int -> [Message] -> CompletionResponse -> Bool -> App ()
+    handleResponse env' tStart n lenContinue msgs resp alreadySentText = do
+      -- Record the provider response.
+      liftIO $ do
+        now <- getCurrentTime
+        let assistantMsg = Message Assistant (rsContent resp)
+            conv = msgs <> [assistantMsg]
+            entry = EntryRecord
+              { erId = ""
+              , erTimestamp = now
+              , erKind = EKResponse
+              , erConvLen = length conv
+              , erEnvelope = Nothing
+              , erUsage = Just (rsUsage resp)
+              , erStop = Just (rsStop resp)
+              , erDurationMs = Nothing
+              , erHarness = Nothing
+              , erCorrelation = Nothing
+              , erMeta = Map.empty
+              }
+        tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+        aeOnEntry env'
+      let toolUses = [b | b@CbToolUse{} <- rsContent resp]
+      if null toolUses
+        then
+          if rsStop resp == StopMaxTokens && lenContinue < maxLengthContinueRetries
+            then do
+              liftIO (logTruncation (aeLogPath env') (lenContinue + 1))
               let assistantMsg = Message Assistant (rsContent resp)
-                  resultMsg = Message User results
-              -- Record the tool results to the transcript immediately so
-              -- the frontend sees them as soon as each tool call completes
-              -- (the dispatchOne calls above already recorded any approval
-              -- evidence + the dispatcher's own opcode-invocation entries).
+                  contMsg = textMsg User continuationPrompt
+                  conv2 = msgs <> [assistantMsg, contMsg]
               liftIO $ do
                 now2 <- getCurrentTime
-                let conv2 = msgs <> [assistantMsg, resultMsg]
-                    entry2 = EntryRecord
+                let entry2 = EntryRecord
                       { erId = ""
                       , erTimestamp = now2
                       , erKind = EKRequest
@@ -205,11 +277,67 @@ runTurn env userText = do
                       , erCorrelation = Nothing
                       , erMeta = Map.empty
                       }
-                tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv2 entry2)
-                aeOnEntry env
+                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                aeOnEntry env'
               tEnd <- liftIO getCurrentTime
-              liftIO (logTurnEnd (aeLogPath env) (n - 1) (msDiff tStart tEnd))
-              go (n - 1) (msgs <> [assistantMsg, resultMsg])
+              liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
+              go (n - 1) (lenContinue + 1) conv2
+            else liftIO $ do
+              tEnd <- getCurrentTime
+              logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd)
+              let texts = [t | CbText t <- rsContent resp]
+                  ModelId m = aeModel env'
+                  prefix = aeProviderLabel env' <> "/" <> m <> "> "
+              if rsStop resp == StopMaxTokens
+                then do
+                  logTruncationGiveUp (aeLogPath env')
+                  let notice = "(stopped: response truncated at the "
+                        <> T.pack (show defaultMaxTokens)
+                        <> "-token output limit after "
+                        <> T.pack (show maxLengthContinueRetries)
+                        <> " continuation attempts. Send any message to \
+                        \continue.)"
+                      combined = case texts of
+                        [] -> notice
+                        ts -> T.intercalate "\n" ts <> "\n\n" <> notice
+                  -- The truncation notice is always sent to the arrival
+                  -- channel (it's new information — the user needs to know
+                  -- the turn was truncated), even if the partial text was
+                  -- already streamed.
+                  ccSend (aeCaps env') (prefix <> combined)
+                  notifyStop (prefix <> combined)
+                else do
+                  -- Normal final answer: text was already streamed live;
+                  -- don't re-send via ccSend (would double-deliver). Only
+                  -- fan out to other chat channels via notifyStop.
+                  unless alreadySentText $
+                    ccSend (aeCaps env') (prefix <> T.intercalate "\n" texts)
+                  notifyStop (prefix <> T.intercalate "\n" texts)
+        else do
+          results <- mapM dispatchOne toolUses
+          let assistantMsg = Message Assistant (rsContent resp)
+              resultMsg = Message User results
+          liftIO $ do
+            now2 <- getCurrentTime
+            let conv2 = msgs <> [assistantMsg, resultMsg]
+                entry2 = EntryRecord
+                  { erId = ""
+                  , erTimestamp = now2
+                  , erKind = EKRequest
+                  , erConvLen = length conv2
+                  , erEnvelope = Nothing
+                  , erUsage = Nothing
+                  , erStop = Nothing
+                  , erDurationMs = Nothing
+                  , erHarness = Nothing
+                  , erCorrelation = Nothing
+                  , erMeta = Map.empty
+                  }
+            tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+            aeOnEntry env'
+          tEnd <- liftIO getCurrentTime
+          liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
+          go (n - 1) 0 (msgs <> [assistantMsg, resultMsg])
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
@@ -313,8 +441,25 @@ runTurn env userText = do
           aeOnEntry env
     dispatchOne other = pure other  -- non-tool blocks never reach dispatchOne
 
-providerComplete :: SomeProvider -> CompletionRequest -> IO (Either Text CompletionResponse)
-providerComplete (SomeProvider p) = complete p
+-- | Is a provider error text transient (worth retrying)? Transport failures
+-- (the common "Ollama not running" case), rate limits (HTTP 429), and server
+-- errors (HTTP 5xx) are transient — the daemon might come back, a rate limit
+-- might clear, a 5xx might be a transient upstream fault. Auth errors (401),
+-- bad requests (400), and decode failures are permanent — retrying wastes
+-- time and delays surfacing the real problem to the user.
+isTransientError :: Text -> Bool
+isTransientError err =
+  any (`T.isInfixOf` err) transientMarkers
+  where
+    transientMarkers =
+      [ "could not reach"           -- Ollama transport failure
+      , "connection or transport error"  -- Anthropic transport failure
+      , "HTTP 429"                  -- rate limit (Anthropic + Ollama)
+      , "HTTP 500"                  -- server error
+      , "HTTP 502"                  -- bad gateway
+      , "HTTP 503"                  -- service unavailable
+      , "HTTP 504"                  -- gateway timeout
+      ]
 
 -- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
 -- append the full 'CompletionRequest' (one JSONL line, with trailing newline)
@@ -333,3 +478,17 @@ appendDebugRequest (Just path) req =
 -- (for turn-duration logging).
 msDiff :: UTCTime -> UTCTime -> Integer
 msDiff start end = round (realToFrac (diffUTCTime end start) * 1000 :: Double)
+
+-- | Aggregate a list of 'StreamEvent's (collected during streaming) into a
+-- 'CompletionResponse' for the transcript. Text chunks are concatenated into
+-- a single 'CbText' block; tool-call start/end pairs become 'CbToolUse'
+-- blocks. The stop reason + usage come from the 'StreamOutcome'.
+aggregateStreamEvents :: [StreamEvent] -> StreamOutcome -> CompletionResponse
+aggregateStreamEvents events outcome =
+  CompletionResponse blocks (soStop outcome) (soUsage outcome)
+  where
+    textChunks = [t | StreamTextChunk t <- events]
+    textBlocks = [CbText (T.intercalate "" textChunks) | not (null textChunks)]
+    toolBlocks = [CbToolUse tcid name args
+                | StreamToolEnd tcid name args <- events]
+    blocks = textBlocks <> toolBlocks

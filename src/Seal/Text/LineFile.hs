@@ -9,6 +9,7 @@
 -- semantics table in the design spec.
 module Seal.Text.LineFile
   ( LineWindow (..)
+  , maxReadChars
   , windowLines
   , readLineWindow
   , renderWindow
@@ -55,6 +56,18 @@ windowLines params offset mLimit ls =
        }
 
 -- | The compiled-in default scan byte ceiling (>= 65536, the prior FILE_READ
+-- | The hard character ceiling for a single 'FILE_READ' response. If the
+-- file content exceeds this many characters AND the caller did not supply
+-- an explicit @offset@\/@limit@ (i.e. is not paginating), the read is
+-- rejected outright — the model must use @offset@\/@limit@ to chunk the
+-- file. This mirrors Hermes' @read_file@ behavior: reads exceeding
+-- ~100K characters are rejected. When the caller IS paginating (supplied
+-- @offset@ or @limit@), no rejection — the window is returned normally.
+-- The byte-level @maxScanBytes@ ceiling remains the memory safety bound;
+-- this is a content-level guard that improves the model's pagination UX.
+maxReadChars :: Int
+maxReadChars = 100000   -- 100K chars
+
 -- bound). Used by callers that do not have an operator-configured ceiling;
 -- 'FILE_READ' resolves the ceiling from the @[retrieval]@ config section (via
 -- 'Seal.Config.File.retrievalMaxScanBytes') and passes it in, so this default

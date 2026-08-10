@@ -41,6 +41,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     payload: '{}',
     harness: null,
     model: null,
+    channel: null,
     raw: '{}',
     ...overrides,
   }
@@ -263,6 +264,29 @@ describe('transcriptToMessages', () => {
     const userRow = msgs.find((m) => m.agentName === 'You')
     expect(userRow).toBeTruthy()
     expect(userRow!.blocks[0]!.text).toBe('hi there')
+  })
+
+  it('surfaces the originating channel in the user-message source label', () => {
+    // A user message sent from a channel (e.g. Telegram) carries the
+    // channel label as a top-level `channel` field on the TranscriptEntry
+    // (stamped into the request entry's erMeta by runTurn's requestMeta).
+    // transcriptToMessages should render the source label as
+    // "You · <channel>" so the user can tell where the message came from.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u-tg',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi from telegram' }] }],
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    const userRow = msgs.find((m) => m.agentName === 'You · telegram')
+    expect(userRow).toBeTruthy()
+    expect(userRow!.blocks[0]!.text).toBe('hi from telegram')
   })
 
   it('carries the verbatim raw json through to the row', () => {
@@ -489,6 +513,90 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.input).toEqual({ id: 'greet' })
     expect(tcBlock!.toolCall!.result).toBe('say hello warmly')
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    // No channel in the payload → the source label is just "Skill".
+    expect(msgs[0]!.agentName).toBe('Skill')
+  })
+
+  it('surfaces the originating channel in the SKILL_LOAD source label', () => {
+    // When a skill is loaded from a channel (e.g. Telegram), the backend
+    // stamps the channel label into the entry's erMeta under "channel",
+    // shipped as a top-level `channel` field on the TranscriptEntry.
+    // transcriptToMessages should render the source label as
+    // "Skill · <channel>" so the user can tell how/why the skill was loaded.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'skillload-tg',
+        direction: 'request',
+        channel: 'telegram',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SKILL_LOAD' },
+          input: { id: 'start' },
+          result: { id: 'start', description: 'start skill', body: 'body text' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    expect(msgs[0]!.agentName).toBe('Skill · telegram')
+  })
+
+  it('renders a SETUP_REPO harness result entry (failed clone) as a tool-call box marked as error', () => {
+    // A failed clone (e.g. git@ SSH auth failure) is recorded by the
+    // backend's recordSetupRepoResult. transcriptToMessages should
+    // synthesize a ToolCallBlock so the failure is visible in the chat
+    // (not silent), with resultIsError=true so it renders as an error.
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-fail',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'git@github.com:foo/bar.git' },
+          result: { status: 'failed', target: '' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('SETUP_REPO')
+    expect(tcBlock!.toolCall!.input).toEqual({ url: 'git@github.com:foo/bar.git' })
+    expect(tcBlock!.toolCall!.result).toBe('Clone failed')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(true)
+    expect(msgs[0]!.agentName).toBe('Repo')
+  })
+
+  it('renders a SETUP_REPO harness result entry (successful clone) as a tool-call box', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'setuprepo-ok',
+        direction: 'request',
+        channel: 'web',
+        payload: JSON.stringify({
+          messages: [],
+          harness: null,
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/foo/bar.git' },
+          result: { status: 'cloned', target: 'bar' },
+        }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.length).toBe(1)
+    const tcBlock = msgs[0]!.blocks.find((b) => b.toolCall !== undefined)
+    expect(tcBlock).toBeTruthy()
+    expect(tcBlock!.toolCall!.name).toBe('SETUP_REPO')
+    expect(tcBlock!.toolCall!.result).toBe('Cloned into bar')
+    expect(tcBlock!.toolCall!.resultIsError).toBe(false)
+    expect(msgs[0]!.agentName).toBe('Repo · web')
   })
 })
 
@@ -886,5 +994,48 @@ describe('providerFromRuntime', () => {
   it('returns null for a runtime string not in the expected shape', () => {
     expect(providerFromRuntime('harness')).toBeNull()
     expect(providerFromRuntime(undefined)).toBeNull()
+  })
+})
+
+describe('SessionSetup Agent dropdown', () => {
+  // SessionSetup renders when messages=[] and onSend/agents/onAgentChange/
+  // onCustomPromptFile are all provided (the "new session, pick an agent" view).
+  function renderSessionSetup(agents: { name: string; isDefault: boolean; displayName?: string }[]) {
+    return render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[]}
+        onSend={() => {}}
+        agents={agents}
+        onAgentChange={() => {}}
+        onCustomPromptFile={() => {}}
+      />,
+    )
+  }
+
+  it('renders repo-local agent displayNames when present (agents-md → "Project (agents.md)")', () => {
+    renderSessionSetup([
+      { name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' },
+      { name: 'vtag--foo-agent', isDefault: false, displayName: 'vtag/Foo Agent' },
+    ])
+    // The dropdown renders displayName for the label; the synthetic prefixed
+    // id never leaks to the UI.
+    expect(screen.getByText('vtag/Project (agents.md) (default)')).toBeTruthy()
+    expect(screen.getByText('vtag/Foo Agent')).toBeTruthy()
+    expect(screen.queryByText('vtag--agents-md')).toBeNull()
+  })
+
+  it('falls back to name when displayName is absent', () => {
+    renderSessionSetup([{ name: 'bare-agent', isDefault: false }])
+    expect(screen.getByText('bare-agent')).toBeTruthy()
+  })
+
+  it('marks the isDefault entry with "(default)" in the label', () => {
+    renderSessionSetup([
+      { name: 'a', isDefault: false },
+      { name: 'b', isDefault: true },
+    ])
+    expect(screen.getByText('b (default)')).toBeTruthy()
+    expect(screen.getByText('a')).toBeTruthy()
   })
 })

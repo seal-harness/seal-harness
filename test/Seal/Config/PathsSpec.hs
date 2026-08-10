@@ -13,6 +13,7 @@ import Seal.Config.Paths
   ( SealPaths (..)
   , resolveSealHome, getSealPaths, ensureSealDirs
   , configFilePath, vaultFilePath
+  , reposFilePath, repoCloneStateDir
   , sessionsRoot, sessionDir, sessionMetaPath, sessionTranscriptPath
   , sessionConversationPath, sessionEntriesPath, sessionRequestsPath
   , sessionLogPath
@@ -98,6 +99,18 @@ spec = describe "Seal.Config.Paths" $ do
         withSealHomeEnv tmp $ do
           paths <- getSealPaths
           vaultFilePath paths `shouldBe` tmp </> "config" </> "vault" </> "vault.age"
+
+    it "reposFilePath returns config/repos.toml" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          reposFilePath paths `shouldBe` tmp </> "config" </> "repos.toml"
+
+    it "repoCloneStateDir returns state/repos" $
+      withSystemTempDirectory "seal-home" $ \tmp ->
+        withSealHomeEnv tmp $ do
+          paths <- getSealPaths
+          repoCloneStateDir paths `shouldBe` tmp </> "state" </> "repos"
 
   describe "session paths" $ do
     it "derives sessions root, dir, meta and transcript paths under state/" $ do

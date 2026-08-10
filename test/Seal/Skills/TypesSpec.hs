@@ -25,6 +25,7 @@ sampleSkill = Skill
   { skId = sampleSkillId
   , skDescription = "greeting skill"
   , skBody = "say hello"
+  , skGroup = Nothing
   , skCreatedAt = sampleTime
   , skUpdatedAt = sampleTime
   , skSession = mkSystemSessionId "s1"

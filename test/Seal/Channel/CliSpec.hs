@@ -12,6 +12,7 @@ import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Command.Provider (ProviderRuntime (..))
@@ -41,15 +42,16 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" Nothing Nothing Nothing t t
+  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing t t
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
 recordingCaps :: IORef [Text] -> ChannelCaps
-recordingCaps ref = ChannelCaps
+recordingCaps ref = def
   { ccSend         = \t -> modifyIORef' ref (t :)
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
   }
 
 -- | A plain-text handler that never fires; used by the non-'PlainMessage' cases.
@@ -131,7 +133,7 @@ spec = do
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th mkRemoteUntrustedIOStub
-                  Nothing Full approvals (pure ()) False Nothing 90 Nothing
+                  Nothing Full approvals (pure ()) False Nothing 90 Nothing "cli" Nothing
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing

@@ -50,13 +50,13 @@ spec = describe "Seal.Text.LineFile" $ do
 
   describe "windowLines" $ do
 
-    it "defaultPageParams first window of 320 lines is 72, hasMore True" $ do
-      let ls  = [T.pack (show n) | n <- [1..320 :: Int]]
+    it "defaultPageParams first window of 1200 lines is 500, hasMore True" $ do
+      let ls  = [T.pack (show n) | n <- [1..1200 :: Int]]
           win = windowLines defaultPageParams 0 Nothing ls
-      length (lwLines win) `shouldBe` 72
+      length (lwLines win) `shouldBe` 500
       lwStart win `shouldBe` 0
-      lwEnd win `shouldBe` 72
-      lwTotal win `shouldBe` 320
+      lwEnd win `shouldBe` 500
+      lwTotal win `shouldBe` 1200
       lwHasMore win `shouldBe` True
       lwTruncated win `shouldBe` False
 
@@ -75,9 +75,9 @@ spec = describe "Seal.Text.LineFile" $ do
       lwEnd win `shouldBe` 5
 
     it "explicit limit above ceiling clamps to ceiling" $ do
-      let ls  = [T.pack (show n) | n <- [1..1000 :: Int]]
+      let ls  = [T.pack (show n) | n <- [1..5000 :: Int]]
           win = windowLines defaultPageParams 0 (Just 10000) ls
-      length (lwLines win) `shouldBe` 200
+      length (lwLines win) `shouldBe` 2000
 
     prop "lwEnd == lwStart + length lwLines" $ \offset mLimit (ls :: [Text]) ->
       let win = windowLines defaultPageParams offset mLimit ls
@@ -243,19 +243,23 @@ spec = describe "Seal.Text.LineFile" $ do
 
     it "offset paging reaches the tail" $
       withSystemTempDirectory "seal-lf" $ \dir -> do
-        let ls  = ["l" <> T.pack (show i) | i <- [1..30 :: Int]]
+        let ls  = ["l" <> T.pack (show i) | i <- [1..1200 :: Int]]
             body = BS.intercalate "\n" (map TE.encodeUtf8 ls) <> "\n"
         withSafeFile dir body $ \safe -> do
-          -- defaultPageParams: pageSize = clamp 10 200 (round(4*sqrt 30)) =
-          -- clamp 10 200 (round 21.90) = 22.
+          -- defaultPageParams: pageSize = 500 (flat default, coeff=0).
           w1 <- readLineWindow defaultPageParams 0 Nothing maxScanBytes safe
-          length (lwLines w1) `shouldBe` 22
+          length (lwLines w1) `shouldBe` 500
           lwHasMore w1 `shouldBe` True
-          -- Page to offset = lwEnd w1 (the copy-paste footer value).
+          -- Second 500-line window.
           w2 <- readLineWindow defaultPageParams (lwEnd w1) Nothing maxScanBytes safe
-          lwStart w2 `shouldBe` 22
-          lwLines w2 `shouldBe` drop 22 ls
-          lwHasMore w2 `shouldBe` False
+          lwStart w2 `shouldBe` 500
+          lwLines w2 `shouldBe` take 500 (drop 500 ls)
+          lwHasMore w2 `shouldBe` True
+          -- Third page gets the remaining 200 lines.
+          w3 <- readLineWindow defaultPageParams (lwEnd w2) Nothing maxScanBytes safe
+          lwStart w3 `shouldBe` 1000
+          lwLines w3 `shouldBe` drop 1000 ls
+          lwHasMore w3 `shouldBe` False
 
     it "limit override bounds the window" $
       withSystemTempDirectory "seal-lf" $ \dir -> do

@@ -19,16 +19,23 @@ module Seal.Providers.Class
   , CompletionResponse (..)
   , Provider (..)
   , SomeProvider (..)
+  , StreamEvent (..)
+  , StreamOutcome (..)
+  , providerStreamWithRetry
   ) where
 
+import Control.Monad (void, unless)
+import Control.Retry
+  ( RetryPolicyM, exponentialBackoff, limitRetries, retrying )
 import Data.Aeson
 import Data.Aeson.Key (fromString)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 import GHC.Generics (Generic)
 
-import Seal.Core.Types (ModelId, OpName, ToolCallId)
+import Seal.Core.Types (ModelId, OpName (..), ToolCallId)
 import Seal.Util.AesonUtils (stripPrefixToJSON, stripPrefixParseJSON)
 
 data Role = User | Assistant deriving stock (Eq, Show, Generic)
@@ -149,5 +156,85 @@ instance FromJSON CompletionResponse where parseJSON = stripPrefixParseJSON
 class Provider p where
   complete   :: p -> CompletionRequest -> IO (Either Text CompletionResponse)
   listModels :: p -> IO (Either Text [ModelId])
+  -- | Stream a completion request, invoking the callback for each 'StreamEvent'
+  -- as it arrives. The callback returns 'True' to continue streaming or 'False'
+  -- to abort early (e.g. the consumer is no longer interested). The final
+  -- 'StreamOutcome' carries the aggregated stop reason + usage. Providers
+  -- that do not support streaming can fall back to 'complete' + emit a single
+  -- 'StreamContentChunk' + 'StreamDone' (the default implementation does this).
+  streamComplete
+    :: p -> CompletionRequest -> (StreamEvent -> IO Bool) -> IO (Either Text StreamOutcome)
+  streamComplete p cr k = do
+    -- Default: use the non-streaming 'complete' and emit events for each
+    -- content block (text + tool calls), then a final 'StreamDone'.
+    eresp <- complete p cr
+    case eresp of
+      Left err -> pure (Left err)
+      Right resp -> do
+        mapM_ (emitBlock k) (rsContent resp)
+        _ <- k (StreamDone (rsStop resp) (rsUsage resp))
+        pure (Right (StreamOutcome (rsStop resp) (rsUsage resp)))
+
+-- | Emit 'StreamEvent's for a single 'ContentBlock' (used by the default
+-- 'streamComplete' implementation that wraps the non-streaming 'complete').
+emitBlock :: (StreamEvent -> IO Bool) -> ContentBlock -> IO ()
+emitBlock k block = case block of
+  CbText t -> unless (T.null t) $
+    void (k (StreamTextChunk t))
+  CbToolUse tcid (OpName name) args ->
+    void (k (StreamToolStart tcid (OpName name)) >>
+          k (StreamToolEnd tcid (OpName name) args))
+  CbToolResult{} -> pure ()  -- tool results are not model output
 
 data SomeProvider = forall p. Provider p => SomeProvider p
+
+-- | A single streaming event emitted by 'streamComplete'. Mirrors the
+-- 'LLMEvent' contract from OpenCode: text deltas, tool-call lifecycle
+-- (start/delta/end), and a final done signal carrying the stop reason +
+-- usage. The events arrive incrementally as the model generates; the
+-- consumer aggregates them into 'ContentBlock's and writes to the
+-- transcript live.
+data StreamEvent
+  = StreamTextChunk Text
+  -- ^ A chunk of assistant text. Multiple chunks concatenate to form the
+  -- final 'CbText' block(s).
+  | StreamToolStart ToolCallId OpName
+  -- ^ The model began emitting a tool call. The id is synthesized by the
+  -- provider (Ollama carries no ids; the provider assigns sequential ones).
+  | StreamToolDelta ToolCallId Text
+  -- ^ A chunk of the tool-call's JSON arguments. Multiple deltas
+  -- concatenate to form the final 'cbInput' 'Value' (parsed at 'StreamToolEnd').
+  | StreamToolEnd ToolCallId OpName Value
+  -- ^ A tool call completed. Carries the fully-parsed 'cbInput'.
+  | StreamDone StopReason Usage
+  -- ^ The generation finished. Carries the final stop reason + usage. This
+  -- is always the last event (unless the stream was aborted by the callback
+  -- returning 'False' or a transport error).
+  deriving stock (Eq, Show)
+
+-- | The aggregated outcome of a completed stream: the final stop reason +
+-- usage. The loop uses this (alongside the accumulated 'ContentBlock's) to
+-- decide whether to continue (tool calls / truncation) or finish.
+data StreamOutcome = StreamOutcome
+  { soStop :: StopReason
+  , soUsage :: Usage
+  } deriving stock (Eq, Show)
+
+-- | Retry policy for transient provider failures during streaming (same as
+-- the non-streaming path: up to 2 retries, 50ms exponential backoff).
+streamRetryPolicy :: RetryPolicyM IO
+streamRetryPolicy =
+  exponentialBackoff 50_000 <> limitRetries 2
+
+-- | Call 'streamComplete' with retry on transient errors. Mirrors
+-- 'providerCompleteWithRetry' in the non-streaming path. The transient-error
+-- predicate is the same ('isTransientError' lives in the loop; here we
+-- accept a predicate so the streaming provider can reuse it).
+providerStreamWithRetry
+  :: SomeProvider -> (Text -> Bool) -> CompletionRequest
+  -> (StreamEvent -> IO Bool) -> IO (Either Text StreamOutcome)
+providerStreamWithRetry (SomeProvider p) isTransient cr k =
+  retrying streamRetryPolicy shouldRetry $ \_ -> streamComplete p cr k
+  where
+    shouldRetry _ (Left err) = pure (isTransient err)
+    shouldRetry _ (Right _)  = pure False

@@ -19,6 +19,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channels.Signal.Run (runSignalLoop)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Tabs (newTabsHandle)
@@ -45,6 +46,7 @@ import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
+import Seal.Logging.Logger (testSealLogger)
 import Seal.Ingest (emptyChain)
 
 -- A scripted provider: replies a long message to test chunking.
@@ -101,12 +103,14 @@ spec = describe "Seal.Phase2bSpec" $ do
         sid      = either (error "sid") id (mkSessionId "phase2b")
         isaReg   = ISA.mkRegistry []
         allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
-    appEnv <- mkEnv defaultConfig
+    sigLogger <- testSealLogger
+    appEnv <- mkEnv sigLogger defaultConfig
     let runOneTurn h ms body =
-          let handleCaps = ChannelCaps
+          let handleCaps = def
                 { ccSend = chSend h
                 , ccPrompt = \_ -> pure ""
                 , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True  -- tests: streaming by default
                 }
               agentEnv = AgentEnv
                 { aeProvider = provider
@@ -120,12 +124,14 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeCaps = handleCaps
                 , aeSession = sid
                 , aeMaxTurns = 4
+                , aeChannel = "signal"
                 , aeMessageSource = Just ms
                 , aeAutonomy = Full
                 , aeApprovals = approvals
                 , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
+                    , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                 }
@@ -135,7 +141,7 @@ spec = describe "Seal.Phase2bSpec" $ do
           Nothing -> pure ()
     tabsH <- newTabsHandle
     askReply <- newAskReplyStore 0
-    let meta = SessionMeta sid "ollama" "test" "signal" Nothing Nothing Nothing
+    let meta = SessionMeta sid "ollama" "test" "signal" Nothing Nothing Nothing Nothing
                  (UTCTime (fromGregorian 2026 1 1) 0)
                  (UTCTime (fromGregorian 2026 1 1) 0)
     activeRef <- newIORef meta
@@ -145,7 +151,8 @@ spec = describe "Seal.Phase2bSpec" $ do
           , srConfigPath = ""
           , srActive = activeRef
           }
-    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler
+    sigLogger2 <- testSealLogger
+    runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler sigLogger2
     -- The plain turn is forked so the loop can keep receiving; give the
     -- forked thread a moment to finish its runTurn + chSend before reading
     -- the captured sends.
@@ -154,7 +161,7 @@ spec = describe "Seal.Phase2bSpec" $ do
     -- /ping dispatched → pong sent via the handle
     map snd cap `shouldContain` ["pong"]
     -- hello routed → the model's reply sent via the handle
-    map snd cap `shouldContain` ["ollama/test> reply from model"]
+    map snd cap `shouldContain` ["reply from model"]
     -- all sends went to the allow-listed peer
     all ((== "+15551234567") . fst) cap `shouldBe` True
     -- the dropped env never reached the loop body (no send to +19999999999)

@@ -18,6 +18,7 @@ import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.StoreSpec
 import qualified Seal.Session.LogSpec
+import qualified Seal.Session.LockSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
@@ -25,6 +26,7 @@ import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
+import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
@@ -50,6 +52,7 @@ import qualified Seal.Command.ProviderSpec
 import qualified Seal.Command.SessionSpec
 import qualified Seal.Command.ServeSpec
 import qualified Seal.Command.SkillSpec
+import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
 import qualified Seal.Command.CallSpec
@@ -101,13 +104,21 @@ import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Skills.BackendSpec
+import qualified Seal.Skills.PromptSpec
 import qualified Seal.Agent.Def.TypesSpec
 import qualified Seal.Agent.Def.BackendSpec
+import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
+import qualified Seal.ISA.Ops.RepoSpec
+import qualified Seal.ISA.Ops.GitSpec
 import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.ISA.Ops.RegistrySpec
+import qualified Seal.SourceControl.RepoSpec
+import qualified Seal.SourceControl.RegistrySpec
+import qualified Seal.SourceControl.AgentRegistrySpec
+import qualified Seal.SourceControl.CloneSpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
 import qualified Seal.Phase6aSpec
@@ -124,6 +135,7 @@ import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
+import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
@@ -134,6 +146,8 @@ import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
+import qualified Seal.Logging.LoggerSpec
+import qualified Seal.Logging.ExceptionsSpec
 
 main :: IO ()
 main = hspec $ do
@@ -153,6 +167,7 @@ main = hspec $ do
   Seal.Session.MetaSpec.spec
   Seal.Session.StoreSpec.spec
   Seal.Session.LogSpec.spec
+  Seal.Session.LockSpec.spec
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
@@ -160,6 +175,7 @@ main = hspec $ do
   Seal.Tools.Exec.LocalSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
+  Seal.Tools.Ssh.AgentSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
@@ -185,6 +201,7 @@ main = hspec $ do
   Seal.Command.SessionSpec.spec
   Seal.Command.ServeSpec.spec
   Seal.Command.SkillSpec.spec
+  Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
   Seal.Command.CallSpec.spec
@@ -236,13 +253,21 @@ main = hspec $ do
   Seal.Memory.BackendSpec.spec
   Seal.Skills.TypesSpec.spec
   Seal.Skills.BackendSpec.spec
+  Seal.Skills.PromptSpec.spec
   Seal.Agent.Def.TypesSpec.spec
   Seal.Agent.Def.BackendSpec.spec
+  Seal.Agent.PromptPartsSpec.spec
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
+  Seal.ISA.Ops.RepoSpec.spec
+  Seal.ISA.Ops.GitSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
+  Seal.SourceControl.RepoSpec.spec
+  Seal.SourceControl.RegistrySpec.spec
+  Seal.SourceControl.AgentRegistrySpec.spec
+  Seal.SourceControl.CloneSpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec
   Seal.Phase6aSpec.spec
@@ -267,5 +292,8 @@ main = hspec $ do
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
+  Seal.RepoDiscoverySpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
+  Seal.Logging.LoggerSpec.spec
+  Seal.Logging.ExceptionsSpec.spec

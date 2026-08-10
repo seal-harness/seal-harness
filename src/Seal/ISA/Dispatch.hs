@@ -20,18 +20,25 @@ module Seal.ISA.Dispatch
   ( DispatchError (..)
   , dispatch
   , recordSkillLoadResult
+  , recordSetupRepoResult
+  , recordGitPushResult
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.Types (parseMaybe)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
@@ -113,11 +120,41 @@ mkInvocationEntry name input = do
 -- opcodes' 'orRecorded' is not surfaced to the frontend via this path.
 -- Error results ('orIsError' = True) are NOT recorded here — the error
 -- text is rendered via 'ccSend' to the slash bubble instead.
-recordSkillLoadResult :: TwoFileHandle -> OpName -> Value -> OpResult -> IO ()
-recordSkillLoadResult h (OpName nm) input result
+--
+-- The skill body is ALSO appended to @conversation.jsonl@ as a 'User'
+-- message carrying the rendered body text. The agent loop builds its
+-- next-turn context from @conversation.jsonl@ ('runTurn' at
+-- 'Seal.Agent.Loop' reads @tfwReadConversation@); without this write,
+-- a user-invoked @/skill load@ would record the body only to
+-- @entries.jsonl@ (the audit sidecar) and the model would never see
+-- the skill on the next turn — the @/skill load@ "Command output" box
+-- would display but the skill would not actually load. The agent's own
+-- tool-call path needs no such write because 'runTurn' already folds
+-- the 'CbToolResult' into @conversation.jsonl@; this closes the gap
+-- for the user-invoked path, which bypasses the agent loop.
+--
+-- The @channel@ argument is the communications-channel label of the
+-- session the skill was loaded into (e.g. @"telegram"@, @"web"@,
+-- @"cli"@), or 'Nothing' when the caller didn't supply one. It is
+-- recorded under @"channel"@ in @erMeta@ so the frontend can surface
+-- the channel provenance in the skill-load row's source label (e.g.
+-- @"Skill · telegram"@), making it clear how/why the skill was loaded.
+--
+-- The @input@'s optional @message@ field (a string) is appended to
+-- @conversation.jsonl@ as a SECOND 'User' message AFTER the skill body,
+-- so the model sees the skill followed by the user's trailing message on
+-- the next turn (e.g. @/skill load start #123@ loads the @start@ skill
+-- then sends @#123@ as the user's message). When @message@ is absent or
+-- blank, no second message is written (the load behaves as before — skill
+-- body only).
+recordSkillLoadResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordSkillLoadResult h (OpName nm) input result mChannel
   | nm == "SKILL_LOAD" && not (orIsError result) = do
       now <- getCurrentTime
-      let entry = EntryRecord
+      let channelMeta = case mChannel of
+            Just ch  -> [("channel", A.String ch)]
+            Nothing  -> []
+          entry = EntryRecord
             { erId = ""
             , erTimestamp = now
             , erKind = EKHarness
@@ -129,10 +166,91 @@ recordSkillLoadResult h (OpName nm) input result
             , erHarness = Nothing
             , erCorrelation = Nothing
             , erMeta = Map.fromList
-                [ ("op", object ["name" .= OpName nm])
-                , ("input", input)
-                , ("result", orRecorded result)
-                ]
+                ([ ("op", object ["name" .= OpName nm])
+                 , ("input", input)
+                 , ("result", orRecorded result)
+                 ] <> channelMeta)
             }
-      tfwRecordAndAck h (TwoFileWrite [] entry)
+          bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
+          -- The optional trailing message from the /skill load <id> <message>
+          -- invocation. Extracted from the input's @message@ field; blank or
+          -- absent yields no second conversation message.
+          messageText = fromMaybe "" (parseMaybe (A.withObject "input" (A..: "message")) input)
+          trimmedMessage = T.strip messageText
+          convMsgs =
+            [ Message User [CbText bodyText] | not (T.null bodyText) ]
+            <> [ Message User [CbText trimmedMessage] | not (T.null trimmedMessage) ]
+      tfwRecordAndAck h (TwoFileWrite convMsgs entry)
   | otherwise = pure ()
+
+-- | Record the result of a 'SETUP_REPO' opcode invocation as an
+-- 'EKHarness' transcript entry + a conversation message. Unlike
+-- 'recordSkillLoadResult', this records BOTH success and failure (a
+-- failed clone is the case the operator most needs to see in the
+-- transcript — the error text tells them why the repo didn't appear).
+-- The conversation message carries the opcode's text result so the
+-- user sees the clone/no-op/conflict/failure message in the chat.
+recordSetupRepoResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordSetupRepoResult h (OpName nm) input result mChannel = do
+  now <- getCurrentTime
+  let channelMeta = case mChannel of
+        Just ch  -> [("channel", A.String ch)]
+        Nothing  -> []
+      entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 0
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList
+            ([ ("op", object ["name" .= OpName nm])
+             , ("input", input)
+             , ("result", orRecorded result)
+             ] <> channelMeta)
+        }
+      bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
+      convMsgs = [ Message User [CbText bodyText] | not (T.null bodyText) ]
+  tfwRecordAndAck h (TwoFileWrite convMsgs entry)
+
+-- | Record the result of a 'GIT_PUSH' opcode invocation as an
+-- 'EKHarness' transcript entry + a conversation message (mirrors
+-- 'recordSetupRepoResult'). The audit is secret-free: the entry's
+-- @erMeta@ carries @op.name@ + @input@ + @result.orRecorded@ (which
+-- includes @credential_kind@ + @status@ — public strings, NOT the
+-- secret). The dispatcher's pre-run ACK ('Dispatch.hs:66', fires for ALL
+-- Untrusted opcodes) is the \"records-then-runs\" pre-run audit; this
+-- function is the post-run result entry, called at the 3 dispatch sites
+-- (Send.hs/Loop.hs/Cli.hs) AFTER @dispatch@ returns a successful 'Right'
+-- for a @GIT_PUSH@. Records BOTH success and failure (a failed push is
+-- the case the operator most needs to see in the transcript).
+recordGitPushResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
+recordGitPushResult h (OpName nm) input result mChannel = do
+  now <- getCurrentTime
+  let channelMeta = case mChannel of
+        Just ch  -> [("channel", A.String ch)]
+        Nothing  -> []
+      entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 0
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList
+            ([ ("op", object ["name" .= OpName nm])
+             , ("input", input)
+             , ("result", orRecorded result)
+             ] <> channelMeta)
+        }
+      bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
+      convMsgs = [ Message User [CbText bodyText] | not (T.null bodyText) ]
+  tfwRecordAndAck h (TwoFileWrite convMsgs entry)

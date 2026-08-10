@@ -33,6 +33,7 @@ import Seal.Agent.Runtime.Delegation
   , ChildWorkerOutcome (..)
   )
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Config.Paths (SealPaths, agentSessionDir)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
@@ -122,6 +123,12 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdOnEntry :: IO ()
     -- ^ The on-entry hook for the child's transcript (live broadcast).
     -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
+  , dwdChannel :: Text
+    -- ^ The parent session's channel label (e.g. @\"telegram\"@, @\"web\"@,
+    -- @\"cli\"@), inherited by the child so the child's request entries are
+    -- attributed to the same channel the parent turn ran on. Stamped into
+    -- the child's 'aeChannel' so 'runTurn' attributes the child's user
+    -- messages (the task goals) to the originating channel.
   }
 
 -- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
@@ -134,10 +141,10 @@ data DelegationWorkerDeps = DelegationWorkerDeps
 -- the IORef after the run. The child's @ccPrompt@ is a no-op (children don't
 -- prompt the human — that would deadlock the parent).
 mkDelegateWorker :: DelegationWorkerDeps -> AgentWorkerBuilder
-mkDelegateWorker deps def childSid task _hooks = do
+mkDelegateWorker deps agentDef childSid task _hooks = do
   let childDir = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
   createDirectoryIfMissing True childDir
-  eProv <- dwdResolveProvider deps def
+  eProv <- dwdResolveProvider deps agentDef
   case eProv of
     Left err -> pure (ChildWorkerOutcome
                        (Just ("agent start failed: " <> err))
@@ -145,17 +152,16 @@ mkDelegateWorker deps def childSid task _hooks = do
     Right (prov, model) ->
       withTwoFileTranscript childDir $ \childTHandle -> do
         summaryRef <- newIORef (Nothing :: Maybe Text)
-        let capturingCaps = ChannelCaps
+        let capturingCaps = def
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
-              , ccPrompt = \_ -> pure ""  -- children don't prompt the human
-              , ccPromptSecret = \_ -> pure ""
+              , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
-        childReg <- dwdChildRegistry deps def childSid capturingCaps
+        childReg <- dwdChildRegistry deps agentDef childSid capturingCaps
         childUio <- dwdMkUntrustedIO deps childSid
-        childSystem <- dwdChildSystemPrompt deps def task
+        childSystem <- dwdChildSystemPrompt deps agentDef task
         let env = AgentEnv
               { aeProvider   = prov
-              , aeProviderLabel = providerLabel def
+              , aeProviderLabel = providerLabel agentDef
               , aeModel      = model
               , aeSystem     = childSystem
               , aeRegistry   = childReg
@@ -165,12 +171,14 @@ mkDelegateWorker deps def childSid task _hooks = do
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 90
+              , aeChannel    = dwdChannel deps
               , aeMessageSource = Nothing
               , aeAutonomy   = dwdAutonomy deps
               , aeApprovals  = dwdApprovals deps
               , aeDebugRequestsPath = Nothing
               , aeOnEntry    = dwdOnEntry deps
               , aeOnUserMessage = Nothing
+              , aeOnStop     = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
               }

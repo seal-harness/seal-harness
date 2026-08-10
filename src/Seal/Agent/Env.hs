@@ -41,14 +41,29 @@ data AgentEnv = AgentEnv
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int
+  , aeChannel :: Text
+    -- ^ The channel this turn's message arrived on (e.g. @\"telegram\"@,
+    -- @\"web\"@, @\"cli\"@). This is the /arrival/ channel, NOT the
+    -- session's channel-of-origin — a web message sent to a
+    -- Telegram-created session carries @\"web\"@, not @\"telegram\"@. Each
+    -- wiring site passes the channel the message actually came in on:
+    -- the web gateway passes @"web"@, the CLI passes @"cli"@, and the
+    -- inbox-channel loop passes @smChannel@ (correct because an inbox
+    -- session is always created on the channel its messages arrive on).
+    -- 'runTurn' stamps this into every request entry's @erMeta@ @channel@
+    -- field so the frontend can attribute every user message to the
+    -- channel it came from. This is the single source of truth for channel
+    -- provenance — 'MessageSource' carries the finer-grained conversation
+    -- id + user id, but the channel label itself always comes from here.
   , aeMessageSource :: Maybe MessageSource
     -- ^ The authenticated-transport identity of the inbound message this
-    -- turn is answering. 'Nothing' for the CLI TUI (which bypasses
-    -- 'MessageSource'); @'Just' ms@ for channels that carry one (Signal).
-    -- 'runTurn' folds the 'msChannelKind' into the request 'EntryRecord's
-    -- @erMeta@ @channel@ field and the 'msConversationId' into
-    -- @conversationId@, so the transcript records which channel + conversation
-    -- each turn served.
+    -- turn is answering. 'Nothing' for the CLI TUI and the web (which
+    -- bypass 'MessageSource'); @'Just' ms@ for channels that carry one
+    -- (Signal, Telegram). 'runTurn' folds the 'msConversationId' into the
+    -- request 'EntryRecord's @erMeta@ @conversationId@ field. The
+    -- @channel@ field comes from 'aeChannel' (above), NOT from here, so
+    -- every channel — including those with no 'MessageSource' — is
+    -- attributed.
   , aeAutonomy :: AutonomyLevel
     -- ^ The operator-selected autonomy level. 'Full' (@--yolo@) bypasses the
     -- human-confirmation gate for Untrusted opcodes (they run immediately after
@@ -86,6 +101,16 @@ data AgentEnv = AgentEnv
     -- sidebar shows the session name immediately rather than after the
     -- first LLM response. 'Nothing' (the default) keeps the async
     -- 'tfwRecordAsync' write (no fsync latency at turn start).
+  , aeOnStop :: Maybe (Text -> IO ())
+    -- ^ When 'Just fanout', the loop calls @fanout text@ with the final
+    -- user-visible text at every stop branch (final answer, truncation
+    -- give-up, max-turns stop, provider error). This is the chat-channel
+    -- notification hook: wiring sites bind it to 'replyFanout' against the
+    -- session's 'ReplyRegistry' so every subscribed chat channel (Telegram,
+    -- Signal, …) attached to the tab receives the stop notice — not just
+    -- the arrival channel (which 'ccSend' covers). 'Nothing' (the default
+    -- for tests and the standalone CLI) means no fan-out; the arrival
+    -- channel alone is notified via 'ccSend'.
   , aeOnDemandSchemas :: Bool
     -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
     -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,

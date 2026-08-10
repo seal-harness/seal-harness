@@ -12,17 +12,17 @@ spec :: Spec
 spec = describe "Seal.Core.Paging" $ do
 
   describe "pageSize" $ do
-    it "defaultPageParams on 320 lines = 72 (spec example)" $
-      pageSize defaultPageParams 320 `shouldBe` 72
+    it "defaultPageParams on 320 lines = 500 (flat default, coeff=0)" $
+      pageSize defaultPageParams 320 `shouldBe` 500
 
-    it "defaultPageParams on 0 lines = floor (10)" $
-      pageSize defaultPageParams 0 `shouldBe` 10
+    it "defaultPageParams on 0 lines = floor (500)" $
+      pageSize defaultPageParams 0 `shouldBe` 500
 
-    it "defaultPageParams on 1 line = clamp 10 200 (round(4*1)=4 -> 10)" $
-      pageSize defaultPageParams 1 `shouldBe` 10
+    it "defaultPageParams on 1 line = floor (500)" $
+      pageSize defaultPageParams 1 `shouldBe` 500
 
-    it "defaultPageParams on a huge total is capped at the ceiling (200)" $
-      pageSize defaultPageParams 1000000 `shouldBe` 200
+    it "defaultPageParams on a huge total is still 500 (coeff=0, no scaling)" $
+      pageSize defaultPageParams 1000000 `shouldBe` 500
 
     prop "result is always within [ppFloor, ppCeiling]" $ \params n ->
       n >= 0 ==>
@@ -46,7 +46,7 @@ spec = describe "Seal.Core.Paging" $ do
       windowSize defaultPageParams 100 (Just 5) `shouldBe` 5
 
     it "Just n above ceiling is clamped to ceiling" $
-      windowSize defaultPageParams 100 (Just 1000) `shouldBe` 200
+      windowSize defaultPageParams 100 (Just 5000) `shouldBe` 2000
 
     it "Just 0 is clamped up to 1" $
       windowSize defaultPageParams 100 (Just 0) `shouldBe` 1
@@ -61,20 +61,21 @@ spec = describe "Seal.Core.Paging" $ do
       in do
         pgOffset p `shouldBe` 0
         pgTotal p `shouldBe` 100
-        length (pgItems p) `shouldBe` pageSize defaultPageParams 100
-        pgHasMore p `shouldBe` True
+        -- pageSize = 500 but only 100 items exist, so all fit in one page.
+        length (pgItems p) `shouldBe` 100
+        pgHasMore p `shouldBe` False
 
     it "explicit limit overrides the computed size" $
       let p = paginate defaultPageParams 0 (Just 5) [1..100 :: Int]
       in length (pgItems p) `shouldBe` 5
 
-    it "explicit limit above ceiling is clamped to ceiling" $
-      let p = paginate defaultPageParams 0 (Just 1000) [1..100 :: Int]
-      in length (pgItems p) `shouldBe` 100   -- total is 100 < ceiling 200
+    it "explicit limit above ceiling with small list returns all items" $
+      let p = paginate defaultPageParams 0 (Just 5000) [1..100 :: Int]
+      in length (pgItems p) `shouldBe` 100   -- total is 100 < ceiling 2000
 
     it "explicit limit above ceiling with large list clamps to ceiling" $
-      let p = paginate defaultPageParams 0 (Just 1000) [1..1000 :: Int]
-      in length (pgItems p) `shouldBe` 200
+      let p = paginate defaultPageParams 0 (Just 5000) [1..10000 :: Int]
+      in length (pgItems p) `shouldBe` 2000
 
     it "offset past end yields empty window and pgHasMore False" $
       let p = paginate defaultPageParams 500 Nothing [1..10 :: Int]

@@ -15,15 +15,18 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
-import System.IO (hPutStrLn, stderr)
+
+import Katip (Severity (..), ls)
 
 import Seal.Channel.Caps (ChannelCaps (..))
+import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
+import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
@@ -39,8 +42,8 @@ import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, vaultFilePath)
+import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Types (mkSessionId)
@@ -55,6 +58,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, lookupByRef)
 import Seal.Security.Vault qualified as Vault
@@ -77,9 +81,9 @@ runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
   let accountLabel = signalAccountText account
   eTransport <- mkRealSignalTransport accountLabel
   case eTransport of
-    Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
+    Left err -> logIO (cdLogger deps) ErrorS ("seal signal: " <> ls err)
     Right transport -> do
-      let withCh = withSignalChannel (allow, chunkLimit) account transport
+      let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
       runChannelLoop deps withCh plainHandler registry chain askReply tabsH
 
@@ -102,11 +106,12 @@ runSignalLoop
   -> AskReplyStore
   -> SessionRuntime
   -> (ChannelHandle -> Maybe MessageSource -> Text -> IO ())
+  -> SealLogger
   -> IO ()
-runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr plainHandler =
-  withSignalChannel (allow, chunkLimit) account transport $ \ch -> do
+runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askReply sr plainHandler logger =
+  withSignalChannel (allow, chunkLimit) account transport logger $ \ch -> do
     let h = toHandle ch
-        handleCaps = ChannelCaps
+        handleCaps = Data.Default.def
           { ccSend         = chSend h
           , ccPrompt       = \q -> do
               -- Bind the pending question to the active session so the
@@ -117,6 +122,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
               outcome <- askHuman askReply sid q (\_qid -> chSend h q)
               pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+          , ccStreaming    = False  -- Signal: send accumulated text once, not per-delta
           }
     loop h handleCaps
   where
@@ -236,24 +242,24 @@ renderTab t =
 -- threads through to 'mkSessionAgentEnv' so 'Supervised' (the default)
 -- prompts before running Untrusted opcodes (the next inbound message from
 -- the peer delivers the answer via the ask/reply store).
-runSignalMain :: Seal.Security.Policy.AutonomyLevel -> IO ()
-runSignalMain autonomy = do
+runSignalMain :: Seal.Security.Policy.AutonomyLevel -> SealLogger -> IO ()
+runSignalMain autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
+      logIO logger WarningS ("could not load config: " <> ls err)
       pure defaultRuntimeConfig
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      logIO logger WarningS ("could not load security config: " <> ls err)
       pure defaultSecurityConfig
     Right c  -> pure c
   -- Vault (mirrors Tui.tryOpenVault but inlined to keep this module standalone)
-  mHandle <- tryOpenVault paths secCfg
+  mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -297,31 +303,32 @@ runSignalMain autonomy = do
   let loadCfg = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
+  repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
   chanDeps <- newChannelDeps
-        paths rt pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg tabsH
+        paths rt repoRegH pr backends autonomy Nothing
+        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
   let registry = mkRegistry
         [ sessionCommandSpec sr
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
+        , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         ]
   case resolveSignalConfig (rcSignal cfg) Nothing of
-    Left err -> hPutStrLn stderr ("seal signal: " <> T.unpack err)
+    Left err -> logIO logger ErrorS ("seal signal: " <> ls err)
     Right resolved -> runSignal chanDeps registry emptyChain tabsH resolved askReply
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone
 -- (a later refactor can extract the shared startup).
-tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe Vault.VaultHandle)
-tryOpenVault paths cfg =
+tryOpenVault :: SealPaths -> SecurityConfig -> SealLogger -> IO (Maybe Vault.VaultHandle)
+tryOpenVault paths cfg logger =
   case (scVaultRecipient cfg, scVaultIdentity cfg) of
     (Just _, Just _) ->
       resolveEncryptor cfg >>= \case
         Left err -> do
-          hPutStrLn stderr ("Warning: vault not available: " <> show err)
+          logIO logger WarningS ("vault not available: " <> ls (T.pack (show err)))
           pure Nothing
         Right enc -> do
           let vcfg = Vault.VaultConfig

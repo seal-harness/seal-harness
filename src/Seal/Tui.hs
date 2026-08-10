@@ -9,6 +9,7 @@ import qualified Data.Text as T
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
+import Seal.Logging.Logger (SealLogger)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
@@ -27,6 +28,7 @@ import Seal.Config.Paths
   , configFilePath
   , ensureSealDirs
   , getSealPaths
+  , reposFilePath
   , securityFilePath
   , vaultFilePath
   )
@@ -35,6 +37,7 @@ import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
@@ -68,8 +71,8 @@ tryOpenVault paths cfg =
 
 -- | Full TUI wiring. The autonomy level threads through to 'mkSessionAgentEnv'
 -- so 'Supervised' (the default) prompts before running Untrusted opcodes.
-runTui :: AutonomyLevel -> IO ()
-runTui autonomy = do
+runTui :: AutonomyLevel -> SealLogger -> IO ()
+runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
@@ -161,6 +164,7 @@ runTui autonomy = do
             writeIORef activeRef newMeta
             pure oldSid
         }
+  repoReg <- mkRepoRegistryHandle (reposFilePath paths)
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
@@ -168,8 +172,8 @@ runTui autonomy = do
         , modelCommandSpec pr sr
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
-        , tabCommandSpec tabsH noTabCloseNotifier
+        , tabCommandSpec paths tabsH noTabCloseNotifier
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]
-  runCliTui paths rt pr sr registry emptyChain backends tabsH autonomy askReply
+  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger

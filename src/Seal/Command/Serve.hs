@@ -14,11 +14,11 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text qualified as T
 import Network.HTTP.Client.TLS (newTlsManager)
 import System.Directory (doesFileExist)
-import System.IO (hPutStrLn, stderr)
+
+import Katip (Severity (..), ls)
 
 import qualified Seal.Signal.Config
 import qualified Seal.Telegram.Config
-import qualified Seal.Security.Vault
 import qualified Data.Text.Encoding as TE
 import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
@@ -33,15 +33,18 @@ import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
+import Seal.Command.Repo (RepoTestSeam (..), repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
+import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, securityFilePath, sessionMetaPath, tabListPath, vaultFilePath)
+import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -56,7 +59,14 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy (AutonomyLevel)
-import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
+import qualified Seal.SourceControl.Clone as Clone
+import Seal.SourceControl.Clone (lsRemoteRepo)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
+import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
 import Seal.Tabs (newPersistingTabsHandle, rebindTabH, seedTabsHandle, snapshotTabs)
@@ -71,23 +81,28 @@ import Seal.Web.UiState (newUiStateHandle)
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
 -- server.
-runServeMain :: AutonomyLevel -> IO ()
-runServeMain autonomy = do
+runServeMain :: AutonomyLevel -> SealLogger -> IO ()
+runServeMain autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
+  -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
+  -- a crashed/killed seal process so their stale entries don't accumulate
+  -- (#88). Live agents are reused (the key is still loaded).
+  startupAgentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep startupAgentRegH
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load config: " <> T.unpack err)
+      logIO logger WarningS ("could not load config: " <> ls err)
       pure defaultRuntimeConfig
     Right c  -> pure c
   secCfg <- loadSecurityConfig (securityFilePath paths) >>= \case
     Left err -> do
-      hPutStrLn stderr ("Warning: could not load security config: " <> T.unpack err)
+      logIO logger WarningS ("could not load security config: " <> ls err)
       pure defaultSecurityConfig
     Right c  -> pure c
-  mHandle <- tryOpenVault paths secCfg
+  mHandle <- tryOpenVault paths secCfg logger
   ref     <- newIORef mHandle
   let rt = VaultRuntime
             { vrPaths      = paths
@@ -106,6 +121,17 @@ runServeMain autonomy = do
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
   backends <- newBackends cfgRoot repo
+  -- W4: the source-control repo registry handle (closes over
+  -- repos.toml). Built once at startup and threaded into ApiDeps for
+  -- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on
+  -- each call so mutations from other processes are reflected.
+  repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  -- W5: the /repo slash command's test seam. The ls-remote arm runs real
+  -- git against repoCloneStateDir; the vault-list arm backs the /repo info
+  -- non-blocking vault-key advisory. The vault handle (mHandle) may be
+  -- 'Nothing' if the vault is not configured — in that case /repo test
+  -- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.
+  repoSeam <- mkRepoTestSeam rt repoRegH paths
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -139,9 +165,12 @@ runServeMain autonomy = do
   -- can be shared with the web send handler (SendDeps). The cursor store,
   -- reply registry, and write locks are created inside newChannelDeps.
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
+      isRemoteExec = case untrustedExecConfigFromSecurity secCfg of
+        Just uec -> uecMode uec == UemRemote
+        Nothing  -> False
   chanDeps <- newChannelDeps
-        paths rt pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg tabsH
+        paths rt repoRegH pr backends autonomy (Just broker)
+        reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath
@@ -178,14 +207,16 @@ runServeMain autonomy = do
         , modelCommandSpec pr sr
         , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
         , agentCommandSpec (bAgentDefs backends) cfgPath
-        , tabCommandSpec tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
+        , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
         , callCommandSpec (webCallDispatcher sendDeps)
         , newCommandSpec newDeps
+        , repoCommandSpec repoRegH repoSeam
         ]
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdRepoReg    = repoRegH
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends
@@ -203,6 +234,8 @@ runServeMain autonomy = do
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
         , sdTabsHandle  = tabsH
+        , sdLogger      = logger
+        , sdIsRemote    = isRemoteExec
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)
@@ -224,6 +257,10 @@ runServeMain autonomy = do
         , adDefaultAgent    = rcDefaultAgent <$> loadCfg
         , adBroker          = Just broker
         , adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
+        , adRepoRegistry     = repoRegH
+        , adConfigRepo       = repo
+        , adVault            = rt
+        , adPaths            = paths
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from
@@ -239,7 +276,8 @@ runServeMain autonomy = do
       origins = if isWildcard
                   then []  -- wildcard host → empty allowlist → Stream.hs accepts any
                   else httpOrigins <> gcAllowedOrigins gwCfg
-      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024 }
+      guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
+  logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
@@ -255,15 +293,44 @@ runServeMain autonomy = do
         Nothing   -> False
   runGateway gwCfg isRemote deps
 
+-- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
+-- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
+-- 'VaultHandle'; when the vault is unconfigured/locked ('Nothing' in the
+-- ref), @rtsLsRemote@ fails closed to 'CloneVaultError VaultLocked' (via
+-- 'Clone.resolveVaultHandle') and @rtsVaultList@ returns 'Left VaultLocked'
+-- (/repo info shows the locked advisory). Mirrors 'vaultGetByName' in
+-- 'Seal.ISA.Ops.Secret'.
+mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> IO RepoTestSeam
+mkRepoTestSeam rt repoRegH paths = do
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  pure RepoTestSeam
+    { rtsLsRemote  = \repo -> do
+        let deps = Clone.CloneDeps
+              { Clone.cdVault = rt
+              , Clone.cdRepoReg = repoRegH
+              , Clone.cdSshAgent = mkRealSshAgentHandle
+              , Clone.cdAgentRegistry = agentRegH
+              , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , Clone.cdKeyfilesDir = repoKeysDir paths
+              , Clone.cdIsRemote = False
+              }
+        lsRemoteRepo deps repo
+  , rtsVaultList = do
+      mh <- readIORef (vrHandleRef rt)
+      case mh of
+        Nothing -> pure (Left VaultLocked)
+        Just vh -> vhList vh
+  }
+
 -- | Open the vault if both recipient and identity are configured. Mirrors
 -- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
-tryOpenVault :: SealPaths -> SecurityConfig -> IO (Maybe VaultHandle)
-tryOpenVault paths fcfg =
+tryOpenVault :: SealPaths -> SecurityConfig -> SealLogger -> IO (Maybe VaultHandle)
+tryOpenVault paths fcfg logger =
   case (scVaultRecipient fcfg, scVaultIdentity fcfg) of
     (Just _, Just _) ->
       resolveEncryptor fcfg >>= \case
         Left err -> do
-          hPutStrLn stderr ("Warning: vault not available: " <> show err)
+          logIO logger WarningS ("vault not available: " <> ls (T.pack (show err)))
           pure Nothing
         Right enc -> do
           let vcfg = VaultConfig
@@ -310,11 +377,11 @@ forkSignalListener deps cfg registry =
       let accountLabel = Seal.Signal.Config.signalAccountText account
       eTransport <- mkRealSignalTransport accountLabel
       case eTransport of
-        Left err -> hPutStrLn stderr ("seal serve: signal channel skipped: " <> T.unpack err)
+        Left err -> logIO (cdLogger deps) WarningS ("seal serve: signal channel skipped: " <> ls err)
         Right transport -> do
           let tabsH = cdTabs deps
           askReply <- newAskReplyStore 0
-          let withCh = withSignalChannel (allow, chunkLimit) account transport
+          let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
               plainHandler h = plainTurn deps h askReply
           _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
           pure ()
@@ -331,7 +398,7 @@ forkTelegramListener deps cfg registry = do
   mVaultToken <- case mh of
     Nothing -> pure Nothing
     Just vh -> do
-      r <- Seal.Security.Vault.vhGet vh Seal.Telegram.Config.telegramVaultKey
+      r <- vhGet vh Seal.Telegram.Config.telegramVaultKey
       pure $ case r of
         Right bs -> Just (TE.decodeUtf8 bs)
         Left _   -> Nothing
@@ -341,7 +408,7 @@ forkTelegramListener deps cfg registry = do
           -- The [telegram] section is present but unresolved (e.g. the vault
           -- is locked / missing the token). Surface it so the channel isn't
           -- silently dropped on startup.
-          hPutStrLn stderr ("seal serve: telegram channel skipped: " <> T.unpack err)
+          logIO (cdLogger deps) WarningS ("seal serve: telegram channel skipped: " <> ls err)
       | otherwise -> pure ()  -- not configured; skip silently
     Right (token, chunkLimit, allow) -> do
       mgr <- newTlsManager
@@ -350,7 +417,7 @@ forkTelegramListener deps cfg registry = do
       tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)
       let tabsH = cdTabs deps
       askReply <- newAskReplyStore 0
-      let withCh = withTelegramChannel (allow, chunkLimit) transport
+      let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
       _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
       pure ()

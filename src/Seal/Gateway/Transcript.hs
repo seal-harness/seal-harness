@@ -29,11 +29,11 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
 import Data.Vector qualified as V
 import System.Directory (doesFileExist)
@@ -45,6 +45,7 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Transcript.Entries (EntryRecord (..))
 import Seal.Transcript.Reconstruct (reconstruct)
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+import Seal.Util.StrictIO (readFileTextStrict)
 
 -- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
 -- so the @Server-Timing@ header can name the path the request took.
@@ -145,7 +146,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
   if legacyExists
     then do
       tFr0 <- getCurrentTime
-      raw <- TIO.readFile legacyPath
+      raw <- readFileTextStrict legacyPath
       tFr1 <- getCurrentTime
       tPr0 <- getCurrentTime
       let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -169,7 +170,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
     else if convExists
       then do
         tFr0 <- getCurrentTime
-        raw <- TIO.readFile convPath
+        raw <- readFileTextStrict convPath
         tFr1 <- getCurrentTime
         tPr0 <- getCurrentTime
         let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -181,7 +182,7 @@ readTranscriptEntriesTimed paths model fallbackTs sid = do
         if entriesExist
           then do
             tFr2 <- getCurrentTime
-            eraw <- TIO.readFile (sessionEntriesPath paths sid)
+            eraw <- readFileTextStrict (sessionEntriesPath paths sid)
             tFr3 <- getCurrentTime
             tPr2 <- getCurrentTime
             let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
@@ -250,13 +251,13 @@ firstUserMessageSnippet paths sid = do
   convExists   <- doesFileExist convPath
   if convExists
     then do
-      raw <- TIO.readFile convPath
+      raw <- readFileTextStrict convPath
       let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                           (filter (not . T.null) (T.lines raw)) :: [Message]
       pure (snippetFromMessages msgs)
     else if legacyExists
       then do
-        raw <- TIO.readFile legacyPath
+        raw <- readFileTextStrict legacyPath
         let entries = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)
                                (filter (not . T.null) (T.lines raw)) :: [TranscriptEntry]
         pure (snippetFromMessages (legacyRequestMessages entries))
@@ -318,6 +319,15 @@ teLineToFrontend rawLine =
           Just v  -> v
           Nothing -> A.String s
         other -> fromMaybe A.Null other
+      -- The legacy transcript.jsonl entry's `meta` field carries the
+      -- channel label (stamped by runTurn's requestMeta). Extract it so
+      -- the frontend can attribute user messages to their channel on the
+      -- legacy path too. Null when absent (response entries, old entries).
+      mChannel = case KeyMap.lookup (k "meta") o of
+        Just (A.Object mo) -> case KeyMap.lookup (k "channel") mo of
+          Just (A.String ch) -> Just ch
+          _                  -> Nothing
+        _ -> Nothing
   in object
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
@@ -325,6 +335,7 @@ teLineToFrontend rawLine =
      , "payload"   .= payloadVal
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
+     , "channel"   .= mChannel
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
 
@@ -354,15 +365,16 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
         else A.object ["content" A..= content]
       entryId = T.pack (show idx)
       ts = fromMaybe fallbackTs (lookup idx (zip [0..] entryTimestamps))
-   in object
-      [ "id"        .= entryId
-      , "timestamp" .= T.pack ts
-      , "direction" .= direction
-      , "payload"   .= payloadJson
-      , "harness"   .= (Nothing :: Maybe Text)
-      , "model"     .= model
-     , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
-     ]
+    in object
+       [ "id"        .= entryId
+       , "timestamp" .= T.pack ts
+       , "direction" .= direction
+       , "payload"   .= payloadJson
+       , "harness"   .= (Nothing :: Maybe Text)
+       , "model"     .= model
+       , "channel"   .= (Nothing :: Maybe Text)
+      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
+      ]
 
 -- | Rewrite one on-disk 'ContentBlock' (GHC-Generics 'TaggedObject' shape)
 -- into the Anthropic-style block the frontend parses.
@@ -479,6 +491,17 @@ reconEntryToFrontend idx te =
             Response -> "response"
           payloadJson = rewritePayload payloadVal (teDirection te)
           entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw
+          -- The originating channel label (e.g. "telegram", "web", "cli"),
+          -- stamped into the request entry's erMeta by runTurn's
+          -- requestMeta (and into SKILL_LOAD entries by
+          -- recordSkillLoadResult). Surfaced as a top-level `channel` field
+          -- so the frontend can attribute user messages — and skill loads —
+          -- to the channel they came from. Null when the entry carries no
+          -- channel (e.g. response entries, CLI TUI turns with no
+          -- MessageSource).
+          mChannel = case Map.lookup "channel" (teMeta te) of
+            Just (A.String ch) -> Just ch
+            _                  -> Nothing
       in object
          [ "id"        .= entryId
          , "timestamp" .= T.pack (showIso (teTimestamp te))
@@ -495,6 +518,7 @@ reconEntryToFrontend idx te =
          , "payload"   .= payloadJson
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
+         , "channel"   .= mChannel
          -- The `raw` field is deliberately EMPTY for the reconstructed
          -- (two-file) path. The pre-rewrite payload Value is the same
          -- content as `payload` (just in GHC-Generics TaggedObject shape
@@ -568,9 +592,10 @@ rewritePayload val dir =
                -- passing @input@ + @result@ through, the frontend's
                -- @transcriptToMessages@ sees @op.name = "SKILL_LOAD"@ but no
                -- @result@, so the skill-load tool-call box never renders.
-               <> passthrough (k "input")
-               <> passthrough (k "result")
-               <> rewriteMsgs
+                <> passthrough (k "input")
+                <> passthrough (k "result")
+                <> passthrough (k "channel")
+                <> rewriteMsgs
             Response ->
               passthrough (k "model")
                <> rewriteContent

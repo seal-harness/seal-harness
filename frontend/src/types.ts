@@ -178,6 +178,11 @@ export interface DiscoverableWindow {
 export interface AgentInfo {
   name: string
   isDefault: boolean
+  /** The human-readable display name (from the def's frontmatter `name`, or
+   *  a friendly fallback like "Project (agents.md)" for the repo-level
+   *  `agents-md` def). The dropdown renders this when present, falling back
+   *  to `name` (the id). Backend: `agentInfoJson` `displayName` field. */
+  displayName?: string
 }
 
 export interface ProviderInfo {
@@ -257,6 +262,64 @@ export interface SkillInput {
   body?: string
 }
 
+// ── Source-control repo registry ─────────────────────────────────────────
+
+/** The credential kind for a source-control repo. */
+export type RepoCredentialKind = 'pat' | 'deploy_key' | 'machine_user'
+
+/** The credential descriptor stored in repos.toml — a vault key NAME, never
+ *  a secret value. The actual credential lives in the Seal vault. */
+export interface RepoCredential {
+  kind: RepoCredentialKind
+  vault_key: string
+  username?: string   // only for machine_user
+}
+
+/** A source-control repo returned by GET /api/repos + GET /api/repos/:id, and
+ *  accepted by POST /api/repos + PUT /api/repos/:id. Mirrors the backend
+ *  SourceRepo JSON (snake_case wire). No secret-value field ever appears. */
+export interface RepoInfo {
+  id: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+  /** The deploy-key public key (present iff credential.kind == deploy_key
+   *  and the key was generated). Public data — safe to display. */
+  deploy_key_public?: string
+  /** The path to the encrypted keyfile on the harness disk (ciphertext).
+   *  Present iff credential.kind == deploy_key + key was generated. */
+  keyfile_path?: string
+}
+
+/** The body for POST /api/repos + PUT /api/repos/:id. The id is required for
+ *  POST; PUT takes the id from the path. No new_id (ids are stable). */
+export interface RepoInput {
+  id?: string
+  url: string
+  vcs_kind: 'git' | 'github'
+  credential: RepoCredential
+  /** If true AND credential.kind == deploy_key, the server generates a new
+   *  deploy keypair (ssh-keygen) + stores the encrypted keyfile + the
+   *  passphrase in the vault. The response carries the public key. */
+  generate_key?: boolean
+}
+
+/** The response from GET /api/repos/:id/deploy-key + POST
+ *  /api/repos/:id/deploy-key/generate: the public key + host-aware setup
+ *  instructions. No private key ever appears. */
+export interface DeployKeyInfo {
+  public_key: string
+  setup_instructions: string
+}
+
+/** Human-readable label for each credential kind (mirrors the backend
+ *  credentialKindLabel + the /repo --cred help text). */
+export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
+  pat: 'Personal Access Token',
+  deploy_key: 'SSH Deploy Key',
+  machine_user: 'Bot Account',
+}
+
 // ── Transcript ─────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {
@@ -273,6 +336,14 @@ export interface TranscriptEntry {
   payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
+  /** The originating communications-channel label of this entry (e.g.
+   *  "telegram", "web", "cli"), or null when the entry carries no channel
+   *  (response entries, CLI TUI turns with no MessageSource, the
+   *  conversation-only fallback path). Stamped into the request entry's
+   *  erMeta by runTurn's requestMeta, and into SKILL_LOAD entries by
+   *  recordSkillLoadResult. Surfaced so the frontend can attribute user
+   *  messages and skill loads to the channel they came from. */
+  channel: string | null
   /** The full, verbatim on-disk transcript.jsonl line for this entry — all 9
    *  `_te_*` fields including `_te_metadata`, byte-faithful to disk. Surfaced in
    *  the "View raw JSON (message)" modal. Required, never optional, per the

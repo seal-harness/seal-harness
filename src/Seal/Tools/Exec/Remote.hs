@@ -8,8 +8,11 @@
 -- confirm a new host key, so adoption fail-closes).
 module Seal.Tools.Exec.Remote
   ( sshExecArgv
+  , sshExecArgvForwarding
   , runRemoteShell
+  , runRemoteShellForwarding
   , runRemoteWithStdin
+  , runRemoteWithStdinForwarding
   , RemoteRunner (..)
   , mkRealRemoteRunner
   , mkFakeRemoteRunner
@@ -20,9 +23,11 @@ import Control.Exception (try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.IO (hClose)
 import System.Process
@@ -44,9 +49,52 @@ import Seal.Tools.Exec.Types
 -- as the remote user's default shell, but the command string is a single
 -- argv element (ssh itself passes it to the remote shell, but the
 -- *local* argv is fixed, no shell wrapping).
+--
+-- Agent forwarding is OFF (no @-A@) — this is the default for all
+-- non-credential ops (SHELL_EXEC, file writes, process ops). Git-credential
+-- ops (clone/fetch/pull/push with a deploy key) use 'sshExecArgvForwarding'
+-- to opt in to @-A@ so the forwarded @SSH_AUTH_SOCK@ reaches the remote
+-- @git@. A blanket @-A@ would widen the signing-oracle surface; opt-in
+-- per git-op is the security-critical invariant (design §5.6, W2 DoD).
 sshExecArgv :: SshConfig -> Text -> [String]
 sshExecArgv cfg cmd =
   [ "ssh"
+  , "-o", "StrictHostKeyChecking=yes"
+  , "-o", "BatchMode=yes"
+  , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
+  ]
+  <> portArg
+  <> identityArg
+  <> [ userAtHost
+     , "--"
+     , T.unpack cmd
+     ]
+  where
+    userAtHost = T.unpack (getSshUser (scUser cfg)) <> "@"
+                 <> T.unpack (getSshHost (scHost cfg))
+    portArg = case scPort cfg of
+      22 -> []
+      p  -> ["-p", show p]
+    identityArg = case scIdentity cfg of
+      Nothing -> []
+      Just f  -> ["-i", f]
+
+-- | Variant of 'sshExecArgv' that adds @-A@ (forward the agent). Used by
+-- git-credential ops (clone/fetch/pull/push with a deploy key) so the
+-- remote @git@ can sign via the forwarded @SSH_AUTH_SOCK@. The @-A@ is
+-- opt-in per git-op — non-credential remote ops use 'sshExecArgv' (no
+-- @-A@) to keep the signing-oracle surface minimal (design §5.6).
+--
+-- The remote arm of 'uioShellExecGitEnv' (UntrustedIO.hs) uses this via
+-- 'runRemoteShellForwarding' for deploy-key ops. The @SSH_AUTH_SOCK@ /
+-- @SSH_AGENT_PID@ are stripped from the env prefix (the forwarded socket
+-- replaces them) and the @known_hosts@ content is written to a remote
+-- temp file so @GIT_SSH_COMMAND@'s @UserKnownHostsFile=@ resolves on the
+-- remote machine. PAT ops work on both executors (token in argv, no
+-- agent).
+sshExecArgvForwarding :: SshConfig -> Text -> [String]
+sshExecArgvForwarding cfg cmd =
+  [ "ssh", "-A"
   , "-o", "StrictHostKeyChecking=yes"
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
@@ -83,6 +131,11 @@ sshExecArgv cfg cmd =
 data RemoteRunner = RemoteRunner
   { runRemote      :: [String] -> IO (Either ExecError Text)
   , runRemoteStdin :: [String] -> ByteString -> IO (Either ExecError Text)
+  , runRemoteEnv   :: [(String, String)] -> [String] -> IO (Either ExecError Text)
+    -- ^ Run an argv with local env overrides MERGED over the inherited
+    -- environment. Used by the deploy-key remote clone path: the local
+    -- @ssh -A@ process needs the SEAL agent's @SSH_AUTH_SOCK@ (not the
+    -- ambient one) so the forwarded agent has the deploy key loaded.
   }
 
 -- | The real SSH runner via 'System.Process'. Fail-closed: any IOError or
@@ -91,20 +144,25 @@ data RemoteRunner = RemoteRunner
 -- failure, never bypassed).
 mkRealRemoteRunner :: RemoteRunner
 mkRealRemoteRunner = RemoteRunner
-  { runRemote      = runReal Nothing
-  , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) argv
+  { runRemote      = runReal Nothing []
+  , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) [] argv
+  , runRemoteEnv   = runReal Nothing
   }
   where
-    runReal :: Maybe ByteString -> [String] -> IO (Either ExecError Text)
-    runReal mStdin argv = do
+    runReal :: Maybe ByteString -> [(String, String)] -> [String] -> IO (Either ExecError Text)
+    runReal mStdin envExtras argv = do
       let (program, args) = case argv of
             (p : as) -> (p, as)
             []       -> error "runReal: empty argv (unreachable)"
           cp0 = (proc program args)
                   { std_out = CreatePipe, std_err = CreatePipe }
-          cp = case mStdin of
+          cp1 = case mStdin of
             Nothing -> cp0 { std_in = NoStream }
             Just _  -> cp0 { std_in = CreatePipe }
+      mEnv <- case envExtras of
+        [] -> pure Nothing
+        xs -> Just <$> mergeEnvReal xs
+      let cp = cp1 { env = mEnv }
       res <- try @IOError
              (withCreateProcess cp $ \mIn mOut mErr ph -> do
                 -- Pipe the stdin payload (if any) to the process and close
@@ -134,10 +192,19 @@ mkRealRemoteRunner = RemoteRunner
 
 -- | Run a shell command via the remote SSH executor. The command is a
 -- validated 'ShellCommand' (NUL rejected). Returns the stdout or a
--- structured 'ExecError'.
+-- structured 'ExecError'. Agent forwarding is OFF (no @-A@) — use
+-- 'runRemoteShellForwarding' for git-credential ops.
 runRemoteShell :: RemoteRunner -> SshConfig -> ShellCommand -> IO (Either ExecError Text)
 runRemoteShell runner cfg cmd =
   let argv = sshExecArgv cfg (textShellCommand cmd)
+  in runRemote runner argv
+
+-- | Variant of 'runRemoteShell' that forwards the agent (@-A@). Used by
+-- git-credential ops (clone/fetch/pull/push with a deploy key).
+runRemoteShellForwarding
+  :: RemoteRunner -> SshConfig -> ShellCommand -> IO (Either ExecError Text)
+runRemoteShellForwarding runner cfg cmd =
+  let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
   in runRemote runner argv
 
 -- | Run a shell command via the remote SSH executor WITH a stdin payload.
@@ -145,12 +212,23 @@ runRemoteShell runner cfg cmd =
 -- 'UntrustedIO' arm for file writes (the file content goes over the SSH
 -- channel, never interpolated into the command string, so content with
 -- quotes/backticks/@$()@ is safe). The argv is the same fixed
--- 'sshExecArgv' shape; the stdin is a runtime parameter.
+-- 'sshExecArgv' shape; the stdin is a runtime parameter. Agent forwarding
+-- is OFF — use 'runRemoteWithStdinForwarding' for git-credential ops.
 runRemoteWithStdin
   :: RemoteRunner -> SshConfig -> ShellCommand -> ByteString
   -> IO (Either ExecError Text)
 runRemoteWithStdin runner cfg cmd stdinBytes =
   let argv = sshExecArgv cfg (textShellCommand cmd)
+  in runRemoteStdin runner argv stdinBytes
+
+-- | Variant of 'runRemoteWithStdin' that forwards the agent (@-A@). Used
+-- by git-credential ops that pipe stdin (e.g. writing @known_hosts@ over
+-- SSH before a clone with a deploy key).
+runRemoteWithStdinForwarding
+  :: RemoteRunner -> SshConfig -> ShellCommand -> ByteString
+  -> IO (Either ExecError Text)
+runRemoteWithStdinForwarding runner cfg cmd stdinBytes =
+  let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
   in runRemoteStdin runner argv stdinBytes
 
 -- | A fake 'RemoteRunner' that always returns a canned result (the
@@ -160,6 +238,7 @@ mkFakeRemoteRunner :: Either ExecError Text -> RemoteRunner
 mkFakeRemoteRunner canned = RemoteRunner
   { runRemote      = \_argv -> pure canned
   , runRemoteStdin = \_argv _stdin -> pure canned
+  , runRemoteEnv   = \_env _argv -> pure canned
   }
 
 -- | A fake 'RemoteRunner' that records every call's argv + stdin into an
@@ -179,4 +258,14 @@ mkFakeRemoteRunnerRecording ref canned = RemoteRunner
   , runRemoteStdin = \argv stdin -> do
       modifyIORef' ref (++ [(argv, Just stdin)])
       pure canned
+  , runRemoteEnv = \_env argv -> do
+      modifyIORef' ref (++ [(argv, Nothing)])
+      pure canned
   }
+
+-- | Merge env overrides over the inherited environment (overrides win).
+-- Mirrors 'mergeEnv' in 'UntrustedIO.hs' but kept local to avoid a
+-- circular import.
+mergeEnvReal :: [(String, String)] -> IO [(String, String)]
+mergeEnvReal overrides =
+  Map.toList . Map.union (Map.fromList overrides) . Map.fromList <$> getEnvironment
