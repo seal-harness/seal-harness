@@ -445,13 +445,25 @@ export async function setSessionAgent(sessionId: string, agent: string | null): 
 
 // ── Pending questions (human-confirmation gate / ASK_HUMAN) ────────────
 
+/** One discrete choice offered alongside an ASK_HUMAN question. The label
+ *  is the value returned to the agent when picked; the description is a
+ *  one-line explanation shown alongside the button (may be absent). */
+export interface QuestionOption {
+  label: string
+  description?: string
+}
+
 /** One pending human-confirmation question (Untrusted opcode gate or
  *  ASK_HUMAN). The agent loop is blocked until the human answers or
- *  cancels. */
+ *  cancels. `options` is present when ASK_HUMAN offered discrete choices
+ *  (the frontend renders one button per option + an "Other" textarea);
+ *  absent for open-ended questions + the confirmation gate. */
 export interface PendingQuestion {
   id: string
   question: string
   createdAt: string
+  meta?: unknown
+  options?: QuestionOption[]
 }
 
 /** Fetch the session's pending questions (the frontend polls this on
@@ -479,6 +491,29 @@ export async function answerQuestion(sessionId: string, askId: string, scope: st
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope }),
+      },
+    )
+    if (!res.ok) return false
+    const data = (await res.json().catch(() => ({}))) as { accepted?: boolean }
+    return data.accepted === true
+  } catch {
+    return false
+  }
+}
+
+/** Deliver a free-text answer (a chosen option's label or a typed "Other"
+ *  reply) to a pending ASK_HUMAN question, unblocking the agent loop.
+ *  Returns true when the answer was accepted (the question was pending and
+ *  not yet answered). Returns false on network error, non-2xx, or when the
+ *  question was already answered/cancelled/unknown. */
+export async function answerQuestionText(sessionId: string, askId: string, answer: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(askId)}/answer`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer }),
       },
     )
     if (!res.ok) return false
