@@ -1,6 +1,6 @@
 # ASK_HUMAN Stock Answers (Channel-Portable Multiple-Choice Questions)
 
-**Issue**: (to be filed)
+**Issue**: https://github.com/seal-harness/seal-harness/issues/91
 **Branch**: `feat/ask-human-stock-answers`
 **Date**: 2026-08-10 (rev 2 — gate-approved with changes)
 **Status**: Design — gate-approved (5× APPROVE-WITH-CHANGES, all blocking concerns folded into rev 2)
