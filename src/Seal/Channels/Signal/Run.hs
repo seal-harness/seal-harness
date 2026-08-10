@@ -51,7 +51,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply
-  ( AskReplyStore, askHumanWithOptions, deliverNextAnswer
+  ( AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
   , newApprovalCache, newAskReplyStore, formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
@@ -139,7 +139,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
           -- question is pending, the message is a normal inbound turn.
           meta <- readIORef (srActive sr)
           let sid = smId meta
-          delivered <- deliverNextAnswer askReply sid body
+          (_resolved, delivered) <- deliverNextAnswerResolved askReply sid body
           if delivered
             then loop h handleCaps
             else do

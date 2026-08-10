@@ -97,7 +97,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswer
+  ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
   , formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
@@ -377,7 +377,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
           -- confirmation ask to this sid. Updated every turn, before any
           -- slash-command dispatch.
           writeIORef bgConvSid sid
-          delivered <- deliverNextAnswer askReply sid body
+          (_resolved, delivered) <- deliverNextAnswerResolved askReply sid body
           if delivered
             then loop h reg bgConvSid
             else do

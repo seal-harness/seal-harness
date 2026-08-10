@@ -118,7 +118,7 @@ import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel 
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, deliverNextAnswerAny
+  ( ApprovalCache, AskReplyStore, deliverNextAnswerResolvedAny
   , askHumanWithOptions, formatQuestionWithOptions, newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -714,7 +714,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           -- the inbox-driven channels run at the top of their loop, but is
           -- session-agnostic because the CLI has one input stream serving
           -- the active session plus any /bg background sessions.
-          delivered <- liftIO $ deliverNextAnswerAny askReply (T.pack line)
+          (_resolved, delivered) <- liftIO $ deliverNextAnswerResolvedAny askReply (T.pack line)
           if delivered
             then loop caps plainHandler th reg
             else do
