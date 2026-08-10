@@ -324,20 +324,41 @@ data ChannelCaps = ChannelCaps
   gate has no options; its four scope buttons are client-side).
 - `Seal.Gateway.Send.webAskCaps` (Send.hs:984) — `ccPrompt` closure updated.
 - `Seal.Channels.Loop.mkHandleCaps` (Loop.hs:431) — `ccPrompt` closure
-  updated.
+  updated. (This also covers the Telegram channel, which uses
+  `mkHandleCaps` via `newChannelDeps` — `Telegram.Run` has no `ccPrompt`
+  closure of its own in Slice 1.)
 - `Seal.Channels.Signal.Run` (Signal.Run.hs:116) — `ccPrompt` closure
   updated.
 - `Seal.Channel.Cli` (Cli.hs:621) — `ccPrompt` closure updated.
-- `Seal.Channels.Telegram.Run` — `ccPrompt` closure updated (Slice 3).
-- `Seal.Vault.Commands` (Vault/Commands.hs:312) + `Seal.Command.Provider`
-  (Provider.hs:165, :181) — these call `ccPromptSecret` (unchanged), not
-  `ccPrompt`, so no edit. (Verify during implementation.)
-- Test sites: `test/Seal/Channels/LoopSpec.hs` (8 `newChannelDeps` calls),
-  `test/Seal/Gateway/SendSpec.hs`, `test/Seal/Gateway/ApiSpec.hs`,
-  `test/Seal/Handles/AskReplySpec.hs` — any `def { ccPrompt = ... }` or
-  `ccPrompt caps q` call site updated.
+- **`Seal.Vault.Backend` (Vault/Backend.hs:197, 218, 219) +
+  `Seal.Vault.Commands` (Vault/Commands.hs:168, 190, 195, 197) +
+  `Seal.Command.Provider` (Provider.hs:178, 266) + `Seal.Command.Channel`
+  (Channel.hs:249, 300, 324, 335, 350, 356, 459)** — these 13 production
+  call sites call `ccPrompt caps "<prompt text>"` (gate-plan correction:
+  the rev 1/rev 2 claim that Vault/Provider only call `ccPromptSecret` was
+  false — they call both). Each `ccPrompt caps "x"` → `ccPrompt caps
+  (AskPrompt "x" [])` (mechanical arity wrap, no behavior change). The
+  `ccPromptSecret` sites in these same modules are unchanged.
+- Test sites (gate-plan correction): the shared helper
+  `test/Seal/TestHelpers/FakeCaps.hs` (`pop _prompt` ignores the arg, so
+  it compiles unchanged — but verify); `test/Seal/Agent/LoopSpec.hs`
+  lines 439/479/519/560 (`\q -> modifyIORef' prompts (++ [q])` — `q`
+  becomes `AskPrompt`, capture `apQuestion q`); `test/Seal/Phase2aSpec.hs:64`
+  (`fmap (fromRight "") . chPrompt h` — `chPrompt :: Text -> …` composition
+  breaks on the arity change, adapt); the `\_ -> pure ""` sites across
+  ~10 test files compile unchanged (arity-polymorphic `_`). The
+  `SendSpec`/`ApiSpec` `SendDeps` literals do NOT override `ccPrompt`
+  (`SendDeps` has no `ChannelCaps` field) — no edit.
   }
 ```
+
+**Commit shape (gate-plan correction):** W3 is one red commit (change
+`ccPrompt` arity in `Caps.hs` + add `AskPrompt` — build breaks everywhere)
++ one green commit (migrate all ~18 call sites: 4 channel closures +
+`checkConfirmation` + `askHumanOp` + 13 production prompts + the 3
+breaking test helpers). `cabal build all` green is the gate between them.
+Splitting the green commit per-file would leave the build red between
+commits.
 
 ### 4.4 The web channel
 
