@@ -42,7 +42,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import System.Random (randomRIO)
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend, unionAgentDefBackend, deriveAgentsMdId)
+import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
 import Seal.Core.AllowList (AllowList (..))
@@ -769,10 +769,15 @@ handleSessionAgents deps sid = do
   where
     userDefaultResolves ds (Just aid) = any ((== aid) . adId) ds
     userDefaultResolves _ Nothing = False
+    -- The repo default is the prefixed agents-md def (e.g.
+    -- @vtag--agents-md@). The prefix is the repo's top-level dir name, which
+    -- varies per session, so we match by the @"--agents-md"@ suffix rather
+    -- than the bare 'deriveAgentsMdId'. Returns the full prefixed id so the
+    -- @isDefault@ flag is set on the right def.
     agentsMdInUnion ds =
-      case rightToMaybe (mkAgentDefId deriveAgentsMdId) of
-        Just aid | any ((== aid) . adId) ds -> Just aid
-        _ -> Nothing
+      case [ adId d | d <- ds, "--agents-md" `T.isSuffixOf` agentDefIdText (adId d) ] of
+        (aid:_) -> Just aid
+        []      -> Nothing
     rightToMaybe (Right a) = Just a
     rightToMaybe (Left _) = Nothing
 

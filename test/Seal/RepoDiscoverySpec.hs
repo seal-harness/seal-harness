@@ -94,7 +94,7 @@ spec = do
       defs <- adbList backend
       length defs `shouldBe` 1
       case defs of
-        [d] -> agentDefIdText (adId d) `shouldBe` "my-agent"
+        [d] -> agentDefIdText (adId d) `shouldBe` "my-repo--my-agent"
         _ -> expectationFailure "expected exactly 1 def"
       cleanup tmp
 
@@ -121,19 +121,19 @@ spec = do
       backend <- workdirAgentDefBackend tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
-      -- Exactly 2 defs: the project def (agents-md) + the sub-agent (foo-agent).
-      -- No bogus 'agents' or 'skills' empty-prompt entries.
+      -- Exactly 2 defs: the project def (my-repo--agents-md) + the sub-agent
+      -- (my-repo--foo-agent). No bogus 'agents' or 'skills' empty-prompt entries.
       length defs `shouldBe` 2
-      ids `shouldContain` ["agents-md", "foo-agent"]
-      ids `shouldNotContain` [T.pack "agents"]
-      ids `shouldNotContain` [T.pack "skills"]
+      ids `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent"]
+      ids `shouldNotContain` ["agents"]
+      ids `shouldNotContain` ["skills"]
       -- The project def's system prompt is the agents.md body (frontmatter stripped).
-      let mProject = [d | d <- defs, agentDefIdText (adId d) == "agents-md"]
+      let mProject = [d | d <- defs, agentDefIdText (adId d) == "my-repo--agents-md"]
       case mProject of
         [d] -> adSystem d `shouldBe` Just "# Project Guidelines\nDo good work."
         _ -> expectationFailure "expected exactly one agents-md def"
       -- The sub-agent's system prompt is the agent.md body.
-      let mFoo = [d | d <- defs, agentDefIdText (adId d) == "foo-agent"]
+      let mFoo = [d | d <- defs, agentDefIdText (adId d) == "my-repo--foo-agent"]
       case mFoo of
         [d] -> do
           adSystem d `shouldBe` Just "You are a foo specialist."
@@ -157,8 +157,8 @@ spec = do
       backend <- workdirAgentDefBackend tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
-      ids `shouldContain` ["on-agent"]
-      ids `shouldNotContain` ["off-agent"]
+      ids `shouldContain` ["my-repo--on-agent"]
+      ids `shouldNotContain` ["my-repo--off-agent"]
       cleanup tmp
 
     it "frontmatter id overrides the subdir name when present and valid" $ do
@@ -173,8 +173,8 @@ spec = do
       backend <- workdirAgentDefBackend tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
-      ids `shouldContain` ["real-id"]
-      ids `shouldNotContain` ["subdir-name"]
+      ids `shouldContain` ["my-repo--real-id"]
+      ids `shouldNotContain` ["my-repo--subdir-name"]
       cleanup tmp
 
     it "rejects a symlinked agent.md escaping .agents/ (SafePath confinement)" $ do
@@ -192,9 +192,9 @@ spec = do
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- The leaking 'leak' agent must NOT appear (its body would be the secret).
-      ids `shouldNotContain` ["leak"]
+      ids `shouldNotContain` ["my-repo--leak"]
       -- The project def still appears (it's not a symlink).
-      ids `shouldContain` ["agents-md"]
+      ids `shouldContain` ["my-repo--agents-md"]
       -- No def's system prompt contains the secret.
       let systems = mapMaybe adSystem defs
       systems `shouldNotSatisfy` any ("PRIVATE KEY MATERIAL" `T.isInfixOf`)
@@ -212,14 +212,37 @@ spec = do
       backend <- workdirAgentDefBackend tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
-      ids `shouldContain` ["my-agent"]
-      ids `shouldNotContain` ["agents-md"]
+      ids `shouldContain` ["my-repo--my-agent"]
+      ids `shouldNotContain` ["my-repo--agents-md"]
       cleanup tmp
 
     it "deriveAgentsMdId always passes isValidAgentDefId and ends in '-md' (QuickCheck)" $ do
       let theId = deriveAgentsMdId
       isValidAgentDefId theId `shouldBe` True
       "-md" `T.isSuffixOf` theId `shouldBe` True
+
+    it "prefixes repo-local agent ids + displayNames with the repo dir name to disambiguate collisions" $ do
+      let tmp = "/tmp/seal-repo-discovery-protocol-prefix-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "vtag" </> ".agents" </> "agents" </> "architect-agent")
+      writeFile (tmp </> "vtag" </> ".agents" </> "agents.md")
+        "---\nkind: agents\n---\nProject.\n"
+      writeFile (tmp </> "vtag" </> ".agents" </> "agents" </> "architect-agent" </> "agent.md")
+        "---\nname: Architect Agent\n---\nYou are an architect.\n"
+      backend <- workdirAgentDefBackend tmp
+      defs <- adbList backend
+      let ids = map (agentDefIdText . adId) defs
+      -- Repo-local ids are prefixed with the repo dir + "--" so a user agent
+      -- named "architect-agent" coexists with "vtag--architect-agent" (no
+      -- workdir-wins shadowing between repo and user).
+      ids `shouldContain` ["vtag--agents-md", "vtag--architect-agent"]
+      ids `shouldNotContain` ["architect-agent"]
+      -- The displayName uses "/" for human readability (vtag/Architect Agent).
+      let arch = [d | d <- defs, agentDefIdText (adId d) == "vtag--architect-agent"]
+      case arch of
+        [d] -> adName d `shouldBe` "vtag/Architect Agent"
+        _ -> expectationFailure "expected exactly one prefixed architect-agent def"
+      cleanup tmp
 
   describe "Seal.Agent.Def.Backend.unionAgentDefBackend" $ do
     it "workdir defs shadow user defs on id collision" $ do

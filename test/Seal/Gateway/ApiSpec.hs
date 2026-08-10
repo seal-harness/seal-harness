@@ -2916,8 +2916,8 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Array xs) -> do
           let names = [ n | A.Object o <- V.toList xs
                           , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o] ]
-          -- Workdir defs: agents-md, foo-agent. User def: user-agent.
-          names `shouldContain` ["agents-md", "foo-agent", "user-agent"]
+          -- Workdir defs: my-repo--agents-md, my-repo--foo-agent. User def: user-agent.
+          names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
         _ -> expectationFailure "expected a JSON array"
 
     it "marks agents-md as default when no user default_agent is configured (§3.2 case b)" $ do
@@ -2931,8 +2931,8 @@ spec = describe "Seal.Gateway.API" $ do
                        , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o]
                        , Just (A.Bool isDef) <- [KeyMap.lookup (Key.fromText "isDefault") o]
                        ]
-          -- Exactly one entry is marked default: agents-md.
-          filter snd defaults `shouldBe` [("agents-md", True)]
+          -- Exactly one entry is marked default: my-repo--agents-md.
+          filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
         _ -> expectationFailure "expected a JSON array"
 
     it "returns 404 for an unknown session id" $ do

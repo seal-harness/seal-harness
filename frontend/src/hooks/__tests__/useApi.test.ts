@@ -415,10 +415,10 @@ describe('useAgents', () => {
 
 describe('fetchSessionAgents', () => {
   it('GETs /api/sessions/:id/agents and returns the list', async () => {
-    setNextResponse([{ name: 'agents-md', isDefault: true, displayName: 'Project (agents.md)' }])
+    setNextResponse([{ name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' }])
     const res = await fetchSessionAgents('sess123')
     expect(fetchCalls.some((c) => c.url === '/api/sessions/sess123/agents')).toBe(true)
-    expect(res).toEqual([{ name: 'agents-md', isDefault: true, displayName: 'Project (agents.md)' }])
+    expect(res).toEqual([{ name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' }])
   })
 
   it('returns null on a non-ok response', async () => {

@@ -62,7 +62,7 @@ import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Either (fromRight)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -582,8 +582,17 @@ workdirAgentDefBackend workdir = pure AgentDefBackend
 
 -- | Enumerate every agent def found under the conventional locations across
 -- all top-level directories (cloned repos) in @workdir@. The
--- alphabetically-first repo wins on id collisions (deterministic). Missing
--- @workdir@ or empty workdirs yield @[]@.
+-- alphabetically-first repo wins on prefixed-id collisions (deterministic).
+-- Missing @workdir@ or empty workdirs yield @[]@.
+--
+-- Each def's id is prefixed with its repo's top-level directory name + @"--"@
+-- (e.g. @vtag--architect-agent@) and its @adName@ with @\<repo\>\/@ (e.g.
+-- @vtag\/Architect Agent@). This disambiguates repo-local agents from the
+-- user's own agents (and from other repos' agents) when the union backend
+-- merges workdir ⊕ user: a repo shipping @architect-agent@ no longer shadows
+-- the user's @architect-agent@ — both appear, distinguished by the prefix.
+-- The @--@ separator is charset-safe (@isValidAgentDefId@); the @/@ in the
+-- display name is for human readability only.
 listWorkdirAgentDefs :: FilePath -> IO [AgentDef]
 listWorkdirAgentDefs workdir = do
   exists <- doesDirectoryExist workdir
@@ -593,7 +602,7 @@ listWorkdirAgentDefs workdir = do
       dirs <- listWorkdirSubdirs workdir
       perRepo <- forM dirs $ \repo -> do
         let repoDir = workdir </> repo
-        concat <$> forM workdirAgentDefConventions (\conv -> do
+        defs <- concat <$> forM workdirAgentDefConventions (\conv -> do
           let convDir = repoDir </> conv
           cExists <- doesDirectoryExist convDir
           if not cExists
@@ -603,10 +612,26 @@ listWorkdirAgentDefs workdir = do
               if conv == ".agents"
                 then listAgentsDotAgents convDir
                 else listAgentDefs convDir)
+        pure (mapMaybe (prefixWorkdirDef (T.pack repo)) defs)
       let merge m [] = m
           merge m (d:ds) = merge (Map.insertWith (\_new old -> old) (adId d) d m) ds
           merged = merge Map.empty (concat perRepo)
       pure (Map.elems merged)
+
+-- | Prefix a workdir-discovered def's id with @\<repo\>--\<id\>@ and its
+-- @adName@ with @\<repo\>\/\<name\>@. The id prefix uses @"--"@ (charset-safe
+-- per 'isValidAgentDefId'); the display name uses @"/"@ for readability. If
+-- the prefixed id fails validation (e.g. the repo dir has a char outside the
+-- charset), the def is dropped ('Nothing' — fail-closed).
+prefixWorkdirDef :: Text -> AgentDef -> Maybe AgentDef
+prefixWorkdirDef repo d =
+  let prefixedIdText = repo <> "--" <> agentDefIdText (adId d)
+  in case mkAgentDefId prefixedIdText of
+       Left _ -> Nothing
+       Right aid -> Just d
+         { adId = aid
+         , adName = repo <> "/" <> adName d
+         }
 
 -- | Dispatch for the @.agents\/@ convention dir: protocol-root detection
 -- (§3.3). When @.agents\/@ contains @agents.md@ OR an @agents\/@

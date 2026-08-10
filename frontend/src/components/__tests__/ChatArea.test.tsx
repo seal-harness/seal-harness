@@ -1015,14 +1015,14 @@ describe('SessionSetup Agent dropdown', () => {
 
   it('renders repo-local agent displayNames when present (agents-md → "Project (agents.md)")', () => {
     renderSessionSetup([
-      { name: 'agents-md', isDefault: true, displayName: 'Project (agents.md)' },
-      { name: 'foo-agent', isDefault: false, displayName: 'Foo Agent' },
+      { name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' },
+      { name: 'vtag--foo-agent', isDefault: false, displayName: 'vtag/Foo Agent' },
     ])
-    // The dropdown renders displayName for the label; the synthetic id
-    // 'agents-md' never leaks to the UI.
-    expect(screen.getByText('Project (agents.md) (default)')).toBeTruthy()
-    expect(screen.getByText('Foo Agent')).toBeTruthy()
-    expect(screen.queryByText('agents-md')).toBeNull()
+    // The dropdown renders displayName for the label; the synthetic prefixed
+    // id never leaks to the UI.
+    expect(screen.getByText('vtag/Project (agents.md) (default)')).toBeTruthy()
+    expect(screen.getByText('vtag/Foo Agent')).toBeTruthy()
+    expect(screen.queryByText('vtag--agents-md')).toBeNull()
   })
 
   it('falls back to name when displayName is absent', () => {
