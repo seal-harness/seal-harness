@@ -26,6 +26,7 @@ import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
+import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
@@ -116,6 +117,7 @@ import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
 import qualified Seal.SourceControl.RegistrySpec
+import qualified Seal.SourceControl.AgentRegistrySpec
 import qualified Seal.SourceControl.CloneSpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
@@ -133,6 +135,7 @@ import qualified Seal.Providers.OllamaSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
 import qualified Seal.ISA.DispatchSpec
+import qualified Seal.RepoDiscoverySpec
 import qualified Seal.ISA.IntegrationSpec
 import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
@@ -172,6 +175,7 @@ main = hspec $ do
   Seal.Tools.Exec.LocalSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
+  Seal.Tools.Ssh.AgentSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
@@ -262,6 +266,7 @@ main = hspec $ do
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec
   Seal.SourceControl.RegistrySpec.spec
+  Seal.SourceControl.AgentRegistrySpec.spec
   Seal.SourceControl.CloneSpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec
@@ -287,6 +292,7 @@ main = hspec $ do
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
+  Seal.RepoDiscoverySpec.spec
   Seal.ISA.Ops.SecretSpec.spec
   Seal.ISA.RegistrySpec.spec
   Seal.Logging.LoggerSpec.spec

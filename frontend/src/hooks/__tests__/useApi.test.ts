@@ -41,6 +41,8 @@ import {
   useTranscript,
   useSendMessage,
   useAgents,
+  useSessionAgents,
+  fetchSessionAgents,
   useConfiguredProviders,
   setSessionDescription,
   setSessionArchived,
@@ -408,6 +410,39 @@ describe('useAgents', () => {
     const { result } = renderHook(() => useAgents())
     await waitFor(() => expect(result.current.agents).toHaveLength(1))
     expect(result.current.agents[0]!.name).toBe('dev')
+  })
+})
+
+describe('fetchSessionAgents', () => {
+  it('GETs /api/sessions/:id/agents and returns the list', async () => {
+    setNextResponse([{ name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' }])
+    const res = await fetchSessionAgents('sess123')
+    expect(fetchCalls.some((c) => c.url === '/api/sessions/sess123/agents')).toBe(true)
+    expect(res).toEqual([{ name: 'vtag--agents-md', isDefault: true, displayName: 'vtag/Project (agents.md)' }])
+  })
+
+  it('returns null on a non-ok response', async () => {
+    setNextResponse('not found', 404)
+    const res = await fetchSessionAgents('nope')
+    expect(res).toBeNull()
+  })
+})
+
+describe('useSessionAgents', () => {
+  it('fetches /api/sessions/:id/agents when sessionId is non-null', async () => {
+    setNextResponse([{ name: 'foo-agent', isDefault: false }])
+    const { result } = renderHook(() => useSessionAgents('sess-abc'))
+    await waitFor(() => expect(result.current.agents).toHaveLength(1))
+    expect(result.current.agents[0]!.name).toBe('foo-agent')
+    expect(fetchCalls.some((c) => c.url === '/api/sessions/sess-abc/agents')).toBe(true)
+  })
+
+  it('fetches /api/agents when sessionId is null (global fallback)', async () => {
+    setNextResponse([{ name: 'global-agent', isDefault: true }])
+    const { result } = renderHook(() => useSessionAgents(null))
+    await waitFor(() => expect(result.current.agents).toHaveLength(1))
+    expect(result.current.agents[0]!.name).toBe('global-agent')
+    expect(fetchCalls.some((c) => c.url === '/api/agents')).toBe(true)
   })
 })
 

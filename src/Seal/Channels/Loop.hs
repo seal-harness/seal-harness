@@ -52,7 +52,6 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -88,7 +87,7 @@ import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -132,6 +131,7 @@ import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
@@ -226,12 +226,12 @@ data ChannelDeps = ChannelDeps
 -- keys are compile-time-embedded.
 mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
 mkCloneDepsFromChannel deps = do
-  agentEnvRef <- newIORef Map.empty
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (cdPaths deps))
   pure Clone.CloneDeps
     { Clone.cdVault = cdVault deps
     , Clone.cdRepoReg = cdRepoReg deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentEnvRef
+    , Clone.cdAgentRegistry = agentRegH
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
     , Clone.cdIsRemote = cdIsRemote deps
@@ -737,9 +737,15 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
             Right wd -> SkillBackend.workdirSkillBackend wd
             Left _err -> SkillBackend.workdirSkillBackend "/nonexistent-workdir-fail-closed"
           let sessionSkills = SkillBackend.tripleUnionSkillBackend workdirSkills (bSkills backends)
+          -- Workdir-aware agent def backend: repo-local (.agents/) + user,
+          -- workdir-wins. Fail-closed on a workdir error.
+          workdirAgentDefs <- case eWd of
+            Right wd -> Def.workdirAgentDefBackend wd
+            Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+          let sessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs backends) }
           mSystem <- case smAgent meta of
             Nothing  -> pure Nothing
-            Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs backends) aid
+            Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs sessionBackends) aid
           let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
               injectCatalog = either (const True) resolvedAvailableSkills eCfg
               parallel = either (const True) resolvedParallelToolGuidance eCfg
@@ -755,9 +761,9 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
                 deps paths sid handleCaps untrustedIO appEnv eCfg
-                wsroot operatorCeiling (smChannel meta) isaReg
+                wsroot operatorCeiling (smChannel meta) isaReg sessionBackends
               isaReg = buildIsaRegistry
-                rt cloneDeps backends wsroot sid operatorCeiling autonomy
+                rt cloneDeps sessionBackends wsroot sid operatorCeiling autonomy
                 (either (const Nothing) rcWeb eCfg)
                 startWiring
                 (cdHarnessRegistry deps) (cdTmuxRunner deps)
@@ -918,16 +924,20 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
     untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
     eWd <- ensureSessionWorkdir paths sid
     cloneDeps <- mkCloneDepsFromChannel deps
+    workdirAgentDefs <- case eWd of
+          Right wd -> Def.workdirAgentDefBackend wd
+          Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
     let wsRoot = case eWd of
           Right wd -> WorkspaceRoot wd
           Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
         caps = mkHandleCaps h askReply sid
         onDemand = either (const False) onDemandSchemas eCfg
+        sessionBackends = (cdBackends deps) { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (cdBackends deps)) }
         startWiring = channelStartWiring
           deps paths sid caps untrustedIO appEnv eCfg
-          wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg
+          wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg sessionBackends
         isaReg = buildIsaRegistry
-          (cdVault deps) cloneDeps (cdBackends deps) wsRoot sid operatorCeiling
+          (cdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
           (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
@@ -1051,10 +1061,10 @@ unwrapOptMaybe = maybe Nothing
 -- captures the final text response as the summary.
 channelStartWiring
   :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> ISA.Registry -> AgentStartWiring
-channelStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel _isaReg =
+  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> ISA.Registry -> Backends -> AgentStartWiring
+channelStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel _isaReg sessionBackends =
   AgentStartWiring
-    { aswDefBackend = bAgentDefs (cdBackends deps)
+    { aswDefBackend = bAgentDefs sessionBackends
     , aswRuntime = bRuntime (cdBackends deps)
     , aswConfig = do
         eCfg' <- loadRuntimeConfig (prConfigPath (cdProvider deps))

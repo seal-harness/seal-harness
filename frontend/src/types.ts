@@ -178,6 +178,11 @@ export interface DiscoverableWindow {
 export interface AgentInfo {
   name: string
   isDefault: boolean
+  /** The human-readable display name (from the def's frontmatter `name`, or
+   *  a friendly fallback like "Project (agents.md)" for the repo-level
+   *  `agents-md` def). The dropdown renders this when present, falling back
+   *  to `name` (the id). Backend: `agentInfoJson` `displayName` field. */
+  displayName?: string
 }
 
 export interface ProviderInfo {

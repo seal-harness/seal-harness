@@ -17,15 +17,13 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
-import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
 import System.FilePath ((</>))
-import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Temp (createTempDirectory, withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
@@ -36,6 +34,7 @@ import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Repo
@@ -51,10 +50,18 @@ import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 
--- | Create a fresh 'IORef' for 'cdAgentEnvRef' in a pure @let@ context.
-freshAgentRegistry :: IORef (Map Text SshAgentEnv)
-freshAgentRegistry = unsafePerformIO (newIORef Map.empty)
+-- | Create a fresh 'AgentRegistryHandle' for 'cdAgentRegistry' in a pure
+-- @let@ context. Each call creates a NEW handle backed by a fresh temp
+-- directory (the @NOINLINE@ prevents GHC from CSE'ing multiple calls).
+freshAgentRegistry :: AgentRegistryHandle
+freshAgentRegistry = unsafePerformIO (mkAgentRegistryHandle =<< createTestTempDir)
 {-# NOINLINE freshAgentRegistry #-}
+
+-- | Create a fresh temp directory for the agent registry.
+createTestTempDir :: IO FilePath
+createTestTempDir = do
+  sysTmp <- getTemporaryDirectory
+  createTempDirectory sysTmp "seal-gitreg-test-"
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Git" $ do
@@ -121,14 +128,14 @@ spec = describe "Seal.ISA.Ops.Git" $ do
         BS.writeFile (keyfilesDir </> "myrepo") "ciphertext"
         vault <- makeFakeVaultRuntime [("K_PASS", "passphrase")]
         callsRef <- newIORef []
-        agentRegRef <- newIORef Map.empty
+        agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             repoReg = fakeRepoReg [deployRepo]
             deps = CloneDeps
               { cdVault = vault
               , cdRepoReg = repoReg
               , cdSshAgent = agent
-              , cdAgentRegistry = agentRegRef
+              , cdAgentRegistry = agentRegH
               , cdPinnedKnownHosts = pinnedGithubKnownHosts
               , cdKeyfilesDir = keyfilesDir
               , cdIsRemote = False

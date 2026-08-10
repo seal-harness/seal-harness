@@ -9,6 +9,7 @@ module Seal.Config.Paths
   , reposFilePath
   , repoCloneStateDir
   , repoKeysDir
+  , sshAgentsDir
   , sessionsRoot
   , sessionDir
   , sessionMetaPath
@@ -89,6 +90,9 @@ ensureSealDirs paths = do
   -- The vault lives in a subdirectory of config/ ('vaultFilePath'); create it
   -- so the atomic vault write has an existing parent for its .tmp file.
   createDirectoryIfMissing True (takeDirectory (vaultFilePath paths))
+  -- The persistent ssh-agent registry lives in a subdirectory of state/repos;
+  -- create it so the registry file has an existing parent (#88).
+  createDirectoryIfMissing True (sshAgentsDir paths)
   setFileMode (spKeys paths) 0o700
 
 -- | Absolute path to the TOML config file: @\<config\>\/config.toml@.
@@ -129,6 +133,14 @@ repoCloneStateDir paths = spState paths </> "repos"
 -- The encrypted keyfile is the per-repo artifact named by 'repoIdText'.
 repoKeysDir :: SealPaths -> FilePath
 repoKeysDir paths = repoCloneStateDir paths </> "keys"
+
+-- | The directory holding the persistent ssh-agent registry file:
+-- @\<state\>\/repos\/ssh-agents@. The registry (@registry.json@) records the
+-- @SSH_AUTH_SOCK@ \/ @SSH_AGENT_PID@ of each repo's agent so they survive
+-- @seal serve@ restarts (#88). Created mode @0700@ by 'ensureSealDirs'
+-- (the socket paths are not secrets but shouldn't be world-readable).
+sshAgentsDir :: SealPaths -> FilePath
+sshAgentsDir paths = repoCloneStateDir paths </> "ssh-agents"
 
 -- | Root directory holding one subdirectory per session: @\<state\>\/sessions@.
 sessionsRoot :: SealPaths -> FilePath

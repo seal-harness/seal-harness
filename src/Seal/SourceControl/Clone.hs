@@ -65,8 +65,7 @@ import Control.Exception (bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
-import Data.IORef (IORef, readIORef, writeIORef)
-import Data.Map.Strict (Map)
+import Data.IORef (readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -83,6 +82,9 @@ import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..)
   , hostAllowed, parseRepoHost, repoIdText )
+import Seal.SourceControl.AgentRegistry
+  ( AgentRegistryHandle, arIsLive, arLoad, arRemove, arUpsert
+  , probeAgent, AgentStatus (..) )
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
@@ -232,12 +234,13 @@ data CloneDeps = CloneDeps
   { cdVault           :: VaultRuntime
   , cdRepoReg         :: RepoRegistryHandle
   , cdSshAgent        :: SshAgentHandle
-  , cdAgentRegistry   :: IORef (Map Text SshAgentEnv)
+  , cdAgentRegistry   :: AgentRegistryHandle
     -- ^ One-agent-per-repo registry, keyed by the repo's vault key. Each
     -- unique repo gets its own @ssh-agent@ process, started lazily on
-    -- first use. The agent + key persist for the harness lifetime (no
-    -- per-op @sahDeleteAll@). At shutdown, @sahKill@ is called for each
-    -- agent in the registry.
+    -- first use. The agent + key persist for the harness lifetime AND
+    -- across @seal serve@ restarts (the registry is persisted to disk —
+    -- #88). At startup, 'arProbeAndSweep' GCs dead agents from crashed
+    -- processes; live agents are reused (the key is still loaded).
   , cdPinnedKnownHosts :: ByteString
   , cdKeyfilesDir     :: FilePath
   , cdIsRemote        :: Bool
@@ -368,27 +371,32 @@ resolveCloneTarget deps repo =
             case mpass of
               Left ve -> pure (Left (CloneVaultError ve))
               Right passphrase -> do
-                -- One-agent-per-repo: look up the registry by vault key.
-                -- If cached, reuse the agent (skip start + addkey). If
-                -- not, start a new agent + load the key once, then cache.
-                registry <- readIORef (cdAgentRegistry deps)
+                -- One-agent-per-repo: look up the persistent registry by
+                -- vault key. If a live agent is cached (in this process or
+                -- persisted from a prior seal process), reuse it — the key
+                -- is still loaded. If the persisted agent is dead (crashed
+                -- seal), remove the stale entry and start a fresh agent.
+                -- If no entry exists, start a new agent + load the key
+                -- once, then persist (#88).
+                registry <- arLoad (cdAgentRegistry deps)
                 agentEnv <- case Map.lookup vaultKey registry of
-                  Just env -> pure env
-                  Nothing -> do
-                    eStart <- sahStart (cdSshAgent deps)
-                    case eStart of
-                      Left msg -> pure (error (T.unpack msg))
-                      Right env -> do
-                        eAdd <- sahAddKey (cdSshAgent deps) env keyfilePath passphrase
-                        case eAdd of
-                          Left msg -> do
-                            -- Fail closed: delete-all even on add failure.
-                            sahDeleteAll (cdSshAgent deps) env
-                            pure (error (T.unpack msg))
-                          Right () -> do
-                            writeIORef (cdAgentRegistry deps)
-                              (Map.insert vaultKey env registry)
-                            pure env
+                  Just cachedEnv -> do
+                    -- If the agent was started in THIS process, reuse it
+                    -- directly (no probe — it's alive). If it was loaded
+                    -- from a prior process's persisted registry, probe to
+                    -- check liveness (#88).
+                    isLive <- arIsLive (cdAgentRegistry deps) vaultKey
+                    if isLive
+                      then pure cachedEnv  -- reuse (key still loaded)
+                      else do
+                        status <- probeAgent cachedEnv
+                        case status of
+                          AgentAlive -> pure cachedEnv  -- reuse across restart
+                          AgentDead -> do
+                            -- GC the stale entry + start a fresh agent.
+                            arRemove (cdAgentRegistry deps) vaultKey
+                            startAndLoadAgent deps vaultKey keyfilePath passphrase
+                  Nothing -> startAndLoadAgent deps vaultKey keyfilePath passphrase
                 -- Build the CloneEnv. The key stays loaded (no per-op
                 -- sahDeleteAll); the cleanup is a no-op (the agent is
                 -- killed at harness shutdown, not per-op).
@@ -455,6 +463,27 @@ resolveCloneTarget deps repo =
                           , ceCleanup = knownHostsCleanup
                           }
                     pure (Right CloneTarget { ctEnv = env, ctCleanup = knownHostsCleanup })
+
+-- | Start a fresh ssh-agent + load the deploy key once, then persist the
+-- agent env to the registry so it's reused across ops (and across seal
+-- restarts — #88). On failure, fail closed (delete-all + error).
+startAndLoadAgent :: CloneDeps -> Text -> FilePath -> ByteString -> IO SshAgentEnv
+startAndLoadAgent deps vaultKey keyfilePath passphrase = do
+  eStart <- sahStart (cdSshAgent deps)
+  case eStart of
+    Left msg -> error (T.unpack msg)
+    Right env -> do
+      eAdd <- sahAddKey (cdSshAgent deps) env keyfilePath passphrase
+      case eAdd of
+        Left msg -> do
+          -- Fail closed: delete-all even on add failure.
+          sahDeleteAll (cdSshAgent deps) env
+          error (T.unpack msg)
+        Right () -> do
+          -- Persist the agent env so a second seal process (or a restart)
+          -- reuses this agent instead of spawning a new one (#88).
+          arUpsert (cdAgentRegistry deps) vaultKey env
+          pure env
 
 -- | The base name of the encrypted keyfile for a 'SourceRepo' — the
 -- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2

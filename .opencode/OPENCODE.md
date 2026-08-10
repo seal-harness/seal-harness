@@ -71,7 +71,7 @@ After writing a design document, you can request a review:
 
 ## POC Scope
 
-Full agent roster is registered (19/19). All 13 metaswarm skills are loaded from `.opencode/skills/` (discovered automatically, no `opencode.json` registration needed). Commands are partially wired: 11 of 13 commands registered. Remaining commands will be added incrementally in follow-up PRs.
+Full agent roster is registered (19/19). All 13 metaswarm skills are loaded from `.agents/skills/` (discovered automatically, no `opencode.json` registration needed). Commands are partially wired: 11 of 13 commands registered. Remaining commands will be added incrementally in follow-up PRs.
 
 ## Current Limitations
 

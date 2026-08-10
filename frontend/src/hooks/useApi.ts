@@ -79,9 +79,9 @@ export function mapDiscoverableWindow(wire: DiscoverableWindowWire): Discoverabl
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T | null> {
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return null
     return await res.json() as T
   } catch {
@@ -524,6 +524,57 @@ export function useAgents() {
     const unsub = streamClient().onAgentDefsChanged(() => load())
     return unsub
   }, [load])
+
+  return { agents }
+}
+
+/** Fetch the session-scoped agent-defs list (workdir ⊕ user, workdir-wins).
+ *  Returns the same `AgentInfo[]` shape as `/api/agents` (with `displayName`
+ *  so the dropdown can show a friendly name for repo-local defs like
+ *  `agents-md`). Used by the Session setup Agent dropdown (W3). */
+export async function fetchSessionAgents(sessionId: string): Promise<AgentInfo[] | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/agents`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return Array.isArray(data) ? (data as AgentInfo[]) : null
+  } catch {
+    return null
+  }
+}
+
+/** A session-scoped variant of `useAgents`. When `sessionId` is non-null,
+ *  fetches `GET /api/sessions/:id/agents` (the workdir-aware union); when
+ *  null, fetches `GET /api/agents` (the global user store) — so the hook is
+ *  always valid and App.tsx can call it unconditionally (rules-of-hooks).
+ *  Re-fetches on `sessionId` change (with AbortController cancellation) and
+ *  on the `onAgentDefsChanged` WS event (so a SETUP_REPO clone triggers a
+ *  re-fetch via the backend's `broadcastAgentDefsChanged`). */
+export function useSessionAgents(sessionId: string | null) {
+  const [agents, setAgents] = useState<AgentInfo[]>([])
+
+  const load = useCallback((sid: string | null, signal?: AbortSignal) => {
+    const url = sid
+      ? `/api/sessions/${encodeURIComponent(sid)}/agents`
+      : '/api/agents'
+    fetchJson<AgentInfo[]>(url, signal).then((data) => {
+      if (Array.isArray(data)) setAgents(data)
+    }).catch(() => { /* aborted or network error — leave stale */ })
+  }, [])
+
+  // Re-fetch when the session id changes (abort the in-flight previous fetch).
+  useEffect(() => {
+    const controller = new AbortController()
+    load(sessionId, controller.signal)
+    return () => { controller.abort() }
+  }, [sessionId, load])
+
+  // Re-fetch when the WS signals agent defs changed (SETUP_REPO completion,
+  // user-store agent-def mutations). No polling.
+  useEffect(() => {
+    const unsub = streamClient().onAgentDefsChanged(() => load(sessionId))
+    return unsub
+  }, [sessionId, load])
 
   return { agents }
 }

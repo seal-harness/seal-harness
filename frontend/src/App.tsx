@@ -10,7 +10,7 @@ import { ReposView } from './components/ReposView'
 import { PerfOverlay } from './components/PerfOverlay'
 import {
   useSendMessage,
-  useAgents,
+  useSessionAgents,
   useTabs,
   useRecentSessions,
   useArchivedSessions,
@@ -227,12 +227,16 @@ export default function App() {
   const thinkingSessionIds = wsLive ? wsLists.thinkingSessionIds
     : usePollLists ? polledLists.thinkingSessionIds
     : []
-  const { agents } = useAgents()
 
   // ── Selection ─────────────────────────────────────────────────────────
   const [section, setSection] = useState<TopSection>(sectionFromPath)
   const [selectedId, setSelectedId] = useState<string | null>(selectedIdFromPath)
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
+  // Tracks the previous isDefault agent name so the default-resolution
+  // effect only overrides the selection when the isDefault entry is NEW
+  // (e.g. the repo agents-md arriving after SETUP_REPO), not on every
+  // agents re-broadcast (which would clobber an explicit user choice).
+  const prevDefaultRef = useRef<string | null>(null)
   const [customPromptFile, setCustomPromptFile] = useState<{ name: string; content: string } | null>(null)
 
   // Optimistic strip: hide an archived session from the sidebar immediately.
@@ -296,6 +300,12 @@ export default function App() {
     currentSessionId = pinnedSessionIdRef.current
   }
 
+  // Session-scoped agent defs (workdir ⊕ user, workdir-wins). When a session
+  // is focused, fetches /api/sessions/:id/agents (repo-local defs surface);
+  // otherwise fetches /api/agents (the global user store). Called
+  // unconditionally after `currentSessionId` is resolved (rules-of-hooks).
+  const { agents } = useSessionAgents(currentSessionId)
+
   // ── Transcript: HTTP seed + live WS tail, merged ──────────────────────
   // `useTranscriptStream` is the SOLE source of transcript entries. It
   // performs the HTTP seed fetch + the WS subscription + the merge, so we
@@ -328,24 +338,61 @@ export default function App() {
   // the session's bound agent) instead of inheriting the previous
   // session's selection. The default-agent effect below re-runs on the
   // next render once `agents` is available.
-  useEffect(() => { setSelectedAgent(null) }, [currentSessionId])
+  useEffect(() => { setSelectedAgent(null); prevDefaultRef.current = null }, [currentSessionId])
 
-  // Initialize selectedAgent from the default agent once agents load. We
-  // consult GET /api/agents/default directly (not the polled list's
-  // isDefault flag) so a just-changed default is reflected immediately —
-  // the polled list may still carry the stale isDefault for up to
-  // POLL_INTERVAL after a PUT /api/agents/default.
+  // Initialize selectedAgent from the default agent once agents load. When
+  // a session is focused, the `agents` list is the session-scoped union
+  // (workdir ⊕ user) and `isDefault` reflects the precedence (repo
+  // agents.md > user default_agent > none) — so we read it directly. When no
+  // session is focused, `agents` is the global user store and we consult
+  // GET /api/agents/default (the user-configured default) so a just-changed
+  // default is reflected immediately (the polled list may lag by up to
+  // POLL_INTERVAL).
+  //
+  // The effect re-runs when `agents` changes so the repo agents-md (which
+  // arrives AFTER the async SETUP_REPO clone, via the onAgentDefsChanged
+  // broadcast) overrides the initial fallback selection. To avoid
+  // clobbering an explicit user choice, the override only fires when the
+  // isDefault entry is NEW (wasn't in the previous agents list) — tracked
+  // via prevDefaultRef. Once the user explicitly picks an agent, subsequent
+  // isDefault re-arrivals (e.g. WS invalidation) don't override it.
   useEffect(() => {
-    if (selectedAgent !== null || agents.length === 0) return
+    if (agents.length === 0) return
+    const def = agents.find((a) => a.isDefault)
+    const defName = def?.name ?? null
+    if (currentSessionId) {
+      // Session-scoped: trust the endpoint's isDefault (repo agents.md
+      // > user default_agent > none).
+      if (defName) {
+        // Select the isDefault entry when it's new (just arrived) or when
+        // nothing is selected yet. Don't clobber an explicit user choice
+        // when the isDefault entry is unchanged (a stale re-broadcast).
+        // When the isDefault entry is NEW, also bind it to the backend so
+        // its system prompt is injected on turn one (mirrors handleAgentChange).
+        if (prevDefaultRef.current !== defName || selectedAgent === null) {
+          if (selectedAgent !== defName) {
+            setSelectedAgent(defName)
+            void setSessionAgent(currentSessionId, defName)
+          }
+        }
+      } else if (selectedAgent === null) {
+        // No isDefault yet (workdir still empty): pick a fallback.
+        setSelectedAgent(agents[0]?.name ?? null)
+      }
+      prevDefaultRef.current = defName
+      return
+    }
+    // Global: consult the configured default via the dedicated endpoint.
+    if (selectedAgent !== null) return
     let cancelled = false
     void (async () => {
       const defId = await fetchDefaultAgent()
       if (cancelled) return
-      const def = defId ? agents.find((a) => a.name === defId) : undefined
-      setSelectedAgent(def?.name ?? agents[0]?.name ?? null)
+      const d = defId ? agents.find((a) => a.name === defId) : undefined
+      setSelectedAgent(d?.name ?? agents[0]?.name ?? null)
     })()
     return () => { cancelled = true }
-  }, [agents, selectedAgent])
+  }, [agents, selectedAgent, currentSessionId])
 
   // Apply an agent change for the focused session: update local state AND
   // persist the binding to the backend so the next /send turn picks up the
@@ -652,15 +699,30 @@ export default function App() {
       // without this the session would start unbound and the agent's
       // system prompt would never be injected on the first turn. The
       // user can still override via the SessionSetup dropdown.
+      //
+      // When a repo URL was entered, the repo's .agents/agents.md (if any)
+      // should be the default — skip the auto-bind so the SessionSetup
+      // dropdown's pre-selection (the repo agents-md, which arrives after
+      // the async SETUP_REPO clone) takes over. The onAgentDefsChanged
+      // re-fetch + the default-resolution effect handle the re-selection.
       if (res.session_id) {
         const sid = res.session_id
-        // Consult GET /api/agents/default directly so a just-changed
-        // default is honored even when the polled `agents` list still
-        // carries the stale isDefault flag.
-        void (async () => {
-          const defId = await fetchDefaultAgent()
-          if (defId) void setSessionAgent(sid, defId)
-        })()
+        const repoUrl = composerSpec.repo.trim()
+        if (repoUrl) {
+          // Repo session: defer to the SessionSetup dropdown's pre-selection
+          // (the repo agents-md, which arrives after SETUP_REPO). The
+          // default-resolution effect picks it up when the
+          // onAgentDefsChanged broadcast fires.
+          void setSessionAgent(sid, null)
+        } else {
+          // No repo: consult GET /api/agents/default directly so a
+          // just-changed default is honored even when the polled `agents`
+          // list still carries the stale isDefault flag.
+          void (async () => {
+            const defId = await fetchDefaultAgent()
+            if (defId) void setSessionAgent(sid, defId)
+          })()
+        }
       }
     }
   }, [syncPath])
