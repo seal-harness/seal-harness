@@ -61,6 +61,11 @@ data TelegramTransport = TelegramTransport
     -- @parse_mode@ (gate: Security #3 — plain text).
   , tgSetCommands :: [BotCommand] -> IO ()
     -- ^ Register the bot's command menu via @setMyCommands@ (auto-completion).
+  , tgAnswerCallback :: Text -> IO ()
+    -- ^ Acknowledge a @callback_query@ via the Bot API
+    -- @answerCallbackQuery@ (stops the button's loading spinner).
+    -- Best-effort: never throws. The argument is the
+    -- @callback_query_id@.
   , tgClose       :: IO ()
   }
 
@@ -115,15 +120,20 @@ data TelegramUpdate = TelegramUpdate
 -- 'IORef' of captured sends. 'tgReceive' pops the next inbound (or returns
 -- @Left "inbox empty"@); 'tgSend' appends @(chatId, body)@ to the capture;
 -- 'tgSetCommands' captures the last registered commands; 'tgClose' is a
--- no-op (idempotent). Returns the transport + an action to read captured
--- sends + an IORef holding the last set commands (for test assertions).
+-- no-op (idempotent). 'tgSendWithKeyboard' + 'tgAnswerCallback' capture to
+-- separate IORefs (for test assertions). Returns the transport + an action
+-- to read captured sends + an action to read captured commands + an action
+-- to read captured callback acknowledgements.
 mkMockTelegramTransport
-  :: [TelegramUpdate] -> IO (TelegramTransport, IO [(Text, Text)], IO [BotCommand])
+  :: [TelegramUpdate]
+  -> IO (TelegramTransport, IO [(Text, Text)], IO [BotCommand], IO [Text])
 mkMockTelegramTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
   cmdRef <- newIORef []
+  kbRef <- newIORef []
+  cbRef <- newIORef []
   let transport = TelegramTransport
         { tgReceive = do
             m <- atomically (tryReadTQueue q)
@@ -131,13 +141,15 @@ mkMockTelegramTransport scripted = do
               Just u  -> pure (Right u)
               Nothing -> pure (Left "telegram inbox empty")
         , tgSend = \c b -> modifyIORef' capRef ((c, b) :)
-        , tgSendWithKeyboard = \_c _b _kb -> pure ()  -- mock: no-op (tests can capture via a separate ref if needed)
+        , tgSendWithKeyboard = \c b kb -> modifyIORef' kbRef ((c, b, kb) :)
         , tgSetCommands = writeIORef cmdRef
+        , tgAnswerCallback = \cbId -> modifyIORef' cbRef (cbId :)
         , tgClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
       getCommands = readIORef cmdRef
-  pure (transport, getCaptured, getCommands)
+      getCallbacks = reverse <$> readIORef cbRef
+  pure (transport, getCaptured, getCommands, getCallbacks)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS
@@ -169,6 +181,7 @@ mkRealTelegramTransport token mgr = do
         case eRes of
           Left err -> globalLogIO ErrorS ("telegram setMyCommands failed: " <> ls err)
           Right _  -> pure ()
+    , tgAnswerCallback = answerCallbackQueryViaApi mgr token
     , tgClose = pure ()
     }
   where

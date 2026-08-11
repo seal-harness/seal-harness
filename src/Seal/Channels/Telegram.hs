@@ -16,6 +16,7 @@ import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM
   (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
+import Control.Monad (void)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -123,6 +124,11 @@ readerLoop ch = go
           if isAllowed sender (tcgAllowList ch)
             then do
               writeIORef (tcgLastChat ch) (Just (tuChatId upd))
+              -- Acknowledge a callback_query (button tap) so the button's
+              -- loading spinner dismisses. Best-effort: never throws.
+              case tuCallbackId upd of
+                Just cbId -> void (try @SomeException (tgAnswerCallback (tcgTransport ch) cbId))
+                Nothing   -> pure ()
               case mkMessageSource (tuConversationId upd) Telegram (Just sender) mempty of
                 Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
                 Right ms -> atomically (writeTQueue (tcgInbox ch) (ms, tuBody upd))
