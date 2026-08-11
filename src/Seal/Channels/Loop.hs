@@ -38,6 +38,7 @@ module Seal.Channels.Loop
   , mkHandleCaps
   , handleTabCommand
   , plainTurn
+  , plainTurnWithCaps
   , buildIsaRegistry
   , buildChannelRegistry
   , mkBgRunner
@@ -699,7 +700,17 @@ plainTurn
   :: ChannelDeps -> ChannelHandle -> AskReplyStore
   -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
 plainTurn deps h askReply meta =
-  runTurnOnSession deps h askReply (smId meta) meta
+  runTurnOnSession deps h askReply Nothing (smId meta) meta
+
+-- | Like 'plainTurn' but with an optional 'ChannelCaps' factory override
+-- (e.g. Telegram's 'mkTelegramHandleCaps' for inline-keyboard @ASK_HUMAN@).
+-- 'Nothing' uses the generic 'mkHandleCaps' (numbered-list rendering).
+plainTurnWithCaps
+  :: ChannelDeps -> ChannelHandle -> AskReplyStore
+  -> Maybe (ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps)
+  -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
+plainTurnWithCaps deps h askReply mkCaps meta =
+  runTurnOnSession deps h askReply mkCaps (smId meta) meta
 
 -- | The shared turn body. 'askSid' is the 'SessionId' used to key the
 -- 'ccPrompt' ask/reply slot: for a normal turn it is the session's own sid
@@ -712,9 +723,10 @@ plainTurn deps h askReply meta =
 -- session): transcript, 'aeSession', and the approval cache stay scoped to
 -- the bg session; only the ask-delivery key moves to the conversation.
 runTurnOnSession
-  :: ChannelDeps -> ChannelHandle -> AskReplyStore -> SessionId
-  -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
-runTurnOnSession deps h askReply askSid meta mSrc t = do
+  :: ChannelDeps -> ChannelHandle -> AskReplyStore
+  -> Maybe (ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps)
+  -> SessionId -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
+runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
   let pr = cdProvider deps
       paths = cdPaths deps
       backends = cdBackends deps
@@ -784,7 +796,9 @@ runTurnOnSession deps h askReply askSid meta mSrc t = do
                          then injectAvailableSkills sessionSkills mSystem'
                          else pure mSystem'
           cloneDeps <- mkCloneDepsFromChannel deps
-          let handleCaps = mkHandleCaps h askReply askSid
+          let handleCaps = case mkCaps of
+                Nothing  -> mkHandleCaps h askReply askSid
+                Just f   -> f h askReply askSid
               onDemand = either (const False) onDemandSchemas eCfg
               startWiring = channelStartWiring
                 deps paths sid handleCaps untrustedIO appEnv eCfg
@@ -915,7 +929,7 @@ mkBgRunner deps h askReply bgConvSid tabsH = BgRunner $ \prompt -> do
   meta <- newSessionMeta (cdPaths deps) provider model "bg" mAgent
   saveSessionMeta (cdPaths deps) meta
   broadcastTabs deps tabsH
-  void (forkIO (runTurnOnSession deps h askReply convSid meta Nothing prompt))
+  void (forkIO (runTurnOnSession deps h askReply Nothing convSid meta Nothing prompt))
 
 -- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.
 -- Dispatches an opcode against the active session's ISA registry + transcript

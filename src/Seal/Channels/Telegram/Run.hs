@@ -28,7 +28,7 @@ import Katip (Severity (..), ls)
 
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Core.Types (SessionId)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
 import Seal.Handles.AskReply
   ( AskId, AskReplyStore, newApprovalCache, newAskReplyStore
   , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix
@@ -88,7 +88,7 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
   -- Register the bot's slash-command menu with BotFather for auto-completion.
   tgSetCommands transport (telegramBotCommands registry)
   let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
-      plainHandler h = plainTurn deps h askReply
+      plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))
   tabsH <- newTabsHandle
   runChannelLoop deps withCh plainHandler registry chain askReply tabsH
     (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply))
