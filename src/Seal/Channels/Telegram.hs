@@ -125,9 +125,14 @@ readerLoop ch = go
             then do
               writeIORef (tcgLastChat ch) (Just (tuChatId upd))
               -- Acknowledge a callback_query (button tap) so the button's
-              -- loading spinner dismisses. Best-effort: never throws.
+              -- loading spinner dismisses, and remove the inline keyboard
+              -- so the buttons can't be re-clicked. Both best-effort.
               case tuCallbackId upd of
-                Just cbId -> void (try @SomeException (tgAnswerCallback (tcgTransport ch) cbId))
+                Just cbId -> do
+                  void (try @SomeException (tgAnswerCallback (tcgTransport ch) cbId))
+                  case tuCallbackMessageId upd of
+                    Just msgId -> void (try @SomeException (tgEditReplyMarkup (tcgTransport ch) (tuChatId upd) msgId))
+                    Nothing    -> pure ()
                 Nothing   -> pure ()
               case mkMessageSource (tuConversationId upd) Telegram (Just sender) mempty of
                 Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)

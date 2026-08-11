@@ -80,6 +80,7 @@ callbackUpdate cId sId cbData cbId =
        , tuBody            = cbData
        , tuCallbackData    = Just cbData
        , tuCallbackId      = Just cbId
+       , tuCallbackMessageId = Just "9999"
        }
 
 -- | Poll the mock transport's keyboard-capture accessor until non-empty
@@ -144,7 +145,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
   -- -----------------------------------------------------------------------
   describe "mkTelegramHandleCaps ccPrompt" $ do
 
-    it "ccPrompt with options sends an inline keyboard (1 call, opts+1 rows)" $ do
+    it "ccPrompt with options sends an inline keyboard (1 call, N rows)" $ do
       let opts = [opt "main", opt "develop"]
       (transport, _, _, _, getKb) <- mkMockTelegramTransport []
       sendRef <- newIORef []
@@ -164,22 +165,18 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
           body `shouldSatisfy` T.isPrefixOf "which branch?"
           body `shouldSatisfy` T.isInfixOf "1) main"
           body `shouldSatisfy` T.isInfixOf "2) develop"
-          length keyboard `shouldBe` 3  -- 2 options + 1 Other
-          map length keyboard `shouldBe` [1, 1, 1]
+          length keyboard `shouldBe` 2  -- 2 options, no Other button
+          map length keyboard `shouldBe` [1, 1]
           case keyboard of
-            [[b0], [b1], [bOther]] -> do
+            [[b0], [b1]] -> do
               tbText b0 `shouldBe` "main"
               tbText b1 `shouldBe` "develop"
-              tbText bOther `shouldBe` "Other"
               let cbd0 = tbCallbackData b0
                   cbd1 = tbCallbackData b1
-                  cbdOther = tbCallbackData bOther
               cbd0 `shouldSatisfy` (\t -> T.length t >= 10 && T.isSuffixOf ":0" t)
               cbd1 `shouldSatisfy` (\t -> T.length t >= 10 && T.isSuffixOf ":1" t)
-              cbdOther `shouldSatisfy` T.isSuffixOf ":other"
-              -- All callback_data ≤ 64 bytes (Telegram limit).
-              all (\t -> T.length t <= 64) [cbd0, cbd1, cbdOther] `shouldBe` True
-            _ -> expectationFailure ("expected 3 single-button rows, got: " <> show keyboard)
+              all (\t -> T.length t <= 64) [cbd0, cbd1] `shouldBe` True
+            _ -> expectationFailure ("expected 2 single-button rows, got: " <> show keyboard)
         _ -> expectationFailure ("expected 1 keyboard call, got: " <> show (length kbs))
       deliverFirstPending store sid
       takeMVar done
@@ -243,7 +240,9 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
       -- The ask unblocked with "main".
       waitDone
 
-    it "<8hex>:other returns False without delivering + sends type-your-answer hint" $ do
+    it "<8hex>:other (legacy) returns False without delivering" $ do
+      -- The "Other" button was removed, but a stale :other callback (from
+      -- an old keyboard) should still fall through gracefully.
       store <- newAskReplyStore 0
       sendRef <- newIORef []
       let h = testHandle (Just chatId) sendRef
@@ -251,9 +250,6 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
       (waitDone, prefix) <- forkAskWithOptions store sid "which branch?" opts
       res <- onTelegramCallback store h sid (prefix <> ":other")
       res `shouldBe` False
-      sends <- reverse <$> readIORef sendRef
-      sends `shouldBe` ["✏️ Type your answer…"]
-      -- Clean up: deliver an answer so the forked thread unblocks.
       deliverFirstPending store sid
       waitDone
 
@@ -289,10 +285,10 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
       res <- onTelegramCallback store h sid "zzzzzzzz:0"
       res `shouldBe` False
 
-    prop "prop_callbackDataWithin64Bytes: <8hex>:<idx|other> is <= 64 chars"
+    prop "prop_callbackDataWithin64Bytes: <8hex>:<idx> is <= 64 chars"
       $ \(SmallIdx idx) -> do
         let prefix = "deadbeef" :: Text
-            token = if idx < 0 then "other" else T.pack (show idx)
+            token = T.pack (show idx)
             cbd = prefix <> ":" <> token
         T.length cbd <= 64
 
@@ -315,9 +311,9 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
 -- QuickCheck generators
 -- ---------------------------------------------------------------------------
 
--- | A small index: -1 (maps to "other") or 0-7 (maps to the index).
+-- | A small index: 0-7 (maps to the option index).
 newtype SmallIdx = SmallIdx Int
   deriving stock (Eq, Show)
 
 instance Arbitrary SmallIdx where
-  arbitrary = SmallIdx <$> chooseInt (-1, 7)
+  arbitrary = SmallIdx <$> chooseInt (0, 7)

@@ -39,6 +39,7 @@ mkTestUpdate chatId senderId body =
        , tuBody            = body
        , tuCallbackData    = Nothing
        , tuCallbackId      = Nothing
+       , tuCallbackMessageId = Nothing
        }
 
 -- | A scripted callback_query update (a button tap). 'tuBody' is the
@@ -47,7 +48,8 @@ mkTestUpdate chatId senderId body =
 mkTestCallback :: Text -> Text -> Text -> Text -> TelegramUpdate
 mkTestCallback chatId senderId cbData cbId =
   (mkTestUpdate chatId senderId cbData) { tuCallbackData = Just cbData
-                                        , tuCallbackId   = Just cbId }
+                                        , tuCallbackId   = Just cbId
+                                        , tuCallbackMessageId = Just "9999" }
 
 spec :: Spec
 spec = describe "Seal.Channels.Telegram" $ do

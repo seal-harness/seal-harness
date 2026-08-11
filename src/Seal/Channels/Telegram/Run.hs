@@ -241,16 +241,17 @@ mkTelegramHandleCaps transport h askReply sid = def
       in tgSendWithKeyboard transport chatId body (buildKeyboard prefix opts)
 
 -- | Build the inline keyboard: one row per option (button label = the
--- option's 'qoLabel', callback_data = @\"<prefix>:<idx>\"@), plus a final
--- row with one "Other" button (callback_data = @\"<prefix>:other\"@).
--- Pure. The callback_data is always ≤ 64 bytes (8 hex + 1 colon + ≤ 5
--- chars for the index or "other" = ≤ 14 bytes).
+-- option's 'qoLabel', callback_data = @\"<prefix>:<idx>\"@). No "Other"
+-- free-text button (Telegram has no inline free-text input; the user can
+-- still type a free-text answer as a regular message, which the loop
+-- routes via 'deliverNextAnswerResolved' when no pending callback match
+-- is found). Pure. The callback_data is always ≤ 64 bytes (8 hex + 1
+-- colon + ≤ 1 char for the index = ≤ 10 bytes).
 buildKeyboard :: Text -> [QuestionOption] -> [[TelegramButton]]
 buildKeyboard prefix opts =
   [ [TelegramButton (qoLabel o) (prefix <> ":" <> T.pack (show i))]
   | (i, o) <- zip [0 :: Int ..] opts
   ]
-  <> [[TelegramButton "Other" (prefix <> ":other")]]
 
 -- | The callback handler for Telegram: parses the @callback_data@
 -- (@\"<8hex>:<token>\"@), where @token@ is either a decimal index (the
@@ -259,10 +260,9 @@ buildKeyboard prefix opts =
 -- the option's label via the pending ask's 'pqiOptions', and delivers it
 -- by-id via 'deliverAnswer'. Sends a persistent "✓ <label>" confirmation
 -- to the chat via 'chSend' so the user sees their tap was registered (the
--- LLM may take time to respond). For @other@, returns 'False' so the loop
--- falls through to 'deliverNextAnswerResolved' (the next typed message is
--- captured as the free-text answer). Returns 'True' if a callback was
--- delivered; 'False' if not (fall through).
+-- LLM may take time to respond). A stale @:other@ token (from a legacy
+-- keyboard that had an "Other" button) falls through to 'False'. Returns
+-- 'True' if a callback was delivered; 'False' if not (fall through).
 --
 -- The 'AskReplyStore' is the first arg so the caller can partially apply
 -- it; the 'runChannelLoop' 'onCallback' hook supplies the 'ChannelHandle'.
@@ -271,13 +271,9 @@ onTelegramCallback store h sid body =
   case T.splitOn ":" body of
     [prefix, token]
       | T.length prefix == 8 && T.all isHexChar prefix ->
-          if token == "other"
-            then do
-              chSend h "✏️ Type your answer…"
-              pure False
-            else case parseIndex token of
-              Just idx -> resolveIndex h store sid prefix idx
-              Nothing  -> pure False
+          case parseIndex token of
+            Just idx -> resolveIndex h store sid prefix idx
+            Nothing  -> pure False  -- non-numeric (e.g. legacy "other"): fall through
     _ -> pure False
   where
     isHexChar c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')

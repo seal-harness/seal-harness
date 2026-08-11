@@ -16,6 +16,7 @@ module Seal.Channels.Telegram.Transport
   , chunkMessage
   , tgSendWithKeyboardViaApi
   , answerCallbackQueryViaApi
+  , editReplyMarkupViaApi
   ) where
 
 import Control.Concurrent.STM
@@ -66,6 +67,10 @@ data TelegramTransport = TelegramTransport
     -- @answerCallbackQuery@ (stops the button's loading spinner).
     -- Best-effort: never throws. The argument is the
     -- @callback_query_id@.
+  , tgEditReplyMarkup :: Text -> Text -> IO ()
+    -- ^ Remove the inline keyboard from a message via the Bot API
+    -- @editMessageReplyMarkup@ (disables the buttons after a tap).
+    -- Args: chat id, message id. Best-effort: never throws.
   , tgClose       :: IO ()
   }
 
@@ -110,6 +115,9 @@ data TelegramUpdate = TelegramUpdate
   , tuBody            :: Text
   , tuCallbackData    :: Maybe Text  -- ^ @Just data@ for callback_query; @Nothing@ for message
   , tuCallbackId      :: Maybe Text  -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@ for message
+  , tuCallbackMessageId :: Maybe Text
+  -- ^ @Just msgId@ for callback_query (the message holding the keyboard,
+  -- so we can remove it after a tap); @Nothing@ for message.
   } deriving stock (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -146,6 +154,7 @@ mkMockTelegramTransport scripted = do
         , tgSendWithKeyboard = \c b kb -> modifyIORef' kbRef ((c, b, kb) :)
         , tgSetCommands = writeIORef cmdRef
         , tgAnswerCallback = \cbId -> modifyIORef' cbRef (cbId :)
+        , tgEditReplyMarkup = \_c _m -> pure ()  -- mock: no-op
         , tgClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
@@ -185,6 +194,7 @@ mkRealTelegramTransport token mgr = do
           Left err -> globalLogIO ErrorS ("telegram setMyCommands failed: " <> ls err)
           Right _  -> pure ()
     , tgAnswerCallback = answerCallbackQueryViaApi mgr token
+    , tgEditReplyMarkup = editReplyMarkupViaApi mgr token
     , tgClose = pure ()
     }
   where
@@ -326,6 +336,7 @@ parseTelegramUpdate v =
             , tuBody            = body
             , tuCallbackData    = Nothing
             , tuCallbackId      = Nothing
+            , tuCallbackMessageId = Nothing
             }
         _ -> Left "message not an object"
     parseCallbackQuery cq =
@@ -357,6 +368,11 @@ parseTelegramUpdate v =
                     Left err -> Left ("telegram callback sender not a valid UserId: " <> err)
                   _ -> Left "callback_query.from.id missing"
                 _ -> Left "callback_query.from field missing"
+              -- The message_id of the message holding the keyboard (so the
+              -- reader can remove the keyboard after a tap).
+              mMsgId <- case KeyMap.lookup (Key.fromString "message_id") mo of
+                Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
+                _ -> Left "callback_query.message.message_id missing"
               Right TelegramUpdate
                 { tuConversationId = cid
                 , tuChatId          = chatId
@@ -364,6 +380,7 @@ parseTelegramUpdate v =
                 , tuBody            = callbackData
                 , tuCallbackData    = Just callbackData
                 , tuCallbackId      = Just callbackId
+                , tuCallbackMessageId = Just mMsgId
                 }
             _ -> Left "callback_query.message not an object"
         _ -> Left "callback_query not an object"
@@ -457,6 +474,29 @@ answerCallbackQueryViaApi mgr token callbackQueryId = do
     Right req0 -> do
       let payload = A.object
             [ "callback_query_id" A..= callbackQueryId
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Remove the inline keyboard from a message via the Bot API
+-- @editMessageReplyMarkup@ with an empty @reply_markup@. Disables the
+-- buttons after a tap so they can't be re-clicked. Best-effort (logs on
+-- failure, never throws). Args: chat id, message id.
+editReplyMarkupViaApi :: Manager -> Text -> Text -> Text -> IO ()
+editReplyMarkupViaApi mgr token chatId messageId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/editMessageReplyMarkup")))
+  case eReq of
+    Left _ -> pure ()
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "message_id" A..= messageId
+            , "reply_markup" A..= A.object [ "inline_keyboard" A..= ([] :: [[A.Value]]) ]
             ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)

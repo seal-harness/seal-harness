@@ -79,6 +79,7 @@ spec = do
                 , "message" .= object
                     [ "chat" .= object [ "id" .= (86611052 :: Int) ]
                     , "from" .= object [ "id" .= (8971756743 :: Int) ]
+                    , "message_id" .= (1442 :: Int)
                     , "text" .= ("What's your favorite color?" :: Text)
                     ]
                 , "data" .= ("ee457b5a:1" :: Text)
@@ -89,6 +90,7 @@ spec = do
           tuBody upd `shouldBe` "ee457b5a:1"
           tuCallbackData upd `shouldBe` Just "ee457b5a:1"
           tuCallbackId upd `shouldBe` Just "371991640038127550"
+          tuCallbackMessageId upd `shouldBe` Just "1442"
           tuChatId upd `shouldBe` "86611052"
           conversationIdText (tuConversationId upd) `shouldBe` "tg:86611052"
           userIdText (tuSender upd) `shouldBe` "86611052"
@@ -103,12 +105,15 @@ spec = do
                 , "message" .= object
                     [ "chat" .= object [ "id" .= (86611052 :: Int) ]
                     , "from" .= object [ "id" .= (8971756743 :: Int) ]
+                    , "message_id" .= (1442 :: Int)
                     ]
                 , "data" .= ("deadbeef:0" :: Text)
                 ]
             ]
       case parseTelegramUpdate raw of
-        Right upd -> tuCallbackId upd `shouldBe` Just "37199164"
+        Right upd -> do
+          tuCallbackId upd `shouldBe` Just "37199164"
+          tuCallbackMessageId upd `shouldBe` Just "1442"
         Left err -> expectationFailure ("unexpected Left: " <> T.unpack err)
 
     it "rejects a callback_query missing the data field" $ do
