@@ -24,10 +24,11 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
 import Seal.Channels.Telegram (withTelegramChannel)
+import Seal.Channels.Telegram.Run (mkTelegramHandleCaps, onTelegramCallback)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
@@ -418,6 +419,7 @@ forkTelegramListener deps cfg registry = do
       let tabsH = cdTabs deps
       askReply <- newAskReplyStore 0
       let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
-          plainHandler h = plainTurn deps h askReply
-      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH Nothing Nothing)
+          plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))
+      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH
+                     (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply)))
       pure ()
