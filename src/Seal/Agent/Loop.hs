@@ -387,6 +387,12 @@ runTurn env userText = do
                           pure (Right ())
                         Nothing -> do
                           let prompt = buildConfirmationPrompt opName' input'
+                          -- The confirmation gate's prompt (Allow <NAME>
+                          -- <JSON>? [y/N]) is NOT model text, so it must be
+                          -- sent to the channel. ccPrompt no longer sends
+                          -- (the model already streamed ASK_HUMAN text), so
+                          -- we send here.
+                          liftIO (ccSend (aeCaps env) prompt)
                           reply <- liftIO (ccPrompt (aeCaps env) (AskPrompt prompt []))
                           let scope = parseScopeReply reply
                           liftIO (recordApproval (aeApprovals env) (aeSession env) opName' scope)
