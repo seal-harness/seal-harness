@@ -44,6 +44,7 @@ inlineHandle fc = ChannelHandle
   , chStreaming    = ifStreaming fc
   , chReadSecret   = pure Nothing
   , chReceive      = popInbox fc
+  , chLastChatId   = pure Nothing
   }
 
 popPrompt :: InlineFake -> IO (Either Deferral Text)

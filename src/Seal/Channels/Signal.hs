@@ -57,6 +57,7 @@ instance Channel SignalChannel where
     , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
     , chReadSecret   = pure Nothing                  -- vault is reached via the vault handle
     , chReceive      = receiveFromInbox ch
+    , chLastChatId   = pure Nothing                  -- Signal addresses by user id, not chat id
     }
 
 -- | Run the reader thread with cleanup. Spawns a background thread that

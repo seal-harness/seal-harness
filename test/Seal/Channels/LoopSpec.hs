@@ -79,6 +79,7 @@ stubHandle = ChannelHandle
   , chStreaming    = False
   , chReadSecret   = pure Nothing
   , chReceive      = pure (Nothing, "")
+  , chLastChatId   = pure Nothing
   }
 
 -- | A minimal no-op CommandSpec with the given name, used to populate a base

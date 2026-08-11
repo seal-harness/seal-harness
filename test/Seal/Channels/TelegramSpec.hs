@@ -111,3 +111,12 @@ spec = describe "Seal.Channels.Telegram" $ do
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
       chStreaming h `shouldBe` False
+
+  it "chLastChatId returns the last chat id after an update is received" $ do
+    let upd1 = mkTestUpdate chatId1 senderId1 "hello"
+    (transport, _, _) <- mkMockTelegramTransport [upd1]
+    logger <- testSealLogger
+    withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
+      let h = toHandle ch
+      _ <- chReceive h  -- primes the last-chat id via the reader
+      chLastChatId h `shouldReturn` Just chatId1

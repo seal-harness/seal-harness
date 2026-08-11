@@ -33,6 +33,7 @@ recordingHandle label = do
         , chStreaming    = False
         , chReadSecret   = pure Nothing
         , chReceive      = pure (Nothing, "")
+        , chLastChatId   = pure Nothing
         }
   pure (h, reverse <$> readIORef ref)
 

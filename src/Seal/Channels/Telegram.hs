@@ -57,6 +57,7 @@ instance Channel TelegramChannel where
     , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
     , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
+    , chLastChatId   = readIORef (tcgLastChat ch)
     }
 
 -- | Run the reader thread with cleanup. Spawns a background thread that
