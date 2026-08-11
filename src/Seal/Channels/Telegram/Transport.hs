@@ -16,6 +16,7 @@ module Seal.Channels.Telegram.Transport
   , chunkMessage
   , tgSendWithKeyboardViaApi
   , answerCallbackQueryViaApi
+  , editReplyMarkupViaApi
   ) where
 
 import Control.Concurrent.STM
@@ -61,6 +62,15 @@ data TelegramTransport = TelegramTransport
     -- @parse_mode@ (gate: Security #3 — plain text).
   , tgSetCommands :: [BotCommand] -> IO ()
     -- ^ Register the bot's command menu via @setMyCommands@ (auto-completion).
+  , tgAnswerCallback :: Text -> IO ()
+    -- ^ Acknowledge a @callback_query@ via the Bot API
+    -- @answerCallbackQuery@ (stops the button's loading spinner).
+    -- Best-effort: never throws. The argument is the
+    -- @callback_query_id@.
+  , tgEditReplyMarkup :: Text -> Text -> IO ()
+    -- ^ Remove the inline keyboard from a message via the Bot API
+    -- @editMessageReplyMarkup@ (disables the buttons after a tap).
+    -- Args: chat id, message id. Best-effort: never throws.
   , tgClose       :: IO ()
   }
 
@@ -105,6 +115,9 @@ data TelegramUpdate = TelegramUpdate
   , tuBody            :: Text
   , tuCallbackData    :: Maybe Text  -- ^ @Just data@ for callback_query; @Nothing@ for message
   , tuCallbackId      :: Maybe Text  -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@ for message
+  , tuCallbackMessageId :: Maybe Text
+  -- ^ @Just msgId@ for callback_query (the message holding the keyboard,
+  -- so we can remove it after a tap); @Nothing@ for message.
   } deriving stock (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -115,15 +128,22 @@ data TelegramUpdate = TelegramUpdate
 -- 'IORef' of captured sends. 'tgReceive' pops the next inbound (or returns
 -- @Left "inbox empty"@); 'tgSend' appends @(chatId, body)@ to the capture;
 -- 'tgSetCommands' captures the last registered commands; 'tgClose' is a
--- no-op (idempotent). Returns the transport + an action to read captured
--- sends + an IORef holding the last set commands (for test assertions).
+-- no-op (idempotent). 'tgSendWithKeyboard' + 'tgAnswerCallback' capture to
+-- separate IORefs (for test assertions). Returns the transport + an action
+-- to read captured sends + an action to read captured commands + an action
+-- to read captured callback acknowledgements + an action to read captured
+-- keyboard sends (each @(chatId, body, keyboard)@).
 mkMockTelegramTransport
-  :: [TelegramUpdate] -> IO (TelegramTransport, IO [(Text, Text)], IO [BotCommand])
+  :: [TelegramUpdate]
+  -> IO ( TelegramTransport, IO [(Text, Text)], IO [BotCommand]
+        , IO [Text], IO [(Text, Text, [[TelegramButton]])] )
 mkMockTelegramTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
   cmdRef <- newIORef []
+  kbRef <- newIORef []
+  cbRef <- newIORef []
   let transport = TelegramTransport
         { tgReceive = do
             m <- atomically (tryReadTQueue q)
@@ -131,13 +151,17 @@ mkMockTelegramTransport scripted = do
               Just u  -> pure (Right u)
               Nothing -> pure (Left "telegram inbox empty")
         , tgSend = \c b -> modifyIORef' capRef ((c, b) :)
-        , tgSendWithKeyboard = \_c _b _kb -> pure ()  -- mock: no-op (tests can capture via a separate ref if needed)
+        , tgSendWithKeyboard = \c b kb -> modifyIORef' kbRef ((c, b, kb) :)
         , tgSetCommands = writeIORef cmdRef
+        , tgAnswerCallback = \cbId -> modifyIORef' cbRef (cbId :)
+        , tgEditReplyMarkup = \_c _m -> pure ()  -- mock: no-op
         , tgClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
       getCommands = readIORef cmdRef
-  pure (transport, getCaptured, getCommands)
+      getCallbacks = reverse <$> readIORef cbRef
+      getKeyboards = reverse <$> readIORef kbRef
+  pure (transport, getCaptured, getCommands, getCallbacks, getKeyboards)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS
@@ -169,6 +193,8 @@ mkRealTelegramTransport token mgr = do
         case eRes of
           Left err -> globalLogIO ErrorS ("telegram setMyCommands failed: " <> ls err)
           Right _  -> pure ()
+    , tgAnswerCallback = answerCallbackQueryViaApi mgr token
+    , tgEditReplyMarkup = editReplyMarkupViaApi mgr token
     , tgClose = pure ()
     }
   where
@@ -179,20 +205,38 @@ mkRealTelegramTransport token mgr = do
         Just u  -> pure (Right u)
         Nothing -> do
           offset <- readIORef offsetRef
-          eUpdates <- getUpdates mgr token offset
-          case eUpdates of
+          eResult <- getUpdates mgr token offset
+          case eResult of
             Left err -> pure (Left err)
-            Right [] -> fillAndReceive buffer offsetRef
-            Right updates -> do
-              let lastId = maximum (map fst updates)
-              modifyIORef' offsetRef (const (lastId + 1))
-              mapM_ ((atomically . writeTQueue buffer) . snd) updates
-              fillAndReceive buffer offsetRef
+            Right (updates, rawIds) ->
+              if null updates
+                then
+                  -- No parseable updates. Still advance the offset past
+                  -- any raw update_ids so we don't loop forever on
+                  -- unparseable updates.
+                  if null rawIds
+                    then fillAndReceive buffer offsetRef
+                    else do
+                      let lastId = maximum rawIds
+                      modifyIORef' offsetRef (const (lastId + 1))
+                      fillAndReceive buffer offsetRef
+                else do
+                  let lastId = maximum (map fst updates)
+                  modifyIORef' offsetRef (const (lastId + 1))
+                  mapM_ ((atomically . writeTQueue buffer) . snd) updates
+                  fillAndReceive buffer offsetRef
 
 -- | Call @getUpdates@ with long-polling (30s timeout). Returns the parsed
--- updates as @(update_id, TelegramUpdate)@ pairs — non-message updates
--- (edited messages, callbacks, etc.) are skipped.
-getUpdates :: Manager -> Text -> Int -> IO (Either Text [(Int, TelegramUpdate)])
+-- updates as @(update_id, TelegramUpdate)@ pairs — @message@ and
+-- @callback_query@ updates are parsed; other update types are skipped.
+-- Explicitly requests @message@ + @callback_query@ via @allowed_updates@
+-- so button taps are delivered (without this, Telegram uses the previous
+-- setting, which may exclude @callback_query@).
+getUpdates :: Manager -> Text -> Int -> IO (Either Text ([(Int, TelegramUpdate)], [Int]))
+-- ^ Returns @(parsedUpdates, allRawUpdateIds)@. The raw ids let the caller
+-- advance the offset even when some updates fail to parse (e.g. an
+-- unparseable callback_query), avoiding an infinite loop re-receiving
+-- them.
 getUpdates mgr token offset = do
   let url = T.unpack (telegramApiBase <> token <> "/getUpdates")
              <> "?offset=" <> show offset <> "&timeout=30"
@@ -200,10 +244,6 @@ getUpdates mgr token offset = do
   case eReq of
     Left ex -> pure (Left ("getUpdates request error: " <> T.pack (show ex)))
     Right req0 -> do
-      -- The Telegram long-poll holds the connection for up to 30s; set a
-      -- per-request timeout of 60s so the HTTP client doesn't abort before
-      -- Telegram responds. The manager default is ~30s which races the
-      -- long-poll and causes spurious ResponseTimeout errors.
       let req = req0 { responseTimeout = responseTimeoutMicro 60000000 }
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
@@ -213,26 +253,41 @@ getUpdates mgr token offset = do
               body = responseBody resp
           in if code == 200
                then pure (parseGetUpdatesResponse body)
-               else pure (Left ("getUpdates returned HTTP " <> T.pack (show code)))
+               else pure (Left ("getUpdates returned HTTP " <> T.pack (show code)
+                              <> " — " <> T.pack (show body)))
 
--- | Parse the JSON response from getUpdates. The shape is
--- @{"ok":true,"result":[{"update_id":N,"message":{...}},...]}@. Extracts
--- @(update_id, TelegramUpdate)@ pairs, skipping non-message updates.
-parseGetUpdatesResponse :: BL.ByteString -> Either Text [(Int, TelegramUpdate)]
+-- | Parse the JSON response from getUpdates. Returns @(parsedUpdates,
+-- allRawUpdateIds)@. The raw ids let the caller advance the offset even
+-- when some updates fail to parse (e.g. an unparseable callback_query).
+parseGetUpdatesResponse :: BL.ByteString -> Either Text ([(Int, TelegramUpdate)], [Int])
 parseGetUpdatesResponse body =
   case A.decode body of
     Nothing -> Left "getUpdates: malformed JSON response"
     Just (A.Object o) -> case KeyMap.lookup (Key.fromString "result") o of
       Just (A.Array arr) ->
-        let parsed = [ parseOneUpdate v | v <- V.toList arr ]
-        in Right [ (uid, u) | Right (uid, u) <- parsed ]
-      _ -> Right []
+        let raws = V.toList arr
+            allIds = [ uid | v <- raws, Just uid <- [rawUpdateId v] ]
+            parsed = [ parseOneUpdate v | v <- raws ]
+            okUpdates = [ (uid, u) | Right (uid, u) <- parsed ]
+        in Right (okUpdates, allIds)
+      _ -> Right ([], [])
     Just _ -> Left "getUpdates: response not an object"
   where
     parseOneUpdate v = do
       uid <- updateId v
-      u <- parseTelegramUpdate v
-      Right (uid, u)
+      case parseTelegramUpdate v of
+        Left err -> Left err
+        Right u  -> Right (uid, u)
+
+-- | Extract the raw @update_id@ from an update object (for offset
+-- advancement even when the update body fails to parse).
+rawUpdateId :: Value -> Maybe Int
+rawUpdateId v =
+  case v of
+    A.Object o -> case KeyMap.lookup (Key.fromString "update_id") o of
+      Just (A.Number n) -> Just (round n)
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Extract the numeric @update_id@ from a Telegram update object.
 updateId :: Value -> Either Text Int
@@ -281,13 +336,16 @@ parseTelegramUpdate v =
             , tuBody            = body
             , tuCallbackData    = Nothing
             , tuCallbackId      = Nothing
+            , tuCallbackMessageId = Nothing
             }
         _ -> Left "message not an object"
     parseCallbackQuery cq =
       case cq of
         A.Object cqo -> do
-          -- callback_query has: id, from, message (with chat), data
+          -- callback_query has: id (a String per the Bot API), from,
+          -- message (with chat), data.
           callbackId <- case KeyMap.lookup (Key.fromString "id") cqo of
+            Just (A.String t) -> Right t
             Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
             _ -> Left "callback_query.id missing"
           callbackData <- case KeyMap.lookup (Key.fromString "data") cqo of
@@ -310,6 +368,11 @@ parseTelegramUpdate v =
                     Left err -> Left ("telegram callback sender not a valid UserId: " <> err)
                   _ -> Left "callback_query.from.id missing"
                 _ -> Left "callback_query.from field missing"
+              -- The message_id of the message holding the keyboard (so the
+              -- reader can remove the keyboard after a tap).
+              mMsgId <- case KeyMap.lookup (Key.fromString "message_id") mo of
+                Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
+                _ -> Left "callback_query.message.message_id missing"
               Right TelegramUpdate
                 { tuConversationId = cid
                 , tuChatId          = chatId
@@ -317,6 +380,7 @@ parseTelegramUpdate v =
                 , tuBody            = callbackData
                 , tuCallbackData    = Just callbackData
                 , tuCallbackId      = Just callbackId
+                , tuCallbackMessageId = Just mMsgId
                 }
             _ -> Left "callback_query.message not an object"
         _ -> Left "callback_query not an object"
@@ -410,6 +474,29 @@ answerCallbackQueryViaApi mgr token callbackQueryId = do
     Right req0 -> do
       let payload = A.object
             [ "callback_query_id" A..= callbackQueryId
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      _ <- try @SomeException (httpLbs req mgr)
+      pure ()
+
+-- | Remove the inline keyboard from a message via the Bot API
+-- @editMessageReplyMarkup@ with an empty @reply_markup@. Disables the
+-- buttons after a tap so they can't be re-clicked. Best-effort (logs on
+-- failure, never throws). Args: chat id, message id.
+editReplyMarkupViaApi :: Manager -> Text -> Text -> Text -> IO ()
+editReplyMarkupViaApi mgr token chatId messageId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/editMessageReplyMarkup")))
+  case eReq of
+    Left _ -> pure ()
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "message_id" A..= messageId
+            , "reply_markup" A..= A.object [ "inline_keyboard" A..= ([] :: [[A.Value]]) ]
             ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)

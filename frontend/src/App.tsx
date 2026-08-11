@@ -192,13 +192,13 @@ export default function App() {
   const polledTabs = useTabs(legacyDisabled)
   const polledRecent = useRecentSessions(legacyDisabled)
   const polledArchived = useArchivedSessions(legacyDisabled)
-  // Optimistic first-message-snippet overlay keyed by session id. Set on
-  // send so a freshly-created tab's label updates immediately (before the
-  // backend's next `lists` frame arrives with the persisted snippet).
-  // `sessionDisplayTitle` already prefers description > autoSummary >
-  // firstMessageSnippet, so this never overrides a user-set title or
-  // generated summary — it only fills the same slot the backend would.
-  const [snippetOverrides, setSnippetOverrides] = useState<Map<string, string>>(() => new Map())
+  // Optimistic first-message-snippet overlay keyed by session id. Uses a
+  // ref (not state) so handleSend always sees the current map — no stale
+  // closures. A companion state counter forces re-renders when the ref
+  // changes so applySnippet picks up the new value.
+  const snippetOverridesRef = useRef<Map<string, string>>(new Map())
+  const [, forceSnippetRerender] = useState(0)
+  const snippetOverrides = snippetOverridesRef.current
   const tabs = wsLive ? wsLists.tabs
     : usePollLists ? polledLists.tabs
     : polledTabs.tabs
@@ -211,10 +211,27 @@ export default function App() {
   const tabSessions0 = wsLive ? wsLists.tabSessions
     : usePollLists ? polledLists.tabSessions
     : []
+  // Auto-clear: when the backend provides a non-null firstMessageSnippet
+  // for a session that has an override, delete the override from the ref
+  // and force a re-render. This retires the optimistic fill so it can
+  // never clobber the backend's value on a future lists frame.
+  useEffect(() => {
+    const toClear: string[] = []
+    for (const list of [rawSessions0, archivedSessions0, tabSessions0]) {
+      for (const s of list) {
+        if (s.firstMessageSnippet && snippetOverridesRef.current.has(s.id)) toClear.push(s.id)
+      }
+    }
+    if (toClear.length > 0) {
+      for (const id of toClear) snippetOverridesRef.current.delete(id)
+      forceSnippetRerender((n) => n + 1)
+      console.log('[snippet] auto-cleared overrides', toClear)
+    }
+  }, [rawSessions0, archivedSessions0, tabSessions0])
   const applySnippet = (list: SessionInfo[]): SessionInfo[] =>
     snippetOverrides.size === 0 ? list : list.map((s) => {
       const ov = snippetOverrides.get(s.id)
-      return ov && !s.description && !s.autoSummary
+      return ov && !s.description && !s.autoSummary && !s.firstMessageSnippet
         ? { ...s, firstMessageSnippet: ov }
         : s
     })
@@ -637,13 +654,25 @@ export default function App() {
     setPendingMessage(message)
     // Optimistically fill the session's first-message-snippet so the tab
     // label updates immediately (before the backend's next `lists` frame).
-    // Truncated to 80 chars + ellipsis to match the backend's snippet shape.
-    const snippet = message.length > 80 ? message.slice(0, 80) + '…' : message
-    setSnippetOverrides((m) => { const n = new Map(m); n.set(currentSessionId, snippet); return n })
+    // Only set the override when the session doesn't already have a
+    // firstMessageSnippet AND no override is already recorded. Uses the
+    // ref (not state) so the check is always against the current map —
+    // no stale-closure race between the first and second send.
+    const existingSession = sessions.find((s) => s.id === currentSessionId)
+      ?? archivedSessions.find((s) => s.id === currentSessionId)
+      ?? tabSessions.find((s) => s.id === currentSessionId)
+    if (!existingSession?.firstMessageSnippet && !snippetOverridesRef.current.has(currentSessionId)) {
+      const snippet = message.length > 80 ? message.slice(0, 80) + '…' : message
+      snippetOverridesRef.current.set(currentSessionId, snippet)
+      console.log('[snippet] set override', { sid: currentSessionId, snippet, existingSnippet: existingSession?.firstMessageSnippet ?? null, refHas: snippetOverridesRef.current.has(currentSessionId) })
+      forceSnippetRerender((n) => n + 1)
+    } else {
+      console.log('[snippet] NOT setting override', { sid: currentSessionId, existingSnippet: existingSession?.firstMessageSnippet ?? null, refHas: snippetOverridesRef.current.has(currentSessionId) })
+    }
     const seq = ++seqRef.current
     const r = await send(message, modelOverride ?? lastTranscriptModel)
     handleSendResult(r, seq)
-  }, [send, entries.length, currentSessionId, archivedSessions, sessions, modelOverride, lastTranscriptModel, handleSendResult])
+  }, [send, entries.length, currentSessionId, archivedSessions, sessions, tabSessions, modelOverride, lastTranscriptModel, handleSendResult])
 
   // ── Selection handlers ────────────────────────────────────────────────
   const handleSelectTab = useCallback((index: number) => {

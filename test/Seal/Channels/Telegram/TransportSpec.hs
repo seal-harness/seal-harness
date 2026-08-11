@@ -68,6 +68,68 @@ spec = do
         Right upd -> tuBody upd `shouldBe` ""
         Left err  -> expectationFailure ("unexpected Left: " <> T.unpack err)
 
+    it "parses a callback_query update with a String id" $ do
+      -- Telegram's Bot API returns callback_query.id as a String (it can
+      -- exceed Int64 range). This is the real-world shape.
+      let raw = object
+            [ "update_id" .= (100 :: Int)
+            , "callback_query" .= object
+                [ "id" .= ("371991640038127550" :: Text)
+                , "from" .= object [ "id" .= (86611052 :: Int) ]
+                , "message" .= object
+                    [ "chat" .= object [ "id" .= (86611052 :: Int) ]
+                    , "from" .= object [ "id" .= (8971756743 :: Int) ]
+                    , "message_id" .= (1442 :: Int)
+                    , "text" .= ("What's your favorite color?" :: Text)
+                    ]
+                , "data" .= ("ee457b5a:1" :: Text)
+                ]
+            ]
+      case parseTelegramUpdate raw of
+        Right upd -> do
+          tuBody upd `shouldBe` "ee457b5a:1"
+          tuCallbackData upd `shouldBe` Just "ee457b5a:1"
+          tuCallbackId upd `shouldBe` Just "371991640038127550"
+          tuCallbackMessageId upd `shouldBe` Just "1442"
+          tuChatId upd `shouldBe` "86611052"
+          conversationIdText (tuConversationId upd) `shouldBe` "tg:86611052"
+          userIdText (tuSender upd) `shouldBe` "86611052"
+        Left err -> expectationFailure ("unexpected Left: " <> T.unpack err)
+
+    it "parses a callback_query update with a Number id (backward compat)" $ do
+      let raw = object
+            [ "update_id" .= (101 :: Int)
+            , "callback_query" .= object
+                [ "id" .= (37199164 :: Int)
+                , "from" .= object [ "id" .= (86611052 :: Int) ]
+                , "message" .= object
+                    [ "chat" .= object [ "id" .= (86611052 :: Int) ]
+                    , "from" .= object [ "id" .= (8971756743 :: Int) ]
+                    , "message_id" .= (1442 :: Int)
+                    ]
+                , "data" .= ("deadbeef:0" :: Text)
+                ]
+            ]
+      case parseTelegramUpdate raw of
+        Right upd -> do
+          tuCallbackId upd `shouldBe` Just "37199164"
+          tuCallbackMessageId upd `shouldBe` Just "1442"
+        Left err -> expectationFailure ("unexpected Left: " <> T.unpack err)
+
+    it "rejects a callback_query missing the data field" $ do
+      let raw = object
+            [ "update_id" .= (102 :: Int)
+            , "callback_query" .= object
+                [ "id" .= ("123" :: Text)
+                , "from" .= object [ "id" .= (86611052 :: Int) ]
+                , "message" .= object
+                    [ "chat" .= object [ "id" .= (86611052 :: Int) ]
+                    , "from" .= object [ "id" .= (8971756743 :: Int) ]
+                    ]
+                ]
+            ]
+      parseTelegramUpdate raw `shouldSatisfy` isLeft
+
   describe "Seal.Channels.Telegram.Transport.chunkMessage" $ do
     it "empty input -> []" $
       chunkMessage 100 "" `shouldBe` []

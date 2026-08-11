@@ -54,4 +54,9 @@ data ChannelHandle = ChannelHandle
   -- ^ Pull the next inbound message from the channel's inbox, with its
   -- authenticated 'MessageSource'. Returns @(Nothing, "")@ when the inbox
   -- is empty (the caller may block or poll depending on the channel).
+  , chLastChatId  :: IO (Maybe Text)
+  -- ^ The last chat id the channel addressed a reply to (for transports
+  -- that need it, e.g. Telegram's @tgSendWithKeyboard@ which addresses a
+  -- chat by id). @Nothing@ for channels that address by user id (Signal)
+  -- or have no chat-id concept (CLI, web, fakes).
   }

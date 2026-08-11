@@ -57,6 +57,7 @@ instance Channel FakeChannel where
     , chStreaming    = fcStreaming fc
     , chReadSecret   = pure Nothing
     , chReceive      = popInbox fc
+    , chLastChatId   = pure Nothing
     }
 
 popPrompt :: FakeChannel -> IO (Either Deferral Text)

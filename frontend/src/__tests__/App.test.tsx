@@ -341,6 +341,78 @@ describe('App — send + branch', () => {
   })
 })
 
+// ── Tab name stability ──────────────────────────────────────────────────
+
+describe('App — tab name stability', () => {
+  it('tab name stays as the first message snippet when a second message is sent', async () => {
+    // Regression: the optimistic snippet overlay was unconditionally set on
+    // every send, so the tab name changed to the second message's snippet
+    // instead of staying as the first message's snippet. The fix: only
+    // set the snippet override when the session has no existing
+    // firstMessageSnippet, and don't let applySnippet override an existing
+    // backend-provided snippet.
+    let sessionsCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      if (url === '/api/agents') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers') return new globalThis.Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers/anthropic/models') return new globalThis.Response(JSON.stringify([{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      // Legacy three-poll path: /api/tabs + /api/sessions (no /api/lists).
+      if (url === '/api/tabs') {
+        return new globalThis.Response(JSON.stringify([
+          { index: 0, kind: 'session:anthropic', label: null, status: 'idle', session_id: 'sess-snippet', ext_modified: false, stale: false, attach_command: null },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/sessions' && method === 'GET') {
+        sessionsCalls++
+        // On the second poll (after first send), the backend provides
+        // firstMessageSnippet from the first user message.
+        const sess = sessionsCalls >= 2
+          ? makeSession({ id: 'sess-snippet', description: null, firstMessageSnippet: 'first message text' })
+          : makeSession({ id: 'sess-snippet', description: null, firstMessageSnippet: null })
+        return new globalThis.Response(JSON.stringify([sess]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/sessions/archived') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/harnesses') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/harnesses/discover') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url.includes('/transcript')) return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/sessions/sess-snippet/send' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ response: 'ok', kind: 'assistant' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/questions')) return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new globalThis.Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<App />)
+    // The tab appears in Active Tabs. Initially the session has no snippet,
+    // so the label falls back to the session ID prefix. Select it.
+    const tabRow = await screen.findByText('sess-snippet'.slice(0, 12))
+    fireEvent.click(tabRow)
+    // Type the first message + send.
+    let textarea = await screen.findByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: 'first message text' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.some((c) => c.url === '/api/sessions/sess-snippet/send')).toBe(true)
+    })
+    // Wait for the tab label to show the first message's snippet
+    // (optimistic overlay fills it immediately on send).
+    await waitFor(() => {
+      expect(screen.getByTitle('first message text')).toBeTruthy()
+    })
+    // Send a second message.
+    textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: 'second message text' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.filter((c) => c.url === '/api/sessions/sess-snippet/send').length).toBe(2)
+    })
+    // The tab label must still show the FIRST message's snippet, not the second.
+    expect(screen.getByTitle('first message text')).toBeTruthy()
+    expect(screen.queryByTitle('second message text')).toBeFalsy()
+  })
+})
+
 // ── Tab close preserves the focused session ─────────────────────────────
 // When the user closes a tab ABOVE the focused tab, the backend compacts the
 // remaining tab indices. The frontend must re-select the focused session's

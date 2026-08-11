@@ -16,6 +16,7 @@ import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM
   (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
+import Control.Monad (void)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -57,6 +58,7 @@ instance Channel TelegramChannel where
     , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
     , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
+    , chLastChatId   = readIORef (tcgLastChat ch)
     }
 
 -- | Run the reader thread with cleanup. Spawns a background thread that
@@ -122,6 +124,16 @@ readerLoop ch = go
           if isAllowed sender (tcgAllowList ch)
             then do
               writeIORef (tcgLastChat ch) (Just (tuChatId upd))
+              -- Acknowledge a callback_query (button tap) so the button's
+              -- loading spinner dismisses, and remove the inline keyboard
+              -- so the buttons can't be re-clicked. Both best-effort.
+              case tuCallbackId upd of
+                Just cbId -> do
+                  void (try @SomeException (tgAnswerCallback (tcgTransport ch) cbId))
+                  case tuCallbackMessageId upd of
+                    Just msgId -> void (try @SomeException (tgEditReplyMarkup (tcgTransport ch) (tuChatId upd) msgId))
+                    Nothing    -> pure ()
+                Nothing   -> pure ()
               case mkMessageSource (tuConversationId upd) Telegram (Just sender) mempty of
                 Left err -> logIO logger WarningS ("MessageSource construction failed: " <> ls err)
                 Right ms -> atomically (writeTQueue (tcgInbox ch) (ms, tuBody upd))

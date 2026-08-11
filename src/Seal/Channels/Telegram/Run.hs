@@ -8,28 +8,35 @@
 module Seal.Channels.Telegram.Run
   ( runTelegram
   , runTelegramMain
+  , mkTelegramHandleCaps
+  , onTelegramCallback
   ) where
 
 import Data.Char (isDigit)
 import Data.Either (fromRight)
 import Data.IORef (newIORef)
+import Data.Default (def)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR (decimal)
+import Data.Vector qualified as V
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
 
-import Seal.Channel.Caps (ChannelCaps)
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Core.Types (SessionId)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier, mkHandleCaps)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
 import Seal.Handles.AskReply
-  ( AskReplyStore, newApprovalCache, newAskReplyStore
-  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix )
+  ( AskId, AskReplyStore, newApprovalCache, newAskReplyStore
+  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix
+  , askHumanWithOptions, askIdText, pendingForSession, pqiId, pqiOptions
+  , QuestionOption (..), formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Channels.Telegram.Transport
-  ( TelegramTransport (..), mkRealTelegramTransport, tgSetCommands )
+  ( TelegramTransport (..), TelegramButton (..), mkRealTelegramTransport, tgSetCommands )
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
@@ -81,7 +88,7 @@ runTelegram deps registry chain (token, chunkLimit, allow) askReply = do
   -- Register the bot's slash-command menu with BotFather for auto-completion.
   tgSetCommands transport (telegramBotCommands registry)
   let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
-      plainHandler h = plainTurn deps h askReply
+      plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))
   tabsH <- newTabsHandle
   runChannelLoop deps withCh plainHandler registry chain askReply tabsH
     (Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply))
@@ -193,36 +200,108 @@ tryOpenVault paths cfg logger =
           Just <$> Vault.openVault vcfg enc
     _ -> pure Nothing
 
--- | Build a 'ChannelCaps' for the Telegram channel. For v1, this uses the
--- same numbered-list rendering as Signal/CLI ('formatQuestionWithOptions'
--- via 'chSend h'). The inline keyboard ('tgSendWithKeyboard') is deferred
--- to a follow-up: the 'ChannelHandle' doesn't expose the raw Telegram chat
--- id (needed for 'tgSendWithKeyboard'), and 'answerCallbackQuery' is also
--- deferred (the 'callback_query_id' is not threaded through
--- 'chReceive'). The 'onTelegramCallback' hook (below) IS wired so that
--- callback_data from a button tap (if a keyboard is ever sent) routes
--- by-id. The inline keyboard + answerCallbackQuery will be added in a
--- follow-up that threads the chat id + callback_query_id through the
--- channel handle.
+-- | Build a 'ChannelCaps' for the Telegram channel. When the 'AskPrompt'
+-- has non-empty options AND the handle has a last chat id, 'ccPrompt' sends
+-- the question + a numbered list of options (with descriptions) as the
+-- message body, with an inline keyboard (one button per option + an
+-- "Other" free-text button) attached. The message body carries the full
+-- option text + descriptions (Telegram button labels are too short for
+-- descriptions); the buttons carry just the short labels for tap
+-- convenience. 'answerCallbackQuery' shows a toast on tap; the loop also
+-- sends a persistent "✓ <label>" confirmation after delivery. When the
+-- options are empty OR no chat id is known, it falls back to the generic
+-- numbered-list rendering via 'chSend' + 'formatQuestionWithOptions'.
 mkTelegramHandleCaps :: TelegramTransport -> ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
-mkTelegramHandleCaps _transport = mkHandleCaps
+mkTelegramHandleCaps transport h askReply sid = def
+  { ccSend         = chSend h
+  , ccPrompt       = \ap -> do
+      let AskPrompt q opts = ap
+      mChat <- chLastChatId h
+      case (mChat, opts) of
+        (Just chatId, _ : _) -> do
+          outcome <- askHumanWithOptions askReply sid q opts (sendKeyboard chatId q opts)
+          pure (fromRight "" outcome)
+        _ -> do
+          -- Empty options OR no chat id: fall back to the numbered list.
+          chSend h (formatQuestionWithOptions q opts)
+          outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
+          pure (fromRight "" outcome)
+  , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+  , ccStreaming    = chStreaming h
+  }
+  where
+    -- | The notify callback: sends the question + option descriptions as
+    -- the message body, with the inline keyboard (short labels only)
+    -- attached. The 8-hex prefix of the 'AskId' ties the buttons to this
+    -- specific pending ask.
+    sendKeyboard :: Text -> Text -> [QuestionOption] -> AskId -> IO ()
+    sendKeyboard chatId q opts qid =
+      let prefix = T.take 8 (askIdText qid)
+          body = formatQuestionWithOptions q opts
+      in tgSendWithKeyboard transport chatId body (buildKeyboard prefix opts)
+
+-- | Build the inline keyboard: one row per option (button label = the
+-- option's 'qoLabel', callback_data = @\"<prefix>:<idx>\"@). No "Other"
+-- free-text button (Telegram has no inline free-text input; the user can
+-- still type a free-text answer as a regular message, which the loop
+-- routes via 'deliverNextAnswerResolved' when no pending callback match
+-- is found). Pure. The callback_data is always ≤ 64 bytes (8 hex + 1
+-- colon + ≤ 1 char for the index = ≤ 10 bytes).
+buildKeyboard :: Text -> [QuestionOption] -> [[TelegramButton]]
+buildKeyboard prefix opts =
+  [ [TelegramButton (qoLabel o) (prefix <> ":" <> T.pack (show i))]
+  | (i, o) <- zip [0 :: Int ..] opts
+  ]
 
 -- | The callback handler for Telegram: parses the @callback_data@
--- (@\"<8hex>:<label>\"@), finds the pending ask by the 8-hex prefix, and
--- delivers the label by-id via 'deliverAnswer'. Returns 'True' if the body
--- was a callback + delivered; 'False' if not (fall through to
--- 'deliverNextAnswerResolved').
-onTelegramCallback :: AskReplyStore -> SessionId -> Text -> IO Bool
-onTelegramCallback store sid body =
+-- (@\"<8hex>:<token>\"@), where @token@ is either a decimal index (the
+-- tapped option button) or @other@ (the Other free-text button). For an
+-- index, finds the pending ask by the 8-hex prefix, resolves the index to
+-- the option's label via the pending ask's 'pqiOptions', and delivers it
+-- by-id via 'deliverAnswer'. Sends a persistent "✓ <label>" confirmation
+-- to the chat via 'chSend' so the user sees their tap was registered (the
+-- LLM may take time to respond). A stale @:other@ token (from a legacy
+-- keyboard that had an "Other" button) falls through to 'False'. Returns
+-- 'True' if a callback was delivered; 'False' if not (fall through).
+--
+-- The 'AskReplyStore' is the first arg so the caller can partially apply
+-- it; the 'runChannelLoop' 'onCallback' hook supplies the 'ChannelHandle'.
+onTelegramCallback :: AskReplyStore -> ChannelHandle -> SessionId -> Text -> IO Bool
+onTelegramCallback store h sid body =
   case T.splitOn ":" body of
-    [prefix, label]
-      | T.length prefix == 8 && T.all isHexChar prefix -> do
-          mQid <- findByAskIdPrefix store sid prefix
-          case mQid of
-            Just qid -> do
-              _accepted <- deliverAnswer store qid (AskReply ScopeOnce label)
-              pure True
-            Nothing -> pure False
+    [prefix, token]
+      | T.length prefix == 8 && T.all isHexChar prefix ->
+          case parseIndex token of
+            Just idx -> resolveIndex h store sid prefix idx
+            Nothing  -> pure False  -- non-numeric (e.g. legacy "other"): fall through
     _ -> pure False
   where
     isHexChar c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+-- | Parse a non-negative decimal index from the callback token. 'Nothing'
+-- if the token is not a clean decimal (e.g. empty, negative, or has
+-- trailing chars).
+parseIndex :: Text -> Maybe Int
+parseIndex t =
+  case TR.decimal (T.strip t) of
+    Right (n, rest) | T.null rest && n >= 0 -> Just n
+    _ -> Nothing
+
+-- | Resolve a callback index to the option's label + deliver it by-id,
+-- then send a "✓ <label>" confirmation to the chat.
+resolveIndex :: ChannelHandle -> AskReplyStore -> SessionId -> Text -> Int -> IO Bool
+resolveIndex h store sid prefix idx = do
+  mQid <- findByAskIdPrefix store sid prefix
+  case mQid of
+    Nothing -> pure False
+    Just qid -> do
+      ps <- pendingForSession store sid
+      case filter (\p -> pqiId p == qid) ps of
+        (p : _) ->
+          case V.fromList (pqiOptions p) V.!? idx of
+            Just o  -> do
+              _accepted <- deliverAnswer store qid (AskReply ScopeOnce (qoLabel o))
+              chSend h ("✓ " <> qoLabel o)
+              pure True
+            Nothing -> pure False  -- out of bounds
+        [] -> pure False  -- stale (ask vanished between the two lookups)
