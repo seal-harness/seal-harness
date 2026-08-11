@@ -340,7 +340,7 @@ runChannelLoop
   -> AskReplyStore
   -> TabsHandle
   -> Maybe (ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps)
-  -> Maybe (SessionId -> Text -> IO Bool)
+  -> Maybe (ChannelHandle -> SessionId -> Text -> IO Bool)
   -> IO ()
 runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCaps onCallback =
   withChannel $ \ch -> do
@@ -397,7 +397,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
           -- the loop. Otherwise, fall through to deliverNextAnswerResolved.
           mCallbackHandled <- case onCallback of
             Nothing -> pure False
-            Just cb -> cb sid body
+            Just cb -> cb h sid body
           delivered <-
             if mCallbackHandled
               then pure True

@@ -158,9 +158,12 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
       kbs <- waitForKeyboard getKb 100
       length kbs `shouldBe` 1
       case kbs of
-        [(kbChat, body, keyboard)] -> do
-          kbChat `shouldBe` chatId
-          body `shouldBe` "which branch?"
+        [(_, body, keyboard)] -> do
+          -- The body is the question + numbered list with descriptions
+          -- (formatQuestionWithOptions); the keyboard has short labels.
+          body `shouldSatisfy` T.isPrefixOf "which branch?"
+          body `shouldSatisfy` T.isInfixOf "1) main"
+          body `shouldSatisfy` T.isInfixOf "2) develop"
           length keyboard `shouldBe` 3  -- 2 options + 1 Other
           map length keyboard `shouldBe` [1, 1, 1]
           case keyboard of
@@ -225,48 +228,65 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
   -- -----------------------------------------------------------------------
   describe "onTelegramCallback" $ do
 
-    it "resolves <8hex>:<idx> to the option label and delivers it" $ do
+    it "resolves <8hex>:<idx> to the option label and delivers it + sends confirmation" $ do
       store <- newAskReplyStore 0
-      let opts = [opt "main", opt "develop"]
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+          opts = [opt "main", opt "develop"]
       (waitDone, prefix) <- forkAskWithOptions store sid "which branch?" opts
       -- Tap button 0 (the "main" option).
-      res <- onTelegramCallback store sid (prefix <> ":0")
+      res <- onTelegramCallback store h sid (prefix <> ":0")
       res `shouldBe` True
+      -- A "✓ main" confirmation was sent to the chat.
+      sends <- reverse <$> readIORef sendRef
+      sends `shouldBe` ["✓ main"]
       -- The ask unblocked with "main".
       waitDone
 
-    it "<8hex>:other returns False without delivering" $ do
+    it "<8hex>:other returns False without delivering + sends type-your-answer hint" $ do
       store <- newAskReplyStore 0
-      let opts = [opt "main", opt "develop"]
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+          opts = [opt "main", opt "develop"]
       (waitDone, prefix) <- forkAskWithOptions store sid "which branch?" opts
-      res <- onTelegramCallback store sid (prefix <> ":other")
+      res <- onTelegramCallback store h sid (prefix <> ":other")
       res `shouldBe` False
+      sends <- reverse <$> readIORef sendRef
+      sends `shouldBe` ["✏️ Type your answer…"]
       -- Clean up: deliver an answer so the forked thread unblocks.
       deliverFirstPending store sid
       waitDone
 
     it "out-of-bounds index returns False without delivering" $ do
       store <- newAskReplyStore 0
-      let opts = [opt "main", opt "develop"]
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+          opts = [opt "main", opt "develop"]
       (waitDone, prefix) <- forkAskWithOptions store sid "which branch?" opts
-      res <- onTelegramCallback store sid (prefix <> ":99")
+      res <- onTelegramCallback store h sid (prefix <> ":99")
       res `shouldBe` False
       deliverFirstPending store sid
       waitDone
 
     it "stale prefix returns False" $ do
       store <- newAskReplyStore 0
-      res <- onTelegramCallback store sid "deadbeef:0"
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+      res <- onTelegramCallback store h sid "deadbeef:0"
       res `shouldBe` False
 
     it "malformed callback body (no colon) returns False" $ do
       store <- newAskReplyStore 0
-      res <- onTelegramCallback store sid "noColonHere"
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+      res <- onTelegramCallback store h sid "noColonHere"
       res `shouldBe` False
 
     it "malformed callback body (non-hex prefix) returns False" $ do
       store <- newAskReplyStore 0
-      res <- onTelegramCallback store sid "zzzzzzzz:0"
+      sendRef <- newIORef []
+      let h = testHandle (Just chatId) sendRef
+      res <- onTelegramCallback store h sid "zzzzzzzz:0"
       res `shouldBe` False
 
     prop "prop_callbackDataWithin64Bytes: <8hex>:<idx|other> is <= 64 chars"
