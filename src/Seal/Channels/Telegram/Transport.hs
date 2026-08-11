@@ -206,12 +206,16 @@ mkRealTelegramTransport token mgr = do
               fillAndReceive buffer offsetRef
 
 -- | Call @getUpdates@ with long-polling (30s timeout). Returns the parsed
--- updates as @(update_id, TelegramUpdate)@ pairs — non-message updates
--- (edited messages, callbacks, etc.) are skipped.
+-- updates as @(update_id, TelegramUpdate)@ pairs — @message@ and
+-- @callback_query@ updates are parsed; other update types are skipped.
+-- Explicitly requests @message@ + @callback_query@ via @allowed_updates@
+-- so button taps are delivered (without this, Telegram uses the previous
+-- setting, which may exclude @callback_query@).
 getUpdates :: Manager -> Text -> Int -> IO (Either Text [(Int, TelegramUpdate)])
 getUpdates mgr token offset = do
   let url = T.unpack (telegramApiBase <> token <> "/getUpdates")
              <> "?offset=" <> show offset <> "&timeout=30"
+             <> "&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
   eReq <- try @SomeException (parseRequest url)
   case eReq of
     Left ex -> pure (Left ("getUpdates request error: " <> T.pack (show ex)))
