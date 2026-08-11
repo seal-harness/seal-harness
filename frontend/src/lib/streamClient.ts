@@ -15,6 +15,7 @@
 
 import type {
   ActivityEvent,
+  AskPayload,
   ClientOp,
   ListsSnapshot,
   ServerEvent,
@@ -49,7 +50,7 @@ class StreamClientImpl implements StreamClient {
   private entryListeners = new Set<(e: TranscriptEntry) => void>()
   private activityListeners = new Set<(sid: string, a: ActivityEvent) => void>()
   private listsListeners = new Set<(snapshot: ListsSnapshot) => void>()
-  private askListeners = new Set<(sid: string, ask: { id: string; question: string }) => void>()
+  private askListeners = new Set<(sid: string, ask: AskPayload) => void>()
   private askResolvedListeners = new Set<(sid: string, ask: { id: string; resolution: string }) => void>()
   private agentDefsChangedListeners = new Set<() => void>()
   private skillsChangedListeners = new Set<() => void>()
@@ -112,7 +113,7 @@ class StreamClientImpl implements StreamClient {
     }
   }
 
-  onAsk(cb: (sid: string, ask: { id: string; question: string }) => void): () => void {
+  onAsk(cb: (sid: string, ask: AskPayload) => void): () => void {
     this.askListeners.add(cb)
     return () => {
       this.askListeners.delete(cb)

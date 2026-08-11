@@ -2,8 +2,12 @@
 module Seal.Gateway.SendSpec (spec) where
 
 import Control.Exception (catch, SomeException)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (concurrently)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Data.Either (isLeft)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Text.Encoding qualified as TE
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -12,14 +16,21 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Channel.Cli (newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
-import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend)
+import Seal.Gateway.Send
+  ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
+  , handleAnswerTextDelivery, parseAnswerBody )
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
-import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
+import Seal.Handles.AskReply
+  ( QuestionOption (..), deliverAnswer, newAskReplyStore
+  , newApprovalCache, pendingForSession, PendingQuestionInfo (..)
+  , AskReply (..), ApprovalScope (..), askIdText, askHumanWithOptions )
+import Data.ByteString.Lazy qualified as BL
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -309,3 +320,72 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
         snap <- snapshotTabs tabsH
         tabCount snap `shouldBe` 0
+
+  describe "webAskCaps" $ do
+    it "ccPrompt with options registers a pending ask carrying the options" $ do
+      store <- newAskReplyStore 0
+      let sid = mkSid "ask-opts"
+          caps = webAskCaps Nothing store sid
+          opts = [ QuestionOption "main" "the default branch"
+                 , QuestionOption "develop" "the integration branch"
+                 ]
+      -- Fork the ccPrompt call (it blocks until the answer is delivered).
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _reply <- ccPrompt caps (AskPrompt "which branch?" opts)
+        putMVar done ()
+      threadDelay 10000
+      -- The pending ask should carry the options.
+      ps <- pendingForSession store sid
+      length ps `shouldBe` 1
+      case ps of
+        [info] -> do
+          info `shouldSatisfy` (not . T.null . pqiQuestion)
+          pqiQuestion info `shouldBe` "which branch?"
+          pqiOptions info `shouldBe` opts
+          -- Deliver an answer to unblock the forked thread.
+          _accepted <- deliverAnswer store (pqiId info) (AskReply ScopeOnce "main")
+          pure ()
+        _ -> expectationFailure "expected exactly one pending ask"
+      takeMVar done
+
+  describe "parseAnswerBody" $ do
+    it "accepts {scope: once} → Left (Left ScopeOnce)" $
+      parseAnswerBody (BL.fromStrict (TE.encodeUtf8 "{\"scope\":\"once\"}"))
+        `shouldBe` Right (Left ScopeOnce)
+    it "accepts {answer: main} → Left (Right main)" $
+      parseAnswerBody (BL.fromStrict (TE.encodeUtf8 "{\"answer\":\"main\"}"))
+        `shouldBe` Right (Right "main")
+    it "rejects {scope, answer} (both) → Left" $
+      parseAnswerBody (BL.fromStrict (TE.encodeUtf8 "{\"scope\":\"once\",\"answer\":\"main\"}"))
+        `shouldSatisfy` isLeft
+    it "rejects {} (neither) → Left" $
+      parseAnswerBody (BL.fromStrict (TE.encodeUtf8 "{}"))
+        `shouldSatisfy` isLeft
+
+  describe "handleAnswerTextDelivery" $ do
+    it "delivers a text answer to a pending ASK_HUMAN question" $ do
+      withSystemTempDirectory "ask-text" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache"
+              }
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        let sid = mkSid "ask-text"
+            store = sdAskReply baseDeps
+            opts = [QuestionOption "main" "the default branch"]
+        -- Register a pending ask with options.
+        done <- newEmptyMVar
+        _ <- forkIO $ do
+          _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+          putMVar done ()
+        threadDelay 10000
+        ps <- pendingForSession store sid
+        case ps of
+          [info] -> do
+            let qidText = askIdText (pqiId info)
+            res <- handleAnswerTextDelivery baseDeps sid qidText "main"
+            res `shouldBe` Right True
+          _ -> expectationFailure "expected one pending ask"
+        takeMVar done

@@ -35,6 +35,7 @@ module Seal.Channels.Loop
   ( ChannelDeps (..)
   , newChannelDeps
   , runChannelLoop
+  , mkHandleCaps
   , handleTabCommand
   , plainTurn
   , buildIsaRegistry
@@ -69,7 +70,7 @@ import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv
@@ -97,7 +98,9 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, askHuman, deliverNextAnswer )
+  ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
+  , formatQuestionWithOptions
+  )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
@@ -317,6 +320,15 @@ buildChannelRegistry skillBackend bgRunner callDispatcher registry =
 -- 'Seal.Routing.Route', and dispatches. Each conversation resolves its
 -- session via the cursor store (not a shared active-session ref). On
 -- first message from a conversation, a new tab + session is created.
+--
+-- The optional 'mkCaps' factory overrides the default 'mkHandleCaps'
+-- (e.g. Telegram's inline-keyboard 'ccPrompt'). 'Nothing' = use
+-- 'mkHandleCaps' (Signal + the generic numbered list).
+--
+-- The optional 'onCallback' hook is called before
+-- 'deliverNextAnswerResolved' — Telegram uses it to route callback_query
+-- button taps by 'AskId' (by-id delivery, NOT FIFO). 'Nothing' = no
+-- callback support (the body goes straight to 'deliverNextAnswerResolved').
 runChannelLoop
   :: (Channel c)
   => ChannelDeps
@@ -326,8 +338,10 @@ runChannelLoop
   -> PreprocessChain
   -> AskReplyStore
   -> TabsHandle
+  -> Maybe (ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps)
+  -> Maybe (SessionId -> Text -> IO Bool)
   -> IO ()
-runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
+runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCaps onCallback =
   withChannel $ \ch -> do
     let h = toHandle ch
     -- A mutable cell holding the originating conversation's active session
@@ -372,15 +386,27 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
               | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
           let sid = smId meta
           -- Record the conversation's active session so the /bg runner
-          -- (dispatched below if this turn is a /bg) keys its
-          -- confirmation ask to this sid. Updated every turn, before any
-          -- slash-command dispatch.
+          -- (dispatched below if this turn is a /bg) keys its confirmation
+          -- ask to this sid. Updated every turn, before any slash-command
+          -- dispatch.
           writeIORef bgConvSid sid
-          delivered <- deliverNextAnswer askReply sid body
+          -- For channels with callback support (Telegram), try the
+          -- onCallback hook first (by-id delivery for button taps). If it
+          -- returns True, the body was a callback + delivered; continue
+          -- the loop. Otherwise, fall through to deliverNextAnswerResolved.
+          mCallbackHandled <- case onCallback of
+            Nothing -> pure False
+            Just cb -> cb sid body
+          delivered <-
+            if mCallbackHandled
+              then pure True
+              else snd <$> deliverNextAnswerResolved askReply sid body
           if delivered
             then loop h reg bgConvSid
             else do
-              let handleCaps = mkHandleCaps h askReply sid
+              let handleCaps = case mkCaps of
+                    Nothing -> mkHandleCaps h askReply sid
+                    Just f  -> f h askReply sid
               case Route.route body of
                 Right (Route.Focus idx) -> do
                   _ <- focusTabH tabsH idx
@@ -430,8 +456,9 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH =
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
-  , ccPrompt       = \q -> do
-      outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+  , ccPrompt       = \(AskPrompt q opts) -> do
+      chSend h (formatQuestionWithOptions q opts)
+      outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
   , ccStreaming    = chStreaming h

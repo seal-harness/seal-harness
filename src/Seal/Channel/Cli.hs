@@ -40,7 +40,7 @@ import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
@@ -118,8 +118,8 @@ import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel 
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, deliverNextAnswerAny, askHuman
-  , newApprovalCache )
+  ( ApprovalCache, AskReplyStore, deliverNextAnswerResolvedAny
+  , askHumanWithOptions, formatQuestionWithOptions, newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
@@ -313,9 +313,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = def
         { ccSend         = putStrLn . T.unpack
-        , ccPrompt       = \prompt ->
+        , ccPrompt       = \(AskPrompt prompt opts) ->
             runInputT innerSettings $ do
-              mLine <- getInputLine (T.unpack prompt)
+              mLine <- getInputLine (T.unpack (formatQuestionWithOptions prompt opts))
               pure (maybe "" T.pack mLine)
         , ccPromptSecret = \prompt ->
             runInputT innerSettings $ do
@@ -620,8 +620,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
           let bgCaps = def
                 { ccSend = ccSend caps
-                , ccPrompt = \q -> do
-                    outcome <- askHuman askReply bgSid q (\_qid -> ccSend caps q)
+                , ccPrompt = \(AskPrompt q opts) -> do
+                    outcome <- askHumanWithOptions askReply bgSid q opts
+                                 (\_qid -> ccSend caps (formatQuestionWithOptions q opts))
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
                 }
@@ -713,7 +714,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           -- the inbox-driven channels run at the top of their loop, but is
           -- session-agnostic because the CLI has one input stream serving
           -- the active session plus any /bg background sessions.
-          delivered <- liftIO $ deliverNextAnswerAny askReply (T.pack line)
+          (_resolved, delivered) <- liftIO $ deliverNextAnswerResolvedAny askReply (T.pack line)
           if delivered
             then loop caps plainHandler th reg
             else do

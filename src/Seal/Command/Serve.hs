@@ -383,7 +383,7 @@ forkSignalListener deps cfg registry =
           askReply <- newAskReplyStore 0
           let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
               plainHandler h = plainTurn deps h askReply
-          _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
+          _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH Nothing Nothing)
           pure ()
 
 -- | Fork the Telegram channel listener if @[telegram]@ is configured.
@@ -419,5 +419,5 @@ forkTelegramListener deps cfg registry = do
       askReply <- newAskReplyStore 0
       let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
-      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH)
+      _ <- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH Nothing Nothing)
       pure ()

@@ -99,11 +99,21 @@ export interface ListsEvent {
 /** A pending human-confirmation question from an Untrusted opcode (SHELL_EXEC,
  *  BIN_EXEC, etc.) under Supervised autonomy, or from ASK_HUMAN. The agent
  *  loop is blocked until the human answers via POST .../questions/:qid/answer
- *  or cancels via POST .../questions/:qid/cancel. */
+ *  or cancels via POST .../questions/:qid/cancel. `options` is present when
+ *  ASK_HUMAN offered discrete choices (the frontend renders one button per
+ *  option + an "Other" textarea); absent for open-ended questions + the
+ *  confirmation gate. */
+export interface AskPayload {
+  id: string
+  question: string
+  options?: import('../hooks/useApi').QuestionOption[]
+  meta?: unknown
+}
+
 export interface AskEvent {
   type: 'ask'
   sessionId: string
-  ask: { id: string; question: string }
+  ask: AskPayload
 }
 
 /** A pending question was answered or cancelled; the frontend should dismiss
@@ -178,7 +188,7 @@ export interface StreamClient {
   /** Subscribe to status changes. */
   onStatusChange(cb: (s: StreamStatus) => void): () => void
   /** Subscribe to pending human-confirmation questions (ASK_HUMAN / Untrusted opcode gate). */
-  onAsk(cb: (sessionId: string, ask: { id: string; question: string }) => void): () => void
+  onAsk(cb: (sessionId: string, ask: AskPayload) => void): () => void
   /** Subscribe to question-resolved events (answer delivered or cancelled). */
   onAskResolved(cb: (sessionId: string, ask: { id: string; resolution: string }) => void): () => void
   /** Subscribe to agent-defs-changed invalidation signals (re-fetch /api/agents). */

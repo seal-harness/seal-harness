@@ -47,12 +47,20 @@ module Seal.Handles.AskReply
   , deliverAnswer
   , deliverNextAnswer
   , deliverNextAnswerAny
+  , deliverNextAnswerResolved
+  , deliverNextAnswerResolvedAny
+  , findByAskIdPrefix
   , cancelAsk
   , cancelSessionAsks
   , pendingForSession
   , lookupAsk
   , checkApproval
   , recordApproval
+  , QuestionOption (..)
+  , validateOptions
+  , askHumanWithOptions
+  , PendingQuestionInfo (..)
+  , formatQuestionWithOptions
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -60,16 +68,20 @@ import Control.Concurrent.STM
   ( TMVar, TVar, atomically, modifyTVar', newEmptyTMVarIO, newTVarIO, readTVar, readTVarIO
   , takeTMVar, tryPutTMVar, writeTVar, tryReadTMVar )
 import Control.Monad (void)
-import Data.Aeson (Value, ToJSON (..))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.!=), (.=))
+import Data.Aeson.Key (fromText)
 import Data.Bits ((.&.), (.|.), complement)
+import Data.ByteString qualified as BS
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.List (sortBy)
+import Data.List (nub, sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR (decimal)
 import Data.Time (UTCTime, getCurrentTime)
 import Data.UUID.Types qualified as U
 import Data.Word (Word64)
@@ -156,8 +168,93 @@ data AskReply = AskReply
   , arText  :: Text
   } deriving stock (Eq, Show)
 
+-- | One discrete choice offered to the human alongside an @ASK_HUMAN@
+-- question. The 'qoLabel' is the value returned to the agent when the human
+-- picks this choice; the 'qoDescription' is a one-line explanation shown
+-- alongside the button (may be empty). Labels MUST be non-empty, ≤ 64
+-- bytes (UTF-8), and unique within one question's offer set — enforced by
+-- 'validateOptions'.
+data QuestionOption = QuestionOption
+  { qoLabel       :: !Text
+  , qoDescription :: !Text
+  } deriving stock (Eq, Show, Generic)
+
+-- | ToJSON for 'QuestionOption' — encodes as @{label, description}@ (the
+-- 'qo' field prefix stripped so the wire shape matches the LLM schema + the
+-- frontend 'QuestionOption' type).
+instance ToJSON QuestionOption where
+  toJSON (QuestionOption lbl desc) = object
+    [ fromText "label" .= lbl
+    , fromText "description" .= desc
+    ]
+
+-- | FromJSON for 'QuestionOption' — decodes from @{label, description}@.
+-- 'description' defaults to empty when absent.
+instance FromJSON QuestionOption where
+  parseJSON = withObject "QuestionOption" $ \o -> QuestionOption
+    <$> o .: fromText "label"
+    <*> o .:? fromText "description" .!= ""
+
+-- | Validate a list of 'QuestionOption's for an @ASK_HUMAN@ invocation.
+-- Pure (no IO); returns 'Right' the validated list on success, 'Left' an
+-- error message on failure. Rules:
+--
+-- 1. Non-empty list (1 ≤ length).
+-- 2. At most 8 options.
+-- 3. Each 'qoLabel' non-empty and ≤ 64 bytes (UTF-8; 'Data.Text.length'
+--    counts code points, so we measure bytes explicitly to bound non-ASCII).
+-- 4. Each 'qoDescription' ≤ 200 chars.
+-- 5. Labels unique within the list (case-sensitive).
+validateOptions :: [QuestionOption] -> Either Text [QuestionOption]
+validateOptions [] = Left "options must be non-empty"
+validateOptions opts
+  | length opts > 8 = Left "options must be at most 8"
+  | otherwise = case foldr checkOpt (Right []) opts of
+      Left e -> Left e
+      Right _ ->
+        let labels = map qoLabel opts
+        in if length labels /= length (nub labels)
+             then Left "option labels must be unique"
+             else Right opts
+  where
+    checkOpt _ (Left e) = Left e
+    checkOpt opt@(QuestionOption lbl desc) (Right acc)
+      | T.null lbl          = Left "option label must be non-empty"
+      | labelBytes > 64     = Left ("option label exceeds 64 bytes: " <> lbl)
+      | T.length desc > 200 = Left ("option description exceeds 200 chars: " <> qoLabel opt)
+      | otherwise           = Right (opt : acc)
+      where
+        labelBytes = BS.length (TE.encodeUtf8 lbl)
+
+-- | Format a question + its options as a numbered list for chat channels
+-- (Signal, CLI TUI). When the options are non-empty, the format is:
+--
+-- @
+-- \<question\>
+--
+-- 1) main — the default branch
+-- 2) develop — ...
+--
+-- Reply with a number or type your own answer.
+-- @
+--
+-- When the options are empty, just the question text (today's behavior).
+-- Pure (no IO).
+formatQuestionWithOptions :: Text -> [QuestionOption] -> Text
+formatQuestionWithOptions question [] = question
+formatQuestionWithOptions question opts =
+  question
+  <> "\n\n"
+  <> T.intercalate "\n" (zipWith formatLine [1 :: Int ..] opts)
+  <> "\n\nReply with a number or type your own answer."
+  where
+    formatLine n (QuestionOption lbl desc)
+      | T.null desc = T.pack (show n <> ") ") <> lbl
+      | otherwise   = T.pack (show n <> ") ") <> lbl <> " — " <> desc
+
 -- | One pending question: the session it belongs to, the question text, the
 -- timestamp it was minted, optional metadata (opcode name + input for the
+-- confirmation gate), the offered options (for @ASK_HUMAN@; empty for the
 -- confirmation gate), and the answer slot. The slot carries 'Left' on
 -- cancel/timeout, 'Right' on a delivered answer.
 data PendingAsk = PendingAsk
@@ -166,8 +263,21 @@ data PendingAsk = PendingAsk
   , paQuestion  :: Text
   , paCreatedAt :: UTCTime
   , paMeta      :: Maybe Value  -- ^ opcode name + input (for the confirmation gate); Nothing for ASK_HUMAN
+  , paOptions   :: [QuestionOption]  -- ^ offered options (for ASK_HUMAN); empty for open-ended + the confirmation gate
   , paSlot      :: TMVar (Either AskOutcome AskReply)
   }
+
+-- | A read-only view of a pending question for medium rendering (the web
+-- frontend polls this via GET @/api/sessions/:id/questions@; the WS @ask@
+-- event carries the same fields). Does /not/ expose the answer slot.
+data PendingQuestionInfo = PendingQuestionInfo
+  { pqiId        :: !AskId
+  , pqiSession   :: !SessionId
+  , pqiQuestion  :: !Text
+  , pqiCreatedAt :: !UTCTime
+  , pqiMeta      :: !(Maybe Value)
+  , pqiOptions   :: ![QuestionOption]
+  } deriving stock (Eq, Show)
 
 -- | The shared, in-process store. STM-backed: a 'TVar' of pending questions
 -- keyed by 'AskId'. The timeout (microseconds; 0 = block indefinitely) bounds
@@ -239,7 +349,7 @@ askHuman
   -> (AskId -> IO ())  -- ^ the medium-specific notify callback
   -> IO (Either AskOutcome Text)
 askHuman store sid question notify = do
-  r <- askHumanWithMeta store sid question Nothing notify
+  r <- askHumanCore store sid question Nothing [] notify
   pure (case r of
     Left o   -> Left o
     Right ar -> Right (arText ar))
@@ -255,12 +365,43 @@ askHumanWithMeta
   -> Maybe Value   -- ^ optional metadata (opcode name + input)
   -> (AskId -> IO ())  -- ^ the medium-specific notify callback
   -> IO (Either AskOutcome AskReply)
-askHumanWithMeta store sid question meta notify = do
+askHumanWithMeta store sid question meta =
+  askHumanCore store sid question meta []
+
+-- | Like 'askHuman' but carries the offered 'QuestionOption's in the
+-- 'PendingAsk'. The options are surfaced in the WS @ask@ event + the
+-- @GET .../questions@ REST route so the frontend can render one button per
+-- option. The @notify@ callback fires before the blocking wait so the medium
+-- can surface the question + options immediately. Returns the human's typed
+-- reply (a chosen option's label or a free-text "Other" reply).
+askHumanWithOptions
+  :: AskReplyStore
+  -> SessionId
+  -> Text              -- ^ the question text
+  -> [QuestionOption]  -- ^ the offered options (validated by the opcode before this call)
+  -> (AskId -> IO ())  -- ^ the medium-specific notify callback
+  -> IO (Either AskOutcome Text)
+askHumanWithOptions store sid question opts notify = do
+  r <- askHumanCore store sid question Nothing opts notify
+  pure (case r of
+    Left o   -> Left o
+    Right ar -> Right (arText ar))
+
+-- | The shared core for 'askHuman'/'askHumanWithMeta'/'askHumanWithOptions'.
+askHumanCore
+  :: AskReplyStore
+  -> SessionId
+  -> Text              -- ^ the question text
+  -> Maybe Value       -- ^ optional metadata (opcode name + input)
+  -> [QuestionOption]  -- ^ offered options (empty for open-ended + the confirmation gate)
+  -> (AskId -> IO ())  -- ^ the medium-specific notify callback
+  -> IO (Either AskOutcome AskReply)
+askHumanCore store sid question meta opts notify = do
   qid <- newAskId
   slot <- newEmptyTMVarIO
   now <- getCurrentTime
   let pa = PendingAsk { paId = qid, paSession = sid, paQuestion = question
-                      , paCreatedAt = now, paMeta = meta, paSlot = slot }
+                      , paCreatedAt = now, paMeta = meta, paOptions = opts, paSlot = slot }
   atomically (modifyTVar' (arsPending store) (Map.insert qid pa))
   notify qid
   timeoutUs <- readIORef (arsTimeoutUs store)
@@ -376,6 +517,77 @@ deliverNextAnswerAny store ans = do
               >> pure Nothing
   pure (case mQid of Just _ -> True; Nothing -> False)
 
+-- | Resolve a 1-based numeric index into the pending ask's 'paOptions'.
+-- If the body (after 'T.strip') is a decimal 'Int' in @[1..length opts]@,
+-- return the indexed option's 'qoLabel'; otherwise return the body as-is.
+-- Pure (safe inside STM).
+resolveOptionIndex :: Text -> [QuestionOption] -> Text
+resolveOptionIndex body opts =
+  let stripped = T.strip body
+  in case TR.decimal stripped of
+       Right (n, rest) | T.null rest && n >= 1 && n <= length opts ->
+         qoLabel (opts !! (n - 1))
+       _ -> body
+
+-- | Like 'deliverNextAnswer' but resolves a 1-based numeric index into the
+-- oldest pending ask's 'paOptions' to the indexed option's label. The
+-- resolution + the delivery happen in the /same/ STM transaction (gate:
+-- Architect #4, Security #2 — eliminates the TOCTOU race + the double-read
+-- of the original @resolveStockIndex@ design). 'T.strip' is applied before
+-- parsing; @02@ → 2 is accepted. Out-of-range numbers, non-numeric text,
+-- and asks with no options are delivered as-is ("Other"). Returns
+-- @(deliveredText, accepted)@.
+deliverNextAnswerResolved :: AskReplyStore -> SessionId -> Text -> IO (Text, Bool)
+deliverNextAnswerResolved store sid body = do
+  mResult <- atomically $ do
+    m <- readTVar (arsPending store)
+    let matching = filter (\pa -> paSession pa == sid)
+                  $ sortByCreatedAt (Map.elems m)
+    case matching of
+      [] -> pure Nothing
+      pa : _ ->
+        let resolved = resolveOptionIndex body (paOptions pa)
+            slot = paSlot pa
+            reply' = AskReply ScopeOnce resolved
+        in do
+          won <- tryPutTMVar slot (Right reply')
+          if won
+            then writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, True))
+            else writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, False))
+  pure (case mResult of
+    Just (resolved, accepted) -> (resolved, accepted)
+    Nothing                   -> (body, False))
+
+-- | The session-agnostic counterpart of 'deliverNextAnswerResolved' (mirrors
+-- 'deliverNextAnswerAny'). Finds the oldest pending ask across /all/ sessions
+-- (FIFO by 'paCreatedAt'), resolves a numeric index to the indexed label
+-- (same 'resolveOptionIndex' logic), delivers, returns @(deliveredText,
+-- accepted)@. Used by the CLI TUI's foreground REPL
+-- ('Seal.Channel.Cli':716) where one input stream serves the active session
+-- plus any @/bg@ background sessions.
+deliverNextAnswerResolvedAny :: AskReplyStore -> Text -> IO (Text, Bool)
+deliverNextAnswerResolvedAny store body = do
+  mResult <- atomically $ do
+    m <- readTVar (arsPending store)
+    case sortByCreatedAt (Map.elems m) of
+      [] -> pure Nothing
+      pa : _ ->
+        let resolved = resolveOptionIndex body (paOptions pa)
+            slot = paSlot pa
+            reply' = AskReply ScopeOnce resolved
+        in do
+          won <- tryPutTMVar slot (Right reply')
+          if won
+            then writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, True))
+            else writeTVar (arsPending store) (Map.delete (paId pa) m)
+                 >> pure (Just (resolved, False))
+  pure (case mResult of
+    Just (resolved, accepted) -> (resolved, accepted)
+    Nothing                   -> (body, False))
+
 -- | 'True' if the question was pending and is now cancelled.
 cancelAsk :: AskReplyStore -> AskId -> IO Bool
 cancelAsk store qid = do
@@ -407,14 +619,34 @@ cancelSessionAsks store sid = do
 -- | to render open questions on reconnect (the web frontend polls this via
 -- | GET /api/sessions/:id/questions). Does /not/ expose the answer slot.
 -- | Includes the metadata (opcode name + input) when present so the frontend
--- | can display it.
+-- | can display it, and the offered options (for @ASK_HUMAN@) so the frontend
+-- | can render one button per option.
 pendingForSession
   :: AskReplyStore -> SessionId
-  -> IO [(AskId, Text, UTCTime, Maybe Value)]
+  -> IO [PendingQuestionInfo]
 pendingForSession store sid =
-  map (\pa -> (paId pa, paQuestion pa, paCreatedAt pa, paMeta pa))
+  map (\pa -> PendingQuestionInfo
+              { pqiId = paId pa
+              , pqiSession = paSession pa
+              , pqiQuestion = paQuestion pa
+              , pqiCreatedAt = paCreatedAt pa
+              , pqiMeta = paMeta pa
+              , pqiOptions = paOptions pa
+              })
   . filter (\pa -> paSession pa == sid)
   . Map.elems <$> readTVarIO (arsPending store)
+
+-- | Find a pending ask by an 8-hex prefix of its 'AskId'. Used by the
+-- Telegram inbound path: the @callback_data@ is @\"<8hex>:<label>\"@, and
+-- this scans the session's pending asks for one whose 'askIdText' starts
+-- with the prefix. Returns 'Nothing' if no match (the body was not a
+-- callback — fall through to 'deliverNextAnswerResolved').
+findByAskIdPrefix :: AskReplyStore -> SessionId -> Text -> IO (Maybe AskId)
+findByAskIdPrefix store sid prefix = do
+  ps <- pendingForSession store sid
+  pure (case filter (T.isPrefixOf prefix . askIdText . pqiId) ps of
+    [] -> Nothing
+    info : _ -> Just (pqiId info))
 
 -- | Look up a single pending question by id (for the delivery path to
 -- | validate). Returns 'Nothing' if the id is unknown or already answered.

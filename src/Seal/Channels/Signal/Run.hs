@@ -22,7 +22,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
@@ -51,8 +51,8 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply
-  ( AskReplyStore, askHuman, deliverNextAnswer, newApprovalCache
-  , newAskReplyStore )
+  ( AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
+  , formatQuestionWithOptions, newApprovalCache, newAskReplyStore )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
@@ -85,7 +85,7 @@ runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
     Right transport -> do
       let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)
           plainHandler h = plainTurn deps h askReply
-      runChannelLoop deps withCh plainHandler registry chain askReply tabsH
+      runChannelLoop deps withCh plainHandler registry chain askReply tabsH Nothing Nothing
 
 -- | The inbox-driven loop. Spawns the Signal channel via 'withSignalChannel',
 -- pulls @(MessageSource, body)@ from 'chReceive', classifies via
@@ -113,13 +113,14 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
     let h = toHandle ch
         handleCaps = Data.Default.def
           { ccSend         = chSend h
-          , ccPrompt       = \q -> do
+          , ccPrompt       = \(AskPrompt q opts) -> do
               -- Bind the pending question to the active session so the
               -- next inbound message from the peer (delivered via
               -- 'deliverNextAnswer' in the loop below) unblocks this thread.
               meta <- readIORef (srActive sr)
               let sid = smId meta
-              outcome <- askHuman askReply sid q (\_qid -> chSend h q)
+              outcome <- askHumanWithOptions askReply sid q opts
+                           (\_qid -> chSend h (formatQuestionWithOptions q opts))
               pure (fromRight "" outcome)
           , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
           , ccStreaming    = False  -- Signal: send accumulated text once, not per-delta
@@ -138,7 +139,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
           -- question is pending, the message is a normal inbound turn.
           meta <- readIORef (srActive sr)
           let sid = smId meta
-          delivered <- deliverNextAnswer askReply sid body
+          (_resolved, delivered) <- deliverNextAnswerResolved askReply sid body
           if delivered
             then loop h handleCaps
             else do

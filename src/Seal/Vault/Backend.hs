@@ -32,7 +32,7 @@ import System.Posix.Files (setFileMode)
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Config.Security (SecurityConfig (..))
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Security.Path (ensureKeysRoot, getSafeKeyPath, mkSafeKeyPath)
@@ -194,7 +194,7 @@ setupYubiKey paths name touchRequired pinRequired caps = do
                    <> "    age-plugin-yubikey --generate --touch-policy "
                    <> T.pack touchPolicy <> " --pin-policy " <> T.pack pinPolicy
                    <> " > " <> T.pack identPath)
-                _ <- ccPrompt caps "Press Enter once the command has completed"
+                _ <- ccPrompt caps (AskPrompt "Press Enter once the command has completed" [])
                 rawE <- try @IOException (BS.readFile identPath)
                 case rawE of
                   Left e ->
@@ -215,8 +215,8 @@ setupYubiKey paths name touchRequired pinRequired caps = do
 
 setupUserSupplied :: ChannelCaps -> IO (Either Text ResolvedKey)
 setupUserSupplied caps = do
-  recipient <- ccPrompt caps "Recipient (age1\x2026): "
-  identity  <- ccPrompt caps "Identity file path: "
+  recipient <- ccPrompt caps (AskPrompt "Recipient (age1\x2026): " [])
+  identity  <- ccPrompt caps (AskPrompt "Identity file path: " [])
   pure (Right ResolvedKey
     { rkRecipient = T.strip recipient
     , rkIdentity  = T.strip identity

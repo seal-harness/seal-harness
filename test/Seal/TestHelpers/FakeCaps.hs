@@ -12,7 +12,7 @@ import Data.Functor (($>))
 import Data.IORef (IORef, modifyIORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 
 data FakeCaps = FakeCaps
@@ -26,18 +26,23 @@ makeFakeCaps :: [Text] -> IO (FakeCaps, ChannelCaps)
 makeFakeCaps inputs = do
   sentRef  <- newIORef []
   inputRef <- newIORef inputs
-  let pop _prompt = do
-        queue <- readIORef inputRef
-        case queue of
-          []     -> fail "FakeCaps: scripted input queue exhausted"
-          (x:xs) -> writeIORef inputRef xs $> x
+  let popPrompt (AskPrompt _ _) = popQueue inputRef
+      popSecret _prompt = popQueue inputRef
       caps = def
         { ccSend         = \t -> modifyIORef sentRef (t :)
-        , ccPrompt       = pop
-        , ccPromptSecret = pop
+        , ccPrompt       = popPrompt
+        , ccPromptSecret = popSecret
   , ccStreaming    = True  -- tests: streaming by default
         }
   pure (FakeCaps sentRef inputRef, caps)
+
+-- | Pop the next scripted answer from the queue (FIFO). Fails if empty.
+popQueue :: IORef [Text] -> IO Text
+popQueue inputRef = do
+  queue <- readIORef inputRef
+  case queue of
+    []     -> fail "FakeCaps: scripted input queue exhausted"
+    (x:xs) -> writeIORef inputRef xs $> x
 
 -- | Retrieve sent messages in chronological (send) order.
 getSent :: FakeCaps -> IO [Text]

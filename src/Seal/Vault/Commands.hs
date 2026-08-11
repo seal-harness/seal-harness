@@ -17,7 +17,7 @@ import Data.Text.Encoding qualified as TE
 import Options.Applicative
 import System.Directory (doesFileExist)
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..)
   , CommandAction (..)
@@ -165,7 +165,7 @@ setupCmd rt = CommandAction $ \caps -> do
           (  "A vault already exists. Continuing will ROTATE its key: every "
           <> "secret is re-encrypted to a new key. Your existing secrets are "
           <> "preserved, and the current key file is kept (never overwritten).")
-        ans <- ccPrompt caps "Rotate the vault key? [y/N]: "
+        ans <- ccPrompt caps (AskPrompt "Rotate the vault key? [y/N]: " [])
         pure (T.toLower (T.strip ans) `elem` ["y", "yes"])
       else pure True
   if not proceed
@@ -187,15 +187,15 @@ runSetup rt caps oldCfg = do
     ccSend caps "  2. YubiKey (age-plugin-yubikey) — key stays on token [recommended]"
   let userNum = if hasYubi then "3" else "2"
   ccSend caps ("  " <> userNum <> ". User-supplied (bring your own key)")
-  choice <- T.strip <$> ccPrompt caps "Choose backend [1]: "
+  choice <- T.strip <$> ccPrompt caps (AskPrompt "Choose backend [1]: " [])
   let effective = if T.null choice then "1" else choice
   rkResult <- case (effective, hasYubi) of
     ("1", _)     -> setupLocalAgeKey (vrPaths rt) "default"
     ("2", True)  -> do
-      tp <- ccPrompt caps "Require touch? [y/N]: "
+      tp <- ccPrompt caps (AskPrompt "Require touch? [y/N]: " [])
       let touch = T.toLower (T.strip tp) `elem` ["y", "yes"]
       pp <- ccPrompt caps
-        "Require PIN on each decrypt session? [Y/n] (choose n for no PIN): "
+        (AskPrompt "Require PIN on each decrypt session? [Y/n] (choose n for no PIN): " [])
       let pin = T.toLower (T.strip pp) `notElem` ["n", "no"]
       setupYubiKey (vrPaths rt) "default" touch pin caps
     ("2", False) -> setupUserSupplied caps

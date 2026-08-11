@@ -826,6 +826,14 @@ discoverable `/help`, and the preprocessing gate come for free.
 **Milestone:** reach the agent from anywhere (web, Signal, Telegram, CLI),
 multiple providers, durable off-box audit — the full README feature set.
 
+**User directive (2026-08-10):** the "more chat channels" thread is
+considered **done** — the Telegram channel shipped, and dialing in the UX
+for the channels we have is higher priority than adding more channels.
+The Phase 8 breadth items that remain in scope are: Scheduling, MCP,
+remaining providers, off-box mirroring, gateway pairing. A new UX-dial-in
+thread begins with ASK_HUMAN stock answers (see
+`docs/superpowers/specs/2026-08-10-ask-human-stock-answers-design.md`).
+
 ---
 
 ## Per-phase definition of done

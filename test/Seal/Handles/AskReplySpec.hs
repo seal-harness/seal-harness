@@ -4,16 +4,22 @@ module Seal.Handles.AskReplySpec (spec) where
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.List (uncons)
+import Data.Either (isLeft)
+import Data.List (nub, uncons)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Test.Hspec
+import Test.QuickCheck
 
 import Seal.Core.Types (mkSessionId)
 import qualified Seal.Core.Types as CT (SessionId)
 import Seal.Handles.AskReply
   ( ApprovalScope (..), AskOutcome (..), AskReply (..), askHuman, askIdText
   , cancelAsk, cancelSessionAsks, deliverAnswer, deliverNextAnswer, lookupAsk
-  , newAskReplyStore, parseAskId, pendingForSession )
+  , newAskReplyStore, parseAskId, pendingForSession
+  , QuestionOption (..), validateOptions
+  , askHumanWithOptions, PendingQuestionInfo (..), AskId (..)
+  , deliverNextAnswerResolved, deliverNextAnswerResolvedAny )
 
 -- | A valid UUID v4 text for tests that need a pre-known id (not minted).
 dummyUuidText :: Text
@@ -21,9 +27,9 @@ dummyUuidText = "12345678-1234-4234-8234-123456789012"
 
 -- | Extract the first pending question (id, text) from a non-empty list,
 -- failing the test if the list is empty.
-firstPending :: [(a, Text, b, c)] -> (a, Text)
+firstPending :: [PendingQuestionInfo] -> (AskId, Text)
 firstPending ps = case uncons ps of
-  Just ((qid, q, _, _), _) -> (qid, q)
+  Just (info, _) -> (pqiId info, pqiQuestion info)
   Nothing -> error "firstPending: empty list (test invariant violation)"
 
 -- | Safe session-id construction for tests (the literal is known-valid).
@@ -233,7 +239,7 @@ spec = describe "Seal.Handles.AskReply" $ do
       -- The questions are all present (the exact order depends on
       -- getCurrentTime resolution; the FIFO delivery test covers ordering
       -- via deliverNextAnswer which is the real consumer).
-      map (\(_, q, _, _) -> q) ps `shouldMatchList` ["q1?", "q2?", "q3?"]
+      map pqiQuestion ps `shouldMatchList` ["q1?", "q2?", "q3?"]
       cancelSessionAsks store sid
       _ <- takeMVar d1 :: IO ()
       _ <- takeMVar d2 :: IO ()
@@ -285,3 +291,190 @@ spec = describe "Seal.Handles.AskReply" $ do
 
     it "rejects an empty string" $ do
       parseAskId "" `shouldBe` Left "invalid AskId: "
+
+  describe "askHumanWithOptions" $ do
+    it "registers a pending ask with options surfacing in pendingForSession" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      let opts = [ QuestionOption "main" "the default branch"
+                 , QuestionOption "develop" "the integration branch"
+                 ]
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      ps <- pendingForSession store sid
+      length ps `shouldBe` 1
+      case ps of
+        [info] -> do
+          pqiQuestion info `shouldBe` "which branch?"
+          pqiOptions info `shouldBe` opts
+          _cancelled <- cancelAsk store (pqiId info)
+          pure ()
+        _ -> error "expected exactly one pending ask"
+      takeMVar done
+
+  describe "QuestionOption validation" $ do
+    let genLabel = do
+          n <- chooseInt (1, 64)
+          chars <- vectorOf n (elements (['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9'] ++ "-_/."))
+          pure (T.pack chars)
+        genDesc = do
+          chars <- listOf (elements (['a'..'z'] ++ " "))
+          pure (T.pack chars)
+        genOption = QuestionOption <$> genLabel <*> genDesc
+        genOptions = chooseInt (1, 8) >>= \n -> vectorOf n genOption
+        genUniqueOptions = genOptions `suchThat` \opts ->
+          let labels = map qoLabel opts in length labels == length (nub labels)
+
+    it "accepts a valid non-empty list of unique-label options" $
+      property $ forAll genUniqueOptions $ \opts ->
+        validateOptions opts == Right opts
+
+    it "rejects an empty list" $
+      validateOptions [] `shouldBe` Left "options must be non-empty"
+
+    it "rejects a list longer than 8" $ do
+      let opts = [QuestionOption (T.pack ("l" <> show n)) "" | n <- [1 :: Int .. 9]]
+      validateOptions opts `shouldSatisfy` isLeft
+
+    it "rejects an empty label" $
+      validateOptions [QuestionOption "" "desc"] `shouldSatisfy` isLeft
+
+    it "rejects a label exceeding 64 bytes" $ do
+      let longLabel = T.replicate 65 "x"
+      validateOptions [QuestionOption longLabel ""] `shouldSatisfy` isLeft
+
+    it "rejects a label whose UTF-8 encoding exceeds 64 bytes (non-ASCII)" $ do
+      let longUnicode = T.replicate 33 "é"
+      validateOptions [QuestionOption longUnicode ""] `shouldSatisfy` isLeft
+
+    it "rejects duplicate labels (case-sensitive)" $
+      validateOptions
+        [ QuestionOption "main" "first"
+        , QuestionOption "main" "second"
+        ]
+        `shouldSatisfy` isLeft
+
+    it "rejects a description exceeding 200 chars" $ do
+      let longDesc = T.replicate 201 "d"
+      validateOptions [QuestionOption "ok" longDesc] `shouldSatisfy` isLeft
+
+  describe "deliverNextAnswerResolved (FIFO + numeric resolution)" $ do
+    let opts = [ QuestionOption "main" "the default branch"
+               , QuestionOption "develop" "the integration branch"
+               , QuestionOption "release" "the release branch"
+               ]
+
+    it "resolves a 1-based numeric index to the option label" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done r
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "2"
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+      r <- takeMVar done
+      r `shouldBe` Right "develop"
+
+    it "resolves ' 2 ' (whitespace) to the 2nd label after T.strip" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done r
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid " 2 "
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+
+    it "resolves '02' (leading zero) to the 2nd label" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "02"
+      accepted `shouldBe` True
+      delivered `shouldBe` "develop"
+      takeMVar done
+
+    it "delivers an out-of-range number as-is ('Other')" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "99"
+      accepted `shouldBe` True
+      delivered `shouldBe` "99"
+      takeMVar done
+
+    it "delivers non-numeric text as-is ('Other')" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "my custom answer"
+      accepted `shouldBe` True
+      delivered `shouldBe` "my custom answer"
+      takeMVar done
+
+    it "delivers text as-is when the ask has no options (open-ended)" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHuman store sid "open?" (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "anything"
+      accepted `shouldBe` True
+      delivered `shouldBe` "anything"
+      takeMVar done
+
+    it "returns (body, False) when no question is pending" $ do
+      store <- newAskReplyStore 0
+      (delivered, accepted) <- deliverNextAnswerResolved store sid "2"
+      accepted `shouldBe` False
+      delivered `shouldBe` "2"
+
+  describe "deliverNextAnswerResolvedAny (session-agnostic FIFO + numeric resolution)" $ do
+    let opts = [ QuestionOption "main" "default"
+               , QuestionOption "develop" "integration"
+               ]
+
+    it "resolves a numeric index across all sessions (session-agnostic)" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "1"
+      accepted `shouldBe` True
+      delivered `shouldBe` "main"
+      takeMVar done
+
+    it "delivers non-numeric text as-is across all sessions" $ do
+      store <- newAskReplyStore 0
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        _r <- askHumanWithOptions store sid2 "which branch?" opts (\_ -> pure ())
+        putMVar done ()
+      threadDelay 10000
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "custom"
+      accepted `shouldBe` True
+      delivered `shouldBe` "custom"
+      takeMVar done
+
+    it "returns (body, False) when no question is pending" $ do
+      store <- newAskReplyStore 0
+      (delivered, accepted) <- deliverNextAnswerResolvedAny store "2"
+      accepted `shouldBe` False
+      delivered `shouldBe` "2"

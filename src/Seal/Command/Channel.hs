@@ -54,7 +54,7 @@ import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess,
     withCreateProcess )
 
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
@@ -246,7 +246,7 @@ signalSetupCmd rt = CommandAction $ \caps -> do
         , ""
         , "Note: Option 2 will take over the number from any existing Signal registration."
         ]
-      choice <- T.strip <$> ccPrompt caps "Choice [1]: "
+      choice <- T.strip <$> ccPrompt caps (AskPrompt "Choice [1]: " [])
       let effectiveChoice = if T.null choice then "1" else choice
       case effectiveChoice of
         "1" -> signalLinkFlow rt caps
@@ -297,7 +297,7 @@ signalLinkFlow rt caps = linkAttempt (3 :: Int)
 -- required), then @verify@.
 signalRegisterFlow :: ChannelRuntime -> ChannelCaps -> IO ()
 signalRegisterFlow rt caps = do
-  phoneNumber <- T.strip <$> ccPrompt caps "Phone number (E.164 format, e.g. +15555550123): "
+  phoneNumber <- T.strip <$> ccPrompt caps (AskPrompt "Phone number (E.164 format, e.g. +15555550123): " [])
   if T.null phoneNumber || not ("+" `T.isPrefixOf` phoneNumber)
     then ccSend caps "Invalid phone number. Must start with + (E.164 format)."
     else signalRegister rt caps phoneNumber Nothing
@@ -321,7 +321,7 @@ signalRegister rt caps phoneNumber mCaptcha = do
         , "4. Click \"Open Signal\" \x2014 find the signalcaptcha:// URL in the Network tab"
         , "5. Copy and paste the full URL here (starts with signalcaptcha://)"
         ]
-      captchaInput <- T.strip <$> ccPrompt caps "Captcha token: "
+      captchaInput <- T.strip <$> ccPrompt caps (AskPrompt "Captcha token: " [])
       let token = T.strip (T.replace "signalcaptcha://" "" captchaInput)
       if T.null token
         then ccSend caps "No captcha provided. Setup cancelled."
@@ -332,7 +332,7 @@ signalRegister rt caps phoneNumber mCaptcha = do
 signalVerify :: ChannelRuntime -> ChannelCaps -> Text -> IO ()
 signalVerify rt caps phoneNumber = do
   ccSend caps "Verification code sent! Check your SMS."
-  code <- T.strip <$> ccPrompt caps "Verification code: "
+  code <- T.strip <$> ccPrompt caps (AskPrompt "Verification code: " [])
   result <- scVerify (crSignalCli rt) phoneNumber code
   case result of
     VerifyOk -> do
@@ -347,13 +347,13 @@ detectAndWriteSignalConfig rt caps = do
   result <- scListAccounts (crSignalCli rt)
   case result of
     AccountsFailed _ -> do
-      phoneNumber <- T.strip <$> ccPrompt caps "What phone number was linked? (E.164 format): "
+      phoneNumber <- T.strip <$> ccPrompt caps (AskPrompt "What phone number was linked? (E.164 format): " [])
       writeSignalConfig rt caps phoneNumber
     AccountsFound (phone : _) -> do
       ccSend caps ("Detected account: " <> phone)
       writeSignalConfig rt caps phone
     AccountsFound [] -> do
-      phoneNumber <- T.strip <$> ccPrompt caps "Could not detect account. Phone number (E.164 format): "
+      phoneNumber <- T.strip <$> ccPrompt caps (AskPrompt "Could not detect account. Phone number (E.164 format): " [])
       writeSignalConfig rt caps phoneNumber
 
 -- | Write the @[signal]@ section into @config.toml@ and confirm. Preserves
@@ -456,7 +456,7 @@ telegramSetupCmd rt = CommandAction $ \caps -> do
     , "  2. Send /newbot and follow the prompts"
     , "  3. Copy the token it gives you (looks like 123456:ABC-DEF...)"
     ]
-  tokenInput <- T.strip <$> ccPrompt caps "Bot token: "
+  tokenInput <- T.strip <$> ccPrompt caps (AskPrompt "Bot token: " [])
   case mkTelegramToken tokenInput of
     Left err -> ccSend caps ("Invalid token: " <> err)
     Right token -> do

@@ -145,7 +145,13 @@ export function useTranscriptStream(
     const unsub = sc.onAsk((_sid, ask) => {
       setPendingQuestions((prev) => {
         if (prev.some((q) => q.id === ask.id)) return prev
-        return [...prev, { id: ask.id, question: ask.question, createdAt: new Date().toISOString() }]
+        return [...prev, {
+          id: ask.id,
+          question: ask.question,
+          createdAt: new Date().toISOString(),
+          options: ask.options,
+          meta: ask.meta,
+        }]
       })
     })
     return unsub

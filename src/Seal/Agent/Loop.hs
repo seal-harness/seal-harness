@@ -7,7 +7,6 @@ module Seal.Agent.Loop
   ) where
 
 import Control.Exception (SomeException, catch)
-import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -25,7 +24,7 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.MessageSource
   ( MessageSource (..), conversationIdText )
 import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
-import Seal.Channel.Caps (ChannelCaps (..))
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
@@ -232,7 +231,7 @@ runTurn env userText = do
     -- ccSend (streaming path) — don't re-send the full text, only send the
     -- prefix / truncation notice if applicable.
     handleResponse :: AgentEnv -> UTCTime -> Int -> Int -> [Message] -> CompletionResponse -> Bool -> App ()
-    handleResponse env' tStart n lenContinue msgs resp alreadySentText = do
+    handleResponse env' tStart n lenContinue msgs resp _alreadySentText = do
       -- Record the provider response.
       liftIO $ do
         now <- getCurrentTime
@@ -310,8 +309,13 @@ runTurn env userText = do
                   -- Normal final answer: text was already streamed live;
                   -- don't re-send via ccSend (would double-deliver). Only
                   -- fan out to other chat channels via notifyStop.
-                  unless alreadySentText $
-                    ccSend (aeCaps env') (prefix <> T.intercalate "\n" texts)
+                  -- For non-streaming channels (Telegram, Signal — chStreaming
+                  -- = False), alreadySentText is False, so ccSend would fire.
+                  -- But notifyStop (replyFanout) already sends to ALL
+                  -- subscribed channels INCLUDING the arrival channel. So
+                  -- ccSend would double-deliver. Fix: skip ccSend entirely;
+                  -- replyFanout handles all delivery (it sends to every
+                  -- subscribed channel, which includes the arrival one).
                   notifyStop (prefix <> T.intercalate "\n" texts)
         else do
           results <- mapM dispatchOne toolUses
@@ -387,7 +391,13 @@ runTurn env userText = do
                           pure (Right ())
                         Nothing -> do
                           let prompt = buildConfirmationPrompt opName' input'
-                          reply <- liftIO (ccPrompt (aeCaps env) prompt)
+                          -- The confirmation gate's prompt (Allow <NAME>
+                          -- <JSON>? [y/N]) is NOT model text, so it must be
+                          -- sent to the channel. ccPrompt no longer sends
+                          -- (the model already streamed ASK_HUMAN text), so
+                          -- we send here.
+                          liftIO (ccSend (aeCaps env) prompt)
+                          reply <- liftIO (ccPrompt (aeCaps env) (AskPrompt prompt []))
                           let scope = parseScopeReply reply
                           liftIO (recordApproval (aeApprovals env) (aeSession env) opName' scope)
                           recordApprovalEvidence opName' input' scope
