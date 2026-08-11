@@ -45,7 +45,7 @@ module Seal.Tools.Exec.UntrustedIO
 
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
-import Data.Char (isDigit)
+import Data.Char (isDigit, isSpace)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -706,65 +706,192 @@ runRemoteShellText runner cfg cmdText =
 -- @Right newContent@ on success. This is the same applier that lived in
 -- 'Seal.ISA.Ops.File.applyUnifiedDiff' — lifted here so both arms share
 -- one implementation.
+--
+-- The applier is **content-based**, not position-based: for each hunk it
+-- extracts the old lines (context @ @ + removed @-@), searches for that
+-- sequence in the file starting near the hunk header's line-number hint,
+-- and splices in the new lines (context @ @ + added @+@). The line number
+-- is a hint to disambiguate duplicate matches, NOT a trusted insertion
+-- index — this is the design used by OpenCode (@seek@ in patch.ts) and
+-- Hermes (@fuzzy_find_and_replace@). A position-based applier that
+-- blindly @splitAt@s at the header's oldStart corrupts the file when:
+--   * the model's line number is stale (file changed since it read it),
+--   * an earlier hunk in the same patch shifted line numbers, or
+--   * the model miscounted lines.
+-- All three were observed in session 20260810-123133-477 ("The patch is
+-- inserting lines at wrong positions").
 applyUnifiedDiff :: Text -> Text -> Either Text Text
 applyUnifiedDiff original patch =
   let origLines  = T.lines original
       patchLines = T.lines patch
   in go origLines patchLines
   where
-    go origLines [] = Right (T.intercalate "\n" origLines <> "\n")
+    -- All hunks apply against the ORIGINAL file's line numbering; we
+    -- thread the already-patched lines through 'go' so successive hunks
+    -- see a consistent view. The search-start hint is carried in the
+    -- accumulator so a later hunk's line-number hint still points into
+    -- the original's coordinate space (we never let an earlier hunk's
+    -- insertions/deletions shift a later hunk's target).
+    go origLines [] = Right (joinLines origLines)
     go origLines (h : rest)
-      | T.isPrefixOf "@@ " h   = applyHunk origLines h rest
-      | T.isPrefixOf "--- " h  = go origLines rest
-      | T.isPrefixOf "+++ " h  = go origLines rest
-      | T.null h               = go origLines rest
-      | otherwise              = Left ("unexpected line in patch: " <> h)
+      | T.isPrefixOf "@@ " h  = applyHunk origLines h rest
+      | T.isPrefixOf "--- " h = go origLines rest
+      | T.isPrefixOf "+++ " h = go origLines rest
+      | T.null h              = go origLines rest
+      | otherwise             = Left ("unexpected line in patch: " <> h)
+
     applyHunk origLines header rest =
       case parseHunkHeader header of
         Left err -> Left err
-        Right (oldStart, _oldLen, _newStart, _newLen) ->
+        Right (oldStart, mOldLen) ->
           let (hunkLines, remainingPatch) = span isHunkLine rest
-              idx = max 0 (oldStart - 1)
-              (before, atAndAfter) = splitAt idx origLines
-          in case applyHunkLines atAndAfter hunkLines of
+              (oldLines, _newLines) = splitHunk hunkLines
+              -- The line-number hint is a 0-based index into the file
+              -- pointing at where the hunk's old lines BEGIN. For a
+              -- normal hunk (oldLen >= 1) that's oldStart-1 (1-based ->
+              -- 0-based). For a PURE-INSERT hunk (oldLen == 0) the
+              -- header's oldStart is the line AFTER which to insert
+              -- (1-based), so the 0-based insertion index is oldStart
+              -- itself (insert after that line). The @@ -0,0 +1,N @@
+              -- form (insert at start of empty file) gives oldStart=0,
+              -- which clamps to index 0.
+              isPureInsert = case mOldLen of
+                Just 0  -> True
+                Nothing -> null oldLines   -- short-form header; infer
+                _       -> False
+              hint = if isPureInsert
+                       then max 0 oldStart        -- insert after line oldStart
+                       else max 0 (oldStart - 1) -- replace starting at oldStart
+          in case findMatch origLines oldLines hint of
                Left err -> Left err
-               Right patched -> go (before ++ patched) remainingPatch
+               Right idx ->
+                 let (before, atAndAfter) = splitAt idx origLines
+                     matched = take (length oldLines) atAndAfter
+                     after   = drop (length oldLines) atAndAfter
+                     -- Build the replacement: walk the hunk body and the
+                     -- matched file lines in parallel. For context (' ')
+                     -- lines we prefer the FILE's actual text (so a
+                     -- fuzzy match doesn't drag the patch's trailing
+                     -- whitespace into the file); for '+' lines we use
+                     -- the patch's text; '-' lines are dropped.
+                     replacement = spliceHunk hunkLines matched
+                 in go (before ++ replacement ++ after) remainingPatch
+
+    -- | Walk the hunk body and the matched file lines in parallel,
+    -- producing the replacement line list. Context (' ') lines take
+    -- the FILE's line (preserving the file's actual whitespace);
+    -- '+' lines take the patch's text; '-' and '\\' lines are dropped.
+    spliceHunk :: [Text] -> [Text] -> [Text]
+    spliceHunk = go'
+      where
+        go' [] _ = []
+        go' (l : ls) fileLines =
+          case T.uncons l of
+            Just (' ', _) -> case fileLines of
+              (f : fs) -> f : go' ls fs
+              []       -> go' ls []   -- shouldn't happen; findMatch guards
+            Just ('+', body') -> body' : go' ls fileLines
+            Just ('-', _) -> go' ls (drop 1 fileLines)
+            Just ('\\', _) -> go' ls fileLines
+            _ -> go' ls fileLines   -- empty/malformed: skip, keep file pos
+
+    -- | Split hunk body lines into (oldLines, newLines). Context lines
+    -- (' ' prefix) appear in BOTH; removed lines ('-') in old only;
+    -- added lines ('+') in new only. '\\' (no-newline-at-eof) and empty
+    -- lines are ignored.
+    splitHunk :: [Text] -> ([Text], [Text])
+    splitHunk ls =
+      let go' []         = ([], [])
+          go' (l : rest) =
+            case T.uncons l of
+              Just (' ', body) -> let (o, n) = go' rest in (body : o, body : n)
+              Just ('-', body) -> let (o, n) = go' rest in (body : o, n)
+              Just ('+', body) -> let (o, n) = go' rest in (o, body : n)
+              Just ('\\', _)   -> go' rest
+              _                -> go' rest  -- empty or malformed: skip
+      in go' ls
+
+    -- | Find the index in @lines@ where the @pattern@ sequence matches,
+    -- searching near the @hint@ first, then the whole file. Tries four
+    -- comparison strategies in order (exact -> rstrip -> trim ->
+    -- normalized) so trailing-whitespace and Unicode punctuation
+    -- differences don't cause a hard failure — mirrors OpenCode's
+    -- @seek@ fallback ladder. An empty pattern (pure-insert hunk) lands
+    -- at the hint index (insert after the hinted line).
+    findMatch :: [Text] -> [Text] -> Int -> Either Text Int
+    findMatch _    []     hint = Right hint
+    findMatch xs pat    hint =
+      case searchNear xs pat hint of
+        Just idx -> Right idx
+        Nothing  ->
+          case searchAll xs pat of
+            Just idx -> Right idx
+            Nothing  ->
+              Left ("FILE_PATCH: context not found near line "
+                      <> T.pack (show (hint + 1)) <> ":\n"
+                      <> T.intercalate "\n" pat)
+
+    searchNear xs pat hint =
+      let n      = length xs
+          plen   = length pat
+          -- Search outward from the hint: try hint, hint±1, hint±2, ...
+          -- so the closest match to the claimed line wins (disambiguates
+          -- duplicates by proximity to the hint).
+          offsets = concatMap (\d -> [hint + d, hint - d]) [0..(n - 1)]
+          valid  = filter (\i -> i >= 0 && i <= n - plen) offsets
+      in firstMatch xs pat valid
+
+    searchAll xs pat =
+      let n    = length xs
+          plen = length pat
+      in firstMatch xs pat [0 .. n - plen]
+
+    firstMatch _    _   []       = Nothing
+    firstMatch xs pat (i : is) =
+      if matchesAt xs pat i
+        then Just i
+        else firstMatch xs pat is
+
+    matchesAt xs pat i =
+      any (\cmp -> and (zipWith cmp (drop i xs) pat))
+           [exactEq, rstripEq, trimEq, normalizedEq]
+
+    exactEq a b = a == b
+    rstripEq a b = T.dropWhileEnd isSpace a == T.dropWhileEnd isSpace b
+    trimEq a b = T.dropWhile isSpace (T.dropWhileEnd isSpace a)
+              == T.dropWhile isSpace (T.dropWhileEnd isSpace b)
+    normalizedEq a b = normalize (trimLine a) == normalize (trimLine b)
+      where
+        trimLine = T.dropWhile isSpace . T.dropWhileEnd isSpace
+        normalize = T.map (\c -> if c == '\t' then ' ' else c)
+
     isHunkLine l =
       T.null l
       || T.isPrefixOf " " l
       || T.isPrefixOf "-" l
       || T.isPrefixOf "+" l
       || T.isPrefixOf "\\" l
-    applyHunkLines orig [] = Right orig
-    applyHunkLines (o : os) (h : hs)
-      | T.isPrefixOf " " h  = keep o        (applyHunkLines os hs)
-      | T.isPrefixOf "-" h  =                applyHunkLines os hs
-      | T.isPrefixOf "+" h  = keep (T.drop 1 h) (applyHunkLines (o : os) hs)
-      | T.isPrefixOf "\\" h =                applyHunkLines (o : os) hs
-      | T.null h            =                applyHunkLines (o : os) hs
-      | otherwise           = Left ("unexpected hunk line: " <> h)
-      where keep x acc = (x :) <$> acc
-    applyHunkLines [] (h : hs)
-      | T.isPrefixOf "+" h  = keep (T.drop 1 h) (applyHunkLines [] hs)
-      | T.isPrefixOf " " h  = Left ("hunk context line past end of file: " <> h)
-      | T.isPrefixOf "-" h  = Left ("hunk removed line past end of file: " <> h)
-      | T.isPrefixOf "\\" h = applyHunkLines [] hs
-      | T.null h            = applyHunkLines [] hs
-      | otherwise           = Left ("unexpected hunk line at end: " <> h)
-      where keep x acc = (x :) <$> acc
+
+    -- | Join lines back into text, preserving the trailing newline if
+    -- the original had one (T.lines drops it; we re-add it so a file
+    -- ending in a newline round-trips).
+    joinLines [] = ""
+    joinLines ls = T.intercalate "\n" ls <> "\n"
+
     parseHunkHeader h =
       case T.stripPrefix "@@ -" h of
         Nothing -> Left ("malformed hunk header: " <> h)
         Just rest0 ->
           let (oldStartStr, afterOld) = breakNum rest0
-              afterPlus0 = T.dropWhile (/= '+') afterOld
+              (oldLenStr, afterOldLen) = breakLen afterOld
+              afterPlus0 = T.dropWhile (/= '+') afterOldLen
               afterPlus  = T.drop 1 afterPlus0
               (newStartStr, _) = breakNum afterPlus
               oldStart = readMaybe (T.unpack oldStartStr) :: Maybe Int
-              newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
-          in case (oldStart, newStart) of
-               (Just os_, Just ns_) -> Right (os_, Nothing, ns_, Nothing)
-               _ -> Left ("malformed hunk header numbers: " <> h)
+              _newStart = readMaybe (T.unpack newStartStr) :: Maybe Int
+          in case oldStart of
+               Just os_ -> Right (os_, readMaybe (T.unpack oldLenStr) :: Maybe Int)
+               Nothing  -> Left ("malformed hunk header numbers: " <> h)
       where
         breakNum :: Text -> (Text, Text)
         breakNum s =
@@ -772,6 +899,16 @@ applyUnifiedDiff original patch =
           in case T.uncons rest of
                Just (',', rest') -> (digits, T.dropWhile isDigit rest')
                _                 -> (digits, rest)
+        -- | After the oldStart number, an optional @,len@ may follow.
+        -- Return the len string (empty if the short form was used) and
+        -- the rest after the @,len@ (or after the start number if short
+        -- form). The length is informational (the content search is the
+        -- source of truth); we keep it only for diagnostics.
+        breakLen :: Text -> (Text, Text)
+        breakLen s =
+          case T.uncons s of
+            Just (',', rest) -> T.span isDigit rest
+            _                -> ("", s)
         readMaybe :: String -> Maybe Int
         readMaybe s = case reads s :: [(Int, String)] of
           [(n, _)] -> Just n
