@@ -173,7 +173,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
                   cbdOther = tbCallbackData bOther
               cbd0 `shouldSatisfy` (\t -> T.length t >= 10 && T.isSuffixOf ":0" t)
               cbd1 `shouldSatisfy` (\t -> T.length t >= 10 && T.isSuffixOf ":1" t)
-              cbdOther `shouldSatisfy` (\t -> T.isSuffixOf ":other" t)
+              cbdOther `shouldSatisfy` T.isSuffixOf ":other"
               -- All callback_data ≤ 64 bytes (Telegram limit).
               all (\t -> T.length t <= 64) [cbd0, cbd1, cbdOther] `shouldBe` True
             _ -> expectationFailure ("expected 3 single-button rows, got: " <> show keyboard)
