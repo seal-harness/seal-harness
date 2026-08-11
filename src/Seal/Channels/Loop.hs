@@ -90,6 +90,7 @@ import Seal.Config.File
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
+import Seal.Logging.Global (globalLogIO)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
 import Seal.Core.Paging (defaultPageParams)
@@ -457,11 +458,10 @@ mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
   , ccPrompt       = \(AskPrompt q opts) -> do
-      -- Send the question text to the channel. The model may have
-      -- streamed text before the tool call (causing a duplicate), but
-      -- ASK_HUMAN's contract is that the question is in the tool
-      -- input, not in model text — so this is the primary send.
-      chSend h (formatQuestionWithOptions q opts)
+      -- Send the question text to the channel.
+      let msg = formatQuestionWithOptions q opts
+      globalLogIO InfoS ("[ASK_HUMAN] ccPrompt sending question to channel: " <> ls (T.take 80 msg))
+      chSend h msg
       outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
