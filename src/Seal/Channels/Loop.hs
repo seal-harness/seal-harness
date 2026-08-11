@@ -99,7 +99,8 @@ import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
-   )
+  , formatQuestionWithOptions
+  )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
@@ -456,10 +457,11 @@ mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
   , ccPrompt       = \(AskPrompt q opts) -> do
-      -- The model already streamed the question text to the channel
-      -- during the provider response (see Agent/Loop.hs:196). Don't
-      -- re-send it — that would double-deliver. Only register the
-      -- pending ask + block for the human's reply.
+      -- Send the question text to the channel. The model may have
+      -- streamed text before the tool call (causing a duplicate), but
+      -- ASK_HUMAN's contract is that the question is in the tool
+      -- input, not in model text — so this is the primary send.
+      chSend h (formatQuestionWithOptions q opts)
       outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
