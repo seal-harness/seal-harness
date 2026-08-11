@@ -195,15 +195,26 @@ mkRealTelegramTransport token mgr = do
         Just u  -> pure (Right u)
         Nothing -> do
           offset <- readIORef offsetRef
-          eUpdates <- getUpdates mgr token offset
-          case eUpdates of
+          eResult <- getUpdates mgr token offset
+          case eResult of
             Left err -> pure (Left err)
-            Right [] -> fillAndReceive buffer offsetRef
-            Right updates -> do
-              let lastId = maximum (map fst updates)
-              modifyIORef' offsetRef (const (lastId + 1))
-              mapM_ ((atomically . writeTQueue buffer) . snd) updates
-              fillAndReceive buffer offsetRef
+            Right (updates, rawIds) ->
+              if null updates
+                then
+                  -- No parseable updates. Still advance the offset past
+                  -- any raw update_ids so we don't loop forever on
+                  -- unparseable updates.
+                  if null rawIds
+                    then fillAndReceive buffer offsetRef
+                    else do
+                      let lastId = maximum rawIds
+                      modifyIORef' offsetRef (const (lastId + 1))
+                      fillAndReceive buffer offsetRef
+                else do
+                  let lastId = maximum (map fst updates)
+                  modifyIORef' offsetRef (const (lastId + 1))
+                  mapM_ ((atomically . writeTQueue buffer) . snd) updates
+                  fillAndReceive buffer offsetRef
 
 -- | Call @getUpdates@ with long-polling (30s timeout). Returns the parsed
 -- updates as @(update_id, TelegramUpdate)@ pairs — @message@ and
@@ -211,19 +222,18 @@ mkRealTelegramTransport token mgr = do
 -- Explicitly requests @message@ + @callback_query@ via @allowed_updates@
 -- so button taps are delivered (without this, Telegram uses the previous
 -- setting, which may exclude @callback_query@).
-getUpdates :: Manager -> Text -> Int -> IO (Either Text [(Int, TelegramUpdate)])
+getUpdates :: Manager -> Text -> Int -> IO (Either Text ([(Int, TelegramUpdate)], [Int]))
+-- ^ Returns @(parsedUpdates, allRawUpdateIds)@. The raw ids let the caller
+-- advance the offset even when some updates fail to parse (e.g. an
+-- unparseable callback_query), avoiding an infinite loop re-receiving
+-- them.
 getUpdates mgr token offset = do
   let url = T.unpack (telegramApiBase <> token <> "/getUpdates")
              <> "?offset=" <> show offset <> "&timeout=30"
-             <> "&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
   eReq <- try @SomeException (parseRequest url)
   case eReq of
     Left ex -> pure (Left ("getUpdates request error: " <> T.pack (show ex)))
     Right req0 -> do
-      -- The Telegram long-poll holds the connection for up to 30s; set a
-      -- per-request timeout of 60s so the HTTP client doesn't abort before
-      -- Telegram responds. The manager default is ~30s which races the
-      -- long-poll and causes spurious ResponseTimeout errors.
       let req = req0 { responseTimeout = responseTimeoutMicro 60000000 }
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
@@ -233,26 +243,41 @@ getUpdates mgr token offset = do
               body = responseBody resp
           in if code == 200
                then pure (parseGetUpdatesResponse body)
-               else pure (Left ("getUpdates returned HTTP " <> T.pack (show code)))
+               else pure (Left ("getUpdates returned HTTP " <> T.pack (show code)
+                              <> " — " <> T.pack (show body)))
 
--- | Parse the JSON response from getUpdates. The shape is
--- @{"ok":true,"result":[{"update_id":N,"message":{...}},...]}@. Extracts
--- @(update_id, TelegramUpdate)@ pairs, skipping non-message updates.
-parseGetUpdatesResponse :: BL.ByteString -> Either Text [(Int, TelegramUpdate)]
+-- | Parse the JSON response from getUpdates. Returns @(parsedUpdates,
+-- allRawUpdateIds)@. The raw ids let the caller advance the offset even
+-- when some updates fail to parse (e.g. an unparseable callback_query).
+parseGetUpdatesResponse :: BL.ByteString -> Either Text ([(Int, TelegramUpdate)], [Int])
 parseGetUpdatesResponse body =
   case A.decode body of
     Nothing -> Left "getUpdates: malformed JSON response"
     Just (A.Object o) -> case KeyMap.lookup (Key.fromString "result") o of
       Just (A.Array arr) ->
-        let parsed = [ parseOneUpdate v | v <- V.toList arr ]
-        in Right [ (uid, u) | Right (uid, u) <- parsed ]
-      _ -> Right []
+        let raws = V.toList arr
+            allIds = [ uid | v <- raws, Just uid <- [rawUpdateId v] ]
+            parsed = [ parseOneUpdate v | v <- raws ]
+            okUpdates = [ (uid, u) | Right (uid, u) <- parsed ]
+        in Right (okUpdates, allIds)
+      _ -> Right ([], [])
     Just _ -> Left "getUpdates: response not an object"
   where
     parseOneUpdate v = do
       uid <- updateId v
-      u <- parseTelegramUpdate v
-      Right (uid, u)
+      case parseTelegramUpdate v of
+        Left err -> Left err
+        Right u  -> Right (uid, u)
+
+-- | Extract the raw @update_id@ from an update object (for offset
+-- advancement even when the update body fails to parse).
+rawUpdateId :: Value -> Maybe Int
+rawUpdateId v =
+  case v of
+    A.Object o -> case KeyMap.lookup (Key.fromString "update_id") o of
+      Just (A.Number n) -> Just (round n)
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Extract the numeric @update_id@ from a Telegram update object.
 updateId :: Value -> Either Text Int
@@ -306,8 +331,10 @@ parseTelegramUpdate v =
     parseCallbackQuery cq =
       case cq of
         A.Object cqo -> do
-          -- callback_query has: id, from, message (with chat), data
+          -- callback_query has: id (a String per the Bot API), from,
+          -- message (with chat), data.
           callbackId <- case KeyMap.lookup (Key.fromString "id") cqo of
+            Just (A.String t) -> Right t
             Just (A.Number n) -> Right (T.pack (show (round n :: Int)))
             _ -> Left "callback_query.id missing"
           callbackData <- case KeyMap.lookup (Key.fromString "data") cqo of

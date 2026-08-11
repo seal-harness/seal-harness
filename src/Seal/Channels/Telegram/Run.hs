@@ -265,10 +265,10 @@ onTelegramCallback store sid body =
     [prefix, token]
       | T.length prefix == 8 && T.all isHexChar prefix ->
           if token == "other"
-            then pure False  -- Other: fall through to deliverNextAnswerResolved
+            then pure False
             else case parseIndex token of
               Just idx -> resolveIndex store sid prefix idx
-              Nothing  -> pure False  -- non-numeric token: fall through
+              Nothing  -> pure False
     _ -> pure False
   where
     isHexChar c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
