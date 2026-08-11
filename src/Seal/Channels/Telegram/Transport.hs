@@ -123,10 +123,12 @@ data TelegramUpdate = TelegramUpdate
 -- no-op (idempotent). 'tgSendWithKeyboard' + 'tgAnswerCallback' capture to
 -- separate IORefs (for test assertions). Returns the transport + an action
 -- to read captured sends + an action to read captured commands + an action
--- to read captured callback acknowledgements.
+-- to read captured callback acknowledgements + an action to read captured
+-- keyboard sends (each @(chatId, body, keyboard)@).
 mkMockTelegramTransport
   :: [TelegramUpdate]
-  -> IO (TelegramTransport, IO [(Text, Text)], IO [BotCommand], IO [Text])
+  -> IO ( TelegramTransport, IO [(Text, Text)], IO [BotCommand]
+        , IO [Text], IO [(Text, Text, [[TelegramButton]])] )
 mkMockTelegramTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
@@ -149,7 +151,8 @@ mkMockTelegramTransport scripted = do
       getCaptured = reverse <$> readIORef capRef
       getCommands = readIORef cmdRef
       getCallbacks = reverse <$> readIORef cbRef
-  pure (transport, getCaptured, getCommands, getCallbacks)
+      getKeyboards = reverse <$> readIORef kbRef
+  pure (transport, getCaptured, getCommands, getCallbacks, getKeyboards)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS

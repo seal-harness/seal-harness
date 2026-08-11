@@ -8,11 +8,14 @@
 module Seal.Channels.Telegram.Run
   ( runTelegram
   , runTelegramMain
+  , mkTelegramHandleCaps
+  , onTelegramCallback
   ) where
 
 import Data.Char (isDigit)
 import Data.Either (fromRight)
 import Data.IORef (newIORef)
+import Data.Default (def)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -21,15 +24,17 @@ import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
 
-import Seal.Channel.Caps (ChannelCaps)
+import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Core.Types (SessionId)
-import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier, mkHandleCaps)
+import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
 import Seal.Handles.AskReply
-  ( AskReplyStore, newApprovalCache, newAskReplyStore
-  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix )
+  ( AskId, AskReplyStore, newApprovalCache, newAskReplyStore
+  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix
+  , askHumanWithOptions, askIdText
+  , QuestionOption (..), formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Channels.Telegram.Transport
-  ( TelegramTransport (..), mkRealTelegramTransport, tgSetCommands )
+  ( TelegramTransport (..), TelegramButton (..), mkRealTelegramTransport, tgSetCommands )
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Commands (telegramBotCommands)
@@ -193,19 +198,55 @@ tryOpenVault paths cfg logger =
           Just <$> Vault.openVault vcfg enc
     _ -> pure Nothing
 
--- | Build a 'ChannelCaps' for the Telegram channel. For v1, this uses the
--- same numbered-list rendering as Signal/CLI ('formatQuestionWithOptions'
--- via 'chSend h'). The inline keyboard ('tgSendWithKeyboard') is deferred
--- to a follow-up: the 'ChannelHandle' doesn't expose the raw Telegram chat
--- id (needed for 'tgSendWithKeyboard'), and 'answerCallbackQuery' is also
--- deferred (the 'callback_query_id' is not threaded through
--- 'chReceive'). The 'onTelegramCallback' hook (below) IS wired so that
--- callback_data from a button tap (if a keyboard is ever sent) routes
--- by-id. The inline keyboard + answerCallbackQuery will be added in a
--- follow-up that threads the chat id + callback_query_id through the
--- channel handle.
+-- | Build a 'ChannelCaps' for the Telegram channel. When the 'AskPrompt'
+-- has non-empty options AND the handle has a last chat id, 'ccPrompt' sends
+-- the question with an inline keyboard (one button per option + an "Other"
+-- free-text button) via 'tgSendWithKeyboard', then blocks on
+-- 'askHumanWithOptions'. The @callback_data@ is @\"<8hex>:<idx>\"@ for
+-- option buttons and @\"<8hex>:other\"@ for the Other button; the
+-- 'onTelegramCallback' hook resolves the index to the option label and
+-- delivers it by-id. When the options are empty OR no chat id is known
+-- (the graceful-degradation path — should not happen in practice since the
+-- first inbound message sets the chat id), it falls back to the generic
+-- numbered-list rendering via 'chSend' + 'formatQuestionWithOptions'.
 mkTelegramHandleCaps :: TelegramTransport -> ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
-mkTelegramHandleCaps _transport = mkHandleCaps
+mkTelegramHandleCaps transport h askReply sid = def
+  { ccSend         = chSend h
+  , ccPrompt       = \ap -> do
+      let AskPrompt q opts = ap
+      mChat <- chLastChatId h
+      case (mChat, opts) of
+        (Just chatId, _ : _) -> do
+          outcome <- askHumanWithOptions askReply sid q opts (sendKeyboard chatId q opts)
+          pure (fromRight "" outcome)
+        _ -> do
+          -- Empty options OR no chat id: fall back to the numbered list.
+          chSend h (formatQuestionWithOptions q opts)
+          outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
+          pure (fromRight "" outcome)
+  , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
+  , ccStreaming    = chStreaming h
+  }
+  where
+    -- | The notify callback: sends the question + inline keyboard before
+    -- 'askHumanWithOptions' blocks. The 8-hex prefix of the 'AskId' ties
+    -- the buttons to this specific pending ask.
+    sendKeyboard :: Text -> Text -> [QuestionOption] -> AskId -> IO ()
+    sendKeyboard chatId q opts qid =
+      let prefix = T.take 8 (askIdText qid)
+      in tgSendWithKeyboard transport chatId q (buildKeyboard prefix opts)
+
+-- | Build the inline keyboard: one row per option (button label = the
+-- option's 'qoLabel', callback_data = @\"<prefix>:<idx>\"@), plus a final
+-- row with one "Other" button (callback_data = @\"<prefix>:other\"@).
+-- Pure. The callback_data is always ≤ 64 bytes (8 hex + 1 colon + ≤ 5
+-- chars for the index or "other" = ≤ 14 bytes).
+buildKeyboard :: Text -> [QuestionOption] -> [[TelegramButton]]
+buildKeyboard prefix opts =
+  [ [TelegramButton (qoLabel o) (prefix <> ":" <> T.pack (show i))]
+  | (i, o) <- zip [0 :: Int ..] opts
+  ]
+  <> [[TelegramButton "Other" (prefix <> ":other")]]
 
 -- | The callback handler for Telegram: parses the @callback_data@
 -- (@\"<8hex>:<label>\"@), finds the pending ask by the 8-hex prefix, and
