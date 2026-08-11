@@ -20,6 +20,8 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR (decimal)
+import Data.Vector qualified as V
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Katip (Severity (..), ls)
@@ -30,7 +32,7 @@ import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChann
 import Seal.Handles.AskReply
   ( AskId, AskReplyStore, newApprovalCache, newAskReplyStore
   , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix
-  , askHumanWithOptions, askIdText
+  , askHumanWithOptions, askIdText, pendingForSession, pqiId, pqiOptions
   , QuestionOption (..), formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Channels.Telegram.Transport
@@ -249,21 +251,54 @@ buildKeyboard prefix opts =
   <> [[TelegramButton "Other" (prefix <> ":other")]]
 
 -- | The callback handler for Telegram: parses the @callback_data@
--- (@\"<8hex>:<label>\"@), finds the pending ask by the 8-hex prefix, and
--- delivers the label by-id via 'deliverAnswer'. Returns 'True' if the body
--- was a callback + delivered; 'False' if not (fall through to
--- 'deliverNextAnswerResolved').
+-- (@\"<8hex>:<token>\"@), where @token@ is either a decimal index (the
+-- tapped option button) or @other@ (the Other free-text button). For an
+-- index, finds the pending ask by the 8-hex prefix, resolves the index to
+-- the option's label via the pending ask's 'pqiOptions', and delivers it
+-- by-id via 'deliverAnswer'. For @other@, returns 'False' so the loop
+-- falls through to 'deliverNextAnswerResolved' (the next typed message is
+-- captured as the free-text answer). Returns 'True' if a callback was
+-- delivered; 'False' if not (fall through).
 onTelegramCallback :: AskReplyStore -> SessionId -> Text -> IO Bool
 onTelegramCallback store sid body =
   case T.splitOn ":" body of
-    [prefix, label]
-      | T.length prefix == 8 && T.all isHexChar prefix -> do
-          mQid <- findByAskIdPrefix store sid prefix
-          case mQid of
-            Just qid -> do
-              _accepted <- deliverAnswer store qid (AskReply ScopeOnce label)
-              pure True
-            Nothing -> pure False
+    [prefix, token]
+      | T.length prefix == 8 && T.all isHexChar prefix ->
+          if token == "other"
+            then pure False  -- Other: fall through to deliverNextAnswerResolved
+            else case parseIndex token of
+              Just idx -> resolveIndex store sid prefix idx
+              Nothing  -> pure False  -- non-numeric token: fall through
     _ -> pure False
   where
     isHexChar c = isDigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+-- | Parse a non-negative decimal index from the callback token. 'Nothing'
+-- if the token is not a clean decimal (e.g. empty, negative, or has
+-- trailing chars).
+parseIndex :: Text -> Maybe Int
+parseIndex t =
+  case TR.decimal (T.strip t) of
+    Right (n, rest) | T.null rest && n >= 0 -> Just n
+    _ -> Nothing
+
+-- | Resolve a callback index to the option's label + deliver it by-id.
+-- Looks up the pending ask by the 8-hex prefix, reads its 'pqiOptions',
+-- safely indexes with 'V.!?'. Returns 'True' if delivered; 'False' if the
+-- prefix is stale, the ask has no options, or the index is out of bounds
+-- (all fall through to 'deliverNextAnswerResolved').
+resolveIndex :: AskReplyStore -> SessionId -> Text -> Int -> IO Bool
+resolveIndex store sid prefix idx = do
+  mQid <- findByAskIdPrefix store sid prefix
+  case mQid of
+    Nothing -> pure False
+    Just qid -> do
+      ps <- pendingForSession store sid
+      case filter (\p -> pqiId p == qid) ps of
+        (p : _) ->
+          case V.fromList (pqiOptions p) V.!? idx of
+            Just o  -> do
+              _accepted <- deliverAnswer store qid (AskReply ScopeOnce (qoLabel o))
+              pure True
+            Nothing -> pure False  -- out of bounds
+        [] -> pure False  -- stale (ask vanished between the two lookups)
