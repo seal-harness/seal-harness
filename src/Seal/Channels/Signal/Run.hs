@@ -52,7 +52,7 @@ import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
 import Seal.Handles.AskReply
   ( AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
-  , newApprovalCache, newAskReplyStore, formatQuestionWithOptions )
+  , formatQuestionWithOptions, newApprovalCache, newAskReplyStore )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)

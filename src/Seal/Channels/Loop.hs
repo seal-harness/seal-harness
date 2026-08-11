@@ -99,7 +99,7 @@ import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
-  , formatQuestionWithOptions )
+   )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
@@ -456,8 +456,11 @@ mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
   , ccPrompt       = \(AskPrompt q opts) -> do
-      outcome <- askHumanWithOptions askReply sid q opts
-                   (\_qid -> chSend h (formatQuestionWithOptions q opts))
+      -- The model already streamed the question text to the channel
+      -- during the provider response (see Agent/Loop.hs:196). Don't
+      -- re-send it — that would double-deliver. Only register the
+      -- pending ask + block for the human's reply.
+      outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))
       pure (fromRight "" outcome)
   , ccPromptSecret = fmap (fromRight "") . chPromptSecret h
   , ccStreaming    = chStreaming h
