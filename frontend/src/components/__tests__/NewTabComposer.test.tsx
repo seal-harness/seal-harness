@@ -3,11 +3,13 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { NewTabComposer } from '../NewTabComposer'
 import { adoptWindow, createTab } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
+import type { NewTabResponse } from '../../hooks/useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   adoptWindow: vi.fn(async () => ({ ok: true, sessionId: 'adopted-1' })),
   createTab: vi.fn(async () => ({ tab_index: 1, session_id: 's2', kind: 'provider' })),
+  setupRepo: vi.fn(async () => ({ ok: true })),
 }))
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -317,5 +319,66 @@ describe('NewTabComposer — branding', () => {
       <NewTabComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />,
     )
     expect(container.textContent).not.toMatch(/pureclaw/i)
+  })
+})
+
+describe('NewTabComposer — submit spinner', () => {
+  it('shows a spinner while the createTab round-trip is in flight', async () => {
+    // Pause createTab so we can assert the spinner before it resolves.
+    let resolveCreate: (v: NewTabResponse | null) => void = () => {}
+    vi.mocked(createTab).mockImplementationOnce(() => new Promise((resolve) => { resolveCreate = resolve }))
+    const onSubmit = vi.fn()
+    render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
+
+    // Initially the form is visible (provider dropdown, submit button).
+    expect(screen.getByLabelText('Provider')).toBeTruthy()
+    expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+
+    // The form body is replaced by the spinner.
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toBeTruthy()
+      expect(screen.queryByLabelText('Provider')).toBeNull()
+      expect(screen.queryByLabelText('Submit new tab')).toBeNull()
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+
+    // Resolve the promise → onSubmit fires, spinner disappears, form is gone.
+    resolveCreate({ tab_index: 1, session_id: 's2', kind: 'provider' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+  })
+
+  it('shows a spinner while the adoptWindow round-trip is in flight', async () => {
+    let resolveAdopt: (v: { ok: boolean; sessionId: string }) => void = () => {}
+    vi.mocked(adoptWindow).mockImplementationOnce(() => new Promise((resolve) => { resolveAdopt = resolve }))
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ kind: 'attach', attachSession: 'main', attachWindow: 'zsh', attachWindowIndex: 0 })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toBeTruthy()
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+
+    resolveAdopt({ ok: true, sessionId: 'adopted-1' })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+  })
+
+  it('restores the form if createTab fails', async () => {
+    vi.mocked(createTab).mockResolvedValueOnce(null)
+    render(<NewTabComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() => {
+      expect(screen.getByLabelText('Provider')).toBeTruthy()
+      expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
+    })
   })
 })
