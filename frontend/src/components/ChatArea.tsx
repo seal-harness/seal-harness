@@ -797,11 +797,13 @@ function ToolCallBlock({
   // Auto-expand for the confirmation gate (inline-approval panel lives inside
   // the expanded section). For ASK_HUMAN-with-options, the AskHumanForm
   // renders OUTSIDE the collapsible part (attached to the box, always
-  // visible), so the box stays collapsed for conciseness.
+  // visible), so the box stays collapsed for conciseness. For open-ended
+  // ASK_HUMAN (no options), the form also renders outside, so stay collapsed.
   const hasOptions = (pendingQuestion?.options?.length ?? 0) > 0
-  const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions))
+  const isAskHuman = tc.name === 'ASK_HUMAN'
+  const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions && !isAskHuman))
 
-  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions])
+  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman])
 
   const summary = toolCallSummary(tc.input)
   const inputJson = (() => {
@@ -876,7 +878,7 @@ function ToolCallBlock({
           {hasResult && tc.result !== undefined && (
             <ResultPreview text={tc.result} isError={failed} />
           )}
-          {isPending && pendingQuestion && onAnswer && onCancel && (pendingQuestion.options === undefined || pendingQuestion.options.length === 0) && (
+          {isPending && pendingQuestion && onAnswer && onCancel && !isAskHuman && (pendingQuestion.options === undefined || pendingQuestion.options.length === 0) && (
             <div data-testid="inline-approval" className="rounded-md p-3" style={{ background: 'rgba(255,193,7,0.06)', border: '1px solid var(--needs-input)' }}>
               <div className="text-xs font-semibold mb-2" style={{ color: 'var(--needs-input)' }}>
                 {'\u26A0'} Confirmation required
@@ -907,8 +909,9 @@ function ToolCallBlock({
       {/* The AskHumanForm renders OUTSIDE the collapsible section, attached
           to the box but always visible — so the tool-call box can stay
           collapsed for conciseness (AC13: opcode === 'ASK_HUMAN' &&
-          options.length > 0). */}
-      {isPending && pendingQuestion && (pendingQuestion.options?.length ?? 0) > 0 && onAnswerText && onCancel && (
+          options.length > 0). Open-ended ASK_HUMAN (no options) renders the
+          same form with only the textarea. */}
+      {isPending && pendingQuestion && isAskHuman && onAnswerText && onCancel && (
         <div className="px-3 pb-3">
           <AskHumanForm pendingQuestion={pendingQuestion} onAnswerText={onAnswerText} onCancel={onCancel} />
         </div>
@@ -971,14 +974,18 @@ function ToolDefsCollapsed({ block, anchorId }: { block: ToolDefsBlock; anchorId
 /** Check whether a pending question matches a tool call. For the
  *  confirmation gate, the pending question's text has the format
  *  "Allow <NAME> <JSON>? [y/N] " — parse the name + input JSON and compare
- *  against the tool call's name + input. For ASK_HUMAN with options, match
- *  by opcode name (the question text is the agent's free-form question, not
- *  the "Allow …?" format). The oldest-unmatched correlation (≥2 ASK_HUMAN
- *  tool calls) is handled by the caller (MessageBlock) via the
- *  matchedQuestionIds set. */
+ *  against the tool call's name + input. For ASK_HUMAN (with or without
+ *  options), match by opcode name — the question text is the agent's
+ *  free-form question, not the "Allow …?" format. The oldest-unmatched
+ *  correlation (≥2 ASK_HUMAN tool calls) is handled by the caller
+ *  (MessageBlock) via the matchedQuestionIds set.
+ *
+ *  The confirmation gate is never emitted as an ASK_HUMAN tool call (it's
+ *  emitted as the gated opcode, e.g. SHELL_EXEC), so `tc.name === 'ASK_HUMAN'`
+ *  unambiguously means ASK_HUMAN — with or without options. */
 function matchesToolCall(pq: PendingQuestion, tc: ToolCallInfo): boolean {
-  // ASK_HUMAN with options: match by opcode name (AC13/AC14).
-  if (tc.name === 'ASK_HUMAN' && pq.options && pq.options.length > 0) return true
+  // ASK_HUMAN (open-ended or with options): match by opcode name (AC13/AC14).
+  if (tc.name === 'ASK_HUMAN') return true
   // Confirmation gate: match via the "Allow <NAME> <JSON>?" regex.
   const m = pq.question.match(/^Allow\s+(\S+)\s+(\{.*\})\?/)
   if (!m) return false

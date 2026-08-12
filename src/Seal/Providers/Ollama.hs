@@ -236,11 +236,18 @@ data StreamChunkState = StreamChunkState
     -- ^ Tool ids already emitted via 'StreamToolStart'/'StreamToolEnd', so
     -- we don't re-emit them if the same chunk is processed twice or if
     -- subsequent chunks repeat the tool_calls array.
+  , scsSawTools :: Bool
+    -- ^ True once any tool call was emitted during this stream. Ollama's
+    -- @done_reason@ for a tool-call response is still @"stop"@ (which maps
+    -- to 'StopEnd'), but the non-streaming path overrides the stop reason
+    -- to 'StopToolUse' when tool blocks are present (see 'parseRespFrom').
+    -- This flag lets the streaming path do the same override in the
+    -- 'StreamDone' chunk so the transcript's stop reason is accurate.
   }
 
 -- | Initial streaming state (no tools seen yet).
 initialStreamChunkState :: StreamChunkState
-initialStreamChunkState = StreamChunkState 0 []
+initialStreamChunkState = StreamChunkState 0 [] False
 
 -- | Decode one Ollama streaming NDJSON chunk into zero or more 'StreamEvent's,
 -- threading the accumulator state. A single chunk can carry:
@@ -265,7 +272,12 @@ parseStreamChunk st = withObject "ollama stream chunk" $ \o -> do
       doneReason <- o .:? "done_reason"
       promptTok  <- o .:? "prompt_eval_count" .!= 0
       evalTok    <- o .:? "eval_count" .!= 0
-      let stop = stopFromDone doneReason
+      let rawStop = stopFromDone doneReason
+          -- Override StopEnd → StopToolUse when tools were emitted during
+          -- this stream (Ollama reports done_reason="stop" even for
+          -- tool-call responses; the non-streaming path does the same
+          -- override in parseRespFrom).
+          stop = if scsSawTools st && rawStop == StopEnd then StopToolUse else rawStop
       pure (st, [StreamDone stop (Usage promptTok evalTok)])
     else do
       msgVal <- o .:? "message" .!= object []
@@ -283,6 +295,7 @@ parseStreamChunk st = withObject "ollama stream chunk" $ \o -> do
           else
             let s' = s { scsToolIndex = scsToolIndex s + 1
                        , scsSeenToolIds = tcid : scsSeenToolIds s
+                       , scsSawTools = True
                        }
             in (s', evs <> [StreamToolStart tcid name, StreamToolEnd tcid name args])
 
