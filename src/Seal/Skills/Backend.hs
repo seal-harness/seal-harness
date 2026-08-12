@@ -122,16 +122,20 @@ unionSkillBackend user = SkillBackend
 -- @.skills@ follows the [agentskills.io](https://agentskills.io)
 -- specification: each subdirectory contains a @SKILL.md@ file with YAML
 -- frontmatter (@name@, @description@) + Markdown body. The other
--- conventions use Seal's native flat/grouped @.md@ layout.
+-- @.agents\/skills@ also uses the agentskills.io format (it is the skills
+-- sub-directory of the [.agents Protocol](https://dotagentsprotocol.com)).
+-- The other conventions use Seal's native flat/grouped @.md@ layout.
 workdirSkillConventions :: [FilePath]
-workdirSkillConventions = [ ".skills", ".seal/skills", ".claude/skills", "agents/skills" ]
+workdirSkillConventions = [ ".skills", ".agents/skills", ".seal/skills", ".claude/skills", "agents/skills" ]
 
 -- | A read-only 'SkillBackend' that scans a session workdir for skills
 -- shipped by cloned repositories. For each top-level directory in the
 -- workdir (a cloned repo), it checks the conventional skill locations
--- (@.skills\/@, @.seal\/skills\/@, @.claude\/skills\/@, @agents\/skills\/@)
--- and loads any skills there. The @.skills@ convention uses the
--- agentskills.io directory-based format (@\<name\>\/SKILL.md@); the others
+-- (@.skills\/@, @.agents\/skills\/@, @.seal\/skills\/@,
+-- @.claude\/skills\/@, @agents\/skills\/@)
+-- and loads any skills there. The @.skills@ and @.agents\/skills@
+-- conventions use the agentskills.io directory-based format
+-- (@\<name\>\/SKILL.md@); the others
 -- use Seal's native flat/grouped @.md@ layout.
 --
 -- This backend is /read-only/: 'sbCreate'/'sbUpdate'/'sbDelete' are no-ops
@@ -160,7 +164,7 @@ workdirSkillBackend workdir = pure SkillBackend
 -- alphabetically-first repo wins on id collisions (deterministic). Missing
 -- @workdir@ or empty workdirs yield @[]@.
 --
--- For the @.skills@ convention, skills are loaded from the agentskills.io
+-- For the @.skills@ and @.agents\/skills@ conventions, skills are loaded from the agentskills.io
 -- directory format (each subdirectory contains a @SKILL.md@). For the
 -- other conventions, skills are loaded from Seal's native flat/grouped
 -- @.md@ layout.
@@ -178,7 +182,7 @@ listWorkdirSkills workdir = do
           cExists <- doesDirectoryExist convDir
           if not cExists
             then pure []
-            else if conv == ".skills"
+            else if conv `elem` [".skills", ".agents/skills"]
                    then do
                      -- agentskills.io format: subdirectories with SKILL.md
                      agentSkills <- listAgentSkillsDir convDir

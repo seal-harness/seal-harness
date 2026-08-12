@@ -53,6 +53,8 @@ spec = do
   describe "Seal.Skills.Backend.workdirSkillConventions" $ do
     it "includes .skills as the first convention" $ do
       ".skills" `elem` workdirSkillConventions `shouldBe` True
+    it "includes .agents/skills as the second convention" $ do
+      ".agents/skills" `elem` workdirSkillConventions `shouldBe` True
   describe "Seal.Skills.Backend.workdirSkillBackend (.skills directory)" $ do
     it "discovers skills in agentskills.io format" $ do
       let tmp = "/tmp/seal-repo-discovery-skills-test"
@@ -74,6 +76,24 @@ spec = do
           mSkill <- sbRead backend sid
           mSkill `shouldSatisfy` isJust
         Left _ -> expectationFailure "invalid skill id"
+      cleanup tmp
+
+  describe "Seal.Skills.Backend.workdirSkillBackend (.agents/skills directory)" $ do
+    it "discovers skills in agentskills.io format under .agents/skills/" $ do
+      let tmp = "/tmp/seal-repo-discovery-agents-skills-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill" </> "SKILL.md")
+        "---\nname: my-skill\ndescription: A .agents/skills skill.\n---\nDo .agents things.\n"
+      backend <- workdirSkillBackend tmp
+      skills <- sbList backend
+      length skills `shouldBe` 1
+      case skills of
+        [s] -> do
+          skillIdText (skId s) `shouldBe` "my-skill"
+          skDescription s `shouldBe` "A .agents/skills skill."
+          skBody s `shouldBe` "Do .agents things.\n"
+        _ -> expectationFailure "expected exactly 1 skill"
       cleanup tmp
 
     it "returns empty list when workdir has no repos" $ do
