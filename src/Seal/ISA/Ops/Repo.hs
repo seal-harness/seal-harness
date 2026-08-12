@@ -247,8 +247,13 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
   case eTarget of
     Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
     Right target -> withCloneTarget target $ \env -> do
-      let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
-          cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
+      -- Shell-quote each config arg: the @http.extraHeader@ value for
+      -- PAT/MachineUser contains spaces (@Authorization: Basic <base64>@)
+      -- that the shell would split on. Quoting each arg preserves the
+      -- value as a single token for both local (@/bin/sh -c@) and remote
+      -- (SSH) arms. Mirrors the fix in 'Seal.ISA.Ops.Git.runGitCommand'.
+      let gitConfigArgs = map shellQ (ceGitConfigArgs env)
+          cloneCmd = "git " <> T.unwords gitConfigArgs
                      <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
       cloneRes <- uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
       case cloneRes of

@@ -1,8 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.RepoSpec (spec) where
 
-import Data.IORef (newIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
+import Data.Text (Text)
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, withCurrentDirectory )
 import System.FilePath ((</>))
@@ -12,13 +13,19 @@ import Test.Hspec
 
 import Seal.ISA.Ops.Repo
   ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, validateRepoUrl )
+import Seal.SourceControl.Repo
+  ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
-import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
+import Seal.Tools.Args (textShellCommand)
+import Seal.Tools.Exec.Types (ExecError (..))
+import Seal.Tools.Exec.UntrustedIO
+  ( UntrustedErr (..), UntrustedIO (..), mkLocalUntrustedIO )
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), mkFakeSshAgentHandle )
 
@@ -301,6 +308,78 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             ("expected CloneFailed, got " <> show other
              <> " — cloneRepoIO must verify the clone landed, since uioShellExec returns Right on non-zero exit")
 
+    describe "PAT http.extraHeader shell-quoting in cloneWithCredential" $ do
+      it "the http.extraHeader value is single-quoted in the clone command" $ do
+        withSystemTempDirectory "seal-repo-pat-quote" $ \wd -> do
+          let keyfilesDir = wd </> "keys"
+          createDirectoryIfMissing True keyfilesDir
+          vault <- makeFakeVaultRuntime [("K_PAT", "ghp_TOKEN")]
+          callsRef <- newIORef []
+          agentRegH <- mkAgentRegistryHandle keyfilesDir
+          cmdRef <- newIORef ("" :: Text)
+          let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+              rid = case mkRepoId "myrepo" of Right i -> i; Left _ -> error "bad id"
+              patRepo = SourceRepo rid
+                "https://github.com/owner/repo.git"
+                VcsGitHub (CredPat "K_PAT") Nothing Nothing
+              repoReg = fakeRepoReg [patRepo]
+              deps = CloneDeps
+                { cdVault = vault
+                , cdRepoReg = repoReg
+                , cdSshAgent = agent
+                , cdAgentRegistry = agentRegH
+                , cdPinnedKnownHosts = pinnedGithubKnownHosts
+                , cdKeyfilesDir = keyfilesDir
+                , cdIsRemote = False
+                }
+              uio = recordingUio "__NONE__" cmdRef
+          _ <- cloneRepoIO deps uio (T.pack "https://github.com/owner/repo.git")
+          cmd <- readIORef cmdRef
+          -- The http.extraHeader arg contains spaces and must be
+          -- single-quoted so the shell preserves it as one token.
+          "'http.extraHeader=Authorization: Basic " `T.isInfixOf` cmd
+            `shouldBe` True
+
 isLeft :: Either a b -> Bool
 isLeft (Left _)  = True
 isLeft (Right _) = False
+
+----------------------------------------------------------------------------
+-- PAT http.extraHeader shell-quoting in cloneWithCredential
+----------------------------------------------------------------------------
+
+-- | A fake 'UntrustedIO' for the PAT quoting test: returns a canned origin
+-- URL for the idempotency check (@uioShellExec@), records the clone command
+-- from @uioShellExecGitEnv@ into the 'IORef', and returns a canned success
+-- for the clone + verify steps.
+recordingUio :: Text -> IORef Text -> UntrustedIO
+recordingUio originUrl cmdRef = stubUio
+  { uioShellExec = \_cmd _mCwd ->
+      pure (Right originUrl)
+  , uioShellExecGitEnv = \_env _kh cmd _mCwd -> do
+      writeIORef cmdRef (textShellCommand cmd)
+      pure (Right "__NONE__")
+  }
+
+-- | A stub 'UntrustedIO' that fail-closes on every method.
+stubUio :: UntrustedIO
+stubUio = UntrustedIO
+  { uioReadFile = \_ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioWriteFile = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioPatchFile = \_ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExec = \_ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExec = \_ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioProcessList = pure (Left (UeExec ExecNotImplemented))
+  , uioProcessKill = \_ -> pure (Left (UeExec ExecNotImplemented))
+  , uioSearchFiles = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  }
+
+-- | A fake 'RepoRegistryHandle' whose @rrhList@ returns the given repos.
+fakeRepoReg :: [SourceRepo] -> RepoRegistryHandle
+fakeRepoReg repos = RepoRegistryHandle
+  { rrhList = pure (Right repos)
+  , rrhMutate = \_ -> pure (Right ())
+  }
