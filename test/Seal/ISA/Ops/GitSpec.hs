@@ -357,12 +357,22 @@ spec = describe "Seal.ISA.Ops.Git" $ do
         appEnv <- mkAppEnv
         _ <- runApp appEnv (uoRun op uio input)
         cmd <- readIORef cmdRef
-        -- The command string must contain a single-quoted
-        -- http.extraHeader=... so the shell preserves the spaces in
-        -- "Authorization: Basic <base64>".
-        "http.extraHeader='Authorization:" `T.isInfixOf` cmd `shouldBe` True
-        -- The full header value (with spaces) must be inside the quotes.
-        "'Authorization: Basic " `T.isInfixOf` cmd `shouldBe` True
+        -- The @http.extraHeader@ arg contains spaces
+        -- (@Authorization: Basic <base64>@) and must be single-quoted
+        -- so the shell preserves it as one token. The entire arg
+        -- @http.extraHeader=Authorization: Basic ...@ is wrapped in
+        -- single quotes by 'shellQ'.
+        "'http.extraHeader=Authorization: Basic " `T.isInfixOf` cmd
+          `shouldBe` True
+        -- The unquoted form (bare spaces the shell would split on)
+        -- must NOT appear outside single quotes. After removing the
+        -- quoted form, the bare form should be absent.
+        let cmdStripped = T.replace
+              "'http.extraHeader=Authorization: Basic " ""
+              cmd
+        ("http.extraHeader=Authorization: Basic " :: Text)
+          `T.isInfixOf` cmdStripped
+          `shouldBe` False
 
   --------------------------------------------------------------------------
   -- Opcode metadata
