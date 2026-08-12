@@ -15,7 +15,7 @@ import Seal.Handles.Transcript (TwoFileHandle (..), fakeTwoFileTranscript)
 import Seal.ISA.Dispatch
 import Seal.ISA.Opcode
 import Seal.ISA.Registry
-import Seal.Providers.Class (ContentBlock (..), Message (..), ToolResultPart (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Transcript.Entries (erMeta)
 import Seal.Types.App
@@ -230,3 +230,86 @@ spec = describe "Seal.ISA.Dispatch" $ do
       (conv, _entries) <- readState
       let texts = [ t | Message _ bs <- conv, CbText t <- bs ]
       texts `shouldBe` [bodyText]
+
+    it "writes the skill body as an Assistant message (harness output, not user input)" $ do
+      (h, readState) <- fakeTwoFileTranscript
+      let bodyText :: Text
+          bodyText = "skill body"
+          result = OpResult
+            { orParts = [TrpText bodyText]
+            , orIsError = False
+            , orRecorded = object ["id" .= ("greet" :: Text)]
+            }
+      recordSkillLoadResult h (OpName "SKILL_LOAD") (object ["id" .= ("greet" :: Text)]) result Nothing
+      (conv, _entries) <- readState
+      case conv of
+        [m] -> msgRole m `shouldBe` Assistant
+        _   -> expectationFailure ("expected exactly one message, got " <> show (length conv))
+
+    it "writes the trailing message as a User message (actual user input)" $ do
+      (h, readState) <- fakeTwoFileTranscript
+      let bodyText :: Text
+          bodyText = "# start\n\nstart skill\n\n---\n\nbody"
+          result = OpResult
+            { orParts = [TrpText bodyText]
+            , orIsError = False
+            , orRecorded = object ["id" .= ("start" :: Text)]
+            }
+          input = object
+            [ "id" .= ("start" :: Text)
+            , "message" .= ("#123" :: Text)
+            ]
+      recordSkillLoadResult h (OpName "SKILL_LOAD") input result Nothing
+      (conv, _entries) <- readState
+      case conv of
+        [skillMsg, userMsg] -> do
+          msgRole skillMsg `shouldBe` Assistant
+          msgRole userMsg  `shouldBe` User
+        _ -> expectationFailure ("expected two messages, got " <> show (length conv))
+
+  describe "recordSetupRepoResult" $ do
+    it "writes the clone result as an Assistant message (harness output, not user input)" $ do
+      (h, readState) <- fakeTwoFileTranscript
+      let bodyText :: Text
+          bodyText = "Cloned git@github.com:seal-harness/seal-harness.git into seal-harness (shallow)."
+          result = OpResult
+            { orParts = [TrpText bodyText]
+            , orIsError = False
+            , orRecorded = object ["target" .= ("seal-harness" :: Text), "status" .= ("cloned" :: Text)]
+            }
+      recordSetupRepoResult h (OpName "SETUP_REPO") (object ["url" .= ("git@github.com:seal-harness/seal-harness.git" :: Text)]) result Nothing
+      (conv, _entries) <- readState
+      case conv of
+        [m] -> msgRole m `shouldBe` Assistant
+        _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
+
+    it "writes the clone failure as an Assistant message" $ do
+      (h, readState) <- fakeTwoFileTranscript
+      let bodyText :: Text
+          bodyText = "SETUP_REPO: clone failed: connection refused"
+          result = OpResult
+            { orParts = [TrpText bodyText]
+            , orIsError = True
+            , orRecorded = object ["target" .= ("" :: Text), "status" .= ("failed" :: Text)]
+            }
+      recordSetupRepoResult h (OpName "SETUP_REPO") (object ["url" .= ("https://example.com/repo.git" :: Text)]) result Nothing
+      (conv, _entries) <- readState
+      case conv of
+        [m] -> msgRole m `shouldBe` Assistant
+        _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
+
+  describe "recordGitPushResult" $ do
+    it "writes the push result as an Assistant message (harness output, not user input)" $ do
+      (h, readState) <- fakeTwoFileTranscript
+      let bodyText :: Text
+          bodyText = "Pushed main to origin."
+      let result = OpResult
+            { orParts = [TrpText bodyText]
+            , orIsError = False
+            , orRecorded = object ["status" .= ("pushed" :: Text)]
+            }
+      recordGitPushResult h (OpName "GIT_PUSH") (object ["workdir" .= ("seal-harness" :: Text), "refspec" .= ("main" :: Text)]) result Nothing
+      (conv, _entries) <- readState
+      case conv of
+        [m] -> msgRole m `shouldBe` Assistant
+        _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
