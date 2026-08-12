@@ -45,6 +45,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
   const noProviders = spec.providersLoaded && spec.configuredProviders.length === 0
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
 
   // Lock the kind to provider whenever a branchFrom is supplied. The hook's
   // own state is the source of truth; we just force-set it here whenever the
@@ -57,12 +58,15 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
 
   const handleSubmit = async () => {
     if (spec.validationError) return
+    setSubmitting(true)
     setRepoWarning(null)
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
       if (res.ok) {
         spec.persistOnSubmit()
         onSubmit(null)
+      } else {
+        setSubmitting(false)
       }
       return
     }
@@ -86,7 +90,38 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       }
       spec.persistOnSubmit()
       onSubmit(res)
+    } else {
+      // createTab failed — re-enable the form so the user can retry.
+      setSubmitting(false)
     }
+  }
+
+  // While the server round-trip is in flight, replace the entire form body
+  // with a spinner so the user gets immediate visual feedback that their
+  // click was registered. The header stays for context.
+  if (submitting) {
+    return (
+      <div style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 16,
+        maxWidth: 640,
+        margin: '0 auto',
+        padding: '24px 0',
+      }}>
+        <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)' }}>
+          {branchFrom ? 'Branch from here' : 'Start a new tab'}
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '48px 0',
+        }}>
+          <span className="composer-spinner" role="status" aria-label="Creating session" />
+        </div>
+      </div>
+    )
   }
 
   return (
