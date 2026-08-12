@@ -8,6 +8,11 @@
 --    (secret-free — no token/passphrase/key bytes).
 -- 5. Per-op scoping (one sahAddKey+sahDeleteAll+sahKill per op via the
 --    fake SshAgentHandle).
+-- 6. PAT http.extraHeader shell-quoting: the @Authorization: Basic <b64>@
+--    value contains spaces and must be single-quoted when interpolated
+--    into a shell command string (both local and remote arms pass through
+--    a shell). Without quoting, the shell splits on spaces and git only
+--    sees @http.extraHeader=Authorization:@ — authentication fails.
 module Seal.ISA.Ops.GitSpec (spec) where
 
 import Data.Aeson (Value, object, (.=))
@@ -41,6 +46,7 @@ import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, makeLockedVaultRuntime)
+import Seal.Tools.Args (textShellCommand)
 import Seal.Tools.Exec.Types (ExecError (..))
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedErr (..), UntrustedIO (..) )
@@ -323,6 +329,42 @@ spec = describe "Seal.ISA.Ops.Git" $ do
         SahStart `elem` calls `shouldBe` False
 
   --------------------------------------------------------------------------
+  -- PAT http.extraHeader shell-quoting (both local + remote arms)
+  --------------------------------------------------------------------------
+
+  describe "GIT_PUSH (PAT, http.extraHeader shell-quoting)" $ do
+    it "the http.extraHeader value is single-quoted in the command string" $ do
+      withSystemTempDirectory "seal-git" $ \dir -> do
+        let keyfilesDir = dir </> "keys"
+        createDirectoryIfMissing True keyfilesDir
+        vault <- makeFakeVaultRuntime [("K_PAT", "ghp_TOKEN")]
+        callsRef <- newIORef []
+        cmdRef <- newIORef ("" :: Text)
+        let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+            repoReg = fakeRepoReg [patRepo]
+            deps = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = repoReg
+              , cdSshAgent = agent
+              , cdAgentRegistry = freshAgentRegistry
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
+              }
+            uio = recordingUio (Just patOriginUrl) (Right "push output") cmdRef
+            op = gitPushOp deps (WorkspaceRoot dir) Full
+            input = object [ "workdir" .= ("myrepo" :: Text), "refspec" .= ("main" :: Text) ]
+        appEnv <- mkAppEnv
+        _ <- runApp appEnv (uoRun op uio input)
+        cmd <- readIORef cmdRef
+        -- The command string must contain a single-quoted
+        -- http.extraHeader=... so the shell preserves the spaces in
+        -- "Authorization: Basic <base64>".
+        "http.extraHeader='Authorization:" `T.isInfixOf` cmd `shouldBe` True
+        -- The full header value (with spaces) must be inside the quotes.
+        "'Authorization: Basic " `T.isInfixOf` cmd `shouldBe` True
+
+  --------------------------------------------------------------------------
   -- Opcode metadata
   --------------------------------------------------------------------------
 
@@ -368,6 +410,23 @@ fakeUioErr mOrigin = stubUio
       Nothing  -> Right "")
   , uioShellExecEnv = \_env _cmd _mCwd -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecGitEnv = \_env _kh _cmd _mCwd -> pure (Left (UeExec ExecNotImplemented))
+  }
+
+-- | A fake 'UntrustedIO' that records the command string from the git
+-- operation call (the @uioShellExecEnv@ / @uioShellExecGitEnv@ arm) into
+-- the 'IORef'. The first @uioShellExec@ call returns the @mOrigin@; the
+-- git-op call returns @gitResult@ AND records the command into @cmdRef@.
+recordingUio :: Maybe Text -> Either UntrustedErr Text -> IORef Text -> UntrustedIO
+recordingUio mOrigin gitResult cmdRef = stubUio
+  { uioShellExec = \_cmd _mCwd -> pure (case mOrigin of
+      Just url -> Right url
+      Nothing  -> Right "")
+  , uioShellExecEnv = \_env cmd _mCwd -> do
+      writeIORef cmdRef (textShellCommand cmd)
+      pure gitResult
+  , uioShellExecGitEnv = \_env _kh cmd _mCwd -> do
+      writeIORef cmdRef (textShellCommand cmd)
+      pure gitResult
   }
 
 -- | A stub 'UntrustedIO' that fail-closes on every method (the fake
