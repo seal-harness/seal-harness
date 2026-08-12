@@ -60,6 +60,22 @@ skillLoadPayload = object
                          ]
   ]
 
+-- | A SETUP_REPO harness payload (no approval key) — mirrors the shape
+-- 'recordSetupRepoResult' (Dispatch.hs) writes: @op.name = SETUP_REPO@ +
+-- @input@ (the repo url) + @result@ (the clone/no-op/conflict/failure
+-- outcome). The frontend's 'transcriptToMessages' (ChatArea.tsx) has
+-- explicit rendering for SETUP_REPO result entries; this entry must
+-- surface through 'reconEntryToFrontend' so the user sees the clone
+-- outcome in the chat when a session is created with an attached repo.
+setupRepoPayload :: Value
+setupRepoPayload = object
+  [ "messages" .= ([] :: [Value])
+  , "harness"  .= Null
+  , "op"       .= object [ "name" .= String "SETUP_REPO" ]
+  , "input"    .= object ["url" .= String "git@github.com:seal-harness/seal-harness.git"]
+  , "result"   .= object ["status" .= String "cloned", "target" .= String "/path/to/workdir"]
+  ]
+
 -- | A SHELL_EXEC harness payload (no approval key, op not whitelisted).
 -- Should be dropped by reconEntryToFrontend.
 shellExecPayload :: Value
@@ -86,6 +102,12 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
     case reconEntryToFrontend 0 te of
       Just _  -> pure ()
       Nothing -> expectationFailure "expected Just (SKILL_LOAD entry surfaces), got Nothing"
+
+  it "surfaces a SETUP_REPO harness entry (whitelisted)" $ do
+    let te = mkHarnessTe setupRepoPayload
+    case reconEntryToFrontend 0 te of
+      Just _  -> pure ()
+      Nothing -> expectationFailure "expected Just (SETUP_REPO entry surfaces), got Nothing"
 
   it "drops a SHELL_EXEC harness entry (not whitelisted, no approval)" $ do
     let te = mkHarnessTe shellExecPayload
