@@ -447,12 +447,19 @@ trpToFrontend blk =
 -- the web frontend SPA as distinct harness entries (not be dropped by
 -- 'reconEntryToFrontend'). v1: @SKILL_LOAD@ so /skill load invocations
 -- appear in the transcript as identifiable skill-load events (per the
--- user's "properly identified as a skill load operation" requirement).
+-- user's "properly identified as a skill load operation" requirement);
+-- @SETUP_REPO@ so the clone/no-op/conflict/failure outcome of a
+-- repo-attached session creation is visible in the chat (the frontend's
+-- 'transcriptToMessages' renders it as a tool-call box; without this
+-- whitelist entry, the SETUP_REPO result recorded by
+-- 'recordSetupRepoResult' is dropped before reaching either the WS
+-- broadcast or the HTTP seed, so the user sees nothing for the repo
+-- setup).
 -- Approval-bearing entries always surface regardless of this whitelist.
 -- A 'Set' rather than a list to make the shared-state surface
 -- discoverable (see the design doc's §8 risk 2).
 userSurfacingOps :: Set.Set Text
-userSurfacingOps = Set.fromList ["SKILL_LOAD"]
+userSurfacingOps = Set.fromList ["SKILL_LOAD", "SETUP_REPO"]
 
 -- | Predicate: does a harness payload's @op.name@ fall in
 -- 'userSurfacingOps'? Returns 'False' for payloads with no @op@ key, a
