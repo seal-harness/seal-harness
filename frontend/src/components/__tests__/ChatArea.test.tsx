@@ -1227,4 +1227,121 @@ describe('AskHumanForm', () => {
     expect(screen.queryByRole('img')).toBeNull()
     expect(screen.getByText(xssLabel)).toBeTruthy()
   })
+
+  // ── Open-ended ASK_HUMAN (no options) ──────────────────────────────────
+  // Regression (session 20260812-001914-833): when the model calls ASK_HUMAN
+  // WITHOUT an `options` array (an open-ended question), the frontend failed
+  // to correlate the pending question with the tool call. `matchesToolCall`
+  // only matched ASK_HUMAN when `pq.options.length > 0`, so the open-ended
+  // case fell through to the "Allow <NAME> <JSON>?" confirmation-gate regex
+  // (which didn't match), and no form rendered. The AskHumanForm must render
+  // for open-ended questions too — with the textarea as the only input
+  // (no option buttons).
+
+  function makeOpenAskMessage(question: string, overrides: Partial<Message> = {}): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'ASK_HUMAN',
+          input: { question },
+        },
+      }],
+      rawJson: '{}',
+      ...overrides,
+    }
+  }
+
+  function makeOpenPendingQuestion(question: string, overrides: Partial<{ id: string; question: string; createdAt: string; options: undefined; meta: undefined }> = {}): {
+    id: string; question: string; createdAt: string; options: undefined; meta: undefined
+  } {
+    return {
+      id: 'q1',
+      question,
+      createdAt: new Date().toISOString(),
+      options: undefined,
+      meta: undefined,
+      ...overrides,
+    }
+  }
+
+  it('renders the AskHumanForm for an open-ended ASK_HUMAN (no options)', () => {
+    const messages = [makeOpenAskMessage('I am Zoe. Who are you?')]
+    const pendingQuestions = [makeOpenPendingQuestion('I am Zoe. Who are you?')]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    // The AskHumanForm renders (the free-text textarea is the question UI).
+    expect(screen.getByTestId('ask-human-form')).toBeTruthy()
+    expect(screen.getByText('I am Zoe. Who are you?')).toBeTruthy()
+    expect(screen.getByPlaceholderText('Type your own answer…')).toBeTruthy()
+  })
+
+  it('does NOT render the inline-approval panel for open-ended ASK_HUMAN', () => {
+    const messages = [makeOpenAskMessage('I am Zoe. Who are you?')]
+    const pendingQuestions = [makeOpenPendingQuestion('I am Zoe. Who are you?')]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestion={() => {}}
+        onCancelQuestion={() => {}}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+      />,
+    )
+    // The inline-approval panel (Yes/Reject) is for the confirmation gate,
+    // NOT for open-ended ASK_HUMAN.
+    expect(screen.queryByTestId('inline-approval')).toBeNull()
+    expect(screen.getByTestId('ask-human-form')).toBeTruthy()
+  })
+
+  it('typing + Enter submits the open-ended ASK_HUMAN answer', () => {
+    const messages = [makeOpenAskMessage('What is your name?')]
+    const pendingQuestions = [makeOpenPendingQuestion('What is your name?')]
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
+    fireEvent.change(ta, { target: { value: 'Mighty' } })
+    fireEvent.keyDown(ta, { key: 'Enter' })
+    expect(onAnswerText).toHaveBeenCalledWith('q1', 'Mighty')
+  })
+
+  it('Escape cancels an open-ended ASK_HUMAN', () => {
+    const messages = [makeOpenAskMessage('What is your name?')]
+    const pendingQuestions = [makeOpenPendingQuestion('What is your name?')]
+    const onCancel = vi.fn()
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={() => Promise.resolve(true)}
+        onCancelQuestion={onCancel}
+      />,
+    )
+    const ta = screen.getByPlaceholderText('Type your own answer…') as HTMLTextAreaElement
+    fireEvent.keyDown(ta, { key: 'Escape' })
+    expect(onCancel).toHaveBeenCalledWith('q1')
+  })
 })

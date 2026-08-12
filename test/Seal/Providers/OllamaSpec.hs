@@ -181,6 +181,46 @@ spec = describe "Seal.Providers.Ollama" $ do
       decodeResponse body `shouldBe`
         Right (CompletionResponse [] StopEnd (Usage 0 0))
 
+  -- Regression: when the model emits a tool call, the streaming path must
+  -- label the stop reason 'StopToolUse' (not 'StopEnd'). The non-streaming
+  -- path already does this (see the "parses tool_calls" test above), but
+  -- the streaming 'decodeStreamChunk' path was labelling tool-call
+  -- responses as 'StopEnd', which mislabelled the transcript's stop reason
+  -- (the loop branches on tool blocks, not the stop reason, so control
+  -- flow was unaffected — but the audit trail was wrong). This test feeds
+  -- a tool-call chunk followed by a done chunk and asserts the aggregated
+  -- stop is 'StopToolUse'.
+  describe "decodeStreamChunk (tool-call stop reason)" $ do
+    it "labels a tool-call response as StopToolUse, not StopEnd" $ do
+      let toolChunk = object
+            [ "message" .= object
+                [ "role" .= ("assistant" :: String)
+                , "content" .= ("" :: String)
+                , "tool_calls" .=
+                    [ object ["function" .= object
+                        ["name" .= ("ASK_HUMAN" :: String)
+                        , "arguments" .= object ["question" .= ("who are you?" :: String)]]]
+                    ]
+                ]
+            ]
+          doneChunk = object
+            [ "done" .= True
+            , "done_reason" .= ("stop" :: String)
+            , "eval_count" .= (53 :: Int)
+            ]
+      case decodeStreamChunk initialStreamChunkState toolChunk of
+        Left e -> expectationFailure ("tool chunk decode failed: " <> T.unpack e)
+        Right (st1, toolEvents) -> do
+          -- Tool call emitted.
+          toolEvents `shouldSatisfy` any (\case StreamToolEnd{} -> True; _ -> False)
+          case decodeStreamChunk st1 doneChunk of
+            Left e -> expectationFailure ("done chunk decode failed: " <> T.unpack e)
+            Right (_, doneEvents) -> do
+              let doneStop = [s | StreamDone s _ <- doneEvents]
+              case doneStop of
+                [stop] -> stop `shouldBe` StopToolUse
+                _      -> expectationFailure "expected one StreamDone event"
+
   -- Regression: the previous two-step read-then-advance counter raced under
   -- concurrency, so two overlapping responses could both synthesize "call_0"
   -- (observed in the wild in session 20260718-210934-264). The fix is a single
