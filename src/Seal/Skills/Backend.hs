@@ -20,13 +20,14 @@ module Seal.Skills.Backend
   , decodeSkill
   , listAgentSkillsDir
   , decodeAgentSkill
+  , prefixWorkdirSkill
   ) where
 import Control.Monad (forM, forM_)
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -195,7 +196,7 @@ listWorkdirSkills workdir = do
         -- Stamp each repo-local skill with a group derived from the repo
         -- directory name so the <available_skills> catalog groups them
         -- under a "<repo> project skills" heading.
-        pure (map (stampProjectGroup (T.pack repo)) raw)
+        pure (mapMaybe (prefixWorkdirSkill (T.pack repo)) (map (stampProjectGroup (T.pack repo)) raw))
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)
@@ -212,12 +213,27 @@ stampProjectGroup repo s = case skGroup s of
   Just g | not (T.null (T.strip g)) -> s
   _ -> s { skGroup = Just (repo <> " project skills") }
 
+-- | Prefix a workdir-discovered skill's id with @\<repo\>--\<id\>@ so it
+-- never collides with a user-store skill of the same name (mirrors the
+-- agent-def pattern in 'Seal.Agent.Def.Backend.prefixWorkdirDef'). The
+-- @--@ separator is charset-safe per 'isValidSkillId'. If the prefixed id
+-- fails validation (e.g. the repo dir has a char outside the charset),
+-- the skill is dropped ('Nothing' — fail-closed).
+prefixWorkdirSkill :: Text -> Skill -> Maybe Skill
+prefixWorkdirSkill repo s =
+  let prefixedIdText = repo <> "--" <> skillIdText (skId s)
+  in case mkSkillId prefixedIdText of
+       Left _ -> Nothing
+       Right sid -> Just s { skId = sid }
+
 -- | A three-way union of a workdir backend (repo-local skills), a user
--- backend, and the built-in skills. 'workdir-wins' on id collisions:
--- workdir shadows user, user shadows built-in. Reads check workdir first,
--- then user, then the built-in map. Listing merges all three with the
--- same precedence. Writes go to the /user/ backend only (repo and
--- built-in skills are immutable from the model's perspective).
+-- backend, and the built-in skills. Workdir skill ids are namespaced
+-- (@\<repo\>--\<id\>@) so they never collide with user skills by design.
+-- On id collisions between user and built-in, user shadows built-in.
+-- Reads check workdir first, then user, then the built-in map. Listing
+-- merges all three with the same precedence. Writes go to the /user/
+-- backend only (repo and built-in skills are immutable from the model's
+-- perspective).
 --
 -- This is the backend wired into per-turn prompt construction so the
 -- @\<available_skills\>@ catalog and @SKILL_LOAD@ surface repo-local
