@@ -36,7 +36,8 @@ type FocusState =
   | { kind: 'focused'; sessionId: string | null; since: string | undefined }
 
 class StreamClientImpl implements StreamClient {
-  private url: string
+  private url: string | null = null
+  private urlPromise: Promise<string> | null = null
   private ws: WebSocket | null = null
   private _status: StreamStatus = 'connecting'
   private focusState: FocusState = { kind: 'none' }
@@ -56,9 +57,18 @@ class StreamClientImpl implements StreamClient {
   private skillsChangedListeners = new Set<() => void>()
   private reposChangedListeners = new Set<() => void>()
 
-  constructor(url: string) {
-    this.url = url
-    this.connect()
+  constructor(urlOrPromise: string | Promise<string>) {
+    if (typeof urlOrPromise === 'string') {
+      this.url = urlOrPromise
+      this.connect()
+    } else {
+      this.urlPromise = urlOrPromise
+      this.urlPromise.then((url) => {
+        this.url = url
+        this.urlPromise = null
+        if (!this.closedByUser) this.connect()
+      })
+    }
   }
 
   get status(): StreamStatus {
@@ -169,6 +179,11 @@ class StreamClientImpl implements StreamClient {
   // ── internals ──────────────────────────────────────────────────────────
 
   private connect(): void {
+    if (this.url === null) {
+      // URL not yet discovered (async health check in progress); the
+      // constructor's .then() will call connect() once it resolves.
+      return
+    }
     let sock: WebSocket
     try {
       sock = new WebSocket(this.url)
@@ -364,25 +379,47 @@ export function createStreamClient(url: string): StreamClient & { close(): void 
 }
 
 /**
- * Build the default WS URL from the current page. Seal 7a runs the WS server
- * on a separate port from the REST + static WARP server (default 8081); the
- * port is read from `import.meta.env.VITE_WS_PORT` (falling back to 8081).
- * Uses `wss:` on https pages and `ws:` on http pages.
+ * Build the default WS URL from the current page. The WS port is discovered
+ * at runtime from `/api/health` (the backend's `wsPort` field), falling back
+ * to `VITE_WS_PORT` and then `8081`. Uses `wss:` on https pages and `ws:` on
+ * http pages.
  */
-function defaultStreamUrl(): string {
-  const wsPort = import.meta.env.VITE_WS_PORT ?? '8081'
-  if (typeof window === 'undefined') return `ws://localhost:${wsPort}/`
+async function discoverStreamUrl(): Promise<string> {
+  const fallbackPort = import.meta.env.VITE_WS_PORT ?? '8081'
+  if (typeof window === 'undefined') return `ws://localhost:${fallbackPort}/`
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  // The WS server is on a separate port; the host is the page host.
-  return `${proto}//${window.location.hostname}:${wsPort}/`
+  const host = window.location.hostname
+  // Discover the WS port from the backend at runtime so the frontend never
+  // needs a build-time VITE_WS_PORT that matches the server's config. The
+  // build-time env var is only a fallback for dev servers without the
+  // health endpoint.
+  let wsPort = fallbackPort
+  try {
+    const res = await fetch('/api/health')
+    if (res.ok) {
+      const data = await res.json() as { wsPort?: number }
+      if (typeof data.wsPort === 'number' && data.wsPort > 0) {
+        wsPort = String(data.wsPort)
+      }
+    }
+  } catch {
+    // Health endpoint unreachable — fall back to the env var / default.
+  }
+  return `${proto}//${host}:${wsPort}/`
 }
 
 let _instance: (StreamClient & { close(): void }) | null = null
 
-/** Shared singleton — lazily constructed on first access. */
+/**
+ * Shared singleton — lazily constructed on first access. The WS URL is
+ * discovered from `/api/health` at runtime (with a build-time env var
+ * fallback), so the frontend never needs a `VITE_WS_PORT` that matches
+ * the server's `ws_port` config. Synchronous: the `StreamClientImpl`
+ * constructor starts an async URL discovery and connects once resolved.
+ */
 export function streamClient(): StreamClient {
   if (_instance === null) {
-    _instance = new StreamClientImpl(defaultStreamUrl())
+    _instance = new StreamClientImpl(discoverStreamUrl())
   }
   return _instance
 }
