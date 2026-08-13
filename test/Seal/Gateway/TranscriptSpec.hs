@@ -19,6 +19,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
@@ -123,7 +124,8 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
         -- The approval key must be present in the surfaced payload. The
         -- `payload` field is now a JSON object (not a string), so we look
         -- it up as an Object and check for the "approval" key. The `raw`
-        -- field is empty for the reconstructed path.
+        -- field carries the full rewritten payload for the reconstructed
+        -- path.
         case val of
           Object o ->
             case KeyMap.lookup (Key.fromString "payload") o of
@@ -183,6 +185,29 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
                 KeyMap.member (Key.fromString "input_schema") o `shouldBe` False
               _ -> expectationFailure "expected tool object"
           other -> expectationFailure ("expected tools array, got " ++ show other)
+        Nothing -> expectationFailure "expected Just (request entry surfaces), got Nothing"
+
+    it "raw view preserves input_schema (Anthropic shape)" $ do
+      let tools = A.Array $ V.fromList
+            [ object
+                [ "name" .= ("FILE_READ" :: Text)
+                , "description" .= ("Read a file from the workspace." :: Text)
+                , "input_schema" .= object ["type" .= ("object" :: Text), "properties" .= object []]
+                ]
+            ]
+          te = mkReqTe tools
+      case reconEntryToFrontend 0 te of
+        Just val -> case val of
+          Object o -> case KeyMap.lookup (Key.fromString "raw") o of
+            Just (String rawTxt) -> case A.decodeStrict (BC.pack (T.unpack rawTxt)) of
+              Just (Object ro) -> case KeyMap.lookup (Key.fromString "tools") ro of
+                Just (A.Array rarr) -> case V.head rarr of
+                  Object rt -> KeyMap.member (Key.fromString "input_schema") rt `shouldBe` True
+                  _ -> expectationFailure "expected raw tool object"
+                other -> expectationFailure ("expected raw tools array, got " ++ show other)
+              _ -> expectationFailure "expected raw JSON to decode to an object"
+            other -> expectationFailure ("expected raw string, got " ++ show other)
+          _ -> expectationFailure "expected object value"
         Nothing -> expectationFailure "expected Just (request entry surfaces), got Nothing"
 
     it "includes name + description from Ollama function wrapper shape" $ do

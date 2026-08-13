@@ -122,7 +122,7 @@ describe('transcriptToMessages', () => {
     // e3's request carries the tool_result but its last message is a user with
     // a tool_result content (no text) — so no user-text row for e3.
     const agents = msgs.map((m) => m.agentName)
-    expect(agents).toContain('System')
+    expect(agents).toContain('System Prompt')
     expect(agents).toContain('You')
     expect(agents).toContain('claude-sonnet-4-20250514')
 
@@ -136,7 +136,7 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
   })
 
-  it('nests tool defs inside the System row with names + descriptions + JSON', () => {
+  it('emits a Tools row with names + descriptions + JSON separate from System', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 't1',
@@ -153,9 +153,12 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const sysRow = msgs.find((m) => m.agentName === 'System')
+    const sysRow = msgs.find((m) => m.agentName === 'System Prompt')
     expect(sysRow).toBeTruthy()
-    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    expect(sysRow!.blocks.find((b) => b.toolDefs !== undefined)).toBeUndefined()
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block).toBeTruthy()
     expect(block.toolDefs!.count).toBe(2)
     expect(block.toolDefs!.names).toEqual(['shell', 'read'])
@@ -167,7 +170,7 @@ describe('transcriptToMessages', () => {
     expect(parsed[0]!.name).toBe('shell')
   })
 
-  it('nests tool defs from Anthropic wire shape inside System row', () => {
+  it('emits a Tools row from Anthropic wire shape', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'a1',
@@ -183,14 +186,14 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const sysRow = msgs.find((m) => m.agentName === 'System')
-    expect(sysRow).toBeTruthy()
-    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block.toolDefs!.names).toEqual(['shell'])
     expect(block.toolDefs!.descriptions).toEqual(['sh'])
   })
 
-  it('nests tool defs from Ollama-style function wrappers inside System row', () => {
+  it('emits a Tools row from Ollama-style function wrappers', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'o1',
@@ -206,14 +209,14 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const sysRow = msgs.find((m) => m.agentName === 'System')
-    expect(sysRow).toBeTruthy()
-    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
+    expect(toolsRow).toBeTruthy()
+    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block.toolDefs!.names).toEqual(['web_search'])
     expect(block.toolDefs!.descriptions).toEqual(['search the web'])
   })
 
-  it('emits a System row with tools only once per unique (system, tools) pair', () => {
+  it('emits System + Tools rows only once per unique (system, tools) pair', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
@@ -237,8 +240,8 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const sysRows = msgs.filter((m) => m.agentName === 'System')
-    expect(sysRows).toHaveLength(1)
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
   it('omits tool defs when tools array is empty or absent', () => {
@@ -251,7 +254,8 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    expect(msgs.find((m) => m.agentName === 'System')).toBeUndefined()
+    expect(msgs.find((m) => m.agentName === 'System Prompt')).toBeUndefined()
+    expect(msgs.find((m) => m.agentName === 'Tools')).toBeUndefined()
   })
 
   it('emits a text block for a plain user message', () => {
@@ -612,7 +616,7 @@ describe('ChatArea', () => {
     const messages: Message[] = [
       {
         id: 'm1',
-        agentName: 'System',
+        agentName: 'System Prompt',
         agentStatus: 'idle',
         timestamp: '2024-06-01 12:00:00',
         blocks: [{ id: 'b1', collapsedText: 'You are a helpful assistant.' }],
@@ -768,6 +772,31 @@ describe('ChatArea', () => {
     expect(screen.queryByTestId('raw-json-modal')).toBeNull()
   })
 
+  it('System row with rawJson shows the "View raw JSON" button and opens the modal', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'System Prompt',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', collapsedText: 'You are a helpful assistant.' }],
+        rawJson: '{"system":"You are a helpful assistant.","tools":[{"name":"shell","input_schema":{}}]}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // The "View raw JSON (message)" button is present on the System row.
+    expect(screen.getByLabelText('View raw JSON (message)')).toBeTruthy()
+    // Open the modal and verify the raw JSON (with input_schema) is shown.
+    fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
+    expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    expect(screen.getByText('"input_schema"')).toBeTruthy()
+  })
+
   it('slash bubble renders transiently with the "command output — not saved" label', () => {
     const messages: Message[] = [
       {
@@ -891,16 +920,25 @@ describe('ChatArea', () => {
     expect(screen.getByText(/200k/)).toBeTruthy()
   })
 
-  it('renders a collapsed System row with nested tools showing count + names, expandable to full JSON', () => {
+  it('renders a collapsed System row and a separate collapsed Tools row, both expandable', () => {
     const messages: Message[] = [
       {
         id: 'm1',
-        agentName: 'System',
+        agentName: 'System Prompt',
         agentStatus: 'idle',
         timestamp: '2024-06-01 12:00:00',
         blocks: [{
           id: 'b1',
           collapsedText: 'You are a helpful assistant.',
+        }],
+      },
+      {
+        id: 'm2',
+        agentName: 'Tools',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{
+          id: 'b2',
           toolDefs: {
             count: 2,
             names: ['shell', 'read'],
@@ -919,18 +957,14 @@ describe('ChatArea', () => {
         messages={messages}
       />,
     )
-    // Collapsed header shows the system prompt preview + tool count.
-    expect(screen.getByText(/helpful assistant.*2 tools/)).toBeTruthy()
+    // System row collapsed preview.
+    expect(screen.getByText(/helpful assistant/)).toBeTruthy()
+    // Tools row collapsed header shows the tool count + names.
+    expect(screen.getByText(/2 tools: shell, read/)).toBeTruthy()
     // The full JSON is NOT visible while collapsed.
     expect(screen.queryByText('"input_schema"')).toBeNull()
-    // Click to expand.
-    fireEvent.click(screen.getByText(/helpful assistant/))
-    // The system prompt text renders inside a <pre>.
-    const pres = document.querySelectorAll('pre')
-    expect(pres.length).toBeGreaterThanOrEqual(1)
-    expect(pres[0]!.textContent).toContain('helpful assistant')
-    // The Tools sub-section is visible but collapsed — click to expand it.
-    fireEvent.click(screen.getByText('Tools'))
+    // Click the Tools row to expand it.
+    fireEvent.click(screen.getByText(/2 tools/))
     // Now the tools JSON renders inside a <pre> with the tool definitions.
     const presAfter = document.querySelectorAll('pre')
     const toolsPre = Array.from(presAfter).find(p => p.textContent?.includes('"input_schema"'))

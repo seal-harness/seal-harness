@@ -557,7 +557,7 @@ function CodeBlock({ lines }: { lines: CodeSpan[][] }) {
  *     can never be mistaken for the System prompt).
  *  Content is always rendered as React text children (escaped); there is no
  *  `dangerouslySetInnerHTML` anywhere on this path. */
-function CollapsedBlock({ text, anchorId, label, toolDefs }: { text: string; anchorId?: string; label?: string; toolDefs?: ToolDefsBlock }) {
+function CollapsedBlock({ text, anchorId, label }: { text: string; anchorId?: string; label?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
   const [expanded, setExpanded] = useState(targeted)
@@ -566,8 +566,6 @@ function CollapsedBlock({ text, anchorId, label, toolDefs }: { text: string; anc
 
   const preview = text.slice(0, 120).replace(/\n/g, ' ')
   const truncated = text.length > 120
-  // When tools are present, append a tool count to the collapsed preview.
-  const toolsSuffix = toolDefs ? ` (${toolDefs.count} tool${toolDefs.count === 1 ? '' : 's'})` : ''
 
   return (
     <div
@@ -596,12 +594,9 @@ function CollapsedBlock({ text, anchorId, label, toolDefs }: { text: string; anc
             <pre className="whitespace-pre-wrap break-words" style={{ fontFamily: 'inherit', margin: 0, maxHeight: 400, overflow: 'auto' }}>
             {text}
           </pre>
-            {toolDefs && (
-              <ToolDefsNested block={toolDefs} anchorId={anchorId ? anchorId + '-tools' : undefined} />
-            )}
           </div>
         ) : (
-          <span className="flex-1 truncate">{preview}{truncated ? '\u2026' : ''}{toolsSuffix}</span>
+          <span className="flex-1 truncate">{preview}{truncated ? '\u2026' : ''}</span>
         )}
       </div>
     </div>
@@ -927,13 +922,11 @@ function ToolCallBlock({
   )
 }
 
-/** A nested collapsible tool-definitions sub-section, rendered inside the
- *  System block. Collapsed, shows the tool count and the comma-joined list
- *  of tool names ("3 tools: shell, read, edit"). Expanded, renders the full
- *  tools JSON (name + description per tool). Independently collapsible so
- *  the user can expand the System prompt without expanding the tools, and
- *  vice versa. */
-function ToolDefsNested({ block, anchorId }: { block: ToolDefsBlock; anchorId?: string }) {
+/** A standalone collapsible tool-definitions block, rendered as its own
+ *  top-level row (agentName "Tools"). Collapsed, shows the tool count and
+ *  the comma-joined list of tool names ("3 tools: shell, read, edit").
+ *  Expanded, renders the full tools JSON (name + description per tool). */
+function ToolDefsBlockRow({ block, anchorId }: { block: ToolDefsBlock; anchorId?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
   const [expanded, setExpanded] = useState(targeted)
@@ -946,13 +939,13 @@ function ToolDefsNested({ block, anchorId }: { block: ToolDefsBlock; anchorId?: 
     <div
       ref={ref}
       id={anchorId}
-      className="addressable-block rounded px-2 py-1 mt-1 text-xs cursor-pointer select-none"
+      className="addressable-block rounded px-3 py-2 mb-2 text-xs cursor-pointer select-none"
       style={{
         background: 'var(--bg-sunken)',
         border: `1px solid ${targeted ? 'var(--accent-primary)' : 'var(--border)'}`,
         color: 'var(--text-muted)',
       }}
-      onClick={(e) => { e.stopPropagation(); setExpanded(!expanded) }}
+      onClick={() => setExpanded(!expanded)}
     >
       <div className="flex items-center gap-1.5">
         <span style={{ fontSize: 10, opacity: 0.6 }}>{expanded ? '\u25BC' : '\u25B6'}</span>
@@ -1046,8 +1039,11 @@ function MessageBlock({
       />
     )
   }
+  if (block.toolDefs) {
+    return <ToolDefsBlockRow block={block.toolDefs} anchorId={block.id} />
+  }
   if (block.collapsedText) {
-    return <CollapsedBlock text={block.collapsedText} anchorId={block.id} toolDefs={block.toolDefs} />
+    return <CollapsedBlock text={block.collapsedText} anchorId={block.id} />
   }
   if (block.thinkingText) {
     return <CollapsedBlock text={block.thinkingText} anchorId={block.id} label="Thinking" />
@@ -1696,14 +1692,12 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // Extract system prompt + tools as a single collapsed "System"
-        // message (only first occurrence). The tools array is nested as
-        // an independently collapsible sub-section inside the System block,
-        // so the user sees the full picture — system prompt text + the
-        // tools the LLM was offered — in one place. The synthesized row
-        // deliberately omits rawJson: the user message that follows from
-        // the same entry carries the same payload, and that's the
-        // verbatim-on-disk view the user wants.
+        // Extract system prompt + tools as TWO top-level rows (first
+        // occurrence only): a "System" row for the system prompt and a
+        // "Tools" row for the tool definitions. Splitting them (rather than
+        // nesting tools inside the System block) gives each its own header,
+        // permalink, and "View raw JSON" affordance. Both rows carry
+        // `rawJson` so the user can view the full request payload.
         const sysPrompt = parsed.system as string | undefined
         const tools = parsed.tools
         const hasTools = Array.isArray(tools) && tools.length > 0
@@ -1715,17 +1709,30 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
             })()
           : undefined
         // Dedup key: system prompt text + tools JSON. Only the first
-        // occurrence of a given (system, tools) pair renders a row.
+        // occurrence of a given (system, tools) pair renders rows.
         const dedupKey = (sysPrompt ?? '') + '\u0000' + toolsJson
         if ((sysPrompt || hasTools) && !seenSystemPrompts.has(dedupKey)) {
           seenSystemPrompts.add(dedupKey)
-          messages.push({
-            id: e.id + '-sys',
-            agentName: 'System',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt ?? '', toolDefs: toolDefsBlock }],
-          })
+          if (sysPrompt) {
+            messages.push({
+              id: e.id + '-sys',
+              agentName: 'System Prompt',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+              rawJson,
+            })
+          }
+          if (toolDefsBlock) {
+            messages.push({
+              id: e.id + '-tools',
+              agentName: 'Tools',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+              rawJson,
+            })
+          }
         }
         // Extract only the LAST message from the request — it's the new
         // one being sent. Earlier messages in the array are conversation

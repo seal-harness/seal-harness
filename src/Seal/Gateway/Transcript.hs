@@ -496,7 +496,11 @@ reconEntryToFrontend idx te =
       let dirStr = case teDirection te of
             Request  -> "request" :: Text
             Response -> "response"
-          payloadJson = rewritePayload payloadVal (teDirection te)
+          payloadJson = rewritePayload False payloadVal (teDirection te)
+          -- The `raw` view preserves full tool input_schemas so the
+          -- "View raw JSON" modal shows the verbatim schemas the LLM was
+          -- sent (the `payload` field strips them to keep the wire small).
+          rawJson = rewritePayload True payloadVal (teDirection te)
           entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw
           -- The originating channel label (e.g. "telegram", "web", "cli"),
           -- stamped into the request entry's erMeta by runTurn's
@@ -526,22 +530,22 @@ reconEntryToFrontend idx te =
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
          , "channel"   .= mChannel
-         -- The `raw` field is deliberately EMPTY for the reconstructed
-         -- (two-file) path. The pre-rewrite payload Value is the same
-         -- content as `payload` (just in GHC-Generics TaggedObject shape
-         -- vs the Anthropic shape the frontend parses), so shipping it
-         -- would double the wire payload for no information gain. The
-         -- legacy path (teLineToFrontend) still ships the verbatim
-         -- on-disk line because there the `raw` view is genuinely
-         -- distinct from `payload`. The frontend's "View raw JSON"
-         -- modal falls back to `payload` when `raw` is empty.
-         , "raw"       .= ("" :: Text)
+         -- The `raw` field carries the full rewritten payload with tool
+         -- input_schemas preserved, so the frontend's "View raw JSON"
+         -- modal shows the verbatim schemas the LLM was sent. The legacy
+         -- path (teLineToFrontend) still ships the verbatim on-disk line.
+         , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawJson))
          ]
 
 -- | Rewrite a reconstructed payload 'Value' from GHC-Generics
 -- 'TaggedObject' encoding to the Anthropic-style JSON the frontend parses.
-rewritePayload :: A.Value -> Direction -> A.Value
-rewritePayload val dir =
+-- When @preserveSchemas@ is 'True', the @tools@ array keeps its full
+-- @input_schema@/parameters fields — used to build the @raw@ view so the
+-- "View raw JSON" modal shows the verbatim schemas the LLM was sent. When
+-- 'False', 'toolsWithDescriptions' strips them to keep the wire payload
+-- small (the frontend's collapsed Tools row only needs names + descriptions).
+rewritePayload :: Bool -> A.Value -> Direction -> A.Value
+rewritePayload preserveSchemas val dir =
   case val of
     A.Object o ->
       let k = Key.fromText
@@ -573,6 +577,9 @@ rewritePayload val dir =
                      ]
                    _ -> []
             _ -> []
+          toolsField = if preserveSchemas
+            then passthrough (k "tools")
+            else toolsWithDescriptions o
           fields = case dir of
             Request ->
               passthrough (k "system")
@@ -588,7 +595,10 @@ rewritePayload val dir =
                -- for seeing WHAT tools were available + what they do, just
                -- not the full schemas). The frontend already deduplicates
                -- tools via `seenTools` so only the first occurrence renders.
-               <> toolsWithDescriptions o
+               -- The @raw@ view (built with preserveSchemas=True) ships the
+               -- full tools array so the "View raw JSON" modal shows the
+               -- verbatim schemas the LLM was sent.
+               <> toolsField
                <> passthrough (k "toolChoice")
                <> passthrough (k "maxTokens")
                <> passthrough (k "approval")
