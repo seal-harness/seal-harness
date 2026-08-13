@@ -1,17 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Gateway.SendSpec (spec) where
 
-import Control.Exception (catch, SomeException)
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (catch, SomeException, throwIO)
+import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.Async (concurrently)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (void)
+import Data.Aeson qualified as A
+import Data.Aeson.Key (fromText)
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Either (isLeft)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (mapMaybe)
 import Data.Text.Encoding qualified as TE
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -24,6 +29,8 @@ import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
   , handleAnswerTextDelivery, parseAnswerBody )
+import Seal.Gateway.StreamBroker
+  ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply
@@ -66,11 +73,48 @@ instance Provider ScriptProvider where
       []         -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
 
+-- | A fake provider that always throws a synchronous exception. Used to
+-- test that the bracket-based idle broadcast fires even when the turn dies.
+data ThrowingProvider = ThrowingProvider
+instance Provider ThrowingProvider where
+  complete _ _ = throwIO (userError "simulated provider crash")
+  listModels _ = pure (Right [ModelId "llama3.2"])
+
+-- | A fake provider that blocks forever on `complete`. Used to test that
+-- the bracket-based idle broadcast fires when the turn thread is killed
+-- (async exception) mid-turn.
+newtype BlockingProvider = BlockingProvider (MVar ())
+instance Provider BlockingProvider where
+  complete (BlockingProvider mv) _ = takeMVar mv >> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+  listModels _ = pure (Right [ModelId "llama3.2"])
+
+-- | Extract the "status" field from a BeActivity's Value, if it's a
+-- harness-status activity. Used to assert thinking/idle broadcasts.
+harnessStatus :: BrokerEvent -> Maybe T.Text
+harnessStatus (BeActivity _ v) = do
+  o <- asObject v
+  A.String "harness-status" <- KeyMap.lookup (fromText "kind") o
+  A.String status <- KeyMap.lookup (fromText "status") o
+  pure status
+harnessStatus _ = Nothing
+
+asObject :: A.Value -> Maybe A.Object
+asObject (A.Object o) = Just o
+asObject _ = Nothing
+
 -- | Build a minimal SendDeps with the script provider + a fresh tabsH
 -- rooted at the temp dir. The sdTabsHandle is left unset (use record
 -- update in the test: `baseDeps { sdTabsHandle = tabsH }`).
 mkSendDeps :: SealPaths -> IORef [CompletionResponse] -> IO SendDeps
-mkSendDeps paths providerRef = do
+mkSendDeps paths providerRef = mkSendDepsWith paths resolveStub
+  where
+    resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
+
+-- | Build SendDeps with a custom provider resolve function. Used by tests
+-- that need a specific provider (e.g. a throwing provider to test the
+-- bracket-based idle broadcast).
+mkSendDepsWith :: SealPaths -> (SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))) -> IO SendDeps
+mkSendDepsWith paths resolveStub = do
   logger <- testSealLogger
   let configRoot = spConfig paths
       stateRoot  = spState paths
@@ -90,8 +134,6 @@ mkSendDeps paths providerRef = do
   let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
-      resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
-      resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
   -- fails -> defaults). The vault ref holds Nothing so resolveSessionProvider
   -- would fail — but sdResolve is stubbed, so the vault is never consulted.
@@ -320,6 +362,92 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
         snap <- snapshotTabs tabsH
         tabCount snap `shouldBe` 0
+
+  describe "handleSend idle broadcast on turn death" $ do
+    it "broadcasts idle (not just thinking) when the provider throws a synchronous exception" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        let throwingResolve _ = pure (Right (SomeProvider ThrowingProvider, ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths throwingResolve
+        tabsH <- newTabsHandle
+        broker <- newStreamBroker 10
+        eventsRef <- newIORef ([] :: [BrokerEvent])
+        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :))
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
+            sid = mkSid "20260701-130000-201"
+        seedSession paths sid
+        outcome <- handleSend sendDeps sid "hello"
+        -- The turn fails (provider threw), so handleSend returns
+        -- SendError 500. The important assertion is below: the idle
+        -- broadcast fired despite the death.
+        case outcome of
+          SendError 500 _ -> pure ()
+          other           -> expectationFailure ("expected SendError 500, got " <> show other)
+        -- The broker should have received BOTH a thinking and an idle
+        -- activity event. The idle broadcast must fire even though the
+        -- turn died, because the bracket cleanup is guaranteed.
+        events <- readIORef eventsRef
+        let statuses = mapMaybe harnessStatus events
+        statuses `shouldSatisfy` ("thinking" `elem`)
+        statuses `shouldSatisfy` ("idle" `elem`)
+        -- The broker's in-memory thinking set should be empty (idle
+        -- was broadcast, which clears the session from the set).
+        thinking <- thinkingSessions broker
+        thinking `shouldBe` mempty
+
+    it "broadcasts idle when the turn thread is killed (async exception)" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        -- A provider whose complete blocks forever (so we can kill the
+        -- thread from outside, simulating a process shutdown).
+        blockMVar <- newEmptyMVar
+        let blockingResolve _ = pure (Right (SomeProvider (BlockingProvider blockMVar), ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths blockingResolve
+        tabsH <- newTabsHandle
+        broker <- newStreamBroker 10
+        eventsRef <- newIORef ([] :: [BrokerEvent])
+        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :))
+        let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
+            sid = mkSid "20260701-130000-202"
+        seedSession paths sid
+        -- Fork the send so we can kill the thread mid-turn.
+        tid <- forkIO (void (handleSend sendDeps sid "hello" `catch` \(_ :: SomeException) -> pure SendAssistant))
+        threadDelay 100000  -- let the turn start (thinking broadcast)
+        -- Verify thinking was broadcast.
+        events1 <- readIORef eventsRef
+        let statuses1 = mapMaybe harnessStatus events1
+        statuses1 `shouldSatisfy` ("thinking" `elem`)
+        -- Kill the thread (async exception).
+        killThread tid
+        threadDelay 100000  -- let the bracket cleanup fire
+        -- Verify idle was broadcast despite the kill.
+        events2 <- readIORef eventsRef
+        let statuses2 = mapMaybe harnessStatus events2
+        statuses2 `shouldSatisfy` ("idle" `elem`)
+        thinking <- thinkingSessions broker
+        thinking `shouldBe` mempty
+
+    it "writes to seal.log when the turn dies (session log records the death)" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        let throwingResolve _ = pure (Right (SomeProvider ThrowingProvider, ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths throwingResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20260701-130000-203"
+        seedSession paths sid
+        _ <- handleSend sendDeps sid "hello"
+        let logFile = sessionDir paths sid </> "seal.log"
+        exists <- doesFileExist logFile
+        exists `shouldBe` True
+        content <- readFile logFile
+        content `shouldSatisfy` \s -> "ERROR" `T.isInfixOf` T.pack s
 
   describe "webAskCaps" $ do
     it "ccPrompt with options registers a pending ask carrying the options" $ do

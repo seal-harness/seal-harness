@@ -121,8 +121,9 @@ mkInvocationEntry name input = do
 -- Error results ('orIsError' = True) are NOT recorded here — the error
 -- text is rendered via 'ccSend' to the slash bubble instead.
 --
--- The skill body is ALSO appended to @conversation.jsonl@ as a 'User'
--- message carrying the rendered body text. The agent loop builds its
+-- The skill body is ALSO appended to @conversation.jsonl@ as an 'Assistant'
+-- message carrying the rendered body text (harness output, not user input).
+-- The agent loop builds its
 -- next-turn context from @conversation.jsonl@ ('runTurn' at
 -- 'Seal.Agent.Loop' reads @tfwReadConversation@); without this write,
 -- a user-invoked @/skill load@ would record the body only to
@@ -178,7 +179,7 @@ recordSkillLoadResult h (OpName nm) input result mChannel
           messageText = fromMaybe "" (parseMaybe (A.withObject "input" (A..: "message")) input)
           trimmedMessage = T.strip messageText
           convMsgs =
-            [ Message User [CbText bodyText] | not (T.null bodyText) ]
+            [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
             <> [ Message User [CbText trimmedMessage] | not (T.null trimmedMessage) ]
       tfwRecordAndAck h (TwoFileWrite convMsgs entry)
   | otherwise = pure ()
@@ -211,10 +212,10 @@ recordSetupRepoResult h (OpName nm) input result mChannel = do
             ([ ("op", object ["name" .= OpName nm])
              , ("input", input)
              , ("result", orRecorded result)
-             ] <> channelMeta)
+            ] <> channelMeta)
         }
       bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
-      convMsgs = [ Message User [CbText bodyText] | not (T.null bodyText) ]
+      convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
   tfwRecordAndAck h (TwoFileWrite convMsgs entry)
 
 -- | Record the result of a 'GIT_PUSH' opcode invocation as an
@@ -252,5 +253,5 @@ recordGitPushResult h (OpName nm) input result mChannel = do
              ] <> channelMeta)
         }
       bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
-      convMsgs = [ Message User [CbText bodyText] | not (T.null bodyText) ]
+      convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
   tfwRecordAndAck h (TwoFileWrite convMsgs entry)

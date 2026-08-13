@@ -24,7 +24,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (finally)
+import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
@@ -422,8 +422,10 @@ plainTurn deps meta t = do
           sessionDirPath = sessionDir paths sid
       createDirectoryIfMissing True sessionDirPath
       -- Signal the turn start so the web sidebar transitions the tab to
-      -- Thinking. Paired with the idle signal below (run on every exit
-      -- path of the lock bracket via 'finally').
+      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
+      -- below, which runs on EVERY exit path (success, synchronous
+      -- exceptions, AND async exceptions like ThreadKilled) so a turn that
+      -- dies mid-way cannot leave the tab stuck in Thinking.
       broadcastHarnessStatus (sdBroker deps) sid "thinking"
       -- Cross-channel message mirroring: fan out the web user's message
       -- to every append-only channel subscribed to this session, prefixed
@@ -431,8 +433,17 @@ plainTurn deps meta t = do
       -- the sender), so it is excluded by the "web" label (no chat channel
       -- has that label, so all subscribed channels receive the mirror).
       replyFanoutMessage (sdReplies deps) sid "web" t
-      turnResult <- withSessionLock (sdLocks deps) sid
-           (withTwoFileTranscript sessionDirPath (\tHandle -> do
+      bracket
+        (pure ())
+        (\_ -> do
+          -- Guaranteed cleanup: signal idle so the web sidebar
+          -- transitions the tab back to Idle regardless of how the turn
+          -- exited (success, exception, ThreadKilled). Then fan out the
+          -- reply to chat channels subscribed to this session.
+          broadcastHarnessStatus (sdBroker deps) sid "idle"
+          fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid)
+        (\_ -> withSessionLock (sdLocks deps) sid
+             (withTwoFileTranscript sessionDirPath (\tHandle -> do
             appEnv <- mkEnv (sdLogger deps) defaultConfig
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
@@ -485,18 +496,7 @@ plainTurn deps meta t = do
             result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
               runApp appEnv (runTurn env t)
             broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-            pure result))
-      -- Signal the turn end so the web sidebar transitions the tab back to
-      -- Idle. Runs on every exit path (success + lock/transcript failure)
-      -- via 'finally' so a turn that dies mid-way does not leave the tab
-      -- stuck in Thinking. The reply fanout below then fires the
-      -- reply-delivered signal for any chat-channel subscribers.
-      finally (pure ()) (broadcastHarnessStatus (sdBroker deps) sid "idle")
-      -- Fan out the reply to chat channels subscribed to this session.
-      -- The web frontend already received entries via the WS broker above;
-      -- only chat channels need the explicit chSend.
-      fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid
-      pure turnResult
+            pure result)))
 
 -- | Build the ISA registry for a web turn. Mirrors
 -- 'Seal.Channels.Signal.Run.buildRegistry' but includes AGENT_START (the
@@ -684,55 +684,65 @@ plainTurnWithCaps deps meta caps t = do
       createDirectoryIfMissing True sessionDirPath
       -- Cross-channel message mirroring (see plainTurn for the rationale).
       replyFanoutMessage (sdReplies deps) sid "web" t
-      withTwoFileTranscript sessionDirPath (\tHandle -> do
-        appEnv <- mkEnv (sdLogger deps) defaultConfig
-        eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
-        eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
-        let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-        untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-        eWd <- ensureSessionWorkdir paths sid
-        let wsRoot = case eWd of
-              Right wd -> WorkspaceRoot wd
-              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-        workdirSkills <- case eWd of
-          Right wd -> Skill.workdirSkillBackend wd
-          Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
-        workdirAgentDefs <- case eWd of
-          Right wd -> workdirAgentDefBackend wd
-          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
-        let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
-            sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
-            agentDefBackend = bAgentDefs sessionBackends
-            autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-            injectCatalog = either (const True) resolvedAvailableSkills eCfg
-            parallel = either (const True) resolvedParallelToolGuidance eCfg
-            toolUse = either (const True) resolvedToolUseEnforcement eCfg
-            taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-        mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-        cloneDeps <- mkCloneDepsFromSend deps
-        let onDemand = either (const False) onDemandSchemas eCfg
-            startWiring = webStartWiring
-              deps paths sid caps untrustedIO appEnv eCfg
-              wsRoot operatorCeiling "web" sessionBackends
-            isaReg = buildWebRegistry
-              (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
-              (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
-              (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-              caps onDemand
-            env = mkSessionAgentEnv
-              caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
-              (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-              (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-              onDemand
-              (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
-              Nothing
-              "web"
-              (Just (replyFanout (sdReplies deps) sid))
-        tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-        result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
-          runApp appEnv (runTurn env t)
-        broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-        pure result)
+      -- Signal the turn start so the web sidebar transitions the tab to
+      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
+      -- below, which runs on EVERY exit path (success, synchronous
+      -- exceptions, AND async exceptions like ThreadKilled).
+      broadcastHarnessStatus (sdBroker deps) sid "thinking"
+      bracket
+        (pure ())
+        (\_ -> do
+          broadcastHarnessStatus (sdBroker deps) sid "idle"
+          fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid)
+        (\_ -> withTwoFileTranscript sessionDirPath $ \tHandle -> do
+          appEnv <- mkEnv (sdLogger deps) defaultConfig
+          eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
+          eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
+          let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
+          untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
+          eWd <- ensureSessionWorkdir paths sid
+          let wsRoot = case eWd of
+                Right wd -> WorkspaceRoot wd
+                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+          workdirSkills <- case eWd of
+            Right wd -> Skill.workdirSkillBackend wd
+            Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+          workdirAgentDefs <- case eWd of
+            Right wd -> workdirAgentDefBackend wd
+            Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+          let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
+              sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
+              agentDefBackend = bAgentDefs sessionBackends
+              autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+              injectCatalog = either (const True) resolvedAvailableSkills eCfg
+              parallel = either (const True) resolvedParallelToolGuidance eCfg
+              toolUse = either (const True) resolvedToolUseEnforcement eCfg
+              taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+          mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+          cloneDeps <- mkCloneDepsFromSend deps
+          let onDemand = either (const False) onDemandSchemas eCfg
+              startWiring = webStartWiring
+                deps paths sid caps untrustedIO appEnv eCfg
+                wsRoot operatorCeiling "web" sessionBackends
+              isaReg = buildWebRegistry
+                (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
+                (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
+                (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
+                caps onDemand
+              env = mkSessionAgentEnv
+                caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
+                (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
+                onDemand
+                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
+                Nothing
+                "web"
+                (Just (replyFanout (sdReplies deps) sid))
+          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+          result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
+            runApp appEnv (runTurn env t)
+          broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+          pure result)
 
 -- | Build a 'CallDispatcher' for the web channel. Resolves the active
 -- session at call time, opens its transcript, builds the session's ISA
