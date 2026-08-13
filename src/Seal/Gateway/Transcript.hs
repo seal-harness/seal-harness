@@ -496,7 +496,11 @@ reconEntryToFrontend idx te =
       let dirStr = case teDirection te of
             Request  -> "request" :: Text
             Response -> "response"
-          payloadJson = rewritePayload payloadVal (teDirection te)
+          payloadJson = rewritePayload False payloadVal (teDirection te)
+          -- The `raw` view preserves full tool input_schemas so the
+          -- "View raw JSON" modal shows the verbatim schemas the LLM was
+          -- sent (the `payload` field strips them to keep the wire small).
+          rawJson = rewritePayload True payloadVal (teDirection te)
           entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw
           -- The originating channel label (e.g. "telegram", "web", "cli"),
           -- stamped into the request entry's erMeta by runTurn's
@@ -526,22 +530,22 @@ reconEntryToFrontend idx te =
          , "harness"   .= (Nothing :: Maybe Text)
          , "model"     .= (Nothing :: Maybe Text)
          , "channel"   .= mChannel
-         -- The `raw` field is deliberately EMPTY for the reconstructed
-         -- (two-file) path. The pre-rewrite payload Value is the same
-         -- content as `payload` (just in GHC-Generics TaggedObject shape
-         -- vs the Anthropic shape the frontend parses), so shipping it
-         -- would double the wire payload for no information gain. The
-         -- legacy path (teLineToFrontend) still ships the verbatim
-         -- on-disk line because there the `raw` view is genuinely
-         -- distinct from `payload`. The frontend's "View raw JSON"
-         -- modal falls back to `payload` when `raw` is empty.
-         , "raw"       .= ("" :: Text)
+         -- The `raw` field carries the full rewritten payload with tool
+         -- input_schemas preserved, so the frontend's "View raw JSON"
+         -- modal shows the verbatim schemas the LLM was sent. The legacy
+         -- path (teLineToFrontend) still ships the verbatim on-disk line.
+         , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawJson))
          ]
 
 -- | Rewrite a reconstructed payload 'Value' from GHC-Generics
 -- 'TaggedObject' encoding to the Anthropic-style JSON the frontend parses.
-rewritePayload :: A.Value -> Direction -> A.Value
-rewritePayload val dir =
+-- When @preserveSchemas@ is 'True', the @tools@ array keeps its full
+-- @input_schema@/parameters fields — used to build the @raw@ view so the
+-- "View raw JSON" modal shows the verbatim schemas the LLM was sent. When
+-- 'False', 'toolsWithDescriptions' strips them to keep the wire payload
+-- small (the frontend's collapsed Tools row only needs names + descriptions).
+rewritePayload :: Bool -> A.Value -> Direction -> A.Value
+rewritePayload preserveSchemas val dir =
   case val of
     A.Object o ->
       let k = Key.fromText
@@ -573,21 +577,28 @@ rewritePayload val dir =
                      ]
                    _ -> []
             _ -> []
+          toolsField = if preserveSchemas
+            then passthrough (k "tools")
+            else toolsWithDescriptions o
           fields = case dir of
             Request ->
               passthrough (k "system")
                <> passthrough (k "model")
-               -- Replace the full tool definitions with names-only. The
-               -- full definitions (with input_schema, description, etc.) are
-               -- the same across every request turn and can be 11KB+ each;
+               -- Replace the full tool definitions with name + description,
+               -- stripping input_schema/parameters to keep the wire payload
+               -- small. The full definitions (with input_schema) are the
+               -- same across every request turn and can be 11KB+ each;
                -- shipping them in all 73 request entries of a 146-turn
                -- session wastes ~840KB. The frontend's "Tools" collapsed
-               -- row only needs the names + count for its header, and the
-               -- expanded view's JSON is the names-only array (still useful
-               -- for seeing WHAT tools were available, just not the full
-               -- schemas). The frontend already deduplicates tools via
-               -- `seenTools` so only the first occurrence renders.
-               <> toolsNamesOnly o
+               -- row shows the names + descriptions, and the expanded
+               -- view's JSON carries the name + description array (useful
+               -- for seeing WHAT tools were available + what they do, just
+               -- not the full schemas). The frontend already deduplicates
+               -- tools via `seenTools` so only the first occurrence renders.
+               -- The @raw@ view (built with preserveSchemas=True) ships the
+               -- full tools array so the "View raw JSON" modal shows the
+               -- verbatim schemas the LLM was sent.
+               <> toolsField
                <> passthrough (k "toolChoice")
                <> passthrough (k "maxTokens")
                <> passthrough (k "approval")
@@ -612,30 +623,35 @@ rewritePayload val dir =
       in A.object fields
     _ -> val
 
--- | Extract just the tool NAMES from a tools array, dropping the full
--- definitions (description, input_schema, etc.) to keep the wire payload
--- small. Returns @["tools" .= [...]]@ where each element is
--- @{"name": "<toolName>"}@ — the shape the frontend's
--- 'extractToolDefNames' parses. Returns @[]@ when the tools field is
--- absent or not an array.
-toolsNamesOnly :: KeyMap.KeyMap Value -> [(Key, Value)]
-toolsNamesOnly o =
+-- | Extract name + description from a tools array, dropping input_schema /
+-- parameters to keep the wire payload small. Returns
+-- @["tools" .= [...]]@ where each element is
+-- @{"name": "<toolName>", "description": "<toolDesc>"}@ — the shape the
+-- frontend's 'extractToolDefNames' parses. Returns @[]@ when the tools field
+-- is absent or not an array.
+toolsWithDescriptions :: KeyMap.KeyMap Value -> [(Key, Value)]
+toolsWithDescriptions o =
   case KeyMap.lookup (Key.fromText "tools") o of
     Just (A.Array arr) ->
-      let names = map toolName (V.toList arr)
-      in ["tools" .= A.Array (V.fromList names)]
+      let defs = map toolNameDesc (V.toList arr)
+      in ["tools" .= A.Array (V.fromList defs)]
     _ -> []
   where
-    -- Extract {name: "..."} from a tool definition Value. Handles both
-    -- the Anthropic shape ({name, description, input_schema}) and the
-    -- Ollama shape ({type:"function", function:{name, ...}}).
-    toolName v = case v of
+    -- Extract {name, description} from a tool definition Value, dropping
+    -- input_schema / parameters. Handles both the Anthropic shape
+    -- ({name, description, input_schema}) and the Ollama shape
+    -- ({type:"function", function:{name, description, parameters}}).
+    toolNameDesc v = case v of
       A.Object td ->
-        case KeyMap.lookup (Key.fromText "name") td of
-          Just n -> A.object ["name" .= n]
-          Nothing -> case KeyMap.lookup (Key.fromText "function") td of
+        case ( KeyMap.lookup (Key.fromText "name") td
+             , KeyMap.lookup (Key.fromText "description") td ) of
+          (Just n, Just d) -> A.object ["name" .= n, "description" .= d]
+          (Just n, Nothing) -> A.object ["name" .= n]
+          (Nothing, _) -> case KeyMap.lookup (Key.fromText "function") td of
             Just (A.Object fn) -> case KeyMap.lookup (Key.fromText "name") fn of
-              Just n -> A.object ["name" .= n]
+              Just n -> case KeyMap.lookup (Key.fromText "description") fn of
+                Just d -> A.object ["name" .= n, "description" .= d]
+                Nothing -> A.object ["name" .= n]
               Nothing -> A.object ["name" .= A.Null]
             _ -> A.object ["name" .= A.Null]
       _ -> A.object ["name" .= A.Null]

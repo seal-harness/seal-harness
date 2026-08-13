@@ -590,9 +590,11 @@ function CollapsedBlock({ text, anchorId, label }: { text: string; anchorId?: st
           </span>
         )}
         {expanded ? (
-          <pre className="whitespace-pre-wrap break-words flex-1" style={{ fontFamily: 'inherit', margin: 0, maxHeight: 400, overflow: 'auto' }}>
+          <div className="flex-1" style={{ minWidth: 0 }}>
+            <pre className="whitespace-pre-wrap break-words" style={{ fontFamily: 'inherit', margin: 0, maxHeight: 400, overflow: 'auto' }}>
             {text}
           </pre>
+          </div>
         ) : (
           <span className="flex-1 truncate">{preview}{truncated ? '\u2026' : ''}</span>
         )}
@@ -920,14 +922,11 @@ function ToolCallBlock({
   )
 }
 
-/** A collapsible tool-definitions block. Collapsed, shows the tool count and
- *  the comma-joined list of tool names ("3 tools: shell, read, edit"), so the
- *  user can see what the LLM was told it could do without expanding. Expanded,
- *  renders the full tools JSON the LLM was sent. The expanded JSON is NOT
- *  rawJson-style verbatim — it's pretty-printed for readability. The verbatim
- *  on-disk payload for the same entry remains available via the
- *  "View raw JSON (message)" affordance on the row. */
-function ToolDefsCollapsed({ block, anchorId }: { block: ToolDefsBlock; anchorId?: string }) {
+/** A standalone collapsible tool-definitions block, rendered as its own
+ *  top-level row (agentName "Tools"). Collapsed, shows the tool count and
+ *  the comma-joined list of tool names ("3 tools: shell, read, edit").
+ *  Expanded, renders the full tools JSON (name + description per tool). */
+function ToolDefsBlockRow({ block, anchorId }: { block: ToolDefsBlock; anchorId?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const targeted = useFragmentAnchor(anchorId, ref)
   const [expanded, setExpanded] = useState(targeted)
@@ -1041,7 +1040,7 @@ function MessageBlock({
     )
   }
   if (block.toolDefs) {
-    return <ToolDefsCollapsed block={block.toolDefs} anchorId={block.id} />
+    return <ToolDefsBlockRow block={block.toolDefs} anchorId={block.id} />
   }
   if (block.collapsedText) {
     return <CollapsedBlock text={block.collapsedText} anchorId={block.id} />
@@ -1540,32 +1539,43 @@ function extractToolCalls(
     })
 }
 
-/** Extract tool-definition names from a tools array. Handles three shapes:
- *   - the transcript/CompletionRequest shape `[{name, description, input_schema}]`
- *     (the Anthropic wire shape — what the reconstructed payload carries since
- *     ToolDefinition's ToJSON emits the wire keys directly),
- *   - the Anthropic wire shape `[{name, description, input_schema}]`,
- *   - the Ollama wire shape `[{type:"function", function:{name, description, parameters}}]`.
- *  Unknown shapes fall back to a JSON one-liner per entry so we never
- *  silently lose structure. Returns the tool names in document order. */
-function extractToolDefNames(tools: unknown[]): string[] {
-  const nameFields = ['name']
-  return tools.map((t) => {
-    if (t == null || typeof t !== 'object') return JSON.stringify(t)
+/** Extract tool-definition name + description from a tools array. Returns
+ *  two parallel arrays: names and descriptions (descriptions may be empty
+ *  strings when absent). Handles both the Anthropic wire shape
+ *  ({name, description, input_schema}) and the Ollama wire shape
+ *  ({type:"function", function:{name, description, parameters}}). */
+function extractToolDefs(tools: unknown[]): { names: string[]; descriptions: string[] } {
+  const names: string[] = []
+  const descriptions: string[] = []
+  for (const t of tools) {
+    if (t == null || typeof t !== 'object') {
+      names.push(JSON.stringify(t))
+      descriptions.push('')
+      continue
+    }
     const o = t as Record<string, unknown>
-    for (const k of nameFields) {
-      const v = o[k]
-      if (typeof v === 'string' && v.length > 0) return v
+    const name = typeof o.name === 'string' && o.name.length > 0 ? o.name : null
+    const desc = typeof o.description === 'string' ? o.description : null
+    if (name) {
+      names.push(name)
+      descriptions.push(desc ?? '')
+      continue
     }
     const fn = o.function
     if (fn != null && typeof fn === 'object') {
-      for (const k of nameFields) {
-        const v = (fn as Record<string, unknown>)[k]
-        if (typeof v === 'string' && v.length > 0) return v
+      const f = fn as Record<string, unknown>
+      const fnName = typeof f.name === 'string' && f.name.length > 0 ? f.name : null
+      const fnDesc = typeof f.description === 'string' ? f.description : null
+      if (fnName) {
+        names.push(fnName)
+        descriptions.push(fnDesc ?? '')
+        continue
       }
     }
-    return JSON.stringify(o)
-  })
+    names.push(JSON.stringify(o))
+    descriptions.push('')
+  }
+  return { names, descriptions }
 }
 
 /** Convert transcript entries to the Message format ChatArea expects.
@@ -1578,7 +1588,6 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
   const seenSystemPrompts = new Set<string>()
-  const seenTools = new Set<string>()
   const toolResults = buildToolResultIndex(entries)
 
   for (const e of entries) {
@@ -1683,38 +1692,45 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // Extract system prompt as a separate collapsed message (only first
-        // occurrence). The synthesized row deliberately omits rawJson: the
-        // user message that follows from the same entry carries the same
-        // payload, and that's the verbatim-on-disk view the user wants.
+        // Extract system prompt + tools as TWO top-level rows (first
+        // occurrence only): a "System" row for the system prompt and a
+        // "Tools" row for the tool definitions. Splitting them (rather than
+        // nesting tools inside the System block) gives each its own header,
+        // permalink, and "View raw JSON" affordance. Both rows carry
+        // `rawJson` so the user can view the full request payload.
         const sysPrompt = parsed.system as string | undefined
-        if (sysPrompt && !seenSystemPrompts.has(sysPrompt)) {
-          seenSystemPrompts.add(sysPrompt)
-          messages.push({
-            id: e.id + '-sys',
-            agentName: 'System',
-            agentStatus: 'idle',
-            timestamp: ts,
-            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
-          })
-        }
-        // Extract the tools array as a separate collapsed "Tools" row (only
-        // first occurrence of that exact tool set). Names are extracted for
-        // the collapsed header; the full JSON renders on expand. Like the
-        // System row, this synthesized row omits rawJson — the following
-        // user/assistant row carries the verbatim payload.
         const tools = parsed.tools
-        if (Array.isArray(tools) && tools.length > 0) {
-          const toolsJson = JSON.stringify(tools, null, 2)
-          if (!seenTools.has(toolsJson)) {
-            seenTools.add(toolsJson)
-            const names = extractToolDefNames(tools)
+        const hasTools = Array.isArray(tools) && tools.length > 0
+        const toolsJson = hasTools ? JSON.stringify(tools, null, 2) : ''
+        const toolDefsBlock = hasTools
+          ? (() => {
+              const { names, descriptions } = extractToolDefs(tools)
+              return { count: names.length, names, descriptions, json: toolsJson }
+            })()
+          : undefined
+        // Dedup key: system prompt text + tools JSON. Only the first
+        // occurrence of a given (system, tools) pair renders rows.
+        const dedupKey = (sysPrompt ?? '') + '\u0000' + toolsJson
+        if ((sysPrompt || hasTools) && !seenSystemPrompts.has(dedupKey)) {
+          seenSystemPrompts.add(dedupKey)
+          if (sysPrompt) {
+            messages.push({
+              id: e.id + '-sys',
+              agentName: 'System Prompt',
+              agentStatus: 'idle',
+              timestamp: ts,
+              blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+              rawJson,
+            })
+          }
+          if (toolDefsBlock) {
             messages.push({
               id: e.id + '-tools',
               agentName: 'Tools',
               agentStatus: 'idle',
               timestamp: ts,
-              blocks: [{ id: 'td-' + e.id, toolDefs: { count: names.length, names, json: toolsJson } }],
+              blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+              rawJson,
             })
           }
         }
