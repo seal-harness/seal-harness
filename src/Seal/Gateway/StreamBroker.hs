@@ -20,12 +20,14 @@ module Seal.Gateway.StreamBroker
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (when, filterM)
+import Control.Monad (unless, when, filterM)
 import Data.Aeson (Value)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
-import Seal.Core.Types (SessionId)
+import Katip (Severity (..), ls)
+import Seal.Core.Types (SessionId, sessionIdText)
+import Seal.Logging.Global (globalLogIO)
 
 -- | One event the broker fans out to subscribers.
 data BrokerEvent
@@ -102,9 +104,6 @@ broadcast broker event = do
   -- check avoids a needless STM write when everyone survived.
   when (length live < length subs) $ atomically $ writeTVar (sbSubs broker) live
   where
-    -- Decide whether this event targets the subscriber's focused session,
-    -- attempt the send, and return False (swallowing the exception) if the
-    -- send threw so the caller can prune the dead subscriber.
     deliverTo ev s =
       (do
          ok <- shouldSend ev s
@@ -129,7 +128,11 @@ broadcast broker event = do
       BeAskResolved sid _  -> matchSession s sid
     matchSession s sid = do
       subSid <- readTVarIO (subSessionRef s)
-      pure (subSid == sid)
+      let matched = subSid == sid
+      unless matched $
+        globalLogIO DebugS (ls ("[broker] filter: entry sid=" :: String) <> ls (sessionIdText sid)
+          <> ls (" != subSid=" :: String) <> ls (sessionIdText subSid))
+      pure matched
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()

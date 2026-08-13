@@ -107,6 +107,7 @@ streamApp guard broker pending = do
               ]))
       let defaultSid = case mkSessionId "default" of Right s -> s; Left _ -> error "sid"
       subSessionRef <- subscribe broker defaultSid sendEvent
+      globalLogIO InfoS "[ws] connected, initial focus=default"
       -- Send an initial lists snapshot AFTER subscribing so this connection
       -- is in the broker's subscriber list and actually receives the frame.
       -- Without this, the snapshot is broadcast to zero subscribers, the
@@ -118,7 +119,9 @@ streamApp guard broker pending = do
               case A.decode msg of
                 Just (focusOp :: FocusOp) ->
                   case mkSessionId (foSession focusOp) of
-                    Right s  -> updateSubscriberSession subSessionRef s
+                    Right s  -> do
+                      globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
+                      updateSubscriberSession subSessionRef s
                     Left _e  -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("invalid session id" :: Text)]))
                 Nothing -> sendTextData conn (A.encode (object ["type" .= ("error" :: Text), "message" .= ("expected a focus op" :: Text)]))
         readerLoop `catch` \(_e :: SomeException) -> pure ()
