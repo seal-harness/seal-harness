@@ -113,6 +113,7 @@ data ApiDeps = ApiDeps
   , adConfigRepo       :: ConfigRepo            -- ^ for the best-effort @gitCommitAll@ audit-commit of repos.toml after a mutation (W4)
   , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
+  , adWsPort           :: Int                   -- ^ the WS stream server port (returned in /api/health so the frontend can discover it at runtime)
   }
 
 -- | The REST API as a WAI Application.
@@ -120,7 +121,10 @@ apiApp :: ApiDeps -> Application
 apiApp deps req respond =
   case (requestMethod req, pathInfo req) of
     (m', ["api", "health"]) | m' == methodGet ->
-      respond (jsonOk (object ["status" .= ("ok" :: Text)]))
+      respond (jsonOk (object
+        [ "status" .= ("ok" :: Text)
+        , "wsPort" .= adWsPort deps
+        ]))
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)

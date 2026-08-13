@@ -200,7 +200,7 @@ mkDepsFor paths = do
     , adRepoRegistry     = repoRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
     }
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
@@ -1559,7 +1559,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1634,7 +1634,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1699,7 +1699,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1765,7 +1765,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1856,7 +1856,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1912,7 +1912,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1967,7 +1967,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -2003,7 +2003,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -2091,7 +2091,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -2145,7 +2145,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -2198,7 +2198,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -2245,7 +2245,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -2301,7 +2301,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = repoRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
 
     it "GET /api/repos returns 200 + [] when the registry is empty" $
@@ -2635,7 +2635,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = corruptH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
@@ -2676,7 +2676,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2905,7 +2905,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
                 }
           pure (apiApp deps, sidTxt)
 
@@ -3018,7 +3018,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -3111,7 +3111,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -3236,7 +3236,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -3346,7 +3346,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths
+                , adPaths            = fakePaths, adWsPort = 8081
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

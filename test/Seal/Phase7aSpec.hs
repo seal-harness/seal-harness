@@ -89,6 +89,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
+    , adWsPort = 8081
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -142,6 +143,7 @@ spec = describe "Seal.Phase7aSpec" $ do
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
+    , adWsPort = 8081
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

@@ -51,6 +51,7 @@ module Seal.Channels.Loop
   ) where
 
 import Control.Concurrent (forkIO)
+import Control.Exception (bracket)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -753,9 +754,21 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
       -- frontend sees the message via the transcript, not this registry.
       replyFanoutMessage (cdReplies deps) sid (chLabel h) t
       -- Signal the turn start so the web sidebar transitions the tab to
-      -- Thinking. Paired with the idle signal after the lock bracket.
+      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
+      -- below, which runs on EVERY exit path (success, synchronous
+      -- exceptions, AND async exceptions like ThreadKilled) so a turn
+      -- that dies mid-way cannot leave the tab stuck in Thinking.
       broadcastHarnessStatus (cdBroker deps) sid "thinking"
-      withSessionLock (cdLocks deps) sid $ do
+      bracket
+        (pure ())
+        (\_ -> do
+          -- Guaranteed cleanup: signal idle + reply-delivered so the
+          -- web sidebar transitions the tab back to Idle regardless of
+          -- how the turn exited.
+          broadcastHarnessStatus (cdBroker deps) sid "idle"
+          broadcastReplyDelivered (cdBroker deps) sid)
+        (\_ ->
+        withSessionLock (cdLocks deps) sid $ do
         withTwoFileTranscript sessionDirPath $ \tHandle -> do
           appEnv <- mkEnv (cdLogger deps) defaultConfig
           eCfg <- loadRuntimeConfig (prConfigPath pr)
@@ -841,14 +854,7 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
           case eResult of
             Left errMsg -> logIO (cdLogger deps) ErrorS ("[channel] turn failed: " <> ls errMsg)
             Right _     -> pure ()
-      broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-      -- Signal the turn end so the web sidebar transitions the tab back
-      -- to Idle, AND mark the session "seen" because the channel's reply
-      -- was delivered to this channel handle (subscribed above) during
-      -- the turn. The reply-delivered signal lets the sidebar drop a
-      -- channel-originated tab to Idle Read.
-      broadcastHarnessStatus (cdBroker deps) sid "idle"
-      broadcastReplyDelivered (cdBroker deps) sid
+        broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
       -- W3 invariant 2: auto-tab the session after a channel turn. Idempotent
       -- (no-op if a tab already binds sid — e.g. createConversationSession
       -- already inserted one on first message). Uses KindAi (channel/CLI

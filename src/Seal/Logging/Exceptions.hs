@@ -53,6 +53,13 @@ withExceptionLogging logger mLogPath whereLabel action =
       Just asyncEx -> do
         logIO logger InfoS (escapeNewlines (ls $
           "shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx))
+        -- Also record the shutdown in the per-session log so an operator
+        -- inspecting seal.log after a hung session can see WHY the turn
+        -- died (e.g. ThreadKilled) rather than just a dangling [TURN]
+        -- start with no matching end. Best-effort (logTurnError swallows
+        -- IO errors) and rethrown after logging so the bracket cleanup
+        -- (idle broadcast) still fires.
+        logTurnError mLogPath ("shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx)
         throwIO e
       Nothing -> do
         correlationId <- mkCorrelationId

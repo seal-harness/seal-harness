@@ -5,6 +5,9 @@ import Control.Exception (throwIO, AsyncException (..))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Logging.Exceptions (withExceptionLogging)
@@ -62,6 +65,31 @@ spec = describe "Seal.Logging.Exceptions" $ do
       withExceptionLogging logger Nothing "test" (throwIO ThreadKilled)
         `shouldThrow` (== ThreadKilled)
       closeSealLogger logger
+
+    it "logs AsyncException to the session log before rethrowing" $
+      withSystemTempDirectory "seal-exc" $ \tmp -> do
+        logger <- testSealLogger
+        let logPath = tmp </> "seal.log"
+        withExceptionLogging logger (Just logPath) "turn" (throwIO ThreadKilled)
+          `shouldThrow` (== ThreadKilled)
+        closeSealLogger logger
+        exists <- doesFileExist logPath
+        exists `shouldBe` True
+        content <- readFile logPath
+        content `shouldSatisfy` \s -> "shutdown signal" `T.isInfixOf` T.pack s
+        content `shouldSatisfy` \s -> "turn" `T.isInfixOf` T.pack s
+
+    it "logs synchronous exceptions to the session log" $
+      withSystemTempDirectory "seal-exc" $ \tmp -> do
+        logger <- testSealLogger
+        let logPath = tmp </> "seal.log"
+        _ <- withExceptionLogging logger (Just logPath) "turn" $
+          throwIO (userError "something broke")
+        closeSealLogger logger
+        exists <- doesFileExist logPath
+        exists `shouldBe` True
+        content <- readFile logPath
+        content `shouldSatisfy` \s -> "turn failed" `T.isInfixOf` T.pack s
 
     it "includes a correlation id in the sanitized text" $ do
       logger <- testSealLogger

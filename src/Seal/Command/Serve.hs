@@ -262,6 +262,7 @@ runServeMain autonomy logger = do
         , adConfigRepo       = repo
         , adVault            = rt
         , adPaths            = paths
+        , adWsPort           = gcWsPort gwCfg
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

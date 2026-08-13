@@ -102,9 +102,6 @@ broadcast broker event = do
   -- check avoids a needless STM write when everyone survived.
   when (length live < length subs) $ atomically $ writeTVar (sbSubs broker) live
   where
-    -- Decide whether this event targets the subscriber's focused session,
-    -- attempt the send, and return False (swallowing the exception) if the
-    -- send threw so the caller can prune the dead subscriber.
     deliverTo ev s =
       (do
          ok <- shouldSend ev s

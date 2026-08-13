@@ -75,6 +75,7 @@ mkDeps = do
     , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
+    , adWsPort = 8081
     })
 
 spec :: Spec

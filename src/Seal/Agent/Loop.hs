@@ -19,6 +19,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 import qualified System.IO as IO
+import System.Timeout (timeout)
 
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Core.MessageSource
@@ -48,6 +49,18 @@ import Seal.Types.App (App)
 -- explicitly (see 'go') — but it reduces the frequency.
 defaultMaxTokens :: Int
 defaultMaxTokens = 8192
+
+-- | Hard timeout for a single provider streaming call, in microseconds.
+-- 5 minutes gives generous headroom for large contexts on remote models
+-- (the Ollama HTTP client has its own 5-minute response timeout; this is
+-- a safety net for a stalled connection that never closes). If the stream
+-- does not complete within this window, the turn aborts with a provider
+-- error so the session does not hang forever in "thinking" with no log
+-- output. The error is logged to seal.log and surfaced to the user as a
+-- normal provider error (not an exception), so the bracket cleanup in
+-- the send path still fires the idle broadcast.
+streamTimeoutUs :: Int
+streamTimeoutUs = 5 * 60 * 1_000_000
 
 -- | The synthetic user message appended after a 'StopMaxTokens' truncation
 -- with no tool calls, asking the model to continue exactly where it left off
@@ -188,14 +201,23 @@ runTurn env userText = do
       collectedRef <- liftIO (newIORef ([] :: [StreamEvent]))
       let streamSends = ccStreaming (aeCaps env)
       let isTransient = isTransientError
-      estream <- liftIO (providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
-        case ev of
-          StreamTextChunk delta
-            | streamSends -> do
-            ccSend (aeCaps env) delta
-          _ -> pure ()
-        modifyIORef' collectedRef (++ [ev])
-        pure True))
+      -- Wrap the stream in a hard timeout so a stalled provider
+      -- connection (TCP open but no data) cannot hang the session
+      -- forever in "thinking". On timeout, the turn surfaces a provider
+      -- error — logged to seal.log + the transcript — and the bracket
+      -- cleanup in the send path fires the idle broadcast.
+      mResult <- liftIO (timeout streamTimeoutUs $
+        providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
+          case ev of
+            StreamTextChunk delta
+              | streamSends -> do
+              ccSend (aeCaps env) delta
+            _ -> pure ()
+          modifyIORef' collectedRef (++ [ev])
+          pure True))
+      let estream = case mResult of
+            Nothing -> Left "stream timed out (no data for 5 minutes)"
+            Just r  -> r
       case estream of
         Left err -> liftIO $ do
           logProviderError (aeLogPath env) err

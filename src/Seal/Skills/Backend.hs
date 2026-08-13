@@ -20,13 +20,14 @@ module Seal.Skills.Backend
   , decodeSkill
   , listAgentSkillsDir
   , decodeAgentSkill
+  , prefixWorkdirSkill
   ) where
 import Control.Monad (forM, forM_)
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -122,16 +123,20 @@ unionSkillBackend user = SkillBackend
 -- @.skills@ follows the [agentskills.io](https://agentskills.io)
 -- specification: each subdirectory contains a @SKILL.md@ file with YAML
 -- frontmatter (@name@, @description@) + Markdown body. The other
--- conventions use Seal's native flat/grouped @.md@ layout.
+-- @.agents\/skills@ also uses the agentskills.io format (it is the skills
+-- sub-directory of the [.agents Protocol](https://dotagentsprotocol.com)).
+-- The other conventions use Seal's native flat/grouped @.md@ layout.
 workdirSkillConventions :: [FilePath]
-workdirSkillConventions = [ ".skills", ".seal/skills", ".claude/skills", "agents/skills" ]
+workdirSkillConventions = [ ".skills", ".agents/skills", ".seal/skills", ".claude/skills", "agents/skills" ]
 
 -- | A read-only 'SkillBackend' that scans a session workdir for skills
 -- shipped by cloned repositories. For each top-level directory in the
 -- workdir (a cloned repo), it checks the conventional skill locations
--- (@.skills\/@, @.seal\/skills\/@, @.claude\/skills\/@, @agents\/skills\/@)
--- and loads any skills there. The @.skills@ convention uses the
--- agentskills.io directory-based format (@\<name\>\/SKILL.md@); the others
+-- (@.skills\/@, @.agents\/skills\/@, @.seal\/skills\/@,
+-- @.claude\/skills\/@, @agents\/skills\/@)
+-- and loads any skills there. The @.skills@ and @.agents\/skills@
+-- conventions use the agentskills.io directory-based format
+-- (@\<name\>\/SKILL.md@); the others
 -- use Seal's native flat/grouped @.md@ layout.
 --
 -- This backend is /read-only/: 'sbCreate'/'sbUpdate'/'sbDelete' are no-ops
@@ -160,7 +165,7 @@ workdirSkillBackend workdir = pure SkillBackend
 -- alphabetically-first repo wins on id collisions (deterministic). Missing
 -- @workdir@ or empty workdirs yield @[]@.
 --
--- For the @.skills@ convention, skills are loaded from the agentskills.io
+-- For the @.skills@ and @.agents\/skills@ conventions, skills are loaded from the agentskills.io
 -- directory format (each subdirectory contains a @SKILL.md@). For the
 -- other conventions, skills are loaded from Seal's native flat/grouped
 -- @.md@ layout.
@@ -173,12 +178,12 @@ listWorkdirSkills workdir = do
       dirs <- listSubdirs workdir
       perRepo <- forM dirs $ \repo -> do
         let repoDir = workdir </> repo
-        concat <$> forM workdirSkillConventions (\conv -> do
+        raw <- concat <$> forM workdirSkillConventions (\conv -> do
           let convDir = repoDir </> conv
           cExists <- doesDirectoryExist convDir
           if not cExists
             then pure []
-            else if conv == ".skills"
+            else if conv `elem` [".skills", ".agents/skills"]
                    then do
                      -- agentskills.io format: subdirectories with SKILL.md
                      agentSkills <- listAgentSkillsDir convDir
@@ -188,17 +193,47 @@ listWorkdirSkills workdir = do
                      x <- listTopLevelSkills convDir
                      y <- listGroupedSkills convDir
                      pure (catMaybes (x ++ y)))
+        -- Stamp each repo-local skill with a group derived from the repo
+        -- directory name so the <available_skills> catalog groups them
+        -- under a "<repo> project skills" heading.
+        pure (mapMaybe (prefixWorkdirSkill (T.pack repo)) (map (stampProjectGroup (T.pack repo)) raw))
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)
       pure (Map.elems merged)
 
+-- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
+-- so the @\<available_skills\>@ catalog groups them under a per-repo
+-- heading. A skill that already has a group (e.g. from the native grouped
+-- layout) keeps its existing group — only ungrouped skills are stamped.
+-- This mirrors how 'readAndStampGroup' fills 'skGroup' from the on-disk
+-- directory for user-store skills.
+stampProjectGroup :: Text -> Skill -> Skill
+stampProjectGroup repo s = case skGroup s of
+  Just g | not (T.null (T.strip g)) -> s
+  _ -> s { skGroup = Just (repo <> " project skills") }
+
+-- | Prefix a workdir-discovered skill's id with @\<repo\>--\<id\>@ so it
+-- never collides with a user-store skill of the same name (mirrors the
+-- agent-def pattern in 'Seal.Agent.Def.Backend.prefixWorkdirDef'). The
+-- @--@ separator is charset-safe per 'isValidSkillId'. If the prefixed id
+-- fails validation (e.g. the repo dir has a char outside the charset),
+-- the skill is dropped ('Nothing' — fail-closed).
+prefixWorkdirSkill :: Text -> Skill -> Maybe Skill
+prefixWorkdirSkill repo s =
+  let prefixedIdText = repo <> "--" <> skillIdText (skId s)
+  in case mkSkillId prefixedIdText of
+       Left _ -> Nothing
+       Right sid -> Just s { skId = sid }
+
 -- | A three-way union of a workdir backend (repo-local skills), a user
--- backend, and the built-in skills. 'workdir-wins' on id collisions:
--- workdir shadows user, user shadows built-in. Reads check workdir first,
--- then user, then the built-in map. Listing merges all three with the
--- same precedence. Writes go to the /user/ backend only (repo and
--- built-in skills are immutable from the model's perspective).
+-- backend, and the built-in skills. Workdir skill ids are namespaced
+-- (@\<repo\>--\<id\>@) so they never collide with user skills by design.
+-- On id collisions between user and built-in, user shadows built-in.
+-- Reads check workdir first, then user, then the built-in map. Listing
+-- merges all three with the same precedence. Writes go to the /user/
+-- backend only (repo and built-in skills are immutable from the model's
+-- perspective).
 --
 -- This is the backend wired into per-turn prompt construction so the
 -- @\<available_skills\>@ catalog and @SKILL_LOAD@ surface repo-local

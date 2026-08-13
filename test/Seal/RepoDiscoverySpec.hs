@@ -10,11 +10,17 @@ import Test.Hspec
 
 import Seal.Skills.Backend
   ( SkillBackend (..)
+  , tripleUnionSkillBackend
   , workdirSkillBackend
   , workdirSkillConventions
   , decodeAgentSkill
   )
+import qualified Seal.Skills.Backend as SkillBackend
 import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+import Data.Time (UTCTime (..))
+import Data.Time.Calendar (fromGregorian)
+import Data.Time.Clock (secondsToDiffTime)
+import Seal.Core.Types (mkSystemSessionId)
 import Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
   , workdirAgentDefBackend
@@ -53,6 +59,8 @@ spec = do
   describe "Seal.Skills.Backend.workdirSkillConventions" $ do
     it "includes .skills as the first convention" $ do
       ".skills" `elem` workdirSkillConventions `shouldBe` True
+    it "includes .agents/skills as the second convention" $ do
+      ".agents/skills" `elem` workdirSkillConventions `shouldBe` True
   describe "Seal.Skills.Backend.workdirSkillBackend (.skills directory)" $ do
     it "discovers skills in agentskills.io format" $ do
       let tmp = "/tmp/seal-repo-discovery-skills-test"
@@ -65,21 +73,72 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-skill"
+          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
           skDescription s `shouldBe` "A repo-local skill."
           skBody s `shouldBe` "Do repo things.\n"
+          skGroup s `shouldBe` Just "my-repo project skills"
         _ -> expectationFailure "expected exactly 1 skill"
-      case mkSkillId "my-skill" of
+      case mkSkillId "my-repo--my-skill" of
         Right sid -> do
           mSkill <- sbRead backend sid
           mSkill `shouldSatisfy` isJust
         Left _ -> expectationFailure "invalid skill id"
       cleanup tmp
 
+  describe "Seal.Skills.Backend.workdirSkillBackend (.agents/skills directory)" $ do
+    it "discovers skills in agentskills.io format under .agents/skills/" $ do
+      let tmp = "/tmp/seal-repo-discovery-agents-skills-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill" </> "SKILL.md")
+        "---\nname: my-skill\ndescription: A .agents/skills skill.\n---\nDo .agents things.\n"
+      backend <- workdirSkillBackend tmp
+      skills <- sbList backend
+      length skills `shouldBe` 1
+      case skills of
+        [s] -> do
+          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skDescription s `shouldBe` "A .agents/skills skill."
+          skBody s `shouldBe` "Do .agents things.\n"
+          skGroup s `shouldBe` Just "my-repo project skills"
+        _ -> expectationFailure "expected exactly 1 skill"
+      cleanup tmp
+
     it "returns empty list when workdir has no repos" $ do
       backend <- workdirSkillBackend "/nonexistent-path-12345"
       skills <- sbList backend
       skills `shouldBe` []
+
+  describe "Seal.Skills.Backend.tripleUnionSkillBackend (no-collision namespacing)" $ do
+    it "shows both user and workdir skills when they share the same raw id" $ do
+      let tmp = "/tmp/seal-repo-discovery-no-collision-test"
+      cleanup tmp
+      -- Workdir skill: .agents/skills/shared-skill/SKILL.md
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "shared-skill")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "shared-skill" </> "SKILL.md")
+        "---\nname: shared-skill\ndescription: Repo version.\n---\nRepo body.\n"
+      -- User skill: in-memory backend with the same id "shared-skill"
+      workdirBackend <- workdirSkillBackend tmp
+      userBackend <- SkillBackend.noneBackend
+      case mkSkillId "shared-skill" of
+        Right sid -> do
+          sbCreate userBackend Skill
+            { skId = sid
+            , skDescription = "User version."
+            , skBody = "User body.\n"
+            , skGroup = Just "metaswarm"
+            , skCreatedAt = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
+            , skUpdatedAt = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
+            , skSession = mkSystemSessionId "manual"
+            }
+          let unioned = tripleUnionSkillBackend workdirBackend userBackend
+          skills <- sbList unioned
+          length skills `shouldBe` 3
+          let ids = map (skillIdText . skId) skills
+          ids `shouldContain` ["my-repo--shared-skill"]
+          ids `shouldContain` ["shared-skill"]
+        Left _ -> expectationFailure "invalid skill id"
+      cleanup tmp
 
   describe "Seal.Agent.Def.Backend.workdirAgentDefBackend" $ do
     it "discovers agent defs from .agents/ directory" $ do
