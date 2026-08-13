@@ -904,6 +904,7 @@ describe('ChatArea', () => {
           toolDefs: {
             count: 2,
             names: ['shell', 'read'],
+            descriptions: ['sh', 'rd'],
             json: JSON.stringify([
               { name: 'shell', description: 'sh', input_schema: {} },
               { name: 'read', description: 'rd', input_schema: {} },
