@@ -177,7 +177,7 @@ listWorkdirSkills workdir = do
       dirs <- listSubdirs workdir
       perRepo <- forM dirs $ \repo -> do
         let repoDir = workdir </> repo
-        concat <$> forM workdirSkillConventions (\conv -> do
+        raw <- concat <$> forM workdirSkillConventions (\conv -> do
           let convDir = repoDir </> conv
           cExists <- doesDirectoryExist convDir
           if not cExists
@@ -192,10 +192,25 @@ listWorkdirSkills workdir = do
                      x <- listTopLevelSkills convDir
                      y <- listGroupedSkills convDir
                      pure (catMaybes (x ++ y)))
+        -- Stamp each repo-local skill with a group derived from the repo
+        -- directory name so the <available_skills> catalog groups them
+        -- under a "<repo> project skills" heading.
+        pure (map (stampProjectGroup (T.pack repo)) raw)
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)
       pure (Map.elems merged)
+
+-- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
+-- so the @\<available_skills\>@ catalog groups them under a per-repo
+-- heading. A skill that already has a group (e.g. from the native grouped
+-- layout) keeps its existing group — only ungrouped skills are stamped.
+-- This mirrors how 'readAndStampGroup' fills 'skGroup' from the on-disk
+-- directory for user-store skills.
+stampProjectGroup :: Text -> Skill -> Skill
+stampProjectGroup repo s = case skGroup s of
+  Just g | not (T.null (T.strip g)) -> s
+  _ -> s { skGroup = Just (repo <> " project skills") }
 
 -- | A three-way union of a workdir backend (repo-local skills), a user
 -- backend, and the built-in skills. 'workdir-wins' on id collisions:

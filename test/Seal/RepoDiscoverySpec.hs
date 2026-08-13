@@ -70,6 +70,7 @@ spec = do
           skillIdText (skId s) `shouldBe` "my-skill"
           skDescription s `shouldBe` "A repo-local skill."
           skBody s `shouldBe` "Do repo things.\n"
+          skGroup s `shouldBe` Just "my-repo project skills"
         _ -> expectationFailure "expected exactly 1 skill"
       case mkSkillId "my-skill" of
         Right sid -> do
@@ -93,6 +94,7 @@ spec = do
           skillIdText (skId s) `shouldBe` "my-skill"
           skDescription s `shouldBe` "A .agents/skills skill."
           skBody s `shouldBe` "Do .agents things.\n"
+          skGroup s `shouldBe` Just "my-repo project skills"
         _ -> expectationFailure "expected exactly 1 skill"
       cleanup tmp
 
