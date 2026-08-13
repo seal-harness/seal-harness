@@ -136,7 +136,7 @@ describe('transcriptToMessages', () => {
     expect(tcBlock!.toolCall!.resultIsError).toBe(false)
   })
 
-  it('emits a Tools row from parsed.tools with names + count + full JSON', () => {
+  it('nests tool defs inside the System row with names + descriptions + JSON', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 't1',
@@ -153,25 +153,27 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
-    expect(toolsRow).toBeTruthy()
-    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    const sysRow = msgs.find((m) => m.agentName === 'System')
+    expect(sysRow).toBeTruthy()
+    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block).toBeTruthy()
     expect(block.toolDefs!.count).toBe(2)
     expect(block.toolDefs!.names).toEqual(['shell', 'read'])
-    // Full JSON carries both tool definitions.
+    expect(block.toolDefs!.descriptions).toEqual(['run a shell command', 'read a file'])
+    // Full JSON carries both tool definitions (name + description, input_schema stripped by backend).
     const parsed = JSON.parse(block.toolDefs!.json)
     expect(Array.isArray(parsed)).toBe(true)
     expect(parsed).toHaveLength(2)
     expect(parsed[0]!.name).toBe('shell')
   })
 
-  it('emits a Tools row from Anthropic wire shape ({name, input_schema})', () => {
+  it('nests tool defs from Anthropic wire shape inside System row', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'a1',
         direction: 'request',
         payload: JSON.stringify({
+          system: 'sys',
           tools: [
             { name: 'shell', description: 'sh', input_schema: { type: 'object' } },
           ],
@@ -181,18 +183,20 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
-    expect(toolsRow).toBeTruthy()
-    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    const sysRow = msgs.find((m) => m.agentName === 'System')
+    expect(sysRow).toBeTruthy()
+    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block.toolDefs!.names).toEqual(['shell'])
+    expect(block.toolDefs!.descriptions).toEqual(['sh'])
   })
 
-  it('emits a Tools row from Ollama-style function wrappers', () => {
+  it('nests tool defs from Ollama-style function wrappers inside System row', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'o1',
         direction: 'request',
         payload: JSON.stringify({
+          system: 'sys',
           tools: [
             { type: 'function', function: { name: 'web_search', description: 'search the web', parameters: { type: 'object' } } },
           ],
@@ -202,19 +206,20 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const toolsRow = msgs.find((m) => m.agentName === 'Tools')
-    expect(toolsRow).toBeTruthy()
-    const block = toolsRow!.blocks.find((b) => b.toolDefs !== undefined)!
+    const sysRow = msgs.find((m) => m.agentName === 'System')
+    expect(sysRow).toBeTruthy()
+    const block = sysRow!.blocks.find((b) => b.toolDefs !== undefined)!
     expect(block.toolDefs!.names).toEqual(['web_search'])
+    expect(block.toolDefs!.descriptions).toEqual(['search the web'])
   })
 
-  it('emits a Tools row only once per unique tool set', () => {
+  it('emits a System row with tools only once per unique (system, tools) pair', () => {
     const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'd1',
         direction: 'request',
-        payload: JSON.stringify({ tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+        payload: JSON.stringify({ system: 'sys', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
         raw: '{}',
       }),
       makeEntry({
@@ -227,16 +232,16 @@ describe('transcriptToMessages', () => {
       makeEntry({
         id: 'd3',
         direction: 'request',
-        payload: JSON.stringify({ tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
+        payload: JSON.stringify({ system: 'sys', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
         raw: '{}',
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    const toolsRows = msgs.filter((m) => m.agentName === 'Tools')
-    expect(toolsRows).toHaveLength(1)
+    const sysRows = msgs.filter((m) => m.agentName === 'System')
+    expect(sysRows).toHaveLength(1)
   })
 
-  it('omits a Tools row when tools array is empty or absent', () => {
+  it('omits tool defs when tools array is empty or absent', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
         id: 'e1',
@@ -246,7 +251,7 @@ describe('transcriptToMessages', () => {
       }),
     ]
     const msgs = transcriptToMessages(entries)
-    expect(msgs.find((m) => m.agentName === 'Tools')).toBeUndefined()
+    expect(msgs.find((m) => m.agentName === 'System')).toBeUndefined()
   })
 
   it('emits a text block for a plain user message', () => {
@@ -886,15 +891,16 @@ describe('ChatArea', () => {
     expect(screen.getByText(/200k/)).toBeTruthy()
   })
 
-  it('renders a collapsed Tools row showing count + names, expandable to full JSON', () => {
+  it('renders a collapsed System row with nested tools showing count + names, expandable to full JSON', () => {
     const messages: Message[] = [
       {
         id: 'm1',
-        agentName: 'Tools',
+        agentName: 'System',
         agentStatus: 'idle',
         timestamp: '2024-06-01 12:00:00',
         blocks: [{
           id: 'b1',
+          collapsedText: 'You are a helpful assistant.',
           toolDefs: {
             count: 2,
             names: ['shell', 'read'],
@@ -912,17 +918,24 @@ describe('ChatArea', () => {
         messages={messages}
       />,
     )
-    // Collapsed header shows count + names.
-    expect(screen.getByText(/2 tools:.*shell.*read/)).toBeTruthy()
+    // Collapsed header shows the system prompt preview + tool count.
+    expect(screen.getByText(/helpful assistant.*2 tools/)).toBeTruthy()
     // The full JSON is NOT visible while collapsed.
     expect(screen.queryByText('"input_schema"')).toBeNull()
     // Click to expand.
-    fireEvent.click(screen.getByText(/2 tools:/))
-    // Now the full JSON renders inside a <pre>.
-    const pre = document.querySelector('pre')
-    expect(pre).toBeTruthy()
-    expect(pre!.textContent).toContain('"input_schema"')
-    expect(pre!.textContent).toContain('"shell"')
+    fireEvent.click(screen.getByText(/helpful assistant/))
+    // The system prompt text renders inside a <pre>.
+    const pres = document.querySelectorAll('pre')
+    expect(pres.length).toBeGreaterThanOrEqual(1)
+    expect(pres[0]!.textContent).toContain('helpful assistant')
+    // The Tools sub-section is visible but collapsed — click to expand it.
+    fireEvent.click(screen.getByText('Tools'))
+    // Now the tools JSON renders inside a <pre> with the tool definitions.
+    const presAfter = document.querySelectorAll('pre')
+    const toolsPre = Array.from(presAfter).find(p => p.textContent?.includes('"input_schema"'))
+    expect(toolsPre).toBeTruthy()
+    expect(toolsPre!.textContent).toContain('"input_schema"')
+    expect(toolsPre!.textContent).toContain('"shell"')
   })
 
   it('renders the empty-state message when there are no messages and no setup props', () => {

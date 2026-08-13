@@ -13,10 +13,13 @@
 module Seal.Gateway.TranscriptSpec (spec) where
 
 import Data.Aeson (Value (..), object, (.=))
+import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Char8 qualified as BC
 import Data.Map.Strict qualified as Map
+import Data.Text (Text)
+import Data.Vector qualified as V
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 
@@ -130,6 +133,83 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               other -> expectationFailure ("expected 'payload' object in frontend entry, got " ++ show other)
           _ -> expectationFailure "expected object value"
       Nothing -> expectationFailure "expected Just (approval entry surfaces), got Nothing"
+
+  -- ── tools rewriting in request entries ──────────────────────────────
+
+  describe "tools rewriting in request entries" $ do
+    -- A helper: build a request TranscriptEntry with a tools array.
+    let mkReqTe tools = TranscriptEntry
+          { teId = ""
+          , teTimestamp = sampleTime
+          , teModel = Nothing
+          , teDirection = Request
+          , tePayload = object
+              [ "tools" .= tools
+              , "messages" .= ([] :: [Value])
+              ]
+          , teDurationMs = Nothing
+          , teCorrelation = Nothing
+          , teMeta = Map.empty
+          }
+        -- Look up the "tools" array inside a frontend payload object.
+        frontendTools val = case val of
+          Object o -> case KeyMap.lookup (Key.fromString "payload") o of
+            Just (Object p) -> KeyMap.lookup (Key.fromString "tools") p
+            _ -> Nothing
+          _ -> Nothing
+
+    it "includes name + description, strips input_schema (Anthropic shape)" $ do
+      let tools = A.Array $ V.fromList
+            [ object
+                [ "name" .= ("FILE_READ" :: Text)
+                , "description" .= ("Read a file from the workspace." :: Text)
+                , "input_schema" .= object ["type" .= ("object" :: Text), "properties" .= object []]
+                ]
+            , object
+                [ "name" .= ("SHELL_EXEC" :: Text)
+                , "description" .= ("Run a shell command." :: Text)
+                , "input_schema" .= object ["type" .= ("object" :: Text)]
+                ]
+            ]
+          te = mkReqTe tools
+      case reconEntryToFrontend 0 te of
+        Just val -> case frontendTools val of
+          Just (A.Array arr) -> do
+            V.length arr `shouldBe` 2
+            case V.head arr of
+              Object o -> do
+                KeyMap.lookup (Key.fromString "name") o `shouldBe` Just (String "FILE_READ")
+                KeyMap.lookup (Key.fromString "description") o `shouldBe` Just (String "Read a file from the workspace.")
+                KeyMap.member (Key.fromString "input_schema") o `shouldBe` False
+              _ -> expectationFailure "expected tool object"
+          other -> expectationFailure ("expected tools array, got " ++ show other)
+        Nothing -> expectationFailure "expected Just (request entry surfaces), got Nothing"
+
+    it "includes name + description from Ollama function wrapper shape" $ do
+      let tools = A.Array $ V.fromList
+            [ object
+                [ "type" .= ("function" :: Text)
+                , "function" .= object
+                    [ "name" .= ("WEB_SEARCH" :: Text)
+                    , "description" .= ("Search the web." :: Text)
+                    , "parameters" .= object ["type" .= ("object" :: Text)]
+                    ]
+                ]
+            ]
+          te = mkReqTe tools
+      case reconEntryToFrontend 0 te of
+        Just val -> case frontendTools val of
+          Just (A.Array arr) -> do
+            V.length arr `shouldBe` 1
+            case V.head arr of
+              Object o -> do
+                KeyMap.lookup (Key.fromString "name") o `shouldBe` Just (String "WEB_SEARCH")
+                KeyMap.lookup (Key.fromString "description") o `shouldBe` Just (String "Search the web.")
+                KeyMap.member (Key.fromString "parameters") o `shouldBe` False
+                KeyMap.member (Key.fromString "function") o `shouldBe` False
+              _ -> expectationFailure "expected tool object"
+          other -> expectationFailure ("expected tools array, got " ++ show other)
+        Nothing -> expectationFailure "expected Just (request entry surfaces), got Nothing"
 
   -- ── renderServerTiming ───────────────────────────────────────────────
 
