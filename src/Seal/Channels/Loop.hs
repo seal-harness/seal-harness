@@ -64,7 +64,6 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 
 import Katip (Severity (..), ls)
-import Seal.Logging.Global (globalLogIO)
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..))
@@ -1266,6 +1265,4 @@ broadcastNewEntries mBroker paths sid model createdAt =
     Nothing -> pure ()
     Just broker -> do
       entries <- readTranscriptEntries paths model (showIso createdAt) sid
-      globalLogIO InfoS ("[broadcast] newEntries (channel) sid=" <> ls (sessionIdText sid)
-        <> " count=" <> ls (T.pack (show (length entries))))
       mapM_ (broadcast broker . BeEntryRecorded sid) entries

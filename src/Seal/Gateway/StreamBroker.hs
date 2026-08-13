@@ -20,14 +20,12 @@ module Seal.Gateway.StreamBroker
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (unless, when, filterM)
+import Control.Monad (when, filterM)
 import Data.Aeson (Value)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
-import Katip (Severity (..), ls)
-import Seal.Core.Types (SessionId, sessionIdText)
-import Seal.Logging.Global (globalLogIO)
+import Seal.Core.Types (SessionId)
 
 -- | One event the broker fans out to subscribers.
 data BrokerEvent
@@ -128,11 +126,7 @@ broadcast broker event = do
       BeAskResolved sid _  -> matchSession s sid
     matchSession s sid = do
       subSid <- readTVarIO (subSessionRef s)
-      let matched = subSid == sid
-      unless matched $
-        globalLogIO DebugS (ls ("[broker] filter: entry sid=" :: String) <> ls (sessionIdText sid)
-          <> ls (" != subSid=" :: String) <> ls (sessionIdText subSid))
-      pure matched
+      pure (subSid == sid)
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()

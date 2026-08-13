@@ -130,8 +130,7 @@ import Seal.Session.Lock
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
-import Katip (Severity (..), ls)
-import Seal.Logging.Logger (SealLogger, logIO)
+import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -487,7 +486,7 @@ plainTurn deps meta t = do
                 env = mkSessionAgentEnv
                   caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-                  (broadcastNewEntries (sdLogger deps) (sdBroker deps) paths sid (modelText model) (smCreatedAt meta) "onEntry")
+                  (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
                   (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                   Nothing
@@ -496,7 +495,7 @@ plainTurn deps meta t = do
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
               runApp appEnv (runTurn env t)
-            broadcastNewEntries (sdLogger deps) (sdBroker deps) paths sid (modelText model) (smCreatedAt meta) "postTurn"
+            broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
             pure result)))
 
 -- | Build the ISA registry for a web turn. Mirrors
@@ -733,7 +732,7 @@ plainTurnWithCaps deps meta caps t = do
               env = mkSessionAgentEnv
                 caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
                 (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-                (broadcastNewEntries (sdLogger deps) (sdBroker deps) paths sid (modelText model) (smCreatedAt meta) "onEntry")
+                (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                 onDemand
                 (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                 Nothing
@@ -742,7 +741,7 @@ plainTurnWithCaps deps meta caps t = do
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
             runApp appEnv (runTurn env t)
-          broadcastNewEntries (sdLogger deps) (sdBroker deps) paths sid (modelText model) (smCreatedAt meta) "postTurn"
+          broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
           pure result)
 
 -- | Build a 'CallDispatcher' for the web channel. Resolves the active
@@ -805,7 +804,7 @@ webCallDispatcher deps callOpName val = do
         -- only appears after a page reload re-fetches the transcript
         -- seed. The regular turn path broadcasts in plainTurnWithCaps
         -- (Send.hs:600); the dispatcher path must do the same.
-        broadcastNewEntries (sdLogger deps) (sdBroker deps) paths sid (smModel meta) (smCreatedAt meta) "callDispatch"
+        broadcastNewEntries (sdBroker deps) paths sid (smModel meta) (smCreatedAt meta)
       Left _  -> pure ()
     pure res
 
@@ -977,15 +976,12 @@ modelText (ModelId t) = t
 -- and broadcasts every entry — the frontend dedupes by id, so already-seen
 -- entries are no-ops. 'Nothing' broker (tests) is a no-op.
 broadcastNewEntries
-  :: SealLogger -> Maybe StreamBroker -> SealPaths -> SessionId -> Text -> UTCTime -> Text -> IO ()
-broadcastNewEntries logger mBroker paths sid model createdAt label =
+  :: Maybe StreamBroker -> SealPaths -> SessionId -> Text -> UTCTime -> IO ()
+broadcastNewEntries mBroker paths sid model createdAt =
   case mBroker of
     Nothing -> pure ()
     Just broker -> do
       entries <- readTranscriptEntries paths model (showIso createdAt) sid
-      logIO logger InfoS ("[broadcast] newEntries label=" <> ls label
-        <> " sid=" <> ls (sessionIdText sid)
-        <> " count=" <> ls (T.pack (show (length entries))))
       mapM_ (broadcast broker . BeEntryRecorded sid) entries
 
 -- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend' is a
