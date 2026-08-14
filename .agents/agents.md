@@ -103,6 +103,28 @@ The frontend is embedded into the binary at compile time via `file-embed`
 (`embedDir "frontend/dist"`), so `frontend/dist` must exist when `cabal build`
 runs (the Makefile gates this).
 
+### Shell Command Pitfalls
+
+**Never pipe `cabal` (or other Haskell binary) output through `head`/`tail`.**
+The Haskell RTS sets `SIGPIPE` to `SIG_IGN` on startup. When a consumer like
+`head -80` closes the pipe early, the next write from `cabal` throws an
+`IOError` (`ResourceVanished` / `EPIPE`) inside cabal's process. Instead of
+dying cleanly, cabal hangs in its exception handler — the shell pipe never
+returns and the command appears to hang forever.
+
+**Use file redirection instead:**
+```bash
+nix develop --command cabal build all >build.log 2>&1; head -80 build.log
+nix develop --command cabal test >test.log 2>&1; head -80 test.log
+```
+
+Then read the log file with `FILE_READ` or `head` on the file (not on the
+pipe). This applies to any Haskell binary (`cabal`, `hlint`, `ghcid`,
+`nix`-spawned Haskell tools, etc.). Non-Haskell programs (`make`, `rg`,
+`git`) are not affected because they use the default `SIGPIPE` handler.
+
+When in doubt: redirect to a file, then page through the file.
+
 ---
 
 ## Architecture
