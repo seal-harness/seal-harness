@@ -97,6 +97,7 @@ library
         Seal.Command.Session
         Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Stop
         Seal.Command.Repo
         Seal.Command.Tab
         Seal.Command.Agent

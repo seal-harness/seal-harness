@@ -39,6 +39,7 @@ import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Stop (stopCommandSpec)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
@@ -314,6 +315,7 @@ runSignalMain autonomy logger = do
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , channelCommandSpec channelRt
         , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
+        , stopCommandSpec (cdAbortReg chanDeps) sr
         , terseGrammarSpec
         ]
   case resolveSignalConfig (rcSignal cfg) Nothing of

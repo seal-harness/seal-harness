@@ -32,8 +32,10 @@ import System.Console.Haskeline
   , defaultSettings
   , getInputLine
   , getPassword
+  , handleInterrupt
   , noCompletion
   , runInputT
+  , withInterrupt
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
@@ -45,6 +47,7 @@ import Data.Default (def)
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Stop (stopCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
@@ -70,7 +73,7 @@ import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStu
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
-import Seal.Tools.Exec.Abort (AbortFlag, lookupOrCreateAbortFlag, newSessionAbortRegistry)
+import Seal.Tools.Exec.Abort (AbortFlag, SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
 import Seal.Tools.Timeout (ToolTimeoutConfig, defaultToolTimeoutConfig)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
@@ -659,7 +662,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
                     "cli" Nothing bgAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
               runApp appEnv (runTurn env prompt)))
-      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
+      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher, stopCommandSpec abortReg sr])
       -- The /call dispatcher: dispatch an opcode against the active
       -- session's ISA registry + transcript under Full autonomy (the
       -- operator is the approver by typing /call). Returns the
@@ -710,11 +713,24 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
           ensureTabForSession tabsH KindAi sid
-  runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
+  runInputT hlSettings (loop caps plainHandler tabsH registryWithBg abortReg)
   where
-    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()
-    loop caps plainHandler th reg = do
-      mLine <- getInputLine "> "
+    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> SessionAbortRegistry -> InputT IO ()
+    loop caps plainHandler th reg abortReg = do
+      -- Ctrl-C handler: on interrupt, abort the active session's in-flight
+      -- tool call (design Task 7 — CLI abort wiring). The interrupt is
+      -- caught here (not propagated), so the loop continues; the next
+      -- getInputLine re-prompts. The active session's abort flag is set
+      -- via the SessionAbortRegistry.
+      mLine <- withInterrupt
+        (handleInterrupt
+          (liftIO $ do
+            active <- readIORef (srActive sr)
+            setSessionAbort abortReg (smId active)
+            ccSend caps "interrupted (in-flight tool call aborted)"
+            pure Nothing
+          )
+          (getInputLine "> "))
       case mLine of
         Nothing   -> pure ()   -- EOF / Ctrl-D
         Just line -> do
@@ -728,7 +744,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           -- the active session plus any /bg background sessions.
           (_resolved, delivered) <- liftIO $ deliverNextAnswerResolvedAny askReply (T.pack line)
           if delivered
-            then loop caps plainHandler th reg
+            then loop caps plainHandler th reg abortReg
             else do
               case Seal.Routing.Route.route (T.pack line) of
                 Right (Seal.Routing.Route.Focus idx) -> liftIO (focusTabH th idx) >>= \r -> liftIO $ ccSend caps (case r of Left e -> "focus: " <> e; Right _ -> "focused tab " <> T.singleton (tabIndexToChar idx))
@@ -754,7 +770,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                   liftIO $ interpretDisposition caps plainHandler d
                 Right (Seal.Routing.Route.Plain t) -> liftIO $ plainHandler t
                 Left (Seal.Routing.Route.ParseError e) -> liftIO $ ccSend caps e
-              loop caps plainHandler th reg
+              loop caps plainHandler th reg abortReg
 
 -- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
 -- replying via the channel caps. Pure-ish (the handle mutations are STM).
