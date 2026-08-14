@@ -6,40 +6,49 @@
 -- validated 'BinName' / 'BinArg' (reject empty, NUL). An optional
 -- operator-configured allow-list (a 'Set' of permitted binary names)
 -- gates the binary; when the allow-list is 'Nothing' the binary is
--- permitted by the gate (the autonomy policy still applies). All IO
--- through the 'UntrustedIO' seam; this module never imports
--- 'System.Process'.
+-- permitted by the gate (the autonomy policy still applies). An optional
+-- @cwd@ parameter selects the working directory: a relative path is
+-- SafePath-confined to the workspace root (the session's workdir); an
+-- absolute path is passed through verbatim. When omitted, the executor
+-- defaults to the workspace root. All IO through the 'UntrustedIO' seam;
+-- this module never imports 'System.Process'.
 module Seal.ISA.Ops.Bin
   ( binExecOp
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value, object, withObject, (.:), (.=))
+import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Text qualified as T
+import System.FilePath (isAbsolute)
 
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
-import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Security.Path
+  ( PathError (..), WorkspaceRoot (..), mkSafePathRemote )
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Tools.Args (mkBinName, mkBinArg)
 import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioBinExec)
+import Seal.Tools.Exec.Types (RemotePath, getRemotePath, mkRemotePath)
 
--- | BIN_EXEC opcode. Input: @{ binary: BinName, args: [BinArg, ...] }@.
--- The @args@ field is optional (defaults to @[]@); the @binary@ field is
--- required. When 'sbAllowList' is 'Nothing', any 'BinName' passes the
--- authorize gate (the autonomy policy still applies); when it is
--- @'Just' set@, the binary must be in @set@ or the gate returns 'Denied'.
+-- | BIN_EXEC opcode. Input: @{ binary: BinName, args: [BinArg, ...],
+-- cwd?: Text }@. The @args@ field is optional (defaults to @[]@); the
+-- @binary@ field is required; the @cwd@ field is optional (defaults to
+-- the workspace root). When 'sbAllowList' is 'Nothing', any 'BinName'
+-- passes the authorize gate (the autonomy policy still applies); when it
+-- is @'Just' set@, the binary must be in @set@ or the gate returns
+-- 'Denied'.
 binExecOp
   :: WorkspaceRoot
   -> SecurityPolicy
   -> Maybe (Set Text)
   -> Opcode
-binExecOp _wsRoot policy mAllowList = UntrustedOpcode
+binExecOp wsRoot policy mAllowList = UntrustedOpcode
   { uoName = OpName "BIN_EXEC"
   , uoDesc = "Run a named binary with argv args (no shell, optional allow-list)."
   , uoInSchema = binExecSchema
@@ -58,13 +67,15 @@ binExecOp _wsRoot policy mAllowList = UntrustedOpcode
                      Left _err -> Left "BIN_EXEC: invalid binary name"
                      Right _   -> case traverse mkBinArg <$> mArgsText of
                                     Just (Left _err) -> Left "BIN_EXEC: invalid arg"
-                                    _                -> Right ()
+                                    _                -> authorizeCwd wsRoot v
   , uoRun = \uio v -> do
       let mBin  = binaryField v
           mArgs = argsField v
+          mCwd  = cwdField v
           recorded = object
             [ "binary" .= mBin
             , "arg_count" .= (fmap length mArgs :: Maybe Int)
+            , "cwd" .= mCwd
             ]
       case mBin of
         Nothing -> pure (OpResult [TrpText "BIN_EXEC: missing binary"] True recorded)
@@ -74,11 +85,15 @@ binExecOp _wsRoot policy mAllowList = UntrustedOpcode
             Right bin ->
               case traverse mkBinArg (fromMaybe [] mArgs) of
                    Left err -> pure (OpResult [TrpText ("BIN_EXEC: invalid arg: " <> err)] True recorded)
-                   Right args -> do
-                     res <- liftIO (uioBinExec uio bin args)
-                     pure $ case res of
-                       Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
-                       Right out -> OpResult [TrpText out] False recorded
+                   Right args ->
+                     case resolveCwd wsRoot mCwd of
+                       Left _err ->
+                         pure (OpResult [TrpText "BIN_EXEC: invalid cwd"] True recorded)
+                       Right mCwdPath -> do
+                         res <- liftIO (uioBinExec uio bin args mCwdPath)
+                         pure $ case res of
+                           Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                           Right out -> OpResult [TrpText out] False recorded
   }
 
 binExecSchema :: Value
@@ -95,6 +110,10 @@ binExecSchema =
             , "items" .= object [ "type" .= ("string" :: Text) ]
             , "description" .= ("Argv tokens passed verbatim to the binary (no shell interpretation)." :: Text)
             ]
+        , "cwd" .= object
+            [ "type" .= ("string" :: Text)
+            , "description" .= ("Optional working directory. A relative path is confined to the session workdir; an absolute path is used verbatim. Defaults to the session workdir." :: Text)
+            ]
         ]
     , "required" .= (["binary"] :: [Text])
     ]
@@ -106,3 +125,56 @@ binaryField = parseMaybe (withObject "in" (.: "binary"))
 -- is absent; returns @'Just' []@ when present-but-empty.
 argsField :: Value -> Maybe [Text]
 argsField = parseMaybe (withObject "in" (.: "args"))
+
+-- | Extract the optional @cwd@ string. Returns 'Nothing' when the field
+-- is absent.
+cwdField :: Value -> Maybe Text
+cwdField v = case parseMaybe (withObject "in" (.:? "cwd")) v :: Maybe (Maybe Text) of
+  Just (Just t) -> Just t
+  _             -> Nothing
+
+-- | Validate the @cwd@ at the authorize gate. A relative path is
+-- SafePath-confined (rejects @..@ escapes + blocked names); an absolute
+-- path is accepted verbatim (the operator explicitly chose an
+-- out-of-workspace directory). 'mkRemotePath' defends against
+-- option-injection (leading dash) + control chars for both kinds.
+authorizeCwd :: WorkspaceRoot -> Value -> Either Text ()
+authorizeCwd wsRoot v =
+  case cwdField v of
+    Nothing -> Right ()
+    Just cwdText ->
+      case mkRemotePath cwdText of
+        Left _err -> Left "BIN_EXEC: cwd must not start with '-'"
+        Right rp ->
+          let rel = T.unpack (getRemotePath rp)
+          in if isAbsolute rel
+               then Right ()
+               else case mkSafePathRemote wsRoot rel of
+                      Left pe  -> Left (cwdEscapeErr pe)
+                      Right _  -> Right ()
+
+-- | Resolve the @cwd@ to a 'Maybe RemotePath' for the executor. 'Nothing'
+-- means the caller omitted @cwd@ → the executor defaults to the workspace
+-- root. @'Just' rp@ carries the validated 'RemotePath' (the arm applies
+-- SafePath confinement for relative paths, pass-through for absolute).
+resolveCwd :: WorkspaceRoot -> Maybe Text -> Either Text (Maybe RemotePath)
+resolveCwd _ Nothing = Right Nothing
+resolveCwd wsRoot (Just cwdText) =
+  case mkRemotePath cwdText of
+    Left _err -> Left "BIN_EXEC: cwd must not start with '-'"
+    Right rp ->
+      let rel = T.unpack (getRemotePath rp)
+      in if isAbsolute rel
+           then Right (Just rp)
+           else case mkSafePathRemote wsRoot rel of
+                  Left pe  -> Left (cwdEscapeErr pe)
+                  Right _  -> Right (Just rp)
+
+-- | Render a 'PathError' from cwd validation as a user-facing 'Text'.
+-- Maps the two confinement failures to stable messages the authorize
+-- gate returns (so the test suite can assert on them).
+cwdEscapeErr :: PathError -> Text
+cwdEscapeErr (PathEscapesWorkspace _) = "BIN_EXEC: cwd escapes the workspace"
+cwdEscapeErr (PathIsBlocked _)        = "BIN_EXEC: cwd touches a blocked location"
+cwdEscapeErr (PathDoesNotExist _)     = "BIN_EXEC: cwd does not exist"
+cwdEscapeErr (PathInsecureMode _)     = "BIN_EXEC: cwd has insecure mode"

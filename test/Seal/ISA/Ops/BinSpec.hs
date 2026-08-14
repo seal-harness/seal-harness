@@ -15,6 +15,7 @@ import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args (textBinArg, textBinName)
+import Seal.Tools.Exec.Types (getRemotePath)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Types.App
@@ -25,11 +26,24 @@ import Seal.Logging.Logger (testSealLogger)
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
--- | A fake 'UntrustedIO' that records the binary invocation and returns
--- canned output. Other methods are the fail-closed stub.
-fakeUio :: IORef [Text] -> Text -> UntrustedIO
+-- | A fake 'UntrustedIO' that records the binary invocation (binary, args,
+-- and the cwd 'RemotePath' the opcode resolved) and returns canned output.
+-- Other methods are the fail-closed stub.
+fakeUio :: IORef [(Text, [Text], Maybe Text)] -> Text -> UntrustedIO
 fakeUio seen canned = mkRemoteUntrustedIOStub
-  { uioBinExec = \bin args -> do
+  { uioBinExec = \bin args mCwd -> do
+      modifyIORef' seen (++ [( textBinName bin
+                             , map textBinArg args
+                             , fmap getRemotePath mCwd )])
+      pure (Right canned)
+  }
+
+-- | A fake 'UntrustedIO' that records the binary invocation as a flat
+-- string (binary + args, no cwd) — for tests that only check the
+-- command line.
+fakeUioFlat :: IORef [Text] -> Text -> UntrustedIO
+fakeUioFlat seen canned = mkRemoteUntrustedIOStub
+  { uioBinExec = \bin args _mCwd -> do
       modifyIORef' seen (++ [textBinName bin <> " " <> T.intercalate " " (map textBinArg args)])
       pure (Right canned)
   }
@@ -41,7 +55,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "runs a binary via an allow-listed name" $ do
       seen <- newIORef []
-      let uio = fakeUio seen "42\n"
+      let uio = fakeUioFlat seen "42\n"
           allowList = Just (Set.fromList ["python3", "node"])
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
       r <- runTestApp (uoRun op uio (object
@@ -67,7 +81,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "args field is optional (defaults to [])" $ do
       seen <- newIORef []
-      let uio = fakeUio seen "ok\n"
+      let uio = fakeUioFlat seen "ok\n"
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       r <- runTestApp (uoRun op uio (object
         [ "binary" .= ("ls" :: String)
@@ -104,7 +118,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "orRecorded captures the binary + arg count (secret-free, not the args)" $ do
       seen <- newIORef []
-      let uio = fakeUio seen ""
+      let uio = fakeUioFlat seen ""
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       r <- runTestApp (uoRun op uio (object
         [ "binary" .= ("node" :: String)
@@ -113,4 +127,71 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       orRecorded r `shouldBe` object
         [ "binary" .= ("node" :: String)
         , "arg_count" .= (2 :: Int)
+        , "cwd" .= (Nothing :: Maybe String)
+        ]
+
+  describe "BIN_EXEC cwd" $ do
+
+    it "defaults cwd to Nothing when omitted (the executor anchors it to the workdir)" $ do
+      seen <- newIORef []
+      let uio = fakeUio seen "ok\n"
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      _ <- runTestApp (uoRun op uio (object
+        [ "binary" .= ("pwd" :: String)
+        ]))
+      readIORef seen `shouldReturn` [("pwd", [], Nothing)]
+
+    it "passes a relative cwd as a RemotePath (workspace-relative)" $ do
+      seen <- newIORef []
+      let uio = fakeUio seen "ok\n"
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      _ <- runTestApp (uoRun op uio (object
+        [ "binary" .= ("pwd" :: String)
+        , "cwd" .= ("subdir" :: String)
+        ]))
+      readIORef seen `shouldReturn` [("pwd", [], Just "subdir")]
+
+    it "passes an absolute cwd as a RemotePath (not workspace-confined)" $ do
+      seen <- newIORef []
+      let uio = fakeUio seen "ok\n"
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      _ <- runTestApp (uoRun op uio (object
+        [ "binary" .= ("pwd" :: String)
+        , "cwd" .= ("/tmp/seal-test" :: String)
+        ]))
+      readIORef seen `shouldReturn` [("pwd", [], Just "/tmp/seal-test")]
+
+    it "rejects a @..@ cwd at the authorize gate (escape before execution)" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      uoAuthorize op (object
+        [ "binary" .= ("ls" :: String)
+        , "cwd" .= ("../escape" :: String)
+        ]) `shouldBe` Left "BIN_EXEC: cwd escapes the workspace"
+
+    it "rejects a blocked-name cwd at the authorize gate" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      uoAuthorize op (object
+        [ "binary" .= ("ls" :: String)
+        , "cwd" .= (".ssh" :: String)
+        ]) `shouldBe` Left "BIN_EXEC: cwd touches a blocked location"
+
+    it "rejects a leading-dash cwd at the authorize gate (option injection)" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      uoAuthorize op (object
+        [ "binary" .= ("ls" :: String)
+        , "cwd" .= ("-evil" :: String)
+        ]) `shouldBe` Left "BIN_EXEC: cwd must not start with '-'"
+
+    it "orRecorded captures the cwd (secret-free metadata)" $ do
+      seen <- newIORef []
+      let uio = fakeUio seen ""
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (uoRun op uio (object
+        [ "binary" .= ("pwd" :: String)
+        , "cwd" .= ("subdir" :: String)
+        ]))
+      orRecorded r `shouldBe` object
+        [ "binary" .= ("pwd" :: String)
+        , "arg_count" .= (Nothing :: Maybe Int)
+        , "cwd" .= ("subdir" :: String)
         ]

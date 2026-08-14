@@ -53,6 +53,7 @@ import Data.Text.Encoding qualified as TE
 import System.Directory (renameFile)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
+import System.FilePath (isAbsolute)
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess
   , withCreateProcess
@@ -113,9 +114,12 @@ data UntrustedIO = UntrustedIO
     -- an optional SafePath-confined cwd. Returns stdout (+ exit
     -- annotation) or a structured error.
 
-  , uioBinExec     :: BinName -> [BinArg] -> IO (Either UntrustedErr Text)
-    -- ^ Run a named binary (no shell, fixed argv). Returns stdout or
-    -- error.
+  , uioBinExec     :: BinName -> [BinArg] -> Maybe RemotePath
+                   -> IO (Either UntrustedErr Text)
+    -- ^ Run a named binary (no shell, fixed argv) with an optional cwd.
+    -- A relative 'RemotePath' is SafePath-confined to the workspace root;
+    -- an absolute 'RemotePath' is passed through verbatim (not confined).
+    -- Returns stdout or error.
 
   , uioProcessList :: IO (Either UntrustedErr Text)
     -- ^ List processes on the untrusted plane (bounded output).
@@ -160,11 +164,12 @@ data UntrustedIO = UntrustedIO
     -- agent + known_hosts).
 
   , uioBinExecEnv :: [(String, String)] -> BinName -> [BinArg]
+                 -> Maybe RemotePath
                  -> IO (Either UntrustedErr Text)
     -- ^ Like 'uioBinExec' but with env overrides (same merge strategy as
-    -- 'uioShellExecEnv'). Used by the PAT clone path (@http.extraHeader@
-    -- is an argv element, but the env override is still needed for
-    -- @GIT_TERMINAL_PROMPT=0@).
+    -- 'uioShellExecEnv') and an optional cwd. Used by the PAT clone path
+    -- (@http.extraHeader@ is an argv element, but the env override is
+    -- still needed for @GIT_TERMINAL_PROMPT=0@).
   }
 
 -- | Write mode for 'uioWriteFile': truncate + create (@'WMWrite'@, the
@@ -285,9 +290,11 @@ mkLocalUntrustedIO wsRoot =
            Just rp -> case mkSafePathRemote wsRoot (T.unpack (getRemotePath rp)) of
              Left pe  -> pure (Left (UePath pe))
              Right sp -> runLocalFixedArgv False argv (Just (getSafePath sp))
-  , uioBinExec = \bin bargs ->
+  , uioBinExec = \bin bargs mCwd ->
       let argv = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-      in runLocalFixedArgv True argv (Just wsRootPath)
+      in case resolveBinCwd wsRoot mCwd of
+           Left pe       -> pure (Left (UePath pe))
+           Right cwdAbs -> runLocalFixedArgv True argv (Just cwdAbs)
   , uioProcessList =
       case mkShellCommand "ps -o pid=,cmd=" of
         Left _   -> pure (Left (UeExec ExecNotImplemented))
@@ -317,9 +324,11 @@ mkLocalUntrustedIO wsRoot =
       -- resolveCloneTarget (cdIsRemote=False path); ignore the content
       -- + delegate to uioShellExecEnv.
       uioShellExecEnv (mkLocalUntrustedIO wsRoot) extras cmd mCwd
-  , uioBinExecEnv = \extras bin bargs ->
+  , uioBinExecEnv = \extras bin bargs mCwd ->
       let argv = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-      in runLocalFixedArgvEnv True argv (Just wsRootPath) extras
+      in case resolveBinCwd wsRoot mCwd of
+           Left pe       -> pure (Left (UePath pe))
+           Right cwdAbs -> runLocalFixedArgvEnv True argv (Just cwdAbs) extras
   }
 
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
@@ -542,11 +551,14 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
               let cdCmd = "cd " <> shellQuote (getSafePath sp)
                           <> " && " <> T.unpack (textShellCommand cmd)
               in runRemoteShellText runner sshCfg (T.pack cdCmd)
-  , uioBinExec = \bin bargs ->
+  , uioBinExec = \bin bargs mCwd ->
       let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-          cmd   = T.pack ("cd " <> shellQuote wsRootPath <> " && "
-                          <> T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
-      in runRemoteShellText runner sshCfg cmd
+      in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of
+           Left pe  -> pure (Left (UePath pe))
+           Right cwdPath ->
+             let cmd = T.pack ("cd " <> shellQuote cwdPath <> " && "
+                             <> T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
+             in runRemoteShellText runner sshCfg cmd
   , uioProcessList =
       runRemoteShellText runner sshCfg "ps -o pid=,cmd="
    , uioProcessKill = \pid -> do
@@ -598,12 +610,15 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
                 let cdCmd = "cd " <> shellQuote (getSafePath sp) <> " && "
                     fullCmd = T.pack cdCmd <> remoteEnvPrefix <> T.pack (T.unpack (textShellCommand cmd))
                 in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd
-    , uioBinExecEnv = \extras bin bargs ->
-       let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-           envPrefix = T.pack (renderEnvPrefix extras)
-           cdPart = T.pack ("cd " <> shellQuote wsRootPath <> " && ")
-           cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
-       in runRemoteShellText runner sshCfg (cdPart <> envPrefix <> cmd)
+     , uioBinExecEnv = \extras bin bargs mCwd ->
+        let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
+            envPrefix = T.pack (renderEnvPrefix extras)
+        in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of
+           Left pe  -> pure (Left (UePath pe))
+           Right cwdPath ->
+             let cdPart = T.pack ("cd " <> shellQuote cwdPath <> " && ")
+                 cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
+             in runRemoteShellText runner sshCfg (cdPart <> envPrefix <> cmd)
    }
 
 -- | A stub remote executor that fails-closed on every method (preserving
@@ -616,13 +631,13 @@ mkRemoteUntrustedIOStub = UntrustedIO
   , uioWriteFile   = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioPatchFile   = \_ _      -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExec   = \_ _      -> pure (Left (UeExec ExecNotImplemented))
-  , uioBinExec     = \_ _      -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExec     = \_ _ _  -> pure (Left (UeExec ExecNotImplemented))
   , uioProcessList =             pure (Left (UeExec ExecNotImplemented))
   , uioProcessKill = \_         -> pure (Left (UeExec ExecNotImplemented))
   , uioSearchFiles = \_ _ _     -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecEnv = \_ _ _    -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
-  , uioBinExecEnv   = \_ _ _    -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExecEnv   = \_ _ _ _  -> pure (Left (UeExec ExecNotImplemented))
   }
 
 -- | The workspace root for remote confinement. The 'SshConfig' carries
@@ -630,6 +645,32 @@ mkRemoteUntrustedIOStub = UntrustedIO
 -- 'WorkspaceRoot' for 'mkSafePathRemote'.
 wsRootFromCfg :: SshConfig -> WorkspaceRoot
 wsRootFromCfg cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))
+
+-- | Resolve an optional cwd ('RemotePath') for BIN_EXEC into an absolute
+-- 'FilePath' the executor can pass to the subprocess. Unlike
+-- 'uioShellExec' (which confines ALL paths — relative and absolute —
+-- under the workspace root via 'mkSafePathRemote'), BIN_EXEC treats an
+-- ABSOLUTE cwd as a pass-through (the operator explicitly chose an
+-- out-of-workspace directory); a RELATIVE cwd is SafePath-confined under
+-- the workspace root (the default untrusted-confinement contract).
+--
+--   * 'Nothing' → the workspace root itself (the one-root invariant).
+--   * 'Just rp' (absolute) → the path verbatim (no confinement).
+--   * 'Just rp' (relative) → 'mkSafePathRemote'-confined under the root;
+--     a @..@ escape or blocked name is rejected with 'Left'.
+resolveBinCwd :: WorkspaceRoot -> Maybe RemotePath -> Either PathError FilePath
+resolveBinCwd wsRoot mCwd =
+  case mCwd of
+    Nothing   -> Right wsRootPath
+    Just rp ->
+      let rel = T.unpack (getRemotePath rp)
+      in if isAbsolute rel
+           then Right rel
+           else getSafePath <$> mkSafePathRemote wsRoot rel
+  where
+    wsRootPath = case mkSafePathRemote wsRoot "." of
+      Right sp -> getSafePath sp
+      Left _   -> "/nonexistent-workdir-fail-closed"
 
 -- | Single-quote a 'String' for the remote shell (the path is already
 -- SafePath-validated, but quoting is defense-in-depth against any

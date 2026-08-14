@@ -60,7 +60,7 @@ spec = describe "Seal.Tools.Exec.Local" $ do
       -- Use `echo` (always on PATH) with a single arg.
       bin <- requireRight "invalid bin" (mkBinName "echo")
       arg <- requireRight "invalid arg" (mkBinArg "via_bin")
-      res <- lehExecBin h bin [arg]
+      res <- lehExecBin h bin [arg] Nothing
       case res of
         Right out -> T.strip out `shouldBe` "via_bin"
         Left ExecNotImplemented -> pendingWith "echo not on PATH"
@@ -69,7 +69,7 @@ spec = describe "Seal.Tools.Exec.Local" $ do
     it "returns Left ExecNotImplemented when binary is not on PATH (127)" $ do
       -- 127 for a program (not shell) means the binary itself is not on PATH.
       bin <- requireRight "invalid bin" (mkBinName "this_binary_does_not_exist_12345")
-      res <- lehExecBin h bin []
+      res <- lehExecBin h bin [] Nothing
       res `shouldBe` Left ExecNotImplemented
 
     it "passes leading-dash args verbatim (flag, not option injection)" $ do
@@ -77,7 +77,7 @@ spec = describe "Seal.Tools.Exec.Local" $ do
       -- the raw argv model forwards it as a single token, not a flag to a shell.
       bin <- requireRight "invalid bin" (mkBinName "printf")
       arg <- requireRight "invalid arg" (mkBinArg "--")
-      res <- lehExecBin h bin [arg, arg]
+      res <- lehExecBin h bin [arg, arg] Nothing
       case res of
         Right out -> out `shouldSatisfy` (not . T.null)
         Left ExecNotImplemented -> pendingWith "printf not on PATH"
@@ -102,7 +102,7 @@ spec = describe "Seal.Tools.Exec.Local" $ do
       withSystemTempDirectory "seal-wsroot" $ \wd -> do
         let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
         bin <- requireRight "fixture" (mkBinName "pwd")
-        res <- uioBinExec uio bin []
+        res <- uioBinExec uio bin [] Nothing
         case res of
           Right out -> T.strip out `shouldBe` T.pack wd
           Left e    -> expectationFailure ("expected Right, got Left " ++ show e)
