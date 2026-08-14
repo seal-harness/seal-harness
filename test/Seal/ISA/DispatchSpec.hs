@@ -3,9 +3,13 @@ module Seal.ISA.DispatchSpec (spec) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Map.Strict qualified as Map
 import Data.Functor (($>))
 import Data.IORef
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.IO.Unsafe (unsafePerformIO)
@@ -15,6 +19,8 @@ import Seal.Core.Types
 import Seal.Handles.Transcript (TwoFileHandle (..), fakeTwoFileTranscript)
 import Seal.ISA.Dispatch
 import Seal.ISA.Opcode
+import Seal.ISA.Ops.Shell (shellExecSchema)
+import Seal.ISA.Ops.Bin (binExecSchema)
 import Seal.ISA.Registry
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
@@ -101,6 +107,29 @@ spec = describe "Seal.ISA.Dispatch" $ do
     res <- runTestApp (dispatch (mkRegistry [op]) h localBackend testUntrustedIO defaultToolTimeoutConfig testAbortFlag (OpName "P") (object []))
     res `shouldBe` Left (Denied "nope")
     readIORef ref `shouldReturn` []
+
+  describe "schema advertisement (Task 8)" $ do
+    it "SHELL_EXEC schema declares the optional 'timeout' field" $ do
+      let schema = shellExecSchema
+          props = case schema of
+            A.Object o -> KeyMap.lookup (Key.fromText "properties") o
+            _ -> Nothing
+      props `shouldSatisfy` isJust
+      case props of
+        Just (A.Object ps) ->
+          KeyMap.member (Key.fromText "timeout") ps `shouldBe` True
+        _ -> expectationFailure "expected properties object"
+
+    it "BIN_EXEC schema declares the optional 'timeout' field" $ do
+      let schema = binExecSchema
+          props = case schema of
+            A.Object o -> KeyMap.lookup (Key.fromText "properties") o
+            _ -> Nothing
+      props `shouldSatisfy` isJust
+      case props of
+        Just (A.Object ps) ->
+          KeyMap.member (Key.fromText "timeout") ps `shouldBe` True
+        _ -> expectationFailure "expected properties object"
 
   describe "recordSkillLoadResult" $ do
     -- | Regression: /skill load displays the "Command output" box but the

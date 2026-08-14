@@ -14,6 +14,7 @@
 -- this module never imports 'System.Process'.
 module Seal.ISA.Ops.Bin
   ( binExecOp
+  , binExecSchema
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -113,6 +114,10 @@ binExecSchema =
         , "cwd" .= object
             [ "type" .= ("string" :: Text)
             , "description" .= ("Optional working directory. A relative path is confined to the session workdir; an absolute path is used verbatim. Defaults to the session workdir." :: Text)
+            ]
+        , "timeout" .= object
+            [ "type" .= ("integer" :: Text)
+            , "description" .= ("Per-call timeout in seconds; if the tool doesn't finish in this time, it's killed. Default 120, max 600." :: Text)
             ]
         ]
     , "required" .= (["binary"] :: [Text])

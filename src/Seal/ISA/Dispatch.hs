@@ -45,7 +45,7 @@ import Seal.Types.App
 import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.Timeout (runWithTimeoutAbortRetry)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
-import Seal.Tools.Timeout (Microseconds (..), ToolError, ToolTimeoutConfig, extractPerCallTimeout, renderToolError)
+import Seal.Tools.Timeout (Microseconds (..), ToolError, ToolTimeoutConfig, errorClass, extractPerCallTimeout, renderToolError)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
@@ -83,9 +83,15 @@ dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
                     r <- runApp env (uoRun op untrustedIO input)
                     pure (Right r)  -- OpResult semantic errors are NOT ToolErrors
               raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
-              pure $ case raced of
-                Right opResult -> Right opResult
-                Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
+              case raced of
+                Right opResult -> pure (Right opResult)
+                Left toolErr -> do
+                  -- Record the error class in the transcript (design Task 8:
+                  -- orRecorded carries the error class only — never the full
+                  -- ToolIOError Text payload, which could contain paths/host
+                  -- info, design Blocker Resolution #13).
+                  liftIO (recordToolError h name input toolErr perCallMicros)
+                  pure (Left (ExecFailed (renderToolError name toolErr)))
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do
@@ -97,9 +103,11 @@ dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
                         r <- runApp env (toRun op backend input)
                         pure (Right r)
                   raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
-                  pure $ case raced of
-                    Right opResult -> Right opResult
-                    Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
+                  case raced of
+                    Right opResult -> pure (Right opResult)
+                    Left toolErr -> do
+                      liftIO (recordToolError h name input toolErr perCallMicros)
+                      pure (Left (ExecFailed (renderToolError name toolErr)))
                 Audited -> do
                   -- No Audited log remains; treat as Trusted (record to the
                   -- session transcript, then run). The evolutionary-store
@@ -111,9 +119,11 @@ dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
                         r <- runApp env (toRun op backend input)
                         pure (Right r)
                   raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
-                  pure $ case raced of
-                    Right opResult -> Right opResult
-                    Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
+                  case raced of
+                    Right opResult -> pure (Right opResult)
+                    Left toolErr -> do
+                      liftIO (recordToolError h name input toolErr perCallMicros)
+                      pure (Left (ExecFailed (renderToolError name toolErr)))
                 Untrusted ->
                   -- Unreachable: an UntrustedOpcode would have matched above.
                   -- Kept for exhaustiveness (the GADT already separates the
@@ -255,7 +265,33 @@ recordSetupRepoResult h (OpName nm) input result mChannel = do
       convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
   tfwRecordAndAck h (TwoFileWrite convMsgs entry)
 
--- | Record the result of a 'GIT_PUSH' opcode invocation as an
+-- | Record a 'ToolError' as an 'EKHarness' transcript entry carrying the
+-- error CLASS (secret-free — design Blocker Resolution #13: never the full
+-- 'ToolIOError' Text payload, which could contain paths/host info). The
+-- metadata includes the timeout value (seconds) and the error class string.
+-- Called by 'dispatch' when the timeout/abort/retry wrapper returns 'Left'.
+recordToolError :: TwoFileHandle -> OpName -> Value -> ToolError -> Int -> IO ()
+recordToolError h name input toolErr timeoutMicros = do
+  now <- getCurrentTime
+  let entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 0
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList
+            [ ("op", object ["name" .= name])
+            , ("input", input)
+            , ("error", A.String (errorClass toolErr))
+            , ("timeout_s", A.toJSON (timeoutMicros `div` 1_000_000))
+            ]
+        }
+  tfwRecordAndAck h (TwoFileWrite [] entry)
 -- 'EKHarness' transcript entry + a conversation message (mirrors
 -- 'recordSetupRepoResult'). The audit is secret-free: the entry's
 -- @erMeta@ carries @op.name@ + @input@ + @result.orRecorded@ (which

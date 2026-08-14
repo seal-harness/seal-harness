@@ -153,6 +153,10 @@ webFetchSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("The URL to fetch." :: Text)
             ]
+        , "timeout" .= object
+            [ "type" .= ("integer" :: Text)
+            , "description" .= ("Per-call timeout in seconds; if the fetch doesn't finish in this time, it's killed. Default 120, max 600." :: Text)
+            ]
         ]
     , "required" .= (["url"] :: [Text])
     ]
