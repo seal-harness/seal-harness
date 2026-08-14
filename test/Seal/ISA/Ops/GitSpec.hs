@@ -378,13 +378,13 @@ stubUio = UntrustedIO
   , uioWriteFile = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioPatchFile = \_ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExec = \_ _ -> pure (Left (UeExec ExecNotImplemented))
-  , uioBinExec = \_ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExec = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioProcessList = pure (Left (UeExec ExecNotImplemented))
   , uioProcessKill = \_ -> pure (Left (UeExec ExecNotImplemented))
   , uioSearchFiles = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
-  , uioBinExecEnv = \_ _ _ -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExecEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   }
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ returns the given repos.

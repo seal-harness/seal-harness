@@ -46,11 +46,17 @@ mkLocalExecHandle wsRoot = LocalExecHandle
           case e of
             Left _err -> pure (Left ExecNotImplemented)
             Right sp  -> runShell argv (Just (getSafePath sp))
-  , lehExecBin = \bin bargs ->
+  , lehExecBin = \bin bargs mCwd ->
       let binName  = T.unpack (textBinName bin)
           argTexts = map (T.unpack . textBinArg) bargs
           argv     = binName : argTexts
-      in runProgram argv Nothing
+      in case mCwd of
+           Nothing  -> runProgram argv Nothing
+           Just rp  -> do
+             e <- mkSafePath wsRoot (T.unpack (getRemotePath rp))
+             case e of
+               Left _err -> pure (Left ExecNotImplemented)
+               Right sp  -> runProgram argv (Just (getSafePath sp))
   }
 
 -- | A 'LocalExecHandle' built from explicit IO action functions — the form
@@ -58,7 +64,7 @@ mkLocalExecHandle wsRoot = LocalExecHandle
 -- callers use 'mkLocalExecHandle'.
 mkLocalExecHandleFromFns
   :: (ShellCommand -> Maybe RemotePath -> IO (Either ExecError Text))
-  -> (BinName -> [BinArg] -> IO (Either ExecError Text))
+  -> (BinName -> [BinArg] -> Maybe RemotePath -> IO (Either ExecError Text))
   -> LocalExecHandle
 mkLocalExecHandleFromFns shellFn binFn = LocalExecHandle
   { lehExecShell = shellFn

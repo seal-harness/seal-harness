@@ -24,9 +24,9 @@ haven't.
 **Your current working directory IS your workspace. Stay in it.**
 
 - `SHELL_EXEC` and `BIN_EXEC` already default their cwd to your workdir when
-  you omit the `cwd` argument. You do not need to `cd` anywhere. `BIN_EXEC`
-  takes no `cwd`; it always runs in your workdir. `SHELL_EXEC` accepts an
-  optional workspace-relative `cwd`.
+  you omit the `cwd` argument. You do not need to `cd` anywhere. Both accept
+  an optional `cwd`: a relative path is confined to your workdir; an
+  absolute path is used verbatim.
 - `FILE_READ`, `FILE_WRITE`, `FILE_PATCH`, and `SEARCH_FILES` are all
   confined to your workdir. Relative paths resolve there.
 - `pwd` (with no `cwd` arg) returns your workdir. Run it once to see where

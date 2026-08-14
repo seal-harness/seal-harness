@@ -169,7 +169,7 @@ fakeUio seen canned = mkRemoteUntrustedIOStub
   { uioShellExec = \cmd _cwd -> do
       modifyIORef' seen (++ [textShellCommand cmd])
       pure (Right canned)
-  , uioBinExec = \_ _ -> pure (Right canned)
+  , uioBinExec = \_ _ _ -> pure (Right canned)
   , uioProcessList = pure (Right canned)
   , uioSearchFiles = \_ _ _ -> do
       pure (Right canned)
