@@ -134,6 +134,7 @@ library
           Seal.Tools.Args
           Seal.Tools.Exec.Abort
           Seal.Tools.Exec.Remote
+          Seal.Tools.Exec.Timeout
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
@@ -212,6 +213,7 @@ library
     build-depends:
         base >= 4.18 && < 5
       , aeson
+      , async
       , base64-bytestring
       , data-default
       , bytestring
@@ -424,6 +426,7 @@ test-suite tests
          Seal.Tools.Exec.CapabilityScopingFailSpec
          Seal.Tools.TimeoutSpec
          Seal.Tools.Exec.AbortSpec
+         Seal.Tools.Exec.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec
