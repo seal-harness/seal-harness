@@ -12,26 +12,59 @@
 -- 'Seal.Tools.Exec.Types' (Haskell requires them co-located) and provides
 -- the smart constructor 'mkLocalExecHandle' that wires the real
 -- 'System.Process'-backed IO actions.
+--
+-- = Process-group killing + bounded output (Task 3 + Task 4)
+--
+-- 'runFixedArgv' uses 'withManagedProcess' instead of 'withCreateProcess'.
+-- 'withManagedProcess' spawns the child with @create_group = True@ (so the
+-- child is in its own POSIX process group), and on cleanup kills the whole
+-- group: SIGTERM → grace period → SIGKILL. This ensures that when the
+-- dispatch wrapper ('Seal.Tools.Exec.Timeout.runWithTimeoutAbortRetry')
+-- cancels the Haskell worker thread (via 'async'\'s 'cancel'), the bracket
+-- cleanup runs and kills the OS process group — no orphans. The zombie reap
+-- is bounded (a non-blocking 'getProcessExitCode' poll with a 1s deadline)
+-- so cleanup never hangs. Output capture is bounded via 'readBounded'
+-- (default 50KB) with a truncation marker.
 module Seal.Tools.Exec.Local
   ( mkLocalExecHandle
   , mkLocalExecHandleFromFns
   , LocalExecHandle (..)
+  , withManagedProcess
+  , killProcessGroup
+  , readBounded
   ) where
 
-import Control.Exception (try)
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, bracket, catch, try)
 import Data.ByteString qualified as BS
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.Exit (ExitCode (..))
+import System.IO (Handle, hClose, hIsEOF)
 import System.Process
-  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess
+  ( CreateProcess (..), ProcessHandle, StdStream (..), createProcess
+  , getProcessExitCode, proc, waitForProcess
   )
+import System.Process.Internals (ProcessHandle__ (..), withProcessHandle)
+import qualified System.Posix.Signals as Posix
+import qualified System.Posix.Types as Posix
 
 import Seal.Security.Path (WorkspaceRoot (..), mkSafePath, getSafePath)
 import Seal.Tools.Args
   (BinName, BinArg, ShellCommand, textBinName, textBinArg, textShellCommand)
 import Seal.Tools.Exec.Types
+
+-- | The default bounded-output cap (50KB). Matches
+-- 'Seal.Tools.Timeout.ttcMaxOutputBytes'.
+defaultMaxOutputBytes :: Int
+defaultMaxOutputBytes = 50_000
+
+-- | The default SIGTERM→SIGKILL grace period (5s). Matches
+-- 'Seal.Tools.Timeout.ttcKillGraceMicros'.
+defaultKillGraceMicros :: Int
+defaultKillGraceMicros = 5_000_000
 
 -- | The real 'LocalExecHandle': wires 'System.Process' behind the two IO
 -- actions. The 'WorkspaceRoot' anchors cwd confinement for the shell exec.
@@ -92,6 +125,9 @@ runProgram = runFixedArgv True
 -- Otherwise (shell mode), 127 is a normal command-not-found failure, returned
 -- via 'Right' with the exit code annotation. Any IOError becomes 'Left
 -- ExecNotImplemented'.
+--
+-- Uses 'withManagedProcess' (process-group spawning + kill-on-cleanup) and
+-- 'readBounded' (bounded output capture, default 50KB).
 runFixedArgv :: Bool -> [String] -> Maybe String -> IO (Either ExecError Text)
 runFixedArgv treat127AsMissing argv mCwd = do
   let (program, args) = case argv of
@@ -100,15 +136,16 @@ runFixedArgv treat127AsMissing argv mCwd = do
       cp = (proc program args)
              { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
              , cwd = mCwd
+             , create_group = True
              }
-      -- ^ The validated newtypes guarantee no shell metacharacters reach here.
+      -- ^ @create_group = True@ puts the child in its own POSIX process
+      -- group so 'withManagedProcess' can kill the whole group on cleanup
+      -- (SIGTERM → grace → SIGKILL). This prevents orphans when the
+      -- dispatch wrapper cancels the Haskell worker thread.
   res <- try @IOError
-         (withCreateProcess cp $ \_ mOut mErr ph -> do
-            (hOut, hErr) <- case (mOut, mErr) of
-              (Just a, Just b) -> pure (a, b)
-              _                -> error "runFixedArgv: pipe creation failed (unreachable)"
-            out <- TE.decodeUtf8 <$> BS.hGetContents hOut
-            err <- TE.decodeUtf8 <$> BS.hGetContents hErr
+         (withManagedProcess cp $ \ph _mIn hOut hErr -> do
+            out <- readBounded hOut defaultMaxOutputBytes
+            err <- readBounded hErr defaultMaxOutputBytes
             ec  <- waitForProcess ph
             pure (ec, out, err))
   case res of
@@ -129,3 +166,118 @@ formatExitResult n out err =
   let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
       body  = if null parts then "" else T.intercalate "\n" parts
   in body <> "\n[exit code: " <> T.pack (show n) <> "]"
+
+-- | Spawn a process in its own process group (@create_group = True@) and run
+-- an action with the process handle + stdin/stdout/stderr handles. On cleanup
+-- (normal exit OR async-exception cancellation), kill the whole process
+-- group: SIGTERM → grace period → SIGKILL. Then close handles and reap the
+-- zombie with a BOUNDED wait (non-blocking 'getProcessExitCode' poll with a
+-- 1s deadline) so cleanup never hangs.
+--
+-- When the dispatch wrapper
+-- ('Seal.Tools.Exec.Timeout.runWithTimeoutAbortRetry') cancels the Haskell
+-- worker thread via 'async'\'s 'cancel', the bracket cleanup runs (bracket
+-- is mask-on-cleanup) and kills the OS process group — no orphans. This is
+-- the key mechanism: killing the Haskell thread cascades to killing the OS
+-- process group.
+--
+-- The stdin handle is 'Maybe Handle' — 'Nothing' if @std_in = NoStream@,
+-- 'Just' if @std_in = CreatePipe@. The caller is responsible for writing
+-- the payload and closing the stdin handle (so the child sees EOF).
+withManagedProcess
+  :: CreateProcess
+  -> (ProcessHandle -> Maybe Handle -> Handle -> Handle -> IO a)
+  -> IO a
+withManagedProcess cp action = bracket create cleanup runAction
+  where
+    -- The cp MUST have create_group=True (asserted at the call site in
+    -- runFixedArgv; we re-set it here too for safety).
+    cp' = cp { create_group = True }
+    create = do
+      (mIn, mOut, mErr, ph) <- createProcess cp'
+      pidRef <- newIORef Nothing
+      -- Capture the PID while the process is open.
+      withProcessHandle ph $ \case
+        OpenHandle pid -> writeIORef pidRef (Just (fromIntegral pid :: Int))
+        _              -> pure ()
+      mPid <- readIORef pidRef
+      case (mOut, mErr) of
+        (Just hOut, Just hErr) -> pure (ph, mIn, hOut, hErr, mPid)
+        _                      -> error "withManagedProcess: pipe creation failed (unreachable)"
+    cleanup (ph, mIn, hOut, hErr, mPid) = do
+      -- Kill the process group first (SIGTERM → grace → SIGKILL).
+      case mPid of
+        Nothing -> pure ()
+        Just pid -> killProcessGroup pid defaultKillGraceMicros
+      -- Close the stdin (if open), stdout, stderr handles.
+      case mIn of
+        Nothing -> pure ()
+        Just hIn -> hClose hIn `catch` \(_ :: IOException) -> pure ()
+      hClose hOut `catch` \(_ :: IOException) -> pure ()
+      hClose hErr `catch` \(_ :: IOException) -> pure ()
+      -- Reap the zombie with a BOUNDED wait (non-blocking poll, 1s deadline).
+      -- If the child is stuck in an uninterruptible state, don't hang
+      -- cleanup forever — the OS init process reaps it eventually.
+      reapBounded ph
+    -- Run the action with (ph, mIn, hOut, hErr).
+    runAction (ph, mIn, hOut, hErr, _) = action ph mIn hOut hErr
+
+-- | Reap a zombie with a bounded wait. Polls 'getProcessExitCode' every
+-- 10ms for up to 1s; if the child hasn't exited, gives up (the OS init
+-- process reaps it eventually). Never hangs.
+reapBounded :: ProcessHandle -> IO ()
+reapBounded ph = go (100 :: Int)  -- 100 polls × 10ms = 1s deadline
+  where
+    go :: Int -> IO ()
+    go 0 = pure ()  -- give up; zombie reaped by init eventually
+    go n = do
+      mec <- getProcessExitCode ph
+      case mec of
+        Just _  -> pure ()  -- reaped
+        Nothing -> do
+          threadDelay 10_000  -- 10ms
+          go (n - 1)
+
+-- | Kill a process group: SIGTERM → grace period → SIGKILL.
+-- POSIX: 'signalProcessGroup' sends a signal to every process in the group.
+-- The @graceMicros@ is the SIGTERM→SIGKILL grace period. Because the child
+-- was spawned with @create_group = True@, its PGID equals its PID.
+killProcessGroup :: Int -> Int -> IO ()
+killProcessGroup pid graceMicros = do
+  -- The child is in its own group (create_group=True), so its PGID == its PID.
+  -- 'signalProcessGroup' takes a ProcessGroupID; a CPid and ProcessGroupID
+  -- are both newtype'd Int, so we coerce via fromIntegral.
+  let pgid = fromIntegral pid :: Posix.ProcessGroupID
+  -- SIGTERM the whole group.
+  _ <- try @IOException (Posix.signalProcessGroup Posix.sigTERM pgid)
+  -- Wait the grace period.
+  threadDelay graceMicros
+  -- SIGKILL the whole group (idempotent on already-dead processes).
+  _ <- try @IOException (Posix.signalProcessGroup Posix.sigKILL pgid)
+  pure ()
+
+-- | Read at most N bytes from a handle, returning the content. If the
+-- stream has more than N bytes remaining, a truncation marker is appended:
+-- @[output truncated at N bytes — redirect to a file and FILE_READ with
+-- pagination for full output]@. The marker hints at the recovery workflow
+-- so the model learns the pattern.
+--
+-- After reading the bounded amount (and detecting non-EOF), the handle is
+-- CLOSED — this prevents a deadlock where the child blocks on a full pipe
+-- buffer while 'waitForProcess' waits for the child. Closing the handle
+-- causes the child's writes to fail (SIGPIPE/EPIPE), the child exits, and
+-- 'waitForProcess' returns. The truncation marker is the signal that output
+-- was lost.
+readBounded :: Handle -> Int -> IO Text
+readBounded h maxBytes = do
+  bs <- BS.hGet h maxBytes
+  eof <- hIsEOF h
+  let content = TE.decodeUtf8 bs
+  if eof
+    then pure content
+    else do
+      -- There's more output. Close the handle so the child's writes fail
+      -- (SIGPIPE), the child exits, and waitForProcess doesn't deadlock.
+      hClose h
+      pure (content <> "\n[output truncated at " <> T.pack (show maxBytes)
+                     <> " bytes — redirect to a file and FILE_READ with pagination for full output]")
