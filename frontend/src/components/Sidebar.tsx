@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
-import { findSession, sessionDisplayTitle, sessionSubtitle, tabDisplayLabel } from '../types'
+import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
 import { ActiveTabs } from './ActiveTabs'
@@ -237,6 +237,16 @@ export function Sidebar({
   const tabLabel = (tab: TabInfo): string =>
     tabDisplayLabel(tab, findSession(tab.session_id, sessions, archivedSessions, tabSessions))
 
+  // The shortened model id this tab's session was started with, or empty
+  // string when no model is known (no backing session, or session with
+  // no model). Centralized here so both ActiveTabs and RunningHarnesses
+  // share the same session-join — mirrors the tabLabel pattern.
+  const tabModel = (tab: TabInfo): string => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    if (!session || !session.model) return ''
+    return shortenModel(session.model)
+  }
+
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
   // uses activity.lastEntryAt ?? session.lastActive. Tabs without a backing
   // session (e.g. raw shell tabs) or any activity frame render no pill.
@@ -283,6 +293,7 @@ export function Sidebar({
           selectedId={selectedId}
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
+          tabModel={tabModel}
           tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
@@ -297,6 +308,7 @@ export function Sidebar({
           selectedId={selectedId}
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
+          tabModel={tabModel}
           tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}

@@ -74,6 +74,7 @@ export function TabRow({
   onAcknowledge,
   onRelease,
   activity,
+  model,
   ageText,
 }: {
   tab: TabInfo
@@ -88,6 +89,9 @@ export function TabRow({
   onAcknowledge: () => void
   onRelease: () => void
   activity?: SessionActivityState
+  /** The model id this tab's session was started with (already
+   *  shortened for display), or empty string when no model is known. */
+  model?: string
   /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
    *  mirroring the Recent Sessions age pill. Empty string → no pill. */
   ageText?: string
@@ -273,11 +277,17 @@ export function TabRow({
         {ageText && <span className="pill token-count">{ageText}</span>}
       </div>
       <div
-        className="text-xs ml-6 mt-0.5"
+        className="text-xs ml-6 mt-0.5 flex items-center gap-1"
         style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
         data-testid={`tab-status-label-${tab.index}`}
       >
         {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
+        {model && (
+          <>
+            <span style={{ color: 'var(--text-faint)' }}>·</span>
+            <span style={{ color: 'var(--text-faint)' }}>{model}</span>
+          </>
+        )}
       </div>
     </div>
   )
@@ -287,6 +297,7 @@ export function ActiveTabs({
   tabs,
   selectedId,
   sessionActivity,
+  tabModel,
   tabLabel,
   tabAgeText,
   onSelectTab,
@@ -303,6 +314,11 @@ export function ActiveTabs({
    *  else ellipsis). Centralized by the parent so all tab-label consumers
    *  agree. */
   tabLabel: (tab: TabInfo) => string
+  /** Resolve a tab to the shortened model id its session was started with,
+   *  or empty string when no model is known (no session, or session with
+   *  no model). Centralized by the parent so Active Tabs and Running
+   *  Harnesses agree. */
+  tabModel: (tab: TabInfo) => string
   /** Resolve a tab to its coarse age pill text ("now"/"Nm"/"Nh"/"Nd"), or
    *  empty string when no age basis is available (no pill rendered).
    *  Centralized by the parent so Active Tabs and Running Harnesses agree
@@ -350,6 +366,7 @@ export function ActiveTabs({
           onAcknowledge={() => onAcknowledge(tab.index)}
           onRelease={() => onRelease(tab.index)}
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
+          model={tabModel(tab)}
           ageText={tabAgeText(tab)}
         />
       ))}

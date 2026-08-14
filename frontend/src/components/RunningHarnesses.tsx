@@ -13,6 +13,7 @@ export function RunningHarnesses({
   tabs,
   selectedId,
   sessionActivity,
+  tabModel,
   tabLabel,
   tabAgeText,
   onSelectTab,
@@ -24,6 +25,10 @@ export function RunningHarnesses({
   tabs: TabInfo[]
   selectedId: string | null
   sessionActivity?: Record<string, SessionActivityState>
+  /** Resolve a tab to the shortened model id its session was started with,
+   *  or empty string when no model is known. See ActiveTabs.tabModel. */
+  tabModel: (tab: TabInfo) => string
+  /** Resolve a tab to its display label — see ActiveTabs.tabLabel. */
   tabLabel: (tab: TabInfo) => string
   /** Resolve a tab to its coarse age pill text — see ActiveTabs.tabAgeText. */
   tabAgeText: (tab: TabInfo) => string
@@ -73,6 +78,7 @@ export function RunningHarnesses({
             onAcknowledge={() => onAcknowledge(tab.index)}
             onRelease={() => onRelease(tab.index)}
             activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
+            model={tabModel(tab)}
             ageText={tabAgeText(tab)}
           />
         ))}

@@ -44,6 +44,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -64,6 +65,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId="tab:0"
         tabLabel={(t) => t.label ?? '…'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -83,6 +85,7 @@ describe('ActiveTabs', () => {
         tabs={[]}
         selectedId={null}
         tabLabel={() => 'x'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
@@ -103,6 +106,7 @@ describe('ActiveTabs', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
@@ -218,6 +222,7 @@ describe('RunningHarnesses', () => {
         tabs={[]}
         selectedId={null}
         tabLabel={() => 'x'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -235,6 +240,7 @@ describe('RunningHarnesses', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -253,6 +259,7 @@ describe('RunningHarnesses', () => {
         tabs={tabs}
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
+        tabModel={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -463,9 +470,12 @@ describe('Sidebar — tab status indicator', () => {
         onReleaseTab={() => {}}
       />,
     )
-    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Thinking')
-    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Idle Unread')
-    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('Idle Read')
+    // The status label now includes the model suffix ("· m") since the
+    // backing sessions have model "m" (the default). shortenModel("m")
+    // returns "m" unchanged.
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Thinking·m')
+    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Idle Unread·m')
+    expect(screen.getByTestId('tab-status-label-2').textContent).toBe('Idle Read·m')
     // Thinking renders an animated ActivityDot (not the static glyph span).
     expect(document.querySelector('.dot-thinking')).toBeTruthy()
     expect(screen.getByTestId('tab-kind-idle-unread')).toBeTruthy()
@@ -514,8 +524,8 @@ describe('Sidebar — tab status indicator', () => {
     // The status-label testids carry the tab index, so reading them in
     // document order yields the rendered sort.
     const labels = screen.getAllByTestId(/^tab-status-label-\d+$/).map((el) => el.textContent)
-    // Expected: Unread old, Unread new, Read, Thinking.
-    expect(labels).toEqual(['Idle Unread', 'Idle Unread', 'Idle Read', 'Thinking'])
+    // Expected: Unread old, Unread new, Read, Thinking (with model suffix).
+    expect(labels).toEqual(['Idle Unread·m', 'Idle Unread·m', 'Idle Read·m', 'Thinking·m'])
     // And the tab index badges (rendered first per row) follow the same order.
     const indexBadges = screen.getAllByText(/^([0-9]+)$/).map((el) => el.textContent)
     // The Active Tabs section renders tab.index badges; verify the sorted order.
@@ -547,6 +557,7 @@ describe('Sidebar — tab status indicator', () => {
     )
     expect(screen.getByTestId('status-exited')).toBeTruthy()
     expect(screen.queryByTestId('tab-kind-idle-read')).toBeNull()
+    // No backing session → no model suffix.
     expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Exited')
   })
 })
