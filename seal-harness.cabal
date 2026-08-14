@@ -132,6 +132,7 @@ library
          Seal.Security.Vault.Age
          Seal.Text.LineFile
           Seal.Tools.Args
+          Seal.Tools.Exec.Abort
           Seal.Tools.Exec.Remote
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
@@ -422,6 +423,7 @@ test-suite tests
          Seal.Tools.ArgsSpec
          Seal.Tools.Exec.CapabilityScopingFailSpec
          Seal.Tools.TimeoutSpec
+         Seal.Tools.Exec.AbortSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec

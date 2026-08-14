@@ -150,6 +150,7 @@ import qualified Seal.ISA.RegistrySpec
 import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
 import qualified Seal.Tools.TimeoutSpec
+import qualified Seal.Tools.Exec.AbortSpec
 
 main :: IO ()
 main = hspec $ do
@@ -301,3 +302,4 @@ main = hspec $ do
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
   Seal.Tools.TimeoutSpec.spec
+  Seal.Tools.Exec.AbortSpec.spec
