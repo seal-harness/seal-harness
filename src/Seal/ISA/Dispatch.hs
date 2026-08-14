@@ -25,6 +25,7 @@ module Seal.ISA.Dispatch
   ) where
 
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ask)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Types (parseMaybe)
@@ -41,7 +42,10 @@ import Seal.ISA.Registry
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
+import Seal.Tools.Exec.Abort (AbortFlag)
+import Seal.Tools.Exec.Timeout (runWithTimeoutAbortRetry)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Timeout (Microseconds (..), ToolError, ToolTimeoutConfig, extractPerCallTimeout, renderToolError)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
@@ -52,9 +56,11 @@ data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
 -- Trusted/Audited opcodes ignore it (they have no 'UntrustedIO' in scope —
 -- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO -> OpName -> Value
+  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO
+  -> ToolTimeoutConfig -> AbortFlag
+  -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend untrustedIO name input =
+dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -62,21 +68,52 @@ dispatch reg h backend untrustedIO name input =
         Left why -> pure (Left (Denied why))
         Right () -> do
           entry <- liftIO (mkInvocationEntry name input)
+          let -- Extract the per-call timeout (in seconds → microseconds)
+              -- from the input JSON, clamped to the max.
+              Microseconds perCallMicros = extractPerCallTimeout input toolTimeout
           case op of
             UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              Right <$> uoRun op untrustedIO input
+              -- Wrap uoRun in the timeout/abort/retry race. The App→IO
+              -- bridge (design Blocker Resolution #1): capture the env via
+              -- ask, re-enter App in the worker via runApp env (uoRun ...).
+              env <- ask
+              let ioAction :: IO (Either ToolError OpResult)
+                  ioAction = do
+                    r <- runApp env (uoRun op untrustedIO input)
+                    pure (Right r)  -- OpResult semantic errors are NOT ToolErrors
+              raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
+              pure $ case raced of
+                Right opResult -> Right opResult
+                Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do
                   liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-                  Right <$> toRun op backend input
+                  -- Wrap toRun in the same timeout/abort/retry race.
+                  env <- ask
+                  let ioAction :: IO (Either ToolError OpResult)
+                      ioAction = do
+                        r <- runApp env (toRun op backend input)
+                        pure (Right r)
+                  raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
+                  pure $ case raced of
+                    Right opResult -> Right opResult
+                    Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
                 Audited -> do
                   -- No Audited log remains; treat as Trusted (record to the
                   -- session transcript, then run). The evolutionary-store
                   -- opcodes that used to be Audited are now Trusted file writes.
                   liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-                  Right <$> toRun op backend input
+                  env <- ask
+                  let ioAction :: IO (Either ToolError OpResult)
+                      ioAction = do
+                        r <- runApp env (toRun op backend input)
+                        pure (Right r)
+                  raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
+                  pure $ case raced of
+                    Right opResult -> Right opResult
+                    Left toolErr -> Left (ExecFailed (renderToolError name toolErr))
                 Untrusted ->
                   -- Unreachable: an UntrustedOpcode would have matched above.
                   -- Kept for exhaustiveness (the GADT already separates the

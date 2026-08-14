@@ -85,8 +85,10 @@ import Seal.Skills.Backend qualified as SkillBackend
 import Seal.Skills.Types (skBody)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Args (textShellCommand)
+import Seal.Tools.Exec.Abort (newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkLocalUntrustedIO, mkRemoteUntrustedIOStub )
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
@@ -152,7 +154,8 @@ dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
                -> App (Either DispatchError OpResult)
 dispatchOneWith reg uio name input = do
   (h, _) <- liftIO fakeTwoFileTranscript
-  dispatch reg h localBackend uio name input
+  abortFlag <- liftIO newAbortFlag
+  dispatch reg h localBackend uio defaultToolTimeoutConfig abortFlag name input
 
 right :: Show e => Either e a -> a
 right (Right x) = x
@@ -240,10 +243,12 @@ spec = describe "Seal.ISA.Integration" $ do
               ]
         ref <- newIORef script
         (h, _) <- fakeTwoFileTranscript
+        abortFlag <- newAbortFlag
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    mkRemoteUntrustedIOStub caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
+                    mkRemoteUntrustedIOStub abortFlag defaultToolTimeoutConfig
+                    caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

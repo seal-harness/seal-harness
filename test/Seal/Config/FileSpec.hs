@@ -44,6 +44,7 @@ spec = describe "Seal.Config.File" $ do
         , rcSkills           = Nothing
         , rcAgent            = Nothing
         , rcMaxTurns         = Nothing
+        , rcToolTimeout      = Nothing
         }
 
   describe "loadRuntimeConfig" $ do
@@ -97,6 +98,7 @@ spec = describe "Seal.Config.File" $ do
               , rcSkills          = Nothing
               , rcAgent           = Nothing
               , rcMaxTurns        = Nothing
+              , rcToolTimeout     = Nothing
               }
         saveRuntimeConfig path cfg
         result <- loadRuntimeConfig path

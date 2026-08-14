@@ -26,6 +26,7 @@ module Seal.Config.File
   , defaultDelegationConfig
   , defaultWebConfig
   , emptyProviderConfig
+  , runtimeConfigCodec
   , loadRuntimeConfig
   , providerBaseUrl
   , providerDefaultModel
@@ -41,6 +42,8 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , toolTimeoutConfig
+  , toolTimeoutConfigCodec
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -62,6 +65,8 @@ import Toml.Type.Key (pattern (:||))
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
+import Seal.Tools.Timeout
+  ( ToolTimeoutConfig (..), defaultToolTimeoutConfig )
 
 -- | The agent/operator-tunable runtime configuration persisted in
 -- @config\/config.toml@. Every field is optional; a missing key decodes as
@@ -137,6 +142,11 @@ data RuntimeConfig = RuntimeConfig
     -- tool-use iterations per turn before the loop stops. Absent →
     -- 'defaultMaxTurns' (90). Values < 1 are clamped to 1 at resolution
     -- time. Mirrors Hermes' default.
+  , rcToolTimeout :: Maybe ToolTimeoutFileConfig
+    -- ^ Optional @[tool_timeout]@ section (per-call timeout/abort/retry
+    -- behavior for opcode dispatch). Absent means
+    -- 'Seal.Tools.Timeout.defaultToolTimeoutConfig' applies at resolution
+    -- time. Each field inside is optional too; the resolver fills defaults.
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
@@ -180,6 +190,30 @@ data DelegationFileConfig = DelegationFileConfig
   , dfcSubagentAutoApprove   :: Maybe Bool
     -- ^ Whether subagent dangerous-command approvals auto-approve. Default
     -- False (auto-deny). Not yet wired; reserved for future use.
+  } deriving stock (Eq, Show)
+
+-- | The @[tool_timeout]@ section: per-call timeout/abort/retry behavior for
+-- opcode dispatch. Every field is optional at the TOML layer; a missing key
+-- decodes as 'Nothing' and the resolver ('toolTimeoutConfig') fills the
+-- compiled-in default at resolution time. Mirrors the @delegation.*@ pattern
+-- ('DelegationFileConfig').
+data ToolTimeoutFileConfig = ToolTimeoutFileConfig
+  { ttfcDefaultSeconds  :: Maybe Int
+    -- ^ Default per-call timeout in seconds (default 120).
+  , ttfcMaxSeconds      :: Maybe Int
+    -- ^ Hard cap in seconds (default 600).
+  , ttfcRetryMax        :: Maybe Int
+    -- ^ Max retry attempts (default 3).
+  , ttfcRetryBaseMicros :: Maybe Int
+    -- ^ Base delay between retries in microseconds (default 2_000_000).
+  , ttfcRetryFactor     :: Maybe Double
+    -- ^ Backoff multiplier (default 2.0).
+  , ttfcKillGraceMicros :: Maybe Int
+    -- ^ SIGTERM→SIGKILL grace period in microseconds (default 5_000_000).
+  , ttfcMaxOutputBytes  :: Maybe Int
+    -- ^ Bounded output cap in bytes (default 50_000).
+  , ttfcAbortPollMicros :: Maybe Int
+    -- ^ Abort-poll interval in microseconds (default 100_000).
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
@@ -233,6 +267,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcSkills           = Nothing
   , rcAgent            = Nothing
   , rcMaxTurns         = Nothing
+  , rcToolTimeout      = Nothing
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -334,6 +369,23 @@ maxTurnsConfig cfg = case rcMaxTurns cfg of
   Just n | n < 1 -> 1
   Just n       -> n
 
+-- | Resolve the effective 'ToolTimeoutConfig': the config-file section if
+-- present (with defaults filling absent fields), else
+-- 'defaultToolTimeoutConfig'.
+toolTimeoutConfig :: RuntimeConfig -> ToolTimeoutConfig
+toolTimeoutConfig cfg = case rcToolTimeout cfg of
+  Nothing    -> defaultToolTimeoutConfig
+  Just ttfc  -> ToolTimeoutConfig
+    { ttcDefaultSeconds  = fromMaybe (ttcDefaultSeconds  defaultToolTimeoutConfig) (ttfcDefaultSeconds  ttfc)
+    , ttcMaxSeconds      = fromMaybe (ttcMaxSeconds      defaultToolTimeoutConfig) (ttfcMaxSeconds      ttfc)
+    , ttcRetryMax        = fromMaybe (ttcRetryMax        defaultToolTimeoutConfig) (ttfcRetryMax        ttfc)
+    , ttcRetryBaseMicros = fromMaybe (ttcRetryBaseMicros defaultToolTimeoutConfig) (ttfcRetryBaseMicros ttfc)
+    , ttcRetryFactor     = fromMaybe (ttcRetryFactor     defaultToolTimeoutConfig) (ttfcRetryFactor     ttfc)
+    , ttcKillGraceMicros = fromMaybe (ttcKillGraceMicros defaultToolTimeoutConfig) (ttfcKillGraceMicros ttfc)
+    , ttcMaxOutputBytes  = fromMaybe (ttcMaxOutputBytes  defaultToolTimeoutConfig) (ttfcMaxOutputBytes  ttfc)
+    , ttcAbortPollMicros = fromMaybe (ttcAbortPollMicros defaultToolTimeoutConfig) (ttfcAbortPollMicros ttfc)
+    }
+
 -- ---------------------------------------------------------------------------
 -- Codec
 -- ---------------------------------------------------------------------------
@@ -359,12 +411,29 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
   <*> Toml.dioptional (Toml.table agentConfigCodec "agent")     .= rcAgent
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
+  <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+
+-- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
+-- field is optional at the TOML layer; a missing key decodes as 'Nothing'
+-- and the resolver ('toolTimeoutConfig') fills the default at resolution
+-- time. This means an operator can set only the knobs they care about
+-- (e.g. @[tool_timeout] default_seconds = 300@) and inherit the rest.
+toolTimeoutConfigCodec :: Toml.TomlCodec ToolTimeoutFileConfig
+toolTimeoutConfigCodec = ToolTimeoutFileConfig
+  <$> Toml.dioptional (Toml.int    "default_seconds")   .= ttfcDefaultSeconds
+  <*> Toml.dioptional (Toml.int    "max_seconds")       .= ttfcMaxSeconds
+  <*> Toml.dioptional (Toml.int    "retry_max")         .= ttfcRetryMax
+  <*> Toml.dioptional (Toml.int    "retry_base_micros") .= ttfcRetryBaseMicros
+  <*> Toml.dioptional (Toml.double "retry_factor")      .= ttfcRetryFactor
+  <*> Toml.dioptional (Toml.int    "kill_grace_micros") .= ttfcKillGraceMicros
+  <*> Toml.dioptional (Toml.int    "max_output_bytes")  .= ttfcMaxOutputBytes
+  <*> Toml.dioptional (Toml.int    "abort_poll_micros") .= ttfcAbortPollMicros
 
 -- | Bidirectional tomland codec for the @[retrieval]@ section.
 retrievalConfigCodec :: Toml.TomlCodec RetrievalConfig

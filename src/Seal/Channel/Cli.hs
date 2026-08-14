@@ -51,7 +51,8 @@ import Seal.Command.Spec
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
-                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
+                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance,
+                          toolTimeoutConfig)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
@@ -69,6 +70,8 @@ import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStu
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+import Seal.Tools.Exec.Abort (AbortFlag, lookupOrCreateAbortFlag, newSessionAbortRegistry)
+import Seal.Tools.Timeout (ToolTimeoutConfig, defaultToolTimeoutConfig)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -234,8 +237,9 @@ mkSessionAgentEnv
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
   -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> Maybe (Text -> IO ())
+  -> AbortFlag -> ToolTimeoutConfig
   -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop abortFlag toolTimeout = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -257,6 +261,8 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeOnStop     = onStop
   , aeOnDemandSchemas = onDemand
   , aeLogPath    = logPath
+  , aeAbortFlag  = abortFlag
+  , aeToolTimeout = toolTimeout
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -294,6 +300,7 @@ runCliTui
   -> AskReplyStore -> SealLogger -> IO ()
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
+  abortReg <- newSessionAbortRegistry
   active0 <- readIORef (srActive sr)
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   eCfg <- loadRuntimeConfig (prConfigPath pr)
@@ -474,6 +481,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , dwdChildSystemPrompt = cliChildSystemPrompt
               , dwdOnEntry = pure ()
               , dwdChannel = "cli"
+              , dwdAbortFlag = lookupOrCreateAbortFlag abortReg
+              , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               }
             mkWorker = mkDelegateWorker delegateDeps
             delegationCfg = do
@@ -644,10 +653,11 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta bgMwd
               bgUio <- mkSessionUio bgSid
+              bgAbortFlag <- lookupOrCreateAbortFlag abortReg bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-                    "cli" Nothing
+                    "cli" Nothing bgAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
       -- The /call dispatcher: dispatch an opcode against the active
@@ -676,7 +686,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           callUio <- mkSessionUio sid
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
+          callAbortFlag <- lookupOrCreateAbortFlag abortReg sid
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
           case res of
             Right r -> do
               let opNm = case callOpName of OpName n -> n
@@ -689,11 +700,12 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
           uio <- mkSessionUio sid
+          turnAbortFlag <- lookupOrCreateAbortFlag abortReg sid
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-               "cli" Nothing)
+               "cli" Nothing turnAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
             appEnv t
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
