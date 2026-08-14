@@ -149,6 +149,7 @@ import qualified Seal.ISA.Ops.SecretSpec
 import qualified Seal.ISA.RegistrySpec
 import qualified Seal.Logging.LoggerSpec
 import qualified Seal.Logging.ExceptionsSpec
+import qualified Seal.Tools.TimeoutSpec
 
 main :: IO ()
 main = hspec $ do
@@ -299,3 +300,4 @@ main = hspec $ do
   Seal.ISA.RegistrySpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Tools.TimeoutSpec.spec

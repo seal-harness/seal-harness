@@ -131,12 +131,13 @@ library
          Seal.Security.Vault
          Seal.Security.Vault.Age
          Seal.Text.LineFile
-         Seal.Tools.Args
-         Seal.Tools.Exec.Remote
-         Seal.Tools.Exec.Types
-         Seal.Tools.Exec.Untrusted
-         Seal.Tools.Exec.UntrustedIO
-         Seal.Tools.Ssh.Agent
+          Seal.Tools.Args
+          Seal.Tools.Exec.Remote
+          Seal.Tools.Exec.Types
+          Seal.Tools.Exec.Untrusted
+          Seal.Tools.Exec.UntrustedIO
+          Seal.Tools.Ssh.Agent
+          Seal.Tools.Timeout
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -418,8 +419,9 @@ test-suite tests
         Seal.Config.WorkdirSpec
         Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
-        Seal.Tools.ArgsSpec
-        Seal.Tools.Exec.CapabilityScopingFailSpec
+         Seal.Tools.ArgsSpec
+         Seal.Tools.Exec.CapabilityScopingFailSpec
+         Seal.Tools.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec
