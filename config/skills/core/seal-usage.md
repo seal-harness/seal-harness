@@ -1,6 +1,6 @@
 ---
 id: seal-usage
-description: How to work inside a Seal Harness session — your cwd is a fresh isolated workspace; stay in it; clone into `.`; never `cd ~` or to absolute paths. Load this at the start of any session before touching files.
+description: How to work inside a Seal Harness session — your cwd is a fresh isolated workspace; prefer it as your default; clone into `.`; operating outside the workdir is fine when the task calls for it but shouldn't be your default mode. Load this at the start of any session before touching files.
 created_at: 2026-07-24T00:00:00Z
 updated_at: 2026-07-24T00:00:00Z
 session: manual
@@ -21,7 +21,12 @@ haven't.
 
 ## The one rule
 
-**Your current working directory IS your workspace. Stay in it.**
+**Prefer your current working directory as your workspace. Stay in it by default.**
+
+Operating outside your workdir is allowed when the task genuinely requires it
+(reading a system config, inspecting another project, writing to a shared
+location). It just shouldn't be your default mode of operation — most work
+belongs in your workdir where it's isolated, visible, and auditable.
 
 - `SHELL_EXEC` and `BIN_EXEC` already default their cwd to your workdir when
   you omit the `cwd` argument. You do not need to `cd` anywhere. Both accept
@@ -53,8 +58,8 @@ BIN_EXEC { "binary": "git", "args": ["-C", "seal-harness", "log", "--oneline", "
 
 The clone is a subdirectory of your workspace — that's where it belongs.
 
-**Wrong** — this escapes your workspace and the clone is invisible to every
-file opcode:
+**Wrong (by default)** — this escapes your workspace and the clone is
+invisible to every file opcode:
 
 ```
 SHELL_EXEC { "command": "cd ~ && git clone https://github.com/seal-harness/seal-harness.git" }
@@ -64,7 +69,13 @@ SHELL_EXEC { "command": "cd ~ && git clone https://github.com/seal-harness/seal-
 `~/seal-harness`, outside your workdir. `FILE_READ "seal-harness/README.md"`
 will then fail — your file opcodes look in your workdir, not in `~`.
 
-**Also wrong** — absolute paths have the same problem:
+There are times when this is the right call — e.g. you were asked to clone
+into a specific shared location. When you do operate outside the workdir,
+just be deliberate about it: know where you're writing, and tell the operator
+what you're doing and why.
+
+**Also avoid by default** — absolute paths have the same problem when used
+carelessly:
 
 ```
 SHELL_EXEC { "command": "cd /tmp && git clone …" }
@@ -97,33 +108,42 @@ SHELL_EXEC { "command": "cabal build all", "cwd": "seal-harness" }
 
 That's fine: `seal-harness` is relative, inside your workdir. The cwd
 resets to your workdir on the next call, so a `cwd` does not leak across
-calls. Never use an absolute or home path as `cwd`.
+calls. Prefer relative, workdir-contained `cwd` values; use an absolute or
+home path only when the task explicitly needs it.
 
 ### Why this matters
 
 - **Isolation.** Your workdir is per-session. Parallel sessions get
-  different workdirs and cannot clobber each other. If you `cd ~` and
-  write there, you break that isolation and your writes land somewhere the
-  operator didn't expect.
+  different workdirs and cannot clobber each other. If you `cd ~` and write
+  there by default, you break that isolation and your writes land somewhere
+  the operator didn't expect. (Operating outside the workdir deliberately is
+  fine — doing it by default is what causes problems.)
 - **Visibility.** Every file opcode (`FILE_READ`, `SEARCH_FILES`, …) looks
   in your workdir. Files you write outside it are invisible to those
-  opcodes — your next `SEARCH_FILES` won't find them.
+  opcodes — your next `SEARCH_FILES` won't find them. If you need to work
+  outside the workdir, use absolute paths explicitly so it's clear where
+  things are going.
 - **Audit.** The transcript records what you did. Escaping the workdir
-  produces a confusing audit trail (writes the operator can't find in the
-  session's workdir).
+  *accidentally* produces a confusing audit trail (writes the operator can't
+  find in the session's workdir). Deliberate outside-workdir actions are fine
+  — just be clear about them.
 
 ## Quick checklist before every file/shell opcode
 
 - [ ] Am I using a relative path (or no path — cwd defaults to the workdir)?
-- [ ] Did I avoid `cd ~`, `cd $HOME`, `cd /abs/...`?
-- [ ] Did I avoid chaining `cd <absolute> && …`?
+- [ ] Is this work something that belongs in the workdir? (Most does.)
+- [ ] If I'm operating outside the workdir, is that a deliberate choice — do I
+      know why, and does the operator know?
+- [ ] Did I avoid *accidental* `cd ~`, `cd $HOME`, `cd /abs/...`?
+- [ ] Did I avoid *unintended* chaining `cd <absolute> && …`?
 - [ ] Can this be a `BIN_EXEC` instead of `SHELL_EXEC`? (single binary + args → yes)
 - [ ] If I need to clone, am I cloning with **no destination path** (so it
       lands in my workdir as a subdirectory)?
 
-If you already ran a command that escaped the workdir, don't try to "fix" it
-by copying files around blindly. Tell the operator what happened, then
-re-run the work inside your workdir.
+If you accidentally escaped the workdir, don't try to "fix" it by copying
+files around blindly. Tell the operator what happened, then re-run the work
+inside your workdir. (If you *deliberately* escaped it for a good reason, you
+don't need to fix anything — just make sure the operator knows.)
 
 ## Discovering your workdir
 
@@ -136,12 +156,15 @@ BIN_EXEC { "binary": "pwd" }
 The returned path is your workdir for this session. Use it only for
 reference — you should still pass relative paths to file opcodes.
 
-## What is NOT in your workdir
+## What is NOT in your workdir (by default)
 
 - The operator's home, dotfiles, other projects. These are outside your
-  session. Do not try to read or write them.
-- Other sessions' workdirs. Each session is isolated by design.
-- System paths (`/usr`, `/etc`, `/tmp`). Off-limits.
+  session by default. You *can* read or write them when a task requires it —
+  just be deliberate and explicit about it.
+- Other sessions' workdirs. Each session is isolated by design; leave them
+  alone unless the operator directs you there.
+- System paths (`/usr`, `/etc`, `/tmp`). Off-limits by default; touch them
+  only with a clear reason.
 
 ## Operator-facing note
 
