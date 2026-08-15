@@ -171,6 +171,7 @@ library
         Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
+        Seal.Agent.Def.Workdir
         Seal.Agent.Runtime.Registry
         Seal.Agent.Runtime.Delegation
         Seal.Agent.Runtime.Delegation.Worker
@@ -347,6 +348,7 @@ test-suite tests
         Seal.Skills.BuiltinsSpec
         Seal.Agent.Def.TypesSpec
         Seal.Agent.Def.BackendSpec
+        Seal.Agent.Def.BackendNoDirectFsFailSpec
         Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
         Seal.ISA.Ops.MemorySpec

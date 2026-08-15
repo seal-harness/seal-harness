@@ -34,12 +34,23 @@
 -- The git repo is the versioning + audit layer; model-authored writes
 -- (@AGENT_DEF_CREATE@ \/ @AGENT_DEF_UPDATE@, which are Trusted file writes)
 -- auto-commit.
+--
+-- The /workdir-scoped/ discovery backend (for @.agents\/@ discovery from
+-- cloned repos) lives in "Seal.Agent.Def.Workdir" and is re-exported here.
+-- That module has NO direct @System.Directory@\/@Data.Text.IO@ access —
+-- every workspace read goes through the 'WorkdirFs' handle (§3.6). This
+-- module (the user store) is local-FS by design (§3.9).
 module Seal.Agent.Def.Backend
-  ( AgentDefBackend (..)
+  ( -- * Backend record (re-exported from Seal.Agent.Def.Workdir)
+    AgentDefBackend (..)
   , noneBackend
-  , workdirAgentDefBackend
   , unionAgentDefBackend
+    -- * User store (local-FS, §3.9)
   , markdownAgentDefBackend
+    -- * Workdir-scoped discovery (re-exported from Seal.Agent.Def.Workdir)
+  , workdirAgentDefBackend
+  , workdirAgentDefBackendFs
+    -- * Codecs + DirScheme helpers (re-exported from Seal.Agent.Def.Workdir)
   , encodeAgentDef
   , decodeAgentDef
   , composeDirSystemPrompt
@@ -52,50 +63,35 @@ module Seal.Agent.Def.Backend
   , deriveAgentsMdId
   ) where
 
-import Control.Exception qualified as Exc
 import Control.Monad (forM, when)
-import Data.Aeson (Value (..), encode)
-import Data.ByteString.Lazy qualified as BL
-import Data.Char qualified as Char
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Either (fromRight)
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes)
 import Data.Set qualified as Set
-import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
-import Data.Time (UTCTime (..))
-import Data.Time.Calendar (fromGregorian)
-import Data.Time.Clock (secondsToDiffTime)
-import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
-import Data.Vector qualified as V
-import System.Directory (doesDirectoryExist, doesFileExist, getFileSize, getModificationTime, listDirectory, removeFile, renameFile)
+import System.Directory
+  ( doesDirectoryExist, doesFileExist, listDirectory, removeFile, renameFile
+  )
 import System.FilePath ((</>), (<.>))
 import System.Posix.Files (setFileMode)
 
-import Toml ((.=))
-import Toml qualified
-
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText, isValidAgentDefId)
-import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
+import Seal.Agent.Def.Types
+  ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
+  , isValidAgentDefId
+  )
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
-import Seal.Security.Path (WorkspaceRoot (..), mkSafePath, getSafePath)
-import Seal.Security.Policy (AllowList (..))
-import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList, splitFrontmatterRaw)
+import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Text.LineFile (maxScanBytes)
+import Seal.Tools.Exec.WorkdirFs (WorkdirFs, mkLocalWorkdirFs)
+
+import Seal.Agent.Def.Workdir
 
 -- | The agent-definition store capability. Each operation is IO; 'adbList'
--- returns all defs sorted by id.
-data AgentDefBackend = AgentDefBackend
-  { adbRead   :: AgentDefId -> IO (Maybe AgentDef)
-  , adbUpdate :: AgentDef -> IO ()
-  , adbList   :: IO [AgentDef]
-  , adbDelete :: AgentDefId -> IO ()
-  -- ^ Remove a def by id (delete the file + auto-commit; idempotent).
-  }
+-- returns all defs sorted by id. (Defined in "Seal.Agent.Def.Workdir" to
+-- avoid an import cycle; re-exported here.)
 
 -- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
 noneBackend :: IO AgentDefBackend
@@ -121,50 +117,16 @@ markdownAgentDefBackend dir repo = pure AgentDefBackend
   }
 
 -- ---------------------------------------------------------------------------
--- FlatScheme (existing)
+-- FlatScheme (user store)
 -- ---------------------------------------------------------------------------
 
 -- | The filename for a def: @\<id\>.md@.
 defFile :: FilePath -> AgentDefId -> FilePath
 defFile dir aid = dir </> T.unpack (agentDefIdText aid) <.> "md"
 
--- | Encode an 'AgentDef' as a Markdown document (frontmatter + body, where
--- the body is the system prompt).
-encodeAgentDef :: AgentDef -> Text
-encodeAgentDef d = encodeDoc fm body
-  where
-    ModelId modelName = adModel d
-    body = fromMaybe "" (adSystem d)
-    fm = Map.fromList
-      [ ("id", agentDefIdText (adId d))
-      , ("name", adName d)
-      , ("provider", adProvider d)
-      , ("model", modelName)
-      , ("tools", renderTools (adTools d))
-      , ("created_at", isoTime (adCreatedAt d))
-      , ("updated_at", isoTime (adUpdatedAt d))
-      , ("session", sessionIdText (adSession d))
-      ]
-
--- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
--- field is missing or fails 'mkAgentDefId'.
-decodeAgentDef :: Text -> Maybe AgentDef
-decodeAgentDef content =
-  case decodeDoc content of
-    (fm, body) -> do
-      aidT <- fmLookup "id" fm
-      aid  <- either (const Nothing) Just (mkAgentDefId aidT)
-      Just AgentDef
-        { adId = aid
-        , adName = fromMaybe "" (fmLookup "name" fm)
-        , adProvider = fromMaybe "" (fmLookup "provider" fm)
-        , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
-        , adSystem = if T.null body then Nothing else Just body
-        , adTools = decodeTools fm
-        , adCreatedAt = parseTime (fmLookup "created_at" fm)
-        , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
-        , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
-        }
+-- | The directory for a def: @agents\/\<id\>@.
+defDir :: FilePath -> AgentDefId -> FilePath
+defDir dir aid = dir </> T.unpack (agentDefIdText aid)
 
 -- | Write one def to disk (atomic) and auto-commit.
 writeAgentDef :: FilePath -> ConfigRepo -> AgentDef -> IO ()
@@ -194,232 +156,17 @@ deleteAgentDef dir repo aid = do
       pure ()
 
 -- ---------------------------------------------------------------------------
--- DirScheme (PureClaw-compatible)
+-- Hybrid discovery (flat + dir) — user store, local-FS
 -- ---------------------------------------------------------------------------
 
--- | Optional TOML frontmatter on @AGENTS.md@ inside an agent directory.
--- All fields are optional; unknown fields are ignored by the codec. A
--- missing @AGENTS.md@ or unparseable frontmatter yields
--- 'defaultDirAgentConfig'.
-data DirAgentConfig = DirAgentConfig
-  { dacModel    :: Maybe Text
-  , dacProvider :: Maybe Text
-  , dacTools    :: Maybe [Text]   -- ^ TOML array of opcode names; absent -> 'AllowAll'
-  } deriving stock (Eq, Show)
-
--- | 'DirAgentConfig' with every field unset (the permissive fallback).
-defaultDirAgentConfig :: DirAgentConfig
-defaultDirAgentConfig = DirAgentConfig Nothing Nothing Nothing
-
--- | Bidirectional tomland codec for 'DirAgentConfig'. Mirrors the
--- @Toml.dioptional (Toml.text ...)@ pattern used in 'Seal.Config.File'.
--- @tools@ uses @Toml.arrayOf Toml._Text@ to decode a TOML array of
--- strings (e.g. @tools = ["FILE_READ", "ASK_HUMAN"]@).
-dirAgentConfigCodec :: Toml.TomlCodec DirAgentConfig
-dirAgentConfigCodec = DirAgentConfig
-  <$> Toml.dioptional (Toml.text "model")              .= dacModel
-  <*> Toml.dioptional (Toml.text "provider")           .= dacProvider
-  <*> Toml.dioptional (Toml.arrayOf Toml._Text "tools") .= dacTools
-
--- | Parse the TOML frontmatter off an @AGENTS.md@ document. A document
--- with no frontmatter yields 'defaultDirAgentConfig'. Parse failures also
--- yield 'defaultDirAgentConfig' (permissive — matches PureClaw's
--- 'loadAgentConfig' fallback).
-parseDirAgentConfig :: Text -> DirAgentConfig
-parseDirAgentConfig input =
-  case splitFrontmatterRaw input of
-    (Nothing, _)   -> defaultDirAgentConfig
-    (Just "", _)   -> defaultDirAgentConfig
-    (Just toml, _) ->
-      case Toml.decode dirAgentConfigCodec toml of
-        Left _   -> defaultDirAgentConfig
-        Right cfg -> cfg
-
--- | The directory for a def: @agents\/\<id\>@.
-defDir :: FilePath -> AgentDefId -> FilePath
-defDir dir aid = dir </> T.unpack (agentDefIdText aid)
-
--- | Bootstrap file types, in the fixed injection order (mirrors PureClaw's
--- 'SectionKind' list).
-data SectionKind = SoulK | UserK | AgentsK | MemoryK | IdentityK | ToolsK | BootstrapK
-  deriving stock (Eq, Show)
-
-sectionFileName :: SectionKind -> FilePath
-sectionFileName SoulK      = "SOUL.md"
-sectionFileName UserK      = "USER.md"
-sectionFileName AgentsK    = "AGENTS.md"
-sectionFileName MemoryK    = "MEMORY.md"
-sectionFileName IdentityK  = "IDENTITY.md"
-sectionFileName ToolsK     = "TOOLS.md"
-sectionFileName BootstrapK = "BOOTSTRAP.md"
-
-sectionMarker :: SectionKind -> Text
-sectionMarker SoulK      = "--- SOUL ---"
-sectionMarker UserK      = "--- USER ---"
-sectionMarker AgentsK    = "--- AGENTS ---"
-sectionMarker MemoryK    = "--- MEMORY ---"
-sectionMarker IdentityK  = "--- IDENTITY ---"
-sectionMarker ToolsK     = "--- TOOLS ---"
-sectionMarker BootstrapK = "--- BOOTSTRAP ---"
-
--- | Maximum raw file size we will read. Anything larger is skipped.
-maxBootstrapFileBytes :: Integer
-maxBootstrapFileBytes = 1024 * 1024
-
--- | Default per-file character limit for 'composeDirSystemPrompt'. Large
--- enough that typical SOUL/USER/AGENTS files fit intact; sections beyond
--- this are truncated with the PureClaw-style marker.
-defaultSectionCharLimit :: Int
-defaultSectionCharLimit = 65536
-
--- | Truncate a section body to @limit@ characters, appending the exact
--- truncation marker. Strings at or under the limit are returned as-is.
-truncateSection :: Int -> Text -> Text
-truncateSection limit txt
-  | T.length txt <= limit = txt
-  | otherwise =
-      T.take limit txt
-        <> "\n[...truncated at " <> T.pack (show limit) <> " chars...]"
-
--- | Read a file for the protocol scan (§3.8): reject files larger than
--- 'maxBootstrapFileBytes' (defense-in-depth against OOM / huge symlink
--- targets), then read + truncate to 'defaultSectionCharLimit'. Returns
--- 'Nothing' on missing file, oversize, or read error. Mirrors the size
--- guards in 'readSection' but for whole-file (not section-wise) reads.
-readBoundedFile :: FilePath -> IO (Maybe Text)
-readBoundedFile path = do
-  exists <- doesFileExist path
-  if not exists
-    then pure Nothing
-    else do
-      size <- getFileSize path
-      if size > maxBootstrapFileBytes
-        then pure Nothing
-        else do
-          raw <- Exc.try (TIO.readFile path) :: IO (Either Exc.IOException Text)
-          case raw of
-            Left _ -> pure Nothing
-            Right txt ->
-              let trimmed = T.dropWhileEnd Char.isSpace txt
-              in if T.null (T.strip trimmed)
-                   then pure Nothing
-                   else pure (Just (truncateSection defaultSectionCharLimit trimmed))
-
--- | Read a single bootstrap section file, applying size/empty/truncation
--- rules. Returns 'Nothing' when the file is missing, empty
--- (including whitespace-only), or rejected as oversized. For @AGENTS.md@,
--- only the body after the TOML frontmatter fence is injected (the
--- frontmatter itself lives in 'DirAgentConfig').
-readSection :: FilePath -> SectionKind -> Int -> IO (Maybe Text)
-readSection dir kind limit = do
-  let path = dir </> sectionFileName kind
-  exists <- doesFileExist path
-  if not exists
-    then pure Nothing
-    else do
-      size <- getFileSize path
-      if size > maxBootstrapFileBytes
-        then pure Nothing
-        else do
-          raw <- Exc.try (TIO.readFile path) :: IO (Either Exc.IOException Text)
-          case raw of
-            Left _ -> pure Nothing
-            Right txt ->
-              let contents = case kind of
-                    AgentsK -> case splitFrontmatterRaw txt of
-                      (_, body) -> body
-                    _ -> txt
-                  trimmed = T.dropWhileEnd Char.isSpace contents
-              in if T.null (T.strip trimmed)
-                   then pure Nothing
-                   else pure (Just (truncateSection limit trimmed))
-
--- | Compose a system prompt from an agent directory's bootstrap files.
--- Files are read in the fixed injection order (SOUL, USER, AGENTS,
--- MEMORY, IDENTITY, TOOLS, BOOTSTRAP), missing/empty/oversized files are
--- skipped, and any section exceeding @limit@ characters is truncated with
--- the exact marker @"\\n[...truncated at \<limit\> chars...]"@. Returns
--- the empty string if every section is missing/empty.
-composeDirSystemPrompt :: FilePath -> Int -> IO Text
-composeDirSystemPrompt dir limit = do
-  let kinds = [SoulK, UserK, AgentsK, MemoryK, IdentityK, ToolsK, BootstrapK]
-  sections <- mapM (\k -> readSection dir k limit) kinds
-  let rendered = [ sectionMarker k <> "\n" <> body
-                 | (k, Just body) <- zip kinds sections
-                 ]
-  pure (T.intercalate "\n\n" rendered)
-
--- | Load a DirScheme agent def from @agents\/\<id\>\/@. Composes the
--- system prompt eagerly from the bootstrap files. Returns 'Nothing' if
--- the directory does not exist or the dirname fails 'isValidAgentDefId'.
-loadDirAgentDef :: FilePath -> AgentDefId -> IO (Maybe AgentDef)
-loadDirAgentDef agentsDir aid = do
-  let dir = defDir agentsDir aid
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure Nothing
-    else do
-      cfg <- loadDirAgentConfig dir
-      body <- composeDirSystemPrompt dir defaultSectionCharLimit
-      mtime <- dirMTime dir
-      pure (Just AgentDef
-        { adId = aid
-        , adName = agentDefIdText aid
-        , adProvider = fromMaybe "" (dacProvider cfg)
-        , adModel = ModelId (fromMaybe "" (dacModel cfg))
-        , adSystem = if T.null body then Nothing else Just body
-        , adTools = decodeDirTools (dacTools cfg)
-        , adCreatedAt = mtime
-        , adUpdatedAt = mtime
-        , adSession = mkSystemSessionId "manual"
-        })
-
--- | Read and parse the @AGENTS.md@ frontmatter inside an agent directory.
--- Missing file or parse failure yields 'defaultDirAgentConfig'.
-loadDirAgentConfig :: FilePath -> IO DirAgentConfig
-loadDirAgentConfig dir = do
-  let path = dir </> "AGENTS.md"
-  exists <- doesFileExist path
-  if not exists
-    then pure defaultDirAgentConfig
-    else do
-      raw <- Exc.try (TIO.readFile path) :: IO (Either Exc.IOException Text)
-      case raw of
-        Left _   -> pure defaultDirAgentConfig
-        Right txt -> pure (parseDirAgentConfig txt)
-
--- | Best-effort mtime for an agent directory: the mtime of @AGENTS.md@ if
--- present, else the mtime of @SOUL.md@, else epoch zero. (Unstable across
--- @git pull@ — see the design doc §3.2 timestamp note.)
-dirMTime :: FilePath -> IO UTCTime
-dirMTime dir = do
-  let candidates = [dir </> "AGENTS.md", dir </> "SOUL.md"]
-  go candidates
-  where
-    go [] = pure epochZero
-    go (p:ps) = do
-      exists <- doesFileExist p
-      if not exists
-        then go ps
-        else do
-          mt <- Exc.try (getModificationTime p) :: IO (Either Exc.IOException UTCTime)
-          case mt of
-            Left _  -> go ps
-            Right t -> pure t
-
--- | Decode the @tools@ frontmatter value (a 'Maybe [Text]' from the TOML
--- codec): @Nothing@ -> 'AllowAll'; a list of opcode-name strings ->
--- 'AllowOnly'. The string @"all"@ is not special here (the TOML codec
--- produces a list, not a scalar); callers wanting @AllowAll@ simply omit
--- the @tools@ key.
-decodeDirTools :: Maybe [Text] -> AllowList OpName
-decodeDirTools Nothing     = AllowAll
-decodeDirTools (Just [])   = AllowAll
-decodeDirTools (Just ts)   = AllowOnly (Set.fromList (map OpName ts))
-
--- ---------------------------------------------------------------------------
--- Hybrid discovery (flat + dir)
--- ---------------------------------------------------------------------------
+-- | The local 'WorkdirFs' anchored at the user store's agents directory.
+-- The DirScheme reads ('loadDirAgentDef' et al.) live in
+-- "Seal.Agent.Def.Workdir" and operate over 'WorkdirFs'; the user store
+-- constructs a local-arm 'WorkdirFs' at its @dir@ so the DirScheme reads
+-- share the single confined code path (§3.6) while remaining local-FS
+-- (§3.9).
+userDirFs :: FilePath -> WorkdirFs
+userDirFs dir = mkLocalWorkdirFs (WorkspaceRoot dir) maxScanBytes
 
 -- | Read one def by id. Flat scheme takes precedence on conflict. Falls
 -- back to the dir scheme if the flat file is absent. Returns 'Nothing' if
@@ -438,7 +185,7 @@ readAgentDef dir aid = do
                   <> " has both a flat file and a directory; flat file takes precedence")
       content <- TIO.readFile flatPath
       pure (decodeAgentDef content)
-    else loadDirAgentDef dir aid
+    else loadDirAgentDef (userDirFs dir) aid
 
 -- | Enumerate all defs in the directory (both schemes), sorted by id.
 -- Malformed flat files and malformed dirs are skipped. On flat/dir
@@ -485,304 +232,8 @@ collectDirs dir entries flatIds = do
             putStrLn ("warning: agent def " <> e
                       <> " has both a flat file and a directory; flat file takes precedence")
             pure Nothing  -- skip the dir def; flat wins
-          else loadDirAgentDef dir aid
+          else loadDirAgentDef (userDirFs dir) aid
   pure (catMaybes defs)
-
--- ---------------------------------------------------------------------------
--- Shared helpers (flat + dir)
--- ---------------------------------------------------------------------------
-
--- | Render an 'AllowList OpName' as @"all"@ or a JSON array string.
-renderTools :: AllowList OpName -> Text
-renderTools AllowAll       = "all"
-renderTools (AllowOnly xs) =
-  TE.decodeUtf8 (BL.toStrict (encode (V.fromList [ String t | OpName t <- Set.toList xs ])))
-
--- | Decode the @tools@ frontmatter field (flat scheme): @"all"@ ->
--- 'AllowAll'; a JSON array of opcode-name strings -> 'AllowOnly';
--- absent/other -> 'AllowAll'.
-decodeTools :: Map Text Text -> AllowList OpName
-decodeTools fm = case Map.lookup "tools" fm of
-  Nothing    -> AllowAll
-  Just "all" -> AllowAll
-  Just _     -> case fmLookupList "tools" fm of
-    Just ts -> AllowOnly (Set.fromList (map OpName ts))
-    Nothing -> AllowAll
-
--- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
-isoTime :: UTCTime -> Text
-isoTime = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
-
--- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
--- when absent or unparseable.
-parseTime :: Maybe Text -> UTCTime
-parseTime Nothing    = epochZero
-parseTime (Just raw) = fromMaybe epochZero (parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack raw))
-
--- | The epoch fallback for missing/unparseable timestamps.
-epochZero :: UTCTime
-epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
-----------------------------------------------------------------------------
--- Workdir-scoped agent def backend (for .agents/ discovery from cloned repos)
-----------------------------------------------------------------------------
-
--- | The conventional agent-def directories a cloned repo may carry.
--- @.agents@ is the primary convention (mirrors @.skills@ for the
--- agentskills.io format). The others are back-compat.
-workdirAgentDefConventions :: [FilePath]
-workdirAgentDefConventions = [ ".agents", ".seal/agents", "agents" ]
-
--- | The synthetic 'AgentDefId' text for the project-level @.agents/agents.md@
--- (the @.agents Protocol@ project instructions file). The @-md@ suffix makes
--- accidental collision with a subdir name unlikely; the existing
--- flat-wins-on-conflict rule ('readAgentDef') is the real guard. The suffix
--- is the invariant pinned by the QuickCheck property (§3.1).
-deriveAgentsMdId :: Text
-deriveAgentsMdId = "agents-md"
-
--- | The friendly display name for the project-level @agents.md@ when its
--- frontmatter has no @name@ field (so the synthetic id never leaks to the
--- UI — §3.1).
-projectAgentsMdDisplayName :: Text
-projectAgentsMdDisplayName = "Project (agents.md)"
-
--- | A read-only 'AgentDefBackend' that scans a session workdir for agent
--- definitions shipped by cloned repositories. For each top-level directory
--- in the workdir (a cloned repo), it checks the conventional agent-def
--- locations (@.agents\/@, @.seal\/agents\/@, @agents\/@).
---
--- For @.agents\/@, the [.agents Protocol](https://dotagentsprotocol.com) is
--- recognized: when @.agents\/@ contains @agents.md@ OR an @agents\/@
--- subdirectory, it is treated as a **protocol root** — the project-level
--- @.agents\/agents.md@ is loaded as an agent def (id @agents-md@), and each
--- @.agents\/agents\/\<id\>\/agent.md@ sub-agent is loaded (id = subdir name
--- or frontmatter @id@). Otherwise @.agents\/@ falls back to the legacy
--- hybrid flat + DirScheme discovery ('listAgentDefs') for back-compat.
---
--- @.seal\/agents@ and @agents@ always use the legacy discovery.
---
--- This backend is /read-only/: 'adbUpdate'/'adbDelete' are no-ops (repo-local
--- agent defs are immutable from the model's perspective). 'adbRead' scans
--- on every call (workdirs are small). Within-workdir collisions (two repos
--- ship a def with the same id): the alphabetically-first repo wins
--- (deterministic; same as the skill backend's policy).
---
--- Every file open in the protocol scan goes through 'mkSafePath' anchored at
--- the repo's @.agents\/@ directory (symlink-escape confinement — §3.8) and
--- is size-capped at 'maxBootstrapFileBytes' + 'truncateSection'.
-workdirAgentDefBackend :: FilePath -> IO AgentDefBackend
-workdirAgentDefBackend workdir = pure AgentDefBackend
-    { adbRead   = \aid -> do
-        defs <- listWorkdirAgentDefs workdir
-        pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
-    , adbUpdate = \_ -> pure ()
-    , adbList   = listWorkdirAgentDefs workdir
-    , adbDelete = \_ -> pure ()
-    }
-
--- | Enumerate every agent def found under the conventional locations across
--- all top-level directories (cloned repos) in @workdir@. The
--- alphabetically-first repo wins on prefixed-id collisions (deterministic).
--- Missing @workdir@ or empty workdirs yield @[]@.
---
--- Each def's id is prefixed with its repo's top-level directory name + @"--"@
--- (e.g. @vtag--architect-agent@) and its @adName@ with @\<repo\>\/@ (e.g.
--- @vtag\/Architect Agent@). This disambiguates repo-local agents from the
--- user's own agents (and from other repos' agents) when the union backend
--- merges workdir ⊕ user: a repo shipping @architect-agent@ no longer shadows
--- the user's @architect-agent@ — both appear, distinguished by the prefix.
--- The @--@ separator is charset-safe (@isValidAgentDefId@); the @/@ in the
--- display name is for human readability only.
-listWorkdirAgentDefs :: FilePath -> IO [AgentDef]
-listWorkdirAgentDefs workdir = do
-  exists <- doesDirectoryExist workdir
-  if not exists
-    then pure []
-    else do
-      dirs <- listWorkdirSubdirs workdir
-      perRepo <- forM dirs $ \repo -> do
-        let repoDir = workdir </> repo
-        defs <- concat <$> forM workdirAgentDefConventions (\conv -> do
-          let convDir = repoDir </> conv
-          cExists <- doesDirectoryExist convDir
-          if not cExists
-            then pure []
-            else
-              -- Dispatch: .agents/ is protocol-aware; the rest use legacy.
-              if conv == ".agents"
-                then listAgentsDotAgents convDir
-                else listAgentDefs convDir)
-        pure (mapMaybe (prefixWorkdirDef (T.pack repo)) defs)
-      let merge m [] = m
-          merge m (d:ds) = merge (Map.insertWith (\_new old -> old) (adId d) d m) ds
-          merged = merge Map.empty (concat perRepo)
-      pure (Map.elems merged)
-
--- | Prefix a workdir-discovered def's id with @\<repo\>--\<id\>@ and its
--- @adName@ with @\<repo\>\/\<name\>@. The id prefix uses @"--"@ (charset-safe
--- per 'isValidAgentDefId'); the display name uses @"/"@ for readability. If
--- the prefixed id fails validation (e.g. the repo dir has a char outside the
--- charset), the def is dropped ('Nothing' — fail-closed).
-prefixWorkdirDef :: Text -> AgentDef -> Maybe AgentDef
-prefixWorkdirDef repo d =
-  let prefixedIdText = repo <> "--" <> agentDefIdText (adId d)
-  in case mkAgentDefId prefixedIdText of
-       Left _ -> Nothing
-       Right aid -> Just d
-         { adId = aid
-         , adName = repo <> "/" <> adName d
-         }
-
--- | Dispatch for the @.agents\/@ convention dir: protocol-root detection
--- (§3.3). When @.agents\/@ contains @agents.md@ OR an @agents\/@
--- subdirectory, scan the protocol allow-list (@agents\/@ sub-agents +
--- @agents.md@ project def); otherwise fall back to legacy 'listAgentDefs'
--- (DirScheme with @SOUL.md@\/@AGENTS.md@ bootstrap files).
-listAgentsDotAgents :: FilePath -> IO [AgentDef]
-listAgentsDotAgents agentsDir = do
-  isProto <- isProtocolRoot agentsDir
-  if isProto
-    then listProtocolAgentDefs agentsDir
-    else listAgentDefs agentsDir
-
--- | The detection predicate (§3.3): @.agents\/@ is a protocol root iff it
--- contains @agents.md@ (a file) OR an @agents\/@ subdirectory.
-isProtocolRoot :: FilePath -> IO Bool
-isProtocolRoot agentsDir = do
-  hasAgentsMd <- doesFileExist (agentsDir </> "agents.md")
-  hasAgentsSub <- doesDirectoryExist (agentsDir </> "agents")
-  pure (hasAgentsMd || hasAgentsSub)
-
--- | The protocol allow-list scan (§3.3). Scans only @agents\/\<id\>\/agent.md@
--- (sub-agents) + @agents.md@ (project def). Skips everything else
--- (@skills\/@, @tasks\/@, @memories\/@, @mcp.json@). Every file open goes
--- through 'mkSafePath' anchored at @agentsDir@ (§3.8) and is size-capped.
-listProtocolAgentDefs :: FilePath -> IO [AgentDef]
-listProtocolAgentDefs agentsDir = do
-  -- The project-level agents.md (id agents-md).
-  mProject <- loadProjectAgentDef agentsDir
-  -- Sub-agents under agents/<id>/agent.md.
-  let agentsSub = agentsDir </> "agents"
-  subExists <- doesDirectoryExist agentsSub
-  subDefs <- if not subExists
-    then pure []
-    else do
-      entries <- listDirectory agentsSub
-      let candidate e = do
-            let full = agentsSub </> e
-            isDir <- doesDirectoryExist full
-            pure (if isDir && isValidAgentDefId (T.pack e) then Just e else Nothing)
-      mEntries <- mapM candidate (sortOn id entries)
-      catMaybes <$> mapM (loadProtocolSubAgent agentsDir . T.pack) (catMaybes mEntries)
-  let allDefs = catMaybes [mProject] <> subDefs
-  pure (sortOn (agentDefIdText . adId) allDefs)
-
--- | Load the project-level @.agents\/agents.md@ as an 'AgentDef' with id
--- @agents-md@ (§3.1). The system prompt is the @agents.md@ body (frontmatter
--- stripped). Frontmatter @name@ → @adName@; absent → the friendly
--- 'projectAgentsMdDisplayName'. @provider@/@model@ honored when present.
--- Returns 'Nothing' when the file is missing, unconfined (SafePath), or
--- unparseable.
-loadProjectAgentDef :: FilePath -> IO (Maybe AgentDef)
-loadProjectAgentDef agentsDir = do
-  let rel = "agents.md"
-  ePath <- mkSafePath (WorkspaceRoot agentsDir) rel
-  case ePath of
-    Left _ -> pure Nothing  -- symlink escape or missing → skip
-    Right safePath -> do
-      let path = getSafePath safePath
-      mContent <- readBoundedFile path
-      pure (mContent >>= decodeProjectAgentsMd)
-
--- | Decode the project-level @agents.md@ frontmatter + body into an
--- 'AgentDef' (id @agents-md@). Frontmatter @kind@/@name@/@provider@/@model@
--- honored; @kind@ is not required (its presence doesn't gate discovery —
--- @agents.md@ is the canonical project instructions file regardless).
-decodeProjectAgentsMd :: Text -> Maybe AgentDef
-decodeProjectAgentsMd content =
-  case decodeDoc content of
-    (fm, body) ->
-      case mkAgentDefId deriveAgentsMdId of
-        Left _ -> Nothing
-        Right aid -> Just AgentDef
-          { adId = aid
-          , adName = fromMaybe projectAgentsMdDisplayName (fmLookup "name" fm)
-          , adProvider = fromMaybe "" (fmLookup "provider" fm)
-          , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
-          , adSystem = if T.null body then Nothing else Just body
-          , adTools = decodeTools fm
-          , adCreatedAt = epochZero
-          , adUpdatedAt = epochZero
-          , adSession = mkSystemSessionId "manual"
-          }
-
--- | Load one protocol sub-agent from @agents\/\<id\>\/agent.md@ (§3.3). The
--- id is the subdir name, unless frontmatter @id@ is present and valid (then
--- frontmatter wins; invalid frontmatter @id@ → fall back to subdir name +
--- warning). @enabled: false@ → 'Nothing' (skipped). Every file open goes
--- through 'mkSafePath' anchored at @agentsDir@ (§3.8).
-loadProtocolSubAgent :: FilePath -> Text -> IO (Maybe AgentDef)
-loadProtocolSubAgent agentsDir subDirName = do
-  let rel = "agents" </> T.unpack subDirName </> "agent.md"
-  ePath <- mkSafePath (WorkspaceRoot agentsDir) rel
-  case ePath of
-    Left _ -> pure Nothing  -- symlink escape or missing → skip
-    Right safePath -> do
-      let path = getSafePath safePath
-      mContent <- readBoundedFile path
-      pure (mContent >>= \content -> decodeProtocolAgentMd subDirName content)
-
--- | Decode a protocol @agent.md@ frontmatter + body into an 'AgentDef'.
--- The id is the subdir name, unless frontmatter @id@ is present and valid
--- (then frontmatter wins). @enabled@ absent → enabled (appears); explicit
--- @enabled: false@ → 'Nothing' (skipped per §3.3). Frontmatter
--- @name@/@provider@/@model@ honored when present.
-decodeProtocolAgentMd :: Text -> Text -> Maybe AgentDef
-decodeProtocolAgentMd subDirName content =
-  case decodeDoc content of
-    (fm, body) ->
-      case fmLookup "enabled" fm of
-        Just v | T.strip v == "false" -> Nothing  -- disabled → skip
-        _ ->
-          let idText = fromMaybe subDirName (fmLookup "id" fm >>= validId)
-          in case mkAgentDefId idText of
-               Left _ -> Nothing
-               Right aid -> Just AgentDef
-                 { adId = aid
-                 , adName = fromMaybe idText (fmLookup "name" fm)
-                 , adProvider = fromMaybe "" (fmLookup "provider" fm)
-                 , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
-                 , adSystem = if T.null body then Nothing else Just body
-                 , adTools = decodeTools fm
-                 , adCreatedAt = epochZero
-                 , adUpdatedAt = epochZero
-                 , adSession = mkSystemSessionId "manual"
-                 }
-  where
-    validId t = if isValidAgentDefId t then Just t else Nothing
-
--- | Enumerate the immediate subdirectories of @dir@ (non-recursive, no
--- hidden dirs), sorted for deterministic output. Mirrors the same function
--- in 'Seal.Skills.Backend' (kept local to avoid a cross-module dependency).
-listWorkdirSubdirs :: FilePath -> IO [FilePath]
-listWorkdirSubdirs dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
-    else do
-      entries <- listDirectory dir
-      let visible = [e | e <- entries, not ("." `isPrefixOfStr` e)]
-      filterM'' (doesDirectoryExist . (dir </>)) (sortOn id visible)
-  where
-    isPrefixOfStr p s = take (length p) s == p
-
--- | Local 'filterM' (mirrors the one in 'Seal.Skills.Backend').
-filterM'' :: (a -> IO Bool) -> [a] -> IO [a]
-filterM'' _ []     = pure []
-filterM'' f (x:xs) = do
-  ok <- f x
-  rest <- filterM'' f xs
-  pure (if ok then x : rest else rest)
 
 -- | A union of a workdir 'AgentDefBackend' (repo-local agent defs) and a
 -- user 'AgentDefBackend' (the on-disk @~/.seal/config/agents/@ store).

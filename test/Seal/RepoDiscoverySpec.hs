@@ -2,6 +2,7 @@
 module Seal.RepoDiscoverySpec (spec) where
 
 import Control.Exception (SomeException, catch)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing, mapMaybe)
 import qualified Data.Text as T
 import System.Directory (createDirectoryIfMissing, createDirectoryLink, removeDirectoryRecursive)
@@ -23,12 +24,21 @@ import Data.Time.Clock (secondsToDiffTime)
 import Seal.Core.Types (mkSystemSessionId)
 import Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
-  , workdirAgentDefBackend
+  , workdirAgentDefBackendFs
   , unionAgentDefBackend
   , noneBackend
   , deriveAgentsMdId
   )
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText, isValidAgentDefId)
+import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Text.LineFile (maxScanBytes)
+import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+import Seal.Tools.Exec.WorkdirFs
+  ( WorkdirFs
+  , mkLocalWorkdirFs
+  , mkInMemWorkdirFs
+  , StubEntry (..)
+  )
 
 spec :: Spec
 spec = do
@@ -149,7 +159,7 @@ spec = do
         "You are a test agent.\n"
       writeFile (tmp </> "my-repo" </> ".agents" </> "my-agent" </> "AGENTS.md")
         "---\nmodel: llama3\nprovider: ollama\n---\nAgent instructions.\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       length defs `shouldBe` 1
       case defs of
@@ -158,7 +168,7 @@ spec = do
       cleanup tmp
 
     it "returns empty list when workdir has no repos" $ do
-      backend <- workdirAgentDefBackend "/nonexistent-path-12345"
+      backend <- workdirAgentDefBackendFs =<< mkFs "/nonexistent-path-12345"
       defs <- adbList backend
       defs `shouldBe` []
 
@@ -177,7 +187,7 @@ spec = do
       -- A skills dir that must NOT produce a bogus 'skills' agent.
       writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "bar" </> "SKILL.md")
         "---\nname: bar\ndescription: a skill\n---\nbody\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- Exactly 2 defs: the project def (my-repo--agents-md) + the sub-agent
@@ -213,7 +223,7 @@ spec = do
       createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "on-agent")
       writeFile (tmp </> "my-repo" </> ".agents" </> "agents" </> "on-agent" </> "agent.md")
         "---\nname: On\n---\nEnabled body.\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       ids `shouldContain` ["my-repo--on-agent"]
@@ -229,25 +239,31 @@ spec = do
       createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "subdir-name")
       writeFile (tmp </> "my-repo" </> ".agents" </> "agents" </> "subdir-name" </> "agent.md")
         "---\nid: real-id\nname: Real\n---\nBody.\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       ids `shouldContain` ["my-repo--real-id"]
       ids `shouldNotContain` ["my-repo--subdir-name"]
       cleanup tmp
 
-    it "rejects a symlinked agent.md escaping .agents/ (SafePath confinement)" $ do
+    it "rejects a symlinked agent.md escaping the workdir (SafePath confinement)" $ do
       let tmp = "/tmp/seal-repo-discovery-protocol-symlink-test"
+          escape = "/tmp/seal-escape-target-repo-discovery"
       cleanup tmp
+      cleanup escape
       createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "leak")
-      -- A secret file OUTSIDE the .agents/ dir (the symlink target).
-      writeFile (tmp </> "my-repo" </> "secret.txt") "PRIVATE KEY MATERIAL\n"
+      -- A secret file OUTSIDE the workdir root (the symlink target). It
+      -- MUST live outside @tmp@ so the workdir-anchored confinement
+      -- assertion is non-vacuous (a target inside @tmp@ would be allowed
+      -- by the workdir-rooted SafePath).
+      createDirectoryIfMissing True escape
+      writeFile (escape </> "secret.txt") "PRIVATE KEY MATERIAL\n"
       writeFile (tmp </> "my-repo" </> ".agents" </> "agents.md")
         "---\nkind: agents\n---\nProject.\n"
-      -- Symlink agent.md -> ../../secret.txt (escapes .agents/).
-      createDirectoryLink (tmp </> "my-repo" </> "secret.txt")
+      -- Symlink agent.md -> <escape>/secret.txt (escapes the workdir root).
+      createDirectoryLink (escape </> "secret.txt")
                           (tmp </> "my-repo" </> ".agents" </> "agents" </> "leak" </> "agent.md")
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- The leaking 'leak' agent must NOT appear (its body would be the secret).
@@ -257,6 +273,29 @@ spec = do
       -- No def's system prompt contains the secret.
       let systems = mapMaybe adSystem defs
       systems `shouldNotSatisfy` any ("PRIVATE KEY MATERIAL" `T.isInfixOf`)
+      cleanup tmp
+      cleanup escape
+
+    it "allows a within-workdir symlink (target inside workdir, outside .agents/)" $ do
+      let tmp = "/tmp/seal-repo-discovery-protocol-within-symlink-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "linked")
+      -- A real agent.md body inside the workdir but OUTSIDE .agents/.
+      writeFile (tmp </> "my-repo" </> "real-agent.md")
+        "---\nname: Linked\n---\nLinked body.\n"
+      writeFile (tmp </> "my-repo" </> ".agents" </> "agents.md")
+        "---\nkind: agents\n---\nProject.\n"
+      -- Symlink agent.md -> ../../real-agent.md (within the workdir root,
+      -- outside .agents/ — intentionally allowed).
+      createDirectoryLink (tmp </> "my-repo" </> "real-agent.md")
+                          (tmp </> "my-repo" </> ".agents" </> "agents" </> "linked" </> "agent.md")
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
+      defs <- adbList backend
+      let ids = map (agentDefIdText . adId) defs
+      -- The within-workdir symlink IS allowed: the 'linked' agent appears.
+      ids `shouldContain` ["my-repo--linked"]
+      -- The project def also appears.
+      ids `shouldContain` ["my-repo--agents-md"]
       cleanup tmp
 
     it "falls back to legacy DirScheme for .agents/<id>/SOUL.md (no agents.md/agents/ subdir)" $ do
@@ -268,7 +307,7 @@ spec = do
         "You are a legacy agent.\n"
       writeFile (tmp </> "my-repo" </> ".agents" </> "my-agent" </> "AGENTS.md")
         "---\nmodel: llama3\nprovider: ollama\n---\nAgent instructions.\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       ids `shouldContain` ["my-repo--my-agent"]
@@ -288,7 +327,7 @@ spec = do
         "---\nkind: agents\n---\nProject.\n"
       writeFile (tmp </> "vtag" </> ".agents" </> "agents" </> "architect-agent" </> "agent.md")
         "---\nname: Architect Agent\n---\nYou are an architect.\n"
-      backend <- workdirAgentDefBackend tmp
+      backend <- workdirAgentDefBackendFs =<< mkFs tmp
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- Repo-local ids are prefixed with the repo dir + "--" so a user agent
@@ -303,6 +342,54 @@ spec = do
         _ -> expectationFailure "expected exactly one prefixed architect-agent def"
       cleanup tmp
 
+  describe "Seal.Agent.Def.Backend.workdirAgentDefBackendFs (remote-arm stub parity)" $ do
+    it "discovers the same defs as the local arm over an equivalent fixture" $ do
+      -- A stub-remote WorkdirFs (in-memory, no real SSH / no local FS)
+      -- seeded with the same fixture as the local protocol test:
+      --   my-repo/.agents/agents.md
+      --   my-repo/.agents/agents/foo-agent/agent.md
+      --   my-repo/.agents/agents/leak/agent.md  -> symlink escaping /workspace
+      --   my-repo/.agents/agents/linked/agent.md -> within-workdir symlink
+      -- The escaping symlink is rejected by the stub's containment check;
+      -- the within-workdir symlink is allowed. Discovery parity with the
+      -- local arm is the §1.1 success metric.
+      let agentsMd = "---\nkind: agents\n---\n# Project\nDo good work.\n"
+          fooMd    = "---\nname: Foo Agent\nprovider: ollama\nmodel: llama3\nenabled: true\n---\nYou are a foo specialist.\n"
+          realMd   = "---\nname: Real\n---\nReal body.\n"
+          seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".agents"])
+            , (rp "my-repo/.agents", Directory ["agents.md", "agents"])
+            , (rp "my-repo/.agents/agents.md", FileContent agentsMd)
+            , (rp "my-repo/.agents/agents", Directory ["foo-agent", "leak", "linked"])
+            , (rp "my-repo/.agents/agents/foo-agent", Directory ["agent.md"])
+            , (rp "my-repo/.agents/agents/foo-agent/agent.md", FileContent fooMd)
+            , (rp "my-repo/.agents/agents/leak", Directory ["agent.md"])
+            , (rp "my-repo/.agents/agents/leak/agent.md", SymlinkTarget (rp "/etc/shadow"))
+            , (rp "my-repo/.agents/agents/linked", Directory ["agent.md"])
+            , (rp "my-repo/.agents/agents/linked/agent.md", SymlinkTarget (rp "my-repo/real-agent.md"))
+            , (rp "my-repo/real-agent.md", FileContent realMd)
+            ]
+          fs = mkInMemWorkdirFs seed
+      backend <- workdirAgentDefBackendFs fs
+      defs <- adbList backend
+      let ids = map (agentDefIdText . adId) defs
+      -- Exactly 3 defs: the project def, the foo sub-agent, and the
+      -- within-workdir-symlinked 'linked' sub-agent. The escaping 'leak'
+      -- is rejected.
+      length defs `shouldBe` 3
+      ids `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "my-repo--linked"]
+      ids `shouldNotContain` ["my-repo--leak"]
+      -- The project def's system prompt is the agents.md body.
+      let mProject = [d | d <- defs, agentDefIdText (adId d) == "my-repo--agents-md"]
+      case mProject of
+        [d] -> adSystem d `shouldBe` Just "# Project\nDo good work."
+        _ -> expectationFailure "expected exactly one agents-md def"
+      -- No def's system prompt contains the escaped secret (there is none
+      -- in the stub, but the leaking 'leak' def must not appear at all).
+      let systems = mapMaybe adSystem defs
+      systems `shouldNotSatisfy` any ("PRIVATE" `T.isInfixOf`)
+
   describe "Seal.Agent.Def.Backend.unionAgentDefBackend" $ do
     it "workdir defs shadow user defs on id collision" $ do
       let tmp = "/tmp/seal-repo-discovery-union-test"
@@ -310,7 +397,7 @@ spec = do
       createDirectoryIfMissing True (tmp </> "repo" </> ".agents" </> "shared-agent")
       writeFile (tmp </> "repo" </> ".agents" </> "shared-agent" </> "SOUL.md")
         "Workdir version.\n"
-      workdirBackend <- workdirAgentDefBackend tmp
+      workdirBackend <- workdirAgentDefBackendFs =<< mkFs tmp
       userBackend <- noneBackend
       let unioned = unionAgentDefBackend workdirBackend userBackend
       defs <- adbList unioned
@@ -320,3 +407,16 @@ spec = do
 cleanup :: FilePath -> IO ()
 cleanup path =
   removeDirectoryRecursive path `catch` \(_ :: SomeException) -> pure ()
+
+-- | Build a local 'WorkdirFs' anchored at @tmp@ (the mechanical W4 adapter:
+-- @workdirAgentDefBackendFs . mkLocalWorkdirFs . WorkspaceRoot@).
+mkFs :: FilePath -> IO WorkdirFs
+mkFs tmp = pure (mkLocalWorkdirFs (WorkspaceRoot tmp) maxScanBytes)
+
+-- | Construct a 'RemotePath', crashing on invalid input (test fixtures only).
+-- Used to seed the in-memory stub 'WorkdirFs' for the remote-arm parity test.
+rp :: T.Text -> RemotePath
+rp t = case mkRemotePath t of
+  Right r  -> r
+  Left err -> error ("RepoDiscoverySpec.rp: bad remote path: "
+                     <> T.unpack err <> ": " <> T.unpack t)
