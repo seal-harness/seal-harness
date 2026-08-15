@@ -361,7 +361,8 @@ parseRepoHost url
   | "git@" `T.isPrefixOf` url = parseSsh
   | "https://" `T.isPrefixOf` url = parseHttps
   | "http://" `T.isPrefixOf` url = parseHttps
-  | otherwise = Left "URL is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+  | "ssh://" `T.isPrefixOf` url = parseSshScheme
+  | otherwise = Left "URL is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
   where
     parseSsh :: Either Text Text
     parseSsh =
@@ -372,6 +373,20 @@ parseRepoHost url
              | T.null host -> Left "empty host in scp-form URL"
              | otherwise   -> Right host
 
+    -- | Parse an @ssh:\/\/[user\@]host[:port]\/path@ URL. Strip the scheme,
+    -- strip an optional @user\@@, then take the host up to the first @\/@,
+    -- @:@ (port), @?@, or @#@.
+    parseSshScheme :: Either Text Text
+    parseSshScheme =
+      let afterScheme = T.drop (T.length "ssh://") url
+          afterUser = case T.breakOn "@" afterScheme of
+            (_, rest) | not (T.null rest) -> T.drop 1 rest
+            _ -> afterScheme
+          host = T.takeWhile (\c -> c /= '/' && c /= ':' && c /= '?' && c /= '#') afterUser
+      in if T.null host
+           then Left "empty host in ssh:// URL"
+           else Right host
+
     parseHttps :: Either Text Text
     parseHttps =
       let rest = fromMaybe url (T.stripPrefix "https://" url <|> T.stripPrefix "http://" url)
@@ -380,12 +395,12 @@ parseRepoHost url
            then Left "empty host in HTTPS URL"
            else Right host
 
--- | True iff the URL is non-empty AND matches one of the two supported shapes
--- (SSH @git\@\<host\>:...@ or HTTPS @https://\<host\>/...@).
+-- | True iff the URL is non-empty AND matches one of the supported shapes
+-- (SSH @git\@\<host\>:...@ or @ssh:\/\/...@, or HTTPS @https://\<host\>/...@).
 urlShapeValid :: Text -> Bool
 urlShapeValid url = not (T.null url) && (isSsh url || isHttps url)
   where
-    isSsh u   = "git@" `T.isPrefixOf` u && T.isInfixOf ":" u
+    isSsh u   = ("git@" `T.isPrefixOf` u && T.isInfixOf ":" u) || "ssh://" `T.isPrefixOf` u
     isHttps u = "https://" `T.isPrefixOf` u || "http://" `T.isPrefixOf` u
 
 ----------------------------------------------------------------------------

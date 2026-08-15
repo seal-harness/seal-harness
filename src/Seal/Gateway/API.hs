@@ -1413,7 +1413,7 @@ parseRepoWithId rid (A.Object o) = do
     Nothing           -> Left "url is required"
   -- URL shape (SSH scp-form or HTTPS) — guards against malformed input
   -- before the host allow-list check.
-  unlessRight (urlShapeValid url) "url is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+  unlessRight (urlShapeValid url) "url is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
   -- Host allow-list (GitHub-first). A URL whose parsed host is not in
   -- 'githubHosts' is rejected with 400.
   host <- parseRepoHost url
