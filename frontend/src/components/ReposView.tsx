@@ -49,7 +49,7 @@ function Row({
 }
 
 function emptyInput(): RepoInput {
-  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'pat', vault_key: '' } }
+  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'deploy_key', vault_key: '' } }
 }
 
 function repoToInput(r: RepoInfo): RepoInput {
