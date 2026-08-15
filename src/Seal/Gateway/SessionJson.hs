@@ -90,6 +90,7 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "firstMessageSnippet" .= mSnippet
   , "channel" .= smChannel m
   , "channelUserId" .= (Nothing :: Maybe Text)
+  , "repoId" .= smRepo m
   , "lastUserMessageAt" .= mLastUserMessageAt
   ]
 

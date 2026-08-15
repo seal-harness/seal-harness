@@ -16,6 +16,7 @@ export function RunningHarnesses({
   tabModel,
   tabLabel,
   tabAgeText,
+  tabRepoId,
   onSelectTab,
   onCloseTab,
   onDismiss,
@@ -32,6 +33,8 @@ export function RunningHarnesses({
   tabLabel: (tab: TabInfo) => string
   /** Resolve a tab to its coarse age pill text — see ActiveTabs.tabAgeText. */
   tabAgeText: (tab: TabInfo) => string
+  /** Resolve a tab to its repo id — see ActiveTabs.tabRepoId. */
+  tabRepoId: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onCloseTab: (index: number) => void
   onDismiss: (index: number) => void
@@ -80,6 +83,7 @@ export function RunningHarnesses({
             activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
             model={tabModel(tab)}
             ageText={tabAgeText(tab)}
+            repoId={tabRepoId(tab)}
           />
         ))}
     </div>

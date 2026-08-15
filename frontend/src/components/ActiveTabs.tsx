@@ -76,6 +76,7 @@ export function TabRow({
   activity,
   model,
   ageText,
+  repoId,
 }: {
   tab: TabInfo
   /** Resolved display label for this tab (session title, harness fallback,
@@ -95,6 +96,10 @@ export function TabRow({
   /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
    *  mirroring the Recent Sessions age pill. Empty string → no pill. */
   ageText?: string
+  /** The repo id of the source-control repo associated with this tab's
+   *  session, or empty string when no repo is associated. Displayed
+   *  before the model in the status line. */
+  repoId?: string
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
   // must not crash the render — fall back to a neutral glyph/label.
@@ -282,6 +287,12 @@ export function TabRow({
         data-testid={`tab-status-label-${tab.index}`}
       >
         {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
+       {repoId && (
+         <>
+           <span style={{ color: 'var(--text-faint)' }}>·</span>
+           <span style={{ color: 'var(--text-faint)' }}>{repoId}</span>
+         </>
+       )}
         {model && (
           <>
             <span style={{ color: 'var(--text-faint)' }}>·</span>
@@ -300,6 +311,7 @@ export function ActiveTabs({
   tabModel,
   tabLabel,
   tabAgeText,
+  tabRepoId,
   onSelectTab,
   onNewTab,
   onCloseTab,
@@ -324,6 +336,10 @@ export function ActiveTabs({
    *  Centralized by the parent so Active Tabs and Running Harnesses agree
    *  with the Recent Sessions age pill. */
   tabAgeText: (tab: TabInfo) => string
+  /** Resolve a tab to the repo id of its associated source-control repo,
+   *  or empty string when no repo is associated. Centralized by the parent
+   *  so Active Tabs and Running Harnesses agree. */
+  tabRepoId: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
@@ -368,6 +384,7 @@ export function ActiveTabs({
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
           model={tabModel(tab)}
           ageText={tabAgeText(tab)}
+          repoId={tabRepoId(tab)}
         />
       ))}
     </>

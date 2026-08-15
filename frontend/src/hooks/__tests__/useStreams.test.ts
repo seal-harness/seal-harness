@@ -71,7 +71,7 @@ describe('useListsStream', () => {
     act(() => {
       c.pushLists({
         tabs: [{ index: 0, kind: 'session:anthropic', label: null, status: 'running', session_id: 's1' }],
-        recentSessions: [{ id: 's2', agent: null, runtime: 'r', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: null, channelUserId: null, lastUserMessageAt: null }],
+        recentSessions: [{ id: 's2', agent: null, runtime: 'r', model: 'm', lastActive: 't', createdAt: 't', description: null, autoSummary: null, firstMessageSnippet: null, channel: null, channelUserId: null, lastUserMessageAt: null, repoId: null }],
         archivedSessions: [],
         tabSessions: [],
       })
