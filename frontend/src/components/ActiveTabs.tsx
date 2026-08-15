@@ -75,6 +75,7 @@ export function TabRow({
   onRelease,
   activity,
   model,
+  repo,
   ageText,
 }: {
   tab: TabInfo
@@ -92,6 +93,11 @@ export function TabRow({
   /** The model id this tab's session was started with (already
    *  shortened for display), or empty string when no model is known. */
   model?: string
+  /** The repo id associated with this tab's session (the registered repo
+   *  id or sanitized repo name cloned via SETUP_REPO), or empty string /
+   *  undefined when no repo is associated. Rendered before the model in the
+   *  status line. */
+  repo?: string
   /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
    *  mirroring the Recent Sessions age pill. Empty string → no pill. */
   ageText?: string
@@ -282,6 +288,12 @@ export function TabRow({
         data-testid={`tab-status-label-${tab.index}`}
       >
         {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
+        {repo && (
+          <>
+            <span style={{ color: 'var(--text-faint)' }}>·</span>
+            <span style={{ color: 'var(--text-faint)' }}>{repo}</span>
+          </>
+        )}
         {model && (
           <>
             <span style={{ color: 'var(--text-faint)' }}>·</span>
@@ -298,6 +310,7 @@ export function ActiveTabs({
   selectedId,
   sessionActivity,
   tabModel,
+  tabRepo,
   tabLabel,
   tabAgeText,
   onSelectTab,
@@ -319,6 +332,11 @@ export function ActiveTabs({
    *  no model). Centralized by the parent so Active Tabs and Running
    *  Harnesses agree. */
   tabModel: (tab: TabInfo) => string
+  /** Resolve a tab to the repo id associated with its session (the
+   *  registered repo id or sanitized repo name cloned via SETUP_REPO), or
+   *  empty string when no repo is associated. Centralized by the parent so
+   *  Active Tabs and Running Harnesses agree. */
+  tabRepo: (tab: TabInfo) => string
   /** Resolve a tab to its coarse age pill text ("now"/"Nm"/"Nh"/"Nd"), or
    *  empty string when no age basis is available (no pill rendered).
    *  Centralized by the parent so Active Tabs and Running Harnesses agree
@@ -367,6 +385,7 @@ export function ActiveTabs({
           onRelease={() => onRelease(tab.index)}
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
           model={tabModel(tab)}
+          repo={tabRepo(tab)}
           ageText={tabAgeText(tab)}
         />
       ))}

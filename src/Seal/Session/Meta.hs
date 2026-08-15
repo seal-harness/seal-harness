@@ -44,6 +44,12 @@ data SessionMeta = SessionMeta
     -- @session.json@ so it survives restarts and propagates to the
     -- sidebar (which reads the live session list, not a client-side
     -- override).
+  , smRepo :: Maybe Text
+    -- ^ The id (registered 'RepoId' text, or the sanitized repo name for a
+    -- bare-URL clone) of the repository most recently cloned into the
+    -- session's workdir via @SETUP_REPO@. 'Nothing' when no repo has been
+    -- set up. Persisted so the sidebar can surface the associated repo
+    -- without re-reading the transcript. Cleared only by a new session.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
   } deriving stock (Eq, Show)
@@ -58,6 +64,7 @@ instance ToJSON SessionMeta where
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
     , "description" .= smDescription m
+    , "repo"        .= smRepo m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
     ]
@@ -72,5 +79,6 @@ instance FromJSON SessionMeta where
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
     <*> o .:? "description"
+    <*> o .:? "repo"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

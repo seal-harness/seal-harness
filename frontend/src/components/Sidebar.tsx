@@ -247,6 +247,17 @@ export function Sidebar({
     return shortenModel(session.model)
   }
 
+  // The repo id associated with this tab's session (the registered repo id
+  // or sanitized repo name cloned via SETUP_REPO), or empty string when no
+  // repo is associated (no backing session, or session with no repo).
+  // Centralized here so both ActiveTabs and RunningHarnesses share the
+  // same session-join — mirrors the tabModel pattern.
+  const tabRepo = (tab: TabInfo): string => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    if (!session || !session.repo) return ''
+    return session.repo
+  }
+
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
   // uses activity.lastEntryAt ?? session.lastActive. Tabs without a backing
   // session (e.g. raw shell tabs) or any activity frame render no pill.
@@ -294,6 +305,7 @@ export function Sidebar({
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
           tabModel={tabModel}
+          tabRepo={tabRepo}
           tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
@@ -309,6 +321,7 @@ export function Sidebar({
           sessionActivity={sessionActivity}
           tabLabel={tabLabel}
           tabModel={tabModel}
+          tabRepo={tabRepo}
           tabAgeText={tabAgeText}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}

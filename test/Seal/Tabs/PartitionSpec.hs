@@ -33,7 +33,7 @@ mkMeta s =
     , smAgent = Nothing
     , smSystemOverride = Nothing
     , smAgentName = Nothing
-    , smDescription = Nothing
+    , smDescription = Nothing, smRepo = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime
     }

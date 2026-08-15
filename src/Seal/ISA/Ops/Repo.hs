@@ -44,6 +44,7 @@ module Seal.ISA.Ops.Repo
   , sanitizeRepoName
   , normalizeRepoUrl
   , isShellMetachar
+  , setupRepoPersistId
   , CloneResult (..)
   , cloneRepoIO
   ) where
@@ -65,7 +66,7 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Clone
   ( CloneDeps (..), CloneEnv (..), renderCloneError, resolveCloneTarget
   , withCloneTarget )
-import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..))
+import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..), repoIdText)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
 import Seal.Tools.Exec.UntrustedIO
@@ -312,6 +313,37 @@ shellCmd t = case mkShellCommand t of
 recordWith :: Value -> Text -> Text -> Value
 recordWith _ target status =
   object [ "target" .= target, "status" .= status ]
+
+-- | Pure: derive the repo id to persist into 'SessionMeta.smRepo' after a
+-- @SETUP_REPO@ dispatch. Called by the web dispatcher (and any other
+-- dispatch site that wants to surface the associated repo in the sidebar)
+-- with the opcode's input @Value@ (for the @url@), the 'OpResult' (for the
+-- recorded @target@ + @status@), and the current repo registry list (for
+-- resolving the registered 'RepoId').
+--
+-- Returns:
+--
+-- * 'Just repoId' — the registered 'RepoId' text when the input url
+--   matches a registered repo, falling back to the recorded @target@ dir
+--   name for a bare-URL clone (unregistered repo). Only on a successful
+--   clone or no-op.
+-- * 'Nothing' — on a conflict, a failed clone, a missing @url@ in the
+--   input, or a missing @target@ in the recorded payload (nothing to
+--   persist).
+setupRepoPersistId :: Value -> OpResult -> [SourceRepo] -> Maybe Text
+setupRepoPersistId input result repos
+  | orIsError result = Nothing
+  | otherwise = do
+      url <- urlField input
+      target <- targetField (orRecorded result)
+      let mReg = lookupRepoByUrl url (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
+      pure $ case mReg of
+        Just r  -> repoIdText (srId r)
+        Nothing -> target
+
+-- | Extract the @target@ field from a SETUP_REPO recorded payload (pure).
+targetField :: Value -> Maybe Text
+targetField = parseMaybe (withObject "recorded" (.: "target"))
 
 -- | Single-quote a shell token (the safe way to embed a literal in a
 -- @\/bin\/sh -c@ single-arg command). Any embedded @'@ becomes @'\''@.

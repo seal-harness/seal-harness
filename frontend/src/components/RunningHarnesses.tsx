@@ -14,6 +14,7 @@ export function RunningHarnesses({
   selectedId,
   sessionActivity,
   tabModel,
+  tabRepo,
   tabLabel,
   tabAgeText,
   onSelectTab,
@@ -28,6 +29,9 @@ export function RunningHarnesses({
   /** Resolve a tab to the shortened model id its session was started with,
    *  or empty string when no model is known. See ActiveTabs.tabModel. */
   tabModel: (tab: TabInfo) => string
+  /** Resolve a tab to the repo id associated with its session, or empty
+   *  string when no repo is associated. See ActiveTabs.tabRepo. */
+  tabRepo: (tab: TabInfo) => string
   /** Resolve a tab to its display label — see ActiveTabs.tabLabel. */
   tabLabel: (tab: TabInfo) => string
   /** Resolve a tab to its coarse age pill text — see ActiveTabs.tabAgeText. */
@@ -79,6 +83,7 @@ export function RunningHarnesses({
             onRelease={() => onRelease(tab.index)}
             activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
             model={tabModel(tab)}
+            repo={tabRepo(tab)}
             ageText={tabAgeText(tab)}
           />
         ))}
