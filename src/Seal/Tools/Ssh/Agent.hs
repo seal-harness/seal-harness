@@ -33,9 +33,9 @@ module Seal.Tools.Ssh.Agent
   , mkRealSshAgentHandle
   , mkFakeSshAgentHandle
   , FakeAgentCall (..)
-  , agentCreateProcess_close_fds
-  , addKeyCreateProcess_close_fds
-  , killCreateProcess_close_fds
+  , agentCreateProcessCloseFds
+  , addKeyCreateProcessCloseFds
+  , killCreateProcessCloseFds
   ) where
 
 import Control.Exception (try)
@@ -219,16 +219,16 @@ killCreateProcess env =
 
 -- | Test-visible projections of the 'close_fds' field (the FD-leak
 -- regression test asserts these are 'True').
-agentCreateProcess_close_fds :: Bool
-agentCreateProcess_close_fds =
+agentCreateProcessCloseFds :: Bool
+agentCreateProcessCloseFds =
   close_fds (agentCreateProcess ["ssh-agent", "-s"])
 
-addKeyCreateProcess_close_fds :: Bool
-addKeyCreateProcess_close_fds =
+addKeyCreateProcessCloseFds :: Bool
+addKeyCreateProcessCloseFds =
   close_fds (addKeyCreateProcess [] "ssh-add" ["-D"])
 
-killCreateProcess_close_fds :: Bool
-killCreateProcess_close_fds = close_fds (killCreateProcess [])
+killCreateProcessCloseFds :: Bool
+killCreateProcessCloseFds = close_fds (killCreateProcess [])
 
 -- | Run a process with a given env + stdin 'ByteString', capturing
 -- stdout/stderr as 'Text'.

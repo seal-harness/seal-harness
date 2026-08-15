@@ -196,7 +196,7 @@ listWorkdirSkills workdir = do
         -- Stamp each repo-local skill with a group derived from the repo
         -- directory name so the <available_skills> catalog groups them
         -- under a "<repo> project skills" heading.
-        pure (mapMaybe (prefixWorkdirSkill (T.pack repo)) (map (stampProjectGroup (T.pack repo)) raw))
+        pure (mapMaybe (prefixWorkdirSkill (T.pack repo) . stampProjectGroup (T.pack repo)) raw)
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)

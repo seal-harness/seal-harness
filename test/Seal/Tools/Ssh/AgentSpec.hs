@@ -17,10 +17,10 @@ spec :: Spec
 spec = describe "Seal.Tools.Ssh.Agent" $ do
   describe "mkRealSshAgentHandle (FD-leak regression — #88)" $ do
     it "ssh-agent CreateProcess has close_fds = True" $
-      agentCreateProcess_close_fds `shouldBe` True
+      agentCreateProcessCloseFds `shouldBe` True
 
     it "ssh-add CreateProcess has close_fds = True" $
-      addKeyCreateProcess_close_fds `shouldBe` True
+      addKeyCreateProcessCloseFds `shouldBe` True
 
     it "ssh-agent -k CreateProcess has close_fds = True" $
-      killCreateProcess_close_fds `shouldBe` True
+      killCreateProcessCloseFds `shouldBe` True
