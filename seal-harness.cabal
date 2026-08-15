@@ -134,9 +134,12 @@ library
          Seal.Tools.Args
          Seal.Tools.Exec.Remote
          Seal.Tools.Exec.Types
-         Seal.Tools.Exec.Untrusted
-         Seal.Tools.Exec.UntrustedIO
-         Seal.Tools.Ssh.Agent
+          Seal.Tools.Exec.Untrusted
+          Seal.Tools.Exec.UntrustedIO
+          Seal.Tools.Exec.UIO
+          Seal.Tools.Exec.UIO.Internal
+          Seal.Tools.Exec.UIOGit
+          Seal.Tools.Ssh.Agent
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -420,6 +423,8 @@ test-suite tests
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec
+       Seal.Tools.Exec.UIOSpec
+       Seal.Tools.Exec.UIOParitySpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec
@@ -431,8 +436,9 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
-        Seal.TestHelpers.FakeRegistry
-        Seal.TestHelpers.FakeVault
+       Seal.TestHelpers.FakeRegistry
+       Seal.TestHelpers.FakeVault
+       Seal.TestHelpers.FixtureRepo
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
