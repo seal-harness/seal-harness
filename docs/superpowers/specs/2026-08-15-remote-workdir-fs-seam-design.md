@@ -1,6 +1,6 @@
 # Remote-Aware Workdir Filesystem Seam — Design
 
-> **Status:** Draft (round 5, post-review-gate + UIO augmentation). **Branch**:
+> **Status:** Draft (round 6, post-review-gate + UIO augmentation). **Branch**:
 > `fix/remote-workdir-fs-seam-106`. **Issue**: #106. Closes the remote-mode
 > regression in repo-local agent-def and skill discovery, and introduces
 > the `UIO` monad as the sole execution context for untrusted opcodes.
@@ -270,10 +270,14 @@ An audit of every untrusted opcode (`File.hs`, `Shell.hs`, `Search.hs`,
 - **Zero Katip logging** in opcode bodies.
 - **`UntrustedIO` is already an explicit `uoRun` argument** (not an env
   read) — it slots cleanly into a `UIO` that carries it internally.
-- `WorkspaceRoot`/`SecurityPolicy`/`operatorCeiling`/`CloneDeps` are
-  **closure parameters** captured at opcode construction
-  (`buildWebRegistry`), not runtime env reads. They stay closure
-  parameters under `UIO` (the `UIO` context need not carry them).
+- `WorkspaceRoot`/`SecurityPolicy`/`operatorCeiling` are **closure
+  parameters** captured at opcode construction (`buildWebRegistry`),
+  not runtime env reads. They stay closure parameters under `UIO`
+  (the `UIO` context need not carry them). `CloneDeps` is the one
+  exception — it moves into `UIOEnv` (§3.10/§3.11; Git opcodes use
+  `uioCd*` from the `UIO` context), but it stays a Git closure param
+  through W-A3 (W6 drops it when the dispatcher threads a real
+  `seUIOEnv`).
 - The one wrinkle — Git's `CloneDeps` (repo registry, vault helpers via
   `liftIO`) — is a closure-captured capability, not an env read. It
   lifts into `UIO` the same way `UntrustedIO` does (§3.11).
@@ -367,6 +371,53 @@ sections were internally inconsistent. Resolutions:
   `cloneDeps` dropped — Git opcodes use `uioCd*`"). `aeUntrustedIO`
   → `aeUIOEnv` field rename pinned in W-A3.
 
+## Design review gate (round 5 → round 6)
+
+Round 5 ran 5 reviewers. PM/Security/Architect: APPROVED.
+Designer/CTO: NEEDS_REVISION — both with the same root cause (the
+W-A3→W3 dependency contradiction) plus two doc fixes. Resolutions:
+
+- **CRITICAL: W-A3→W3 dependency contradiction (CTO B1, Architect B2)** —
+  round-5 W-A3 DoD said `aeUntrustedIO → aeUIOEnv` (field rename + type
+  change) AND "keep `uoRunLegacy` so the dispatcher compiles before
+  it's rewired" — mutually exclusive (the rename needs a production
+  `UIOEnv` source that only W3's `mkSessionExec` provides; ~30 test
+  `AgentEnv` sites + 4 production sites would break). Resolution
+  (option (b) from the CTO): **defer the `aeUIOEnv` rename + dispatch
+  `runUIOWithEnv` change to W6** (not W3). W-A3 migrates opcode
+  *bodies* to `UIO` (the `uoRun` field type changes to `Value -> UIO
+  OpResult`); the dispatcher keeps the old `UntrustedIO`-based path
+  via `uoRunLegacy`; `aeUntrustedIO` stays `UntrustedIO` through
+  W-A3/W1/W2/W3. W6 does the rename + dispatch rewire + drops
+  `uoRunLegacy`. The suite is green after each W.
+- **`uoRunLegacy` CloneDeps gap (CTO S3)** — `uoRunLegacy ::
+  UntrustedIO -> Maybe CloneDeps -> Value -> App OpResult` (added the
+  `Maybe CloneDeps` arg). For Git, the real `CloneDeps` (still
+  closure-captured through W-A3) is passed; for non-Git, `Nothing` and
+  a fail-closed stub `CloneDeps` is built internally. Git constructors
+  KEEP `CloneDeps` through W-A3 (drop in W6). Pinned in W-A3 DoD.
+- **W6 migration scope expanded (CTO B2)** — W6 file scope now
+  includes `src/Seal/ISA/Dispatch.hs` (rewire), `src/Seal/Agent/Loop.hs`
+  + `src/Seal/Agent/Runtime/Delegation/Worker.hs` (field rename), and
+  the ~30 test `AgentEnv` construction sites (`LoopSpec`, `Phase2bSpec`,
+  `Phase5Spec`, `Phase7aSpec`, `WiringSpec`, `SignalRunSpec`, `CliSpec`).
+- **CloneDeps placement prose (Designer B1)** — the augmentation
+  narrative still said "stay closure parameters under UIO" for
+  `CloneDeps` (contradicting §3.10/§3.11). Fixed: `CloneDeps` is the
+  one exception (moves into `UIOEnv`; stays a Git closure param through
+  W-A3, dropped in W6). `WorkspaceRoot`/`SecurityPolicy`/
+  `operatorCeiling` stay closure params.
+- **`UIOEnv` in W6 grep (Designer S1)** — W6 DoD grep now asserts no
+  `WorkdirFs` AND no `UIOEnv` field in `AppEnv`/registry/opcode
+  modules.
+- **`mkTestUIOEnv` scope (Designer S2)** — pinned to the `Test`-prefix
+  naming gate (matching `mkFakeRemoteRunnerRecording`); `#ifdef TESTING`
+  dropped (the codebase has zero such guards). Exported to both
+  `src/` (`uoRunLegacy` uses it) and tests.
+- **Security non-blocking (adopted)**: the W-A3 CI grep uses OR logic
+  (module path string `Seal.Tools.Exec.UIOGit` catches qualified/aliased
+  imports; `uioCd` prefix catches re-exports).
+
 ### Design decisions (UIO, round 5 — coherent)
 
 - **`UIO` lifts `UntrustedIO` + `CloneDeps` operations as module-level
@@ -379,7 +430,9 @@ sections were internally inconsistent. Resolutions:
   only by `Seal.ISA.Ops.Git` — lexical scoping restored).
 - **All untrusted opcodes (incl. Git) migrate to `UIO`.** `CloneDeps`
   is in `UIOEnv`; Git opcode constructors DROP their `CloneDeps` param
-  (they use `uioCd*` from the `UIO` context).
+  (they use `uioCd*` from the `UIO` context). (Per round-6: Git keeps
+  `CloneDeps` as a closure param through W-A3 — the dispatcher threads
+  it via `uoRunLegacy`; W6 drops it when `seUIOEnv` is wired.)
 - **`WorkdirFs` stays a separate handle but its remote arm is
   implemented on `UIO`'s `uioShellExec`** (§3.12). One SSH transport
   (`UIO`'s `RemoteRunner`, shared via `runUIOWithEnv`); `WorkdirFs`
@@ -1325,11 +1378,16 @@ no network IO, no subprocess. The implementer MUST NOT reach for
   the existing type at `Clone.hs:277`). Each reads `CloneDeps` from
   `UIOEnv`. Imported only by `Seal.ISA.Ops.Git` (W-A3 CI grep guard).
 - **Test helper** `mkTestUIOEnv :: UntrustedIO -> CloneDeps -> UIOEnv`
-  (exported from `Seal.Tools.Exec.UIO` to tests only — NOT to
-  `src/Seal/` production modules; gate via a `Seal.Test.*` module or a
-  `#ifdef TESTING` boundary, mirroring existing test-helper patterns).
-  Git opcode tests use a stub `CloneDeps` (fake repo registry + vault
-  helpers) via this helper.
+  exported from `Seal.Tools.Exec.UIO` with the `Test` prefix as the
+  naming gate (matching the codebase's `mkFakeRemoteRunnerRecording`
+  pattern in `src/Seal/Tools/Exec/Remote.hs` — the `Fake`/`Test` prefix
+  is the convention; no `#ifdef TESTING` — the codebase has zero such
+  guards). Exported to both `src/` (the `uoRunLegacy` back-compat
+  wrapper in W-A3 uses it to build a `UIOEnv` from the dispatcher's
+  `UntrustedIO` + a stub/real `CloneDeps`) and tests (Git specs use a
+  stub `CloneDeps` — all 6 fields stubbed: `cdVault`, `cdRepoReg`,
+  `cdSshAgent`, `cdAgentRegistry`, `cdPinnedKnownHosts`,
+  `cdKeyfilesDir` — seeded into the `UIOEnv` via this helper).
 - New `UIOSpec`: local arm runs an action calling each `uio*` function
   against a temp workdir; stub arm asserts every operation returns
   fail-closed; `mkLocalUIO` vs `mkRemoteUIO` (with
@@ -1380,50 +1438,82 @@ no network IO, no subprocess. The implementer MUST NOT reach for
   `import Control.Monad.IO.Class` removed from these modules; no
   `liftIO`/`ask`/`throwM` remains. Git opcodes additionally import
   `Seal.Tools.Exec.UIOGit` for `uioCd*`.
-- **Git opcode constructors DROP their `CloneDeps` param**
-  (`gitFetchOp`/`gitPullOp`/`gitPushOp`/`setupRepoOp` no longer take
-  `CloneDeps` — they use `uioCd*` from the `UIO` context).
-  `buildWebRegistry` drops `cloneDeps` from the closure params;
-  `UntrustedIO` is no longer a runtime arg (carried by `UIOEnv`).
-  Closure params `wsRoot`/`policy`/`operatorCeiling` unchanged.
+- **Git opcode constructors KEEP their `CloneDeps` param through W-A3**
+  (the `CloneDeps` moves into `UIOEnv` in **W6**, not W-A3 — see the
+  `uoRunLegacy` CloneDeps gap below). `buildWebRegistry` keeps
+  `cloneDeps` as a closure param through W-A3; W6 drops it. Closure
+  params `wsRoot`/`policy`/`operatorCeiling`/`cloneDeps` unchanged in
+  W-A3. (Git opcode *bodies* migrate to `uioCd*` in W-A3, but the
+  `CloneDeps` value is still closure-captured and threaded into the
+  `UIOEnv` by `uoRunLegacy` until W6 rewires the dispatcher to source
+  it from `seUIOEnv`.)
 - **Agent-loop env**: `aeUntrustedIO :: UntrustedIO` (Loop.hs:374)
-  becomes `aeUIOEnv :: UIOEnv`; the dispatch call site becomes
-  `dispatch ... aeUIOEnv ...`.
-- Dispatcher (`Dispatch.hs`) updated: after `tfwRecordAndAck`, it runs
-  the opcode's `UIO` action via `runUIOWithEnv uioEnv (uoRun op input)`
-  (where `uioEnv` is threaded as a new `dispatch` param), NOT via
-  `App`. `runUIOWithEnv` is imported from `Seal.Tools.Exec.UIO`. The
-  `App` context stays for the dispatcher (ACK + transcript + logging)
-  + the three caller-side recorders (`SKILL_LOAD`/`SETUP_REPO`/
-  `GIT_PUSH`).
+  **stays `UntrustedIO` through W-A3/W1/W2/W3** — the rename to
+  `aeUIOEnv :: UIOEnv` + the dispatch `runUIOWithEnv` change land in
+  **W6** (when `mkSessionExec` provides `seUIOEnv` and the wiring
+  sites pass it). The dispatch signature stays `UntrustedIO`-based
+  through W-A3.
+- Dispatcher (`Dispatch.hs`) keeps the **old `UntrustedIO`-based path
+  through W-A3** via `uoRunLegacy` (below). W6 rewires it to
+  `runUIOWithEnv uioEnv (uoRun op input)` (where `uioEnv` is
+  `seUIOEnv`, threaded as a new `dispatch` param), NOT via `App`.
+  `runUIOWithEnv` is imported from `Seal.Tools.Exec.UIO`. The `App`
+  context stays for the dispatcher (ACK + transcript + logging) + the
+  three caller-side recorders (`SKILL_LOAD`/`SETUP_REPO`/`GIT_PUSH`).
 - **CI grep guard (CloneDeps scoping, W-A3-specific)**: asserts
   `Seal.Tools.Exec.UIOGit` / `uioCd*` are referenced ONLY from
   `src/Seal/ISA/Ops/Git.hs` (+ the `UIOGit.hs` definition site).
   Mirrors the W6 `WorkdirFs` discipline. Added as a grep test in W-A3.
+  (The grep uses OR logic: matches the module path string
+  `Seal.Tools.Exec.UIOGit` — catches qualified/aliased imports — OR
+  the `uioCd` function prefix — catches re-export scenarios.)
 - Existing opcode specs (`FileSpec`, `ShellSpec`, `SearchSpec`,
   `BinSpec`, `ProcessSpec`, `GitSpec`) updated to run opcodes in `UIO`
   (via `mkLocalUIO (WorkspaceRoot tmp)` — no `Maybe GitRepo`) instead
   of passing a raw `UntrustedIO`. Git specs need a stub `CloneDeps`
-  (a fake repo registry + vault helpers) seeded into the `UIOEnv` via
-  a test helper (`mkTestUIOEnv` — added in W-A1 for stub-arm tests).
-  Test logic unchanged; construction wraps.
-- Back-compat: during W-A3, keep a temporary `uoRunLegacy ::
-  UntrustedIO -> Value -> App OpResult` wrapper (delegating to the new
-  `UIO` action via a local `mkLocalUIO`) so the dispatcher compiles
-  before it's rewired. W6 removes it.
+  (all 6 `CloneDeps` fields stubbed: `cdVault`, `cdRepoReg`,
+  `cdSshAgent`, `cdAgentRegistry`, `cdPinnedKnownHosts`,
+  `cdKeyfilesDir` — mirroring the existing `GitSpec` fake repo
+  registry + vault stub pattern) seeded into the `UIOEnv` via
+  `mkTestUIOEnv` (W-A1). Test logic unchanged; construction wraps.
+- **Back-compat (`uoRunLegacy`, the CloneDeps gap fix)**: during
+  W-A3, keep a temporary `uoRunLegacy :: UntrustedIO -> Maybe
+  CloneDeps -> Value -> App OpResult` wrapper. The dispatcher calls
+  `uoRunLegacy op (Just cloneDeps) input` for Git opcodes (where
+  `cloneDeps` is still closure-captured at the opcode construction
+  site — Git constructors keep `CloneDeps` through W-A3) and
+  `uoRunLegacy op Nothing input` for non-Git opcodes. `uoRunLegacy`
+  internally builds a `UIOEnv` from the `UntrustedIO` + the `CloneDeps`
+  (real for Git; a fail-closed stub `CloneDeps` for non-Git, which
+  never touches it) via an internal helper, then runs
+  `runUIOWithEnv uioEnv (uoRun op input)` via `liftIO`. This keeps
+  the suite green (the dispatcher + `AgentEnv` sites + ~30 test
+  `aeUntrustedIO` construction sites unchanged) until W6 does the
+  rename + dispatch rewire + drops `uoRunLegacy` + drops Git's
+  `CloneDeps` closure param. The fail-closed stub `CloneDeps` for
+  non-Git is `mempty`-shaped (all fields stub) — non-Git opcodes
+  never call `uioCd*`, so the stub is never exercised.
 **RED**: a migrated opcode spec asserting the opcode runs under `UIO`
   and produces the correct `OpResult` (behavior RED) + the W-A2
   compile-fail fixture pointed at a real opcode module (a bare `liftIO`
   in the body is a compile error).
-**File scope**: `src/Seal/ISA/Opcode.hs`, `src/Seal/ISA/Dispatch.hs`,
-  `src/Seal/ISA/Ops/{File,Shell,Search,Bin,Process,Git}.hs`,
+**File scope**: `src/Seal/ISA/Opcode.hs` (`uoRun` signature change),
+  `src/Seal/ISA/Dispatch.hs` (add `uoRunLegacy` path; keep old
+  `UntrustedIO`-based dispatch — the `runUIOWithEnv` rewire is W6),
+  `src/Seal/ISA/Ops/{File,Shell,Search,Bin,Process,Git}.hs` (body
+  migration to `uio*`/`uioCd*`),
   `src/Seal/Tools/Exec/UIOGit.hs` (new — the `uioCd*` functions),
-  `src/Seal/Agent/Loop.hs` (`aeUntrustedIO` → `aeUIOEnv`),
-  `src/Seal/Gateway/Send.hs` (the `buildWebRegistry` call — drop
-  `cloneDeps`), `src/Seal/Channels/Loop.hs`, `src/Seal/Channel/Cli.hs`
-  (the dispatch sites — pass `UIOEnv` to `dispatch`),
-  `test/Seal/ISA/Ops/*Spec.hs` (extend), `seal-harness.cabal`,
-  `test/Main.hs`.
+  `src/Seal/Gateway/Send.hs` (the `buildWebRegistry` call — `cloneDeps`
+  stays a closure param through W-A3; dropped in W6),
+  `test/Seal/ISA/Ops/*Spec.hs` (extend — run opcodes via `mkLocalUIO`;
+  Git specs via `mkTestUIOEnv` with stub `CloneDeps`),
+  `test/Seal/ISA/Ops/UIOGitScopingSpec.hs` (new — the W-A3 CI grep
+  guard as a test spec), `seal-harness.cabal`, `test/Main.hs`.
+  (The `aeUntrustedIO` → `aeUIOEnv` rename + dispatch `runUIOWithEnv`
+  rewire + `Channels/Loop.hs`/`Channel/Cli.hs` dispatch-site changes +
+  `src/Seal/Agent/Runtime/Delegation/Worker.hs` + the ~30 test
+  `AgentEnv` construction sites all land in **W6**, not W-A3 — see W6
+  file scope.)
 
 ### W1 — The `WorkdirFs` handle + local/in-memory stubs
 **DoD:**
@@ -1629,18 +1719,35 @@ no network IO, no subprocess. The implementer MUST NOT reach for
   `test/Seal/Skills/BackendNoDirectFsFail.hs` (new),
   `seal-harness.cabal`.
 
-### W6 — Rewire wiring sites + `adSecurityConfig` + remove back-compat wrappers (RED: API integration)
+### W6 — Rewire wiring sites + `adSecurityConfig` + UIO dispatch rewire + remove back-compat wrappers (RED: API integration)
 **DoD:**
 - `Send.hs:461-476`, `API.hs:793-794`, `Channels/Loop.hs` sites,
   `Channel/Cli.hs` sites: replace `mkSessionUntrustedIO` +
   `ensureSessionWorkdir` + `workdirAgentDefBackend wd` +
   `Skill.workdirSkillBackend wd` with
   `mkSessionExec paths secCfg sid mkRealRemoteRunner` +
-  `seWorkdirFs`/`seWorkspaceRoot`, calling the `Fs`-suffixed backend
-  functions (`workdirAgentDefBackendFs`, `workdirSkillBackendFs`).
+  `seWorkdirFs`/`seWorkspaceRoot`/`seUIOEnv`, calling the `Fs`-suffixed
+  backend functions (`workdirAgentDefBackendFs`, `workdirSkillBackendFs`).
 - Remove the W4/W5 back-compat `FilePath` wrappers; promote
   `workdirAgentDefBackendFs` → `workdirAgentDefBackend` (and the skill
   equivalent) at the exported name.
+- **UIO dispatch rewire (deferred from W-A3)**: the `aeUntrustedIO ::
+  UntrustedIO` field in `AgentEnv` (`Loop.hs:374` +
+  `src/Seal/Agent/Runtime/Delegation/Worker.hs:170` +
+  `src/Seal/Channels/Loop.hs` + `src/Seal/Channel/Cli.hs`) renames to
+  `aeUIOEnv :: UIOEnv`; the dispatch call sites become
+  `dispatch ... aeUIOEnv ...`. The dispatcher (`Dispatch.hs`) rewires
+  from `uoRunLegacy` to `runUIOWithEnv uioEnv (uoRun op input)`.
+  `uoRunLegacy` is removed. Git opcode constructors DROP their
+  `CloneDeps` closure param (they source `CloneDeps` from
+  `seUIOEnv`/`uioCd*`); `buildWebRegistry` drops `cloneDeps`.
+  - **Wide mechanical change (~30 test `AgentEnv` sites)**: every
+    test that constructs an `AgentEnv` with `aeUntrustedIO =
+    mkRemoteUntrustedIOStub` (`LoopSpec`: ~25 sites, `Phase2bSpec`,
+    `Phase5Spec`, `Phase7aSpec`, `WiringSpec`, `SignalRunSpec`,
+    `CliSpec`) updates to `aeUIOEnv = <UIOEnv from mkTestUIOEnv or
+    mkUIOStub>`. Plus the 4 production sites (`Send.hs`,
+    `Channels/Loop.hs`, `Channel/Cli.hs`, `Worker.hs`).
 - `wsroot` sourced from `seWorkspaceRoot exec` (not `wfsRoot` — dropped).
 - `ApiDeps` gains `adSecurityConfig :: SecurityConfig`. **Construction
   sites to update (wide mechanical change)**: ~20 `ApiDeps` literals in
@@ -1658,13 +1765,16 @@ no network IO, no subprocess. The implementer MUST NOT reach for
 - **Capability-scoping CI-enforced grep check** (mirrors the
   `CapabilityScopingFail` compile-fail discipline for `UntrustedIO`):
   a grep in the W6 test (or a new `Seal.CapabilityScopingWorkdirFsFail`
-  fixture) asserting NO `WorkdirFs` field appears in `AppEnv`, the ISA
-  registry env record types, or any module under `src/Seal/ISA/Ops/`
-  (the opcode implementations). The `SessionExec` record is consumed at
-  the turn-entry site; `seWorkdirFs` is passed ONLY to the discovery
-  backends. (The handle MAY be captured in backend closures used during
-  opcode dispatch — §3.1 — but opcodes only receive the backends' typed
-  interfaces, never `WorkdirFs` directly.)
+  fixture) asserting NO `WorkdirFs` field AND NO `UIOEnv` field appears
+  in `AppEnv`, the ISA registry env record types, or any module under
+  `src/Seal/ISA/Ops/` (the opcode implementations). The `SessionExec`
+  record is consumed at the turn-entry site; `seWorkdirFs` /
+  `seUIOEnv` are passed ONLY to the discovery backends / dispatcher
+  respectively. (The handles MAY be captured in backend closures used
+  during opcode dispatch — §3.1 — but opcodes only receive the backends'
+  typed interfaces, never `WorkdirFs`/`UIOEnv` directly. `UIOEnv` is
+  threaded to `dispatch`, which runs the opcode via
+  `runUIOWithEnv`; the opcode body in `UIO` has no `UIOEnv` access.)
 - **RED (concrete)**: `ApiSpec` case — `GET /api/sessions/:id/agents`
   in `mode=remote` (with `mkSessionExec` injected with
   `mkFakeRemoteRunnerRecording` and a stub-remote `WorkdirFs` seeded
@@ -1677,11 +1787,20 @@ no network IO, no subprocess. The implementer MUST NOT reach for
 **File scope**: `src/Seal/Gateway/Send.hs`, `src/Seal/Gateway/API.hs`,
   `src/Seal/Gateway/Serve.hs` (the production `ApiDeps` construction),
   `src/Seal/Channels/Loop.hs`, `src/Seal/Channel/Cli.hs`,
+  `src/Seal/ISA/Dispatch.hs` (the `runUIOWithEnv` rewire + drop
+  `uoRunLegacy`), `src/Seal/ISA/Opcode.hs` (drop `uoRunLegacy`),
+  `src/Seal/Agent/Loop.hs` (`aeUntrustedIO` → `aeUIOEnv`),
+  `src/Seal/Agent/Runtime/Delegation/Worker.hs` (same field rename),
+  `src/Seal/ISA/Ops/Git.hs` (drop `CloneDeps` closure param),
   `test/Seal/Gateway/ApiSpec.hs` (extend — ~20 `ApiDeps` literals + the
   RED case), `test/Seal/Gateway/ServerSpec.hs`,
   `test/Seal/Gateway/Phase7aSpec.hs`,
+  `test/Seal/Agent/{LoopSpec,Phase2bSpec,Phase5Spec,Phase7aSpec,
+  WiringSpec,SignalRunSpec,CliSpec}.hs` (~30 `aeUntrustedIO` →
+  `aeUIOEnv` test sites),
   `test/Seal/CapabilityScopingWorkdirFsFail.hs` (new grep/compile-fail
-  fixture), `seal-harness.cabal` (fixture wiring).
+  fixture — asserts no `WorkdirFs`/`UIOEnv` in `AppEnv`/registry/opcode
+  modules), `seal-harness.cabal` (fixture wiring).
 
 ### W7 — Gate
 `make check` green (build + test + lint, `-Werror` clean, `hlint` → No
@@ -1690,7 +1809,7 @@ FAIL to compile when `System.Directory` is imported).
 
 ## 7. Human checkpoints
 
-1. **After this design doc (review-gate round 5, with `UIO` augmentation)**
+1. **After this design doc (review-gate round 6, with `UIO` augmentation)**
    — confirm §3.10 (`UIO` monad: no `MonadIO`, two smart constructors +
    `runUIOWithEnv`), §3.11 (module-level `uio*` + `uioCd*` in separate
    `UIOGit` module), §3.12 (`WorkdirFs`-on-`UIO` via
@@ -1700,11 +1819,12 @@ FAIL to compile when `System.Directory` is imported).
    `UIO` restriction (no `MonadIO`), the two smart constructors +
    `runUIOWithEnv`, the `uio*`/`uioCd*` surface, and the compile-fail
    fixtures assert the restriction, before W-A3.
-3. **After W-A3 (opcode migration)** — review every untrusted opcode
-   body for residual `liftIO`/`ask`/`System.Directory` imports (should
-   be none), the `uoRun` signature change, Git constructors dropping
-   `CloneDeps`, the dispatcher's `runUIOWithEnv (seUIOEnv exec) ...`
-   threading, the `aeUIOEnv` field rename, and the W-A3 CI grep guard
+3. **After W-A3 (opcode body migration)** — review every untrusted
+   opcode body for residual `liftIO`/`ask`/`System.Directory` imports
+   (should be none), the `uoRun` signature change (`Value -> UIO
+   OpResult`), the `uoRunLegacy` back-compat wrapper (dispatcher keeps
+   old `UntrustedIO`-based path; `aeUntrustedIO` stays `UntrustedIO`;
+   Git constructors KEEP `CloneDeps`), and the W-A3 CI grep guard
    (`UIOGit` scoped to `Git.hs`), before W1.
 4. **After W2/W3 (`WorkdirFs` remote arm on `UIO`; `mkSessionExec`
    constructs `UIOEnv`)** — review the single shared `RemoteRunner`
@@ -1717,9 +1837,13 @@ FAIL to compile when `System.Directory` is imported).
    `System.Directory`/`TIO.readFile` remains in the workdir backends
    (compile-fail fixture green), local-arm parity tests pass, and the
    remote-arm symlink-escape test is non-vacuous, before W6.
-6. **After W6 (wiring sites)** — review all four entry points +
-   `ApiDeps.adSecurityConfig` wiring + the capability-scoping
-   review-checklist before the final gate.
+6. **After W6 (wiring sites + UIO dispatch rewire)** — review all
+   four entry points + `ApiDeps.adSecurityConfig` wiring + the
+   `aeUntrustedIO → aeUIOEnv` rename + dispatch `runUIOWithEnv` rewire
+   (drop `uoRunLegacy`) + Git `CloneDeps` closure drop + the ~30 test
+   `AgentEnv` sites + the capability-scoping CI grep (no `WorkdirFs`/
+   `UIOEnv` in `AppEnv`/registry/opcode modules) before the final
+   gate.
 
 ## 8. Alternatives considered + known limitations
 
