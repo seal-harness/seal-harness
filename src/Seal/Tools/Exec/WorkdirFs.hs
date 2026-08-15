@@ -14,12 +14,14 @@ module Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..)
   , WorkdirFsErr (..)
   , mkLocalWorkdirFs
+  , mkRemoteWorkdirFs
   , mkInMemWorkdirFs
   , mkWorkdirFsStub
   , StubEntry (..)
   ) where
 
 import Control.Exception (IOException, try)
+import Data.Char (isDigit, isSpace)
 import Data.Char qualified as Char
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -29,6 +31,7 @@ import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import System.Directory
   ( doesDirectoryExist, doesFileExist, getFileSize, getModificationTime
   , listDirectory
@@ -38,7 +41,11 @@ import Seal.Security.Path
   ( PathError (..), WorkspaceRoot (..), getSafePath, mkSafePath
   , mkSafePathRemote
   )
-import Seal.Tools.Exec.Types (RemotePath, getRemotePath)
+import Seal.Tools.Args (mkShellCommand)
+import Seal.Tools.Exec.Types (RemotePath, SshConfig, getRemotePath)
+import Seal.Tools.Exec.UIO (runUIOWithEnv, uioShellExec)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.UntrustedIO (UntrustedErr (..), shellQuote)
 
 -- | A local/remote-agnostic, SafePath-confined filesystem vocabulary for
 -- workspace-derived discovery. Each field is an IO action; the smart
@@ -177,6 +184,187 @@ readLocalBounded path ceilingBytes = do
               in if T.null (T.strip trimmed)
                    then Left WfsNotFound
                    else Right (truncateSection defaultSectionCharLimit trimmed)
+
+-- ---------------------------------------------------------------------------
+-- Remote arm
+-- ---------------------------------------------------------------------------
+
+-- | The remote arm. Reads via SSH through 'UIO'\'s 'uioShellExec' (the shared
+-- 'RemoteRunner' lives in the 'UIOEnv'). Every path is run through
+-- 'mkSafePathRemote' (anchored at the remote workspace root) BEFORE any
+-- shell-exec call. 'wfsReadFile'/'wfsListDirectory'/'wfsFileSize'/
+-- 'wfsModificationTime' additionally run @realpath -f -- <abspath>@ on the
+-- remote OS and re-check containment on the resolved path, so a symlink
+-- escaping the workspace is rejected before any content is read or any
+-- directory is listed. The @Int@ is the operator scan-byte ceiling,
+-- captured at construction.
+mkRemoteWorkdirFs :: UIOEnv -> SshConfig -> WorkspaceRoot -> Int -> WorkdirFs
+mkRemoteWorkdirFs uioEnv sshCfg wsRoot ceilingBytes = WorkdirFs
+  { wfsReadFile = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left pe -> pure (Left (WfsPath pe))
+        Right sp -> remoteReadFile uioEnv sshCfg wsRoot ceilingBytes (getSafePath sp)
+  , wfsDoesFileExist = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left _  -> pure False
+        Right sp -> remoteTestFlag uioEnv sshCfg "-f" (getSafePath sp)
+  , wfsDoesDirectoryExist = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left _  -> pure False
+        Right sp -> remoteTestFlag uioEnv sshCfg "-d" (getSafePath sp)
+  , wfsListDirectory = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left pe -> pure (Left (WfsPath pe))
+        Right sp -> remoteListDirectory uioEnv sshCfg wsRoot (getSafePath sp)
+  , wfsFileSize = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left pe -> pure (Left (WfsPath pe))
+        Right sp ->
+          remoteStatRechecked uioEnv sshCfg wsRoot "%s" (getSafePath sp) >>= \case
+            Left e -> pure (Left e)
+            Right txt -> case parseInteger txt of
+              Nothing -> pure (Left (WfsIo "stat -c %s: non-numeric stdout"))
+              Just n  -> pure (Right n)
+  , wfsModificationTime = \rp -> do
+      let rel = T.unpack (getRemotePath rp)
+      case mkSafePathRemote wsRoot rel of
+        Left pe -> pure (Left (WfsPath pe))
+        Right sp ->
+          remoteStatRechecked uioEnv sshCfg wsRoot "%Y" (getSafePath sp) >>= \case
+            Left e -> pure (Left e)
+            Right txt -> case parseInteger txt of
+              Nothing -> pure (Left (WfsIo "stat -c %Y: non-numeric stdout"))
+              Just n  -> pure (Right (posixSecondsToUTCTime (fromIntegral n)))
+  }
+
+-- | Run a remote shell command (a 'Text' command string) via 'uioShellExec'
+-- in the shared 'UIOEnv'. The command runs with no cwd override (the paths
+-- are absolute, SafePath-validated). Lifts the 'UntrustedErr' to a
+-- 'WorkdirFsErr'.
+remoteExecText :: UIOEnv -> Text -> IO (Either WorkdirFsErr Text)
+remoteExecText uioEnv cmdText =
+  case mkShellCommand cmdText of
+    Left e -> pure (Left (WfsIo e))
+    Right cmd ->
+      runUIOWithEnv uioEnv (uioShellExec cmd Nothing) >>= \case
+        Left (UePath pe) -> pure (Left (WfsPath pe))
+        Left (UeExec _)  -> pure (Left (WfsExec "remote shell exec failed"))
+        Left (UeIo msg)  -> pure (Left (WfsIo msg))
+        Left (UeBounded n) -> pure (Left (WfsIo ("bounded: " <> T.pack (show n))))
+        Right out -> pure (Right out)
+
+-- | Resolve a remote absolute path with @realpath -f -- <abspath>@, then
+-- re-check lexical containment of the resolved path against the workspace
+-- root. Returns:
+--
+--   * @Right (Just resolved)@ — the resolved absolute path, contained.
+--   * @Right Nothing@ — the path is missing on the remote (@realpath -f@
+--     exits non-zero for a non-existent final component).
+--   * @Left err@ — exec failure, OR the resolved path escapes the workspace
+--     root ('WfsPath').
+remoteRealpathRecheck
+  :: UIOEnv -> SshConfig -> WorkspaceRoot -> FilePath
+  -> IO (Either WorkdirFsErr (Maybe FilePath))
+remoteRealpathRecheck uioEnv _sshCfg wsRoot absPath = do
+  let cmd = T.pack ("realpath -f -- " <> shellQuote absPath)
+  remoteExecText uioEnv cmd >>= \case
+    Left e -> pure (Left e)
+    Right out
+      | T.null (T.strip out) -> pure (Right Nothing)
+      | otherwise ->
+          let resolved = T.unpack (T.strip out)
+          in case mkSafePathRemote wsRoot resolved of
+               Left pe -> pure (Left (WfsPath pe))
+               Right _ -> pure (Right (Just resolved))
+
+-- | @wfsReadFile@ on the remote arm: @realpath -f@ → re-check containment →
+-- @stat -c %s@ (reject 'WfsOversize' if > ceiling) → @head -c <ceil>@ →
+-- raw 'Text'. A missing path's @realpath@ failure yields 'WfsNotFound'.
+remoteReadFile
+  :: UIOEnv -> SshConfig -> WorkspaceRoot -> Int -> FilePath
+  -> IO (Either WorkdirFsErr Text)
+remoteReadFile uioEnv sshCfg wsRoot ceilingBytes absPath =
+  remoteRealpathRecheck uioEnv sshCfg wsRoot absPath >>= \case
+    Left e -> pure (Left e)
+    Right Nothing -> pure (Left WfsNotFound)
+    Right (Just resolved) -> do
+      sizeRes <- remoteExecText uioEnv
+                   (T.pack ("stat -c %s -- " <> shellQuote resolved))
+      case sizeRes of
+        Left e -> pure (Left e)
+        Right sizeTxt -> case parseInteger sizeTxt of
+          Nothing -> pure (Left (WfsIo "stat -c %s: non-numeric stdout"))
+          Just size
+            | size > fromIntegral ceilingBytes -> pure (Left WfsOversize)
+            | otherwise -> do
+                readRes <- remoteExecText uioEnv
+                  (T.pack ( "head -c " <> show ceilingBytes <> " -- "
+                         <> shellQuote resolved))
+                case readRes of
+                  Left e -> pure (Left e)
+                  Right raw ->
+                    let trimmed = T.dropWhileEnd Char.isSpace raw
+                    in if T.null (T.strip trimmed)
+                         then pure (Left WfsNotFound)
+                         else pure (Right (truncateSection defaultSectionCharLimit trimmed))
+
+-- | @wfsDoesFileExist@ / @wfsDoesDirectoryExist@ on the remote arm:
+-- @test -<flag> -- <abspath>@ → parse stdout. Exempt from the @realpath@
+-- re-check (1-bit bool, no target identity).
+remoteTestFlag :: UIOEnv -> SshConfig -> String -> FilePath -> IO Bool
+remoteTestFlag uioEnv _sshCfg flag absPath = do
+  let cmd = T.pack ("test " <> flag <> " -- " <> shellQuote absPath
+                    <> " && echo y")
+  remoteExecText uioEnv cmd >>= \case
+    Right out -> pure (T.strip out == "y")
+    Left _ -> pure False
+
+-- | @wfsListDirectory@ on the remote arm: @realpath -f@ → re-check
+-- containment → @ls -1 -- <resolved>@ → split lines. A missing path's
+-- @realpath@ failure (or a missing dir) yields @Right []@ (fail-soft-to-
+-- empty).
+remoteListDirectory
+  :: UIOEnv -> SshConfig -> WorkspaceRoot -> FilePath
+  -> IO (Either WorkdirFsErr [Text])
+remoteListDirectory uioEnv sshCfg wsRoot absPath =
+  remoteRealpathRecheck uioEnv sshCfg wsRoot absPath >>= \case
+    Left e -> pure (Left e)
+    Right Nothing -> pure (Right [])
+    Right (Just resolved) -> do
+      lsRes <- remoteExecText uioEnv
+                 (T.pack ("ls -1 -- " <> shellQuote resolved))
+      case lsRes of
+        Left e -> pure (Left e)
+        Right out -> pure (Right (filter (not . T.null) (T.lines out)))
+
+-- | A shared helper for @wfsFileSize@ / @wfsModificationTime@: run
+-- @realpath -f@ → re-check containment → @stat -c <fmt> -- <resolved>@,
+-- returning the raw stdout 'Text'. A missing path's @realpath@ failure
+-- yields 'WfsNotFound'.
+remoteStatRechecked
+  :: UIOEnv -> SshConfig -> WorkspaceRoot -> String -> FilePath
+  -> IO (Either WorkdirFsErr Text)
+remoteStatRechecked uioEnv sshCfg wsRoot fmt absPath =
+  remoteRealpathRecheck uioEnv sshCfg wsRoot absPath >>= \case
+    Left e -> pure (Left e)
+    Right Nothing -> pure (Left WfsNotFound)
+    Right (Just resolved) ->
+      remoteExecText uioEnv (T.pack ("stat -c " <> fmt <> " -- " <> shellQuote resolved))
+
+-- | Parse a non-negative integer from 'Text' stdout (the output of
+-- @stat -c %s@ / @stat -c %Y@). Total — returns 'Nothing' on any
+-- non-numeric input (including negative or empty).
+parseInteger :: Text -> Maybe Integer
+parseInteger txt =
+  let t = T.dropWhile isSpace (T.strip txt)
+  in if not (T.null t) && T.all isDigit t
+       then Just (read (T.unpack t))
+       else Nothing
 
 -- ---------------------------------------------------------------------------
 -- In-memory stub arm

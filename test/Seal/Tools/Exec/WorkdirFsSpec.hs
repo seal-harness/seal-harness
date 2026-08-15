@@ -1,7 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 module Seal.Tools.Exec.WorkdirFsSpec (spec) where
 
 import Data.ByteString qualified as BS
+import Data.IORef
 import Data.List (sort)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -12,9 +14,18 @@ import System.Directory
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
+import Test.Hspec.QuickCheck (prop)
+import Test.QuickCheck
 
-import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+import Seal.Security.Path (WorkspaceRoot (..), mkSafePathRemote, getSafePath)
+import Seal.TestHelpers.FixtureRepo (stubCloneDeps)
+import Seal.Tools.Exec.Remote (RemoteRunner (..))
+import Seal.Tools.Exec.Types
+  ( ExecError (..), RemotePath, SshConfig (..), getRemotePath, mkRemotePath
+  , mkSshHost, mkSshUser
+  )
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIO, shellQuote)
 import Seal.Tools.Exec.WorkdirFs
 
 spec :: Spec
@@ -290,6 +301,143 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
           r <- wfsReadFile fs (rp "cwd.txt")
           r `shouldBe` Right "ok"
 
+  --------------------------------------------------------------------------
+  -- Remote arm (mkRemoteWorkdirFs)
+  --------------------------------------------------------------------------
+
+  describe "remote arm (mkRemoteWorkdirFs)" $ do
+
+    it "rejects a .. path BEFORE any SSH call (IORef empty)" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [] 1048576
+      r <- wfsReadFile fs (rp "../etc/passwd")
+      r `shouldSatisfy` isWfsPath
+      readIORef calls `shouldReturn` ([] :: [Text])
+
+    it "rejects an absolute escape path BEFORE any SSH call" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [] 1048576
+      r <- wfsReadFile fs (rp "/etc/shadow")
+      r `shouldSatisfy` isWfsPath
+      readIORef calls `shouldReturn` ([] :: [Text])
+
+    it "wfsReadFile reads a workspace file (realpath → stat → head)" $ do
+      calls <- newIORef []
+      let absPath = "/srv/agent-workspace/agents.md"
+      fs <- mkRemoteFs calls
+        [ Right (T.pack absPath)
+        , Right "12"
+        , Right "hello agents\n"
+        ] 1048576
+      r <- wfsReadFile fs (rp "agents.md")
+      r `shouldBe` Right "hello agents"
+      n <- length <$> readIORef calls
+      n `shouldBe` 3
+
+    it "wfsReadFile rejects a realpath-resolved symlink escape" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "/etc/shadow"] 1048576
+      r <- wfsReadFile fs (rp "evil.md")
+      r `shouldSatisfy` isWfsPath
+      n <- length <$> readIORef calls
+      n `shouldBe` 1
+
+    it "wfsReadFile returns WfsNotFound when realpath reports missing" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right ""] 1048576
+      r <- wfsReadFile fs (rp "ghost.md")
+      r `shouldBe` Left WfsNotFound
+
+    it "wfsReadFile rejects an oversize file (stat-first)" $ do
+      calls <- newIORef []
+      let absPath = "/srv/agent-workspace/big.txt"
+      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "100"] 5
+      r <- wfsReadFile fs (rp "big.txt")
+      r `shouldSatisfy` isWfsOversize
+      n <- length <$> readIORef calls
+      n `shouldBe` 2
+
+    it "wfsDoesFileExist returns True (test -f echo y)" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "y\n"] 1048576
+      wfsDoesFileExist fs (rp "agents.md") `shouldReturn` True
+      n <- length <$> readIORef calls
+      n `shouldBe` 1
+
+    it "wfsDoesFileExist returns False on empty stdout" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right ""] 1048576
+      wfsDoesFileExist fs (rp "ghost.md") `shouldReturn` False
+
+    it "wfsDoesDirectoryExist returns True (test -d echo y)" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "y"] 1048576
+      wfsDoesDirectoryExist fs (rp "sub") `shouldReturn` True
+
+    it "wfsListDirectory returns the dir's children (realpath → ls -1)" $ do
+      calls <- newIORef []
+      let absPath = "/srv/agent-workspace/d"
+      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "a.txt\nb.txt\n"] 1048576
+      r <- wfsListDirectory fs (rp "d")
+      sort <$> r `shouldBe` Right ["a.txt", "b.txt"]
+      n <- length <$> readIORef calls
+      n `shouldBe` 2
+
+    it "wfsListDirectory returns Right [] on a missing dir (realpath empty)" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right ""] 1048576
+      wfsListDirectory fs (rp "nope") `shouldReturn` Right []
+      n <- length <$> readIORef calls
+      n `shouldBe` 1
+
+    it "wfsListDirectory rejects a realpath-resolved symlink escape" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "/etc"] 1048576
+      r <- wfsListDirectory fs (rp "evil-dir")
+      r `shouldSatisfy` isWfsPath
+      n <- length <$> readIORef calls
+      n `shouldBe` 1
+
+    it "wfsFileSize returns the byte size (realpath → stat -c %s)" $ do
+      calls <- newIORef []
+      let absPath = "/srv/agent-workspace/sized.txt"
+      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "42"] 1048576
+      wfsFileSize fs (rp "sized.txt") `shouldReturn` Right 42
+
+    it "wfsFileSize rejects a realpath-resolved symlink escape" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "/etc/passwd"] 1048576
+      r <- wfsFileSize fs (rp "evil.txt")
+      r `shouldSatisfy` isWfsPath
+
+    it "wfsModificationTime returns a UTCTime (realpath → stat -c %Y)" $ do
+      calls <- newIORef []
+      let absPath = "/srv/agent-workspace/mt.txt"
+      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "1700000000"] 1048576
+      r <- wfsModificationTime fs (rp "mt.txt")
+      r `shouldSatisfy` either (const False) (const True)
+
+    it "wfsModificationTime rejects a realpath-resolved symlink escape" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "/etc/passwd"] 1048576
+      r <- wfsModificationTime fs (rp "evil.txt")
+      r `shouldSatisfy` isWfsPath
+
+  --------------------------------------------------------------------------
+  -- QuickCheck: shellQuote has no unescaped shell metacharacters for
+  -- every path that passes mkSafePathRemote.
+  --------------------------------------------------------------------------
+
+  describe "shellQuote property (mkSafePathRemote-validated paths)" $ do
+    prop "contains no unescaped shell metacharacter" $
+      forAll genValidRemotePathText $ \pathTxt ->
+        let wsR = WorkspaceRoot "/srv/agent-workspace"
+        in case mkSafePathRemote wsR (T.unpack pathTxt) of
+             Right sp ->
+               let quoted = shellQuote (getSafePath sp)
+               in noUnescapedMeta quoted
+             Left _ -> True
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
@@ -318,3 +466,96 @@ isWfsIo :: Either WorkdirFsErr a -> Bool
 isWfsIo = \case
   Left (WfsIo _) -> True
   _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Remote-arm test fixtures
+-- ---------------------------------------------------------------------------
+
+sshCfg :: SshConfig
+sshCfg = SshConfig
+  { scHost       = either (error "fixture") id (mkSshHost "exec.internal")
+  , scUser       = either (error "fixture") id (mkSshUser "agent")
+  , scPort       = 22
+  , scIdentity   = Nothing
+  , scKnownHosts = "/home/agent/.ssh/known_hosts"
+  , scWorkspace  = rp "/srv/agent-workspace"
+  }
+
+wsRootOf :: SshConfig -> WorkspaceRoot
+wsRootOf cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))
+
+-- | A scripted fake 'RemoteRunner' that records every call's command string
+-- (the text after the @--@ separator in the SSH argv) into a recording
+-- 'IORef' and returns the next canned result from a separate mutable queue
+-- 'IORef'. Runs out of results → returns @Right ""@. This lets the
+-- multi-step remote methods (realpath → stat → head) be tested under a
+-- single in-process runner (no live SSH).
+scriptedRunner :: IORef [Text] -> [Either ExecError Text] -> IO RemoteRunner
+scriptedRunner recRef canned0 = do
+  qRef <- newIORef canned0
+  pure RemoteRunner
+    { runRemote = recordAndPop recRef qRef . extractCmd
+    , runRemoteStdin = \argv _stdin -> recordAndPop recRef qRef (extractCmd argv)
+    , runRemoteEnv = \_env argv -> recordAndPop recRef qRef (extractCmd argv)
+    }
+  where
+    recordAndPop :: IORef [Text] -> IORef [Either ExecError Text] -> Text
+                 -> IO (Either ExecError Text)
+    recordAndPop recRef' qRef cmdText = do
+      modifyIORef' recRef' (++ [cmdText])
+      atomicModifyIORef' qRef $ \case
+        (y:ys) -> (ys, y)
+        []     -> ([], Right "")
+    extractCmd :: [String] -> Text
+    extractCmd argv = case dropWhile (/= "--") argv of
+      (_sep : rest) -> T.pack (unwords rest)
+      _             -> T.pack (unwords argv)
+
+-- | Build a remote 'WorkdirFs' wired to a scripted runner backed by the
+-- recording 'IORef'. The canned results are consumed in order across the
+-- method's sequential SSH calls.
+mkRemoteFs :: IORef [Text] -> [Either ExecError Text] -> Int -> IO WorkdirFs
+mkRemoteFs recRef canned ceilingBytes = do
+  deps <- stubCloneDeps
+  runner <- scriptedRunner recRef canned
+  let uio = mkRemoteUntrustedIO sshCfg runner
+      env = mkTestUIOEnv uio deps
+  pure (mkRemoteWorkdirFs env sshCfg (wsRootOf sshCfg) ceilingBytes)
+
+-- ---------------------------------------------------------------------------
+-- QuickCheck: shellQuote metacharacter property
+-- ---------------------------------------------------------------------------
+
+-- | Bounded generator over text that 'mkRemotePath' accepts (no leading
+-- dash, no control chars) AND that lexically stays under the workspace root
+-- (no @..@ escape). Generates relative path components from a safe alphabet.
+genValidRemotePathText :: Gen Text
+genValidRemotePathText = do
+  n <- chooseInt (1, 4)
+  comps <- vectorOf n genPathComponent
+  pure (T.intercalate "/" comps)
+  where
+    genPathComponent =
+      T.pack <$> listOf1 (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "-_."))
+
+-- | Assert that a shell-quoted string contains no UNescaped shell
+-- metacharacter. 'shellQuote' wraps the value in single quotes and escapes
+-- embedded single quotes with @'\\''@. Inside single quotes, the shell
+-- interprets NO metacharacters — the only way to break out is an unescaped
+-- @'@. So the property reduces to: between the outer quotes, every @'@ is
+-- part of the @'\\''@ escape sequence (there is no bare @'@ that closes the
+-- quoting). We also assert the result starts and ends with @'@.
+noUnescapedMeta :: String -> Bool
+noUnescapedMeta s =
+  case s of
+    ('\'':rest) -> maybe False noBareQuote (breakLastQuote rest)
+    _ -> False
+  where
+    breakLastQuote xs =
+      if not (null xs) && last xs == '\''
+        then Just (init xs)
+        else Nothing
+    noBareQuote [] = True
+    noBareQuote ('\'':'\\':'\'':'\'':rest) = noBareQuote rest
+    noBareQuote ('\'':_) = False
+    noBareQuote (_:rest) = noBareQuote rest
