@@ -1,8 +1,9 @@
 # Remote-Aware Workdir Filesystem Seam — Design
 
-> **Status:** Draft (round 3, post-review-gate). **Branch**:
+> **Status:** Draft (round 5, post-review-gate + UIO augmentation). **Branch**:
 > `fix/remote-workdir-fs-seam-106`. **Issue**: #106. Closes the remote-mode
-> regression in repo-local agent-def and skill discovery.
+> regression in repo-local agent-def and skill discovery, and introduces
+> the `UIO` monad as the sole execution context for untrusted opcodes.
 
 ## Design review gate (round 1 → round 2)
 
@@ -219,6 +220,185 @@ Security/CTO: NEEDS_REVISION. Resolutions:
   construction site is pinned (CTO's count confirms it spans multiple
   files — listed in W6).
 
+## Augmentation: the `UIO` monad (round 3 → round 4)
+
+After round-3 approval, the design is augmented with a new restricted
+monad `UIO` that becomes the **sole execution context for untrusted
+opcodes**, turning the "don't import `System.Directory`/don't shell
+out in opcodes" convention into a **compile-time guarantee**. This
+categorically eliminates future local/remote parity gaps: there is one
+construction path per mode, and the only IO an untrusted opcode can
+perform is the `UIO`-lifted `UntrustedIO` (+ `CloneDeps`) surface.
+
+### Why `UIO`
+
+Round-3 relies on a *convention* ("opcode bodies must not call
+`liftIO`/import `System.Directory`") + a compile-fail fixture that
+asserts the *absence* of an import. A restricted monad makes the
+guarantee **structural**:
+
+- `UIO` exposes `Functor`, `Applicative`, `Monad` — but **NOT**
+  `MonadIO`, `MonadReader`, `MonadThrow`, `Katip`. An opcode body typed
+  `UIO OpResult` literally cannot call `liftIO`, `ask`, `logMsg`, or
+  `throwM` — it won't compile.
+- `UIO`'s only IO surface is the `UntrustedIO` operations, lifted as
+  module-level `UIO`-typed functions (e.g.
+  `uioRead :: RemotePath -> Int -> UIO (Either UntrustedErr
+  LineWindow)`). No `liftIO (uioReadFile uio ...)` — just
+  `uioRead path n`. (`CloneDeps` surface lives in a separate
+  `Seal.Tools.Exec.UIOGit` module — §3.11.)
+- `UIO` can only be constructed by `mkLocalUIO` or `mkRemoteUIO` (the
+  two smart constructors mirroring `mode=local`/`mode=remote`). The
+  constructor is unexported. There is no other way to obtain a `UIO`
+  execution context.
+- This **categorically kills the regression class**: any code that
+  reads the workdir or shells out MUST run in `UIO`, and `UIO` is
+  backend-selected once at construction — so a feature that works in
+  `mode=local` works in `mode=remote` by construction (the
+  local/remote selection happens at `mkUIO*`, not scattered across
+  opcode bodies).
+
+### Feasibility (grounded in the codebase)
+
+An audit of every untrusted opcode (`File.hs`, `Shell.hs`, `Search.hs`,
+`Bin.hs`, `Process.hs`, `Git.hs`) found:
+
+- **Zero uses of `ask`/`asks`/`MonadReader Env`.** `Env` (the `AppEnv`)
+  carries only log level, host/port, logger — none read by opcodes.
+- **Zero transcript writes.** ACK-before-execute is the dispatcher's job
+  (`Dispatch.hs:67`); the opcode returns `OpResult` (a pure value).
+- **Zero Katip logging** in opcode bodies.
+- **`UntrustedIO` is already an explicit `uoRun` argument** (not an env
+  read) — it slots cleanly into a `UIO` that carries it internally.
+- `WorkspaceRoot`/`SecurityPolicy`/`operatorCeiling`/`CloneDeps` are
+  **closure parameters** captured at opcode construction
+  (`buildWebRegistry`), not runtime env reads. They stay closure
+  parameters under `UIO` (the `UIO` context need not carry them).
+- The one wrinkle — Git's `CloneDeps` (repo registry, vault helpers via
+  `liftIO`) — is a closure-captured capability, not an env read. It
+  lifts into `UIO` the same way `UntrustedIO` does (§3.11).
+
+`OpResult` is pure; constructing it needs no `App`/`IO`. The
+dispatcher stays in `App` (it does the ACK + transcript + logging) and
+invokes the opcode's `UIO` action *after* `tfwRecordAndAck` completes.
+
+### Design review gate (round 4 → round 5)
+
+Round 4 ran 5 reviewers in parallel. PM: APPROVED.
+Architect/Designer/Security/CTO: NEEDS_REVISION. The round-4 `UIO`
+sections were internally inconsistent. Resolutions:
+
+- **CRITICAL: `CloneDeps` placement contradiction** (Designer B1,
+  Security B1, Architect S4) — round-4 put `CloneDeps` in `UIOEnv`
+  (§3.10/§3.11) AND as a closure param (augmentation block + W-A3 DoD)
+  simultaneously — mutually exclusive. Resolution: `CloneDeps` goes
+  **into `UIOEnv`** (per the user's "lift CloneDeps into UIO too"
+  decision); Git opcode constructors (`gitFetchOp`/`gitPullOp`/
+  `gitPushOp`/`setupRepoOp`) **DROP** their `CloneDeps` parameter and
+  use the `uioCd*` module-level functions (§3.11) instead. The
+  augmentation block's "stay closure parameters under UIO" sentence is
+  removed; W-A3 DoD updated (Git constructors lose `CloneDeps`;
+  `buildWebRegistry` drops `cloneDeps` from the closure params).
+- **CRITICAL: `CloneDeps` capability-escalation** (Security B1) —
+  putting `uioCd*` in a `MonadUIO` class (round 4) made them reachable
+  by ALL opcodes (round-3 had them lexically scoped to Git only).
+  Resolution (two parts): (a) `MonadUIO` class is **dropped** in favor
+  of **module-level `UIO`-typed functions** (Architect S1, Designer —
+  single-instance class was a smell; module functions are idiomatic for
+  this codebase); the `uio*` functions are in `Seal.Tools.Exec.UIO`
+  (in scope for all opcode modules), but the `uioCd*` functions are in
+  a **separate `Seal.Tools.Exec.UIOGit` module imported ONLY by
+  `Seal.ISA.Ops.Git`** (lexical scoping restored — a non-Git opcode
+  that wants `uioCdRepoRegList` must add an import, caught at review).
+  (b) A **CI grep guard** (W-A3 DoD) asserts `uioCd*` /
+  `Seal.Tools.Exec.UIOGit` is referenced only from
+  `src/Seal/ISA/Ops/Git.hs` (+ the definition site) — mirroring the W6
+  `WorkdirFs` discipline. The `uioCd*` functions take a `CloneDeps`
+  arg explicitly (not from a class), so they're scoped by import +
+  argument threading, not class membership.
+- **`runUIOWithEnv` seam unspecified** (Architect B1, Designer S1) —
+  the dispatcher and `WorkdirFs`'s remote arm need to run a `UIO`
+  action with a pre-built `UIOEnv` (not re-construct per call).
+  Resolution: `runUIOWithEnv :: UIOEnv -> UIO a -> IO a` is exported
+  from `Seal.Tools.Exec.UIO` (to `Seal.ISA.Dispatch`,
+  `Seal.Session.Workdir`, `Seal.Tools.Exec.WorkdirFs` — NOT to any
+  module under `src/Seal/ISA/Ops/`, enforced by the W6 grep check).
+  The smart constructors delegate:
+  `mkLocalUIO ws action = runUIOWithEnv (buildLocalUIOEnv ws) action`.
+  `UIOEnv` stays non-exported (opaque) — no caller can forge one;
+  only `mkSessionExec`/`mkLocalUIO`/`mkRemoteUIO`/`mkUIOStub` build it.
+  Pinned in §3.10.
+- **Work-unit ordering contradiction** (Architect B2) — W3 (round-3
+  `seUntrustedIO`) and W-A4 (round-4 `seUIOEnv`) described the same
+  record mutably; W2 and W-A4 both rewrote `mkRemoteWorkdirFs`.
+  Resolution: W-A4 is **folded into W2+W3** (W2 owns
+  `mkRemoteWorkdirFs`-on-`UIO`; W3 owns `mkSessionExec`-constructs-
+  `UIOEnv`). W-A4 is dropped. Ordering: W-A1 (`UIO`), W-A2 (fixtures),
+  W-A3 (migrate opcodes), W1 (`WorkdirFs` local/stub), W2
+  (`WorkdirFs` remote arm on `UIO`), W3 (`mkSessionExec`→`UIOEnv`),
+  W4, W5, W6, W7. §6 + §7 updated.
+- **`Maybe GitRepo` undefined/unconsumed** (Designer B2) — `GitRepo`
+  doesn't exist; the workdir is 0-or-many repos (multiple `SETUP_REPO`
+  clones). Resolution: `Maybe GitRepo` is **dropped** from
+  `mkLocalUIO`/`mkRemoteUIO`. Git opcodes resolve the repo at runtime
+  via `CloneDeps` (now in `UIOEnv`), not a constructor param. The
+  smart constructors take `WorkspaceRoot` (+ `SshConfig`/`RemoteRunner`
+  for remote) only.
+- **`GitEnv` vs `CloneEnv`** (Designer B3) — typo. Resolution: §3.11
+  uses `CloneEnv` (the existing type at `Clone.hs:277`), not `GitEnv`.
+- **Naming consistency** (Designer S4) — `mkUIOLocal`/`mkUIORemote`
+  (mode after type) vs existing `mkLocalUntrustedIO`/`mkRemoteUntrustedIO`
+  (mode before). Resolution: renamed to `mkLocalUIO`/`mkRemoteUIO`/
+  `mkUIOStub` (mode before, matching the existing convention).
+- **PM suggestions (adopted)**: §1.1 gains a UIO metric ("no untrusted
+  opcode module imports `System.Directory`/`System.Process`/
+  `Control.Monad.IO.Class` — enforced by `UIOUnrestrictedFail` (W-A2)
+  + verified at W7"). §2 Non-Goals adds: "`UIO` is not a general
+  effect system; it's scoped to untrusted-opcode execution. Trusted/
+  Audited opcodes and control-plane code continue to use `ReaderT
+  AppEnv IO`."
+- **Architect non-blocking (adopted)**: §3.12's "inherits UIO's SafePath
+  confinement by construction" reworded to "inherits UIO's transport
+  (one shared `RemoteRunner`); file-path confinement remains
+  `WorkdirFs`'s own `mkSafePathRemote` + `realpath` re-check, layered
+  on `UIO`'s CWD confinement." `buildWebRegistry` W-A3 DoD tightened
+  ("`uoRun` signature changes; `UntrustedIO` no longer a runtime arg;
+  closure params `wsRoot`/`policy`/`operatorCeiling` unchanged;
+  `cloneDeps` dropped — Git opcodes use `uioCd*`"). `aeUntrustedIO`
+  → `aeUIOEnv` field rename pinned in W-A3.
+
+### Design decisions (UIO, round 5 — coherent)
+
+- **`UIO` lifts `UntrustedIO` + `CloneDeps` operations as module-level
+  `UIO`-typed functions** (no `MonadUIO` class; no `liftIO` in opcode
+  bodies). `uoRun`'s signature changes from
+  `UntrustedIO -> Value -> App OpResult` to `Value -> UIO OpResult`
+  (the `UntrustedIO` + `CloneDeps` are carried by the `UIO` context,
+  not passed). Git's `CloneDeps`-shaped operations lift to `uioCd*`
+  functions in a separate `Seal.Tools.Exec.UIOGit` module (imported
+  only by `Seal.ISA.Ops.Git` — lexical scoping restored).
+- **All untrusted opcodes (incl. Git) migrate to `UIO`.** `CloneDeps`
+  is in `UIOEnv`; Git opcode constructors DROP their `CloneDeps` param
+  (they use `uioCd*` from the `UIO` context).
+- **`WorkdirFs` stays a separate handle but its remote arm is
+  implemented on `UIO`'s `uioShellExec`** (§3.12). One SSH transport
+  (`UIO`'s `RemoteRunner`, shared via `runUIOWithEnv`); `WorkdirFs`
+  inherits the transport + CWD confinement; file-path confinement
+  remains `WorkdirFs`'s own `mkSafePathRemote` + `realpath` re-check.
+- **Two smart constructors + stub**: `mkLocalUIO :: WorkspaceRoot ->
+  UIO a -> IO a` and `mkRemoteUIO :: SshConfig -> RemoteRunner ->
+  WorkspaceRoot -> UIO a -> IO a` (mode before type, matching
+  `mkLocalUntrustedIO`/`mkRemoteUntrustedIO`). `mkUIOStub :: UIO a ->
+  IO a` for fail-closed. `runUIOWithEnv :: UIOEnv -> UIO a -> IO a`
+  exported to dispatcher/`WorkdirFs` (not opcodes). Constructor +
+  `runUIO` + `UIOEnv` unexported; only the smart constructors +
+  `runUIOWithEnv` are.
+- **No `Maybe GitRepo`** — dropped (doesn't connect to how Git
+  opcodes work; they resolve the repo via `CloneDeps`).
+- **Work units**: W-A1 (`UIO`), W-A2 (fixtures), W-A3 (migrate
+  opcodes), W1-W7 (`WorkdirFs`/discovery, with W2/W3 round-5-native
+  on `UIOEnv`). W-A4 is folded into W2+W3.
+
 ## 1. Problem
 
 ### 1.0 User stories
@@ -268,6 +448,11 @@ Security/CTO: NEEDS_REVISION. Resolutions:
 - Fail-closed: a misconfigured/unreachable remote yields empty discovery
   (no agents/skills) and the session still boots (chat + Trusted opcodes
   work). **Evaluated at**: W3 `SessionWorkdirSpec` fail-closed case.
+- **UIO restriction (round 5)**: no untrusted opcode module under
+  `src/Seal/ISA/Ops/` imports `System.Directory`/`System.Process`/
+  `Control.Monad.IO.Class`, and none calls `liftIO`/`ask`/`throwM` —
+  enforced by the `UIOUnrestrictedFail` compile-fail fixture (W-A2) and
+  verified at the W7 gate. **Evaluated at**: W-A2 fixtures + W7 gate.
 
 ### 1.2 The regression
 
@@ -357,6 +542,11 @@ but:
 - SSH round-trip batching (a single batched `find`/`ls -R` to amortize
   discovery into one round-trip) — acknowledged as future work (§8), not
   in scope for this regression fix.
+- **`UIO` as a general effect system.** `UIO` is NOT a general-purpose
+  effect system; it's scoped exclusively to untrusted-opcode execution.
+  Trusted/Audited opcodes and control-plane code (the dispatcher,
+  wiring, discovery backends) continue to use `ReaderT AppEnv IO`
+  (`App`). Lifting `UIO` beyond untrusted opcodes is out of scope.
 
 ## 3. Design decisions
 
@@ -500,40 +690,45 @@ The two constructors share the same mode-resolution
 `mkRealRemoteRunner`; tests pass `mkFakeRemoteRunnerRecording` (so the
 W3 case (b) + W6 RED are testable under §5's no-real-SSH rule).
 
-**`SessionExec` record:**
+**`SessionExec` record** (round-5 — `seUIOEnv` replaces `seUntrustedIO`;
+see §3.12 for the round-4→5 UIO augmentation):
 ```haskell
 data SessionExec = SessionExec
-  { seUntrustedIO   :: UntrustedIO
+  { seUIOEnv        :: UIOEnv
+    -- ^ Carries UntrustedIO + CloneDeps; the dispatcher runs untrusted
+    -- opcodes in 'UIO' via 'runUIOWithEnv seUIOEnv'. (Round 5: replaces
+    -- round-3's seUntrustedIO.)
   , seWorkdirFs     :: WorkdirFs
+    -- ^ For discovery (remote arm built on seUIOEnv via runUIOWithEnv).
   , seWorkspaceRoot :: WorkspaceRoot
-    -- ^ The shared workspace root used by BOTH handles (local path for
-    -- the local arm, remote workspace path string for the remote arm).
-    -- The ISA registry sources its 'wsroot' from here, NOT from a
-    -- handle accessor. This avoids the type-confusion of extracting a
-    -- root from 'WorkdirFs' (which would be a remote path string in
-    -- remote mode, unsafe to feed to local 'mkSafePath').
+    -- ^ The shared workspace root used by UIO + WorkdirFs + the ISA
+    -- registry (local path for the local arm, remote workspace path
+    -- string for the remote arm). The ISA registry sources its 'wsroot'
+    -- from here. This avoids the type-confusion of extracting a root
+    -- from 'WorkdirFs' (which would be a remote path string in remote
+    -- mode, unsafe to feed to local 'mkSafePath').
   }
 ```
 
 **Shared workspace root + shared `RemoteRunner`:** `mkSessionExec` runs
 the mode resolution and remote-workdir creation **once**, then builds
-both handles against the same `WorkspaceRoot` and the same `SshConfig`,
-sharing the **single `RemoteRunner` passed in** between `seUntrustedIO`
-and `seWorkdirFs` (one SSH connection, not two — today
-`mkSessionUntrustedIO` creates one via `mkRealRemoteRunner`; the fold
-preserves that count by taking the runner as a param and reusing it).
-The fail-closed stub path does NOT construct/invoke a runner at all
-(returns both stubs before reaching the runner).
+`UIOEnv` + `WorkdirFs` against the same `WorkspaceRoot` and the same
+`SshConfig`, sharing the **single `RemoteRunner` passed in** between
+`seUIOEnv` (UIO's `UntrustedIO`) and `seWorkdirFs` (via
+`runUIOWithEnv`) — one SSH connection, not two. The fail-closed stub
+path does NOT construct/invoke a runner at all (returns both stubs
+before reaching the runner).
 
 **Back-compat:** `mkSessionUntrustedIO` is kept as a thin wrapper
-(`seUntrustedIO <$> mkSessionExec paths secCfg sid mkRealRemoteRunner`)
-so existing opcode-wiring sites that only need the opcode handle are
-unchanged (the wrapper threads `mkRealRemoteRunner`, preserving the
-current opaque-runner behavior). The wrapper preserves the EXACT current
-semantics (same workdir created, same stub on failure);
-`SessionWorkdirSpec` asserts `mkSessionUntrustedIO` and
-`(seUntrustedIO <$> mkSessionExec ... mkRealRemoteRunner)` yield
-equivalent handles (same root, same arm).
+(`\exec -> uieUntrustedIO (seUIOEnv exec) <$> mkSessionExec paths secCfg
+sid mkRealRemoteRunner`) so existing opcode-wiring sites that only
+need the `UntrustedIO` handle are unchanged (the wrapper threads
+`mkRealRemoteRunner`, preserving the current opaque-runner behavior).
+The wrapper preserves the EXACT current semantics (same workdir
+created, same stub on failure); `SessionWorkdirSpec` asserts
+`mkSessionUntrustedIO` and
+`(uieUntrustedIO . seUIOEnv <$> mkSessionExec ... mkRealRemoteRunner)`
+yield equivalent `UntrustedIO` handles.
 
 **Fail-closed contract:** on ANY workdir-creation failure (local mkdir
 fail, remote unreachable, remote mkdir fail, bad remote path), `mkSessionExec`
@@ -585,8 +780,9 @@ intentional behavior).
 
 ### 3.5 Remote arm — SSH via `RemoteRunner` (confined by `mkSafePathRemote` + `realpath` symlink re-check)
 
-The remote arm implements each method over SSH on the existing
-`RemoteRunner` (the same transport `UntrustedIO`'s remote arm uses):
+The remote arm implements each method via `UIO`'s `uioShellExec`
+(§3.12 — one `RemoteRunner`, shared with `UIO`; the commands are the
+same shape `UntrustedIO`'s remote arm uses today):
 
 | Method | Remote implementation |
 |---|---|
@@ -753,15 +949,17 @@ with:
 
 ```haskell
 exec <- mkSessionExec paths secCfg sid mkRealRemoteRunner
-let untrustedIO   = seUntrustedIO   exec
-    workdirFs     = seWorkdirFs     exec
-    wsroot        = seWorkspaceRoot exec
+let uioEnv       = seUIOEnv        exec  -- threaded to 'dispatch' for untrusted opcodes
+    workdirFs   = seWorkdirFs      exec  -- for discovery backends
+    wsroot      = seWorkspaceRoot exec  -- for the ISA registry
 ... workdirAgentDefBackendFs workdirFs ... Skill.workdirSkillBackendFs workdirFs
 ```
 
-(Production wiring passes `mkRealRemoteRunner`; tests pass
-`mkFakeRemoteRunnerRecording`. The single runner is shared between
-`seUntrustedIO` and `seWorkdirFs`.)
+(The dispatcher receives `uioEnv` and runs untrusted opcodes via
+`runUIOWithEnv uioEnv (uoRun op input)`. Production wiring passes
+`mkRealRemoteRunner`; tests pass `mkFakeRemoteRunnerRecording`. The
+single runner is shared between `seUIOEnv` (UIO) and `seWorkdirFs`
+(via `runUIOWithEnv`).)
 
 The local `ensureSessionWorkdir` call is removed from these sites (it
 now happens inside `mkSessionExec`'s local arm). The `wsroot` used by
@@ -801,6 +999,229 @@ data, not workspace-derived. Only the `workdir*` backends switch to
 `WorkdirFs`. The `unionAgentDefBackend` / `tripleUnionSkillBackend`
 compositions are unchanged (they union backends, not FSs).
 
+### 3.10 The `UIO` monad — definition + construction
+
+**Decision**: introduce a new restricted monad `UIO` in
+`src/Seal/Tools/Exec/UIO.hs` (alongside `UntrustedIO`). It is the sole
+execution context for untrusted opcodes. It exposes `Functor`,
+`Applicative`, `Monad` — and deliberately **no `MonadIO`, no
+`MonadReader`, no `MonadThrow`, no `Katip`**.
+
+```haskell
+-- | The restricted monad for untrusted opcode execution. Carries an
+-- 'UntrustedIO' handle (+ the Git 'CloneDeps' surface) internally; the
+-- only IO an opcode can perform is the lifted 'UntrustedIO'/'CloneDeps'
+-- surface. NO 'MonadIO' — a bare 'liftIO'/'IO' action in an opcode body
+-- won't compile. Constructed ONLY by 'mkLocalUIO'/'mkRemoteUIO'/
+-- 'mkUIOStub'; the constructor + 'unUIO' + 'UIOEnv' + 'runUIO' are
+-- unexported. 'runUIOWithEnv' is exported to the dispatcher +
+-- 'WorkdirFs' (NOT to opcode modules — W6 grep check).
+newtype UIO a = UIO { unUIO :: ReaderT UIOEnv IO a }
+  deriving newtype (Functor, Applicative, Monad)
+  -- deliberately NOT: MonadIO, MonadReader, MonadThrow
+
+data UIOEnv = UIOEnv
+  { uieUntrustedIO :: !UntrustedIO
+  , uieCloneDeps   :: !CloneDeps
+  }
+```
+
+- `UIOEnv` carries the two handles the opcode body needs (`UntrustedIO`
+  + `CloneDeps`). It is NOT exported (opaque — no caller can forge
+  one). The `unUIO` field accessor is also NOT exported (defense-in-depth
+  — exporting it would let an opcode unwrap to `ReaderT UIOEnv IO`,
+  which DOES have `MonadIO`/`MonadReader`/`MonadThrow` instances; the
+  opcode can't re-wrap into `UIO` since the constructor is unexported,
+  so it can't escape, but hiding `unUIO` removes the temptation). The
+  `ReaderT` is an implementation detail; `MonadReader`-ness is **not**
+  re-exposed (only `Functor`/`Applicative`/`Monad` are derived).
+- Module-level `UIO`-typed functions (§3.11) expose the
+  `UntrustedIO`/`CloneDeps` operations as `UIO`-level primitives (no
+  `MonadUIO` class — a single-instance class is a smell; module
+  functions are idiomatic for this codebase's handle pattern). Opcode
+  bodies call `uioRead path n`, `uioShellExec cmd cwd`, etc. — never
+  `liftIO (uioReadFile uio ...)`.
+- **Running**: `runUIO :: UIO a -> IO a` is NOT exported. Two run seams
+  exist: (a) the smart constructors (`mkLocalUIO`/`mkRemoteUIO`/
+  `mkUIOStub`) take a `UIO a` action and run it to `IO a`, having
+  selected the backend (they build a `UIOEnv` internally and delegate
+  to `runUIOWithEnv`); (b) `runUIOWithEnv :: UIOEnv -> UIO a -> IO a`
+  is exported (to `Seal.ISA.Dispatch`, `Seal.Session.Workdir`,
+  `Seal.Tools.Exec.WorkdirFs` — NOT to any module under
+  `src/Seal/ISA/Ops/`, enforced by the W6 grep check) for callers that
+  have a pre-built `UIOEnv` (the dispatcher, `WorkdirFs`'s remote arm).
+  `mkSessionExec` builds the `UIOEnv` once and threads it via
+  `seUIOEnv`; the dispatcher runs the opcode's `UIO` action via
+  `runUIOWithEnv` (not re-constructing per call).
+
+**Construction paths (only two + stub):**
+
+```haskell
+-- | mode=local: the workdir is a local path; UntrustedIO is local.
+mkLocalUIO :: WorkspaceRoot -> UIO a -> IO a
+
+-- | mode=remote: the workdir is a remote workspace path; UntrustedIO
+-- is remote (SSH via the RemoteRunner). The runner is shared with
+-- WorkdirFs (§3.12, via runUIOWithEnv).
+mkRemoteUIO :: SshConfig -> RemoteRunner -> WorkspaceRoot
+            -> UIO a -> IO a
+
+-- | Fail-closed: every operation returns Left/Stub. For misconfigured
+-- or unreachable remotes; mirrors mkRemoteUntrustedIOStub.
+mkUIOStub :: UIO a -> IO a
+
+-- | Run a UIO action with a pre-built UIOEnv (the dispatcher +
+-- WorkdirFs's remote arm use this). Exported to Dispatch/Workdir/WorkdirFs
+-- only — NOT to opcode modules (W6 grep check).
+runUIOWithEnv :: UIOEnv -> UIO a -> IO a
+```
+
+The constructor (`UIO`/`UIOEnv`), `unUIO`, and `runUIO` are unexported;
+only the smart constructors + `runUIOWithEnv` are exported. There is no
+`Maybe GitRepo` parameter — Git opcodes resolve the repo at runtime via
+`CloneDeps` (in `UIOEnv`), not a constructor param. `mkSessionExec`
+(§3.3) builds the `UIOEnv` once and returns it as `seUIOEnv`; the
+wiring runs the opcode's `UIO` action via `runUIOWithEnv` (through the
+dispatcher) after ACK-before-execute.
+
+**Back-compat**: the existing `UntrustedIO` handle stays (it's the
+record of IO actions `UIO` carries internally). The opcode signature
+change (`uoRun :: UntrustedIO -> Value -> App OpResult` → `Value ->
+UIO OpResult`) is the breaking change W-A3 makes; the dispatcher is
+updated to run the `UIO` action via `runUIOWithEnv` after
+ACK-before-execute.
+
+### 3.11 The `UIO` operation surface (lifted `UntrustedIO` + `CloneDeps`)
+
+The `UntrustedIO` methods lift to **module-level `UIO`-typed functions**
+(no `MonadUIO` class — a single-instance class is a smell; module
+functions are idiomatic for this codebase's handle pattern, and
+call-site concision is identical):
+
+```haskell
+-- In Seal.Tools.Exec.UIO (in scope for all opcode modules via import):
+uioRead        :: RemotePath -> Int -> UIO (Either UntrustedErr LineWindow)
+uioWrite       :: RemotePath -> Text -> WriteMode -> Int
+                -> UIO (Either UntrustedErr Int)
+uioPatch       :: RemotePath -> Text -> UIO (Either UntrustedErr ())
+uioShellExec   :: ShellCommand -> Maybe RemotePath
+                -> UIO (Either UntrustedErr Text)
+uioBinExec     :: BinName -> [BinArg] -> Maybe RemotePath
+                -> UIO (Either UntrustedErr Text)
+uioProcessList :: UIO (Either UntrustedErr Text)
+uioProcessKill :: Int -> UIO (Either UntrustedErr ())
+uioSearchFiles :: SearchPattern -> Maybe RemotePath -> Int
+                -> UIO (Either UntrustedErr Text)
+uioShellExecEnv :: [(String,String)] -> ShellCommand -> Maybe RemotePath
+                 -> UIO (Either UntrustedErr Text)
+uioShellExecGitEnv :: [(String,String)] -> Maybe BS.ByteString
+                    -> ShellCommand -> Maybe RemotePath
+                    -> UIO (Either UntrustedErr Text)
+uioBinExecEnv  :: [(String,String)] -> BinName -> [BinArg] -> Maybe RemotePath
+                -> UIO (Either UntrustedErr Text)
+-- each reads the UntrustedIO from UIOEnv via the internal ReaderT and
+-- calls the underlying method.
+```
+
+```haskell
+-- In Seal.Tools.Exec.UIOGit (a SEPARATE module, imported ONLY by
+-- Seal.ISA.Ops.Git — lexical scoping restores the round-3 property
+-- that non-Git opcodes cannot name these functions; enforced by the
+-- W-A3 CI grep guard):
+uioCdRepoRegList :: UIO [RepoRegistryEntry]   -- rrhList (cdRepoReg deps)
+uioResolveClone  :: RepoRef -> UIO (Maybe CloneTarget) -- resolveCloneTarget deps
+uioWithClone     :: CloneTarget -> (CloneEnv -> UIO a) -> UIO a  -- withCloneTarget
+-- ... plus any other CloneDeps IO the Git opcodes use
+-- each reads the CloneDeps from UIOEnv via the internal ReaderT.
+```
+
+- **Naming**: the `uio` prefix is reused (the operations ARE the
+  `UntrustedIO` operations, just lifted). `CloneDeps`-specific
+  functions get `uioCd*` prefixes and live in `Seal.Tools.Exec.UIOGit`.
+- **`CloneDeps` capability scoping (CRITICAL, round-5 fix)**: in
+  round 3, `CloneDeps` was a closure param of Git opcodes only —
+  non-Git opcodes had no lexical access. Round 4 (class) lost that.
+  Round 5 restores it: `uioCd*` live in a separate
+  `Seal.Tools.Exec.UIOGit` module imported only by
+  `Seal.ISA.Ops.Git`. A non-Git opcode that wants `uioCdRepoRegList`
+  must add the import (caught at review); the **W-A3 CI grep guard**
+  asserts `Seal.Tools.Exec.UIOGit` is referenced only from
+  `src/Seal/ISA/Ops/Git.hs` (+ the definition site), mirroring the W6
+  `WorkdirFs` discipline. So the capability surface is scoped by
+  import + CI, not class membership.
+- The `UntrustedIO` record itself stays exported (it's the underlying
+  data; `WorkdirFs`'s remote arm uses it via `UIO`, §3.12). The `UIO`
+  wrapper is what's restricted.
+- Opcode bodies call these directly: `uioRead path n`, `uioShellExec
+  cmd cwd` — no `liftIO`, no handle argument. A bare `liftIO` or `IO`
+  action in an opcode body typed `UIO OpResult` won't compile (no
+  `MonadIO` instance).
+- `CloneEnv` (not `GitEnv`) — the existing type at `Clone.hs:277`;
+  `uioWithClone` yields it (the existing `withCloneTarget`'s callback
+  arg). `GitEnv` was a round-4 typo.
+
+**Compile-fail fixtures (enforce the restriction):**
+- `Seal.ISA.Ops.UIOUnrestrictedFail` — asserts an opcode body typed
+  `UIO OpResult` that calls `liftIO`/`ask`/`throwM` fails to compile
+  (no `MonadIO`/`MonadReader`/`MonadThrow` instance). Mirrors the
+  `CapabilityScopingFailSpec` pattern (build-source-string +
+  `assertCompileFail`). Added to W-A2 DoD.
+- `Seal.ISA.Ops.UIOConstructionFail` — asserts a module that tries to
+  construct `UIO`/`UIOEnv` directly (without the smart constructors)
+  fails to compile (constructor + `unUIO` unexported). Added to W-A2
+  DoD.
+
+### 3.12 `WorkdirFs` is built on `UIO`'s shell-exec (one transport)
+
+**Decision**: `WorkdirFs` (§3.2) stays a separate handle for the
+discovery backends (it's consumed by Trusted prompt-assembly code, not
+opcodes — §3.1 capability scoping). But its remote arm is now
+**implemented on top of `UIO`'s `uioShellExec`/`uioBinExec` primitives**
+rather than calling the `RemoteRunner` directly.
+
+- `mkRemoteWorkdirFs` no longer takes a `RemoteRunner`. It takes the
+  `UIOEnv` and issues its `realpath`/`head -c`/`ls -1`/`stat`/`test`
+  commands via `uioShellExec` (run in the `UIO` context via
+  `runUIOWithEnv uioEnv`, where `uioEnv` is the `seUIOEnv` from
+  `mkSessionExec`). `WorkdirFs`'s remote arm holds the `UIOEnv` and
+  calls `runUIOWithEnv uioEnv (uioShellExec cmd cwd)` for each
+  operation.
+- This **unifies the transport**: one `RemoteRunner` (owned by `UIO`),
+  shared with `WorkdirFs` via `runUIOWithEnv`. No second SSH connection.
+- `WorkdirFs` **inherits `UIO`'s transport (one shared `RemoteRunner`)
+  + CWD confinement** (`uioShellExec`'s `Maybe RemotePath` cwd is
+  SafePath-confined). **File-path confinement remains `WorkdirFs`'s
+  own** `mkSafePathRemote` + `realpath` re-check (§3.5), layered on top
+  of `UIO`'s CWD confinement — `uioShellExec` confines the cwd, not
+  the command-string argv; the file paths `WorkdirFs` reads are
+  validated by `WorkdirFs`'s own `mkSafePathRemote` before the
+  `uioShellExec` call.
+- The local arm of `WorkdirFs` stays on `System.Directory` (direct,
+  confined by `mkSafePath`) — it doesn't go through `UIO` (no need;
+  local reads are cheap and `UIO`'s local arm would just wrap
+  `System.Directory` anyway). Only the remote arm goes through `UIO`.
+  This local/remote asymmetry is intentional and documented.
+
+**`mkSessionExec` revision (round 5):** `mkSessionExec` constructs the
+`UIOEnv` (selecting local vs remote via
+`untrustedExecConfigFromSecurity`, creating the workdir, building the
+`UntrustedIO` + `CloneDeps`), and returns:
+```haskell
+data SessionExec = SessionExec
+  { seUIOEnv        :: UIOEnv        -- for running untrusted opcodes in UIO
+  , seWorkdirFs     :: WorkdirFs     -- for discovery (remote arm built on UIOEnv)
+  , seWorkspaceRoot :: WorkspaceRoot
+  }
+```
+The dispatcher's `uoRun` invocation changes from
+`uoRun op untrustedIO input` (in `App`) to running the opcode's `UIO`
+action via `runUIOWithEnv (seUIOEnv exec) (uoRun op input)` (after
+ACK-before-execute). The `App` context stays for the dispatcher (ACK +
+transcript + logging); the opcode runs in `UIO`. `mkSessionExec` takes
+the `RemoteRunner` param (round-3 CTO fix preserved) and shares it
+between `UIO` and `WorkdirFs` (via `runUIOWithEnv`).
+
+
 ## 4. Security considerations
 
 | Concern | Mitigation |
@@ -815,6 +1236,7 @@ compositions are unchanged (they union backends, not FSs).
 | Fail-closed | `mkWorkdirFsStub` (misconfigured/unreachable remote) yields `False`/`Left WfsStub` everywhere → no agents/skills discovered → session still boots (chat + Trusted opcodes work), mirroring `mkRemoteUntrustedIOStub`. |
 | Local/remote mode asymmetry | RESOLVED (was a round-1 gap). Both arms are now symlink-safe: local via `mkSafePath`'s `canonicalizePath`; remote via the `realpath -f` re-check. An operator whose repo is safe in `mode=local` is now also safe in `mode=remote` (for the symlink-escape-to-host case). Documented for operators. |
 | Invariant 1 posture | `WorkdirFs` is not an opcode; the remote arm invokes fixed trusted binaries (`realpath`/`head`/`test`/`ls`/`stat`) over SSH with no agent-derived content in argv — matches the permitted-infrastructure shape. Not a literal violation; documented §3.5. |
+| **`UIO` restriction (CRITICAL, round 5)** | `UIO` exposes only `Functor`/`Applicative`/`Monad` — no `MonadIO`/`MonadReader`/`MonadThrow`/`Katip` (and `unUIO` is unexported so the `ReaderT`'s instances can't be reached). An opcode body typed `UIO OpResult` literally cannot call `liftIO`, `ask`, `throwM`, or import `System.Directory`/`System.Process` (compile error). The only IO is the module-level `uio*`/`uioCd*` functions (`Seal.Tools.Exec.UIO` + `Seal.Tools.Exec.UIOGit`). Constructed ONLY by `mkLocalUIO`/`mkRemoteUIO`/`mkUIOStub` (constructor + `UIOEnv` + `runUIO` unexported). `runUIOWithEnv` exported to dispatcher/`WorkdirFs` only (NOT opcodes — W6 grep check). **`CloneDeps` scoping restored (round 4 regressed, round 5 fixes):** `uioCd*` live in `Seal.Tools.Exec.UIOGit`, imported only by `Seal.ISA.Ops.Git` (lexical scoping) + a W-A3 CI grep guard asserts no other opcode module references it. `UIOEnv` is also guarded by the W6 grep check (no `UIOEnv` field in `AppEnv`/registry/opcode modules — only in `SessionExec`, consumed at turn-entry sites). Compile-fail fixtures (`UIOUnrestrictedFail`, `UIOConstructionFail`) assert the restriction. This turns the "no direct FS in opcodes" convention into a **type-level guarantee**, categorically eliminating future local/remote parity gaps (one construction path per mode; backend selected once). |
 
 ## 5. Testing
 
@@ -876,6 +1298,133 @@ no network IO, no subprocess. The implementer MUST NOT reach for
 
 ## 6. TDD work units
 
+### W-A1 — The `UIO` monad + smart constructors + operation surface
+**DoD:**
+- `UIO` newtype + `UIOEnv` in `src/Seal/Tools/Exec/UIO.hs`, constructor
+  + `unUIO` + `runUIO` + `UIOEnv` unexported;
+  `Functor`/`Applicative`/`Monad` derived; **no**
+  `MonadIO`/`MonadReader`/`MonadThrow`/`Katip` instances.
+- `mkLocalUIO :: WorkspaceRoot -> UIO a -> IO a`,
+  `mkRemoteUIO :: SshConfig -> RemoteRunner -> WorkspaceRoot -> UIO a
+  -> IO a`, `mkUIOStub :: UIO a -> IO a` (mode before type, matching
+  `mkLocalUntrustedIO`/`mkRemoteUntrustedIO`). No `Maybe GitRepo`.
+  `runUIOWithEnv :: UIOEnv -> UIO a -> IO a` exported (to
+  dispatcher/`WorkdirFs` — NOT opcodes; W6 grep check). Local arm
+  builds a local `UntrustedIO` + `CloneDeps`; remote arm builds a
+  remote `UntrustedIO` (SSH via the runner) + `CloneDeps`; stub arms
+  are fail-closed.
+- Module-level `uio*` functions (§3.11) in `Seal.Tools.Exec.UIO`:
+  `uioRead`, `uioWrite`, `uioPatch`, `uioShellExec`, `uioBinExec`,
+  `uioProcessList`, `uioProcessKill`, `uioSearchFiles`,
+  `uioShellExecEnv`, `uioShellExecGitEnv`, `uioBinExecEnv` — each
+  reads `UntrustedIO` from `UIOEnv` via the internal `ReaderT`. No
+  `MonadUIO` class (single-instance class is a smell; module functions
+  are idiomatic).
+- `Seal.Tools.Exec.UIOGit` (separate module): `uioCdRepoRegList`,
+  `uioResolveClone`, `uioWithClone` (yields `CloneEnv`, not `GitEnv` —
+  the existing type at `Clone.hs:277`). Each reads `CloneDeps` from
+  `UIOEnv`. Imported only by `Seal.ISA.Ops.Git` (W-A3 CI grep guard).
+- **Test helper** `mkTestUIOEnv :: UntrustedIO -> CloneDeps -> UIOEnv`
+  (exported from `Seal.Tools.Exec.UIO` to tests only — NOT to
+  `src/Seal/` production modules; gate via a `Seal.Test.*` module or a
+  `#ifdef TESTING` boundary, mirroring existing test-helper patterns).
+  Git opcode tests use a stub `CloneDeps` (fake repo registry + vault
+  helpers) via this helper.
+- New `UIOSpec`: local arm runs an action calling each `uio*` function
+  against a temp workdir; stub arm asserts every operation returns
+  fail-closed; `mkLocalUIO` vs `mkRemoteUIO` (with
+  `mkFakeRemoteRunnerRecording` — no real SSH) produce equivalent
+  results for the same fixture workdir; `runUIOWithEnv` round-trips a
+  pre-built `UIOEnv`.
+- Wiring: `seal-harness.cabal` (exposed-modules: `Seal.Tools.Exec.UIO`,
+  `Seal.Tools.Exec.UIOGit`), `test/Main.hs`.
+**RED**: `UIOSpec` — every `uio*` function round-trips on the local
+  arm; stub is fail-closed; remote arm (fake runner) matches local for
+  a fixture; `runUIOWithEnv` round-trips.
+**File scope**: `src/Seal/Tools/Exec/UIO.hs`,
+  `src/Seal/Tools/Exec/UIOGit.hs`,
+  `test/Seal/Tools/Exec/UIOSpec.hs`, `seal-harness.cabal`,
+  `test/Main.hs`.
+
+### W-A2 — `UIO` compile-fail fixtures (the restriction is enforced)
+**DoD:**
+- `Seal.ISA.Ops.UIOUnrestrictedFail` (via `assertCompileFail`): an
+  opcode body typed `UIO OpResult` that calls `liftIO`/`ask`/`throwM`
+  fails to compile (no `MonadIO`/`MonadReader`/`MonadThrow` instance).
+  Expected stderr substring: "No instance for" / "Not in scope".
+- `Seal.ISA.Ops.UIOConstructionFail`: a module that constructs `UIO`/
+  `UIOEnv` directly (without the smart constructors) or accesses
+  `unUIO` fails to compile (constructor + `unUIO` + `UIOEnv`
+  unexported). Expected: "Not in scope: 'UIO'" / "...'UIOEnv' is not
+  exported" / "Not in scope: 'unUIO'".
+- Mirrors the existing `CapabilityScopingFailSpec` /
+  `SecurityScopingFailSpec` pattern (build-source-string +
+  `assertCompileFail` in `test/Seal/TestHelpers/CompileFail.hs`).
+- If `ghc` is not on `PATH` (non-Nix env), `pendingWith` (the helper
+  should gain this fallback per AGENTS.md "guarded by pendingWith").
+**RED**: the two fixtures (they assert compile-FAILURE; if the code
+  compiles, the test fails).
+**File scope**: `test/Seal/ISA/Ops/UIOUnrestrictedFailSpec.hs`,
+  `test/Seal/ISA/Ops/UIOConstructionFailSpec.hs`,
+  `test/Seal/TestHelpers/CompileFail.hs` (add `pendingWith` fallback
+  if missing), `seal-harness.cabal`, `test/Main.hs`.
+
+### W-A3 — Migrate untrusted opcodes to `UIO`
+**DoD:**
+- `uoRun` signature changes from
+  `UntrustedIO -> Value -> App OpResult` to `Value -> UIO OpResult`
+  (in `Seal.ISA.Opcode`).
+- Every untrusted opcode body (`File.hs`, `Shell.hs`, `Search.hs`,
+  `Bin.hs`, `Process.hs`, `Git.hs`) migrated: `liftIO (uio* uio ...)`
+  → the module-level `uio*` functions (`Seal.Tools.Exec.UIO`);
+  `import Control.Monad.IO.Class` removed from these modules; no
+  `liftIO`/`ask`/`throwM` remains. Git opcodes additionally import
+  `Seal.Tools.Exec.UIOGit` for `uioCd*`.
+- **Git opcode constructors DROP their `CloneDeps` param**
+  (`gitFetchOp`/`gitPullOp`/`gitPushOp`/`setupRepoOp` no longer take
+  `CloneDeps` — they use `uioCd*` from the `UIO` context).
+  `buildWebRegistry` drops `cloneDeps` from the closure params;
+  `UntrustedIO` is no longer a runtime arg (carried by `UIOEnv`).
+  Closure params `wsRoot`/`policy`/`operatorCeiling` unchanged.
+- **Agent-loop env**: `aeUntrustedIO :: UntrustedIO` (Loop.hs:374)
+  becomes `aeUIOEnv :: UIOEnv`; the dispatch call site becomes
+  `dispatch ... aeUIOEnv ...`.
+- Dispatcher (`Dispatch.hs`) updated: after `tfwRecordAndAck`, it runs
+  the opcode's `UIO` action via `runUIOWithEnv uioEnv (uoRun op input)`
+  (where `uioEnv` is threaded as a new `dispatch` param), NOT via
+  `App`. `runUIOWithEnv` is imported from `Seal.Tools.Exec.UIO`. The
+  `App` context stays for the dispatcher (ACK + transcript + logging)
+  + the three caller-side recorders (`SKILL_LOAD`/`SETUP_REPO`/
+  `GIT_PUSH`).
+- **CI grep guard (CloneDeps scoping, W-A3-specific)**: asserts
+  `Seal.Tools.Exec.UIOGit` / `uioCd*` are referenced ONLY from
+  `src/Seal/ISA/Ops/Git.hs` (+ the `UIOGit.hs` definition site).
+  Mirrors the W6 `WorkdirFs` discipline. Added as a grep test in W-A3.
+- Existing opcode specs (`FileSpec`, `ShellSpec`, `SearchSpec`,
+  `BinSpec`, `ProcessSpec`, `GitSpec`) updated to run opcodes in `UIO`
+  (via `mkLocalUIO (WorkspaceRoot tmp)` — no `Maybe GitRepo`) instead
+  of passing a raw `UntrustedIO`. Git specs need a stub `CloneDeps`
+  (a fake repo registry + vault helpers) seeded into the `UIOEnv` via
+  a test helper (`mkTestUIOEnv` — added in W-A1 for stub-arm tests).
+  Test logic unchanged; construction wraps.
+- Back-compat: during W-A3, keep a temporary `uoRunLegacy ::
+  UntrustedIO -> Value -> App OpResult` wrapper (delegating to the new
+  `UIO` action via a local `mkLocalUIO`) so the dispatcher compiles
+  before it's rewired. W6 removes it.
+**RED**: a migrated opcode spec asserting the opcode runs under `UIO`
+  and produces the correct `OpResult` (behavior RED) + the W-A2
+  compile-fail fixture pointed at a real opcode module (a bare `liftIO`
+  in the body is a compile error).
+**File scope**: `src/Seal/ISA/Opcode.hs`, `src/Seal/ISA/Dispatch.hs`,
+  `src/Seal/ISA/Ops/{File,Shell,Search,Bin,Process,Git}.hs`,
+  `src/Seal/Tools/Exec/UIOGit.hs` (new — the `uioCd*` functions),
+  `src/Seal/Agent/Loop.hs` (`aeUntrustedIO` → `aeUIOEnv`),
+  `src/Seal/Gateway/Send.hs` (the `buildWebRegistry` call — drop
+  `cloneDeps`), `src/Seal/Channels/Loop.hs`, `src/Seal/Channel/Cli.hs`
+  (the dispatch sites — pass `UIOEnv` to `dispatch`),
+  `test/Seal/ISA/Ops/*Spec.hs` (extend), `seal-harness.cabal`,
+  `test/Main.hs`.
+
 ### W1 — The `WorkdirFs` handle + local/in-memory stubs
 **DoD:**
 - `WorkdirFs` record + `WorkdirFsErr` ADT (§3.2 pinned constructors) in
@@ -910,9 +1459,10 @@ no network IO, no subprocess. The implementer MUST NOT reach for
 
 ### W2 — The remote arm over SSH (with `realpath` re-check)
 **DoD:**
-- `mkRemoteWorkdirFs :: SshConfig -> RemoteRunner -> WorkdirFs` (remote
-  arm). Every method validates via `mkSafePathRemote` before any SSH
-  call.
+- `mkRemoteWorkdirFs :: UIOEnv -> WorkdirFs` (remote arm, built on
+  `UIO`'s shell-exec per §3.12 — no direct `RemoteRunner`; the runner
+  is owned by `UIO` and shared). Every method validates via
+  `mkSafePathRemote` before any shell-exec call.
 - `wfsReadFile` remote: (1) `realpath -f -- <abspath>` → resolved; (2)
   re-check containment on resolved path (reject `WfsPath` on escape);
   (3) `stat -c %s -- <resolved>` → reject `WfsOversize` if > ceiling;
@@ -939,40 +1489,54 @@ no network IO, no subprocess. The implementer MUST NOT reach for
 **File scope**: `src/Seal/Tools/Exec/WorkdirFs.hs`,
   `test/Seal/Tools/Exec/WorkdirFsSpec.hs`.
 
-### W3 — `mkSessionExec` construction seam
+### W3 — `mkSessionExec` constructs `UIOEnv` (folds old W-A4)
 **DoD:**
-- `SessionExec` record (`seUntrustedIO`, `seWorkdirFs`,
-  `seWorkspaceRoot`) + `mkSessionExec :: SealPaths -> SecurityConfig ->
-  SessionId -> RemoteRunner -> IO SessionExec` in `Seal.Session.Workdir`
-  (takes the `RemoteRunner` explicitly so tests can inject
-  `mkFakeRemoteRunnerRecording`).
-- `mkSessionUntrustedIO` refactored to
-  `seUntrustedIO <$> mkSessionExec paths secCfg sid mkRealRemoteRunner`
-  (back-compat — existing opcode-wiring sites unchanged; wrapper
-  threads `mkRealRemoteRunner`, preserving EXACT current semantics).
-- Mode resolution + remote-workdir creation run **once**; both handles
-  share the same `WorkspaceRoot` / cloned `SshConfig` / the **single
-  `RemoteRunner` passed in** (one SSH connection, not two). Fail-closed
-  stub path does NOT invoke the runner (returns both stubs first).
-- Fail-closed: on ANY workdir-creation failure, BOTH handles are stubs
-  + `seWorkspaceRoot` is a fail-closed root (never mixed).
+- `SessionExec` record (`seUIOEnv`, `seWorkdirFs`, `seWorkspaceRoot`)
+  + `mkSessionExec :: SealPaths -> SecurityConfig -> SessionId ->
+  RemoteRunner -> IO SessionExec` in `Seal.Session.Workdir` (takes the
+  `RemoteRunner` explicitly so tests can inject
+  `mkFakeRemoteRunnerRecording`). `seUIOEnv` carries the `UntrustedIO`
+  + `CloneDeps` (round-5 — replaces round-3's `seUntrustedIO`).
+- `mkSessionExec` constructs the `UIOEnv` (selecting local vs remote
+  via `untrustedExecConfigFromSecurity`, creating the workdir,
+  building `UntrustedIO` + `CloneDeps`), builds `WorkdirFs` (W2's
+  remote arm via `runUIOWithEnv uioEnv`, local arm via
+  `System.Directory`), and returns the `SessionExec`.
+- `mkSessionUntrustedIO` back-compat wrapper refactored to
+  `(\exec -> uieUntrustedIO (seUIOEnv exec)) <$> mkSessionExec paths
+  secCfg sid mkRealRemoteRunner` (for any lingering caller that wants
+  just the handle; threads `mkRealRemoteRunner`, preserving EXACT
+  current semantics).
+- Mode resolution + remote-workdir creation run **once**; `UIO` and
+  `WorkdirFs` share the same `WorkspaceRoot` / cloned `SshConfig` /
+  the **single `RemoteRunner` passed in** (one SSH connection, not
+  two — `WorkdirFs`'s remote arm reaches it via `runUIOWithEnv`).
+  Fail-closed stub path does NOT invoke the runner (returns both
+  stubs first).
+- Fail-closed: on ANY workdir-creation failure, BOTH `seUIOEnv` (stub)
+  + `seWorkdirFs` (stub) + `seWorkspaceRoot` (fail-closed root) —
+  never mixed.
 - New/extended `SessionWorkdirSpec` cases (use
   `mkFakeRemoteRunnerRecording` — no real SSH): (a) local mode → local
-  `WorkdirFs` + local `UntrustedIO` + local `seWorkspaceRoot`; (b)
-  remote mode + configured → both remote-shaped, share `scWorkspace`,
-  the **same** `RemoteRunner` instance is shared (assert the runner's
-  recorded-calls `IORef` shows both handles' calls went to one runner);
-  (c) remote mode + unreachable/misconfigured → both stubs (runner NOT
-  invoked — `IORef` empty); (d) local mode + workdir `mkdir` fails →
-  both stubs (fail-closed parity); (e) `mkSessionUntrustedIO` and
-  `(seUntrustedIO <$> mkSessionExec ... mkRealRemoteRunner)` yield
-  equivalent handles (same root, same arm).
+  `WorkdirFs` + local `seUIOEnv` (local `UntrustedIO` + `CloneDeps`) +
+  local `seWorkspaceRoot`; (b) remote mode + configured → both
+  remote-shaped, share `scWorkspace`, the **same** `RemoteRunner`
+  instance is shared (assert the runner's recorded-calls `IORef` shows
+  BOTH `UIO`'s AND `WorkdirFs`'s calls went to one runner — proves
+  `WorkdirFs`-on-`UIO`); (c) remote mode + unreachable/misconfigured
+  → both stubs (runner NOT invoked — `IORef` empty); (d) local mode +
+  workdir `mkdir` fails → both stubs (fail-closed parity); (e)
+  `mkSessionUntrustedIO` and
+  `(uieUntrustedIO . seUIOEnv <$> mkSessionExec ... mkRealRemoteRunner)`
+  yield equivalent `UntrustedIO` handles (back-compat).
 **RED**: `SessionWorkdirSpec` — the five cases (all via the fake
-  runner; no real SSH).
+  runner; no real SSH). Case (b) is the round-5 folded W-A4 assertion
+  (one runner shared between `UIO` and `WorkdirFs`).
 **File scope**: `src/Seal/Session/Workdir.hs`,
-  `test/Seal/Config/WorkdirSpec.hs` (the existing spec — module
-  `Seal.Config.WorkdirSpec`, importing `Seal.Session.Workdir`; extend
-  it).
+  `src/Seal/Tools/Exec/WorkdirFs.hs` (remote arm via `runUIOWithEnv`,
+  per W2), `test/Seal/Config/WorkdirSpec.hs` (the existing spec —
+  module `Seal.Config.WorkdirSpec`, importing `Seal.Session.Workdir`;
+  extend it), `seal-harness.cabal`.
 
 ### W4 — Rewire `workdirAgentDefBackend` to `WorkdirFs` (+ back-compat wrapper)
 **DoD:**
@@ -1126,32 +1690,61 @@ FAIL to compile when `System.Directory` is imported).
 
 ## 7. Human checkpoints
 
-1. **After this design doc (review-gate round 2)** — confirm §3.1
-   (capability-scoping invariant), §3.5 (`realpath` re-check),
-   §3.3 (`SessionExec` + `seWorkspaceRoot`), §3.6 (full call-chain
-   migration) before implementation.
-2. **After W2 (remote arm)** — review the SSH command shapes +
-   `realpath`-re-check + pre-SSH `mkSafePathRemote` rejection +
-   `--` separators before W3.
-3. **After W4/W5 (backend rewire)** — review that no direct
+1. **After this design doc (review-gate round 5, with `UIO` augmentation)**
+   — confirm §3.10 (`UIO` monad: no `MonadIO`, two smart constructors +
+   `runUIOWithEnv`), §3.11 (module-level `uio*` + `uioCd*` in separate
+   `UIOGit` module), §3.12 (`WorkdirFs`-on-`UIO` via
+   `runUIOWithEnv`), plus the round-3 confirmations (§3.1 capability
+   scoping, §3.5 `realpath` re-check, §3.6 full call-chain migration).
+2. **After W-A1/W-A2 (`UIO` + compile-fail fixtures)** — review the
+   `UIO` restriction (no `MonadIO`), the two smart constructors +
+   `runUIOWithEnv`, the `uio*`/`uioCd*` surface, and the compile-fail
+   fixtures assert the restriction, before W-A3.
+3. **After W-A3 (opcode migration)** — review every untrusted opcode
+   body for residual `liftIO`/`ask`/`System.Directory` imports (should
+   be none), the `uoRun` signature change, Git constructors dropping
+   `CloneDeps`, the dispatcher's `runUIOWithEnv (seUIOEnv exec) ...`
+   threading, the `aeUIOEnv` field rename, and the W-A3 CI grep guard
+   (`UIOGit` scoped to `Git.hs`), before W1.
+4. **After W2/W3 (`WorkdirFs` remote arm on `UIO`; `mkSessionExec`
+   constructs `UIOEnv`)** — review the single shared `RemoteRunner`
+   (one SSH connection, `WorkdirFs`'s remote arm via `runUIOWithEnv`),
+   `WorkdirFs`'s file-path confinement (own `mkSafePathRemote` +
+   `realpath`, layered on `UIO`'s CWD confinement), and the W3 case (b)
+   assertion (both `UIO`'s and `WorkdirFs`'s calls on one runner),
+   before W4.
+5. **After W4/W5 (backend rewire)** — review that no direct
    `System.Directory`/`TIO.readFile` remains in the workdir backends
    (compile-fail fixture green), local-arm parity tests pass, and the
    remote-arm symlink-escape test is non-vacuous, before W6.
-4. **After W6 (wiring sites)** — review all four entry points +
+6. **After W6 (wiring sites)** — review all four entry points +
    `ApiDeps.adSecurityConfig` wiring + the capability-scoping
    review-checklist before the final gate.
 
 ## 8. Alternatives considered + known limitations
 
+- **`UIO` as a restricted monad (round 4 augmentation).** Adopted —
+  turns the "no direct FS in opcodes" convention into a type-level
+  guarantee (no `MonadIO` instance; compile-fail fixtures). The sole
+  execution context for untrusted opcodes; two smart constructors
+  mirror the two modes. Categorically eliminates future local/remote
+  parity gaps. `WorkdirFs`'s remote arm is built on `UIO`'s
+  shell-exec, unifying the transport.
 - **Extend `UntrustedIO` with raw-read + metadata methods, thread it
   into the backends.** Rejected — `UntrustedIO` is the opcode capability
   handle; holding one in Trusted prompt-assembly code blurs the
   capability-scoping invariant (§3.1). A separate, narrower handle
-  keeps the boundary sharp.
+  keeps the boundary sharp. (`UIO` wraps `UntrustedIO`; `WorkdirFs`
+  stays separate.)
 - **Make `WorkdirFs` a typeclass with local/remote instances.** Rejected
   — the codebase uses the handle pattern (`ReaderT AppEnv IO` + handles),
   not typeclasses, deliberately (AGENTS.md "No effect systems"). A
-  record of IO actions is the idiomatic shape here.
+  record of IO actions is the idiomatic shape here. (`UIO` uses
+  module-level `UIO`-typed functions for its *operation* surface — not
+  a `MonadUIO` class (a single-instance class would be a smell); the
+  carrier is a concrete `newtype UIO`, not a typeclass-polymorphic
+  stack. The `CloneDeps` surface lives in a separate `UIOGit` module
+  for lexical scoping.)
 - **Keep the backends on `FilePath` and add a "remote FS adapter" that
   materializes the remote workdir locally on demand.** Rejected —
   materializing the whole repo locally on the control plane defeats the
@@ -1159,8 +1752,11 @@ FAIL to compile when `System.Directory` is imported).
   workspace files). The whole point of `mode=remote` is that the
   workspace lives on the untrusted plane only.
 - **Have the backends shell out via `uioShellExec` (`cat`/`ls`/`test`).**
-  Rejected — the backends would need an `UntrustedIO` (same scoping
-  problem), and `cat`-parsing is less robust than a typed `wfsReadFile`.
+  Rejected as a direct backend call — the backends would need an
+  `UntrustedIO`/`UIO` (scoping), and `cat`-parsing is less robust than
+  a typed `wfsReadFile`. (`WorkdirFs`'s remote arm DOES use `UIO`'s
+  shell-exec internally, but behind a typed `WorkdirFs` interface —
+  the best of both.)
 - **Do nothing; document that repo-local discovery is local-mode
   only.** Rejected — the issue reports a real regression; `mode=remote`
   is a supported, security-first configuration and the
