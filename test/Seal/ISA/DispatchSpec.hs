@@ -17,6 +17,7 @@ import Seal.ISA.Opcode
 import Seal.ISA.Registry
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
+import Seal.Tools.Exec.UIO qualified as UIO (uioLiftIO)
 import Seal.Transcript.Entries (erMeta)
 import Seal.Types.App
 import Seal.Types.Config
@@ -44,13 +45,14 @@ probe ref tl =
 mkProbeOpcode :: IORef [String] -> TrustLevel -> Opcode
 mkProbeOpcode ref = \case
   Trusted  -> TrustedOpcode (OpName "P") Trusted "p" (object []) (object [])
-                            (const (Right ())) (\_ _ -> recordRun)
+                            (const (Right ())) (\_ _ -> recordRunTrusted)
   Audited  -> TrustedOpcode (OpName "P") Audited "p" (object []) (object [])
-                            (const (Right ())) (\_ _ -> recordRun)
+                            (const (Right ())) (\_ _ -> recordRunTrusted)
   Untrusted -> UntrustedOpcode (OpName "P") "p" (object []) (object [])
-                               (const (Right ())) (\_ _ -> recordRun)
+                               (const (Right ())) (\_ -> recordRunUntrusted)
   where
-    recordRun = liftIO (modifyIORef' ref (++ ["run"])) $> OpResult [] False Null
+    recordRunTrusted = liftIO (modifyIORef' ref (++ ["run"])) $> OpResult [] False Null
+    recordRunUntrusted = UIO.uioLiftIO (modifyIORef' ref (++ ["run"])) $> OpResult [] False Null
 
 -- | The fail-closed 'UntrustedIO' handle the dispatcher threads for
 -- Untrusted opcodes in these tests. Every method returns
@@ -70,27 +72,27 @@ spec = describe "Seal.ISA.Dispatch" $ do
     ref <- newIORef []
     let (h, op) = probe ref Untrusted
         reg = mkRegistry [op]
-    _ <- runTestApp (dispatch reg h localBackend testUntrustedIO (OpName "P") (object []))
+    _ <- runTestApp (dispatch reg h localBackend testUntrustedIO Nothing (OpName "P") (object []))
     readIORef ref `shouldReturn` ["ack", "run"]
 
   it "Trusted: async then run (no ACK gate)" $ do
     ref <- newIORef []
     let (h, op) = probe ref Trusted
         reg = mkRegistry [op]
-    _ <- runTestApp (dispatch reg h localBackend testUntrustedIO (OpName "P") (object []))
+    _ <- runTestApp (dispatch reg h localBackend testUntrustedIO Nothing (OpName "P") (object []))
     readIORef ref `shouldReturn` ["async", "run"]
 
   it "missing opcode -> OpNotFound" $ do
     ref <- newIORef []
     let (h, _) = probe ref Trusted
-    res <- runTestApp (dispatch (mkRegistry []) h localBackend testUntrustedIO (OpName "Z") (object []))
+    res <- runTestApp (dispatch (mkRegistry []) h localBackend testUntrustedIO Nothing (OpName "Z") (object []))
     res `shouldBe` Left (OpNotFound (OpName "Z"))
 
   it "failed authorization -> Denied, never runs" $ do
     ref <- newIORef []
     let (h, base) = probe ref Trusted
         op = withAuthorize base (const (Left "nope"))
-    res <- runTestApp (dispatch (mkRegistry [op]) h localBackend testUntrustedIO (OpName "P") (object []))
+    res <- runTestApp (dispatch (mkRegistry [op]) h localBackend testUntrustedIO Nothing (OpName "P") (object []))
     res `shouldBe` Left (Denied "nope")
     readIORef ref `shouldReturn` []
 

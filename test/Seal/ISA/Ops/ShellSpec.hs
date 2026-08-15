@@ -8,7 +8,7 @@ import Data.Text (Text)
 import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
-import Seal.ISA.Opcode (OpResult (..), uoRun, uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), uoRunLegacy, uoAuthorize)
 import Seal.ISA.Ops.Shell
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
@@ -50,7 +50,7 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "hello\n"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRun op uio (object ["command" .= ("echo hello" :: String)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("echo hello" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "hello\n"]
       readIORef seen `shouldReturn` ["echo hello"]
@@ -59,7 +59,7 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "out"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRun op uio (object ["command" .= ("ls /ws" :: String)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("ls /ws" :: String)]))
       orRecorded r `shouldBe` object ["command" .= ("ls /ws" :: String), "cwd" .= (Nothing :: Maybe String)]
 
     it "Deny policy -> Denied at the authorize gate (never runs the executor)" $ do
@@ -71,12 +71,12 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "x"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRun op uio (object []))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object []))
       orIsError r `shouldBe` True
       readIORef seen `shouldReturn` []
 
     it "executor failure surfaces as an error result" $ do
       let uio = failUio ExecNotImplemented
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRun op uio (object ["command" .= ("false" :: String)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("false" :: String)]))
       orIsError r `shouldBe` True

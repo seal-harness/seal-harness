@@ -42,6 +42,7 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolRes
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.SourceControl.Clone (CloneDeps)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
@@ -52,9 +53,10 @@ data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
 -- Trusted/Audited opcodes ignore it (they have no 'UntrustedIO' in scope —
 -- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO -> OpName -> Value
+  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO
+  -> Maybe CloneDeps -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend untrustedIO name input =
+dispatch reg h backend untrustedIO mCloneDeps name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -65,7 +67,7 @@ dispatch reg h backend untrustedIO name input =
           case op of
             UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              Right <$> uoRun op untrustedIO input
+              Right <$> uoRunLegacy untrustedIO mCloneDeps op input
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do

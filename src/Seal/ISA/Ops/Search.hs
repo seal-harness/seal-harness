@@ -9,7 +9,6 @@ module Seal.ISA.Ops.Search
   ( searchFilesOp
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
@@ -22,7 +21,7 @@ import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Tools.Args (mkSearchPattern)
-import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioSearchFiles)
+import Seal.Tools.Exec.UIO (renderUntrustedErr, uioSearchFiles)
 import Seal.Tools.Exec.Types (mkRemotePath)
 
 -- | SEARCH_FILES opcode. Input: @{ pattern: Text, path?: Text, max_results?:
@@ -45,7 +44,7 @@ searchFilesOp _wsRoot policy maxResults = UntrustedOpcode
           | otherwise -> case spAutonomy policy of
               Deny -> Left "SEARCH_FILES denied by autonomy policy"
               _   -> Right ()
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let pat    = fromMaybe "" (patternField v)
           pth    = fromMaybe "." (pathField v)
           limit  = clampResults maxResults (resultsField v)
@@ -56,7 +55,7 @@ searchFilesOp _wsRoot policy maxResults = UntrustedOpcode
           let mPath = case mkRemotePath pth of
                 Right rp -> Just rp
                 Left _   -> Nothing
-          res <- liftIO (uioSearchFiles uio pat' mPath limit)
+          res <- uioSearchFiles pat' mPath limit
           case res of
             Left err -> pure (OpResult [TrpText (renderUntrustedErr err)] True
                               (object ["pattern" .= pat, "path" .= pth]))

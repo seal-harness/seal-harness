@@ -9,7 +9,7 @@ import Data.Set qualified as Set
 import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
-import Seal.ISA.Opcode (OpResult (..), uoRun, uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), uoRunLegacy, uoAuthorize)
 import Seal.ISA.Ops.Bin
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
@@ -58,7 +58,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       let uio = fakeUioFlat seen "42\n"
           allowList = Just (Set.fromList ["python3", "node"])
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("python3" :: String)
         , "args" .= (["-c", "print(42)"] :: [String])
         ]))
@@ -83,7 +83,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUioFlat seen "ok\n"
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("ls" :: String)
         ]))
       orIsError r `shouldBe` False
@@ -120,7 +120,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUioFlat seen ""
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("node" :: String)
         , "args" .= (["-e", "console.log('hi')"] :: [String])
         ]))
@@ -136,7 +136,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      _ <- runTestApp (uoRun op uio (object
+      _ <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         ]))
       readIORef seen `shouldReturn` [("pwd", [], Nothing)]
@@ -145,7 +145,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      _ <- runTestApp (uoRun op uio (object
+      _ <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("subdir" :: String)
         ]))
@@ -155,7 +155,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      _ <- runTestApp (uoRun op uio (object
+      _ <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("/tmp/seal-test" :: String)
         ]))
@@ -186,7 +186,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
           op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("subdir" :: String)
         ]))

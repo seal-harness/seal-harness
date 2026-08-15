@@ -8,7 +8,6 @@ module Seal.ISA.Ops.Process
   ( processManageOp
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Text (Text)
@@ -19,7 +18,7 @@ import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
-import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioProcessKill, uioProcessList)
+import Seal.Tools.Exec.UIO (renderUntrustedErr, uioProcessKill, uioProcessList)
 
 -- | PROCESS_MANAGE opcode. Input: @{ action: "list" | "kill", pid?: Int }@.
 processManageOp :: WorkspaceRoot -> SecurityPolicy -> Opcode
@@ -39,7 +38,7 @@ processManageOp _wsRoot policy = UntrustedOpcode
                 | pid <= 0   -> Left "PROCESS_MANAGE: pid must be a positive integer"
                 | otherwise  -> checkAutonomy
           | otherwise -> Left ("PROCESS_MANAGE: unknown action \"" <> act <> "\"")
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let act = actionField v
           mPid = pidField v
           recorded = object [ "action" .= act, "pid" .= mPid ]
@@ -47,14 +46,14 @@ processManageOp _wsRoot policy = UntrustedOpcode
         Nothing -> pure (OpResult [TrpText "PROCESS_MANAGE: missing action"] True recorded)
         Just a
           | a == "list" -> do
-              res <- liftIO (uioProcessList uio)
+              res <- uioProcessList
               pure $ case res of
                 Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                 Right out -> OpResult [TrpText out] False recorded
           | a == "kill" -> case mPid of
               Nothing -> pure (OpResult [TrpText "PROCESS_MANAGE: missing pid"] True recorded)
               Just pid -> do
-                res <- liftIO (uioProcessKill uio pid)
+                res <- uioProcessKill pid
                 pure $ case res of
                   Left err -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                   Right _  -> OpResult [TrpText ("killed pid " <> T.pack (show pid))] False recorded

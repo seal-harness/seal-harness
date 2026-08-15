@@ -152,7 +152,7 @@ dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
                -> App (Either DispatchError OpResult)
 dispatchOneWith reg uio name input = do
   (h, _) <- liftIO fakeTwoFileTranscript
-  dispatch reg h localBackend uio name input
+  dispatch reg h localBackend uio Nothing name input
 
 right :: Show e => Either e a -> a
 right (Right x) = x
@@ -243,7 +243,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    mkRemoteUntrustedIOStub caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
+                    mkRemoteUntrustedIOStub Nothing caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent
         sent' `shouldSatisfy` any ("hello world" `T.isInfixOf`)

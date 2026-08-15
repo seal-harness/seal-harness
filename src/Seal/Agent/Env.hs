@@ -16,6 +16,7 @@ import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.SourceControl.Clone (CloneDeps)
 
 data AgentEnv = AgentEnv
   { aeProvider :: SomeProvider
@@ -38,6 +39,11 @@ data AgentEnv = AgentEnv
     -- never sees the backend, only the capability. Trusted/Audited
     -- opcodes ignore it (the GADT 'Opcode' has no 'UntrustedIO' field
     -- for them — type-level capability scoping, spec §4/§8).
+  , aeCloneDeps :: Maybe CloneDeps
+    -- ^ The Git credential deps (Just when the session has Git/Repo
+    -- opcodes registered, Nothing otherwise). Threaded to 'dispatch'
+    -- via 'uoRunLegacy' so Git opcodes can access 'CloneDeps' from the
+    -- 'UIOEnv'. W6 replaces this with 'aeUIOEnv'.
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int

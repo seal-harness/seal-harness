@@ -128,10 +128,10 @@ spec = describe "Seal.Phase6aSpec" $ do
 
 -- | Dispatch one opcode via a one-op registry against a fake transcript.
 dispatchReg :: TwoFileHandle -> Opcode -> App (Either DispatchError OpResult)
-dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub (opName op) (object [])
+dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub Nothing (opName op) (object [])
 
 dispatchOp :: TwoFileHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
-dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub (opName op)
+dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub Nothing (opName op)
 
 testEntry :: HarnessId -> HarnessEntry
 testEntry hid = HarnessEntry

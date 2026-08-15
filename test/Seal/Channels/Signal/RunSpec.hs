@@ -138,6 +138,7 @@ spec = do
                   , aeTranscript = tHandle
                   , aeBackend = localBackend
                   , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeCloneDeps = Nothing
                   , aeCaps = handleCaps
                   , aeSession = sid
                   , aeMaxTurns = 4

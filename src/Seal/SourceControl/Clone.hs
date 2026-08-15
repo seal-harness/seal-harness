@@ -59,6 +59,7 @@ module Seal.SourceControl.Clone
   , lsRemoteRepo
   , renderCloneError
   , renderPatHeader
+  , stubCloneDeps
   ) where
 
 import Control.Exception (bracket, try)
@@ -250,6 +251,22 @@ data CloneDeps = CloneDeps
     -- the default @ssh@ + the forwarded agent + the remote machine's
     -- default @known_hosts@). When 'False', the local path writes a
     -- per-op @known_hosts@ temp file + uses @GIT_SSH_COMMAND@.
+  }
+
+-- | A stub 'CloneDeps' whose fields are all @error@ bottoms. Used by
+-- 'uoRunLegacy' for non-Git opcodes (which never access 'CloneDeps' —
+-- they don't call 'uioCd*'). Accessing any field of this stub is a
+-- runtime error, which is the correct behavior: non-Git opcodes must
+-- never touch the Git credential surface.
+stubCloneDeps :: CloneDeps
+stubCloneDeps = CloneDeps
+  { cdVault = error "stubCloneDeps: cdVault (non-Git opcode must not access)"
+  , cdRepoReg = error "stubCloneDeps: cdRepoReg (non-Git opcode must not access)"
+  , cdSshAgent = error "stubCloneDeps: cdSshAgent (non-Git opcode must not access)"
+  , cdAgentRegistry = error "stubCloneDeps: cdAgentRegistry (non-Git opcode must not access)"
+  , cdPinnedKnownHosts = error "stubCloneDeps: cdPinnedKnownHosts (non-Git opcode must not access)"
+  , cdKeyfilesDir = error "stubCloneDeps: cdKeyfilesDir (non-Git opcode must not access)"
+  , cdIsRemote = False
   }
 
 ----------------------------------------------------------------------------

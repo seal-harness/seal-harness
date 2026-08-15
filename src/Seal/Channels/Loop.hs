@@ -840,6 +840,7 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
                   else Just (broadcastTabs deps (cdTabs deps))
           let env = (mkSessionAgentEnv
                        handleCaps prov (smProvider meta) model sid mSystem'' isaReg tHandle untrustedIO
+                       (Just cloneDeps)
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand
@@ -989,7 +990,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO (Just cloneDeps) callOpName val)
     case res of
       Right r -> do
         let opNm = case callOpName of OpName n -> n

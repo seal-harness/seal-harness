@@ -12,7 +12,6 @@ module Seal.ISA.Ops.Shell
   ( shellExecOp
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Text (Text)
@@ -22,7 +21,7 @@ import Seal.ISA.Opcode
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args (mkShellCommand)
-import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioShellExec)
+import Seal.Tools.Exec.UIO (renderUntrustedErr, uioShellExec)
 import Seal.Tools.Exec.Types (mkRemotePath)
 import Seal.Providers.Class (ToolResultPart (..))
 
@@ -46,7 +45,7 @@ shellExecOp _wsRoot policy = UntrustedOpcode
           Right _ -> case spAutonomy policy of
             Deny -> Left "SHELL_EXEC denied by autonomy policy"
             _   -> Right ()
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let mCmd = commandField v
           mCwd = cwdField v
           recorded = object [ "command" .= (mCmd :: Maybe Text), "cwd" .= mCwd ]
@@ -61,7 +60,7 @@ shellExecOp _wsRoot policy = UntrustedOpcode
                     Just t -> case mkRemotePath t of
                       Right rp -> Just rp
                       Left _   -> Nothing
-              res <- liftIO (uioShellExec uio cmd mCwdPath)
+              res <- uioShellExec cmd mCwdPath
               pure $ case res of
                 Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                 Right out -> OpResult [TrpText out] False recorded

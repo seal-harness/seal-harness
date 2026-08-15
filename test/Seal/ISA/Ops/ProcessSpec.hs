@@ -7,7 +7,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Test.Hspec
 
-import Seal.ISA.Opcode (OpResult (..), uoRun, uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), uoRunLegacy, uoAuthorize)
 import Seal.ISA.Ops.Process
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Core.AllowList (AllowList (..))
@@ -44,7 +44,7 @@ spec = describe "Seal.ISA.Ops.Process" $ do
       seen <- newIORef []
       let uio = fakeUio seen "PID  CMD\n  1  init\n 42  myproc\n"
           op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
-      r <- runTestApp (uoRun op uio (object ["action" .= ("list" :: String)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["action" .= ("list" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldSatisfy` \case [TrpText t] -> "myproc" `T.isInfixOf` t; _ -> False
       readIORef seen `shouldReturn` ["ps -o pid=,cmd="]
@@ -53,7 +53,7 @@ spec = describe "Seal.ISA.Ops.Process" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
           op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
-      r <- runTestApp (uoRun op uio (object ["action" .= ("kill" :: String), "pid" .= (123 :: Int)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["action" .= ("kill" :: String), "pid" .= (123 :: Int)]))
       orIsError r `shouldBe` False
       readIORef seen `shouldReturn` ["kill 123"]
 
@@ -80,5 +80,5 @@ spec = describe "Seal.ISA.Ops.Process" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
           op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
-      r <- runTestApp (uoRun op uio (object ["action" .= ("kill" :: String), "pid" .= (42 :: Int)]))
+      r <- runTestApp (uoRunLegacy uio Nothing op (object ["action" .= ("kill" :: String), "pid" .= (42 :: Int)]))
       orRecorded r `shouldBe` object ["action" .= ("kill" :: String), "pid" .= (42 :: Int)]

@@ -168,6 +168,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeTranscript = childTHandle
               , aeBackend    = localBackend
               , aeUntrustedIO = childUio
+              , aeCloneDeps = Nothing
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 90

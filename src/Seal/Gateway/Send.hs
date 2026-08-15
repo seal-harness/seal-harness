@@ -485,6 +485,7 @@ plainTurn deps meta t = do
                   caps onDemand
                 env = mkSessionAgentEnv
                   caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                  (Just cloneDeps)
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
@@ -731,6 +732,7 @@ plainTurnWithCaps deps meta caps t = do
                 caps onDemand
               env = mkSessionAgentEnv
                 caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                (Just cloneDeps)
                 (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                 (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                 onDemand
@@ -784,7 +786,7 @@ webCallDispatcher deps callOpName val = do
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO (Just cloneDeps) callOpName val)
     case res of
       Right r -> do
         -- Record the opcode result into the transcript. SKILL_LOAD and

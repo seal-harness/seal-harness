@@ -10,7 +10,7 @@ module Seal.Web.Fetch
   ) where
 
 import Control.Exception (try)
-import Control.Monad.IO.Class (liftIO)
+import Seal.Tools.Exec.UIO (uioLiftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString.Lazy qualified as BL
@@ -55,13 +55,13 @@ webFetchOp cfg = UntrustedOpcode
           | not (domainAllowed u (wfcAllowList cfg)) ->
               Left ("WEB_FETCH: domain not in allow-list: " <> hostOf u)
           | otherwise -> Right ()
-  , uoRun = \_uio v -> do
+  , uoRun = \v -> do
       let u = fromMaybe "" (urlField v)
       case wfcManager cfg of
         Nothing -> pure (OpResult
           [TrpText "WEB_FETCH: no HTTP manager configured"]
           True (object ["url" .= u, "status" .= (0 :: Int), "bytes" .= (0 :: Int)]))
-        Just mgr -> liftIO (doFetch mgr (wfcMaxBytes cfg) u)
+        Just mgr -> uioLiftIO (doFetch mgr (wfcMaxBytes cfg) u)
   }
 
 -- | Perform the HTTP fetch: SSRF check → parse the URL → execute the

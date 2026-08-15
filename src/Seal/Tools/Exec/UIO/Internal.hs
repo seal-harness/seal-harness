@@ -37,6 +37,8 @@ module Seal.Tools.Exec.UIO.Internal
   , uioShellExecEnv
   , uioShellExecGitEnv
   , uioBinExecEnv
+  , uioLiftIO
+  , uioUntrustedIO
   , WriteMode (..)
   , UntrustedErr (..)
   , renderUntrustedErr
@@ -46,7 +48,7 @@ module Seal.Tools.Exec.UIO.Internal
   ) where
 
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Reader (ReaderT, ask, runReaderT)
+import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 
@@ -223,3 +225,23 @@ uioBinExecEnv extras bin bargs mCwd = UIO $ do
 -- Opcode bodies call the 'uio*' functions above, never 'liftIO' directly.
 liftIO' :: IO a -> ReaderT UIOEnv IO a
 liftIO' = liftIO
+
+-- | The escape hatch for untrusted opcodes that perform IO NOT through
+-- 'UntrustedIO' (e.g. 'WEB_FETCH' uses an HTTP @Manager@, 'IMAGE_ANALYZE'
+-- uses a vision API). These opcodes live outside @src\/Seal\/ISA\/Ops\/@
+-- (in @src\/Seal\/Web\/@, @src\/Seal\/Media\/@) — the W-A2 compile-fail
+-- fixture asserts that @liftIO@ (from 'MonadIO') does NOT work in a 'UIO'
+-- body, and the ISA opcode modules (File\/Shell\/Search\/Bin\/Process\/
+-- Git\/Repo) use the typed 'uio*' surface instead. This function is the
+-- explicit, audited escape hatch for the Web\/Media opcodes that need
+-- direct IO access.
+uioLiftIO :: IO a -> UIO a
+uioLiftIO = UIO . liftIO'
+
+-- | Read the 'UntrustedIO' handle from the 'UIOEnv'. Escape hatch for
+-- opcodes that delegate to functions taking a raw 'UntrustedIO' (e.g.
+-- 'cloneRepoIO' in 'Seal.ISA.Ops.Repo', which is shared between the opcode
+-- path and the API endpoint). W6 will fully migrate these to the 'uio*'
+-- surface.
+uioUntrustedIO :: UIO UntrustedIO
+uioUntrustedIO = UIO $ asks uieUntrustedIO

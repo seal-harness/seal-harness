@@ -48,6 +48,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeTranscript = h
           , aeBackend = localBackend
           , aeUntrustedIO = mkRemoteUntrustedIOStub
+          , aeCloneDeps = Nothing
           , aeCaps = caps
           , aeSession = either (error "sid") id (mkSessionId "cli")
           , aeMaxTurns = 4

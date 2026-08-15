@@ -9,7 +9,7 @@ import Data.Set qualified as Set
 import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
-import Seal.ISA.Opcode (OpResult (..), uoRun, uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), uoRunLegacy, uoAuthorize)
 import Seal.ISA.Ops.Search
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
@@ -43,7 +43,7 @@ spec = describe "Seal.ISA.Ops.Search" $ do
       seen <- newIORef []
       let uio = fakeUio seen "src/Foo.hs:1:hello\nsrc/Bar.hs:3:world\n"
           op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "pattern" .= ("hello" :: String)
         , "path" .= ("src" :: String)
         ]))
@@ -64,7 +64,7 @@ spec = describe "Seal.ISA.Ops.Search" $ do
       seen <- newIORef []
       let uio = fakeUio seen "a.hs:1:foo\nb.hs:2:bar\n"
           op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "pattern" .= ("foo" :: String)
         , "path" .= ("." :: String)
         ]))
@@ -83,7 +83,7 @@ spec = describe "Seal.ISA.Ops.Search" $ do
       seen <- newIORef []
       let uio = fakeUio seen "a:1:x\nb:2:x\nc:3:x\n"  -- 3 results
           op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 2
-      r <- runTestApp (uoRun op uio (object
+      r <- runTestApp (uoRunLegacy uio Nothing op (object
         [ "pattern" .= ("x" :: String)
         , "path" .= ("." :: String)
         ]))

@@ -121,6 +121,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeTranscript = tHandle
                 , aeBackend = localBackend
                 , aeUntrustedIO = mkRemoteUntrustedIOStub
+                , aeCloneDeps = Nothing
                 , aeCaps = handleCaps
                 , aeSession = sid
                 , aeMaxTurns = 4

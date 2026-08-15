@@ -114,6 +114,7 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
+import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
@@ -231,11 +232,11 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO -> Maybe CloneDeps
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
   -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> Maybe (Text -> IO ())
   -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO mCloneDeps debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -244,6 +245,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeTranscript = tHandle
   , aeBackend    = localBackend
   , aeUntrustedIO = untrustedIO
+  , aeCloneDeps = mCloneDeps
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = maxTurns
@@ -645,6 +647,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               mSystem <- resolveSystem meta bgMwd
               bgUio <- mkSessionUio bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
+                    (Just cloneDeps)
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
                     "cli" Nothing
@@ -676,7 +679,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           callUio <- mkSessionUio sid
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio (Just cloneDeps) callOpName val)
           case res of
             Right r -> do
               let opNm = case callOpName of OpName n -> n
@@ -691,6 +694,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           uio <- mkSessionUio sid
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
+               (Just cloneDeps)
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
                "cli" Nothing)

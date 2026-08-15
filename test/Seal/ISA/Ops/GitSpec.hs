@@ -27,7 +27,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
-import Seal.ISA.Opcode (OpResult (..), opTrust, opName, uoRun)
+import Seal.ISA.Opcode (OpResult (..), opTrust, opName, uoRunLegacy)
 import Seal.ISA.Ops.Git
   ( gitFetchOp, gitPullOp, gitPushOp, resolveOriginUrl )
 import Seal.Logging.Logger (testSealLogger)
@@ -114,7 +114,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult parts False _ -> do
             parts `shouldNotBe` []
@@ -144,7 +144,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        _ <- runApp appEnv (uoRun op uio input)
+        _ <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         calls <- readIORef callsRef
         SahAddKey (keyfilesDir </> "myrepo") "passphrase" `elem` calls `shouldBe` True
         SahDeleteAll `elem` calls `shouldBe` False
@@ -176,7 +176,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult parts True _ -> do
             let msg = T.intercalate "\n" [ t | TrpText t <- parts ]
@@ -211,7 +211,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult parts True _ -> do
             let msg = T.intercalate "\n" [ t | TrpText t <- parts ]
@@ -246,7 +246,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPushOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text), "refspec" .= ("main" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult _parts False recorded -> do
             -- credential_kind is in orRecorded
@@ -280,7 +280,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPushOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text), "refspec" .= ("main" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult _parts True recorded -> do
             lookupKey recorded "credential_kind" `shouldBe` Just "deploy_key"
@@ -313,7 +313,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPullOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (uoRunLegacy uio (Just deps) op input)
         case res of
           OpResult parts False _ -> parts `shouldNotBe` []
           other -> expectationFailure ("expected success, got: " <> show other)
