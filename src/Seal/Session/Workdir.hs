@@ -10,6 +10,8 @@ module Seal.Session.Workdir
   , remoteSessionWorkdirPath
   , ensureRemoteSessionWorkdir
   , mkSessionUntrustedIO
+  , SessionExec (..)
+  , mkSessionExec
   ) where
 
 import Control.Exception (IOException, try)
@@ -26,11 +28,18 @@ import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Tools.Exec.Remote (RemoteRunner (..), runRemoteShell, mkRealRemoteRunner)
+import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Seal.Text.LineFile (maxScanBytes)
+import Seal.Tools.Exec.Remote
+  (RemoteRunner (..), mkRealRemoteRunner, runRemoteShell)
 import Seal.Tools.Args (mkShellCommand)
 import Seal.Tools.Exec.Types (SshConfig (..), getRemotePath, mkRemotePath)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv (..), mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO, mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub )
+  ( UntrustedIO, mkLocalUntrustedIO, mkRemoteUntrustedIO
+  , mkRemoteUntrustedIOStub )
+import Seal.Tools.Exec.WorkdirFs
+  ( WorkdirFs, mkLocalWorkdirFs, mkRemoteWorkdirFs, mkWorkdirFsStub )
 
 -- | The error type for workdir lifecycle operations.
 data WorkdirError
@@ -124,6 +133,87 @@ ensureRemoteSessionWorkdir sshCfg runner sid = do
 -- Unified session UntrustedIO construction (local + remote)
 -- ---------------------------------------------------------------------------
 
+-- | The fail-closed 'WorkspaceRoot' returned when workdir creation fails.
+-- Matches the convention used at the wiring sites (e.g. @Cli.hs@).
+failClosedRoot :: WorkspaceRoot
+failClosedRoot = WorkspaceRoot "/nonexistent-workdir-fail-closed"
+
+-- | The per-session execution bundle: the 'UIOEnv' (carrying 'UntrustedIO'
+-- + 'CloneDeps'), the 'WorkdirFs' for discovery, and the shared
+-- 'WorkspaceRoot' used by UIO + WorkdirFs + the ISA registry. Constructed
+-- by 'mkSessionExec' from the 'SecurityConfig'; the single 'RemoteRunner'
+-- is shared between 'seUIOEnv' (UIO's 'UntrustedIO') and 'seWorkdirFs'
+-- (via 'runUIOWithEnv') — one SSH connection, not two. On ANY workdir-
+-- creation failure, ALL three fields are stubs (fail-closed) — never a
+-- mix of real + stub.
+data SessionExec = SessionExec
+  { seUIOEnv        :: UIOEnv
+  , seWorkdirFs     :: WorkdirFs
+  , seWorkspaceRoot :: WorkspaceRoot
+  }
+
+-- | Construct the per-session 'SessionExec' from the 'SecurityConfig'.
+-- Mirrors 'mkSessionUntrustedIO' with the same three cases (local,
+-- remote + configured, remote + absent/incomplete) but additionally
+-- builds the 'WorkdirFs' and the shared 'WorkspaceRoot'. The
+-- 'RemoteRunner' is passed explicitly so tests can inject
+-- 'mkFakeRemoteRunnerRecording' (no real SSH); production wiring passes
+-- 'mkRealRemoteRunner'. The single runner is shared between 'seUIOEnv'
+-- and 'seWorkdirFs'. On ANY workdir-creation failure, returns a
+-- 'SessionExec' with both handles as stubs and 'seWorkspaceRoot' as
+-- 'failClosedRoot' — never mixed.
+mkSessionExec
+  :: SealPaths -> SecurityConfig -> SessionId
+  -> CloneDeps -> RemoteRunner -> IO SessionExec
+mkSessionExec paths secCfg sid cloneDeps runner =
+  case untrustedExecConfigFromSecurity secCfg of
+    Nothing -> do
+      eWd <- ensureSessionWorkdir paths sid
+      case eWd of
+        Right wd ->
+          let wsRoot  = WorkspaceRoot wd
+              uio     = mkLocalUntrustedIO wsRoot
+              uioEnv  = mkTestUIOEnv uio cloneDeps
+              wfs     = mkLocalWorkdirFs wsRoot maxScanBytes
+          in pure SessionExec
+               { seUIOEnv        = uioEnv
+               , seWorkdirFs     = wfs
+               , seWorkspaceRoot = wsRoot
+               }
+        Left _err -> pure (failClosedSessionExec cloneDeps)
+
+    Just uec ->
+      case uecRemote uec of
+        Nothing -> pure (failClosedSessionExec cloneDeps)
+
+        Just sshCfg -> do
+          eRemoteWd <- ensureRemoteSessionWorkdir sshCfg runner sid
+          case eRemoteWd of
+            Left _err -> pure (failClosedSessionExec cloneDeps)
+            Right remoteWdText ->
+              case mkRemotePath remoteWdText of
+                Left _err -> pure (failClosedSessionExec cloneDeps)
+                Right remotePath ->
+                  let sshCfg' = sshCfg { scWorkspace = remotePath }
+                      wsRoot  = WorkspaceRoot (T.unpack (getRemotePath remotePath))
+                      uio     = mkRemoteUntrustedIO sshCfg' runner
+                      uioEnv  = mkTestUIOEnv uio cloneDeps
+                      wfs     = mkRemoteWorkdirFs uioEnv sshCfg' wsRoot maxScanBytes
+                  in pure SessionExec
+                       { seUIOEnv        = uioEnv
+                       , seWorkdirFs     = wfs
+                       , seWorkspaceRoot = wsRoot
+                       }
+
+-- | The fail-closed 'SessionExec': both handles are stubs, the root is
+-- 'failClosedRoot'. Used on ANY workdir-creation failure.
+failClosedSessionExec :: CloneDeps -> SessionExec
+failClosedSessionExec cloneDeps = SessionExec
+  { seUIOEnv        = mkTestUIOEnv mkRemoteUntrustedIOStub cloneDeps
+  , seWorkdirFs     = mkWorkdirFsStub
+  , seWorkspaceRoot = failClosedRoot
+  }
+
 -- | Construct the per-session 'UntrustedIO' from the 'SecurityConfig':
 --
 --   * @mode=local@ (or absent): create the local workdir via
@@ -144,31 +234,10 @@ ensureRemoteSessionWorkdir sshCfg runner sid = do
 -- should surface the error and NOT proceed — the wiring site checks the
 -- 'WorkdirError' via 'ensureSessionWorkdir' separately if it needs to
 -- surface the error to the user).
+--
+-- Back-compat thin wrapper over 'mkSessionExec' (threads
+-- 'mkRealRemoteRunner', preserving EXACT current semantics).
 mkSessionUntrustedIO
   :: SealPaths -> SecurityConfig -> SessionId -> IO UntrustedIO
 mkSessionUntrustedIO paths secCfg sid =
-  case untrustedExecConfigFromSecurity secCfg of
-    -- mode=local (or absent section) → local workdir
-    Nothing -> do
-      eWd <- ensureSessionWorkdir paths sid
-      case eWd of
-        Right wd -> pure (mkLocalUntrustedIO (WorkspaceRoot wd))
-        Left _err -> pure mkRemoteUntrustedIOStub  -- fail-closed
-
-    -- mode=remote
-    Just uec ->
-      case uecRemote uec of
-        -- remote not configured → fail-closed
-        Nothing -> pure mkRemoteUntrustedIOStub
-
-        -- remote configured → create remote workdir + clone SshConfig
-        Just sshCfg -> do
-          eRemoteWd <- ensureRemoteSessionWorkdir sshCfg mkRealRemoteRunner sid
-          case eRemoteWd of
-            Left _err -> pure mkRemoteUntrustedIOStub  -- fail-closed
-            Right remoteWdText ->
-              case mkRemotePath remoteWdText of
-                Left _err -> pure mkRemoteUntrustedIOStub
-                Right remotePath ->
-                  let sshCfg' = sshCfg { scWorkspace = remotePath }
-                  in pure (mkRemoteUntrustedIO sshCfg' mkRealRemoteRunner)
+  uieUntrustedIO . seUIOEnv <$> mkSessionExec paths secCfg sid stubCloneDeps mkRealRemoteRunner
