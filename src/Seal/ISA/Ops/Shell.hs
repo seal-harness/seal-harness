@@ -10,6 +10,7 @@
 -- 'UntrustedIO'; this module never imports 'System.Process'.
 module Seal.ISA.Ops.Shell
   ( shellExecOp
+  , shellExecSchema
   ) where
 
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
@@ -78,6 +79,10 @@ shellExecSchema =
         , "cwd" .= object
             [ "type" .= ("string" :: Text)
             , "description" .= ("Optional cwd (workspace-relative, SafePath-confined)." :: Text)
+            ]
+        , "timeout" .= object
+            [ "type" .= ("integer" :: Text)
+            , "description" .= ("Per-call timeout in seconds; if the tool doesn't finish in this time, it's killed. Default 120, max 600. For long builds, redirect to a file (e.g. 'build 2>&1 | tee build.log') and FILE_READ the log with pagination." :: Text)
             ]
         ]
     , "required" .= (["command"] :: [Text])

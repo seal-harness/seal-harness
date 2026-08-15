@@ -97,6 +97,7 @@ library
         Seal.Command.Session
         Seal.Command.Serve
         Seal.Command.Skill
+        Seal.Command.Stop
         Seal.Command.Repo
         Seal.Command.Tab
         Seal.Command.Agent
@@ -131,16 +132,19 @@ library
          Seal.Security.Vault
          Seal.Security.Vault.Age
          Seal.Text.LineFile
-         Seal.Tools.Args
-         Seal.Tools.Exec.Remote
-         Seal.Tools.Exec.Types
+          Seal.Tools.Args
+          Seal.Tools.Exec.Abort
+          Seal.Tools.Exec.Remote
+          Seal.Tools.Exec.Timeout
+          Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
-           Seal.Tools.Exec.UIO
-           Seal.Tools.Exec.UIO.Internal
-           Seal.Tools.Exec.UIOGit
-           Seal.Tools.Exec.WorkdirFs
+          Seal.Tools.Exec.UIO
+          Seal.Tools.Exec.UIO.Internal
+          Seal.Tools.Exec.UIOGit
+          Seal.Tools.Exec.WorkdirFs
           Seal.Tools.Ssh.Agent
+          Seal.Tools.Timeout
         Seal.Web.Search
         Seal.Web.SearXngSetup
         Seal.Web.Fetch
@@ -215,6 +219,7 @@ library
     build-depends:
         base >= 4.18 && < 5
       , aeson
+      , async
       , base64-bytestring
       , data-default
       , bytestring
@@ -426,13 +431,16 @@ test-suite tests
         Seal.Config.WorkdirSpec
         Seal.Tools.Exec.LocalSpec
         Seal.Tools.Exec.RemoteSpec
-        Seal.Tools.ArgsSpec
-        Seal.Tools.Exec.CapabilityScopingFailSpec
-        Seal.Tools.Exec.UIOSpec
-        Seal.Tools.Exec.UIOParitySpec
-        Seal.Tools.Exec.WorkdirFsSpec
-       Seal.ISA.Ops.UIOUnrestrictedFailSpec
-       Seal.ISA.Ops.UIOConstructionFailSpec
+         Seal.Tools.ArgsSpec
+         Seal.Tools.Exec.CapabilityScopingFailSpec
+         Seal.Tools.Exec.UIOSpec
+         Seal.Tools.Exec.UIOParitySpec
+         Seal.Tools.Exec.WorkdirFsSpec
+         Seal.ISA.Ops.UIOUnrestrictedFailSpec
+         Seal.ISA.Ops.UIOConstructionFailSpec
+         Seal.Tools.TimeoutSpec
+         Seal.Tools.Exec.AbortSpec
+         Seal.Tools.Exec.TimeoutSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec

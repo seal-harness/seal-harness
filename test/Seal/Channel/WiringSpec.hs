@@ -2,12 +2,15 @@
 module Seal.Channel.WiringSpec (spec) where
 
 import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Agent.Env
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Channel.Cli
 import Seal.Core.Types
 import Seal.Handles.AskReply (newApprovalCache)
@@ -20,6 +23,11 @@ import Seal.TestHelpers.FakeCaps
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.Config
 import Seal.Types.Env
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- | A scripted provider: pops responses from the list in order;
 -- returns a "done" sentinel when exhausted.
@@ -63,6 +71,8 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
                     , aeOnStop = Nothing
           , aeOnDemandSchemas = False
           , aeLogPath = Nothing
+          , aeAbortFlag = testAbortFlag
+          , aeToolTimeout = defaultToolTimeoutConfig
           }
     logger <- testSealLogger
     env <- mkEnv logger defaultConfig

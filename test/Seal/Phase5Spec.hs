@@ -14,6 +14,7 @@ import Data.Text qualified as T
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -35,7 +36,9 @@ import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend, OpResult (..))
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.ISA.Ops.Agent
   ( agentDefWriteOp, agentDefReadOp, agentInstancesOp
   , agentStartOp, agentStatusOp, agentStopOp, agentInterruptOp
@@ -55,6 +58,11 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Types.Env (mkEnv)
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- | A provider that returns a scripted list of responses, one per call.
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
@@ -179,6 +187,8 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run the capstone")
       -- 1. Each mutation landed as a Markdown file under config/.
@@ -225,7 +235,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             ]
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
-      _ <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (OpName "AGENT_DEF_WRITE")
+      _ <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_DEF_WRITE")
                          (object
                            [ "id" .= ("worker" :: Text)
                            , "name" .= ("worker" :: Text)
@@ -236,7 +246,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
       -- Start it via dispatch (synchronous — the worker runs to completion
       -- before dispatch returns; no AGENT_STATUS Running state to observe).
-      rStart <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (OpName "AGENT_START")
+      rStart <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_START")
                             (object ["id" .= ("worker" :: Text), "goal" .= ("do work" :: Text)]))
       rStart `shouldSatisfy` isRight
       -- Synchronous: the worker has already run exactly once.

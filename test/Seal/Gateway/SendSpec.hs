@@ -48,6 +48,7 @@ import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
+import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs)
@@ -131,6 +132,7 @@ mkSendDepsWith paths resolveStub = do
   approvals <- newApprovalCache
   testReplies <- newReplyRegistry
   testLocks <- newSessionLocks
+  testAbortReg <- newSessionAbortRegistry
   let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
@@ -162,6 +164,7 @@ mkSendDepsWith paths resolveStub = do
         , sdApprovals   = approvals
         , sdReplies     = testReplies
         , sdLocks       = testLocks
+        , sdAbortReg    = testAbortReg
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
         , sdIsRemote    = False

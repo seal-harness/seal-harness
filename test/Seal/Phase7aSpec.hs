@@ -10,6 +10,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (newIORef)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Data.Time (UTCTime(..), fromGregorian)
 import Network.HTTP.Types (methodGet, statusCode)
@@ -34,11 +35,17 @@ import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
+
+-- | A shared test abort registry (top-level, created once via unsafePerformIO).
+testAbortReg :: SessionAbortRegistry
+testAbortReg = unsafePerformIO newSessionAbortRegistry
+{-# NOINLINE testAbortReg #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
@@ -93,6 +100,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
+    , adAbortReg = testAbortReg
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -149,6 +157,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
+    , adAbortReg = testAbortReg
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

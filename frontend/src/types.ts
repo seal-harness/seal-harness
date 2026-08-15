@@ -315,8 +315,8 @@ export interface DeployKeyInfo {
 /** Human-readable label for each credential kind (mirrors the backend
  *  credentialKindLabel + the /repo --cred help text). */
 export const REPO_CRED_LABELS: Record<RepoCredentialKind, string> = {
-  pat: 'Personal Access Token',
   deploy_key: 'SSH Deploy Key',
+  pat: 'Personal Access Token',
   machine_user: 'Bot Account',
 }
 

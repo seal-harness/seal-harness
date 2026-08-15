@@ -14,6 +14,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
+import System.IO.Unsafe (unsafePerformIO)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import qualified Data.Vector as V
@@ -40,9 +41,18 @@ import Seal.Types.Env (mkEnv)
 import Seal.Agent.Env
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Agent.Loop
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+-- Test turns clear it at runTurn entry; no test relies on abort behavior
+-- (they all run non-aborting opcodes), so a single shared flag is fine.
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- | A provider that returns a scripted list of responses, one per call.
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
@@ -148,6 +158,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hello")
     readIORef ran `shouldReturn` 1
@@ -185,6 +197,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
@@ -240,6 +254,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
+                      , aeAbortFlag = testAbortFlag
+                      , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
@@ -293,6 +309,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
+                      , aeAbortFlag = testAbortFlag
+                      , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
@@ -362,6 +380,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                       , aeOnDemandSchemas = False
                       , aeLogPath = Nothing
+                      , aeAbortFlag = testAbortFlag
+                      , aeToolTimeout = defaultToolTimeoutConfig
                       }
         runTestApp (runTurn mkEnv' "hi")
         runTestApp (runTurn mkEnv' "how are you")
@@ -467,6 +487,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
@@ -507,6 +529,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` False
@@ -547,6 +571,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "run echo hi")
       readIORef ran `shouldReturn` True
@@ -598,6 +624,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "ping")
       readIORef ran `shouldReturn` 1
@@ -637,6 +665,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (fromJust logPath) `shouldReturn` True
@@ -675,6 +705,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (fromJust logPath) `shouldReturn` True
@@ -719,6 +751,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     (msgs, entries) <- readState
@@ -769,6 +803,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     -- The turn recovered: the user sees the successful reply, not the error.
@@ -810,6 +846,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     -- The provider was called exactly once (no retries).
@@ -849,6 +887,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (logDir </> "seal.log") `shouldReturn` False
@@ -892,6 +932,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "loop")
       content <- readFile (fromJust logPath)
@@ -941,6 +983,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     -- The user sees the resumed final text ("done"), not just "partial".
@@ -985,6 +1029,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     sentMsgs <- readIORef sent
@@ -1025,6 +1071,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     sentMsgs <- readIORef sent
@@ -1066,6 +1114,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "hi")
     -- 1 initial + 3 continuations = 4 calls total, then the loop gives up.
@@ -1117,6 +1167,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                 , aeOnDemandSchemas = False
                 , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
                 }
     runTestApp (runTurn env "ping")
     readIORef ran `shouldReturn` 1
@@ -1159,6 +1211,8 @@ spec = describe "Seal.Agent.Loop" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = logPath
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                   }
       runTestApp (runTurn env "hi")
       doesFileExist (fromJust logPath) `shouldReturn` True

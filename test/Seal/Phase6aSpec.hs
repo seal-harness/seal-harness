@@ -8,6 +8,7 @@ import Control.Concurrent.STM (atomically)
 import Data.Aeson (Value, object, (.=))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Handles.Harness (HarnessError (..))
@@ -20,7 +21,9 @@ import Seal.ISA.Dispatch (DispatchError, dispatch)
 import Seal.ISA.Opcode (Opcode, OpResult, localBackend, opName)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.ISA.Ops.Harness
 import Seal.ISA.Registry qualified as Registry
 import Seal.Session.Kind (HarnessFlavour (..))
@@ -28,6 +31,11 @@ import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Logging.Logger (testSealLogger)
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- A fake TmuxRunner that records argv + returns scripted stdout (LIFO).
 mkFakeRunner :: [Text] -> IO (TmuxRunner, IO [[String]])
@@ -130,10 +138,10 @@ spec = describe "Seal.Phase6aSpec" $ do
 
 -- | Dispatch one opcode via a one-op registry against a fake transcript.
 dispatchReg :: TwoFileHandle -> Opcode -> App (Either DispatchError OpResult)
-dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (opName op) (object [])
+dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op) (object [])
 
 dispatchOp :: TwoFileHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
-dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) (opName op)
+dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op)
 
 testEntry :: HarnessId -> HarnessEntry
 testEntry hid = HarnessEntry

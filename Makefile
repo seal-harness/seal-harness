@@ -50,3 +50,6 @@ clean: ## Remove build artifacts (dist-newstyle)
 
 shell: ## Enter an interactive Nix dev shell
 	nix develop
+
+codegraph-sigs: ## Print all the type signatures in the project
+	codegraph query "" --kind function --limit 10000 --json | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));d.filter(x=>x.node.language==='haskell'&&x.node.signature).forEach(x=>console.log(x.node.qualifiedName+' :: '+x.node.signature))"

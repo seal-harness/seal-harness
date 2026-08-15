@@ -15,7 +15,9 @@ import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Timeout (ToolTimeoutConfig)
 
 data AgentEnv = AgentEnv
   { aeProvider :: SomeProvider
@@ -41,6 +43,21 @@ data AgentEnv = AgentEnv
     -- type-level capability scoping, spec §4/§8). The 'CloneDeps' lives
     -- inside the 'UIOEnv' (via 'uieCloneDeps'), so Git opcodes source it
     -- from here rather than a separate field.
+  , aeAbortFlag :: AbortFlag
+    -- ^ The session-scoped abort flag. Set by the channel layer (Signal
+    -- @\/stop@, CLI Ctrl+C, Web @POST /api/sessions/:id/stop@) to cancel
+    -- in-flight tool calls. Polled by the dispatch wrapper
+    -- ('Seal.Tools.Exec.Timeout.runWithTimeoutAbortRetry') during the
+    -- three-way race. Cleared once at 'runTurn' entry (before any tool
+    -- call); a mid-turn abort keeps the flag set until the next turn.
+    -- Looked up from a 'Seal.Tools.Exec.Abort.SessionAbortRegistry' by
+    -- 'SessionId' (the web gateway has no 'AgentEnv' at the @/stop@ call
+    -- site — the registry is the vehicle, design Blocker Resolution #2).
+  , aeToolTimeout :: ToolTimeoutConfig
+    -- ^ The per-call timeout/retry config (default 120s, max 600s, 3
+    -- retries, 2s base delay, 2.0 backoff, 50KB output cap). Loaded from
+    -- @config.toml@ @[tool_timeout]@ at startup via
+    -- 'Seal.Config.File.toolTimeoutConfig'.
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int

@@ -26,15 +26,15 @@ import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.IO (hClose)
 import System.Process
-  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess
+  ( CreateProcess (..), StdStream (..), proc, waitForProcess
   )
 
 import Seal.Tools.Args (ShellCommand, textShellCommand)
+import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
 import Seal.Tools.Exec.Types
 
 -- | Build the fixed argv for an SSH exec. The argv is:
@@ -155,7 +155,15 @@ mkRealRemoteRunner = RemoteRunner
             (p : as) -> (p, as)
             []       -> error "runReal: empty argv (unreachable)"
           cp0 = (proc program args)
-                  { std_out = CreatePipe, std_err = CreatePipe }
+                  { std_out = CreatePipe, std_err = CreatePipe
+                  , create_group = True
+                  }
+          -- ^ @create_group = True@ puts the ssh child in its own POSIX
+          -- process group so 'withManagedProcess' can kill the whole group
+          -- on cleanup (SIGTERM → grace → SIGKILL). Killing the local ssh
+          -- process closes the SSH channel, which terminates the remote
+          -- command (design Risks §2 — a backgrounded remote child via
+          -- @setsid ... &@ survives, accepted v1 limitation).
           cp1 = case mStdin of
             Nothing -> cp0 { std_in = NoStream }
             Just _  -> cp0 { std_in = CreatePipe }
@@ -163,8 +171,9 @@ mkRealRemoteRunner = RemoteRunner
         [] -> pure Nothing
         xs -> Just <$> mergeEnvReal xs
       let cp = cp1 { env = mEnv }
+          maxOutput = 50_000  -- bounded output cap (Task 4)
       res <- try @IOError
-             (withCreateProcess cp $ \mIn mOut mErr ph -> do
+             (withManagedProcess cp $ \ph mIn hOut hErr -> do
                 -- Pipe the stdin payload (if any) to the process and close
                 -- the write end so the remote @cat@/@tee@ sees EOF.
                 case (mIn, mStdin) of
@@ -172,11 +181,8 @@ mkRealRemoteRunner = RemoteRunner
                     BS.hPut hIn bs
                     hClose hIn
                   _ -> pure ()
-                (hOut, hErr) <- case (mOut, mErr) of
-                  (Just a, Just b) -> pure (a, b)
-                  _                -> error "runReal: pipe creation failed (unreachable)"
-                out <- TE.decodeUtf8 <$> BS.hGetContents hOut
-                err <- TE.decodeUtf8 <$> BS.hGetContents hErr
+                out <- readBounded hOut maxOutput
+                err <- readBounded hErr maxOutput
                 ec  <- waitForProcess ph
                 pure (ec, out, err))
       case res of

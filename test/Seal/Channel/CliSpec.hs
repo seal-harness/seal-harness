@@ -7,6 +7,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Test.Hspec
 
@@ -16,7 +17,9 @@ import Data.Default (def)
 import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandAction (..))
 import Seal.Config.Paths (SealPaths (..))
@@ -31,6 +34,11 @@ import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps)
 import Seal.Vault.Commands (VaultRuntime (..))
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- | A minimal in-process provider for testing 'mkSessionAgentEnv'.
 data StubProvider = StubProvider
@@ -136,6 +144,7 @@ spec = do
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
                   (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
                   Nothing Full approvals (pure ()) False Nothing 90 Nothing "cli" Nothing
+                  testAbortFlag defaultToolTimeoutConfig
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing

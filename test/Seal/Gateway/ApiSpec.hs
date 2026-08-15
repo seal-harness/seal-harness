@@ -30,6 +30,7 @@ import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend, adbUpdate)
@@ -69,6 +70,7 @@ import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
@@ -80,6 +82,11 @@ import Seal.Tabs.Types (TabRef (BoundSession, BoundHarness))
 import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
+
+-- | A shared test abort registry (top-level, created once via unsafePerformIO).
+testAbortReg :: SessionAbortRegistry
+testAbortReg = unsafePerformIO newSessionAbortRegistry
+{-# NOINLINE testAbortReg #-}
 
 -- | A provider that returns a scripted list of responses, one per call
 -- (mirrors the test helpers in LoopSpec/Phase5Spec). Used by the e2e send
@@ -209,7 +216,7 @@ mkDepsFor paths = do
     , adRepoRegistry     = repoRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -1570,7 +1577,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -1647,7 +1654,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -1714,7 +1721,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -1782,7 +1789,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -1875,7 +1882,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -1933,7 +1940,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -1990,7 +1997,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2028,7 +2035,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2118,7 +2125,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2174,7 +2181,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2229,7 +2236,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2278,7 +2285,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2336,7 +2343,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = repoRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2672,7 +2679,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = corruptH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2715,7 +2722,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -2946,7 +2953,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
+                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -3079,6 +3086,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
+            , adAbortReg = testAbortReg
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -3134,6 +3142,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = error "sdApprovals: unused on the 404 path"
             , sdReplies     = error "sdReplies: unused on the 404 path"
             , sdLocks       = error "sdLocks: unused on the 404 path"
+            , sdAbortReg    = testAbortReg
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             , sdLogger      = error "sdLogger: unused on the 404 path"
             , sdIsRemote    = False
@@ -3154,7 +3163,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3229,6 +3238,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = approvals
             , sdReplies     = testReplies
             , sdLocks       = testLocks
+            , sdAbortReg    = testAbortReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -3249,7 +3259,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3356,6 +3366,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = approvals
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
+            , sdAbortReg    = testAbortReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -3376,7 +3387,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3468,6 +3479,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdApprovals   = approvals
             , sdReplies     = error "sdReplies: unused on the slash path"
             , sdLocks       = error "sdLocks: unused on the slash path"
+            , sdAbortReg    = testAbortReg
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
@@ -3488,7 +3500,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
-                , adPaths            = fakePaths, adWsPort = 8081
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

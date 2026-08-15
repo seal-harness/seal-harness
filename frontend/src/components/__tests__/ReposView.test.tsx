@@ -98,16 +98,16 @@ describe('ReposView', () => {
     fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
     fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
     // vcs_kind defaults to github; leave as-is.
-    // vault_key is auto-generated from id + kind (no field for the user).
+    // credential kind defaults to deploy_key; vault_key is auto-generated.
     fireEvent.click(screen.getByLabelText('Create repo'))
     await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
     const body = createRepo.mock.calls[0]![0] as { id?: string; url: string; vcs_kind: string; credential: { kind: string; vault_key: string } }
     expect(body.id).toBe('myrepo')
     expect(body.url).toBe('git@github.com:owner/repo.git')
     expect(body.vcs_kind).toBe('github')
-    expect(body.credential.kind).toBe('pat')
+    expect(body.credential.kind).toBe('deploy_key')
     // vault_key is auto-generated: seal-<kind>-<id>
-    expect(body.credential.vault_key).toBe('seal-pat-myrepo')
+    expect(body.credential.vault_key).toBe('seal-deploy_key-myrepo')
   })
 
   it('create surfaces the backend error when the save fails', async () => {

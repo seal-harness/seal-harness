@@ -9,6 +9,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
 import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString.Char8 qualified as BC
 import Test.Hspec
 
@@ -22,6 +23,7 @@ import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Command.Tab (noTabCloseNotifier)
@@ -31,6 +33,11 @@ import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
+
+-- | A shared test abort registry (top-level, created once via unsafePerformIO).
+testAbortReg :: SessionAbortRegistry
+testAbortReg = unsafePerformIO newSessionAbortRegistry
+{-# NOINLINE testAbortReg #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
@@ -79,6 +86,7 @@ mkDeps = do
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
+    , adAbortReg = testAbortReg
     })
 
 spec :: Spec

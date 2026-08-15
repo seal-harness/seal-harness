@@ -55,7 +55,8 @@ import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
   , WebConfig (..), rcWeb
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
@@ -129,6 +130,8 @@ import Seal.Session.Lock
   , SessionLocks, withSessionLock )
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (SealLogger)
@@ -195,6 +198,13 @@ data SendDeps = SendDeps
     -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
     -- lock before 'withTwoFileTranscript' so a web send and a channel
     -- message on the same tab serialize rather than race.
+  , sdAbortReg :: SessionAbortRegistry
+    -- ^ Per-session abort registry (design Blocker Resolution #2). The web
+    -- @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on
+    -- this; 'handleSend' looks up the per-session 'AbortFlag' via
+    -- 'lookupOrCreateAbortFlag' and passes it into 'mkSessionAgentEnv' as
+    -- 'aeAbortFlag'. Mirrors 'sdLocks' (the registry is a session-keyed
+    -- map, lazily created per session).
   , sdTabsHandle :: TabsHandle
     -- ^ The shared tab handle. 'handleSend' auto-tabs the session after a
     -- successful turn (W2 invariant 2: any message sent to a session with
@@ -470,6 +480,7 @@ plainTurn deps meta t = do
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
             mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+            turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
                   deps paths sid caps uioEnv appEnv eCfg
@@ -488,6 +499,8 @@ plainTurn deps meta t = do
                   Nothing
                   "web"
                   (Just (replyFanout (sdReplies deps) sid))
+                  turnAbortFlag
+                  (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
               runApp appEnv (runTurn env t)
@@ -711,6 +724,7 @@ plainTurnWithCaps deps meta caps t = do
               toolUse = either (const True) resolvedToolUseEnforcement eCfg
               taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
           mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+          turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
           let onDemand = either (const False) onDemandSchemas eCfg
               startWiring = webStartWiring
                 deps paths sid caps uioEnv appEnv eCfg
@@ -729,6 +743,8 @@ plainTurnWithCaps deps meta caps t = do
                 Nothing
                 "web"
                 (Just (replyFanout (sdReplies deps) sid))
+                turnAbortFlag
+                (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
             runApp appEnv (runTurn env t)
@@ -772,7 +788,8 @@ webCallDispatcher deps callOpName val = do
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv callOpName val)
+    callAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
       Right r -> do
         -- Record the opcode result into the transcript. SKILL_LOAD and
@@ -870,6 +887,8 @@ webMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorCeili
     , dwdChildSystemPrompt = childSystemPrompt
     , dwdOnEntry = pure ()  -- web child onEntry: no live broadcast (would need the broker + child sid)
     , dwdChannel = channel
+    , dwdAbortFlag = lookupOrCreateAbortFlag (sdAbortReg deps)
+    , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
     }
   where
     resolveChild agentDef = do

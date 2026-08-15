@@ -30,6 +30,7 @@ import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
+import Seal.Tools.Exec.Abort (clearAbort)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
@@ -90,6 +91,10 @@ requestMeta channel mSrc =
 
 runTurn :: AgentEnv -> Text -> App ()
 runTurn env userText = do
+  -- Clear the per-turn abort flag at turn entry (design: clearAbort fires
+  -- once at runTurn entry, before any tool call; a mid-turn abort keeps the
+  -- flag set until the next turn begins).
+  liftIO (clearAbort (aeAbortFlag env))
   -- Load the prior conversation from disk so the model sees the full history
   -- (not just this turn's new message). The two-file writer's diff-based
   -- appender requires the incoming message list to be a prefix-extension of
@@ -371,7 +376,7 @@ runTurn env userText = do
       mConfirmed <- checkConfirmation name mOp input
       res <- case mConfirmed of
         Left denyMsg -> pure (Left (Denied denyMsg))
-        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) name input
+        Right () -> dispatch (aeRegistry env) (aeTranscript env) (aeBackend env) (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input
       pure $ case res of
         Left e -> CbToolResult tcid [TrpText (T.pack (show e))] True
         Right r -> CbToolResult tcid (orParts r) (orIsError r)
