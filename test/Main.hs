@@ -30,6 +30,8 @@ import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
 import qualified Seal.Tools.Exec.UIOSpec
 import qualified Seal.Tools.Exec.UIOParitySpec
+import qualified Seal.ISA.Ops.UIOUnrestrictedFailSpec
+import qualified Seal.ISA.Ops.UIOConstructionFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
 import qualified Seal.Web.UrlSafetySpec
@@ -182,6 +184,8 @@ main = hspec $ do
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
   Seal.Tools.Exec.UIOSpec.spec
   Seal.Tools.Exec.UIOParitySpec.spec
+  Seal.ISA.Ops.UIOUnrestrictedFailSpec.spec
+  Seal.ISA.Ops.UIOConstructionFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
   Seal.Web.UrlSafetySpec.spec

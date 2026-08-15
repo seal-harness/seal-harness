@@ -425,6 +425,8 @@ test-suite tests
         Seal.Tools.Exec.CapabilityScopingFailSpec
        Seal.Tools.Exec.UIOSpec
        Seal.Tools.Exec.UIOParitySpec
+       Seal.ISA.Ops.UIOUnrestrictedFailSpec
+       Seal.ISA.Ops.UIOConstructionFailSpec
         Seal.Web.SearchSpec
         Seal.Web.FetchSpec
         Seal.Web.BrowserSpec
