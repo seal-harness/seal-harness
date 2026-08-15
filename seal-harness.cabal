@@ -136,9 +136,10 @@ library
          Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
-          Seal.Tools.Exec.UIO
-          Seal.Tools.Exec.UIO.Internal
-          Seal.Tools.Exec.UIOGit
+           Seal.Tools.Exec.UIO
+           Seal.Tools.Exec.UIO.Internal
+           Seal.Tools.Exec.UIOGit
+           Seal.Tools.Exec.WorkdirFs
           Seal.Tools.Ssh.Agent
         Seal.Web.Search
         Seal.Web.SearXngSetup
@@ -423,8 +424,9 @@ test-suite tests
         Seal.Tools.Exec.RemoteSpec
         Seal.Tools.ArgsSpec
         Seal.Tools.Exec.CapabilityScopingFailSpec
-       Seal.Tools.Exec.UIOSpec
-       Seal.Tools.Exec.UIOParitySpec
+        Seal.Tools.Exec.UIOSpec
+        Seal.Tools.Exec.UIOParitySpec
+        Seal.Tools.Exec.WorkdirFsSpec
        Seal.ISA.Ops.UIOUnrestrictedFailSpec
        Seal.ISA.Ops.UIOConstructionFailSpec
         Seal.Web.SearchSpec
