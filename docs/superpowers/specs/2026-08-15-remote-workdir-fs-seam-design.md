@@ -1,9 +1,10 @@
 # Remote-Aware Workdir Filesystem Seam — Design
 
-> **Status:** Draft (round 6, post-review-gate + UIO augmentation). **Branch**:
+> **Status:** Draft (round 7, post-review-gate + UIO augmentation + parity testing plan). **Branch**:
 > `fix/remote-workdir-fs-seam-106`. **Issue**: #106. Closes the remote-mode
 > regression in repo-local agent-def and skill discovery, and introduces
-> the `UIO` monad as the sole execution context for untrusted opcodes.
+> the `UIO` monad as the sole execution context for untrusted opcodes,
+> with executable local/remote parity invariants.
 
 ## Design review gate (round 1 → round 2)
 
@@ -418,6 +419,52 @@ W-A3→W3 dependency contradiction) plus two doc fixes. Resolutions:
   (module path string `Seal.Tools.Exec.UIOGit` catches qualified/aliased
   imports; `uioCd` prefix catches re-exports).
 
+## Augmentation: UIO parity testing plan (round 6 → round 7)
+
+After round-6 approval, the user asked to "use this UIO approach to
+really nail down the testing for this functionality without needing all
+the extra complexity of the frontend, TUI, etc." and to "express things
+like invariants of the behavior of various operations across
+local/remote mode." An audit of the existing test infrastructure
+confirmed: **there is no precedent for local/remote parity testing**
+today — the local arm (`FileSpec` with real FS) and remote arm
+(`UntrustedIORemoteSpec` with fake-runner-argv-recording) live in
+separate spec files with incompatible strategies. `UIO` makes parity
+testing possible for the first time because both arms share the same
+`UIO` surface.
+
+Round 7 adds §5.1 (UIO parity testing — the core safety win):
+- **Testing philosophy**: test untrusted-plane behavior at the `UIO`
+  layer, not the frontend/TUI/gateway. `UIO` + `FixtureRepo` + fake
+  runner is a complete in-process substrate (no `make serve`, browser,
+  WS, or LLM). Parity is an **executable invariant**, not a hope.
+- **7 parity invariants (I1-I7)** as QuickCheck properties:
+  `prop_readParity`, `prop_writeParity`, `prop_shellExecParity`,
+  `prop_searchParity`, `prop_statParity`, `prop_confinementParity`,
+  `prop_stubParity` — same `uio*` action against `(local, remote-fake,
+  stub)` seeded from the same `FixtureRepo`; assert result equality.
+- **`FixtureRepo`** (new test fixture, `test/Seal/TestHelpers/FixtureRepo.hs`):
+  pure data structure seeded into BOTH arms (`materializeFixture` for
+  the local arm's real temp dir; `seedFakeRunner` for the remote arm's
+  canned-output map). The shared substrate that makes parity
+  comparison meaningful.
+- **`UIOParitySpec`** (new, W-A1): the 7 parity invariants as
+  QuickCheck properties (sub-second, in-process). Extended in W-A3
+  (opcode-level parity: `OpResult` equal across arms) and W2/W4
+  (WorkdirFs parity: discovery produces the same `AgentDef` on both
+  arms).
+- **Reuses existing infrastructure**: `mkFakeRemoteRunnerRecording`
+  (`Remote.hs:250`), `mkRemoteUntrustedIOStub` (`UntrustedIO.hs:628`),
+  `TestHelpers/FakeVault` + `FakeRegistry` (stub `CloneDeps`),
+  `TestHelpers/Arbitrary` (bounded generators), `LineWindow`'s `Eq`
+  instance (direct `shouldBe`), the `prop`+`forAll`+`ioProperty`
+  pattern (`PathSpec.hs:82` model).
+- **Why this is strong**: the original bug (local FS read in remote
+  mode) would have FAILED `prop_readParity` (local arm reads the file;
+  remote arm reads an empty workdir; `LineWindow`s differ). Future
+  local/remote divergences fail the same way — CI catches them at the
+  `UIO` layer, before they reach the frontend.
+
 ### Design decisions (UIO, round 5 — coherent)
 
 - **`UIO` lifts `UntrustedIO` + `CloneDeps` operations as module-level
@@ -506,6 +553,15 @@ W-A3→W3 dependency contradiction) plus two doc fixes. Resolutions:
   `Control.Monad.IO.Class`, and none calls `liftIO`/`ask`/`throwM` —
   enforced by the `UIOUnrestrictedFail` compile-fail fixture (W-A2) and
   verified at the W7 gate. **Evaluated at**: W-A2 fixtures + W7 gate.
+- **Local/remote parity (round 7)**: the 7 parity invariants (I1-I7,
+  §5.1) hold — the same `uio*` action produces the same result on the
+  local arm, the remote (fake-runner) arm, and the stub arm, for any
+  `FixtureRepo`. Enforced by `UIOParitySpec` QuickCheck properties
+  (W-A1) + opcode-level parity (W-A3) + WorkdirFs parity (W2/W4).
+  **Evaluated at**: `UIOParitySpec` (W-A1) + W-A3 opcode parity + W2/W4
+  WorkdirFs parity + W7 gate. This is the **executable invariant** the
+  user asked for: "the behavior of various operations across
+  local/remote mode" is a property CI checks, not a manual review.
 
 ### 1.2 The regression
 
@@ -1293,6 +1349,149 @@ between `UIO` and `WorkdirFs` (via `runUIOWithEnv`).
 
 ## 5. Testing
 
+### 5.1 UIO parity testing — the core safety win
+
+**The `UIO` monad's principal testing benefit**: it makes local/remote
+parity a **first-class, executable property** for the first time. Today
+(verified by audit) the local arm (`FileSpec` with real FS) and the
+remote arm (`UntrustedIORemoteSpec` with fake-runner-argv-recording)
+live in **separate spec files with incompatible strategies** — no test
+runs the same opcode against both arms and compares. `UIO` fixes this:
+both arms share the same `UIO` operation surface, so a **parameterized
+test runner** can run the same `UIO` action against a local `UIOEnv`
+and a remote (fake-runner) `UIOEnv` and assert identical `OpResult`s
+(or identical `Either UntrustedErr a`s for the primitive operations).
+This is the mechanism that "categorically eliminates" the regression
+class — not just the compile-time restriction, but a **test-time
+invariant** that the two arms behave identically.
+
+**Testing philosophy (the plan emphasizes this):**
+- **Test untrusted-plane behavior at the `UIO` layer, not the
+  frontend/TUI/gateway.** `UIO` lets us verify file reads, shell exec,
+  process management, search, and (via `WorkdirFs`) agent-def/skill
+  discovery — all without spinning up the gateway, WS broker, React
+  frontend, TUI, or a real LLM provider. This keeps the parity tests
+  **fast** (sub-second, in-process, no network) and **focused** (the
+  failure surface is the `UIO` action, not the whole stack).
+- **Local/remote parity is an executable invariant, not a hope.** A
+  `prop` runs the same `UIO` action against both arms and asserts
+  equality. If a future contributor changes one arm, the parity prop
+  fails in CI — the same way a type error fails. This is the test-time
+  complement to the `UIO` compile-time restriction.
+
+**Parity invariants (the properties the plan pins):**
+
+```haskell
+-- I1: File read parity — same file, same bytes (LineWindow derives Eq)
+prop_readParity :: FixtureRepo -> RemotePath -> Int -> Property
+-- runUIOLocal (uioRead rp n) === runUIORemoteFake (uioRead rp n)
+-- (both arms seeded from the same FixtureRepo; LineWindow Eq comparison)
+
+-- I2: File write parity — same content lands at the same path
+prop_writeParity :: FixtureRepo -> RemotePath -> Text -> Property
+-- both arms write; both arms read-back via uioRead; contents equal
+
+-- I3: Shell exec parity — same command, same stdout
+prop_shellExecParity :: FixtureRepo -> ShellCommand -> Property
+-- the remote fake runner returns canned stdout matching what /bin/sh
+-- would produce on the local arm (seeded from FixtureRepo)
+
+-- I4: Search parity — same pattern, same results
+prop_searchParity :: FixtureRepo -> SearchPattern -> Property
+
+-- I5: Existence/metadata parity — same file, same doesFileExist/Size/MTime
+prop_statParity :: FixtureRepo -> RemotePath -> Property
+
+-- I6: SafePath confinement parity — a bad path is rejected on BOTH arms
+-- (the fake runner's recorded-calls IORef is [] on the remote arm,
+-- proving the rejection happened before any SSH call)
+prop_confinementParity :: BadPath -> Property
+-- runUIOLocal (uioRead badPath n) === Left (UePath ...)
+-- runUIORemoteFake (uioRead badPath n) === Left (UePath ...) AND runner IORef == []
+
+-- I7: Fail-closed parity — mkUIOStub yields the same fail-closed shape
+-- as a misconfigured remote (Left on every op, False on every exists)
+prop_stubParity :: Property
+```
+
+**Test infrastructure reused (existing — no new fakes needed):**
+- `mkFakeRemoteRunnerRecording :: IORef [([String], Maybe ByteString)] -> Either ExecError Text -> RemoteRunner` (`src/Seal/Tools/Exec/Remote.hs:250`) — records argv+stdin, returns canned stdout. The remote-arm parity tests seed it with canned output matching the local arm's real-FS result.
+- `mkRemoteUntrustedIOStub` (`src/Seal/Tools/Exec/UntrustedIO.hs:628`) — the fail-closed stub, base for the stub-arm parity test (I7).
+- `TestHelpers/FakeVault.hs` + `TestHelpers/FakeRegistry.hs` — in-memory `VaultHandle`/`RepoRegistryHandle` for the stub `CloneDeps` (Git parity).
+- `TestHelpers/Arbitrary.hs` — shared `Arbitrary Text` + `Arbitrary AgentDefId`/`SkillId` for the bounded generators.
+- `LineWindow` derives `Eq` (`src/Seal/Text/LineFile.hs:42`) — direct `shouldBe` for read parity (no custom equality).
+- The `prop` + `forAll` + `ioProperty` pattern (`PathSpec.hs:82` is the model) — bounded generators (`resize 4`, small alphabets) per AGENTS.md "Keep the suite fast."
+
+**New test fixture: `FixtureRepo`** — a pure data structure seeded into
+BOTH arms: the local arm materializes it on a real temp dir; the remote
+arm seeds it into the fake runner's canned-output map. This is the
+**shared substrate** that makes parity comparison meaningful (both arms
+see "the same workspace"). Defined in W-A1; reused by W-A3 (opcode
+parity) and W2/W4 (WorkdirFs parity).
+
+```haskell
+data FixtureRepo = FixtureRepo
+  { frFiles :: Map RemotePath Text         -- file contents
+  , frDirs :: Set RemotePath              -- directory structure
+  , frSymlinks :: Map RemotePath RemotePath -- for symlink-escape tests
+  , frFileSizes :: Map RemotePath Integer
+  , frMtimes :: Map RemotePath UTCTime
+  }
+
+-- Materialize on real FS (local arm):
+materializeFixture :: FixtureRepo -> IO WorkspaceRoot
+
+-- Seed the fake runner's canned-output map (remote arm):
+seedFakeRunner :: FixtureRepo -> IO (RemoteRunner, IORef [([String], Maybe ByteString)])
+```
+
+**The parity spec — `UIOParitySpec` (new, W-A1):**
+- Runs each `uio*` primitive against `(local, remote-fake, stub)` and
+  asserts equality of results (I1-I5) + confinement (I6) + fail-closed
+  (I7). Uses `FixtureRepo` as the shared substrate.
+- **QuickCheck parity properties**: `prop_readParity`, `prop_writeParity`,
+  `prop_shellExecParity`, `prop_searchParity`, `prop_statParity`,
+  `prop_confinementParity`, `prop_stubParity` (I1-I7) — bounded
+  generators over `FixtureRepo` + `RemotePath` + `ShellCommand`. These
+  are the **executable local/remote invariants** the user asked for.
+- The spec is **sub-second** (in-process, no network, no real SSH) per
+  AGENTS.md "Keep the suite fast, sub-second."
+
+**Opcode-level parity (W-A3, extends the W-A1 parity spec):**
+- Each migrated opcode (File/Shell/Search/Bin/Process/Git) gets a
+  parity case in its spec: run the opcode's `UIO OpResult` action
+  against `(mkLocalUIO, mkRemoteUIO + fake runner)` seeded from the
+  same `FixtureRepo`; assert `OpResult` equality (`OpResult` derives
+  `Eq` via `ToolResultPart`'s `Eq`). This is the opcode-level
+  invariant: "the model sees the same result regardless of which plane
+  executed."
+- Git opcodes use a stub `CloneDeps` (all 6 fields stubbed via
+  `TestHelpers/FakeVault` + `FakeRegistry`) seeded identically into
+  both arms' `UIOEnv`.
+
+**WorkdirFs parity (W2/W4, extends the parity spec):**
+- `WorkdirFs`'s local arm (real `System.Directory`) vs remote arm
+  (`uioShellExec` via fake runner) against the same `FixtureRepo`:
+  `wfsReadFile`/`wfsListDirectory`/`wfsDoesFileExist`/etc. produce
+  identical results. This is the regression-fix's parity guard — the
+  `.agents/agents.md` discovery produces the same `AgentDef` on both
+  arms.
+
+**Why this is strong (the user's ask):**
+- **No frontend/TUI/gateway complexity** — `UIO` + `FixtureRepo` +
+  fake runner is a complete in-process substrate. The parity test
+  doesn't need `make serve`, a browser, a WS connection, or an LLM.
+- **Executable invariants** — "same opcode, same `OpResult` across
+  modes" is a `prop`, not a manual cross-check. CI fails if a
+  contributor breaks parity.
+- **Catches the regression class by construction** — the original bug
+  (local FS read in remote mode) would have FAILED the read-parity
+  prop (the local arm reads the file; the remote arm reads an empty
+  workdir; `LineWindow`s differ). Future local/remote divergences
+  fail the same way.
+
+### 5.2 WorkdirFs + discovery testing (existing plan, preserved)
+
 **No real SSH / network IO / subprocess spawn.** Every `WorkdirFsSpec` and
 `RepoDiscoverySpec`/`SkillBackendSpec` remote-arm case uses
 `mkFakeRemoteRunnerRecording` (existing in `Seal.Tools.Exec.Remote` —
@@ -1388,20 +1587,43 @@ no network IO, no subprocess. The implementer MUST NOT reach for
   stub `CloneDeps` — all 6 fields stubbed: `cdVault`, `cdRepoReg`,
   `cdSshAgent`, `cdAgentRegistry`, `cdPinnedKnownHosts`,
   `cdKeyfilesDir` — seeded into the `UIOEnv` via this helper).
+- **Test fixture** `FixtureRepo` (§5.1) in `test/Seal/TestHelpers/FixtureRepo.hs`
+  (new): a pure data structure (`frFiles :: Map RemotePath Text`,
+  `frDirs`, `frSymlinks`, `frFileSizes`, `frMtimes`) seeded into BOTH
+  arms — `materializeFixture :: FixtureRepo -> IO WorkspaceRoot`
+  (materializes on a real temp dir for the local arm) +
+  `seedFakeRunner :: FixtureRepo -> IO (RemoteRunner, IORef [...])`
+  (seeds the fake runner's canned-output map for the remote arm). This
+  is the shared substrate that makes parity comparison meaningful.
 - New `UIOSpec`: local arm runs an action calling each `uio*` function
   against a temp workdir; stub arm asserts every operation returns
   fail-closed; `mkLocalUIO` vs `mkRemoteUIO` (with
   `mkFakeRemoteRunnerRecording` — no real SSH) produce equivalent
-  results for the same fixture workdir; `runUIOWithEnv` round-trips a
+  results for the same `FixtureRepo`; `runUIOWithEnv` round-trips a
   pre-built `UIOEnv`.
+- **New `UIOParitySpec`** (§5.1 — the core safety win): runs each
+  `uio*` primitive against `(local, remote-fake, stub)` seeded from the
+  same `FixtureRepo` and asserts result equality. The 7 parity
+  invariants (I1-I7, §5.1) are **QuickCheck properties**:
+  `prop_readParity`, `prop_writeParity`, `prop_shellExecParity`,
+  `prop_searchParity`, `prop_statParity`, `prop_confinementParity`,
+  `prop_stubParity` — bounded generators over `FixtureRepo` +
+  `RemotePath` + `ShellCommand` (sub-second, in-process). This is the
+  **executable local/remote invariant** — CI fails if a contributor
+  breaks parity. Extended in W-A3 (opcode-level parity) and W2/W4
+  (WorkdirFs parity).
 - Wiring: `seal-harness.cabal` (exposed-modules: `Seal.Tools.Exec.UIO`,
-  `Seal.Tools.Exec.UIOGit`), `test/Main.hs`.
+  `Seal.Tools.Exec.UIOGit`; test-modules: `UIOSpec`, `UIOParitySpec`,
+  `FixtureRepo`), `test/Main.hs`.
 **RED**: `UIOSpec` — every `uio*` function round-trips on the local
   arm; stub is fail-closed; remote arm (fake runner) matches local for
-  a fixture; `runUIOWithEnv` round-trips.
+  a `FixtureRepo`; `runUIOWithEnv` round-trips. **`UIOParitySpec`** —
+  the 7 parity invariants (I1-I7) hold across local/remote/stub.
 **File scope**: `src/Seal/Tools/Exec/UIO.hs`,
   `src/Seal/Tools/Exec/UIOGit.hs`,
-  `test/Seal/Tools/Exec/UIOSpec.hs`, `seal-harness.cabal`,
+  `test/Seal/TestHelpers/FixtureRepo.hs` (new),
+  `test/Seal/Tools/Exec/UIOSpec.hs`,
+  `test/Seal/Tools/Exec/UIOParitySpec.hs` (new), `seal-harness.cabal`,
   `test/Main.hs`.
 
 ### W-A2 — `UIO` compile-fail fixtures (the restriction is enforced)
@@ -1493,10 +1715,23 @@ no network IO, no subprocess. The implementer MUST NOT reach for
   `CloneDeps` closure param. The fail-closed stub `CloneDeps` for
   non-Git is `mempty`-shaped (all fields stub) — non-Git opcodes
   never call `uioCd*`, so the stub is never exercised.
+- **Opcode-level parity (extends `UIOParitySpec` from W-A1)**: each
+  migrated opcode (File/Shell/Search/Bin/Process/Git) gets a parity
+  case — run the opcode's `UIO OpResult` action against `(mkLocalUIO,
+  mkRemoteUIO + fake runner)` seeded from the same `FixtureRepo`;
+  assert `OpResult` equality (`OpResult` derives `Eq` via
+  `ToolResultPart`'s `Eq`). This is the opcode-level invariant: "the
+  model sees the same result regardless of which plane executed." Git
+  opcodes use a stub `CloneDeps` seeded identically into both arms'
+  `UIOEnv`. These parity cases live in the opcode specs
+  (`FileSpec`/`ShellSpec`/etc.) OR in `UIOParitySpec` (extended) —
+  pin during implementation.
 **RED**: a migrated opcode spec asserting the opcode runs under `UIO`
   and produces the correct `OpResult` (behavior RED) + the W-A2
   compile-fail fixture pointed at a real opcode module (a bare `liftIO`
-  in the body is a compile error).
+  in the body is a compile error) + the opcode parity case
+  (`OpResult` equal across local/remote arms for the same
+  `FixtureRepo`).
 **File scope**: `src/Seal/ISA/Opcode.hs` (`uoRun` signature change),
   `src/Seal/ISA/Dispatch.hs` (add `uoRunLegacy` path; keep old
   `UntrustedIO`-based dispatch — the `runUIOWithEnv` rewire is W6),
@@ -1815,10 +2050,12 @@ FAIL to compile when `System.Directory` is imported).
    `UIOGit` module), §3.12 (`WorkdirFs`-on-`UIO` via
    `runUIOWithEnv`), plus the round-3 confirmations (§3.1 capability
    scoping, §3.5 `realpath` re-check, §3.6 full call-chain migration).
-2. **After W-A1/W-A2 (`UIO` + compile-fail fixtures)** — review the
-   `UIO` restriction (no `MonadIO`), the two smart constructors +
-   `runUIOWithEnv`, the `uio*`/`uioCd*` surface, and the compile-fail
-   fixtures assert the restriction, before W-A3.
+2. **After W-A1/W-A2 (`UIO` + compile-fail fixtures + parity spec)** —
+   review the `UIO` restriction (no `MonadIO`), the two smart
+   constructors + `runUIOWithEnv`, the `uio*`/`uioCd*` surface, the
+   compile-fail fixtures assert the restriction, AND the
+   `UIOParitySpec` (the 7 parity invariants I1-I7 hold across
+   local/remote/stub for any `FixtureRepo`) before W-A3.
 3. **After W-A3 (opcode body migration)** — review every untrusted
    opcode body for residual `liftIO`/`ask`/`System.Directory` imports
    (should be none), the `uoRun` signature change (`Value -> UIO
