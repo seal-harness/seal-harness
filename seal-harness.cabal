@@ -398,7 +398,8 @@ test-suite tests
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
         Seal.Config.SecuritySpec
-        Seal.Config.SecurityScopingFailSpec
+         Seal.Config.SecurityScopingFailSpec
+         Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec

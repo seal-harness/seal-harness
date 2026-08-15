@@ -92,6 +92,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adPaths = fakePaths
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -147,6 +148,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adPaths = fakePaths
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = gatewayApp deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

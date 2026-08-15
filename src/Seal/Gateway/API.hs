@@ -123,6 +123,14 @@ data ApiDeps = ApiDeps
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
   , adWsPort           :: Int                   -- ^ the WS stream server port (returned in /api/health so the frontend can discover it at runtime)
   , adSecurityConfig   :: SecurityConfig        -- ^ the security config (for mkSessionExec in handleSessionAgents — remote-mode repo-agent discovery)
+  , adMkSessionExec    :: Maybe (SessionId -> IO SessionExec)
+    -- ^ Test injection seam for 'handleSessionAgents': when 'Just', the
+    -- handler calls this instead of the real 'mkSessionExec' (which would
+    -- shell out over SSH). Used by the W6 RED 'ApiSpec' remote-mode test to
+    -- inject a stub-remote 'WorkdirFs' (via 'mkInMemWorkdirFs') seeded with
+    -- a fixture repo's @.agents/agents.md@, so repo-agent discovery is
+    -- exercised without a live SSH connection. 'Nothing' in production
+    -- (the handler builds the real 'SessionExec' via 'mkSessionExec').
   }
 
 -- | The REST API as a WAI Application.
@@ -790,8 +798,11 @@ handleSessionAgents deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      cloneDeps <- cloneDepsForApiDeps deps
-      exec <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+      exec <- case adMkSessionExec deps of
+        Just mk -> mk sid
+        Nothing -> do
+          cloneDeps <- cloneDepsForApiDeps deps
+          mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
       let wfs = seWorkdirFs exec
       workdirBackend <- workdirAgentDefBackend wfs
       let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)

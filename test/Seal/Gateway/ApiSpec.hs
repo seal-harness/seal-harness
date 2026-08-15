@@ -14,6 +14,7 @@ import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromJust, isJust)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -55,7 +56,14 @@ import Seal.Providers.Class
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
+import Seal.Session.Workdir (SessionExec (..))
+import Seal.SourceControl.Clone (stubCloneDeps)
+import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
@@ -203,6 +211,7 @@ mkDepsFor paths = do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
     }
 
 -- | A fake 'RepoRegistryHandle' whose @rrhList@ always returns an empty
@@ -1563,6 +1572,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
                  }
           pure (apiApp deps)
     app <- mkAppDefault
@@ -1639,6 +1649,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1705,6 +1716,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       req <- testPut ["api", "agents", "default"]
@@ -1772,6 +1784,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app' = apiApp deps
     (_, body) <- runAppBody app' (testRequest methodGet ["api", "agents"])
@@ -1864,6 +1877,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "eddy"]
@@ -1921,6 +1935,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "alpha"]
@@ -1977,6 +1992,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "agents", "keep"]
@@ -2014,6 +2030,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "agents", "delme"]
@@ -2103,6 +2120,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "writer"]
@@ -2158,6 +2176,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testPut ["api", "skills", "alpha"]
@@ -2212,6 +2231,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     req <- testDelete ["api", "skills", "gone"]
@@ -2260,6 +2280,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
           }
         app = apiApp deps
     (_, body) <- runAppBody app (testRequest methodGet ["api", "skills"])
@@ -2317,6 +2338,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
 
     it "GET /api/repos returns 200 + [] when the registry is empty" $
@@ -2652,6 +2674,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "repos"])
@@ -2694,6 +2717,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
                 }
           pure (apiApp deps)
     app <- mkAppFiltered
@@ -2924,6 +2948,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
                 }
           pure (apiApp deps, sidTxt)
 
@@ -2975,6 +3000,99 @@ spec = describe "Seal.Gateway.API" $ do
       app <- apiApp <$> mkDepsFor fakePaths
       status <- runAppStatus app (testRequest methodGet ["api", "sessions", "99999999-000000-nope", "agents"])
       status `shouldBe` 404
+
+    -- W6 RED (headline integration test): GET /api/sessions/:id/agents in
+    -- mode=remote (with mkSessionExec injected with a stub-remote WorkdirFs
+    -- seeded with a fixture repo's .agents/agents.md) returns ≥1 repo-local
+    -- def. This is the user-visible success metric for the remote-workdir FS
+    -- seam — repo-agent discovery works over the remote arm without a live
+    -- SSH connection. The test injects adMkSessionExec = Just (const (pure
+    -- stubExec)) so handleSessionAgents bypasses the real mkSessionExec
+    -- (which would shell out over SSH) and uses the in-memory WorkdirFs
+    -- instead.
+    it "GET /api/sessions/:id/agents in mode=remote discovers ≥1 repo-local def via stub-remote WorkdirFs" $ do
+      let tmp = "/tmp/seal-api-session-agents-remote-test"
+          stateRoot = tmp </> "state"
+          cacheRoot = tmp </> "cache"
+          sessionRoot = stateRoot </> "sessions"
+      void (try (removeDirectoryRecursive tmp) :: IO (Either SomeException ()))
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True cacheRoot
+      createDirectoryIfMissing True sessionRoot
+      let sidTxt = "20260815-120000-rem"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          meta = fakeMeta { smId = sid }
+      saveSessionMeta (fakePaths { spState = stateRoot, spCache = cacheRoot }) meta
+      -- Seed a stub-remote WorkdirFs with a fixture repo carrying
+      -- .agents/agents.md (the project-level def) + a sub-agent.
+      let agentsMd = "---\nkind: agents\n---\n# Project\nDo good work.\n"
+          fooMd = "---\nname: Foo Agent\nprovider: ollama\nmodel: llama3\nenabled: true\n---\nYou are a foo specialist.\n"
+          rp :: T.Text -> RemotePath
+          rp t = case mkRemotePath t of Right p -> p; Left _ -> error "bad remote path"
+          seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".agents"])
+            , (rp "my-repo/.agents", Directory ["agents.md", "agents"])
+            , (rp "my-repo/.agents/agents.md", FileContent agentsMd)
+            , (rp "my-repo/.agents/agents", Directory ["foo-agent"])
+            , (rp "my-repo/.agents/agents/foo-agent", Directory ["agent.md"])
+            , (rp "my-repo/.agents/agents/foo-agent/agent.md", FileContent fooMd)
+            ]
+          wfs = mkInMemWorkdirFs seed
+          -- A stub SessionExec: the WorkdirFs is the in-memory seed; the
+          -- UIOEnv carries the stub UntrustedIO (no real SSH). The workspace
+          -- root is the stub's /workspace.
+          stubExec = SessionExec
+            { seUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+            , seWorkdirFs = wfs
+            , seWorkspaceRoot = WorkspaceRoot "/workspace"
+            }
+      -- A user agent-def backend with one def "user-agent" (so the union is
+      -- non-empty even without the workdir, proving the workdir defs are
+      -- discovered on top).
+      userAdb <- noneBackend
+      case mkAgentDefId "user-agent" of
+        Right uid -> adbUpdate userAdb (AgentDef
+          { adId = uid, adName = "User Agent", adProvider = ""
+          , adModel = ModelId "", adSystem = Just "user prompt"
+          , adTools = AllowAll
+          , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
+          , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
+          , adSession = mkSystemSessionId "manual" })
+        Left _ -> expectationFailure "invalid user-agent id"
+      tabsH <- newTabsHandle
+      reg <- newHarnessRegistry
+      uiState <- newUiStateHandle fakePaths
+      skillsBackend <- Skill.noneBackend
+      repoRegH <- mkFakeRepoRegistryHandle
+      activeRef <- newIORef meta
+      let paths = fakePaths { spState = stateRoot, spCache = cacheRoot }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          deps = ApiDeps
+            { adSessionRuntime = sr, adTabsHandle = tabsH
+            , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
+            , adAgentDefs = userAdb, adSkills = skillsBackend
+            , adProviders = pure knownProviders, adUiState = uiState
+            , adSend = Nothing, adDefaultAgent = pure Nothing
+            , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
+            , adSecurityConfig = defaultSecurityConfig
+            , adMkSessionExec = Just (const (pure stubExec))
+            }
+          app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Array xs) -> do
+          let names = [ n | A.Object o <- V.toList xs
+                          , Just (A.String n) <- [KeyMap.lookup (Key.fromText "name") o] ]
+          -- The repo-local defs (my-repo--agents-md, my-repo--foo-agent) are
+          -- discovered via the stub-remote WorkdirFs, alongside the user def.
+          names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
+          -- At least one repo-local def is present (the headline success metric).
+          names `shouldSatisfy` any ("--agents-md" `T.isSuffixOf`)
+        _ -> expectationFailure "expected a JSON array"
 
   it "sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id" $ do
     let (code, val) = sendOutcomeJson (SendSlash "/help output" Nothing)
@@ -3038,6 +3156,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       req <- testPost ["api", "sessions", "no-such-session", "send"]
@@ -3132,6 +3251,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       -- 1. Create a provider tab (persists session.json).
@@ -3258,6 +3378,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       -- Send /skill list to the REQUEST session (not the active one).
@@ -3369,6 +3490,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
             }
           app = apiApp deps
       -- Send /skill load seal-usage to the REQUEST session (not the active one).

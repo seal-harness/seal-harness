@@ -264,6 +264,7 @@ runServeMain autonomy logger = do
         , adPaths            = paths
         , adWsPort           = gcWsPort gwCfg
         , adSecurityConfig   = secCfg
+        , adMkSessionExec    = Nothing
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

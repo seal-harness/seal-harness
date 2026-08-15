@@ -78,6 +78,7 @@ mkDeps = do
     , adPaths = fakePaths
     , adWsPort = 8081
     , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
     })
 
 spec :: Spec
