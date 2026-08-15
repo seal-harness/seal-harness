@@ -15,8 +15,7 @@ import Seal.ISA.Opcode (BackendExec)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
-import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 
 data AgentEnv = AgentEnv
   { aeProvider :: SomeProvider
@@ -31,19 +30,17 @@ data AgentEnv = AgentEnv
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
-  , aeUntrustedIO :: UntrustedIO
-    -- ^ The untrusted-execution capability handle (local vs remote SSH),
-    -- threaded to 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes.
-    -- Backend (local FS vs SSH transport) is selected once at wiring
-    -- time via 'mkLocalUntrustedIO' or 'mkRemoteUntrustedIO'; the opcode
-    -- never sees the backend, only the capability. Trusted/Audited
-    -- opcodes ignore it (the GADT 'Opcode' has no 'UntrustedIO' field
-    -- for them — type-level capability scoping, spec §4/§8).
-  , aeCloneDeps :: Maybe CloneDeps
-    -- ^ The Git credential deps (Just when the session has Git/Repo
-    -- opcodes registered, Nothing otherwise). Threaded to 'dispatch'
-    -- via 'uoRunLegacy' so Git opcodes can access 'CloneDeps' from the
-    -- 'UIOEnv'. W6 replaces this with 'aeUIOEnv'.
+  , aeUIOEnv :: UIOEnv
+    -- ^ The untrusted-execution environment (carrying the 'UntrustedIO'
+    -- capability handle + the Git 'CloneDeps' surface), threaded to
+    -- 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes. Backend (local
+    -- FS vs SSH transport) is selected once at wiring time via
+    -- 'mkSessionExec' (which builds the 'UIOEnv' from the 'SecurityConfig');
+    -- the opcode never sees the backend, only the capability. Trusted/Audited
+    -- opcodes ignore it (the GADT 'Opcode' has no 'UIOEnv' field for them —
+    -- type-level capability scoping, spec §4/§8). The 'CloneDeps' lives
+    -- inside the 'UIOEnv' (via 'uieCloneDeps'), so Git opcodes source it
+    -- from here rather than a separate field.
   , aeCaps :: ChannelCaps
   , aeSession :: SessionId
   , aeMaxTurns :: Int

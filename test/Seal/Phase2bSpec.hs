@@ -16,6 +16,8 @@ import Options.Applicative (info, progDesc)
 import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
@@ -120,8 +122,7 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeRegistry = isaReg
                 , aeTranscript = tHandle
                 , aeBackend = localBackend
-                , aeUntrustedIO = mkRemoteUntrustedIOStub
-                , aeCloneDeps = Nothing
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                 , aeCaps = handleCaps
                 , aeSession = sid
                 , aeMaxTurns = 4

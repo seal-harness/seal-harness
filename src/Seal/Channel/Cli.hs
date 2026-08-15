@@ -69,6 +69,7 @@ import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStu
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -107,14 +108,13 @@ import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
-import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
+import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
@@ -232,11 +232,11 @@ resolveDefProvider pr providerLabel model =
 -- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
 mkSessionAgentEnv
   :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO -> Maybe CloneDeps
+  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UIOEnv
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
   -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> Maybe (Text -> IO ())
   -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO mCloneDeps debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle uioEnv debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -244,8 +244,7 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeRegistry   = isaReg
   , aeTranscript = tHandle
   , aeBackend    = localBackend
-  , aeUntrustedIO = untrustedIO
-  , aeCloneDeps = mCloneDeps
+  , aeUIOEnv     = uioEnv
   , aeCaps       = caps
   , aeSession    = sid
   , aeMaxTurns   = maxTurns
@@ -333,11 +332,13 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
   appEnv <- mkEnv logger defaultConfig
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Per-session untrusted IO: creates the workdir (local or remote)
-      -- and constructs the handle. Handles both mode=local and
-      -- mode=remote via mkSessionUntrustedIO.
-      mkSessionUio :: SessionId -> IO UntrustedIO
-      mkSessionUio = either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg
+      -- Per-session execution bundle: creates the workdir (local or remote)
+      -- and constructs the UIOEnv + WorkdirFs + WorkspaceRoot. Handles both
+      -- mode=local and mode=remote via mkSessionExec.
+      mkSessionExecCli :: SessionId -> IO SessionExec
+      mkSessionExecCli sid' = case eSecCfg of
+        Left _err -> pure (failClosedSessionExec cloneDeps)
+        Right sec -> mkSessionExec paths sec sid' cloneDeps mkRealRemoteRunner
   -- Per-turn transcript + ISA registry construction.
   --
   -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
@@ -421,10 +422,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           then injectAvailableSkills skillBackend withAutoload
           else pure withAutoload
       cliChildRegistryBuilder _def childSid childCaps = do
-        eChildWd <- ensureSessionWorkdir paths childSid
-        let childWsRoot = case eChildWd of
-              Right wd -> WorkspaceRoot wd
-              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+        childExec <- mkSessionExecCli childSid
+        let childWsRoot = seWorkspaceRoot childExec
         let childBaseOps =
               [ showHumanOp childCaps
               , askHumanOp childCaps
@@ -466,7 +465,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               { dwdPaths = paths
               , dwdParentSid = sid
               , dwdAppEnv = appEnv
-              , dwdMkUntrustedIO = mkSessionUio
+              , dwdMkUIOEnv = (seUIOEnv <$>) . mkSessionExecCli
               , dwdAutonomy = autonomy
               , dwdApprovals = approvals
               , dwdOnDemand = onDemand
@@ -547,18 +546,14 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       -- @[skills] available_skills = false@. The catalog is built from the
       -- workdir-aware backend (repo-local skills discovered by SETUP_REPO
       -- ⊕ user ⊕ builtin, workdir-wins).
-      resolveSystem meta mWd = do
-        workdirAgentDefs <- case mWd of
-          Just wd -> Def.workdirAgentDefBackend wd
-          Nothing -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+      resolveSystem meta wfs = do
+        workdirAgentDefs <- Def.workdirAgentDefBackend wfs
         let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
         base <- case smAgent meta of
           Nothing  -> pure Nothing
           Just aid -> maybe Nothing adSystem <$> Def.adbRead sessionAgentDefs aid
         cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
-        workdirSkills <- case mWd of
-          Just wd -> Skill.workdirSkillBackend wd
-          Nothing -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
+        workdirSkills <- Skill.workdirSkillBackend wfs
         let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills skillBackend
             withGuidance = injectStaticGuidance (resolvedParallelToolGuidance cfg)
                                                 (resolvedToolUseEnforcement cfg)
@@ -580,15 +575,11 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          eWd <- ensureSessionWorkdir paths sid
-          workdirAgentDefs <- case eWd of
-            Right wd -> Def.workdirAgentDefBackend wd
-            Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
-          let wsRoot = case eWd of
-                Right wd -> WorkspaceRoot wd
-                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-              mWd = either (const Nothing) Just eWd
-              sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
+          exec <- mkSessionExecCli sid
+          let wfs = seWorkdirFs exec
+              wsRoot = seWorkspaceRoot exec
+          workdirAgentDefs <- Def.workdirAgentDefBackend wfs
+          let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
               sessionBackends = backends { bAgentDefs = sessionAgentDefs }
               startWiring = cliStartWiring sid sessionBackends
               isaReg = cliIsaReg sid startWiring caps wsRoot sessionBackends
@@ -597,7 +588,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           case eprov of
             Left err -> ccSend caps err
             Right (prov, model) -> do
-              mSystem <- resolveSystem meta mWd
+              mSystem <- resolveSystem meta wfs
               act sid tHandle isaReg prov model mSystem
     -- The /bg runner: mint a fresh persisted session from the config
     -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
@@ -628,15 +619,11 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                     pure (fromRight "" outcome)
                 , ccPromptSecret = ccPromptSecret caps
                 }
-          eBgWd <- ensureSessionWorkdir paths bgSid
-          bgWorkdirAgentDefs <- case eBgWd of
-                Right wd -> Def.workdirAgentDefBackend wd
-                Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
-          let bgWsRoot = case eBgWd of
-                Right wd -> WorkspaceRoot wd
-                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-              bgMwd = either (const Nothing) Just eBgWd
-              bgSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend bgWorkdirAgentDefs agentDefBackend }
+          bgExec <- mkSessionExecCli bgSid
+          let bgWfs = seWorkdirFs bgExec
+              bgWsRoot = seWorkspaceRoot bgExec
+          bgWorkdirAgentDefs <- Def.workdirAgentDefBackend bgWfs
+          let bgSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend bgWorkdirAgentDefs agentDefBackend }
               bgStartWiring = cliStartWiring bgSid bgSessionBackends
               bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot bgSessionBackends
           tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
@@ -644,10 +631,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           case eprov of
             Left err -> ccSend caps ("bg failed: " <> err)
             Right (prov, mdl) -> do
-              mSystem <- resolveSystem meta bgMwd
-              bgUio <- mkSessionUio bgSid
-              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
-                    (Just cloneDeps)
+              mSystem <- resolveSystem meta bgWfs
+              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle (seUIOEnv bgExec)
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
                     "cli" Nothing
@@ -667,19 +652,15 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         createDirectoryIfMissing True sessionDirPath'
         saveSessionMeta paths meta
         withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          eWd <- ensureSessionWorkdir paths sid
-          callWorkdirAgentDefs <- case eWd of
-                Right wd -> Def.workdirAgentDefBackend wd
-                Left _err -> Def.workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
-          let wsRoot = case eWd of
-                Right wd -> WorkspaceRoot wd
-                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-              callSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend callWorkdirAgentDefs agentDefBackend }
+          exec <- mkSessionExecCli sid
+          let wfs = seWorkdirFs exec
+              wsRoot = seWorkspaceRoot exec
+          callWorkdirAgentDefs <- Def.workdirAgentDefBackend wfs
+          let callSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend callWorkdirAgentDefs agentDefBackend }
               startWiring = cliStartWiring sid callSessionBackends
               isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          callUio <- mkSessionUio sid
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio (Just cloneDeps) callOpName val)
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend (seUIOEnv exec) callOpName val)
           case res of
             Right r -> do
               let opNm = case callOpName of OpName n -> n
@@ -691,10 +672,9 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       plainHandler t = do
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
-          uio <- mkSessionUio sid
+          exec <- mkSessionExecCli sid
           handlePlain
-            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
-               (Just cloneDeps)
+            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle (seUIOEnv exec)
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
                "cli" Nothing)

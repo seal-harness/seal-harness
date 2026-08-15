@@ -42,7 +42,7 @@ import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Types.App (runApp)
 import Seal.Types.Env (Env)
 
@@ -95,11 +95,12 @@ data DelegationWorkerDeps = DelegationWorkerDeps
   , dwdAppEnv       :: Env
     -- ^ The top-level app env (katip logging, config) — re-used for the
     -- child's 'runApp'.
-  , dwdMkUntrustedIO :: SessionId -> IO UntrustedIO
-    -- ^ Construct the child's 'UntrustedIO' capability handle from the
-    -- child's session id. The wiring layer creates the child's workdir
-    -- (per-session isolation) and resolves the security config into the
-    -- handle. Called at child-start time (after the child's sid is minted).
+  , dwdMkUIOEnv :: SessionId -> IO UIOEnv
+    -- ^ Construct the child's 'UIOEnv' (carrying the 'UntrustedIO'
+    -- capability handle + Git 'CloneDeps') from the child's session id.
+    -- The wiring layer creates the child's workdir (per-session isolation)
+    -- and resolves the security config into the env. Called at child-start
+    -- time (after the child's sid is minted).
   , dwdAutonomy     :: AutonomyLevel
   , dwdApprovals    :: ApprovalCache
   , dwdOnDemand     :: Bool
@@ -157,7 +158,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
         childReg <- dwdChildRegistry deps agentDef childSid capturingCaps
-        childUio <- dwdMkUntrustedIO deps childSid
+        childUioEnv <- dwdMkUIOEnv deps childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
         let env = AgentEnv
               { aeProvider   = prov
@@ -167,8 +168,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeRegistry   = childReg
               , aeTranscript = childTHandle
               , aeBackend    = localBackend
-              , aeUntrustedIO = childUio
-              , aeCloneDeps = Nothing
+              , aeUIOEnv     = childUioEnv
               , aeCaps       = capturingCaps
               , aeSession    = childSid
               , aeMaxTurns   = 90

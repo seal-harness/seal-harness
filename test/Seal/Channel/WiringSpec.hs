@@ -5,6 +5,8 @@ import Data.IORef
 import Test.Hspec
 
 import Seal.Agent.Env
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Channel.Cli
 import Seal.Core.Types
@@ -47,8 +49,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeRegistry = ISA.mkRegistry []
           , aeTranscript = h
           , aeBackend = localBackend
-          , aeUntrustedIO = mkRemoteUntrustedIOStub
-          , aeCloneDeps = Nothing
+          , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
           , aeCaps = caps
           , aeSession = either (error "sid") id (mkSessionId "cli")
           , aeMaxTurns = 4

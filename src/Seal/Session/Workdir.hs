@@ -12,6 +12,7 @@ module Seal.Session.Workdir
   , mkSessionUntrustedIO
   , SessionExec (..)
   , mkSessionExec
+  , failClosedSessionExec
   ) where
 
 import Control.Exception (IOException, try)

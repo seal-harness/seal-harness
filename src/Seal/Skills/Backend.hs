@@ -24,7 +24,6 @@ module Seal.Skills.Backend
   , markdownSkillBackend
   , unionSkillBackend
   , workdirSkillBackend
-  , workdirSkillBackendFs
   , workdirSkillConventions
   , tripleUnionSkillBackend
   , encodeSkill
@@ -178,8 +177,8 @@ userDirFs dir = mkLocalWorkdirFs (WorkspaceRoot dir) maxScanBytes
 -- Every workspace read goes through the 'WorkdirFs' handle (symlink-escape
 -- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
 -- 'maxScanBytes'.
-workdirSkillBackendFs :: WorkdirFs -> IO SkillBackend
-workdirSkillBackendFs fs = pure SkillBackend
+workdirSkillBackend :: WorkdirFs -> IO SkillBackend
+workdirSkillBackend fs = pure SkillBackend
     { sbCreate = \_ -> pure ()
     , sbRead   = \sid -> do
         skills <- listWorkdirSkills fs
@@ -188,15 +187,6 @@ workdirSkillBackendFs fs = pure SkillBackend
     , sbUpdate = \_ -> pure ()
     , sbDelete = \_ -> pure ()
     }
-
--- | Back-compat wrapper (W4/W5): keeps the exported 'FilePath' signature
--- while delegating to 'workdirSkillBackendFs' over a local 'WorkdirFs'
--- anchored at the workdir root. W6 removes this wrapper and promotes
--- 'workdirSkillBackendFs' to the exported 'workdirSkillBackend' name.
--- Existing call sites compile unmodified.
-workdirSkillBackend :: FilePath -> IO SkillBackend
-workdirSkillBackend workdir =
-  workdirSkillBackendFs (mkLocalWorkdirFs (WorkspaceRoot workdir) maxScanBytes)
 
 -- | Enumerate every skill found under the conventional locations across
 -- all top-level directories (cloned repos) in the workdir anchored at the

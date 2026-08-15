@@ -41,22 +41,22 @@ import Seal.ISA.Registry
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
-import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
 
--- | Dispatch an opcode invocation. The dispatcher threads an 'UntrustedIO'
--- for Untrusted opcodes (the unified capability handle for all their
--- side-effecting IO — files, commands, process management, search);
--- Trusted/Audited opcodes ignore it (they have no 'UntrustedIO' in scope —
+-- | Dispatch an opcode invocation. The dispatcher threads a 'UIOEnv'
+-- for Untrusted opcodes (the restricted execution environment carrying
+-- the 'UntrustedIO' capability handle + the Git 'CloneDeps' surface);
+-- Trusted/Audited opcodes ignore it (they have no 'UIOEnv' in scope —
 -- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO
-  -> Maybe CloneDeps -> OpName -> Value
+  :: Registry -> TwoFileHandle -> BackendExec -> UIOEnv
+  -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend untrustedIO mCloneDeps name input =
+dispatch reg h backend uioEnv name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -67,7 +67,7 @@ dispatch reg h backend untrustedIO mCloneDeps name input =
           case op of
             UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              Right <$> uoRunLegacy untrustedIO mCloneDeps op input
+              Right <$> liftIO (runUIOWithEnv uioEnv (uoRun op input))
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do

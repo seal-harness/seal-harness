@@ -48,7 +48,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
@@ -120,14 +120,15 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
+import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
-import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (SealLogger)
@@ -448,22 +449,18 @@ plainTurn deps meta t = do
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
             let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-            eWd <- ensureSessionWorkdir paths sid
-            let wsroot = case eWd of
-                  Right wd -> WorkspaceRoot wd
-                  Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+            cloneDeps <- mkCloneDepsFromSend deps
+            exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+            let wfs = seWorkdirFs exec
+                wsroot = seWorkspaceRoot exec
+                uioEnv = seUIOEnv exec
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
             -- Build the workdir-aware skill backend: repo-local skills
             -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
             -- Fail-closed: a workdir error → no workdir skills (the user ⊕
             -- builtin union still applies).
-            workdirSkills <- case eWd of
-              Right wd -> Skill.workdirSkillBackend wd
-              Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
-            workdirAgentDefs <- case eWd of
-              Right wd -> workdirAgentDefBackend wd
-              Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+            workdirSkills <- Skill.workdirSkillBackend wfs
+            workdirAgentDefs <- workdirAgentDefBackend wfs
             let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
                 sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
                 agentDefBackend = bAgentDefs sessionBackends
@@ -473,10 +470,9 @@ plainTurn deps meta t = do
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
             mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-            cloneDeps <- mkCloneDepsFromSend deps
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
-                  deps paths sid caps untrustedIO appEnv eCfg
+                  deps paths sid caps uioEnv appEnv eCfg
                   wsroot operatorCeiling "web" sessionBackends
                 isaReg = buildWebRegistry
                   (sdVault deps) cloneDeps sessionBackends wsroot sid operatorCeiling
@@ -484,8 +480,7 @@ plainTurn deps meta t = do
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
                 env = mkSessionAgentEnv
-                  caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
-                  (Just cloneDeps)
+                  caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
@@ -700,17 +695,13 @@ plainTurnWithCaps deps meta caps t = do
           eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
           eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-          untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-          eWd <- ensureSessionWorkdir paths sid
-          let wsRoot = case eWd of
-                Right wd -> WorkspaceRoot wd
-                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-          workdirSkills <- case eWd of
-            Right wd -> Skill.workdirSkillBackend wd
-            Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
-          workdirAgentDefs <- case eWd of
-            Right wd -> workdirAgentDefBackend wd
-            Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+          cloneDeps <- mkCloneDepsFromSend deps
+          exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+          let wfs = seWorkdirFs exec
+              wsRoot = seWorkspaceRoot exec
+              uioEnv = seUIOEnv exec
+          workdirSkills <- Skill.workdirSkillBackend wfs
+          workdirAgentDefs <- workdirAgentDefBackend wfs
           let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
               sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
               agentDefBackend = bAgentDefs sessionBackends
@@ -720,10 +711,9 @@ plainTurnWithCaps deps meta caps t = do
               toolUse = either (const True) resolvedToolUseEnforcement eCfg
               taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
           mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-          cloneDeps <- mkCloneDepsFromSend deps
           let onDemand = either (const False) onDemandSchemas eCfg
               startWiring = webStartWiring
-                deps paths sid caps untrustedIO appEnv eCfg
+                deps paths sid caps uioEnv appEnv eCfg
                 wsRoot operatorCeiling "web" sessionBackends
               isaReg = buildWebRegistry
                 (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
@@ -731,8 +721,7 @@ plainTurnWithCaps deps meta caps t = do
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                 caps onDemand
               env = mkSessionAgentEnv
-                caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
-                (Just cloneDeps)
+                caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
                 (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                 (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                 onDemand
@@ -765,20 +754,17 @@ webCallDispatcher deps callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-    untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-    eWd <- ensureSessionWorkdir paths sid
-    let wsRoot = case eWd of
-          Right wd -> WorkspaceRoot wd
-          Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     cloneDeps <- mkCloneDepsFromSend deps
-    workdirAgentDefs <- case eWd of
-          Right wd -> workdirAgentDefBackend wd
-          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+    exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+    let wfs = seWorkdirFs exec
+        wsRoot = seWorkspaceRoot exec
+        uioEnv = seUIOEnv exec
+        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    workdirAgentDefs <- workdirAgentDefBackend wfs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
         startWiring = webStartWiring
-              deps paths sid caps untrustedIO appEnv eCfg
+              deps paths sid caps uioEnv appEnv eCfg
               wsRoot operatorCeiling "web" sessionBackends
         isaReg = buildWebRegistry
               (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
@@ -786,7 +772,7 @@ webCallDispatcher deps callOpName val = do
           (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO (Just cloneDeps) callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv callOpName val)
     case res of
       Right r -> do
         -- Record the opcode result into the transcript. SKILL_LOAD and
@@ -835,12 +821,12 @@ unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
 unwrapOptMaybe = maybe Nothing
 
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
--- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +
+-- 'SendDeps' + parent session id + 'ChannelCaps' + 'UIOEnv' + 'Env' +
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> Backends -> AgentStartWiring
-webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
+webStartWiring deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
   AgentStartWiring
     { aswDefBackend = bAgentDefs sessionBackends
     , aswRuntime = bRuntime (sdBackends deps)
@@ -851,7 +837,7 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel
+    , aswWorker = webMkWorker deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel
     }
 
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
@@ -863,21 +849,18 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
 -- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text
   -> AgentWorkerBuilder
-webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling channel =
+webMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorCeiling channel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdMkUntrustedIO = \childSid -> do
-        eChildWd <- ensureSessionWorkdir paths childSid
-        let childWsRoot = case eChildWd of
-              Right wd -> WorkspaceRoot wd
-              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+    , dwdMkUIOEnv = \childSid -> do
+        childCloneDeps <- mkCloneDepsFromSend deps
         eSecCfg <- loadSecurityConfig (securityFilePath paths)
-        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity childWsRoot) eSecCfg)
+        seUIOEnv <$> either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
     , dwdAutonomy = sdAutonomy deps
     , dwdApprovals = sdApprovals deps
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -915,11 +898,10 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
         then injectAvailableSkills (bSkills (sdBackends deps)) withAutoload
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
-      eChildWd <- ensureSessionWorkdir paths childSid
       childCloneDeps <- mkCloneDepsFromSend deps
-      let childWsRoot = case eChildWd of
-            Right wd -> WorkspaceRoot wd
-            Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+      eSecCfg <- loadSecurityConfig (securityFilePath paths)
+      childExec <- either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
+      let childWsRoot = seWorkspaceRoot childExec
       let childBaseOps =
             [ showHumanOp childCaps
             , askHumanOp childCaps

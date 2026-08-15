@@ -50,7 +50,15 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sessionWorkdir)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sshAgentsDir)
+import Seal.Config.Security (SecurityConfig)
+import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
+import Seal.SourceControl.Clone (CloneDeps (..))
+import qualified Seal.SourceControl.Clone as Clone
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
+import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, pendingForSession, PendingQuestionInfo (..) )
@@ -114,6 +122,7 @@ data ApiDeps = ApiDeps
   , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
   , adWsPort           :: Int                   -- ^ the WS stream server port (returned in /api/health so the frontend can discover it at runtime)
+  , adSecurityConfig   :: SecurityConfig        -- ^ the security config (for mkSessionExec in handleSessionAgents — remote-mode repo-agent discovery)
   }
 
 -- | The REST API as a WAI Application.
@@ -755,6 +764,23 @@ handleSessionDescription deps sid body =
 -- 404 for an unknown session (no @session.json@). 200 + user-only defs for
 -- a known session with an empty/missing workdir (the workdir contributes
 -- @[]@). Reuses 'agentInfoJson' for the wire shape so the frontend's
+-- | Build 'CloneDeps' from 'ApiDeps' for 'mkSessionExec' in
+-- 'handleSessionAgents'. Mirrors 'mkCloneDepsFromSend' but sources from
+-- 'ApiDeps' fields. The ssh-agent is real; pinned host keys are
+-- compile-time-embedded.
+cloneDepsForApiDeps :: ApiDeps -> IO CloneDeps
+cloneDepsForApiDeps deps = do
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (adPaths deps))
+  pure CloneDeps
+    { Clone.cdVault = adVault deps
+    , Clone.cdRepoReg = adRepoRegistry deps
+    , Clone.cdSshAgent = mkRealSshAgentHandle
+    , Clone.cdAgentRegistry = agentRegH
+    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
+    , Clone.cdKeyfilesDir = repoKeysDir (adPaths deps)
+    , Clone.cdIsRemote = False
+    }
+
 -- 'AgentInfo'/'AgentDefInfo' types deserialize unchanged.
 handleSessionAgents :: ApiDeps -> SessionId -> IO Response
 handleSessionAgents deps sid = do
@@ -764,8 +790,10 @@ handleSessionAgents deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      let wd = sessionWorkdir paths sid
-      workdirBackend <- workdirAgentDefBackend wd
+      cloneDeps <- cloneDepsForApiDeps deps
+      exec <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+      let wfs = seWorkdirFs exec
+      workdirBackend <- workdirAgentDefBackend wfs
       let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)
       defs <- adbList unionBackend
       mDefaultId <- adDefaultAgent deps

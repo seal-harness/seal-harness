@@ -34,13 +34,12 @@
 -- @.seal\/agents@ and @agents@ always use the legacy discovery.
 --
 -- The re-exports from "Seal.Agent.Def.Backend" keep the public API
--- stable ('workdirAgentDefBackend', 'workdirAgentDefBackendFs',
--- 'composeDirSystemPrompt', 'encodeAgentDef', 'decodeAgentDef', etc.).
+-- stable ('workdirAgentDefBackend', 'composeDirSystemPrompt',
+-- 'encodeAgentDef', 'decodeAgentDef', etc.).
 module Seal.Agent.Def.Workdir
   ( -- * Backend record
     AgentDefBackend (..)
     -- * Workdir backend
-  , workdirAgentDefBackendFs
   , workdirAgentDefBackend
   , listWorkdirAgentDefs
     -- * DirScheme composition (WorkdirFs-anchored)
@@ -105,16 +104,13 @@ import Seal.Agent.Def.Types
   , isValidAgentDefId
   )
 import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
-import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AllowList (..))
 import Seal.Store.Markdown
   ( decodeDoc, encodeDoc, fmLookup, fmLookupList, splitFrontmatterRaw
   )
-import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..)
-  , mkLocalWorkdirFs
   )
 
 -- ---------------------------------------------------------------------------
@@ -572,8 +568,8 @@ listAgentsDotAgents fs = do
 -- Every file open goes through the 'WorkdirFs' handle (symlink-escape
 -- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
 -- 'maxScanBytes' + 'truncateSection'.
-workdirAgentDefBackendFs :: WorkdirFs -> IO AgentDefBackend
-workdirAgentDefBackendFs fs = pure AgentDefBackend
+workdirAgentDefBackend :: WorkdirFs -> IO AgentDefBackend
+workdirAgentDefBackend fs = pure AgentDefBackend
     { adbRead   = \aid -> do
         defs <- listWorkdirAgentDefs fs
         pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
@@ -581,16 +577,6 @@ workdirAgentDefBackendFs fs = pure AgentDefBackend
     , adbList   = listWorkdirAgentDefs fs
     , adbDelete = \_ -> pure ()
     }
-
--- | Back-compat wrapper (W4/W5): keeps the exported 'FilePath' signature
--- while delegating to 'workdirAgentDefBackendFs' over a local 'WorkdirFs'
--- anchored at the workdir root. W6 removes this wrapper and promotes
--- 'workdirAgentDefBackendFs' to the exported 'workdirAgentDefBackend'
--- name. Existing call sites ('Send.hs', 'API.hs', 'Channels/Loop.hs',
--- 'Channel/Cli.hs', and the tests) compile unmodified.
-workdirAgentDefBackend :: FilePath -> IO AgentDefBackend
-workdirAgentDefBackend workdir =
-  workdirAgentDefBackendFs (mkLocalWorkdirFs (WorkspaceRoot workdir) maxScanBytes)
 
 -- | Enumerate every agent def found under the conventional locations across
 -- all top-level directories (cloned repos) in the workdir anchored at the

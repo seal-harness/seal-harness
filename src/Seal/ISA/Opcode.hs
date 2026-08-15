@@ -28,21 +28,17 @@ module Seal.ISA.Opcode
   , opOutSchema
   , opAuthorize
   , opRun
-  , uoRunLegacy
   , withAuthorize
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 
 import Seal.Core.Types
 import Seal.Providers.Class (ToolResultPart)
 import Seal.Types.App
-import Seal.Tools.Exec.UIO (UIO, runUIOWithEnv, mkTestUIOEnv)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
-import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Seal.Tools.Exec.UIO (UIO)
 
 data OpResult = OpResult
   { orParts :: [ToolResultPart]  -- ^ what the model sees (may include secret values)
@@ -136,15 +132,3 @@ withAuthorize (TrustedOpcode n tl d is os _ r) f =
   TrustedOpcode n tl d is os f r
 withAuthorize (UntrustedOpcode n d is os _ r) f =
   UntrustedOpcode n d is os f r
-
--- | The back-compat wrapper the dispatcher uses through W-A3. Runs the
--- opcode's 'uoRun' (now typed @Value -> UIO OpResult@) in 'App' by building
--- a 'UIOEnv' from the 'UntrustedIO' + an optional 'CloneDeps' (real for Git
--- opcodes, 'stubCloneDeps' for non-Git) and running it via 'runUIOWithEnv'.
--- W6 rewires the dispatcher to source the 'UIOEnv' from 'seUIOEnv' (dropping
--- this wrapper).
-uoRunLegacy :: UntrustedIO -> Maybe CloneDeps -> Opcode -> Value -> App OpResult
-uoRunLegacy uio mCloneDeps op input =
-  let deps = fromMaybe stubCloneDeps mCloneDeps
-      env = mkTestUIOEnv uio deps
-  in liftIO (runUIOWithEnv env (uoRun op input))

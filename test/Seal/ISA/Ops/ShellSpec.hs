@@ -1,14 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.ShellSpec (spec) where
-
-import Data.Aeson (object, (.=))
+import Control.Monad.IO.Class (liftIO)
+import Data.Maybe (fromMaybe)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Data.Aeson (Value, object, (.=))
 import Data.IORef
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Test.Hspec
 
 import Seal.Core.AllowList (AllowList (..))
-import Seal.ISA.Opcode (OpResult (..), uoRunLegacy, uoAuthorize)
+import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun, uoAuthorize)
 import Seal.ISA.Ops.Shell
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
@@ -22,6 +26,11 @@ import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
 
+-- | Local replacement for the removed uoRunLegacy: runs the opcode's uoRun
+-- in a UIOEnv built from the UntrustedIO + optional CloneDeps.
+runOp :: UntrustedIO -> Maybe CloneDeps -> Opcode -> Value -> App OpResult
+runOp uio mDeps op input =
+  liftIO (runUIOWithEnv (mkTestUIOEnv uio (fromMaybe stubCloneDeps mDeps)) (uoRun op input))
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
@@ -50,7 +59,7 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "hello\n"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("echo hello" :: String)]))
+      r <- runTestApp (runOp uio Nothing op (object ["command" .= ("echo hello" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "hello\n"]
       readIORef seen `shouldReturn` ["echo hello"]
@@ -59,7 +68,7 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "out"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("ls /ws" :: String)]))
+      r <- runTestApp (runOp uio Nothing op (object ["command" .= ("ls /ws" :: String)]))
       orRecorded r `shouldBe` object ["command" .= ("ls /ws" :: String), "cwd" .= (Nothing :: Maybe String)]
 
     it "Deny policy -> Denied at the authorize gate (never runs the executor)" $ do
@@ -71,12 +80,12 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
       seen <- newIORef []
       let uio = fakeUio seen "x"
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRunLegacy uio Nothing op (object []))
+      r <- runTestApp (runOp uio Nothing op (object []))
       orIsError r `shouldBe` True
       readIORef seen `shouldReturn` []
 
     it "executor failure surfaces as an error result" $ do
       let uio = failUio ExecNotImplemented
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
-      r <- runTestApp (uoRunLegacy uio Nothing op (object ["command" .= ("false" :: String)]))
+      r <- runTestApp (runOp uio Nothing op (object ["command" .= ("false" :: String)]))
       orIsError r `shouldBe` True
