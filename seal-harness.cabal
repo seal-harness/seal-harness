@@ -342,7 +342,8 @@ test-suite tests
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
         Seal.Skills.TypesSpec
-        Seal.Skills.BackendSpec
+         Seal.Skills.BackendSpec
+         Seal.Skills.BackendNoDirectFsFailSpec
         Seal.Skills.AutoloadSpec
         Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec

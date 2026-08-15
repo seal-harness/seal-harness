@@ -12,7 +12,7 @@ import Test.Hspec
 import Seal.Skills.Backend
   ( SkillBackend (..)
   , tripleUnionSkillBackend
-  , workdirSkillBackend
+  , workdirSkillBackendFs
   , workdirSkillConventions
   , decodeAgentSkill
   )
@@ -78,14 +78,14 @@ spec = do
       createDirectoryIfMissing True (tmp </> "my-repo" </> ".skills" </> "my-skill")
       writeFile (tmp </> "my-repo" </> ".skills" </> "my-skill" </> "SKILL.md")
         "---\nname: my-skill\ndescription: A repo-local skill.\n---\nDo repo things.\n"
-      backend <- workdirSkillBackend tmp
+      backend <- workdirSkillBackendFs =<< mkFs tmp
       skills <- sbList backend
       length skills `shouldBe` 1
       case skills of
         [s] -> do
           skillIdText (skId s) `shouldBe` "my-repo--my-skill"
           skDescription s `shouldBe` "A repo-local skill."
-          skBody s `shouldBe` "Do repo things.\n"
+          skBody s `shouldBe` "Do repo things."
           skGroup s `shouldBe` Just "my-repo project skills"
         _ -> expectationFailure "expected exactly 1 skill"
       case mkSkillId "my-repo--my-skill" of
@@ -102,22 +102,75 @@ spec = do
       createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill")
       writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "my-skill" </> "SKILL.md")
         "---\nname: my-skill\ndescription: A .agents/skills skill.\n---\nDo .agents things.\n"
-      backend <- workdirSkillBackend tmp
+      backend <- workdirSkillBackendFs =<< mkFs tmp
       skills <- sbList backend
       length skills `shouldBe` 1
       case skills of
         [s] -> do
           skillIdText (skId s) `shouldBe` "my-repo--my-skill"
           skDescription s `shouldBe` "A .agents/skills skill."
-          skBody s `shouldBe` "Do .agents things.\n"
+          skBody s `shouldBe` "Do .agents things."
           skGroup s `shouldBe` Just "my-repo project skills"
         _ -> expectationFailure "expected exactly 1 skill"
       cleanup tmp
 
     it "returns empty list when workdir has no repos" $ do
-      backend <- workdirSkillBackend "/nonexistent-path-12345"
+      backend <- workdirSkillBackendFs =<< mkFs "/nonexistent-path-12345"
       skills <- sbList backend
       skills `shouldBe` []
+
+  describe "Seal.Skills.Backend.workdirSkillBackendFs (remote-arm stub parity)" $ do
+    it "discovers a skill in agentskills.io format over a stub-remote WorkdirFs" $ do
+      -- A stub-remote WorkdirFs (in-memory, no real SSH / no local FS)
+      -- seeded with:
+      --   my-repo/.skills/my-skill/SKILL.md
+      -- The skill is discovered with the repo-prefixed id. Discovery parity
+      -- with the local arm is the §1.1 success metric.
+      let skillMd = "---\nname: my-skill\ndescription: A stub skill.\n---\nDo stub things.\n"
+          seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".skills"])
+            , (rp "my-repo/.skills", Directory ["my-skill"])
+            , (rp "my-repo/.skills/my-skill", Directory ["SKILL.md"])
+            , (rp "my-repo/.skills/my-skill/SKILL.md", FileContent skillMd)
+            ]
+          fs = mkInMemWorkdirFs seed
+      backend <- workdirSkillBackendFs fs
+      skills <- sbList backend
+      length skills `shouldBe` 1
+      case skills of
+        [s] -> do
+          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skDescription s `shouldBe` "A stub skill."
+          skBody s `shouldBe` "Do stub things."
+          skGroup s `shouldBe` Just "my-repo project skills"
+        _ -> expectationFailure "expected exactly 1 skill"
+
+    it "rejects a symlinked SKILL.md escaping the workspace (stub-remote containment)" $ do
+      -- A stub-remote WorkdirFs seeded with a .skills entry whose SKILL.md
+      -- is a symlink escaping to /etc/shadow. The escaping skill MUST NOT
+      -- appear; the non-symlink skill in the same repo still does. Parity
+      -- with the W4 agent-def symlink-escape test.
+      let goodMd  = "---\nname: good-skill\ndescription: Good.\n---\nGood body.\n"
+          seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".skills"])
+            , (rp "my-repo/.skills", Directory ["good-skill", "leak"])
+            , (rp "my-repo/.skills/good-skill", Directory ["SKILL.md"])
+            , (rp "my-repo/.skills/good-skill/SKILL.md", FileContent goodMd)
+            , (rp "my-repo/.skills/leak", Directory ["SKILL.md"])
+            , (rp "my-repo/.skills/leak/SKILL.md", SymlinkTarget (rp "/etc/shadow"))
+            ]
+          fs = mkInMemWorkdirFs seed
+      backend <- workdirSkillBackendFs fs
+      skills <- sbList backend
+      let ids = map (skillIdText . skId) skills
+      -- The good skill is discovered; the leaking 'leak' skill is rejected.
+      ids `shouldContain` ["my-repo--good-skill"]
+      ids `shouldNotContain` ["my-repo--leak"]
+      -- No skill body contains the escaped secret.
+      let bodies = map skBody skills
+      bodies `shouldNotSatisfy` any ("PRIVATE" `T.isInfixOf`)
 
   describe "Seal.Skills.Backend.tripleUnionSkillBackend (no-collision namespacing)" $ do
     it "shows both user and workdir skills when they share the same raw id" $ do
@@ -128,7 +181,7 @@ spec = do
       writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "shared-skill" </> "SKILL.md")
         "---\nname: shared-skill\ndescription: Repo version.\n---\nRepo body.\n"
       -- User skill: in-memory backend with the same id "shared-skill"
-      workdirBackend <- workdirSkillBackend tmp
+      workdirBackend <- workdirSkillBackendFs =<< mkFs tmp
       userBackend <- SkillBackend.noneBackend
       case mkSkillId "shared-skill" of
         Right sid -> do

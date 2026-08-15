@@ -110,6 +110,7 @@ import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Skills.BackendSpec
+import qualified Seal.Skills.BackendNoDirectFsFailSpec
 import qualified Seal.Skills.PromptSpec
 import qualified Seal.Agent.Def.TypesSpec
 import qualified Seal.Agent.Def.BackendSpec
@@ -270,6 +271,7 @@ main = hspec $ do
   Seal.Agent.Def.TypesSpec.spec
   Seal.Agent.Def.BackendSpec.spec
   Seal.Agent.Def.BackendNoDirectFsFailSpec.spec
+  Seal.Skills.BackendNoDirectFsFailSpec.spec
   Seal.Agent.PromptPartsSpec.spec
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.ISA.Ops.MemorySpec.spec
