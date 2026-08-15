@@ -7,6 +7,7 @@ module Seal.Phase2bSpec (spec) where
 import Data.Aeson (Value (..), object, (.=))
 import Control.Concurrent (threadDelay)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -16,7 +17,9 @@ import Options.Applicative (info, progDesc)
 import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
@@ -48,6 +51,11 @@ import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (mkEnv)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Ingest (emptyChain)
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 -- A scripted provider: replies a long message to test chunking.
 newtype ScriptProvider = ScriptProvider (IORef [CompletionResponse])
@@ -134,6 +142,8 @@ spec = describe "Seal.Phase2bSpec" $ do
                     , aeOnStop = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
+                  , aeAbortFlag = testAbortFlag
+                  , aeToolTimeout = defaultToolTimeoutConfig
                 }
           in runApp appEnv (runTurn agentEnv body)
         plainHandler h mSrc body = case mSrc of

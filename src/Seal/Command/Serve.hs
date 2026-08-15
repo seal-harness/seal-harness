@@ -234,6 +234,7 @@ runServeMain autonomy logger = do
         , sdApprovals   = approvals
         , sdReplies     = cdReplies chanDeps
         , sdLocks       = cdLocks chanDeps
+        , sdAbortReg    = cdAbortReg chanDeps
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
@@ -263,6 +264,7 @@ runServeMain autonomy logger = do
         , adVault            = rt
         , adPaths            = paths
         , adWsPort           = gcWsPort gwCfg
+        , adAbortReg         = cdAbortReg chanDeps
         }
   -- Start the WS stream server on the WS port.
   -- The Origin allowlist is the configured list PLUS origins derived from

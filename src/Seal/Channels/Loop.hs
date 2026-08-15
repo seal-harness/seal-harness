@@ -88,7 +88,8 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance )
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
@@ -163,6 +164,8 @@ import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs, lookupByRef )
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (SealLogger, logIO)
@@ -203,6 +206,12 @@ data ChannelDeps = ChannelDeps
   , cdLocks       :: SessionLocks
     -- ^ Per-session write locks. Serializes concurrent turns on the same
     -- session to prevent transcript corruption.
+  , cdAbortReg     :: SessionAbortRegistry
+    -- ^ Per-session abort registry (design Blocker Resolution #2). The
+    -- channel @\/stop@ command calls 'setSessionAbort' on this; the turn
+    -- path looks up the per-session 'AbortFlag' via
+    -- 'lookupOrCreateAbortFlag' and passes it into 'mkSessionAgentEnv' as
+    -- 'aeAbortFlag'. Mirrors 'cdLocks'.
   , cdTabs        :: TabsHandle
     -- ^ The shared, unified tab handle. Under @seal serve@, this is the SAME
     -- handle as the web gateway's 'adTabsHandle', so a tab inserted by any
@@ -259,6 +268,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
   cursors <- newCursorStore
   replies <- newReplyRegistry
   locks   <- newSessionLocks
+  abortReg <- newSessionAbortRegistry
   pure ChannelDeps
     { cdPaths      = paths
     , cdVault      = vault
@@ -274,6 +284,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
     , cdCursors     = cursors
     , cdReplies     = replies
     , cdLocks       = locks
+    , cdAbortReg    = abortReg
     , cdTabs        = tabsH
     , cdConfig      = loadCfg
     , cdIsRemote    = isRemote
@@ -809,6 +820,7 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
                          then injectAvailableSkills sessionSkills mSystem'
                          else pure mSystem'
           cloneDeps <- mkCloneDepsFromChannel deps
+          turnAbortFlag <- lookupOrCreateAbortFlag (cdAbortReg deps) sid
           let handleCaps = case mkCaps of
                 Nothing  -> mkHandleCaps h askReply askSid
                 Just f   -> f h askReply askSid
@@ -847,7 +859,9 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
                        (either (const defaultMaxTurns) maxTurnsConfig eCfg)
                        onUserMessage
                        (smChannel meta)
-                       (Just (replyFanout (cdReplies deps) sid)))
+                       (Just (replyFanout (cdReplies deps) sid))
+                       turnAbortFlag
+                       (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
                       { aeMessageSource = mSrc }
           eResult <- withExceptionLogging (cdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
             runApp appEnv (runTurn env t)
@@ -989,7 +1003,8 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO callOpName val)
+    callAbortFlag <- lookupOrCreateAbortFlag (cdAbortReg deps) sid
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
       Right r -> do
         let opNm = case callOpName of OpName n -> n
@@ -1156,6 +1171,8 @@ channelMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot oper
     , dwdChildSystemPrompt = childSystemPrompt
     , dwdOnEntry = pure ()  -- child onEntry: no live broadcast (would need the broker + child sid)
     , dwdChannel = channel
+    , dwdAbortFlag = lookupOrCreateAbortFlag (cdAbortReg deps)
+    , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
     }
   where
     resolveChild agentDef = do

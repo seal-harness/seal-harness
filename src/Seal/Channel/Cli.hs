@@ -32,8 +32,10 @@ import System.Console.Haskeline
   , defaultSettings
   , getInputLine
   , getPassword
+  , handleInterrupt
   , noCompletion
   , runInputT
+  , withInterrupt
   )
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
@@ -45,13 +47,15 @@ import Data.Default (def)
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Stop (stopCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
                           rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
-                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance)
+                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance,
+                          toolTimeoutConfig)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Paging (defaultPageParams)
@@ -69,6 +73,8 @@ import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStu
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+import Seal.Tools.Exec.Abort (AbortFlag, SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
+import Seal.Tools.Timeout (ToolTimeoutConfig, defaultToolTimeoutConfig)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -234,8 +240,9 @@ mkSessionAgentEnv
   -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UntrustedIO
   -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
   -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> Maybe (Text -> IO ())
+  -> AbortFlag -> ToolTimeoutConfig
   -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop = AgentEnv
+mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrustedIO debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop abortFlag toolTimeout = AgentEnv
   { aeProvider   = provider
   , aeProviderLabel = provLabel
   , aeModel      = model
@@ -257,6 +264,8 @@ mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle untrus
   , aeOnStop     = onStop
   , aeOnDemandSchemas = onDemand
   , aeLogPath    = logPath
+  , aeAbortFlag  = abortFlag
+  , aeToolTimeout = toolTimeout
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -294,6 +303,7 @@ runCliTui
   -> AskReplyStore -> SealLogger -> IO ()
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
   approvals <- newApprovalCache
+  abortReg <- newSessionAbortRegistry
   active0 <- readIORef (srActive sr)
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   eCfg <- loadRuntimeConfig (prConfigPath pr)
@@ -474,6 +484,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , dwdChildSystemPrompt = cliChildSystemPrompt
               , dwdOnEntry = pure ()
               , dwdChannel = "cli"
+              , dwdAbortFlag = lookupOrCreateAbortFlag abortReg
+              , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               }
             mkWorker = mkDelegateWorker delegateDeps
             delegationCfg = do
@@ -644,12 +656,13 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta bgMwd
               bgUio <- mkSessionUio bgSid
+              bgAbortFlag <- lookupOrCreateAbortFlag abortReg bgSid
               let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle bgUio
                     (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
                     (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-                    "cli" Nothing
+                    "cli" Nothing bgAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
               runApp appEnv (runTurn env prompt)))
-      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
+      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher, stopCommandSpec abortReg sr])
       -- The /call dispatcher: dispatch an opcode against the active
       -- session's ISA registry + transcript under Full autonomy (the
       -- operator is the approver by typing /call). Returns the
@@ -676,7 +689,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           callUio <- mkSessionUio sid
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio callOpName val)
+          callAbortFlag <- lookupOrCreateAbortFlag abortReg sid
+          res <- runApp appEnv (dispatch isaReg tHandle localBackend callUio (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
           case res of
             Right r -> do
               let opNm = case callOpName of OpName n -> n
@@ -689,20 +703,34 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         meta <- readIORef (srActive sr)
         withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
           uio <- mkSessionUio sid
+          turnAbortFlag <- lookupOrCreateAbortFlag abortReg sid
           handlePlain
             (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle uio
                (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-               "cli" Nothing)
+               "cli" Nothing turnAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
             appEnv t
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
           ensureTabForSession tabsH KindAi sid
-  runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
+  runInputT hlSettings (loop caps plainHandler tabsH registryWithBg abortReg)
   where
-    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()
-    loop caps plainHandler th reg = do
-      mLine <- getInputLine "> "
+    loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> SessionAbortRegistry -> InputT IO ()
+    loop caps plainHandler th reg abortReg = do
+      -- Ctrl-C handler: on interrupt, abort the active session's in-flight
+      -- tool call (design Task 7 — CLI abort wiring). The interrupt is
+      -- caught here (not propagated), so the loop continues; the next
+      -- getInputLine re-prompts. The active session's abort flag is set
+      -- via the SessionAbortRegistry.
+      mLine <- withInterrupt
+        (handleInterrupt
+          (liftIO $ do
+            active <- readIORef (srActive sr)
+            setSessionAbort abortReg (smId active)
+            ccSend caps "interrupted (in-flight tool call aborted)"
+            pure Nothing
+          )
+          (getInputLine "> "))
       case mLine of
         Nothing   -> pure ()   -- EOF / Ctrl-D
         Just line -> do
@@ -716,7 +744,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           -- the active session plus any /bg background sessions.
           (_resolved, delivered) <- liftIO $ deliverNextAnswerResolvedAny askReply (T.pack line)
           if delivered
-            then loop caps plainHandler th reg
+            then loop caps plainHandler th reg abortReg
             else do
               case Seal.Routing.Route.route (T.pack line) of
                 Right (Seal.Routing.Route.Focus idx) -> liftIO (focusTabH th idx) >>= \r -> liftIO $ ccSend caps (case r of Left e -> "focus: " <> e; Right _ -> "focused tab " <> T.singleton (tabIndexToChar idx))
@@ -742,7 +770,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                   liftIO $ interpretDisposition caps plainHandler d
                 Right (Seal.Routing.Route.Plain t) -> liftIO $ plainHandler t
                 Left (Seal.Routing.Route.ParseError e) -> liftIO $ ccSend caps e
-              loop caps plainHandler th reg
+              loop caps plainHandler th reg abortReg
 
 -- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
 -- replying via the channel caps. Pure-ish (the handle mutations are STM).

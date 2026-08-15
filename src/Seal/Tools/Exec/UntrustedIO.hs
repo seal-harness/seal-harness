@@ -56,7 +56,6 @@ import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute)
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess
-  , withCreateProcess
   )
 
 import Seal.Security.Path
@@ -69,6 +68,8 @@ import Seal.Tools.Args
   ( BinArg, BinName, SearchPattern, ShellCommand
   , mkShellCommand, textBinArg, textBinName, textSearchPattern, textShellCommand
   )
+import Seal.Tools.Exec.Local
+  ( readBounded, withManagedProcess )
 import Seal.Tools.Exec.Remote
   ( RemoteRunner (..), runRemoteShell
   , runRemoteStdin, sshExecArgv, sshExecArgvForwarding
@@ -417,14 +418,17 @@ runLocalFixedArgvEnv treat127AsMissing argv mCwd extras = do
       cp = (proc program args)
               { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
               , cwd = mCwd, env = env'
+              , create_group = True
               }
+      -- ^ @create_group = True@ puts the child in its own POSIX process
+      -- group so 'withManagedProcess' can kill the whole group on cleanup
+      -- (SIGTERM → grace → SIGKILL). This prevents orphans when the
+      -- dispatch wrapper cancels the Haskell worker thread.
+      maxOutput = 50_000  -- bounded output cap (Task 4, matches ttcMaxOutputBytes)
   res <- try @IOException
-         (withCreateProcess cp $ \_ mOut mErr ph -> do
-            (hOut, hErr) <- case (mOut, mErr) of
-              (Just a, Just b) -> pure (a, b)
-              _                -> error "runLocalFixedArgvEnv: pipe creation failed (unreachable)"
-            out <- TE.decodeUtf8 <$> BS.hGetContents hOut
-            err <- TE.decodeUtf8 <$> BS.hGetContents hErr
+         (withManagedProcess cp $ \ph _mIn hOut hErr -> do
+            out <- readBounded hOut maxOutput
+            err <- readBounded hErr maxOutput
             ec  <- waitForProcess ph
             pure (ec, out, err))
   pure $ case res of

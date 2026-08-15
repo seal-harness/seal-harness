@@ -21,6 +21,7 @@ module Seal.Session.Lock
   ( SessionLocks
   , newSessionLocks
   , withSessionLock
+  , sessionTurnInFlight
   , ReplyRegistry
   , newReplyRegistry
   , replySubscribe
@@ -32,13 +33,14 @@ module Seal.Session.Lock
   ) where
 
 import Control.Concurrent.MVar
-  ( MVar, newMVar, withMVar )
+  ( MVar, newMVar, tryReadMVar, withMVar )
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (IOException, catch)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 
@@ -78,6 +80,23 @@ withSessionLock (SessionLocks tv) sid action = do
               writeTVar tv (Map.insert sid l m')
               pure l
   withMVar lock (const action)
+
+-- | Non-blocking check: is a turn currently in flight for this session?
+-- Returns 'True' if the session's lock MVar is empty (held by a running
+-- turn via 'withSessionLock'); 'False' if full (no turn in flight) or the
+-- session has no lock yet (never started a turn). Used by the web
+-- @POST /api/sessions/:id/stop@ endpoint to report @pending@ (design
+-- Blocker Resolution #2 + Designer round-2 question). Uses
+-- 'tryReadMVar' (non-blocking): 'Just ()' = full = not held = not in
+-- flight; 'Nothing' = empty = held = in flight.
+sessionTurnInFlight :: SessionLocks -> SessionId -> IO Bool
+sessionTurnInFlight (SessionLocks tv) sid = do
+  m <- readTVarIO tv
+  case Map.lookup sid m of
+    Nothing -> pure False  -- no lock yet → never started a turn → not in flight
+    Just lock -> do
+      mFilled <- tryReadMVar lock
+      pure (isNothing mFilled)  -- Nothing = empty = held = in flight
 
 -- ---------------------------------------------------------------------------
 -- Reply fan-out

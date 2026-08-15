@@ -9,6 +9,7 @@ module Seal.Phase4Spec (spec) where
 import Data.Aeson (Value (..), object, (.=))
 import Data.IORef
 import Data.Text (Text)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types (OpName (..))
@@ -22,6 +23,8 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Tools.Args (textShellCommand)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Tools.Exec.Types (TerminalBackend (..))
@@ -32,6 +35,11 @@ import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
+
+-- | A shared test abort flag (top-level, created once via unsafePerformIO).
+testAbortFlag :: AbortFlag
+testAbortFlag = unsafePerformIO newAbortFlag
+{-# NOINLINE testAbortFlag #-}
 
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
@@ -59,10 +67,10 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
         reg = mkRegistry [shellOp, fileWriteOp']
     (h, _readState) <- fakeTwoFileTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)
-    r1 <- runTestApp (dispatch reg h localBackend uio (OpName "SHELL_EXEC")
+    r1 <- runTestApp (dispatch reg h localBackend uio defaultToolTimeoutConfig testAbortFlag (OpName "SHELL_EXEC")
                        (object ["command" .= ("echo ok" :: String)]))
     -- Dispatch FILE_WRITE (Untrusted: ACK-before-execute)
-    r2 <- runTestApp (dispatch reg h localBackend uio (OpName "FILE_WRITE")
+    r2 <- runTestApp (dispatch reg h localBackend uio defaultToolTimeoutConfig testAbortFlag (OpName "FILE_WRITE")
                        (object ["path" .= ("out.txt" :: String), "content" .= ("data" :: String)]))
     -- Both succeed
     rightOf r1 `shouldSatisfy` isJust

@@ -42,7 +42,9 @@ import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
+import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Timeout (ToolTimeoutConfig)
 import Seal.Types.App (runApp)
 import Seal.Types.Env (Env)
 
@@ -129,6 +131,14 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- attributed to the same channel the parent turn ran on. Stamped into
     -- the child's 'aeChannel' so 'runTurn' attributes the child's user
     -- messages (the task goals) to the originating channel.
+  , dwdAbortFlag :: SessionId -> IO AbortFlag
+    -- ^ Construct the child's abort flag from the child's session id
+    -- (looked up from the 'Seal.Tools.Exec.Abort.SessionAbortRegistry').
+    -- The child's abort is independent of the parent's in v1 (a parent
+    -- abort doesn't auto-abort the child, and vice versa).
+  , dwdToolTimeout :: ToolTimeoutConfig
+    -- ^ The per-call timeout/retry config, inherited from the parent
+    -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
   }
 
 -- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
@@ -159,6 +169,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         childReg <- dwdChildRegistry deps agentDef childSid capturingCaps
         childUio <- dwdMkUntrustedIO deps childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
+        childAbortFlag <- dwdAbortFlag deps childSid
         let env = AgentEnv
               { aeProvider   = prov
               , aeProviderLabel = providerLabel agentDef
@@ -181,6 +192,8 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeOnStop     = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
+              , aeAbortFlag  = childAbortFlag
+              , aeToolTimeout = dwdToolTimeout deps
               }
         runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
           `catch` \e -> writeIORef summaryRef

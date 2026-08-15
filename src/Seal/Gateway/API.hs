@@ -51,6 +51,8 @@ import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sessionWorkdir)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
+import Seal.Session.Lock (sessionTurnInFlight)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Handles.AskReply
   ( askIdText, pendingForSession, PendingQuestionInfo (..) )
@@ -114,6 +116,7 @@ data ApiDeps = ApiDeps
   , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
   , adWsPort           :: Int                   -- ^ the WS stream server port (returned in /api/health so the frontend can discover it at runtime)
+  , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
   }
 
 -- | The REST API as a WAI Application.
@@ -177,6 +180,29 @@ apiApp deps req respond =
               outcome <- handleSend sendDeps sId msg
               let (code, val) = sendOutcomeJson outcome
               respond (jsonLBS (statusFromInt code) (A.encode val))
+    -- POST /api/sessions/:id/stop — abort the session's in-flight tool call
+    -- (and any future tool call until the next turn starts). Returns 200
+    -- {aborted: true, pending: bool} where pending=true means no turn was
+    -- in flight (the flag is set but will be cleared at the next runTurn
+    -- entry). The abort flag is looked up from the SessionAbortRegistry
+    -- (design Blocker Resolution #2 — ApiDeps has no AgentEnv at this call
+    -- site). Trust boundary: loopback-only, matching /api/repos.
+    (m', ["api", "sessions", sid, "stop"]) | m' == methodPost -> do
+      case mkSessionId sid of
+        Left e   -> respond (errJson status400 ("invalid session id: " <> e))
+        Right sId -> do
+          setSessionAbort (adAbortReg deps) sId
+          -- pending: whether a turn is currently in flight. Determined via a
+          -- non-blocking tryReadMVar on the session's lock (from sdLocks if
+          -- adSend is wired; else assume not-in-flight). True = no turn in
+          -- flight (the abort will be a no-op, cleared at next runTurn entry).
+          pending <- case adSend deps of
+            Just sendDeps -> sessionTurnInFlight (sdLocks sendDeps) sId
+            Nothing       -> pure True
+          respond (jsonOk (object
+            [ "aborted" .= True
+            , "pending" .= pending
+            ]))
     -- POST /api/sessions/:id/setup-repo — clone a repo into the session's
     -- workdir before the first turn (the web "set up repo" combo box calls
     -- this). Shares the clone logic with the SETUP_REPO opcode via
