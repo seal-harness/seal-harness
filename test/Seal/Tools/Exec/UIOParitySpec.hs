@@ -97,11 +97,11 @@ spec = describe "Seal.Tools.Exec.UIO local/remote parity" $ do
         writeFile (dir ++ "/searchable.txt") "find me here\n"
         deps <- stubCloneDeps
         localResult <- mkLocalUIO root deps $ do
-          case mkShellCommand "rg -n -- find ." of
+          case mkShellCommand "grep -n -- find searchable.txt" of
             Right cmd -> uioShellExec cmd Nothing
             Left _ -> error "bad command"
         stubResult <- mkUIOStub deps $ do
-          case mkShellCommand "rg -n -- find ." of
+          case mkShellCommand "grep -n -- find searchable.txt" of
             Right cmd -> uioShellExec cmd Nothing
             Left _ -> error "bad command"
         localResult `shouldSatisfy` \case
