@@ -32,6 +32,7 @@ module Seal.SourceControl.Repo
   , lookupRepoByUrl
   , parseRepoHost
   , hostAllowed
+  , isGithubHost
   , urlShapeValid
   , githubHosts
   , repoCredentialKindText
@@ -341,14 +342,29 @@ normalizeReposTable t =
 -- URL helpers (pure — used by planClone in W3 + REST/slash validation in W4/W5)
 ----------------------------------------------------------------------------
 
--- | The GitHub-first host allow-list. This pass restricts clones to
--- @github.com@; a per-credential @cHost@ may widen this in a follow-up.
+-- | The GitHub host allow-list. Repos with 'VcsKind' @github@ are
+-- restricted to hosts in this list (defense-in-depth against the
+-- credential-exfiltration threat in design §5.3 — an attacker who poisons
+-- a @github@-kind registry entry can only send the vault credential to a
+-- host in this list). Repos with 'VcsKind' @git@ are /not/ restricted to
+-- this list: a @git@-kind repo uses SSH (deploy key) and the host is the
+-- operator's own server (frequently an @~/.ssh/config@ alias), so an
+-- allow-list of known-public hosts would be wrong.
 githubHosts :: [Text]
 githubHosts = ["github.com"]
 
--- | Is the parsed host in 'githubHosts'?
-hostAllowed :: Text -> Bool
-hostAllowed h = h `elem` githubHosts
+-- | Is the parsed host a GitHub host (in 'githubHosts')?
+isGithubHost :: Text -> Bool
+isGithubHost h = h `elem` githubHosts
+
+-- | Is the parsed host allowed for the given 'VcsKind'?
+--
+-- * @github@ → the host must be in 'githubHosts' (the allow-list).
+-- * @git@ → any host is allowed (the operator's own git server, often an
+--   @~/.ssh/config@ alias).
+hostAllowed :: VcsKind -> Text -> Bool
+hostAllowed VcsGitHub h = isGithubHost h
+hostAllowed VcsGit    _ = True
 
 -- | Parse the host from an SSH (@git@github.com:owner\/repo.git@) or HTTPS
 -- (@https://github.com/owner/repo.git@) URL. Returns @Left@ with a clear

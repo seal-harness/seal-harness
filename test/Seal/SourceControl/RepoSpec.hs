@@ -270,13 +270,22 @@ spec = describe "Seal.SourceControl.Repo" $ do
       parseRepoHost "ssh:///path/to/repo" `shouldSatisfy` isLeft
 
   describe "hostAllowed" $ do
-    it "allows github.com" $
-      hostAllowed "github.com" `shouldBe` True
+    it "allows github.com for github repos" $
+      hostAllowed VcsGitHub "github.com" `shouldBe` True
 
-    it "rejects an unknown host" $
-      hostAllowed "evil.example.org" `shouldBe` False
+    it "rejects an unknown host for github repos" $
+      hostAllowed VcsGitHub "evil.example.org" `shouldBe` False
 
-    it "githubHosts is the GitHub-first allow-list" $
+    it "allows any host for git repos" $ do
+      hostAllowed VcsGit "evil.example.org" `shouldBe` True
+      hostAllowed VcsGit "192.168.80.201" `shouldBe` True
+      hostAllowed VcsGit "neb-arrakis" `shouldBe` True
+
+    it "isGithubHost identifies GitHub hosts" $ do
+      isGithubHost "github.com" `shouldBe` True
+      isGithubHost "evil.example.org" `shouldBe` False
+
+    it "githubHosts is the GitHub allow-list" $
       githubHosts `shouldBe` ["github.com"]
 
   describe "urlShapeValid" $ do
@@ -305,13 +314,13 @@ spec = describe "Seal.SourceControl.Repo" $ do
             sshScheme = "ssh://git@github.com/" <> owner <> "/" <> repo <> ".git"
         in conjoin
              [ parseRepoHost ssh   === Right "github.com"
-             , hostAllowed (fromRight' (parseRepoHost ssh)) === True
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost ssh)) === True
              , urlShapeValid ssh === True
              , parseRepoHost https === Right "github.com"
-             , hostAllowed (fromRight' (parseRepoHost https)) === True
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost https)) === True
              , urlShapeValid https === True
              , parseRepoHost sshScheme === Right "github.com"
-             , hostAllowed (fromRight' (parseRepoHost sshScheme)) === True
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost sshScheme)) === True
              , urlShapeValid sshScheme === True
              ]
 

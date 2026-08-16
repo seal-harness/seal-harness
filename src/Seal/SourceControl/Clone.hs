@@ -81,7 +81,7 @@ import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..)
-  , hostAllowed, parseRepoHost, repoIdText )
+  , hostAllowed, isGithubHost, parseRepoHost, repoIdText )
 import Seal.SourceControl.AgentRegistry
   ( AgentRegistryHandle, arIsLive, arLoad, arRemove, arUpsert
   , probeAgent, AgentStatus (..) )
@@ -135,7 +135,7 @@ renderCloneError = \case
   CloneUnsupportedVcs v ->
     "unsupported VCS: " <> T.pack (show v)
   CloneHostNotSupported h ->
-    "host " <> h <> " not supported (only github.com is supported in this pass)"
+    "host " <> h <> " not supported (github repos must use github.com; git repos allow any host)"
   CloneAgentError msg ->
     "ssh-agent error: " <> msg
   CloneGitFailed n ->
@@ -163,19 +163,28 @@ data ClonePlan
 -- then routes on 'srVcsKind' / 'srCredential'.
 --
 -- * Malformed URL (host unparseable) → 'CloneNoCredentialForUrl'.
--- * Parsed host not in the allow-list → 'CloneHostNotSupported'.
--- * 'VcsGit' (non-GitHub git) → 'CloneUnsupportedVcs' (no
---   credential-injection path this pass).
--- * 'CredPat' / 'CredMachineUser' → 'ClonePlanExtraHeader' (SSH URL
---   rewritten to token-free HTTPS).
--- * 'CredDeployKey' → 'ClonePlanSshKey' (URL unchanged, SSH).
+-- * @github@ repo whose parsed host is not in the allow-list →
+--   'CloneHostNotSupported'. (@git@ repos are not host-restricted — the
+--   host is the operator's own server, often an @~/.ssh/config@ alias.)
+-- * @git@ + PAT / MachineUser → 'CloneUnsupportedVcs' (the @sshToHttps@
+--   rewrite assumes a GitHub-style host; a plain git server has no
+--   token-over-HTTPS injection path this pass).
+-- * @github@ + 'CredPat' / 'CredMachineUser' → 'ClonePlanExtraHeader'
+--   (SSH URL rewritten to token-free HTTPS).
+-- * @github@ + 'CredDeployKey' → 'ClonePlanSshKey' (URL unchanged, SSH).
+-- * @git@ + 'CredDeployKey' → 'ClonePlanSshKey' (URL unchanged, SSH — the
+--   operator's own git server over SSH with a deploy key).
 planClone :: SourceRepo -> Either CloneError ClonePlan
 planClone repo =
   case parseRepoHost (srUrl repo) of
     Left _err -> Left (CloneNoCredentialForUrl (srUrl repo))
     Right host
-      | not (hostAllowed host) -> Left (CloneHostNotSupported host)
-      | srVcsKind repo == VcsGit -> Left (CloneUnsupportedVcs VcsGit)
+      | not (hostAllowed (srVcsKind repo) host) -> Left (CloneHostNotSupported host)
+      | srVcsKind repo == VcsGit -> case srCredential repo of
+          CredDeployKey vaultKey ->
+            Right (ClonePlanSshKey (srUrl repo) vaultKey)
+          CredPat _           -> Left (CloneUnsupportedVcs VcsGit)
+          CredMachineUser _ _ -> Left (CloneUnsupportedVcs VcsGit)
       | otherwise -> case srCredential repo of
           CredPat vaultKey ->
             Right (ClonePlanExtraHeader (sshToHttps (srUrl repo)) vaultKey)
@@ -425,12 +434,25 @@ resolveCloneTarget deps repo =
                           }
                     pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
                   else do
-                    -- LOCAL deploy-key path: write the per-op
-                    -- @known_hosts@ temp file (public data) to the
-                    -- harness-private @cdKeyfilesDir@.
+                    -- LOCAL deploy-key path. For GitHub hosts, write the
+                    -- per-op @known_hosts@ temp file (the compile-time-embedded
+                    -- GitHub host keys — public data, tamper-resistant) to the
+                    -- harness-private @cdKeyfilesDir@. For non-GitHub hosts
+                    -- (@git@-kind repos — the operator's own git server,
+                    -- frequently an @~/.ssh/config@ alias), do NOT override
+                    -- @UserKnownHostsFile@: let ssh use the user's default
+                    -- @~/.ssh/known_hosts@ + @~/.ssh/config@ (so the alias
+                    -- resolves). @StrictHostKeyChecking=yes@ is kept either way
+                    -- (fail closed on a missing host key).
+                    let mHost = case parseRepoHost (srUrl repo) of Right h -> Just h; Left _ -> Nothing
+                        isGh = maybe False isGithubHost mHost
                     (knownHostsPath, knownHostsCleanup) <-
-                      writeKnownHostsTemp (cdKeyfilesDir deps)
-                                           (cdPinnedKnownHosts deps)
+                      if isGh
+                        then do
+                          (p, c) <- writeKnownHostsTemp (cdKeyfilesDir deps)
+                                                         (cdPinnedKnownHosts deps)
+                          pure (Just p, c)
+                        else pure (Nothing, pure ())
                     -- NOTE: IdentitiesOnly is intentionally omitted from
                     -- GIT_SSH_COMMAND. On macOS, the bundled /usr/bin/ssh
                     -- suppresses agent-offered keys when
@@ -442,11 +464,14 @@ resolveCloneTarget deps repo =
                     -- (exactly one key live at forwarding time) replaces
                     -- what IdentitiesOnly would enforce.
                     let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
+                        knownHostsArg = case knownHostsPath of
+                          Just p  -> " -o UserKnownHostsFile=" <> T.pack p
+                          Nothing -> ""
                         sshCmd = T.pack
                           ( "ssh"
                           <> " -o StrictHostKeyChecking=yes"
                           <> " -o BatchMode=yes"
-                          <> " -o UserKnownHostsFile=" <> knownHostsPath
+                          <> T.unpack knownHostsArg
                           )
                         envExtras =
                           [ ("SSH_AUTH_SOCK", saeAuthSock agentEnv)

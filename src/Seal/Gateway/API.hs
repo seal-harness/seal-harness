@@ -1414,16 +1414,19 @@ parseRepoWithId rid (A.Object o) = do
   -- URL shape (SSH scp-form or HTTPS) — guards against malformed input
   -- before the host allow-list check.
   unlessRight (urlShapeValid url) "url is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
-  -- Host allow-list (GitHub-first). A URL whose parsed host is not in
-  -- 'githubHosts' is rejected with 400.
+  -- Parse the host (used for the allow-list check below).
   host <- parseRepoHost url
-  unlessRight (hostAllowed host) ("host not allowed: " <> host)
   vcsKindTxt <- case KeyMap.lookup (Key.fromText "vcs_kind") o of
     Just (A.String t) | not (T.null (T.strip t)) -> Right t
     Just (A.String _) -> Left "vcs_kind is empty"
-    Just _            -> Left "vcs_kind must be a string"
+    Just _             -> Left "vcs_kind must be a string"
     Nothing           -> Left "vcs_kind is required"
   vcsKind <- parseVcsKind vcsKindTxt
+  -- Host allow-list. A @github@ repo whose parsed host is not in 'githubHosts'
+  -- is rejected with 400 (defense-in-depth — design §5.3). A @git@ repo is not
+  -- host-restricted (the operator's own git server, often an @~/.ssh/config@
+  -- alias).
+  unlessRight (hostAllowed vcsKind host) ("host not allowed: " <> host)
   cred <- case KeyMap.lookup (Key.fromText "credential") o of
     Just (A.Object co) -> parseCredentialObj co
     Just _             -> Left "credential must be an object"

@@ -215,8 +215,8 @@ validateAdd rawId url rawVcs rawCred vaultKey mUsername = do
     then Left "URL is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
     else do
       host <- parseRepoHost url
-      if not (hostAllowed host)
-        then Left ("host " <> host <> " not supported (only github.com is supported in this pass)")
+      if not (hostAllowed vcs host)
+        then Left ("host " <> host <> " not supported (github repos must use github.com; git repos allow any host)")
         else do
           cred <- parseCredentialKind rawCred vaultKey mUsername
           Right SourceRepo
@@ -337,7 +337,7 @@ renderRepoTestError = \case
   CloneUnsupportedVcs v ->
     "unsupported VCS: " <> vcsKindText v
   CloneHostNotSupported h ->
-    "host " <> h <> " not supported (only github.com is supported in this pass)"
+    "host " <> h <> " not supported (github repos must use github.com; git repos allow any host)"
   CloneGitFailed n ->
     "git ls-remote failed (exit " <> T.pack (show n) <> ")"
   CloneAgentError msg ->
