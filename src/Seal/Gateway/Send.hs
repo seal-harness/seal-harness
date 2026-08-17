@@ -48,7 +48,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), untrustedIOFromSecurity, mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
@@ -112,7 +112,7 @@ import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered, broadcastAgentDefsChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -121,14 +121,15 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
+import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Store (SessionRuntime (..), formatSessionId, autoBindRepoAgent)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
-import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Types.App (runApp)
@@ -458,22 +459,32 @@ plainTurn deps meta t = do
             eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
             eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
             let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-            eWd <- ensureSessionWorkdir paths sid
-            let wsroot = case eWd of
-                  Right wd -> WorkspaceRoot wd
-                  Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+            cloneDeps <- mkCloneDepsFromSend deps
+            exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+            let wfs = seWorkdirFs exec
+                wsroot = seWorkspaceRoot exec
+                uioEnv = seUIOEnv exec
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+            -- Auto-bind: if the workdir now contains a repo shipping
+            -- .agents/agents.md (from a prior SETUP_REPO — whether invoked
+            -- by the LLM as a tool call, via /call, or via the web combo
+            -- box) and the session is still bound to its creation-time
+            -- default_agent (not already repo-prefixed), rebind smAgent to
+            -- the repo's agents-md so this turn's resolveSystemPrompt picks
+            -- up the project instructions. Idempotent + non-clobbering
+            -- (see autoBindRepoAgent). Runs over the same WorkdirFs the
+            -- turn uses, so mode=local and mode=remote behave identically.
+            -- Re-load meta after the (possible) rebind so resolveSystemPrompt
+            -- sees the updated smAgent.
+            autoBindRepoAgent wfs paths sid
+            mMetaAfterBind <- loadSessionMeta paths sid
+            let meta' = fromMaybe meta mMetaAfterBind
             -- Build the workdir-aware skill backend: repo-local skills
             -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
             -- Fail-closed: a workdir error → no workdir skills (the user ⊕
             -- builtin union still applies).
-            workdirSkills <- case eWd of
-              Right wd -> Skill.workdirSkillBackend wd
-              Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
-            workdirAgentDefs <- case eWd of
-              Right wd -> workdirAgentDefBackend wd
-              Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+            workdirSkills <- Skill.workdirSkillBackend wfs
+            workdirAgentDefs <- workdirAgentDefBackend wfs
             let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
                 sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
                 agentDefBackend = bAgentDefs sessionBackends
@@ -482,12 +493,11 @@ plainTurn deps meta t = do
                 parallel = either (const True) resolvedParallelToolGuidance eCfg
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-            cloneDeps <- mkCloneDepsFromSend deps
+            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta'
             turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
-                  deps paths sid caps untrustedIO appEnv eCfg
+                  deps paths sid caps uioEnv appEnv eCfg
                   wsroot operatorCeiling "web" sessionBackends
                 isaReg = buildWebRegistry
                   (sdVault deps) cloneDeps sessionBackends wsroot sid operatorCeiling
@@ -495,7 +505,7 @@ plainTurn deps meta t = do
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
                 env = mkSessionAgentEnv
-                  caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                  caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
                   (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                   (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                   onDemand
@@ -712,17 +722,13 @@ plainTurnWithCaps deps meta caps t = do
           eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
           eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
           let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-          untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-          eWd <- ensureSessionWorkdir paths sid
-          let wsRoot = case eWd of
-                Right wd -> WorkspaceRoot wd
-                Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-          workdirSkills <- case eWd of
-            Right wd -> Skill.workdirSkillBackend wd
-            Left _err -> Skill.workdirSkillBackend "/nonexistent-workdir-fail-closed"
-          workdirAgentDefs <- case eWd of
-            Right wd -> workdirAgentDefBackend wd
-            Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+          cloneDeps <- mkCloneDepsFromSend deps
+          exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+          let wfs = seWorkdirFs exec
+              wsRoot = seWorkspaceRoot exec
+              uioEnv = seUIOEnv exec
+          workdirSkills <- Skill.workdirSkillBackend wfs
+          workdirAgentDefs <- workdirAgentDefBackend wfs
           let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
               sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
               agentDefBackend = bAgentDefs sessionBackends
@@ -732,11 +738,10 @@ plainTurnWithCaps deps meta caps t = do
               toolUse = either (const True) resolvedToolUseEnforcement eCfg
               taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
           mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-          cloneDeps <- mkCloneDepsFromSend deps
           turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
           let onDemand = either (const False) onDemandSchemas eCfg
               startWiring = webStartWiring
-                deps paths sid caps untrustedIO appEnv eCfg
+                deps paths sid caps uioEnv appEnv eCfg
                 wsRoot operatorCeiling "web" sessionBackends
               isaReg = buildWebRegistry
                 (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
@@ -744,7 +749,7 @@ plainTurnWithCaps deps meta caps t = do
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                 caps onDemand
               env = mkSessionAgentEnv
-                caps prov (smProvider meta) model sid mSystem isaReg tHandle untrustedIO
+                caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
                 (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
                 (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                 onDemand
@@ -779,20 +784,17 @@ webCallDispatcher deps callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
     eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-    untrustedIO <- either (const (const (pure mkRemoteUntrustedIOStub))) (mkSessionUntrustedIO paths) eSecCfg sid
-    eWd <- ensureSessionWorkdir paths sid
-    let wsRoot = case eWd of
-          Right wd -> WorkspaceRoot wd
-          Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
-        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
     cloneDeps <- mkCloneDepsFromSend deps
-    workdirAgentDefs <- case eWd of
-          Right wd -> workdirAgentDefBackend wd
-          Left _err -> workdirAgentDefBackend "/nonexistent-workdir-fail-closed"
+    exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+    let wfs = seWorkdirFs exec
+        wsRoot = seWorkspaceRoot exec
+        uioEnv = seUIOEnv exec
+        caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+    workdirAgentDefs <- workdirAgentDefBackend wfs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
         startWiring = webStartWiring
-              deps paths sid caps untrustedIO appEnv eCfg
+              deps paths sid caps uioEnv appEnv eCfg
               wsRoot operatorCeiling "web" sessionBackends
         isaReg = buildWebRegistry
               (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
@@ -801,7 +803,7 @@ webCallDispatcher deps callOpName val = do
           caps onDemand
     tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend untrustedIO (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
+    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
       Right r -> do
         -- Record the opcode result into the transcript. SKILL_LOAD and
@@ -811,7 +813,20 @@ webCallDispatcher deps callOpName val = do
         -- here — their results surface via the turn's normal entry flow.
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
-          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          then do
+            recordSetupRepoResult tHandle callOpName val r (Just "web")
+            -- On a successful (non-error) SETUP_REPO, rebind the session's
+            -- smAgent to the cloned repo's .agents/agents.md when the repo
+            -- ships one (auto-bind — design §3.2 amendment). Skipped on
+            -- error results (clone failures / conflicts) so a failed clone
+            -- never clobbers the user's existing agent. The discovery runs
+            -- over the same WorkdirFs (wfs) the clone used, so local and
+            -- remote arms behave identically. Broadcast agent-defs-changed
+            -- so the frontend's Agent dropdown re-fetches and reflects the
+            -- new binding.
+            unless (orIsError r) $
+              autoBindRepoAgent wfs paths sid
+            broadcastAgentDefsChanged (sdBroker deps)
           else if opNm == "GIT_PUSH"
             then recordGitPushResult tHandle callOpName val r (Just "web")
             else recordSkillLoadResult tHandle callOpName val r (Just "web")
@@ -850,12 +865,12 @@ unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
 unwrapOptMaybe = maybe Nothing
 
 -- | Build the 'AgentStartWiring' for a web turn. Closes over the per-turn
--- 'SendDeps' + parent session id + 'ChannelCaps' + 'UntrustedIO' + 'Env' +
+-- 'SendDeps' + parent session id + 'ChannelCaps' + 'UIOEnv' + 'Env' +
 -- loaded config + wsRoot + operatorCeiling.
 webStartWiring
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> Backends -> AgentStartWiring
-webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
+webStartWiring deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel sessionBackends =
   AgentStartWiring
     { aswDefBackend = bAgentDefs sessionBackends
     , aswRuntime = bRuntime (sdBackends deps)
@@ -866,7 +881,7 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
     , aswParentActivity = Just (bParentActivity (sdBackends deps))
     , aswMintSession = webMintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = webMkWorker deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operatorCeiling channel
+    , aswWorker = webMkWorker deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel
     }
 
 -- | The AGENT_START worker-builder for the web channel. Mirrors the CLI's
@@ -878,21 +893,18 @@ webStartWiring deps paths parentSid caps untrustedIO appEnv eCfg wsRoot operator
 -- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
 -- IORef; the worker reads it after the run and returns it as the summary.
 webMkWorker
-  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UntrustedIO -> Env
+  :: SendDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
   -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text
   -> AgentWorkerBuilder
-webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operatorCeiling channel =
+webMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorCeiling channel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = paths
     , dwdParentSid = parentSid
     , dwdAppEnv = appEnv
-    , dwdMkUntrustedIO = \childSid -> do
-        eChildWd <- ensureSessionWorkdir paths childSid
-        let childWsRoot = case eChildWd of
-              Right wd -> WorkspaceRoot wd
-              Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+    , dwdMkUIOEnv = \childSid -> do
+        childCloneDeps <- mkCloneDepsFromSend deps
         eSecCfg <- loadSecurityConfig (securityFilePath paths)
-        pure (either (const mkRemoteUntrustedIOStub) (untrustedIOFromSecurity childWsRoot) eSecCfg)
+        seUIOEnv <$> either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
     , dwdAutonomy = sdAutonomy deps
     , dwdApprovals = sdApprovals deps
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -932,11 +944,10 @@ webMkWorker deps paths parentSid _caps _untrustedIO appEnv eCfg _wsRoot operator
         then injectAvailableSkills (bSkills (sdBackends deps)) withAutoload
         else pure withAutoload
     buildChildRegistry _def childSid childCaps = do
-      eChildWd <- ensureSessionWorkdir paths childSid
       childCloneDeps <- mkCloneDepsFromSend deps
-      let childWsRoot = case eChildWd of
-            Right wd -> WorkspaceRoot wd
-            Left _err -> WorkspaceRoot "/nonexistent-workdir-fail-closed"
+      eSecCfg <- loadSecurityConfig (securityFilePath paths)
+      childExec <- either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
+      let childWsRoot = seWorkspaceRoot childExec
       let childBaseOps =
             [ showHumanOp childCaps
             , askHumanOp childCaps

@@ -23,6 +23,7 @@ import Test.Hspec
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Server (gatewayApp)
@@ -97,6 +98,8 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
     , adWsPort = 8081
+    , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
         app = gatewayApp deps Nothing
@@ -152,6 +155,8 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
     , adWsPort = 8081
+    , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
           }
         app = gatewayApp deps Nothing

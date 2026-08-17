@@ -32,7 +32,6 @@ module Seal.ISA.Ops.Git
   , runGitRemote
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.KeyMap qualified as KM
@@ -54,10 +53,12 @@ import Seal.SourceControl.Repo
   , repoCredentialKindText, RepoRegistry (..) )
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
-import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedErr, UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecGitEnv )
+import Seal.Tools.Exec.UIO
+  ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
+import Seal.Tools.Exec.UntrustedIO (UntrustedErr, UntrustedIO)
+import Seal.Tools.Exec.UntrustedIO qualified as UIORec
+  (UntrustedIO (uioShellExec, uioShellExecGitEnv))
 import Seal.Tools.Exec.Types (mkRemotePath)
-import Seal.Types.App (App)
 
 ----------------------------------------------------------------------------
 -- Opcode constructors
@@ -100,7 +101,7 @@ mkGitOp deps _wsRoot autonomy opNm gitVerb = UntrustedOpcode
         Just _ -> case autonomy of
           Deny -> Left (opNameText opNm <> " denied by autonomy policy")
           _   -> Right ()
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let mWorkdir = workdirField v
           mRefspec = refspecField v
           recorded = object
@@ -110,7 +111,7 @@ mkGitOp deps _wsRoot autonomy opNm gitVerb = UntrustedOpcode
       case mWorkdir of
         Nothing -> pure (OpResult
           [TrpText (opNameText opNm <> " requires {workdir:string}")] True recorded)
-        Just workdir -> runGitRemote deps uio opNm gitVerb workdir mRefspec recorded
+        Just workdir -> runGitRemote deps opNm gitVerb workdir mRefspec recorded
   }
 
 opNameText :: OpName -> Text
@@ -162,17 +163,18 @@ refspecField v = case parseMaybe (withObject "in" (.:? "refspec")) v of
 -- with the resolved env, and stashes @credential_kind@ + outcome in
 -- 'orRecorded' (secret-free — for GIT_PUSH audit).
 runGitRemote
-  :: CloneDeps -> UntrustedIO -> OpName -> Text -> Text -> Maybe Text -> Value
-  -> App OpResult
-runGitRemote deps uio opNm gitVerb workdir mRefspec recorded = do
+  :: CloneDeps -> OpName -> Text -> Text -> Maybe Text -> Value
+  -> UIO OpResult
+runGitRemote deps opNm gitVerb workdir mRefspec recorded = do
+  uio <- uioUntrustedIO
   -- 1. Resolve the origin URL via the SSH executor (the single
   --    no-trust-the-sandbox path).
-  eOrigin <- liftIO (resolveOriginUrl uio workdir)
+  eOrigin <- uioLiftIO (resolveOriginUrl uio workdir)
   case eOrigin of
     Left err -> pure (mkErr opNm ("could not read origin URL: " <> err) recorded)
     Right originUrl -> do
       -- 2. Look up the origin URL in the registry.
-      eRepos <- liftIO (rrhList (cdRepoReg deps))
+      eRepos <- uioLiftIO (rrhList (cdRepoReg deps))
       let mRepo = case eRepos of
             Right repos -> lookupRepoByUrl originUrl
                                (RepoRegistry (Map.fromList [(srId r, r) | r <- repos]))
@@ -184,13 +186,13 @@ runGitRemote deps uio opNm gitVerb workdir mRefspec recorded = do
           recorded)
         Just repo -> do
           -- 3. Resolve the credential via the no-disk seam.
-          eTarget <- liftIO (resolveCloneTarget deps repo)
+          eTarget <- uioLiftIO (resolveCloneTarget deps repo)
           case eTarget of
             Left err -> pure (mkErr opNm (renderCloneError err) recorded)
             Right target -> do
               -- 4. Run the git command with the resolved env.
               let credKind = repoCredentialKindText (srCredential repo)
-              eRes <- liftIO (withCloneTarget target $ \env ->
+              eRes <- uioLiftIO (withCloneTarget target $ \env ->
                 runGitCommand uio env gitVerb workdir mRefspec)
               case eRes of
                 Left err -> pure (mkErr opNm (renderUntrustedErr err)
@@ -211,7 +213,7 @@ resolveOriginUrl uio workdir = do
         Right rp -> Just rp
         Left _   -> Nothing
       cmd = "git config --get remote.origin.url"
-  res <- uioShellExec uio (shellCmd cmd) mCwdPath
+  res <- UIORec.uioShellExec uio (shellCmd cmd) mCwdPath
   pure $ case res of
     Left err -> Left (renderUntrustedErr err)
     Right out
@@ -231,7 +233,7 @@ runGitCommand uio env gitVerb workdir mRefspec = do
       gitConfigArgs = T.unwords (ceGitConfigArgs env)
       refspecArg = maybe "" (\r -> " " <> shellQ r) mRefspec
       cmd = T.strip ("git " <> gitConfigArgs <> " " <> gitVerb <> refspecArg)
-  uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cmd) mCwdPath
+  UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cmd) mCwdPath
 
 ----------------------------------------------------------------------------
 -- Helpers

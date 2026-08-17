@@ -1,7 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.FileSpec (spec) where
-
-import Data.Aeson (object, (.=))
+import Control.Monad.IO.Class (liftIO)
+import Data.Maybe (fromMaybe)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Data.Aeson (Value, object, (.=))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
@@ -23,6 +27,11 @@ import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
 
+-- | Local replacement for the removed uoRunLegacy: runs the opcode's uoRun
+-- in a UIOEnv built from the UntrustedIO + optional CloneDeps.
+runOp :: UntrustedIO -> Maybe CloneDeps -> Opcode -> Value -> App OpResult
+runOp uio mDeps op input =
+  liftIO (runUIOWithEnv (mkTestUIOEnv uio (fromMaybe stubCloneDeps mDeps)) (uoRun op input))
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
@@ -38,7 +47,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("a.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("a.txt" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "hello\n\n[lines 1-1 of 1 (end of file)]"]
 
@@ -46,7 +55,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("a.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("a.txt" :: String)]))
       orRecorded r `shouldBe` object
         [ "path" .= ("a.txt" :: String)
         , "offset" .= (0 :: Int)
@@ -60,7 +69,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "p.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("p.txt" :: String)
               , "offset" .= (5 :: Int)
               , "limit" .= (3 :: Int)
@@ -80,7 +89,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "offset" .= ("oops" :: String)
               , "limit" .= (2.5 :: Double)
@@ -98,7 +107,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "offset" .= (-5 :: Int)
               ]))
@@ -121,7 +130,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "p.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("p.txt" :: String)
               , "offset" .= ("5" :: String)
               , "limit" .= (3 :: Int)
@@ -143,7 +152,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "p.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("p.txt" :: String)
               , "limit" .= ("3" :: String)
               ]))
@@ -161,7 +170,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "max_scan_bytes" .= ("16" :: String)
               ]))
@@ -177,7 +186,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "offset" .= ("banana" :: String)
               ]))
@@ -196,7 +205,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
       let body = BS.concat (replicate 10 "x\n")
       BS.writeFile (root </> "r.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("r.txt" :: String)
               , "max_scan_bytes" .= (5 :: Int)
               ]))
@@ -220,7 +229,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
       BS.writeFile (root </> "a.txt") "hello"
       -- Operator ceiling = 32 (small); model requests 999999 -> clamps to 32.
       let op = fileReadOp (WorkspaceRoot root) 32
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "max_scan_bytes" .= (999999 :: Int)
               ]))
@@ -236,7 +245,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello"
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("a.txt" :: String)
               , "max_scan_bytes" .= (0 :: Int)
               ]))
@@ -255,7 +264,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "big.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("big.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("big.txt" :: String)]))
       orIsError r `shouldBe` False
       case orParts r of
         [TrpText out] -> do
@@ -272,27 +281,27 @@ spec = describe "Seal.ISA.Ops.File" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "empty.txt") ""
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("empty.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("empty.txt" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "[empty file (0 lines)]"]
 
   it "rejects a traversal escape with an error result (no read)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("../escape" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("../escape" :: String)]))
       orIsError r `shouldBe` True
 
   it "returns an error for a nonexistent file" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("nonexistent.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("nonexistent.txt" :: String)]))
       orIsError r `shouldBe` True
 
   it "returns an error result when the path is a directory (IOError caught)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       createDirectory (root </> "adir")
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("adir" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("adir" :: String)]))
       orIsError r `shouldBe` True
 
   -- Character ceiling: files exceeding ~100K chars are rejected outright
@@ -307,7 +316,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "big.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object ["path" .= ("big.txt" :: String)]))
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object ["path" .= ("big.txt" :: String)]))
       orIsError r `shouldBe` True
       case orParts r of
         [TrpText msg] -> do
@@ -322,7 +331,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "big.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("big.txt" :: String)
               , "limit" .= (10 :: Int)
               ]))
@@ -337,7 +346,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
           body = unlinesStr ls
       BS.writeFile (root </> "big.txt") body
       let op = fileReadOp (WorkspaceRoot root) maxScanBytes
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
               [ "path" .= ("big.txt" :: String)
               , "offset" .= (10 :: Int)
               , "limit" .= (10 :: Int)
@@ -349,7 +358,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     it "writes content to a file inside the workspace" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("out.txt" :: String)
           , "content" .= ("hello world" :: String)
           ]))
@@ -361,7 +370,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
       withSystemTempDirectory "seal-ws" $ \root -> do
         BS.writeFile (root </> "out.txt") "first "
         let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("out.txt" :: String)
           , "content" .= ("second" :: String)
           , "mode" .= ("append" :: String)
@@ -373,7 +382,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     it "orRecorded captures path + mode + byte count (not the content)" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("out.txt" :: String)
           , "content" .= ("hi" :: String)
           ]))
@@ -386,7 +395,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     it "rejects a path traversal escape (no write)" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         let op = fileWriteOp (WorkspaceRoot root) maxWriteBytes
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("../escape.txt" :: String)
           , "content" .= ("bad" :: String)
           ]))
@@ -395,7 +404,7 @@ spec = describe "Seal.ISA.Ops.File" $ do
     it "rejects oversized content (bounded write)" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         let op = fileWriteOp (WorkspaceRoot root) 5  -- max 5 bytes
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("big.txt" :: String)
           , "content" .= ("this is way too long" :: String)
           ]))

@@ -8,6 +8,16 @@
 -- The git repo is the versioning + audit layer; model-authored writes
 -- (@SKILL_CREATE@ \/ @SKILL_UPDATE@, which are Trusted file writes) auto-commit.
 -- Human file-drops are committed by the human via @git -C ~/.seal/config@.
+--
+-- The /workdir-scoped/ discovery backend (for @.skills\/@ discovery from
+-- cloned repos) operates over the 'WorkdirFs' handle via
+-- 'workdirSkillBackendFs' (§3.6) — every workspace read goes through the
+-- single SafePath-confined chokepoint. The user store
+-- ('markdownSkillBackend', the @~\/.seal\/config\/skills\/@ reads) stays
+-- local-FS (§3.9): it constructs a local-arm 'WorkdirFs' ('userDirFs') so
+-- the read helpers share the single confined code path while remaining
+-- local-FS. Writes ('writeSkill'\/'deleteSkill') are local-FS by design
+-- (the user store is the model's write target).
 module Seal.Skills.Backend
   ( SkillBackend (..)
   , noneBackend
@@ -22,7 +32,8 @@ module Seal.Skills.Backend
   , decodeAgentSkill
   , prefixWorkdirSkill
   ) where
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, (<=<))
+import Data.Either (fromRight)
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -35,17 +46,21 @@ import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
 import System.Directory
-  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , listDirectory, removeFile, renameFile )
+  ( createDirectoryIfMissing, doesFileExist
+  , removeFile, renameFile )
 import System.FilePath (takeDirectory, (</>), (<.>))
 import System.Posix.Files (setFileMode)
 
 import Seal.Core.Types (mkSystemSessionId)
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Skills.Codec (decodeSkill, encodeSkill)
 import Seal.Skills.Builtins (builtinSkillMap)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Store.Markdown (decodeDoc, fmLookup)
+import Seal.Text.LineFile (maxScanBytes)
+import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
+import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..), mkLocalWorkdirFs)
 data SkillBackend = SkillBackend
   { sbCreate :: Skill -> IO ()
   -- ^ Insert or replace a skill by id (writes the file + auto-commits).
@@ -129,6 +144,15 @@ unionSkillBackend user = SkillBackend
 workdirSkillConventions :: [FilePath]
 workdirSkillConventions = [ ".skills", ".agents/skills", ".seal/skills", ".claude/skills", "agents/skills" ]
 
+-- | A local 'WorkdirFs' anchored at the user store's skills directory. The
+-- read helpers ('listTopLevelSkills', 'listGroupedSkills', 'readAndStampGroup',
+-- 'listSubdirs') operate over 'WorkdirFs'; the user store constructs a
+-- local-arm 'WorkdirFs' at its @dir@ so the reads share the single confined
+-- code path (§3.6) while remaining local-FS (§3.9). Mirrors
+-- 'Seal.Agent.Def.Backend.userDirFs'.
+userDirFs :: FilePath -> WorkdirFs
+userDirFs dir = mkLocalWorkdirFs (WorkspaceRoot dir) maxScanBytes
+
 -- | A read-only 'SkillBackend' that scans a session workdir for skills
 -- shipped by cloned repositories. For each top-level directory in the
 -- workdir (a cloned repo), it checks the conventional skill locations
@@ -149,58 +173,69 @@ workdirSkillConventions = [ ".skills", ".agents/skills", ".seal/skills", ".claud
 -- Within-workdir collisions (two repos ship a skill with the same id):
 -- the alphabetically-first repo wins (deterministic; the operator can
 -- control precedence by renaming a repo clone directory).
-workdirSkillBackend :: FilePath -> IO SkillBackend
-workdirSkillBackend workdir = pure SkillBackend
+--
+-- Every workspace read goes through the 'WorkdirFs' handle (symlink-escape
+-- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
+-- 'maxScanBytes'.
+workdirSkillBackend :: WorkdirFs -> IO SkillBackend
+workdirSkillBackend fs = pure SkillBackend
     { sbCreate = \_ -> pure ()
     , sbRead   = \sid -> do
-        skills <- listWorkdirSkills workdir
+        skills <- listWorkdirSkills fs
         pure (Map.lookup sid (Map.fromList [(skId s, s) | s <- skills]))
-    , sbList   = listWorkdirSkills workdir
+    , sbList   = listWorkdirSkills fs
     , sbUpdate = \_ -> pure ()
     , sbDelete = \_ -> pure ()
     }
 
 -- | Enumerate every skill found under the conventional locations across
--- all top-level directories (cloned repos) in @workdir@. The
--- alphabetically-first repo wins on id collisions (deterministic). Missing
--- @workdir@ or empty workdirs yield @[]@.
+-- all top-level directories (cloned repos) in the workdir anchored at the
+-- 'WorkdirFs'. The alphabetically-first repo wins on id collisions
+-- (deterministic). Missing or empty workdirs yield @[]@.
 --
 -- For the @.skills@ and @.agents\/skills@ conventions, skills are loaded from the agentskills.io
 -- directory format (each subdirectory contains a @SKILL.md@). For the
 -- other conventions, skills are loaded from Seal's native flat/grouped
 -- @.md@ layout.
-listWorkdirSkills :: FilePath -> IO [Skill]
-listWorkdirSkills workdir = do
-  exists <- doesDirectoryExist workdir
+listWorkdirSkills :: WorkdirFs -> IO [Skill]
+listWorkdirSkills fs = do
+  exists <- wfsDoesDirectoryExist fs =<< rpOrDie "."
   if not exists
     then pure []
     else do
-      dirs <- listSubdirs workdir
+      eDirs <- wfsListDirectory fs =<< rpOrDie "."
+      let dirs = visibleSubdirs (fromRight [] eDirs)
       perRepo <- forM dirs $ \repo -> do
-        let repoDir = workdir </> repo
         raw <- concat <$> forM workdirSkillConventions (\conv -> do
-          let convDir = repoDir </> conv
-          cExists <- doesDirectoryExist convDir
+          let convRp = repo <> "/" <> T.pack conv
+          cExists <- wfsDoesDirectoryExist fs =<< rpOrDie convRp
           if not cExists
             then pure []
             else if conv `elem` [".skills", ".agents/skills"]
                    then do
                      -- agentskills.io format: subdirectories with SKILL.md
-                     agentSkills <- listAgentSkillsDir convDir
+                     let subFs = reanchorFs fs convRp
+                     agentSkills <- listAgentSkillsDir subFs
                      pure (catMaybes agentSkills)
                    else do
                      -- Seal native format: flat/grouped .md files
-                     x <- listTopLevelSkills convDir
-                     y <- listGroupedSkills convDir
+                     let subFs = reanchorFs fs convRp
+                     x <- listTopLevelSkills subFs
+                     y <- listGroupedSkills subFs
                      pure (catMaybes (x ++ y)))
         -- Stamp each repo-local skill with a group derived from the repo
         -- directory name so the <available_skills> catalog groups them
         -- under a "<repo> project skills" heading.
-        pure (mapMaybe (prefixWorkdirSkill (T.pack repo) . stampProjectGroup (T.pack repo)) raw)
+        pure (mapMaybe (prefixWorkdirSkill repo . stampProjectGroup repo) raw)
       let merge m [] = m
           merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
           merged = merge Map.empty (concat perRepo)
       pure (Map.elems merged)
+
+-- | The visible (non-hidden) immediate subdirectory names from a
+-- 'wfsListDirectory' listing, sorted for deterministic output.
+visibleSubdirs :: [Text] -> [Text]
+visibleSubdirs = sortOn id . filter (not . T.isPrefixOf ".")
 
 -- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
 -- so the @\<available_skills\>@ catalog groups them under a per-repo
@@ -304,49 +339,48 @@ writeSkill root repo s = do
 -- filled from the directory when the frontmatter omitted it (the common
 -- case), so a grouped file reads back as grouped regardless of whether its
 -- frontmatter redundantly declares a group.
+--
+-- The reads go through the 'WorkdirFs' handle (via 'userDirFs') so they
+-- share the single confined code path (§3.6) while remaining local-FS.
 readSkill :: FilePath -> SkillId -> IO (Maybe Skill)
 readSkill root sid = do
-  groups <- listSubdirs root
-  found <- firstMatchM [ readAndStampGroup root (g </> base) (Just (T.pack g))
+  let fs = userDirFs root
+      base = skillIdText sid <> ".md"
+  groups <- listSubdirs fs
+  found <- firstMatchM [ readAndStampGroup fs (g <> "/" <> base) (Just g)
                        | g <- groups ]
   case found of
     Just s  -> pure (Just s)
-    Nothing -> readAndStampGroup root base Nothing
-  where
-    base = T.unpack (skillIdText sid) <.> "md"
+    Nothing -> readAndStampGroup fs base Nothing
 
--- | Read a skill file at @root/rel@ and, if it decodes, fill in 'skGroup'
--- from the directory when the frontmatter omitted one. @mGroup@ is the
--- group implied by the file's location ('Nothing' for the flat layout).
-readAndStampGroup :: FilePath -> FilePath -> Maybe Text -> IO (Maybe Skill)
-readAndStampGroup root rel mGroup = do
-  let path = root </> rel
-  exists <- doesFileExist path
-  if not exists
-    then pure Nothing
-    else do
-      content <- TIO.readFile path
-      case decodeSkill content of
-        Nothing -> pure Nothing
-        Just s  -> pure (Just (stampGroup s))
+-- | Read a skill file at @\<anchor\>\/\<rel\>@ (via the 'WorkdirFs') and,
+-- if it decodes, fill in 'skGroup' from the directory when the frontmatter
+-- omitted one. @mGroup@ is the group implied by the file's location
+-- ('Nothing' for the flat layout). @rel@ is a relative 'RemotePath' under
+-- the 'WorkdirFs' anchor.
+readAndStampGroup :: WorkdirFs -> Text -> Maybe Text -> IO (Maybe Skill)
+readAndStampGroup fs rel mGroup = do
+  eContent <- wfsReadFile fs =<< rpOrDie rel
+  case eContent of
+    Left _ -> pure Nothing
+    Right content -> case decodeSkill content of
+      Nothing -> pure Nothing
+      Just s  -> pure (Just (stampGroup s))
   where
     stampGroup s = case skGroup s of
       Just _  -> s
       Nothing -> s { skGroup = mGroup }
 
--- | Enumerate the immediate subdirectories of @dir@ (non-recursive, no
--- hidden dirs), sorted for deterministic output.
-listSubdirs :: FilePath -> IO [FilePath]
-listSubdirs dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
-    else do
-      entries <- listDirectory dir
-      let visible = [e | e <- entries, not ("." `isPrefixOfStr` e)]
-      filterM' (doesDirectoryExist . (dir </>)) (sortOn id visible)
-  where
-    isPrefixOfStr p s = take (length p) s == p
+-- | Enumerate the immediate sub-directories of the 'WorkdirFs' anchor
+-- (non-recursive, no hidden dirs), sorted for deterministic output.
+-- Returns the visible sub-directory names as 'Text' (suitable for building
+-- relative 'RemotePath's). Missing anchor yields @[]@.
+listSubdirs :: WorkdirFs -> IO [Text]
+listSubdirs fs = do
+  eEntries <- wfsListDirectory fs =<< rpOrDie "."
+  let entries = fromRight [] eEntries
+      visible = [e | e <- entries, not (T.isPrefixOf "." e)]
+  filterM' (wfsDoesDirectoryExist fs <=< rpOrDie) (sortOn id visible)
 
 -- | Like 'Control.Monad.filterM' but without the import (kept local to
 -- avoid widening the module's import surface for one call site).
@@ -371,48 +405,57 @@ firstMatchM (a:as)   = do
 -- Malformed files are skipped (a partial write never breaks the list).
 -- Each skill's 'skGroup' is filled from its directory when the frontmatter
 -- omitted one. Results are sorted by id for deterministic output.
+--
+-- The reads go through the 'WorkdirFs' handle (via 'userDirFs') so they
+-- share the single confined code path (§3.6) while remaining local-FS.
 listSkills :: FilePath -> IO [Skill]
 listSkills dir = do
-  topLevels <- listTopLevelSkills dir
-  grouped   <- listGroupedSkills dir
+  let fs = userDirFs dir
+  topLevels <- listTopLevelSkills fs
+  grouped   <- listGroupedSkills fs
   pure (sortOn (skillIdText . skId) (catMaybes (topLevels ++ grouped)))
 
--- | Read the flat-layout skills: @.md@ files directly under @dir@. Returns
--- one 'Maybe Skill' per file (the outer list, not the inner Maybe, is the
--- collection; 'Nothing' marks a malformed file to be 'catMaybes'-filtered).
-listTopLevelSkills :: FilePath -> IO [Maybe Skill]
-listTopLevelSkills dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
-    else do
-      entries <- listDirectory dir
-      let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` T.pack e]
-      forM mdFiles $ \e -> readAndStampGroup dir e Nothing
+-- | Read the flat-layout skills: @.md@ files directly under the 'WorkdirFs'
+-- anchor. Returns one 'Maybe Skill' per file (the outer list, not the inner
+-- Maybe, is the collection; 'Nothing' marks a malformed file to be
+-- 'catMaybes'-filtered).
+listTopLevelSkills :: WorkdirFs -> IO [Maybe Skill]
+listTopLevelSkills fs = do
+  eEntries <- wfsListDirectory fs =<< rpOrDie "."
+  let entries = fromRight [] eEntries
+      mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` e]
+  forM mdFiles $ \e -> readAndStampGroup fs e Nothing
 
 -- | Read the grouped-layout skills: for each subdirectory @g@, read the
 -- @.md@ files under @g/@ and stamp 'skGroup' = @Just g@ when the
 -- frontmatter omitted one. Results from all groups are concatenated.
-listGroupedSkills :: FilePath -> IO [Maybe Skill]
-listGroupedSkills dir = do
-  groups <- listSubdirs dir
+listGroupedSkills :: WorkdirFs -> IO [Maybe Skill]
+listGroupedSkills fs = do
+  groups <- listSubdirs fs
   results <- forM groups $ \g -> do
-    let gdir = dir </> g
-    entries <- listDirectory gdir
-    let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` T.pack e]
-    forM mdFiles $ \e -> readAndStampGroup dir (g </> e) (Just (T.pack g))
+    let subFs = reanchorFs fs g
+    eEntries <- wfsListDirectory subFs =<< rpOrDie "."
+    let entries = fromRight [] eEntries
+        mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` e]
+    forM mdFiles $ \e -> readAndStampGroup fs (g <> "/" <> e) (Just g)
   pure (concat results)
 
 -- | Delete one skill file and auto-commit. Idempotent (no-op if the file is
 -- absent). Searches both the grouped and flat layouts: a skill written
 -- under a group is deleted from its group directory; a flat-layout skill
 -- is deleted from the root. If a file exists in both, both are removed.
+--
+-- This is a user-store /write/ operation: it stays on local 'FilePath'
+-- ('removeFile', 'doesFileExist') — 'WorkdirFs' is a read-only discovery
+-- handle. The group enumeration ('listSubdirs') goes through the
+-- 'WorkdirFs' handle (via 'userDirFs') so the read path stays unified.
 deleteSkill :: FilePath -> ConfigRepo -> SkillId -> IO ()
 deleteSkill dir repo sid = do
-  groups <- listSubdirs dir
-  let groupedPaths = [ dir </> g </> base | g <- groups ]
+  let fs = userDirFs dir
+      base = T.unpack (skillIdText sid) <.> "md"
+  groups <- listSubdirs fs
+  let groupedPaths = [ dir </> T.unpack g </> base | g <- groups ]
       flatPath     = skillFile dir sid
-      base         = T.unpack (skillIdText sid) <.> "md"
   candidates <- filterM' doesFileExist (groupedPaths ++ [flatPath])
   forM_ candidates $ \path -> do
     removeFile path
@@ -434,27 +477,25 @@ deleteSkill dir repo sid = do
 ----------------------------------------------------------------------------
 
 -- | Enumerate skills in agentskills.io directory format: each subdirectory
--- of @dir@ contains a @SKILL.md@ file with YAML frontmatter (@name@,
--- @description@) + Markdown body. Returns one 'Maybe Skill' per
+-- of the 'WorkdirFs' anchor contains a @SKILL.md@ file with YAML frontmatter
+-- (@name@, @description@) + Markdown body. Returns one 'Maybe Skill' per
 -- subdirectory ('Nothing' for malformed/missing @SKILL.md@). The skill id
 -- is taken from the @name@ frontmatter field (which the spec requires to
 -- match the parent directory name). The skill group is set to 'Nothing'
 -- (agentskills.io has no group concept; the directory name IS the id).
-listAgentSkillsDir :: FilePath -> IO [Maybe Skill]
-listAgentSkillsDir dir = do
-  exists <- doesDirectoryExist dir
-  if not exists
-    then pure []
-    else do
-      subdirs <- listSubdirs dir
-      forM subdirs $ \subdir -> do
-        let skillMdPath = dir </> subdir </> "SKILL.md"
-        mdExists <- doesFileExist skillMdPath
-        if not mdExists
-          then pure Nothing
-          else do
-            content <- TIO.readFile skillMdPath
-            pure (decodeAgentSkill content)
+listAgentSkillsDir :: WorkdirFs -> IO [Maybe Skill]
+listAgentSkillsDir fs = do
+  subdirs <- listSubdirs fs
+  forM subdirs $ \subdir -> do
+    let subFs = reanchorFs fs subdir
+    mdExists <- wfsDoesFileExist subFs =<< rpOrDie "SKILL.md"
+    if not mdExists
+      then pure Nothing
+      else do
+        eContent <- wfsReadFile subFs =<< rpOrDie "SKILL.md"
+        case eContent of
+          Left _ -> pure Nothing
+          Right content -> pure (decodeAgentSkill content)
 
 -- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter
 -- uses @name@ (required, maps to 'skId') and @description@ (required, maps
@@ -479,3 +520,48 @@ decodeAgentSkill content =
         }
   where
     agentSkillEpoch = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)
+
+----------------------------------------------------------------------------
+-- WorkdirFs re-anchoring + RemotePath helpers (internal)
+----------------------------------------------------------------------------
+
+-- | Produce a 'WorkdirFs' "view" anchored at a sub-directory of the original
+-- anchor. Every 'wfs*' call on the re-anchored handle prepends @prefix@ to
+-- the supplied 'RemotePath'. Works for both the local and remote arms (no
+-- new constructor — pure record wrapper). The prefix is a relative path
+-- (e.g. @"my-repo\/.skills"@); the join uses @\/@ as the separator.
+-- (Mirrors 'Seal.Agent.Def.Workdir.reanchorFs'.)
+reanchorFs :: WorkdirFs -> Text -> WorkdirFs
+reanchorFs fs prefix = WorkdirFs
+  { wfsReadFile            = wfsReadFile fs            <=< joinRp prefix
+  , wfsDoesFileExist       = wfsDoesFileExist fs       <=< joinRp prefix
+  , wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs  <=< joinRp prefix
+  , wfsListDirectory       = wfsListDirectory fs       <=< joinRp prefix
+  , wfsFileSize            = wfsFileSize fs            <=< joinRp prefix
+  , wfsModificationTime    = wfsModificationTime fs    <=< joinRp prefix
+  }
+
+-- | Join a prefix and a (possibly @"\. "@) relative 'RemotePath' into a single
+-- 'RemotePath'. A @"\. "@ suffix collapses to the prefix (so re-anchoring at
+-- @"\. "@ is the identity). Crashes on invalid input — the prefix/suffix
+-- are internally generated from validated components, never user/LLM input.
+joinRp :: Text -> RemotePath -> IO RemotePath
+joinRp prefix rp' =
+  let suffix = getRemotePath rp'
+      joined
+        | T.null prefix            = suffix
+        | suffix == "."            = prefix
+        | T.isPrefixOf "./" suffix = prefix <> "/" <> T.drop 2 suffix
+        | otherwise                = prefix <> "/" <> suffix
+  in case mkRemotePath joined of
+       Right r  -> pure r
+       Left err -> error ("joinRp: invalid remote path: " <> T.unpack err
+                          <> ": " <> T.unpack joined)
+
+-- | Construct a 'RemotePath', crashing on invalid input. Used only for
+-- internally-generated, validated path components (never user/LLM input).
+rpOrDie :: Text -> IO RemotePath
+rpOrDie t = case mkRemotePath t of
+  Right r  -> pure r
+  Left err -> error ("rpOrDie: invalid remote path: " <> T.unpack err
+                     <> ": " <> T.unpack t)

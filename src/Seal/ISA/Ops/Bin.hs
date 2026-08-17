@@ -17,7 +17,6 @@ module Seal.ISA.Ops.Bin
   , binExecSchema
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
@@ -34,7 +33,7 @@ import Seal.Security.Path
   ( PathError (..), WorkspaceRoot (..), mkSafePathRemote )
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Tools.Args (mkBinName, mkBinArg)
-import Seal.Tools.Exec.UntrustedIO (renderUntrustedErr, uioBinExec)
+import Seal.Tools.Exec.UIO (renderUntrustedErr, uioBinExec)
 import Seal.Tools.Exec.Types (RemotePath, getRemotePath, mkRemotePath)
 
 -- | BIN_EXEC opcode. Input: @{ binary: BinName, args: [BinArg, ...],
@@ -69,7 +68,7 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
                      Right _   -> case traverse mkBinArg <$> mArgsText of
                                     Just (Left _err) -> Left "BIN_EXEC: invalid arg"
                                     _                -> authorizeCwd wsRoot v
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let mBin  = binaryField v
           mArgs = argsField v
           mCwd  = cwdField v
@@ -91,7 +90,7 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
                        Left _err ->
                          pure (OpResult [TrpText "BIN_EXEC: invalid cwd"] True recorded)
                        Right mCwdPath -> do
-                         res <- liftIO (uioBinExec uio bin args mCwdPath)
+                         res <- uioBinExec bin args mCwdPath
                          pure $ case res of
                            Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                            Right out -> OpResult [TrpText out] False recorded

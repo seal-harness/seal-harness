@@ -28,6 +28,11 @@ import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
+import qualified Seal.Tools.Exec.UIOSpec
+import qualified Seal.Tools.Exec.UIOParitySpec
+import qualified Seal.Tools.Exec.WorkdirFsSpec
+import qualified Seal.ISA.Ops.UIOUnrestrictedFailSpec
+import qualified Seal.ISA.Ops.UIOConstructionFailSpec
 import qualified Seal.Web.SearchSpec
 import qualified Seal.Web.FetchSpec
 import qualified Seal.Web.UrlSafetySpec
@@ -64,6 +69,7 @@ import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.SecuritySpec
 import qualified Seal.Config.SecurityScopingFailSpec
+import qualified Seal.CapabilityScopingWorkdirFsFailSpec
 import qualified Seal.Vault.BackendSpec
 import qualified Seal.Vault.CommandsSpec
 import qualified Seal.IngestSpec
@@ -105,9 +111,11 @@ import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Skills.BackendSpec
+import qualified Seal.Skills.BackendNoDirectFsFailSpec
 import qualified Seal.Skills.PromptSpec
 import qualified Seal.Agent.Def.TypesSpec
 import qualified Seal.Agent.Def.BackendSpec
+import qualified Seal.Agent.Def.BackendNoDirectFsFailSpec
 import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
@@ -181,6 +189,11 @@ main = hspec $ do
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Ssh.AgentSpec.spec
   Seal.Tools.Exec.CapabilityScopingFailSpec.spec
+  Seal.Tools.Exec.UIOSpec.spec
+  Seal.Tools.Exec.UIOParitySpec.spec
+  Seal.Tools.Exec.WorkdirFsSpec.spec
+  Seal.ISA.Ops.UIOUnrestrictedFailSpec.spec
+  Seal.ISA.Ops.UIOConstructionFailSpec.spec
   Seal.Web.SearchSpec.spec
   Seal.Web.FetchSpec.spec
   Seal.Web.UrlSafetySpec.spec
@@ -217,6 +230,7 @@ main = hspec $ do
   Seal.Config.MigrateSpec.spec
   Seal.Config.SecuritySpec.spec
   Seal.Config.SecurityScopingFailSpec.spec
+  Seal.CapabilityScopingWorkdirFsFailSpec.spec
   Seal.Vault.BackendSpec.spec
   Seal.Vault.CommandsSpec.spec
   Seal.IngestSpec.spec
@@ -261,6 +275,8 @@ main = hspec $ do
   Seal.Skills.PromptSpec.spec
   Seal.Agent.Def.TypesSpec.spec
   Seal.Agent.Def.BackendSpec.spec
+  Seal.Agent.Def.BackendNoDirectFsFailSpec.spec
+  Seal.Skills.BackendNoDirectFsFailSpec.spec
   Seal.Agent.PromptPartsSpec.spec
   Seal.Agent.Runtime.RegistrySpec.spec
   Seal.ISA.Ops.MemorySpec.spec

@@ -48,7 +48,6 @@ module Seal.ISA.Ops.Repo
   , cloneRepoIO
   ) where
 
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Char (isAlphaNum)
@@ -68,10 +67,12 @@ import Seal.SourceControl.Clone
 import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tools.Args (mkShellCommand, ShellCommand)
-import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO (..), renderUntrustedErr, uioShellExec, uioShellExecGitEnv )
+import Seal.Tools.Exec.UIO
+  ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Exec.UntrustedIO qualified as UIORec
+  (UntrustedIO (uioShellExec, uioShellExecGitEnv))
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
-import Seal.Types.App (App)
 
 -- | SETUP_REPO opcode. Input: @{url: Text}@. Authorize: autonomy must not
 -- be 'Deny' and the URL must validate ('validateRepoUrl'). Run: a shallow
@@ -92,14 +93,14 @@ setupRepoOp deps _wsRoot autonomy = UntrustedOpcode
           Right _ -> case autonomy of
             Deny -> Left "SETUP_REPO denied by autonomy policy"
             _   -> Right ()
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let mUrl = urlField v
           recorded = object [ "url" .= (mUrl :: Maybe Text) ]
       case mUrl of
         Nothing -> pure (OpResult [TrpText "SETUP_REPO requires {url:string}"] True recorded)
         Just url -> case validateRepoUrl url of
           Left err -> pure (OpResult [TrpText ("SETUP_REPO: invalid url: " <> err)] True recorded)
-          Right url' -> runSetupRepo deps uio url' recorded
+          Right url' -> runSetupRepo deps url' recorded
   }
 
 setupRepoSchema :: Value
@@ -213,7 +214,7 @@ cloneRepoIO deps uio url = do
       checkCmd = "if [ -d " <> shellQ repoName <> "/.git ]; then git -C "
                  <> shellQ repoName <> " config --get remote.origin.url; else rm -rf "
                  <> shellQ repoName <> "; echo __NONE__; fi"
-  checkRes <- uioShellExec uio (shellCmd checkCmd) mCwdPath
+  checkRes <- UIORec.uioShellExec uio (shellCmd checkCmd) mCwdPath
   case checkRes of
     Left err -> pure (CloneFailed ("idempotency check failed: " <> renderUntrustedErr err))
     Right existing -> do
@@ -250,7 +251,7 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
       let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
           cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
                      <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
-      cloneRes <- uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
+      cloneRes <- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
       case cloneRes of
         Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
         Right _out -> verifyClone uio repoName _out mCwdPath
@@ -259,7 +260,7 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
 cloneBareUrl :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult
 cloneBareUrl uio cleanUrl repoName mCwdPath = do
   let cloneCmd = "git clone --depth 1 -- " <> shellQ cleanUrl <> " " <> shellQ repoName
-  cloneRes <- uioShellExec uio (shellCmd cloneCmd) mCwdPath
+  cloneRes <- UIORec.uioShellExec uio (shellCmd cloneCmd) mCwdPath
   case cloneRes of
     Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
     Right _out -> verifyClone uio repoName _out mCwdPath
@@ -273,7 +274,7 @@ cloneBareUrl uio cleanUrl repoName mCwdPath = do
 verifyClone :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult
 verifyClone uio repoName cloneOut mCwdPath = do
   let verifyCmd = "test -d " <> shellQ repoName <> "/.git && echo __OK__ || echo __MISSING__"
-  vRes <- uioShellExec uio (shellCmd verifyCmd) mCwdPath
+  vRes <- UIORec.uioShellExec uio (shellCmd verifyCmd) mCwdPath
   case vRes of
     Left err -> pure (CloneFailed ("clone verify failed: " <> renderUntrustedErr err))
     Right vOut
@@ -284,9 +285,10 @@ verifyClone uio repoName cloneOut mCwdPath = do
 
 -- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
 -- 'cloneRepoIO' with the audit 'orRecorded' payload).
-runSetupRepo :: CloneDeps -> UntrustedIO -> Text -> Value -> App OpResult
-runSetupRepo deps uio url recorded = do
-  res <- liftIO (cloneRepoIO deps uio url)
+runSetupRepo :: CloneDeps -> Text -> Value -> UIO OpResult
+runSetupRepo deps url recorded = do
+  uio <- uioUntrustedIO
+  res <- uioLiftIO (cloneRepoIO deps uio url)
   pure $ case res of
     CloneCloned repoName ->
       OpResult [TrpText ("Cloned " <> T.strip url <> " into " <> repoName <> " (shallow).")]

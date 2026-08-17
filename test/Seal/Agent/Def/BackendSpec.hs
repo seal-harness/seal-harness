@@ -15,8 +15,11 @@ import Seal.Agent.Def.Backend
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText)
 import Seal.Core.Types (ModelId (..), OpName (..), mkSystemSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.Arbitrary ()
+import Seal.Text.LineFile (maxScanBytes)
+import Seal.Tools.Exec.WorkdirFs (mkLocalWorkdirFs)
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
@@ -173,7 +176,7 @@ spec = describe "Seal.Agent.Def.Backend" $ do
         createDirectoryIfMissing True zoeDir
         let big = T.replicate 1000 "x"
         TIO.writeFile (zoeDir </> "SOUL.md") big
-        out <- composeDirSystemPrompt zoeDir 100
+        out <- composeDirSystemPrompt (mkLocalWorkdirFs (WorkspaceRoot zoeDir) maxScanBytes) 100
         out `shouldSatisfy` ("[...truncated at 100 chars...]" `T.isInfixOf`)
         out `shouldSatisfy` ("--- SOUL ---" `T.isInfixOf`)
 
@@ -184,7 +187,7 @@ spec = describe "Seal.Agent.Def.Backend" $ do
         -- Write a 2MiB SOUL.md; only this file exists, so the composed
         -- prompt is empty (the section is skipped).
         TIO.writeFile (zoeDir </> "SOUL.md") (T.replicate (2 * 1024 * 1024) "x")
-        out <- composeDirSystemPrompt zoeDir defaultSectionCharLimit
+        out <- composeDirSystemPrompt (mkLocalWorkdirFs (WorkspaceRoot zoeDir) maxScanBytes) defaultSectionCharLimit
         T.null out `shouldBe` True
 
     it "flat file takes precedence over directory on conflict" $

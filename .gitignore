@@ -4,6 +4,7 @@ result
 *.swp
 dist-newstyle/
 .superpowers/
+.codegraph/
 # Frontend build artifacts
 node_modules
 frontend/dist/

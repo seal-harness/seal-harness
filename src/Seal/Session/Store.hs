@@ -19,10 +19,11 @@ module Seal.Session.Store
   , updateSessionAgent
   , updateSessionSystemOverride
   , updateSessionDescription
+  , autoBindRepoAgent
   , SessionRuntime (..)
   ) where
 
-import Control.Monad (filterM, forM, unless, when)
+import Control.Monad (filterM, forM, unless, void, when)
 import Data.Aeson (encode)
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef)
@@ -42,7 +43,7 @@ import System.IO
   ( hClose, openBinaryTempFile )
 import System.Posix.Files (setFileMode)
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..))
+import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
 import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
 import Seal.Config.Paths
@@ -51,6 +52,7 @@ import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModel)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
+import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
 import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The mutable active-session ref plus the paths the commands need.
@@ -354,3 +356,54 @@ parseAgentFileId content =
   in case fmLookup "id" fm of
        Just t | not (T.null (T.strip t)) -> Just (T.strip t)
        _                                 -> Nothing
+
+-- | After a successful SETUP_REPO, rebind the session's 'smAgent' to the
+-- cloned repo's project-level @.agents\/agents.md@ def (id
+-- @\<repo\>--agents-md@) when the repo ships one. This makes the repo's
+-- project instructions the effective system prompt on the next turn,
+-- superseding the @default_agent@ stamped at session creation.
+--
+-- The discovery runs over the 'WorkdirFs' handle (the single
+-- 'mkSessionExec'-constructed chokepoint), so the behavior is identical
+-- for @mode=local@ and @mode=remote@ — the workdir is scanned through the
+-- same handle in both arms, never via direct filesystem access.
+--
+-- /Idempotence / non-clobber/: the bind is skipped when the session's
+-- current 'smAgent' is already a repo-prefixed def (its id text contains
+-- the @"--"@ repo-prefix separator). So a user who has explicitly picked a
+-- repo agent (or another repo's agent) via the dropdown is left alone on a
+-- re-clone / subsequent SETUP_REPO. A session still on its creation-time
+-- @default_agent@ (e.g. @zoe@, which has no @"--"@) is rebound to the
+-- repo's @agents-md@; a session with no bound agent ('Nothing') is also
+-- rebound. Missing @session.json@, no @.agents\/agents.md@ in the workdir,
+-- or a discovery error → no-op (fail-closed, never throws).
+autoBindRepoAgent :: WorkdirFs -> SealPaths -> SessionId -> IO ()
+autoBindRepoAgent wfs paths sid = do
+  backend <- workdirAgentDefBackend wfs
+  defs <- adbList backend
+  case agentsMdDef defs of
+    Nothing      -> pure ()
+    Just agentsMdAid -> do
+      mMeta <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing -> pure ()
+        Just meta
+          | alreadyRepoBound (smAgent meta) -> pure ()
+          | otherwise -> void (updateSessionAgent paths sid (Just agentsMdAid))
+  where
+    -- The repo default is the prefixed agents-md def (e.g.
+    -- @my-repo--agents-md@). The prefix varies per repo, so match by the
+    -- @"--agents-md"@ suffix (same rule as 'handleSessionAgents' in the
+    -- gateway). Returns the first match (alphabetical repo order, matching
+    -- 'listWorkdirAgentDefs' determinism).
+    agentsMdDef ds =
+      case [ adId d | d <- ds, "--agents-md" `T.isSuffixOf` agentDefIdText (adId d) ] of
+        (aid:_) -> Just aid
+        []      -> Nothing
+    -- A def is repo-prefixed when its id text contains the @"--"@ separator
+    -- ('prefixWorkdirDef' uses @"--"@ between the repo dir name and the
+    -- def id). User-store ids never contain @"--"@ (they're single-segment
+    -- ids). This is a deliberate superset: any repo-prefixed binding counts
+    -- as "user already chose a repo agent" so we don't clobber it.
+    alreadyRepoBound Nothing = False
+    alreadyRepoBound (Just aid) = "--" `T.isInfixOf` agentDefIdText aid

@@ -1,14 +1,18 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.PatchSpec (spec) where
-
+import Control.Monad.IO.Class (liftIO)
+import Data.Maybe (fromMaybe)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
 import Data.Aeson (Value (..), object, (.=))
 import Data.ByteString qualified as BS
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.ISA.Opcode (OpResult (..), uoRun)
+import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun)
 import Seal.ISA.Ops.File (filePatchOp)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO, mkLocalUntrustedIO)
@@ -17,6 +21,11 @@ import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
 
+-- | Local replacement for the removed uoRunLegacy: runs the opcode's uoRun
+-- in a UIOEnv built from the UntrustedIO + optional CloneDeps.
+runOp :: UntrustedIO -> Maybe CloneDeps -> Opcode -> Value -> App OpResult
+runOp uio mDeps op input =
+  liftIO (runUIOWithEnv (mkTestUIOEnv uio (fromMaybe stubCloneDeps mDeps)) (uoRun op input))
 runTestApp :: App a -> IO a
 runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig; runApp env act
 
@@ -31,7 +40,7 @@ spec = describe "FILE_PATCH" $ do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+world!\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -49,7 +58,7 @@ spec = describe "FILE_PATCH" $ do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-hello\n+hi\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -62,7 +71,7 @@ spec = describe "FILE_PATCH" $ do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1 @@\n-hello\n-world\n+hi\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -75,7 +84,7 @@ spec = describe "FILE_PATCH" $ do
       BS.writeFile (root </> "a.txt") "hello\n"
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1,2 @@\n-hello\n+hi\n+world\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -88,7 +97,7 @@ spec = describe "FILE_PATCH" $ do
       BS.writeFile (root </> "a.txt") "line1\nline2\n"
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n line1\n-line2\n+line2!\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -100,7 +109,7 @@ spec = describe "FILE_PATCH" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- ../escape.txt\n+++ ../escape.txt\n@@ -1 +1 @@\n-a\n+b\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("../escape.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -110,7 +119,7 @@ spec = describe "FILE_PATCH" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+b\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("nonexistent.txt" :: String)
         , "patch" .= (diff :: String)
         ]))
@@ -120,7 +129,7 @@ spec = describe "FILE_PATCH" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       let op = filePatchOp (WorkspaceRoot root)
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+b\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "patch" .= (diff :: String)
         ]))
       orIsError r `shouldBe` True
@@ -133,7 +142,7 @@ spec = describe "FILE_PATCH" $ do
           -- patchField accepts 'diff' as a fallback alias so the model's first
           -- attempt succeeds without a round-trip through OPCODE_DESCRIBE.
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+world!\n"
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "diff" .= (diff :: String)
         ]))
@@ -145,7 +154,7 @@ spec = describe "FILE_PATCH" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
       let op = filePatchOp (WorkspaceRoot root)
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         ]))
       orIsError r `shouldBe` True
@@ -156,7 +165,7 @@ spec = describe "FILE_PATCH" $ do
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
       let op = filePatchOp (WorkspaceRoot root)
-      r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+      r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= ("" :: String)
         ]))
@@ -193,7 +202,7 @@ spec = describe "FILE_PATCH" $ do
               , "-l8"
               , "+l8!"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -218,7 +227,7 @@ spec = describe "FILE_PATCH" $ do
               , "-l8"
               , "+l8!"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -248,7 +257,7 @@ spec = describe "FILE_PATCH" $ do
               , "-world"
               , "+WORLD"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -268,7 +277,7 @@ spec = describe "FILE_PATCH" $ do
               , "-hello"
               , "+HELLO"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -298,7 +307,7 @@ spec = describe "FILE_PATCH" $ do
               , "-world"
               , "+WORLD"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -324,7 +333,7 @@ spec = describe "FILE_PATCH" $ do
               , "+appended1"
               , "+appended2"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -343,7 +352,7 @@ spec = describe "FILE_PATCH" $ do
               , "+first"
               , "+second"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
@@ -377,7 +386,7 @@ spec = describe "FILE_PATCH" $ do
               , "-target"
               , "+CHANGED"
               ]
-        r <- runTestApp (uoRun op (mkTestUio (WorkspaceRoot root)) (object
+        r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
           [ "path" .= ("a.txt" :: String)
           , "patch" .= (diff :: String)
           ]))
