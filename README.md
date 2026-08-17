@@ -391,6 +391,13 @@ echo "use flake" > .envrc
 direnv allow
 ```
 
+## TODO Management
+
+The project uses a [TODO.md](TODO.md) at the repo root as a navigation layer — one file showing roadmap progress, active work, and known issues by priority.
+
+- [**todo-manager agent**](.agents/agents/todo-manager/agent.md) — Full sync: reconcile with GitHub Issues, update roadmap phases, generate standup reports. Start a fresh session when TODO.md is stale or doesn't exist yet.
+- [**todo-md-maintenance skill**](.agents/skills/todo-md-maintenance/SKILL.md) — Lightweight edits: add an item, update a status, or check the list from any conversation context.
+
 ## License
 
 **FSL-1.1-MIT** (Functional Source License) — source-available with a
