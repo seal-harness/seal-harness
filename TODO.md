@@ -2,27 +2,6 @@
 
 ## Status: Pre-alpha → Public Launch
 
-## Roadmap
-
-Master roadmap: [`docs/superpowers/plans/2026-06-28-seal-harness-roadmap.md`](docs/superpowers/plans/2026-06-28-seal-harness-roadmap.md)
-
-- [x] **Phase 0** — Scaffolding
-- [x] **Phase 1** — Security foundation + Secret Vault
-- [~] **Phase 2** — Cross-channel foundation + Signal channel
-      ([2a design](docs/superpowers/plans/2026-07-06-phase-2a-cross-channel-types.md) ·
-      [2b design](docs/superpowers/plans/2026-07-06-phase-2b-signal-channel.md))
-- [x] **Phase 3** — ISA build-out: core Trusted opcodes (M1–M4 + Tools-Meta)
-- [ ] **Phase 4** — Untrusted opcode breadth + isolation
-      ([plan](docs/superpowers/plans/2026-07-07-phase-4-untrusted-opcodes.md))
-- [x] **Phase 5** — Audited evolutionary stores (Memory/Skills/Agents, git-backed)
-- [~] **Phase 6** — Harness + Tabs (text UI)
-      ([6a](docs/superpowers/plans/2026-07-06-phase-6a-harness-backend.md) done ·
-      [6b](docs/superpowers/plans/2026-07-06-phase-6b-harness-tabs.md) in progress)
-- [~] **Phase 7** — Web frontend
-      ([7a](docs/superpowers/plans/2026-07-06-phase-7a-web-frontend.md) done ·
-      [7b](docs/superpowers/plans/2026-07-07-phase-7b-full-frontend.md) in progress)
-- [ ] **Phase 8** — More channels (Telegram → CLI unify), Scheduler, MCP, remaining providers
-
 ## Active Work
 
 - [~] Tool-call timeout/abort/retry — [plan written](docs/superpowers/plans/2026-08-14-tool-call-timeout-abort-retry.md), ready to implement
@@ -68,12 +47,6 @@ Master roadmap: [`docs/superpowers/plans/2026-06-28-seal-harness-roadmap.md`](do
 
 ## Done
 
-- [x] Phase 0 — Scaffolding
-- [x] Phase 1 — Security foundation + Secret Vault
-- [x] Phase 3 — ISA build-out: core Trusted opcodes
-- [x] Phase 5 — Audited evolutionary stores (git-backed Markdown)
-- [x] Phase 6a — Harness backend (tmux seam, UUID registry, reconcile loop)
-- [x] Phase 7a — Gateway + WS broker + minimal chat shell
 - [x] Skills: available-skills catalog, SETUP_REPO opcode, static guidance (#71)
 - [x] Signal channel: auto-lock allow_from, link wizard QR, transport fixes (#72)
 - [x] Streaming: migrate Ollama provider + agent loop to streaming
