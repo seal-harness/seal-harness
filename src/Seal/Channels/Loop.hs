@@ -430,7 +430,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                     Just t  -> chSend h (renderCurrentTab t)
                     Nothing -> chSend h "no current tab"
                   loop h reg bgConvSid
-                Right Route.NewSession -> do
+                Right (Route.NewSession _args) -> do
                   _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
                   loop h reg bgConvSid
                 Right (Route.SlashCommand _) -> do

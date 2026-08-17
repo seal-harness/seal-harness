@@ -1,0 +1,17 @@
+warning: Git tree '/Users/zoe/tmp/seal-harness' is dirty
+Using saved setting for 'extra-substituters = https://cache.iog.io https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk= seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo=' from ~/.local/share/nix/trusted-settings.json.
+evaluation warning: Nixpkgs 26.05 will be the last release to support x86_64-darwin; see https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.05
+trace: WARNING: license "LicenseRef-FSL-1.1-MIT" not found
+Resolving dependencies...
+Build profile: -w ghc-9.12.4 -O1
+In order, the following will be built (use -v for more details):
+ - seal-harness-0.1.0.0 (lib) (configuration changed)
+Configuring library for seal-harness-0.1.0.0...
+Preprocessing library for seal-harness-0.1.0.0...
+Building library for seal-harness-0.1.0.0...
+[144 of 174] Compiling Seal.ISA.Dispatch ( src/Seal/ISA/Dispatch.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/ISA/Dispatch.o, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/ISA/Dispatch.dyn_o ) [Source file changed]
+[145 of 174] Compiling Seal.Command.Call ( src/Seal/Command/Call.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Command/Call.o, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Command/Call.dyn_o ) [Seal.ISA.Dispatch changed]
+[148 of 174] Compiling Seal.Agent.Loop  ( src/Seal/Agent/Loop.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Agent/Loop.o, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Agent/Loop.dyn_o ) [Seal.ISA.Dispatch changed]
+[163 of 174] Compiling Seal.Core.TurnEngine ( src/Seal/Core/TurnEngine.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Core/TurnEngine.o, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Core/TurnEngine.dyn_o ) [Source file changed]
+[172 of 174] Compiling Seal.Command.Serve ( src/Seal/Command/Serve.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Command/Serve.o, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/build/Seal/Command/Serve.dyn_o ) [Seal.ISA.Dispatch changed]

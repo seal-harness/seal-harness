@@ -294,7 +294,7 @@ handleSend deps sid rawText = do
               ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)
             triggerBroadcast deps
             pure r
-      Right NewSession -> do
+      Right (NewSession _args) -> do
         r <- runSlash deps meta rawText
         case r of
           SendError _ _ -> pure r

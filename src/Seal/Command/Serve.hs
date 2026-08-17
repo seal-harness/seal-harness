@@ -40,7 +40,7 @@ import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Repo (RepoTestSeam (..), repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
-import Seal.Gateway.Send (SendDeps (..))
+import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
@@ -57,7 +57,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
-import Seal.Handles.Tab (mkTabIndex)
+import Seal.Handles.Tab (mkTabIndex, TabKind(..))
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Registry (configuredProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -72,7 +72,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Signal.Config (resolveSignalConfig)
-import Seal.Tabs (newPersistingTabsHandle, rebindTabH, seedTabsHandle, snapshotTabs)
+import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -180,25 +180,23 @@ runServeMain autonomy logger = do
              , srActive     = activeRef
              }
       -- The /new command for the web: mints a fresh session, swaps srActive,
-      -- rebinds the tab (if any) bound to the old sid to the new sid, and
-      -- returns the old sid. Mirrors the CLI's ndRebind.
+      -- inserts a new tab into the TabsHandle, swaps srActive to the new
+      -- session, and returns the old sid. When -r/--repo is given, the
+      -- repo is cloned via SETUP_REPO (same as the web "Set up repo").
       newDeps = NewDeps
         { ndPaths = paths
         , ndCfg = loadCfg
         , ndAgentDefs = backends
         , ndChannelLabel = "web"
         , ndOldMeta = readIORef activeRef
-        , ndRebind = \_caps newMeta -> do
+        , ndInsertTab = \_caps newMeta -> do
             oldMeta <- readIORef activeRef
             let oldSid = smId oldMeta
-            snap <- snapshotTabs tabsH
-            case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-              []       -> pure ()
-              (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
-                Left _  -> pure ()  -- best-effort; the swap still happens
-                Right _ -> pure ()
+            _ <- insertTabH tabsH (BoundSession (smId newMeta)) KindProvider Nothing
             writeIORef activeRef newMeta
             pure oldSid
+        , ndSetupRepo = Just (handleSetupRepo sendDeps)
+        , ndRepoReg = Just repoRegH
         }
       -- The slash-command registry mirrors the TUI's. Web slash commands are
       -- best-effort: interactive-only specs (which prompt via ccPrompt) are
