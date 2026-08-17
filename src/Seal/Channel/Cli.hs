@@ -742,7 +742,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
                   case lookupByRef tl (BoundSession (smId active)) of
                     Just t  -> ccSend caps (renderTab t)
                     Nothing -> ccSend caps "no current tab"
-                Right Seal.Routing.Route.NewSession -> do
+                Right (Seal.Routing.Route.NewSession _args) -> do
                   -- /new is registered as a CommandSpec in the registry
                   -- (the CLI tracks "current" via srActive, not a cursor),
                   -- so re-route to the registry path below. Falling

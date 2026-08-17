@@ -1,9 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The Layer-1 terse-grammar routing front-end. @\/N@ switches focus to
 -- tab N, @\/N payload@ injects into tab N, a bare @\/tab@ shows the current
--- tab, @\/<other>…@ is deferred to the @\/@-command registry (including
--- @\/tab \u003csubcommand\u003e@), anything else is plain text to the focused
--- tab. The grammar is a first-class synopsis entry in @\/help@ so it's
+-- tab, @\/new [args]@ starts a new tab with a fresh session, @\/<other>…@
+-- is deferred to the @\/@-command registry (including @\/tab
+-- \u003csubcommand\u003e@), anything else is plain text to the focused tab.
+-- The grammar is a first-class synopsis entry in @\/help@ so it's
 -- discoverable.
 module Seal.Routing.Route
   ( ParseError (..)
@@ -33,7 +34,10 @@ data RoutingDecision
                                    --   this variant is kept for future
                                    --   Layer-1 tab-command routing)
   | CurrentTab                     -- ^ bare /tab — show the current tab
-  | NewSession                     -- ^ /new — start a fresh session in the current tab
+  | NewSession Text                -- ^ /new [args] — start a new tab with a
+                                   --   fresh session. The carried 'Text' is
+                                   --   the raw argument string (everything
+                                   --   after @/new @), empty when bare.
   | SlashCommand Text              -- ^ other /commands (deferred to the registry)
   deriving stock (Eq, Show)
 
@@ -43,7 +47,9 @@ data RoutingDecision
 --                   or followed by a space)
 -- * @\/N payload@  -> 'Inject' N payload
 -- * @\/tab@        -> 'CurrentTab' (show the current tab)
--- * @\/new@        -> 'NewSession' (start a fresh session in the current tab)
+-- * @\/new [args]@ -> 'NewSession' (start a new tab with a fresh session;
+--                   @args@ is the raw text after @/new @, carried for the
+--                   handler to parse optional @-p@\/@-m@\/@-r@ flags)
 -- * @\/<other>…@   -> 'SlashCommand' (deferred to the registry — this is
 --                   multi-char commands like @\/vault@, @\/help@, @\/ping@,
 --                   and @\/tab <subcommand>@)
@@ -70,11 +76,19 @@ route t
                | rest == "tab" ->
                   Right CurrentTab
                | rest == "new" || T.isPrefixOf "new " rest ->
-                  Right NewSession
+                  Right (NewSession (stripNewPrefix rest))
                | otherwise ->
                   Right (SlashCommand rest)
   where
     isTabChar c = isDigit c || isAsciiLower c
+
+-- | Extract the argument text from the @new@ prefix. @\"new\"@ yields
+-- @\"\"@; @\"new -p anthropic\"@ yields @\"-p anthropic\"@.
+stripNewPrefix :: Text -> Text
+stripNewPrefix rest =
+  if rest == "new"
+    then ""
+    else T.drop 1 (snd (T.breakOn " " rest))  -- everything after the first space
 
 -- | Given a valid tab index + the text after it: if the rest is empty (or
 -- whitespace-only), it's a Focus; otherwise it's an Inject (the payload is
