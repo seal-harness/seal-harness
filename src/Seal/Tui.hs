@@ -140,12 +140,14 @@ runTui autonomy logger = do
   -- routes through askHuman, and the CLI loop delivers the next input line
   -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
   askReply <- newAskReplyStore 0
+  repoReg <- mkRepoRegistryHandle (reposFilePath paths)
   -- The /new command: mints a fresh session and inserts a new tab into
   -- the TabsHandle. The ndInsertTab closure reads the old sid from
   -- srActive BEFORE swapping, inserts a new tab bound to the new session,
   -- then writes the new meta to srActive, and returns the old sid so the
   -- confirmation line can name it. No repo setup in the standalone CLI
-  -- (no dispatcher wired).
+  -- (no dispatcher wired). The repo registry is wired so @-r@ can resolve
+  -- registered repo IDs to URLs.
   let newDeps = NewDeps
         { ndPaths = paths
         , ndCfg = pure cfg
@@ -159,8 +161,8 @@ runTui autonomy logger = do
             writeIORef activeRef newMeta
             pure oldSid
         , ndSetupRepo = Nothing
+        , ndRepoReg = Just repoReg
         }
-  repoReg <- mkRepoRegistryHandle (reposFilePath paths)
   let registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr

@@ -10,6 +10,11 @@
 -- new session's workdir via SETUP_REPO before the first turn (same as
 -- the web form's "Set up repo" field).
 --
+-- The @-r@\/@--repo@ argument accepts either a registered repo ID (looked
+-- up in the repo registry @repos.toml@) or a raw git URL. When a registered
+-- ID is found, the registered URL is used for the clone. When no ID
+-- matches, the value is treated as a raw URL.
+--
 -- == Channel wiring
 --
 -- The command is registered as a 'CommandSpec' for the CLI and web-gateway
@@ -26,9 +31,10 @@ module Seal.Command.New
   , NewArgs (..)
   , parseNewArgs
   , emptyNewArgs
+  , resolveRepoUrl
   ) where
 
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -46,6 +52,8 @@ import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
+import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
 -- | Optional arguments for @/new@. All fields are 'Maybe' — 'Nothing' means
 -- "use the config default" (for provider/model) or "no repo" (for repo).
@@ -81,6 +89,23 @@ parseNewArgs raw =
       [] -> []
       ws -> ws
 
+-- | Resolve the @-r@\/@--repo@ value to a git URL. First tries the value
+-- as a registered repo ID (looked up via 'RepoRegistryHandle'); if found,
+-- returns the registered 'srUrl'. If no ID matches, falls back to treating
+-- the value as a raw git URL. This lets the user type @\/new -r myrepo@
+-- (a registered id) or @\/new -r https:\/\/github.com\/foo\/bar.git@ (a raw
+-- URL) interchangeably.
+resolveRepoUrl :: RepoRegistryHandle -> Text -> IO Text
+resolveRepoUrl regH raw = do
+  eRepos <- rrhList regH
+  case eRepos of
+    Right repos | Just repo <- matchById repos -> pure (srUrl repo)
+    _ -> pure raw
+  where
+    matchById repos = do
+      rid <- either (const Nothing) Just (mkRepoId (T.strip raw))
+      listToMaybe [ r | r <- repos, srId r == rid ]
+
 -- | The deps a channel needs to run @/new@. Built once at startup.
 --
 -- 'ndInsertTab' is the seam where each channel plugs in its tab-insertion
@@ -105,6 +130,10 @@ data NewDeps = NewDeps
     -- with the new session id + repo URL to clone a repo into the session
     -- workdir (dispatching SETUP_REPO). 'Nothing' in contexts without a
     -- dispatcher (standalone CLI, tests).
+  , ndRepoReg      :: Maybe RepoRegistryHandle
+    -- ^ Optional repo-registry handle for resolving @-r@ repo IDs to URLs.
+    -- 'Nothing' in contexts without a registry (tests); the @-r@ value is
+    -- then treated as a raw URL.
   }
 
 -- | The @/new@ command spec. Grouped under Sessions in @/help@. Always
@@ -147,7 +176,7 @@ repoOpt = strOption
   (  long "repo"
   <> short 'r'
   <> metavar "REPO"
-  <> help "Repo URL to clone into the session (default: none)"
+  <> help "Repo ID (from /repo list) or git URL to clone into the session (default: none)"
   )
 
 -- | The @/new@ action: read the old session, mint a fresh session using
@@ -160,13 +189,22 @@ newCmd deps mProvider mModel mRepo = CommandAction $ \caps -> do
   meta <- mintNewSessionWith args oldMeta deps
   oldSid <- ndInsertTab deps caps meta
   case (naRepo args, ndSetupRepo deps) of
-    (Just repoUrl, Just setupFn) -> do
+    (Just repoVal, Just setupFn) -> do
+      repoUrl <- resolveRepoUrlMaybe deps repoVal
       eRes <- setupFn (smId meta) repoUrl
       case eRes of
         Left err -> ccSend caps ("repo setup failed: " <> err)
         Right _  -> pure ()
     _ -> pure ()
   ccSend caps (renderNewConfirmation meta oldSid)
+
+-- | Resolve the @-r@ value to a URL using the repo registry (if wired),
+-- falling back to the raw value.
+resolveRepoUrlMaybe :: NewDeps -> Text -> IO Text
+resolveRepoUrlMaybe deps raw =
+  case ndRepoReg deps of
+    Just regH -> resolveRepoUrl regH raw
+    Nothing   -> pure raw
 
 -- | Mint a fresh 'SessionMeta' using the given args, falling back to the
 -- old session's provider/model when no override is given (so mid-session

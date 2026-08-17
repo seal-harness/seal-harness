@@ -194,6 +194,7 @@ runServeMain autonomy logger = do
             writeIORef activeRef newMeta
             pure oldSid
         , ndSetupRepo = Just (handleSetupRepo sendDeps)
+        , ndRepoReg = Just repoRegH
         }
       -- The slash-command registry mirrors the TUI's. Web slash commands are
       -- best-effort: interactive-only specs (which prompt via ccPrompt) are

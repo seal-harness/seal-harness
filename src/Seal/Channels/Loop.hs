@@ -85,7 +85,7 @@ import Seal.Channels.Cursor
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.New (NewArgs (..), parseNewArgs)
+import Seal.Command.New (NewArgs (..), parseNewArgs, resolveRepoUrl)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Command.Tab (TabCloseNotifier)
@@ -563,7 +563,8 @@ handleNewSession deps h tabsH kind oldMeta argsText key askReply = do
       -- channels under the new session id.
       _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
       -- Optionally clone a repo into the new session's workdir.
-      for_ (naRepo args) $ \repoUrl -> do
+      for_ (naRepo args) $ \repoVal -> do
+        repoUrl <- resolveRepoUrl (cdRepoReg deps) repoVal
         sidRef <- newIORef (smId newMeta)
         let dispatcher = channelCallDispatcher deps h askReply sidRef
         eRes <- dispatcher (OpName "SETUP_REPO") (object ["url" .= repoUrl])
