@@ -192,7 +192,6 @@ library
         Seal.ISA.Ops.Memory
          Seal.ISA.Ops.Skills
          Seal.ISA.Ops.Repo
-         Seal.ISA.Ops.Git
          Seal.ISA.Ops.Agent
         Seal.ISA.Ops.Registry
         Seal.ISA.Registry
@@ -360,7 +359,6 @@ test-suite tests
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
-        Seal.ISA.Ops.GitSpec
         Seal.ISA.Ops.AgentSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase2aSpec

@@ -121,7 +121,6 @@ import qualified Seal.Agent.Runtime.RegistrySpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
-import qualified Seal.ISA.Ops.GitSpec
 import qualified Seal.ISA.Ops.AgentSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
@@ -282,7 +281,6 @@ main = hspec $ do
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
-  Seal.ISA.Ops.GitSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec
