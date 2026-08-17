@@ -19,7 +19,7 @@ module Seal.Web.Search
   ) where
 
 import Control.Exception (try)
-import Control.Monad.IO.Class (liftIO)
+import Seal.Tools.Exec.UIO (uioLiftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.!=), (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key (fromText)
@@ -124,7 +124,7 @@ webSearchOp cfg = UntrustedOpcode
           | otherwise -> case limitField v of
               Just n | n < 1 -> Left "WEB_SEARCH: limit must be >= 1"
               _ -> Right ()
-  , uoRun = \_uio v -> do
+  , uoRun = \v -> do
       let q = fromMaybe "" (queryField v)
           userLimit = limitField v
           cfg' = cfg { wscMaxResults = fromMaybe (wscMaxResults cfg) userLimit }
@@ -132,7 +132,7 @@ webSearchOp cfg = UntrustedOpcode
         Nothing -> pure (OpResult
           [TrpText "WEB_SEARCH: no HTTP manager configured"]
           True (recorded cfg' q 0))
-        Just mgr -> liftIO (dispatchSearch mgr cfg' q)
+        Just mgr -> uioLiftIO (dispatchSearch mgr cfg' q)
   }
 
 -- | Build the secret-free 'orRecorded' metadata value for a search call.

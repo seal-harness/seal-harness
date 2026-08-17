@@ -13,7 +13,6 @@ module Seal.ISA.Ops.File
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
@@ -31,7 +30,7 @@ import Seal.Providers.Class
 import Seal.Security.Path
 import Seal.Tools.Exec.Types (mkRemotePath)
 import Seal.Text.LineFile (lwLines, lwTotal, lwTruncated, lwEnd, lwHasMore, maxReadChars, renderWindow, windowLines)
-import Seal.Tools.Exec.UntrustedIO
+import Seal.Tools.Exec.UIO
 
 -- | Local schema for FILE_READ: required @path@ plus optional integer @offset@,
 -- @limit@, and @max_scan_bytes@. (A shared single-string schema helper cannot
@@ -144,7 +143,7 @@ fileReadOp _root operatorCeiling = UntrustedOpcode
   , uoOutSchema = object []
   , uoAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let rel       = maybe "" T.unpack (pathField v)
           offset    = offsetField v
           mLimit    = limitField v
@@ -164,7 +163,7 @@ fileReadOp _root operatorCeiling = UntrustedOpcode
             True
             recorded
         Right rp -> do
-          res <- liftIO (uioReadFile uio rp scanBytes)
+          res <- uioRead rp scanBytes
           case res of
             Left err ->
               pure $ OpResult
@@ -239,7 +238,7 @@ fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
   , uoAuthorize =
       maybe (Left "FILE_WRITE requires {path:string, content:string}") (const (Right ()))
         . pathField
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let rel     = maybe "" T.unpack (pathField v)
           content = fromMaybe "" (contentField v)
           mode    = case modeField v of
@@ -264,7 +263,7 @@ fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
               True
               recorded
           Right rp -> do
-            res <- liftIO (uioWriteFile uio rp content mode operatorWriteCeiling)
+            res <- uioWrite rp content mode operatorWriteCeiling
             pure $ case res of
               Left err ->
                 OpResult
@@ -335,7 +334,7 @@ filePatchOp _root = UntrustedOpcode
         (_, Just p)
           | T.null p      -> Left "FILE_PATCH requires a non-empty patch"
           | otherwise     -> Right ()
-  , uoRun = \uio v -> do
+  , uoRun = \v -> do
       let rel   = maybe "" T.unpack (pathField v)
           patch = fromMaybe "" (patchField v)
           recorded = object [ "path" .= rel, "patch_lines" .= length (T.lines patch) ]
@@ -351,7 +350,7 @@ filePatchOp _root = UntrustedOpcode
             then pure $ OpResult
                    [TrpText "FILE_PATCH requires a non-empty patch"] True recorded
             else do
-              res <- liftIO (uioPatchFile uio rp patch)
+              res <- uioPatch rp patch
               pure $ case res of
                 Left err ->
                   OpResult [TrpText ("FILE_PATCH: " <> renderUntrustedErr err)] True recorded

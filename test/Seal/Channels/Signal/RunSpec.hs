@@ -15,6 +15,8 @@ import Options.Applicative
 import Test.Hspec
 
 import Seal.Agent.Env (AgentEnv (..))
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -145,7 +147,7 @@ spec = do
                   , aeRegistry = isaReg
                   , aeTranscript = tHandle
                   , aeBackend = localBackend
-                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeCaps = handleCaps
                   , aeSession = sid
                   , aeMaxTurns = 4

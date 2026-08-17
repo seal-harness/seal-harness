@@ -19,6 +19,8 @@ import Seal.Harness.Registry
 import Seal.Harness.Tmux
 import Seal.ISA.Dispatch (DispatchError, dispatch)
 import Seal.ISA.Opcode (Opcode, OpResult, localBackend, opName)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -136,10 +138,10 @@ spec = describe "Seal.Phase6aSpec" $ do
 
 -- | Dispatch one opcode via a one-op registry against a fake transcript.
 dispatchReg :: TwoFileHandle -> Opcode -> App (Either DispatchError OpResult)
-dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub defaultToolTimeoutConfig testAbortFlag (opName op) (object [])
+dispatchReg h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op) (object [])
 
 dispatchOp :: TwoFileHandle -> Opcode -> Value -> App (Either DispatchError OpResult)
-dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend mkRemoteUntrustedIOStub defaultToolTimeoutConfig testAbortFlag (opName op)
+dispatchOp h op = dispatch (Registry.mkRegistry [op]) h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (opName op)
 
 testEntry :: HarnessId -> HarnessEntry
 testEntry hid = HarnessEntry

@@ -15,6 +15,8 @@ import Seal.Agent.Env (AgentEnv (..))
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -140,15 +142,15 @@ spec = do
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th mkRemoteUntrustedIOStub
+                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
                   Nothing Full approvals (pure ()) False Nothing 90 Nothing "cli" Nothing
                   testAbortFlag defaultToolTimeoutConfig
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing
       aeMaxTurns env `shouldBe` 90
-      -- The untrusted-execution capability is threaded into the env.
-      aeUntrustedIO env `seq` pure ()  -- type-level check: the field exists
+      -- The untrusted-execution environment is threaded into the env.
+      aeUIOEnv env `seq` pure ()  -- type-level check: the field exists
 
   describe "seal tui smoke (interactive — manual)" $
     it "seal tui launches and shows the > prompt" $

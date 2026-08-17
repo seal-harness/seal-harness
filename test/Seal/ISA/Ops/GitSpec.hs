@@ -9,7 +9,11 @@
 -- 5. Per-op scoping (one sahAddKey+sahDeleteAll+sahKill per op via the
 --    fake SshAgentHandle).
 module Seal.ISA.Ops.GitSpec (spec) where
-
+import Control.Monad.IO.Class (liftIO)
+import Data.Maybe (fromMaybe)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (CloneDeps (..), stubCloneDeps)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as K
@@ -27,7 +31,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec
 
 import Seal.Core.Types (OpName (..), TrustLevel (..))
-import Seal.ISA.Opcode (OpResult (..), opTrust, opName, uoRun)
+import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opName, uoRun)
 import Seal.ISA.Ops.Git
   ( gitFetchOp, gitPullOp, gitPushOp, resolveOriginUrl )
 import Seal.Logging.Logger (testSealLogger)
@@ -35,7 +39,6 @@ import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
-import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
@@ -46,10 +49,15 @@ import Seal.Tools.Exec.UntrustedIO
   ( UntrustedErr (..), UntrustedIO (..) )
 import Seal.Tools.Ssh.Agent
   ( FakeAgentCall (..), SshAgentEnv (..), mkFakeSshAgentHandle )
-import Seal.Types.App (runApp)
+import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 
+-- | Local replacement for the removed uoRunLegacy: runs the opcode's uoRun
+-- in a UIOEnv built from the UntrustedIO + optional CloneDeps.
+runOp :: UntrustedIO -> Maybe CloneDeps -> Opcode -> Value -> App OpResult
+runOp uio mDeps op input =
+  liftIO (runUIOWithEnv (mkTestUIOEnv uio (fromMaybe stubCloneDeps mDeps)) (uoRun op input))
 -- | Create a fresh 'AgentRegistryHandle' for 'cdAgentRegistry' in a pure
 -- @let@ context. Each call creates a NEW handle backed by a fresh temp
 -- directory (the @NOINLINE@ prevents GHC from CSE'ing multiple calls).
@@ -114,7 +122,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult parts False _ -> do
             parts `shouldNotBe` []
@@ -144,7 +152,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        _ <- runApp appEnv (uoRun op uio input)
+        _ <- runApp appEnv (runOp uio (Just deps) op input)
         calls <- readIORef callsRef
         SahAddKey (keyfilesDir </> "myrepo") "passphrase" `elem` calls `shouldBe` True
         SahDeleteAll `elem` calls `shouldBe` False
@@ -176,7 +184,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult parts True _ -> do
             let msg = T.intercalate "\n" [ t | TrpText t <- parts ]
@@ -211,7 +219,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitFetchOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult parts True _ -> do
             let msg = T.intercalate "\n" [ t | TrpText t <- parts ]
@@ -246,7 +254,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPushOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text), "refspec" .= ("main" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult _parts False recorded -> do
             -- credential_kind is in orRecorded
@@ -280,7 +288,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPushOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text), "refspec" .= ("main" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult _parts True recorded -> do
             lookupKey recorded "credential_kind" `shouldBe` Just "deploy_key"
@@ -313,7 +321,7 @@ spec = describe "Seal.ISA.Ops.Git" $ do
             op = gitPullOp deps (WorkspaceRoot dir) Full
             input = object [ "workdir" .= ("myrepo" :: Text) ]
         appEnv <- mkAppEnv
-        res <- runApp appEnv (uoRun op uio input)
+        res <- runApp appEnv (runOp uio (Just deps) op input)
         case res of
           OpResult parts False _ -> parts `shouldNotBe` []
           other -> expectationFailure ("expected success, got: " <> show other)

@@ -139,6 +139,10 @@ library
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
+          Seal.Tools.Exec.UIO
+          Seal.Tools.Exec.UIO.Internal
+          Seal.Tools.Exec.UIOGit
+          Seal.Tools.Exec.WorkdirFs
           Seal.Tools.Ssh.Agent
           Seal.Tools.Timeout
         Seal.Web.Search
@@ -171,6 +175,7 @@ library
         Seal.Agent.PromptParts
         Seal.Agent.Def.Types
         Seal.Agent.Def.Backend
+        Seal.Agent.Def.Workdir
         Seal.Agent.Runtime.Registry
         Seal.Agent.Runtime.Delegation
         Seal.Agent.Runtime.Delegation.Worker
@@ -342,12 +347,14 @@ test-suite tests
         Seal.Memory.TypesSpec
         Seal.Memory.BackendSpec
         Seal.Skills.TypesSpec
-        Seal.Skills.BackendSpec
+         Seal.Skills.BackendSpec
+         Seal.Skills.BackendNoDirectFsFailSpec
         Seal.Skills.AutoloadSpec
         Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec
         Seal.Agent.Def.TypesSpec
         Seal.Agent.Def.BackendSpec
+        Seal.Agent.Def.BackendNoDirectFsFailSpec
         Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
         Seal.ISA.Ops.MemorySpec
@@ -396,7 +403,8 @@ test-suite tests
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
         Seal.Config.SecuritySpec
-        Seal.Config.SecurityScopingFailSpec
+         Seal.Config.SecurityScopingFailSpec
+         Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
         Seal.ConfigSpec
         Seal.IngestSpec
@@ -425,6 +433,11 @@ test-suite tests
         Seal.Tools.Exec.RemoteSpec
          Seal.Tools.ArgsSpec
          Seal.Tools.Exec.CapabilityScopingFailSpec
+         Seal.Tools.Exec.UIOSpec
+         Seal.Tools.Exec.UIOParitySpec
+         Seal.Tools.Exec.WorkdirFsSpec
+         Seal.ISA.Ops.UIOUnrestrictedFailSpec
+         Seal.ISA.Ops.UIOConstructionFailSpec
          Seal.Tools.TimeoutSpec
          Seal.Tools.Exec.AbortSpec
          Seal.Tools.Exec.TimeoutSpec
@@ -439,8 +452,9 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
-        Seal.TestHelpers.FakeRegistry
-        Seal.TestHelpers.FakeVault
+       Seal.TestHelpers.FakeRegistry
+       Seal.TestHelpers.FakeVault
+       Seal.TestHelpers.FixtureRepo
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec

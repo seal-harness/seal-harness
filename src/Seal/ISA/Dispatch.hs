@@ -44,23 +44,24 @@ import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Types.App
 import Seal.Tools.Exec.Abort (AbortFlag)
 import Seal.Tools.Exec.Timeout (runWithTimeoutAbortRetry)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+import Seal.Tools.Exec.UIO (runUIOWithEnv)
 import Seal.Tools.Timeout (Microseconds (..), ToolError, ToolTimeoutConfig, errorClass, extractPerCallTimeout, renderToolError)
 
 data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
   deriving stock (Eq, Show)
 
--- | Dispatch an opcode invocation. The dispatcher threads an 'UntrustedIO'
--- for Untrusted opcodes (the unified capability handle for all their
--- side-effecting IO — files, commands, process management, search);
--- Trusted/Audited opcodes ignore it (they have no 'UntrustedIO' in scope —
+-- | Dispatch an opcode invocation. The dispatcher threads a 'UIOEnv'
+-- for Untrusted opcodes (the restricted execution environment carrying
+-- the 'UntrustedIO' capability handle + the Git 'CloneDeps' surface);
+-- Trusted/Audited opcodes ignore it (they have no 'UIOEnv' in scope —
 -- type-level capability scoping, spec §4/§8).
 dispatch
-  :: Registry -> TwoFileHandle -> BackendExec -> UntrustedIO
+  :: Registry -> TwoFileHandle -> BackendExec -> UIOEnv
   -> ToolTimeoutConfig -> AbortFlag
   -> OpName -> Value
   -> App (Either DispatchError OpResult)
-dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
+dispatch reg h backend uioEnv toolTimeout abortFlag name input =
   case lookupOp reg name of
     Nothing -> pure (Left (OpNotFound name))
     Just op ->
@@ -74,14 +75,16 @@ dispatch reg h backend untrustedIO toolTimeout abortFlag name input =
           case op of
             UntrustedOpcode {} -> do
               liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute
-              -- Wrap uoRun in the timeout/abort/retry race. The App→IO
-              -- bridge (design Blocker Resolution #1): capture the env via
-              -- ask, re-enter App in the worker via runApp env (uoRun ...).
-              env <- ask
+              -- Wrap uoRun in the timeout/abort/retry race. The untrusted
+              -- action runs via 'runUIOWithEnv' (the UIO→IO bridge carrying
+              -- the 'UntrustedIO' capability handle + Git 'CloneDeps'
+              -- surface from the 'UIOEnv'); the race wrapper treats it as a
+              -- plain 'IO' action. OpResult semantic errors are NOT
+              -- ToolErrors (wrapped Right).
               let ioAction :: IO (Either ToolError OpResult)
                   ioAction = do
-                    r <- runApp env (uoRun op untrustedIO input)
-                    pure (Right r)  -- OpResult semantic errors are NOT ToolErrors
+                    r <- runUIOWithEnv uioEnv (uoRun op input)
+                    pure (Right r)
               raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
               case raced of
                 Right opResult -> pure (Right opResult)

@@ -16,7 +16,7 @@ import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Tools.Exec.Abort (AbortFlag)
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Timeout (ToolTimeoutConfig)
 
 data AgentEnv = AgentEnv
@@ -32,14 +32,17 @@ data AgentEnv = AgentEnv
   , aeRegistry :: Registry
   , aeTranscript :: TwoFileHandle
   , aeBackend :: BackendExec
-  , aeUntrustedIO :: UntrustedIO
-    -- ^ The untrusted-execution capability handle (local vs remote SSH),
-    -- threaded to 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes.
-    -- Backend (local FS vs SSH transport) is selected once at wiring
-    -- time via 'mkLocalUntrustedIO' or 'mkRemoteUntrustedIO'; the opcode
-    -- never sees the backend, only the capability. Trusted/Audited
-    -- opcodes ignore it (the GADT 'Opcode' has no 'UntrustedIO' field
-    -- for them — type-level capability scoping, spec §4/§8).
+  , aeUIOEnv :: UIOEnv
+    -- ^ The untrusted-execution environment (carrying the 'UntrustedIO'
+    -- capability handle + the Git 'CloneDeps' surface), threaded to
+    -- 'Seal.ISA.Dispatch.dispatch' for Untrusted opcodes. Backend (local
+    -- FS vs SSH transport) is selected once at wiring time via
+    -- 'mkSessionExec' (which builds the 'UIOEnv' from the 'SecurityConfig');
+    -- the opcode never sees the backend, only the capability. Trusted/Audited
+    -- opcodes ignore it (the GADT 'Opcode' has no 'UIOEnv' field for them —
+    -- type-level capability scoping, spec §4/§8). The 'CloneDeps' lives
+    -- inside the 'UIOEnv' (via 'uieCloneDeps'), so Git opcodes source it
+    -- from here rather than a separate field.
   , aeAbortFlag :: AbortFlag
     -- ^ The session-scoped abort flag. Set by the channel layer (Signal
     -- @\/stop@, CLI Ctrl+C, Web @POST /api/sessions/:id/stop@) to cancel

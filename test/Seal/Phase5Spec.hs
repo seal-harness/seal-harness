@@ -34,6 +34,8 @@ import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Transcript (fakeTwoFileTranscript)
 import Seal.ISA.Dispatch (dispatch)
 import Seal.ISA.Opcode (localBackend, OpResult (..))
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -171,7 +173,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeRegistry = reg
                   , aeTranscript = tHandle
                   , aeBackend = localBackend
-                  , aeUntrustedIO = mkRemoteUntrustedIOStub
+                  , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
                   , aeCaps = caps
                   , aeSession = sampleSession
                   , aeMaxTurns = 8
@@ -233,7 +235,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             ]
       (tHandle, _) <- fakeTwoFileTranscript
       -- Define the agent via dispatch (writes the file + auto-commits).
-      _ <- runTestApp (dispatch reg tHandle localBackend mkRemoteUntrustedIOStub defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_DEF_WRITE")
+      _ <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_DEF_WRITE")
                          (object
                            [ "id" .= ("worker" :: Text)
                            , "name" .= ("worker" :: Text)
@@ -244,7 +246,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       doesFileExist (cfgRoot </> "agents" </> "worker.md") `shouldReturn` True
       -- Start it via dispatch (synchronous — the worker runs to completion
       -- before dispatch returns; no AGENT_STATUS Running state to observe).
-      rStart <- runTestApp (dispatch reg tHandle localBackend mkRemoteUntrustedIOStub defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_START")
+      rStart <- runTestApp (dispatch reg tHandle localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "AGENT_START")
                             (object ["id" .= ("worker" :: Text), "goal" .= ("do work" :: Text)]))
       rStart `shouldSatisfy` isRight
       -- Synchronous: the worker has already run exactly once.

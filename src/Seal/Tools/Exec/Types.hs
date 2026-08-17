@@ -155,7 +155,7 @@ getSshUser (SshUser t) = t
 -- remote root is the job of 'Seal.Security.Path.mkSafePathRemote' in 4g);
 -- 4a only needs a validated newtype the 'SshConfig' can carry.
 newtype RemotePath = RemotePath Text
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 mkRemotePath :: Text -> Either Text RemotePath
 mkRemotePath t

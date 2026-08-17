@@ -23,6 +23,8 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Tools.Args (textShellCommand)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tools.Exec.UntrustedIO
@@ -67,10 +69,10 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
         reg = mkRegistry [shellOp, fileWriteOp']
     (h, _readState) <- fakeTwoFileTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)
-    r1 <- runTestApp (dispatch reg h localBackend uio defaultToolTimeoutConfig testAbortFlag (OpName "SHELL_EXEC")
+    r1 <- runTestApp (dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "SHELL_EXEC")
                        (object ["command" .= ("echo ok" :: String)]))
     -- Dispatch FILE_WRITE (Untrusted: ACK-before-execute)
-    r2 <- runTestApp (dispatch reg h localBackend uio defaultToolTimeoutConfig testAbortFlag (OpName "FILE_WRITE")
+    r2 <- runTestApp (dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig testAbortFlag (OpName "FILE_WRITE")
                        (object ["path" .= ("out.txt" :: String), "content" .= ("data" :: String)]))
     -- Both succeed
     rightOf r1 `shouldSatisfy` isJust

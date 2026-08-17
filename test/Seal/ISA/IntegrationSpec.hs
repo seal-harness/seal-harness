@@ -85,6 +85,8 @@ import Seal.Skills.Backend qualified as SkillBackend
 import Seal.Skills.Types (skBody)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Args (textShellCommand)
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkLocalUntrustedIO, mkRemoteUntrustedIOStub )
@@ -155,7 +157,7 @@ dispatchOneWith :: Registry.Registry -> UntrustedIO -> OpName -> Value
 dispatchOneWith reg uio name input = do
   (h, _) <- liftIO fakeTwoFileTranscript
   abortFlag <- liftIO newAbortFlag
-  dispatch reg h localBackend uio defaultToolTimeoutConfig abortFlag name input
+  dispatch reg h localBackend (mkTestUIOEnv uio stubCloneDeps) defaultToolTimeoutConfig abortFlag name input
 
 right :: Show e => Either e a -> a
 right (Right x) = x
@@ -247,7 +249,7 @@ spec = describe "Seal.ISA.Integration" $ do
         let env = AgentEnv
                     (SomeProvider (ScriptProvider ref))
                     "ollama" (ModelId "m") Nothing reg h localBackend
-                    mkRemoteUntrustedIOStub abortFlag defaultToolTimeoutConfig
+                    (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps) abortFlag defaultToolTimeoutConfig
                     caps sid 8 "test" Nothing Full approvals Nothing (pure ()) Nothing Nothing False Nothing
         runTestApp (runTurn env "Read the file notes.txt and show me what's in it.")
         sent' <- readIORef sent

@@ -38,7 +38,7 @@ import Data.Text (Text)
 import Seal.Core.Types
 import Seal.Providers.Class (ToolResultPart)
 import Seal.Types.App
-import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+import Seal.Tools.Exec.UIO (UIO)
 
 data OpResult = OpResult
   { orParts :: [ToolResultPart]  -- ^ what the model sees (may include secret values)
@@ -82,7 +82,7 @@ data Opcode
       , uoInSchema   :: Value
       , uoOutSchema  :: Value
       , uoAuthorize  :: Value -> Either Text ()
-      , uoRun        :: UntrustedIO -> Value -> App OpResult
+      , uoRun        :: Value -> UIO OpResult
       }
 
 -- | Accessor: the opcode's name (works for both constructors).

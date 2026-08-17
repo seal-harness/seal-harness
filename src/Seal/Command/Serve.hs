@@ -264,6 +264,8 @@ runServeMain autonomy logger = do
         , adVault            = rt
         , adPaths            = paths
         , adWsPort           = gcWsPort gwCfg
+        , adSecurityConfig   = secCfg
+        , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
         }
   -- Start the WS stream server on the WS port.
