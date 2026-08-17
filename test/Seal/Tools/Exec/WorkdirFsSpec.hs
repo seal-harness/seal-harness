@@ -321,20 +321,19 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       r `shouldSatisfy` isWfsPath
       readIORef calls `shouldReturn` ([] :: [Text])
 
-    it "wfsReadFile reads a workspace file (realpath → stat → head)" $ do
+    it "wfsReadFile reads a workspace file (readlink → head)" $ do
       calls <- newIORef []
       let absPath = "/srv/agent-workspace/agents.md"
       fs <- mkRemoteFs calls
         [ Right (T.pack absPath)
-        , Right "12"
         , Right "hello agents\n"
         ] 1048576
       r <- wfsReadFile fs (rp "agents.md")
       r `shouldBe` Right "hello agents"
       n <- length <$> readIORef calls
-      n `shouldBe` 3
+      n `shouldBe` 2
 
-    it "wfsReadFile rejects a realpath-resolved symlink escape" $ do
+    it "wfsReadFile rejects a readlink-resolved symlink escape" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right "/etc/shadow"] 1048576
       r <- wfsReadFile fs (rp "evil.md")
@@ -342,18 +341,27 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       n <- length <$> readIORef calls
       n `shouldBe` 1
 
-    it "wfsReadFile returns WfsNotFound when realpath reports missing" $ do
+    it "wfsReadFile returns WfsNotFound when readlink reports missing" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right ""] 1048576
       r <- wfsReadFile fs (rp "ghost.md")
       r `shouldBe` Left WfsNotFound
 
-    it "wfsReadFile rejects an oversize file (stat-first)" $ do
+    it "wfsReadFile bounds oversize via head -c (no stat pre-check, 2 calls)" $ do
       calls <- newIORef []
       let absPath = "/srv/agent-workspace/big.txt"
-      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "100"] 5
+      -- The remote arm no longer runs a stat size pre-check (the GNU
+      -- `stat -c %s` it used is not portable to BSD/macOS remotes). Instead
+      -- it bounds the read with `head -c <ceil>`, so an oversize file is
+      -- read partially (at most `ceil` bytes on a real remote) rather than
+      -- rejected with WfsOversize. The scripted stub returns the canned
+      -- content verbatim (it doesn't run a real `head`), so this test
+      -- pins the CONTRACT (2 calls: readlink + head, no stat) rather than
+      -- the truncation itself — the byte cap is exercised by the local-arm
+      -- oversize test and the live remote verification.
+      fs <- mkRemoteFs calls [Right (T.pack absPath), Right "100 bytes of content here"] 5
       r <- wfsReadFile fs (rp "big.txt")
-      r `shouldSatisfy` isWfsOversize
+      r `shouldSatisfy` \case Right _ -> True; _ -> False
       n <- length <$> readIORef calls
       n `shouldBe` 2
 
@@ -374,7 +382,7 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       fs <- mkRemoteFs calls [Right "y"] 1048576
       wfsDoesDirectoryExist fs (rp "sub") `shouldReturn` True
 
-    it "wfsListDirectory returns the dir's children (realpath → ls -1)" $ do
+    it "wfsListDirectory returns the dir's children (readlink → ls -1)" $ do
       calls <- newIORef []
       let absPath = "/srv/agent-workspace/d"
       fs <- mkRemoteFs calls [Right (T.pack absPath), Right "a.txt\nb.txt\n"] 1048576
@@ -383,14 +391,14 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       n <- length <$> readIORef calls
       n `shouldBe` 2
 
-    it "wfsListDirectory returns Right [] on a missing dir (realpath empty)" $ do
+    it "wfsListDirectory returns Right [] on a missing dir (readlink empty)" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right ""] 1048576
       wfsListDirectory fs (rp "nope") `shouldReturn` Right []
       n <- length <$> readIORef calls
       n `shouldBe` 1
 
-    it "wfsListDirectory rejects a realpath-resolved symlink escape" $ do
+    it "wfsListDirectory rejects a readlink-resolved symlink escape" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right "/etc"] 1048576
       r <- wfsListDirectory fs (rp "evil-dir")
@@ -398,26 +406,26 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       n <- length <$> readIORef calls
       n `shouldBe` 1
 
-    it "wfsFileSize returns the byte size (realpath → stat -c %s)" $ do
+    it "wfsFileSize returns the byte size (readlink → stat -c %s)" $ do
       calls <- newIORef []
       let absPath = "/srv/agent-workspace/sized.txt"
       fs <- mkRemoteFs calls [Right (T.pack absPath), Right "42"] 1048576
       wfsFileSize fs (rp "sized.txt") `shouldReturn` Right 42
 
-    it "wfsFileSize rejects a realpath-resolved symlink escape" $ do
+    it "wfsFileSize rejects a readlink-resolved symlink escape" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right "/etc/passwd"] 1048576
       r <- wfsFileSize fs (rp "evil.txt")
       r `shouldSatisfy` isWfsPath
 
-    it "wfsModificationTime returns a UTCTime (realpath → stat -c %Y)" $ do
+    it "wfsModificationTime returns a UTCTime (readlink → stat -c %Y)" $ do
       calls <- newIORef []
       let absPath = "/srv/agent-workspace/mt.txt"
       fs <- mkRemoteFs calls [Right (T.pack absPath), Right "1700000000"] 1048576
       r <- wfsModificationTime fs (rp "mt.txt")
       r `shouldSatisfy` either (const False) (const True)
 
-    it "wfsModificationTime rejects a realpath-resolved symlink escape" $ do
+    it "wfsModificationTime rejects a readlink-resolved symlink escape" $ do
       calls <- newIORef []
       fs <- mkRemoteFs calls [Right "/etc/passwd"] 1048576
       r <- wfsModificationTime fs (rp "evil.txt")
@@ -488,7 +496,7 @@ wsRootOf cfg = WorkspaceRoot (T.unpack (getRemotePath (scWorkspace cfg)))
 -- (the text after the @--@ separator in the SSH argv) into a recording
 -- 'IORef' and returns the next canned result from a separate mutable queue
 -- 'IORef'. Runs out of results → returns @Right ""@. This lets the
--- multi-step remote methods (realpath → stat → head) be tested under a
+-- multi-step remote methods (readlink → head, readlink → stat, etc.) be tested under a
 -- single in-process runner (no live SSH).
 scriptedRunner :: IORef [Text] -> [Either ExecError Text] -> IO RemoteRunner
 scriptedRunner recRef canned0 = do
