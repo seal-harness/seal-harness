@@ -43,6 +43,7 @@
 
 - #50 Per-session workdir + optional chroot isolation for untrusted opcodes
 - [ ] GitHub PAT support for repos — existing SSH deploy key credentials only support git operations (clone, push); operations like creating PRs require `gh` CLI auth via env var (`GH_TOKEN`/`GITHUB_TOKEN`) in mode=remote; no unencrypted credentials ever written to disk
+- [ ] Gateway API integration tests — transition core functionality testing to the gateway API level for consistency across web frontend, chat channels, and TUI; test both local and remote opcode execution modes; use containers for mode=remote rather than separate machines to keep complexity manageable
 - #40 On-demand opcode schema loading (config flag + OPCODE_DESCRIBE)
 - #5 Refine CONTRIBUTING.md as Phase 2 lands
 
