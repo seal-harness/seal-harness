@@ -21,7 +21,7 @@ import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
-import Seal.Core.Types (mkSystemSessionId)
+import Seal.Core.Types (mkSystemSessionId, mkSessionId)
 import Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
   , workdirAgentDefBackend
@@ -29,8 +29,11 @@ import Seal.Agent.Def.Backend
   , noneBackend
   , deriveAgentsMdId
   )
-import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText, isValidAgentDefId)
+import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText, isValidAgentDefId, mkAgentDefId)
+import Seal.Config.Paths (SealPaths (..), sessionMetaPath)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveSessionMeta, autoBindRepoAgent)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Tools.Exec.WorkdirFs
@@ -39,6 +42,10 @@ import Seal.Tools.Exec.WorkdirFs
   , mkInMemWorkdirFs
   , StubEntry (..)
   )
+import Seal.Util.StrictIO (decodeFileStrict)
+
+aTime :: UTCTime
+aTime = UTCTime (fromGregorian 2026 8 17) (secondsToDiffTime (13 * 3600 + 14 * 60 + 4))
 
 spec :: Spec
 spec = do
@@ -455,6 +462,114 @@ spec = do
       let unioned = unionAgentDefBackend workdirBackend userBackend
       defs <- adbList unioned
       length defs `shouldBe` 1
+      cleanup tmp
+
+  describe "Seal.Session.Store.autoBindRepoAgent" $ do
+    -- Shared session-JSON scaffold: a session bound to the user's
+    -- configured default_agent "zoe" (the exact scenario from the bug
+    -- report — a session whose smAgent was stamped at creation from
+    -- default_agent, never overridden by the repo's agents.md).
+    let mkSessionState :: FilePath -> SealPaths -> IO SessionMeta
+        mkSessionState tmp paths = do
+          createDirectoryIfMissing True (tmp </> "state" </> "sessions")
+          let sidTxt = "20260817-131404-504"
+              sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "bad sid"
+              zoe = case mkAgentDefId "zoe" of Right a -> a; Left _ -> error "bad zoe id"
+              meta = SessionMeta
+                { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
+                , smChannel = "web", smAgent = Just zoe
+                , smSystemOverride = Nothing, smAgentName = Just "zoe"
+                , smDescription = Nothing
+                , smCreatedAt = aTime, smLastActive = aTime }
+          saveSessionMeta paths meta
+          pure meta
+        statePaths :: FilePath -> SealPaths
+        statePaths tmp = SealPaths
+          { spHome = tmp, spConfig = tmp </> "config"
+          , spState = tmp </> "state", spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+
+    it "rebinds smAgent from the user default (zoe) to the repo's agents-md after a clone" $ do
+      let tmp = "/tmp/seal-auto-bind-repo-agent-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "foo-agent")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "agents.md")
+        "---\nkind: agents\n---\n# Project Guidelines\nDo good work.\n"
+      writeFile (tmp </> "my-repo" </> ".agents" </> "agents" </> "foo-agent" </> "agent.md")
+        "---\nname: Foo\nprovider: ollama\n---\nYou are foo.\n"
+      let paths = statePaths tmp
+      meta <- mkSessionState tmp paths
+      fs <- mkFs tmp
+      autoBindRepoAgent fs paths (smId meta)
+      Just afterMeta <- decodeFileStrict (sessionMetaPath paths (smId meta)) :: IO (Maybe SessionMeta)
+      -- smAgent is now the repo's prefixed agents-md id, NOT zoe.
+      smAgent afterMeta `shouldBe` (case mkAgentDefId "my-repo--agents-md" of Right a -> Just a; Left _ -> Nothing)
+      smAgentName afterMeta `shouldBe` Just "my-repo--agents-md"
+      cleanup tmp
+
+    it "is a no-op when the session already has a repo-prefixed agent bound (user picked one)" $ do
+      let tmp = "/tmp/seal-auto-bind-repo-agent-noop-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "agents" </> "foo-agent")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "agents.md")
+        "---\nkind: agents\n---\n# Project Guidelines\nDo good work.\n"
+      writeFile (tmp </> "my-repo" </> ".agents" </> "agents" </> "foo-agent" </> "agent.md")
+        "---\nname: Foo\nprovider: ollama\n---\nYou are foo.\n"
+      let paths = statePaths tmp
+          pickedId = case mkAgentDefId "my-repo--foo-agent" of Right a -> Just a; Left _ -> Nothing
+      createDirectoryIfMissing True (tmp </> "state" </> "sessions")
+      let sid = case mkSessionId "20260817-131404-504" of Right s -> s; Left _ -> error "bad sid"
+          meta = SessionMeta
+            { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
+            , smChannel = "web", smAgent = pickedId
+            , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
+            , smDescription = Nothing
+            , smCreatedAt = aTime, smLastActive = aTime }
+      saveSessionMeta paths meta
+      fs <- mkFs tmp
+      autoBindRepoAgent fs paths sid
+      Just afterMeta <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
+      -- Unchanged: the user's explicit repo-agent pick is not clobbered.
+      smAgent afterMeta `shouldBe` pickedId
+      cleanup tmp
+
+    it "is a no-op when the workdir has no .agents/agents.md (no repo default)" $ do
+      let tmp = "/tmp/seal-auto-bind-repo-agent-none-test"
+      cleanup tmp
+      -- An empty workdir (no repos).
+      createDirectoryIfMissing True tmp
+      let paths = statePaths tmp
+      meta <- mkSessionState tmp paths
+      fs <- mkFs tmp
+      autoBindRepoAgent fs paths (smId meta)
+      Just afterMeta <- decodeFileStrict (sessionMetaPath paths (smId meta)) :: IO (Maybe SessionMeta)
+      -- Unchanged: still zoe.
+      smAgent afterMeta `shouldBe` (case mkAgentDefId "zoe" of Right a -> Just a; Left _ -> Nothing)
+      cleanup tmp
+
+    it "discovers the repo's agents-md via the in-memory stub WorkdirFs (remote-arm parity)" $ do
+      -- The same scenario but with mkInMemWorkdirFs (the remote-mode
+      -- adapter). The auto-bind must produce the SAME result as the local
+      -- arm — this pins mode=local / mode=remote parity for the feature.
+      let tmp = "/tmp/seal-auto-bind-repo-agent-remote-test"
+      cleanup tmp
+      let agentsMd = "---\nkind: agents\n---\n# Project\nDo good work.\n"
+          fooMd    = "---\nname: Foo\nprovider: ollama\n---\nYou are foo.\n"
+          seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".agents"])
+            , (rp "my-repo/.agents", Directory ["agents.md", "agents"])
+            , (rp "my-repo/.agents/agents.md", FileContent agentsMd)
+            , (rp "my-repo/.agents/agents", Directory ["foo-agent"])
+            , (rp "my-repo/.agents/agents/foo-agent", Directory ["agent.md"])
+            , (rp "my-repo/.agents/agents/foo-agent/agent.md", FileContent fooMd)
+            ]
+          fs = mkInMemWorkdirFs seed
+      let paths = statePaths tmp
+      meta <- mkSessionState tmp paths
+      autoBindRepoAgent fs paths (smId meta)
+      Just afterMeta <- decodeFileStrict (sessionMetaPath paths (smId meta)) :: IO (Maybe SessionMeta)
+      -- Same prefixed id as the local-arm test → parity holds.
+      smAgent afterMeta `shouldBe` (case mkAgentDefId "my-repo--agents-md" of Right a -> Just a; Left _ -> Nothing)
       cleanup tmp
 
 cleanup :: FilePath -> IO ()

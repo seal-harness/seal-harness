@@ -112,7 +112,7 @@ import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered, broadcastAgentDefsChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -124,7 +124,7 @@ import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Store (SessionRuntime (..), formatSessionId, autoBindRepoAgent)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
@@ -465,6 +465,20 @@ plainTurn deps meta t = do
                 wsroot = seWorkspaceRoot exec
                 uioEnv = seUIOEnv exec
                 caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+            -- Auto-bind: if the workdir now contains a repo shipping
+            -- .agents/agents.md (from a prior SETUP_REPO — whether invoked
+            -- by the LLM as a tool call, via /call, or via the web combo
+            -- box) and the session is still bound to its creation-time
+            -- default_agent (not already repo-prefixed), rebind smAgent to
+            -- the repo's agents-md so this turn's resolveSystemPrompt picks
+            -- up the project instructions. Idempotent + non-clobbering
+            -- (see autoBindRepoAgent). Runs over the same WorkdirFs the
+            -- turn uses, so mode=local and mode=remote behave identically.
+            -- Re-load meta after the (possible) rebind so resolveSystemPrompt
+            -- sees the updated smAgent.
+            autoBindRepoAgent wfs paths sid
+            mMetaAfterBind <- loadSessionMeta paths sid
+            let meta' = fromMaybe meta mMetaAfterBind
             -- Build the workdir-aware skill backend: repo-local skills
             -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
             -- Fail-closed: a workdir error → no workdir skills (the user ⊕
@@ -479,7 +493,7 @@ plainTurn deps meta t = do
                 parallel = either (const True) resolvedParallelToolGuidance eCfg
                 toolUse = either (const True) resolvedToolUseEnforcement eCfg
                 taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
+            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta'
             turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
             let onDemand = either (const False) onDemandSchemas eCfg
                 startWiring = webStartWiring
@@ -799,7 +813,20 @@ webCallDispatcher deps callOpName val = do
         -- here — their results surface via the turn's normal entry flow.
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
-          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          then do
+            recordSetupRepoResult tHandle callOpName val r (Just "web")
+            -- On a successful (non-error) SETUP_REPO, rebind the session's
+            -- smAgent to the cloned repo's .agents/agents.md when the repo
+            -- ships one (auto-bind — design §3.2 amendment). Skipped on
+            -- error results (clone failures / conflicts) so a failed clone
+            -- never clobbers the user's existing agent. The discovery runs
+            -- over the same WorkdirFs (wfs) the clone used, so local and
+            -- remote arms behave identically. Broadcast agent-defs-changed
+            -- so the frontend's Agent dropdown re-fetches and reflects the
+            -- new binding.
+            unless (orIsError r) $
+              autoBindRepoAgent wfs paths sid
+            broadcastAgentDefsChanged (sdBroker deps)
           else if opNm == "GIT_PUSH"
             then recordGitPushResult tHandle callOpName val r (Just "web")
             else recordSkillLoadResult tHandle callOpName val r (Just "web")

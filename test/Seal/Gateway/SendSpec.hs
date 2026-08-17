@@ -21,10 +21,11 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
+import Seal.Agent.Def.Types (AgentDefId, mkAgentDefId)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Channel.Cli (newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
@@ -89,6 +90,17 @@ instance Provider BlockingProvider where
   complete (BlockingProvider mv) _ = takeMVar mv >> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
 
+-- | A fake provider that captures the CompletionRequest's crSystem field
+-- (the system prompt that actually drove the turn) into an IORef, then
+-- returns one canned assistant reply. Used by the repo agents.md auto-bind
+-- integration test to assert which system prompt won — zoe's or the repo's.
+newtype CapturingProvider = CapturingProvider (IORef (Maybe T.Text))
+instance Provider CapturingProvider where
+  complete (CapturingProvider ref) req = do
+    writeIORef ref (crSystem req)
+    pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
+  listModels _ = pure (Right [ModelId "llama3.2"])
+
 -- | Extract the "status" field from a BeActivity's Value, if it's a
 -- harness-status activity. Used to assert thinking/idle broadcasts.
 harnessStatus :: BrokerEvent -> Maybe T.Text
@@ -98,6 +110,10 @@ harnessStatus (BeActivity _ v) = do
   A.String status <- KeyMap.lookup (fromText "status") o
   pure status
 harnessStatus _ = Nothing
+
+-- | Local alias for mkAgentDefId (avoids an extra import line in the test).
+mkAgentDefId' :: T.Text -> Either T.Text AgentDefId
+mkAgentDefId' = mkAgentDefId
 
 asObject :: A.Value -> Maybe A.Object
 asObject (A.Object o) = Just o
@@ -520,3 +536,92 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             res `shouldBe` Right True
           _ -> expectationFailure "expected one pending ask"
         takeMVar done
+
+  -- Integration test for the repo agents.md auto-bind feature. This is the
+  -- gateway-level end-to-end test the user asked for: it exercises the SAME
+  -- handleSend → plainTurn → autoBindRepoAgent → resolveSystemPrompt path the
+  -- web frontend triggers when a user sends a message to a session whose
+  -- workdir contains a repo shipping .agents/agents.md. The unit tests in
+  -- RepoDiscoverySpec verified autoBindRepoAgent in isolation; this test
+  -- verifies the wiring actually fires inside a real turn, so a regression
+  -- in the integration (e.g. the hook being placed after resolveSystemPrompt,
+  -- or meta not being reloaded, or the workdir not being seeded before the
+  -- turn) is caught here, not just at the unit level.
+  describe "repo agents.md auto-bind (gateway integration)" $ do
+    -- A provider that captures the CompletionRequest's crSystem so the test
+    -- can assert WHICH system prompt actually drove the turn. Returns one
+    -- canned reply so the turn completes.
+    let capturingDeps :: SealPaths -> IO (SendDeps, IORef (Maybe T.Text))
+        capturingDeps paths = do
+          capRef <- newIORef (Nothing :: Maybe T.Text)
+          let resolveStub _ = pure (Right
+                ( SomeProvider (CapturingProvider capRef)
+                , ModelId "llama3.2" ))
+          deps <- mkSendDepsWith paths resolveStub
+          tabsH <- newTabsHandle
+          pure (deps { sdTabsHandle = tabsH }, capRef)
+        seedZoe :: SealPaths -> IO ()
+        seedZoe paths = do
+          -- A flat-scheme user agent "zoe" with a distinctive system prompt
+          -- so we can tell it apart from the repo's agents.md marker.
+          let agentsDir = spConfig paths </> "agents"
+          createDirectoryIfMissing True agentsDir
+          writeFile (agentsDir </> "zoe.md")
+            "---\nid: zoe\nname: zoe\nprovider: ollama\nmodel: llama3\ntools: all\ncreated_at: 2026-07-01T00:00:00Z\nupdated_at: 2026-07-01T00:00:00Z\nsession: s1\n---\nZOE_SYSTEM_PROMPT_MARKER\n"
+        seedSessionWithZoe :: SealPaths -> SessionId -> IO ()
+        seedSessionWithZoe paths sid = do
+          let sdir = sessionDir paths sid
+          createDirectoryIfMissing True sdir
+          let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
+              meta = SessionMeta sid "ollama" "llama3.2" "web"
+                       (Just zoe) Nothing (Just "zoe") Nothing sampleTime sampleTime
+          saveSessionMeta paths meta
+        seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
+        seedRepoAgentsMd paths sid marker = do
+          -- Seed the session workdir (the same path mkSessionExec uses in
+          -- mode=local) with a repo carrying .agents/agents.md whose body is
+          -- the distinctive marker.
+          let wd = sessionWorkdir paths sid
+              repoDir = wd </> "seal-test-repo" </> ".agents"
+          createDirectoryIfMissing True repoDir
+          writeFile (repoDir </> "agents.md")
+            ("---\nkind: agents\n---\n" <> T.unpack marker <> "\n")
+
+    it "a session bound to the user default (zoe) uses the repo's agents.md after a clone" $ do
+      withSystemTempDirectory "auto-bind-int" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoe paths
+        (baseDeps, capRef) <- capturingDeps paths
+        let sid = mkSid "20260817-151158-281"
+        seedSessionWithZoe paths sid
+        seedRepoAgentsMd paths sid "REPO_PROJECT_MARKER"
+        let sendDeps = baseDeps
+        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome `shouldBe` SendAssistant
+        mSys <- readIORef capRef
+        case mSys of
+          Nothing -> expectationFailure "provider was never called — turn did not reach the LLM"
+          Just sys -> do
+            sys `shouldSatisfy` T.isInfixOf "REPO_PROJECT_MARKER"
+            sys `shouldNotSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+
+    it "a session with no repo in its workdir stays on the user default (zoe)" $ do
+      withSystemTempDirectory "auto-bind-norepo" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoe paths
+        (baseDeps, capRef) <- capturingDeps paths
+        let sid = mkSid "20260817-151158-282"
+        seedSessionWithZoe paths sid
+        -- No repo seeded in the workdir.
+        outcome <- handleSend baseDeps sid "tell me about yourself"
+        outcome `shouldBe` SendAssistant
+        mSys <- readIORef capRef
+        case mSys of
+          Nothing -> expectationFailure "provider was never called"
+          Just sys -> do
+            sys `shouldSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+            sys `shouldNotSatisfy` T.isInfixOf "REPO_PROJECT_MARKER"
