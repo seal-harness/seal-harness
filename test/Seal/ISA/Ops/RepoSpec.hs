@@ -4,8 +4,10 @@ module Seal.ISA.Ops.RepoSpec (spec) where
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import System.Directory
-  ( createDirectoryIfMissing, doesDirectoryExist, withCurrentDirectory )
+  ( createDirectoryIfMissing, doesDirectoryExist
+  , getCurrentDirectory, setCurrentDirectory, withCurrentDirectory )
 import System.FilePath ((</>))
+import System.IO.Unsafe (unsafePerformIO)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess)
 import Test.Hspec
@@ -21,6 +23,30 @@ import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), mkFakeSshAgentHandle )
+
+-- | The process CWD captured at module load (before any test runs). This is
+-- always a valid directory (the project root or the test runner's CWD).
+-- Restored after each test that changes the CWD, so a CWD-deletion by a
+-- prior test's 'withSystemTempDirectory' cleanup doesn't break subsequent
+-- tests that call 'getCurrentDirectory' (e.g. 'git add' in the
+-- channelCallDispatcher test).
+savedCwd :: FilePath
+savedCwd = unsafePerformIO getCurrentDirectory
+{-# NOINLINE savedCwd #-}
+
+-- | Run an action with the process CWD set to a stable directory ("/"),
+-- then restore the saved CWD afterward. This prevents
+-- 'getCurrentDirectory: does not exist' errors when cloneRepoIO's internal
+-- process creation runs after a prior test's 'withSystemTempDirectory'
+-- cleanup deleted the CWD. The restore uses 'setCurrentDirectory' (not
+-- 'withCurrentDirectory') to avoid calling 'getCurrentDirectory' (which
+-- would fail if the CWD is already gone).
+withStableCwd :: IO a -> IO a
+withStableCwd action = do
+  setCurrentDirectory "/"
+  result <- action
+  setCurrentDirectory savedCwd
+  pure result
 
 -- | Build a test 'CloneDeps' with a fake (empty) vault runtime, an empty
 -- repo registry (so @lookupRepoByUrl@ falls through to bare-URL clone —
@@ -153,7 +179,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
     -- raw URL (no validation), so file:// works here even though the
     -- opcode/endpoint layer would reject it.
     it "clones a local bare repo into <workdir>/<name> (shallow)" $
-      withSystemTempDirectory "seal-repo-src" $ \srcDir -> do
+      withStableCwd $ withSystemTempDirectory "seal-repo-src" $ \srcDir -> do
         -- Build a bare repo with one commit under srcDir/repo.git.
         let bare = srcDir </> "repo.git"
         createDirectoryIfMissing True bare
@@ -184,7 +210,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             other -> expectationFailure ("expected CloneCloned, got " <> show other)
 
     it "is a no-op when the same repo is already cloned" $
-      withSystemTempDirectory "seal-repo-src2" $ \srcDir -> do
+      withStableCwd $ withSystemTempDirectory "seal-repo-src2" $ \srcDir -> do
         let bare = srcDir </> "repo.git"
         createDirectoryIfMissing True bare
         withCurrentDirectory bare $ callProcess "git" ["init", "--bare"]
@@ -210,7 +236,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             other -> expectationFailure ("expected CloneNoop, got " <> show other)
 
     it "is a no-op when re-cloned via a URL that normalizes to the same repo (trailing .git vs no .git)" $
-      withSystemTempDirectory "seal-repo-scheme" $ \srcDir -> do
+      withStableCwd $ withSystemTempDirectory "seal-repo-scheme" $ \srcDir -> do
         -- The same bare repo reached via "file://.../repo.git" and
         -- "file://.../repo.git" (with vs without trailing .git) must be
         -- a no-op, proving normalizeRepoUrl is consulted (without it,
@@ -248,7 +274,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
             other -> expectationFailure ("expected CloneNoop, got " <> show other)
 
     it "reports a conflict when a different repo occupies the path" $
-      withSystemTempDirectory "seal-repo-conflict" $ \srcDir -> do
+      withStableCwd $ withSystemTempDirectory "seal-repo-conflict" $ \srcDir -> do
         -- Two distinct bare repos, BOTH named repo.git (in different
         -- parent dirs) so they sanitize to the same target dir "repo".
         let parentA = srcDir </> "a"
