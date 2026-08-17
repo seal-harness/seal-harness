@@ -46,6 +46,7 @@ module Seal.Channels.Loop
   , mkTabCloseNotifier
   , shouldAutoTab
   , isBgSlash
+  , isNewSlash
   , createConversationSession
   , createConversationSessionHeadless
   ) where
@@ -382,6 +383,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
         Just ms -> do
           let key = convKey ms
               bgRoute = isBgSlash body
+              newRoute = isNewSlash body
           -- Resolve the conversation's session (create if first message).
           -- For a /bg command, take the headless path: the conversation needs
           -- an anchor session (its sid keys the bg runner's confirmation ask
@@ -396,10 +398,10 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
               case mMeta of
                 Just m  -> pure m
                 Nothing
-                  | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
+                  | bgRoute || newRoute -> createConversationSessionHeadless deps key (msChannelKind ms)
                   | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
             Nothing
-              | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
+              | bgRoute || newRoute -> createConversationSessionHeadless deps key (msChannelKind ms)
               | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
           let sid = smId meta
           -- Record the conversation's active session so the /bg runner
@@ -645,6 +647,16 @@ isBgSlash body =
     Right (Route.SlashCommand rest) ->
       let cmd = T.toCaseFold (T.takeWhile (/= ' ') rest)
       in cmd == "bg"
+    _ -> False
+-- | True when @body@ is a @\/new@ command (with or without args). Used by
+-- the loop's pre-routing session-resolution to take the headless path (no
+-- tab creation) — 'handleNewSession' will mint the session + insert the
+-- tab. Without this, the loop would create a conversation session + tab in
+-- the pre-routing, and 'handleNewSession' would create a second tab.
+isNewSlash :: Text -> Bool
+isNewSlash body =
+  case Route.route body of
+    Right (Route.NewSession _) -> True
     _ -> False
 
 -- | Push the current tab-list snapshot to WS subscribers (the web frontend
