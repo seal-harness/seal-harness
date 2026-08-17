@@ -19,6 +19,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     channel: null,
     channelUserId: null,
     lastUserMessageAt: null,
+    repoId: null,
     ...overrides,
   }
 }
@@ -46,6 +47,7 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -67,6 +69,7 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -87,6 +90,7 @@ describe('ActiveTabs', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -108,6 +112,7 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -224,6 +229,7 @@ describe('RunningHarnesses', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -242,6 +248,7 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -261,6 +268,7 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -559,6 +567,61 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.queryByTestId('tab-kind-idle-read')).toBeNull()
     // No backing session → no model suffix.
     expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Exited')
+  })
+})
+
+// ── Tab repo id in status line ────────────────────────────────────────
+
+describe('Sidebar — tab repo id in status line', () => {
+  it('renders the repo id before the model in the status line', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({ id: 's1', description: 'Repo tab', model: 'claude-sonnet-4-20250514', repoId: 'my-repo' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The status label shows "Idle Read·my-repo·sonnet-4" — the repo id
+    // appears between the status and the model.
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Idle Read·my-repo·sonnet-4')
+  })
+
+  it('omits the repo id when the session has no associated repo', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({ id: 's1', description: 'No repo tab', model: 'claude-sonnet-4-20250514', repoId: null })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // No repo id → the status line is "Idle Read·sonnet-4" (unchanged).
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Idle Read·sonnet-4')
   })
 })
 

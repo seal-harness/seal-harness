@@ -67,7 +67,7 @@ spec = describe "Seal.Session.Store" $ do
               saveSessionMeta paths SessionMeta
                 { smId = sid, smProvider = "anthropic", smModel = "m"
                 , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-                , smDescription = Nothing
+                , smDescription = Nothing, smRepo = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })

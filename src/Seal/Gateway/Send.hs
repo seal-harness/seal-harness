@@ -33,6 +33,7 @@ import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -116,7 +117,8 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
+import Seal.SourceControl.Repo (lookupRepoByUrl, RepoRegistry (..), repoIdText, normalizeRepoUrl, SourceRepo (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
@@ -124,7 +126,7 @@ import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Store (SessionRuntime (..), formatSessionId, updateSessionRepo)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
@@ -1102,7 +1104,24 @@ handleSetupRepo deps sid url =
             Right opRes ->
               if orIsError opRes
                 then pure (Left (opResultText opRes))
-                else pure (Right (opResultText opRes))
+                else do
+                  -- Persist the repo id (if the URL matches a registered
+                  -- repo) so the sidebar can display it. A bare-URL clone
+                  -- (unregistered public repo) yields Nothing — the
+                  -- sidebar shows no repo id, matching the prior behavior.
+                  eRepos <- rrhList (sdRepoReg deps)
+                  let mRepoId = case eRepos of
+                        Right repos -> fmap (repoIdText . srId)
+                                        (lookupRepoByUrl (normalizeRepoUrl cleanUrl)
+                                                          (RepoRegistry (Map.fromList [(srId r, r) | r <- repos])))
+                        Left _ -> Nothing
+                  _ <- updateSessionRepo (sdPaths deps) sid mRepoId
+                  -- Broadcast a lists snapshot so the sidebar picks up
+                  -- the new repo id without a page refresh.
+                  case sdBroker deps of
+                    Just broker -> broadcastListsSnapshot broker (sdTabsHandle deps) (sdPaths deps)
+                    Nothing     -> pure ()
+                  pure (Right (opResultText opRes))
 
 -- | Join the text parts of an 'OpResult' into a single message (the
 -- clone/no-op/conflict/failure text from SETUP_REPO).

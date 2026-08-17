@@ -76,7 +76,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     firstMessageSnippet: null,
     channel: null,
     channelUserId: null,
-    lastUserMessageAt: null,
+    lastUserMessageAt: null, repoId: null,
     ...overrides,
   }
 }

@@ -19,6 +19,7 @@ module Seal.Session.Store
   , updateSessionAgent
   , updateSessionSystemOverride
   , updateSessionDescription
+  , updateSessionRepo
   , SessionRuntime (..)
   ) where
 
@@ -84,7 +85,7 @@ newSessionMeta _paths provider model channel mAgent = do
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
-    , smDescription = Nothing
+    , smDescription = Nothing, smRepo = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -354,3 +355,24 @@ parseAgentFileId content =
   in case fmLookup "id" fm of
        Just t | not (T.null (T.strip t)) -> Just (T.strip t)
        _                                 -> Nothing
+
+-- | Update the associated repo id for a session. Set to 'Just' when
+-- 'SETUP_REPO' succeeds and the cloned URL matches a registered repo;
+-- 'Nothing' leaves it untouched (the caller can clear it in a follow-up
+-- if desired). Returns 'False' when the session's @session.json@ can't
+-- be found or parsed; 'True' on a successful write. Only touches
+-- 'smRepo' — all other fields are preserved.
+updateSessionRepo :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepo paths sid mRepo = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smRepo = mRepo }
+          saveSessionMeta paths next
+          pure True

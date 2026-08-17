@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- | The on-disk session metadata record ('session.json'). Holds the session's
 -- selected provider label + model id (never a key), its channel of origin, the
--- bound agent definition (if any — set at init from @default_agent@), and
+-- bound agent definition (if any — set at init from @default_agent@), the
+-- associated source-control repo id (if any — set when SETUP_REPO succeeds),
 -- timestamps. The 'FromJSON' is tolerant (missing 'channel' defaults to
 -- @\"cli\"@, missing 'agent' defaults to 'Nothing') so older/partial files
 -- still load.
@@ -44,6 +45,13 @@ data SessionMeta = SessionMeta
     -- @session.json@ so it survives restarts and propagates to the
     -- sidebar (which reads the live session list, not a client-side
     -- override).
+  , smRepo :: Maybe Text
+    -- ^ The repo id of the source-control repo associated with this
+    -- session (set when 'SETUP_REPO' succeeds and the cloned URL matches
+    -- a registered repo). 'Nothing' when no repo is associated (the
+    -- session was created without the \"set up repo\" combo box, or the
+    -- cloned URL was not in the repo registry). Persisted to
+    -- @session.json@ so the sidebar can display it.
   , smCreatedAt  :: UTCTime
   , smLastActive :: UTCTime
   } deriving stock (Eq, Show)
@@ -58,6 +66,7 @@ instance ToJSON SessionMeta where
     , "system_override" .= smSystemOverride m
     , "agent_name"  .= smAgentName m
     , "description" .= smDescription m
+    , "repo"        .= smRepo m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
     ]
@@ -72,5 +81,6 @@ instance FromJSON SessionMeta where
     <*> o .:? "system_override"
     <*> o .:? "agent_name"
     <*> o .:? "description"
+    <*> o .:? "repo"
     <*> o .:  "created_at"
     <*> o .:  "last_active"
