@@ -56,7 +56,9 @@ import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
+import Data.Foldable (for_)
 import Data.Text (Text)
+import Data.Aeson (object, (.=))
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
@@ -79,10 +81,11 @@ import Seal.Channel.Cli
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
-  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll, newCursorStore )
+  ( CursorStore, cursorLookup, cursorSet, cursorClearAll, newCursorStore )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
-import Seal.Command.Call (CallDispatcher, callCommandSpec)
+import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.New (NewArgs (..), parseNewArgs)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Command.Tab (TabCloseNotifier)
@@ -159,7 +162,7 @@ import Seal.Session.Store
   , resolveDefaultAgent, saveSessionMeta )
 import Seal.Tabs
   ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
-  , renameTabH, rebindTabH, snapshotTabs )
+  , renameTabH, snapshotTabs )
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs, lookupByRef )
@@ -442,8 +445,8 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                     Just t  -> chSend h (renderCurrentTab t)
                     Nothing -> chSend h "no current tab"
                   loop h reg bgConvSid
-                Right Route.NewSession -> do
-                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
+                Right (Route.NewSession args) -> do
+                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta args key askReply
                   loop h reg bgConvSid
                 Right (Route.SlashCommand _) -> do
                   d <- ingest reg chain (RawInbound body)
@@ -513,47 +516,59 @@ loadChannelLabel paths sid = do
       mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
       pure (smChannel <$> mMeta)
 
--- | Handle @\/new@ on an inbox channel: mint a fresh session from config
--- defaults, rebind the conversation's current tab (if any) to the new sid,
--- migrate every OTHER conversation cursor pointing at the old ref to the
--- new ref (per the user's "a tab has one session at a time; all channels
--- focused on the tab follow the rebind" model), and send the confirmation
--- line. The old session is kept on disk (still in @/session list@).
+-- | Handle @\/new [args]@ on an inbox channel: parse the optional
+-- @-p@\/@-m@\/@-r@ flags, mint a fresh session (using the old session's
+-- provider/model as defaults when not overridden), insert a NEW tab into
+-- the shared 'TabsHandle', set the conversation's cursor to the new tab,
+-- optionally clone a repo via SETUP_REPO, and send the confirmation line.
+-- The old session is kept on disk (still in @/session list@).
 --
--- Mirrors the CLI's @\/new@ path but lives at the loop level because the
--- conversation key + cursor aren't available to a registry CommandAction
--- (architect review issue C). The fresh @meta@ is NOT used to run a turn —
--- the next inbound message's cursor lookup resolves to the new session
--- automatically (the cursor migrate ensures that).
+-- This creates a new tab (matching the web "Start a new tab" form), NOT a
+-- rebind. The conversation's cursor moves to the new tab; the old tab
+-- remains in the tab list for other channels/web that may be focused on
+-- it.
+--
+-- Lives at the loop level because the conversation key + cursor aren't
+-- available to a registry 'CommandAction' (architect review issue C). The
+-- fresh @meta@ is NOT used to run a turn -- the next inbound message's
+-- cursor lookup resolves to the new session automatically (the cursor-set
+-- ensures that).
 handleNewSession
   :: ChannelDeps -> ChannelHandle -> TabsHandle
-  -> ChannelKind -> SessionMeta -> IO ()
-handleNewSession deps h tabsH kind oldMeta = do
-  -- Preserve the old session's provider/model/agent (so mid-session
-  -- /model use changes survive /new). The new session gets a fresh id +
-  -- timestamps; everything else is copied from the old meta.
+  -> ChannelKind -> SessionMeta -> Text -> (Text, Text) -> AskReplyStore -> IO ()
+handleNewSession deps h tabsH kind oldMeta argsText key askReply = do
   let channelLabel = channelKindToText kind
       oldSid = smId oldMeta
-      oldRef = BoundSession oldSid
-  newMeta <- newSessionMeta (cdPaths deps) (smProvider oldMeta) (smModel oldMeta)
+      args = parseNewArgs argsText
+      provider = fromMaybe (smProvider oldMeta) (naProvider args)
+      model    = fromMaybe (smModel oldMeta) (naModel args)
+  newMeta <- newSessionMeta (cdPaths deps) provider model
                             channelLabel (smAgent oldMeta)
   saveSessionMeta (cdPaths deps) newMeta
-  -- Rebind the tab (if any) bound to the old sid to the new sid.
-  snap <- snapshotTabs tabsH
-  case [ t | t <- tlTabs snap, tRef t == oldRef ] of
-    []       -> pure ()  -- no tab bound to old sid; cursor-only swap below
-    (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
-      Left e  -> chSend h ("warning: /new tab rebind failed: " <> e)
-      Right _ -> broadcastTabs deps tabsH
-  -- Migrate every conversation cursor pointing at the old ref to the new
-  -- ref (includes THIS conversation's cursor). Per the user's model: a tab
-  -- has one session at a time; all channels focused on it follow the
-  -- rebind to the new session.
-  _count <- cursorMigrateAll (cdCursors deps) oldRef (BoundSession (smId newMeta))
-  -- Migrate reply subscriptions from the old session to the new one so
-  -- future fan-outs (including tab-close notifications) reach attached
-  -- channels under the new session id.
-  _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
+  -- Insert a NEW tab bound to the new session (matching the web "Start a
+  -- new tab" form). The old tab stays in the list for other channels/web.
+  r <- insertTabH tabsH (BoundSession (smId newMeta)) KindAi Nothing
+  case r of
+    Left e  -> chSend h ("warning: /new tab insert failed: " <> e)
+    Right _ -> do
+      broadcastTabs deps tabsH
+      -- Set THIS conversation's cursor to the new tab so subsequent
+      -- messages route to the new session.
+      cursorSet (cdCursors deps)
+        key
+        (BoundSession (smId newMeta))
+      -- Migrate reply subscriptions from the old session to the new one so
+      -- future fan-outs (including tab-close notifications) reach attached
+      -- channels under the new session id.
+      _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
+      -- Optionally clone a repo into the new session's workdir.
+      for_ (naRepo args) $ \repoUrl -> do
+        sidRef <- newIORef (smId newMeta)
+        let dispatcher = channelCallDispatcher deps h askReply sidRef
+        eRes <- dispatcher (OpName "SETUP_REPO") (object ["url" .= repoUrl])
+        case eRes of
+          Left dErr -> chSend h ("repo setup failed: " <> renderDispatchError dErr)
+          Right _   -> pure ()
   chSend h
     ("new session " <> sessionIdText (smId newMeta)
        <> " (" <> smProvider newMeta <> "/" <> smModel newMeta <> ")"

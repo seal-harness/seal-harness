@@ -40,10 +40,13 @@ spec = describe "Seal.Routing.Route" $ do
     it "/vault setup -> SlashCommand vault (with args)" $
       route "/vault setup" `shouldBe` Right (SlashCommand "vault setup")
 
-  describe "/new" $ do
-    it "/new -> NewSession" $ route "/new" `shouldBe` Right NewSession
-    it "/new with trailing args still NewSession (args ignored by the route)" $
-      route "/new anything" `shouldBe` Right NewSession
+  describe "/new (carries args)" $ do
+    it "/new -> NewSession with empty args" $
+      route "/new" `shouldBe` Right (NewSession "")
+    it "/new anything -> NewSession carrying args" $
+      route "/new anything" `shouldBe` Right (NewSession "anything")
+    it "/new -p anthropic -> NewSession carrying flags" $
+      route "/new -p anthropic" `shouldBe` Right (NewSession "-p anthropic")
     it "/newbot -> SlashCommand (not NewSession; /new must be alone or space-delimited)" $
       route "/newbot" `shouldBe` Right (SlashCommand "newbot")
 

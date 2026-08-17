@@ -166,7 +166,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
                     Just t  -> chSend h (renderTab t)
                     Nothing -> chSend h "no current tab"
                   loop h handleCaps
-                Right Seal.Routing.Route.NewSession -> do
+                Right (Seal.Routing.Route.NewSession _args) -> do
                   -- /new is registered as a CommandSpec in the registry
                   -- (this standalone loop tracks "current" via srActive, not
                   -- a cursor). Fall through to the registry path.

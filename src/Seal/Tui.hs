@@ -40,8 +40,9 @@ import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
-import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
-import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+import Seal.Tabs (newTabsHandle, insertTabH)
+import Seal.Tabs.Types (TabRef (..))
+import Seal.Handles.Tab (TabKind (..))
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
 
@@ -139,30 +140,25 @@ runTui autonomy logger = do
   -- routes through askHuman, and the CLI loop delivers the next input line
   -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
   askReply <- newAskReplyStore 0
-  -- The /new command: mints a fresh session, swaps srActive, and rebinds the
-  -- tab (if any) bound to the old sid to the new sid. The ndRebind closure
-  -- reads the old sid from srActive BEFORE swapping, rebinds the matching
-  -- tab in TabsHandle, then writes the new meta to srActive, and returns
-  -- the old sid so the confirmation line can name it.
+  -- The /new command: mints a fresh session and inserts a new tab into
+  -- the TabsHandle. The ndInsertTab closure reads the old sid from
+  -- srActive BEFORE swapping, inserts a new tab bound to the new session,
+  -- then writes the new meta to srActive, and returns the old sid so the
+  -- confirmation line can name it. No repo setup in the standalone CLI
+  -- (no dispatcher wired).
   let newDeps = NewDeps
         { ndPaths = paths
         , ndCfg = pure cfg
         , ndAgentDefs = backends
         , ndChannelLabel = "cli"
         , ndOldMeta = readIORef activeRef
-        , ndRebind = \_caps newMeta -> do
+        , ndInsertTab = \_caps newMeta -> do
             oldMeta <- readIORef activeRef
             let oldSid = smId oldMeta
-            -- Rebind the tab (if any) bound to the old sid to the new sid.
-            -- At most one tab can match by I2.
-            snap <- snapshotTabs tabsH
-            case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-              []       -> pure ()  -- no tab bound to old sid; just swap srActive
-              (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
-                Left e  -> putStrLn ("warning: /new tab rebind failed: " <> T.unpack e)
-                Right _ -> pure ()
+            _ <- insertTabH tabsH (BoundSession (smId newMeta)) KindProvider Nothing
             writeIORef activeRef newMeta
             pure oldSid
+        , ndSetupRepo = Nothing
         }
   repoReg <- mkRepoRegistryHandle (reposFilePath paths)
   let registry = mkRegistry

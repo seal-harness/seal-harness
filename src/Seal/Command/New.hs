@@ -1,14 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
--- | The @/new@ command: start a fresh session in the current tab.
+-- | The @/new@ command: start a fresh session in a new tab.
 --
--- @/new@ mints a new 'SessionMeta' from the config defaults (same path as
--- 'initSession'/'createConversationSession'/'handleTabNew') and rebinds the
--- current tab to the new session's id. The old session is kept on disk,
--- untouched — still listed in @/session list@, still resumable with
--- @/tab resume <id>@. No new tab is inserted, no tab is closed.
---
--- This is the user's "fresh conversation in the current window" affordance —
--- distinct from @/tab new@, which opens a new tab.
+-- @/new@ mints a new 'SessionMeta' from the config defaults (or from
+-- optional @-p@\/@-m@ overrides) and inserts a new tab into the
+-- 'TabsHandle' — the same action the web frontend's "Start a new tab"
+-- form performs. The old session (if any) is kept on disk, untouched —
+-- still listed in @\/session list@, still resumable with @\/tab resume
+-- \<id\>@. When @-r@\/@--repo@ is given, the repo is cloned into the
+-- new session's workdir via SETUP_REPO before the first turn (same as
+-- the web form's "Set up repo" field).
 --
 -- == Channel wiring
 --
@@ -23,11 +23,17 @@ module Seal.Command.New
   , newCommandSpec
   , renderNewConfirmation
   , mintNewSession
+  , NewArgs (..)
+  , parseNewArgs
+  , emptyNewArgs
   ) where
 
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
-import Options.Applicative (ParserInfo, info, helper, progDesc, header, (<**>))
+import Data.Text qualified as T
+import Options.Applicative
+  ( Parser, ParserInfo, info, helper, progDesc, header, optional, short, long
+  , strOption, metavar, help, (<**>) )
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli (Backends (..))
@@ -41,31 +47,64 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
 
--- | The deps a channel needs to run @/new@. Built once at startup; the
--- 'ndRebind' callback is the seam where each channel plugs in its "current
--- tab" mutation.
+-- | Optional arguments for @/new@. All fields are 'Maybe' — 'Nothing' means
+-- "use the config default" (for provider/model) or "no repo" (for repo).
+data NewArgs = NewArgs
+  { naProvider :: Maybe Text
+  , naModel    :: Maybe Text
+  , naRepo     :: Maybe Text
+  } deriving stock (Eq, Show)
+
+-- | The empty 'NewArgs' — no overrides, use all config defaults.
+emptyNewArgs :: NewArgs
+emptyNewArgs = NewArgs { naProvider = Nothing, naModel = Nothing, naRepo = Nothing }
+
+-- | Parse the raw argument text from the routing layer into 'NewArgs'.
+-- This is a simple manual parse used by the inbox-channel loop path
+-- ('Seal.Channels.Loop.handleNewSession'), which doesn't go through
+-- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@, and
+-- @-r@\/@--repo@ with a single value each. Unknown flags are ignored.
+parseNewArgs :: Text -> NewArgs
+parseNewArgs raw =
+  go (splitArgs raw) emptyNewArgs
+  where
+    go [] acc = acc
+    go (flag : val : rest) acc
+      | flag `elem` ["-p", "--provider"] = go rest acc { naProvider = Just val }
+      | flag `elem` ["-m", "--model"]    = go rest acc { naModel    = Just val }
+      | flag `elem` ["-r", "--repo"]     = go rest acc { naRepo     = Just val }
+      | otherwise                        = go (val : rest) acc
+    go (_flag : rest) acc = go rest acc
+
+    -- Split on whitespace, preserving non-empty tokens.
+    splitArgs t = case T.words t of
+      [] -> []
+      ws -> ws
+
+-- | The deps a channel needs to run @/new@. Built once at startup.
 --
--- 'ndRebind' receives the freshly-minted 'SessionMeta' AND the old sid
--- (read by the closure from the channel's active-session ref BEFORE the
--- swap), plus the 'ChannelCaps' to send any per-channel diagnostic. It is
--- responsible for: (1) swapping the active-session ref to the new meta,
--- (2) rebinding the matching tab (if any) in the 'TabsHandle' to the new
--- sid, and (3) returning the old sid (so the caller can render the
--- confirmation line naming it). Returning the old sid from 'ndRebind'
--- avoids ordering ambiguity (architect review issue D): the closure reads
--- the old sid, swaps the ref, rebinds the tab, and hands back the old sid
--- in one callback.
+-- 'ndInsertTab' is the seam where each channel plugs in its tab-insertion
+-- + active-session-swap logic. It receives the freshly-minted
+-- 'SessionMeta' and the 'ChannelCaps', inserts a new tab bound to the new
+-- session, swaps the active-session ref to the new meta, and returns the
+-- old sid (so the caller can render the confirmation line naming it).
 data NewDeps = NewDeps
   { ndPaths        :: SealPaths
   , ndCfg          :: IO RuntimeConfig
   , ndAgentDefs    :: Backends
   , ndChannelLabel :: Text
   , ndOldMeta      :: IO SessionMeta
-    -- ^ Read the current (pre-swap) active session. Used to preserve the
-    -- old session's provider/model/agent in the freshly-minted session
-    -- (so @\/model use@ changes survive @\/new@).
-  , ndRebind        :: ChannelCaps -> SessionMeta -> IO SessionId
-    -- ^ Swap active-session ref + rebind the current tab; return the old sid.
+    -- ^ Read the current (pre-swap) active session. Used to (a) determine
+    -- the old sid for the confirmation line, and (b) as the source of
+    -- default provider/model when no overrides are given.
+  , ndInsertTab     :: ChannelCaps -> SessionMeta -> IO SessionId
+    -- ^ Insert a new tab bound to the new session, swap the active-session
+    -- ref, and return the old sid.
+  , ndSetupRepo    :: Maybe (SessionId -> Text -> IO (Either Text Text))
+    -- ^ Optional repo-setup seam. When 'Just', the @/new@ command calls it
+    -- with the new session id + repo URL to clone a repo into the session
+    -- workdir (dispatching SETUP_REPO). 'Nothing' in contexts without a
+    -- dispatcher (standalone CLI, tests).
   }
 
 -- | The @/new@ command spec. Grouped under Sessions in @/help@. Always
@@ -75,50 +114,82 @@ newCommandSpec deps = CommandSpec
   { csName         = CommandName "new"
   , csAliases      = []
   , csGroup        = GroupSession
-  , csSynopsis     = "Start a fresh session in the current tab (vs /tab new, which opens a new tab)"
+  , csSynopsis     = "Start a new tab with a fresh session (optional -p/-m/-r overrides)"
   , csParserInfo   = newParserInfo deps
   , csAvailability = AlwaysAvailable
   }
 
 newParserInfo :: NewDeps -> ParserInfo CommandAction
 newParserInfo deps =
-  info (pure (newCmd deps) <**> helper)
-    (  progDesc "Start a fresh session in the current tab"
-    <> header   "new — start a fresh session in the current tab (old session kept in /session list)"
+  info (newCmd deps <$> optional providerOpt <*> optional modelOpt <*> optional repoOpt <**> helper)
+    (  progDesc "Start a new tab with a fresh session"
+    <> header   "new — start a new tab with a fresh session (old session kept in /session list)"
     )
 
--- | The @/new@ action: read the old session, mint a fresh session that
--- preserves the old provider/model/agent, call 'ndRebind' (which swaps the
--- active-session ref + rebinds the tab + returns the old sid), and send the
--- confirmation line.
-newCmd :: NewDeps -> CommandAction
-newCmd deps = CommandAction $ \caps -> do
+providerOpt :: Parser Text
+providerOpt = strOption
+  (  long "provider"
+  <> short 'p'
+  <> metavar "PROVIDER"
+  <> help "Provider override (default: config default)"
+  )
+
+modelOpt :: Parser Text
+modelOpt = strOption
+  (  long "model"
+  <> short 'm'
+  <> metavar "MODEL"
+  <> help "Model override (default: config default)"
+  )
+
+repoOpt :: Parser Text
+repoOpt = strOption
+  (  long "repo"
+  <> short 'r'
+  <> metavar "REPO"
+  <> help "Repo URL to clone into the session (default: none)"
+  )
+
+-- | The @/new@ action: read the old session, mint a fresh session using
+-- the given args (or config defaults when not specified), insert a new
+-- tab, optionally clone a repo, and send the confirmation line.
+newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
+newCmd deps mProvider mModel mRepo = CommandAction $ \caps -> do
   oldMeta <- ndOldMeta deps
-  meta <- mintNewSessionFrom oldMeta deps
-  oldSid <- ndRebind deps caps meta
+  let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
+  meta <- mintNewSessionWith args oldMeta deps
+  oldSid <- ndInsertTab deps caps meta
+  case (naRepo args, ndSetupRepo deps) of
+    (Just repoUrl, Just setupFn) -> do
+      eRes <- setupFn (smId meta) repoUrl
+      case eRes of
+        Left err -> ccSend caps ("repo setup failed: " <> err)
+        Right _  -> pure ()
+    _ -> pure ()
   ccSend caps (renderNewConfirmation meta oldSid)
 
--- | Mint a fresh 'SessionMeta' that preserves the old session's
--- provider/model/agent (so mid-session @\/model use@ changes survive
--- @\/new@). The new session gets a fresh id + timestamps; everything else
--- is copied from the old meta. Persisted to disk via 'newSession' so
--- @/session list@ picks it up. Shared by the registry path (CLI/web) and
--- the loop-level inbox path.
-mintNewSessionFrom :: SessionMeta -> NewDeps -> IO SessionMeta
-mintNewSessionFrom oldMeta deps =
-  newSession (ndPaths deps) (smProvider oldMeta) (smModel oldMeta)
-             (ndChannelLabel deps) (smAgent oldMeta)
+-- | Mint a fresh 'SessionMeta' using the given args, falling back to the
+-- old session's provider/model when no override is given (so mid-session
+-- @\/model use@ changes survive @\/new@), and ultimately to config
+-- defaults. Persisted to disk via 'newSession' so @/session list@ picks it
+-- up. Shared by the registry path (CLI/web) and the loop-level inbox path.
+mintNewSessionWith :: NewArgs -> SessionMeta -> NewDeps -> IO SessionMeta
+mintNewSessionWith args oldMeta deps =
+  newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta)
+  where
+    provider = fromMaybe (smProvider oldMeta) (naProvider args)
+    model    = fromMaybe (smModel oldMeta) (naModel args)
 
--- | Mint a fresh 'SessionMeta' from the config defaults. Kept for callers
--- that genuinely want config defaults (none today, but reserved for the
--- bare-session "Recent Sessions +" path which is a separate endpoint).
-mintNewSession :: NewDeps -> IO SessionMeta
-mintNewSession deps = do
+-- | Mint a fresh 'SessionMeta' from the config defaults (or the given
+-- overrides). Used when there is no "old session" to inherit from (e.g.
+-- the loop-level path on first conversation message).
+mintNewSession :: NewArgs -> NewDeps -> IO SessionMeta
+mintNewSession args deps = do
   cfg <- ndCfg deps
   (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs (ndAgentDefs deps)) cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
-      provider = fromMaybe cfgProv mProv
-      model    = fromMaybe cfgModel mModel
+      provider = fromMaybe (fromMaybe cfgProv mProv) (naProvider args)
+      model    = fromMaybe (fromMaybe cfgModel mModel) (naModel args)
   newSession (ndPaths deps) provider model (ndChannelLabel deps) mAgent
 
 -- | Render the one-line confirmation. Names the old session + resume hint
