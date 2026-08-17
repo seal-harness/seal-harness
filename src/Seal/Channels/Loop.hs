@@ -94,7 +94,7 @@ import Seal.Config.File
   , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
   , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sessionMetaPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -158,7 +158,7 @@ import Seal.Session.Lock
   , SessionLocks, newSessionLocks, withSessionLock )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( defaultSessionSelection, formatSessionId, newSessionMeta
+  ( autoBindRepoAgent, defaultSessionSelection, formatSessionId, newSessionMeta
   , resolveDefaultAgent, saveSessionMeta )
 import Seal.Tabs
   ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
@@ -813,13 +813,21 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
               uioEnv = seUIOEnv exec
           -- Workdir-aware skill backend: repo-local (SETUP_REPO) ⊕ user ⊕
           -- builtin, workdir-wins. Fail-closed on a workdir error.
+          -- Auto-bind the repo's default agent (from .agents/agents.md)
+          -- if the session has no agent bound yet. Mirrors the web
+          -- gateway's autoBindRepoAgent call (Send.hs). Re-load meta
+          -- after the (possible) bind so the agent resolution below
+          -- sees the updated smAgent.
+          autoBindRepoAgent wfs paths sid
+          mMetaAfterBind <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
+          let meta' = fromMaybe meta mMetaAfterBind
           workdirSkills <- SkillBackend.workdirSkillBackend wfs
           let sessionSkills = SkillBackend.tripleUnionSkillBackend workdirSkills (bSkills backends)
           -- Workdir-aware agent def backend: repo-local (.agents/) + user,
           -- workdir-wins. Fail-closed on a workdir error.
           workdirAgentDefs <- Def.workdirAgentDefBackend wfs
           let sessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs backends) }
-          mSystem <- case smAgent meta of
+          mSystem <- case smAgent meta' of
             Nothing  -> pure Nothing
             Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs sessionBackends) aid
           let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
