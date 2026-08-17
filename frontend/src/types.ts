@@ -57,6 +57,11 @@ export interface SessionInfo {
    *  or no user message. Used by the sidebar to sort the Active Tabs list
    *  (oldest last-user-message first within each status bucket). */
   lastUserMessageAt: string | null
+  /** The id of the repository cloned into the session's workdir via
+   *  SETUP_REPO (the registered repo id, or the sanitized repo name for a
+   *  bare-URL clone), or null when no repo is associated. Surfaced in the
+   *  Active Tabs status line before the model. */
+  repo: string | null
 }
 
 /** Cascade used to pick the display title for a session.

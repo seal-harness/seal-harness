@@ -19,6 +19,7 @@ module Seal.Session.Store
   , updateSessionAgent
   , updateSessionSystemOverride
   , updateSessionDescription
+  , updateSessionRepo
   , SessionRuntime (..)
   ) where
 
@@ -84,7 +85,7 @@ newSessionMeta _paths provider model channel mAgent = do
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
     , smSystemOverride = Nothing, smAgentName = Nothing
-    , smDescription = Nothing
+    , smDescription = Nothing, smRepo = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
@@ -341,6 +342,35 @@ updateSessionDescription paths sid mDesc = do
           pure True
   where
     normalized = case mDesc of
+      Just t
+        | not (T.null (T.strip t)) -> Just t
+        | otherwise                -> Nothing
+      Nothing                      -> Nothing
+
+-- | Update (or clear) the repository id associated with a session. Called
+-- after a successful @SETUP_REPO@ to persist the cloned repo's id (the
+-- registered 'RepoId' text, or the sanitized repo name for a bare-URL
+-- clone) so the sidebar can surface it without re-reading the transcript.
+-- 'Nothing' clears the association. A blank\/all-whitespace string is
+-- normalized to 'Nothing'. Returns 'False' when the session's
+-- @session.json@ can't be found or parsed; 'True' on a successful write.
+-- Only touches 'smRepo' — all other fields are preserved.
+updateSessionRepo :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepo paths sid mRepo = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smRepo = normalized }
+          saveSessionMeta paths next
+          pure True
+  where
+    normalized = case mRepo of
       Just t
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing

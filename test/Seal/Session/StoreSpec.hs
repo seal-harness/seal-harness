@@ -23,7 +23,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, initSession, listSessions
-  , newSession, saveSessionMeta )
+  , newSession, saveSessionMeta, updateSessionRepo )
 
 mkPaths :: FilePath -> SealPaths
 mkPaths root = SealPaths
@@ -67,7 +67,7 @@ spec = describe "Seal.Session.Store" $ do
               saveSessionMeta paths SessionMeta
                 { smId = sid, smProvider = "anthropic", smModel = "m"
                 , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-                , smDescription = Nothing
+                , smDescription = Nothing, smRepo = Nothing
                 , smCreatedAt = aTime, smLastActive = la }
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })
@@ -141,3 +141,31 @@ spec = describe "Seal.Session.Store" $ do
         smAgent m    `shouldBe` Nothing
         smProvider m `shouldBe` "anthropic"
         smModel m    `shouldBe` "claude-opus-4-8"
+
+  describe "updateSessionRepo" $ do
+    it "sets smRepo on an existing session and persists it" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        smRepo m `shouldBe` Nothing
+        ok <- updateSessionRepo paths (smId m) (Just "seal-harness")
+        ok `shouldBe` True
+        [persisted] <- listSessions paths
+        smRepo persisted `shouldBe` Just "seal-harness"
+
+    it "preserves the other fields when setting smRepo" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+        m <- newSession paths "anthropic" "claude-opus-4-8" "cli" Nothing
+        _ <- updateSessionRepo paths (smId m) (Just "myrepo")
+        [persisted] <- listSessions paths
+        smProvider persisted `shouldBe` "anthropic"
+        smModel persisted    `shouldBe` "claude-opus-4-8"
+        smChannel persisted  `shouldBe` "cli"
+
+    it "returns False when the session does not exist" $
+      withSystemTempDirectory "seal-sess" $ \root -> do
+        let paths = mkPaths root
+            badSid = fromRight (error "invalid sid") (Seal.Core.Types.mkSessionId "20260701-120000-999")
+        ok <- updateSessionRepo paths badSid (Just "x")
+        ok `shouldBe` False

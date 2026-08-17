@@ -370,7 +370,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           , smAgent = Nothing
           , smSystemOverride = Nothing
           , smAgentName = Nothing
-          , smDescription = Nothing
+          , smDescription = Nothing, smRepo = Nothing
           , smCreatedAt = error "unused"
           , smLastActive = error "unused"
           }

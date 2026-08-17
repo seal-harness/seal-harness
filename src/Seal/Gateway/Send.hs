@@ -25,7 +25,7 @@ module Seal.Gateway.Send
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Exception (bracket)
-import Control.Monad (unless, when)
+import Control.Monad (void, unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
@@ -96,7 +96,7 @@ import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult, 
 import Seal.Providers.Class
   ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
 import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Repo (setupRepoOp, validateRepoUrl)
+import Seal.ISA.Ops.Repo (setupRepoOp, setupRepoPersistId, validateRepoUrl)
 import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.Process (processManageOp)
@@ -116,7 +116,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, b
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
@@ -124,7 +124,7 @@ import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (ensureSessionWorkdir, mkSessionUntrustedIO)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId)
+import Seal.Session.Store (SessionRuntime (..), formatSessionId, updateSessionRepo)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
@@ -811,7 +811,27 @@ webCallDispatcher deps callOpName val = do
         -- here — their results surface via the turn's normal entry flow.
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
-          then recordSetupRepoResult tHandle callOpName val r (Just "web")
+          then do
+            recordSetupRepoResult tHandle callOpName val r (Just "web")
+            -- Persist the associated repo id into session.json so the
+            -- sidebar can surface it without re-reading the transcript.
+            -- Resolves the registered RepoId when the url matches a
+            -- registered repo (falling back to the target dir name for a
+            -- bare-URL clone). Best-effort: a registry lookup or persistence
+            -- failure must not mask the clone result the user just saw.
+            eRepos <- rrhList (Clone.cdRepoReg cloneDeps)
+            let mRepoId = case eRepos of
+                  Right repos -> setupRepoPersistId val r repos
+                  Left _      -> Nothing
+            case mRepoId of
+              Just repoId -> void (updateSessionRepo paths sid (Just repoId))
+              Nothing     -> pure ()
+            -- The session.json change updates the /api/lists snapshot (the
+            -- repo field on SessionInfo), so broadcast a lists-changed frame
+            -- so the sidebar re-fetches and renders the repo id live.
+            case sdBroker deps of
+              Just broker -> broadcastListsSnapshot broker (sdTabsHandle deps) paths
+              Nothing     -> pure ()
           else if opNm == "GIT_PUSH"
             then recordGitPushResult tHandle callOpName val r (Just "web")
             else recordSkillLoadResult tHandle callOpName val r (Just "web")

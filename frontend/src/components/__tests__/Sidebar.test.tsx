@@ -19,6 +19,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     channel: null,
     channelUserId: null,
     lastUserMessageAt: null,
+    repo: null,
     ...overrides,
   }
 }
@@ -45,6 +46,7 @@ describe('ActiveTabs', () => {
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -66,6 +68,7 @@ describe('ActiveTabs', () => {
         selectedId="tab:0"
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -86,6 +89,7 @@ describe('ActiveTabs', () => {
         selectedId={null}
         tabLabel={() => 'x'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
@@ -107,6 +111,7 @@ describe('ActiveTabs', () => {
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
@@ -223,6 +228,7 @@ describe('RunningHarnesses', () => {
         selectedId={null}
         tabLabel={() => 'x'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -241,6 +247,7 @@ describe('RunningHarnesses', () => {
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -260,6 +267,7 @@ describe('RunningHarnesses', () => {
         selectedId={null}
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
+        tabRepo={() => ''}
         tabAgeText={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -480,6 +488,39 @@ describe('Sidebar — tab status indicator', () => {
     expect(document.querySelector('.dot-thinking')).toBeTruthy()
     expect(screen.getByTestId('tab-kind-idle-unread')).toBeTruthy()
     expect(screen.getByTestId('tab-kind-idle-read')).toBeTruthy()
+  })
+
+  it('renders the repo id before the model in the tab status line when the session has a repo', () => {
+    const tabs = [
+      makeTab({ index: 0, kind: 'session:anthropic', session_id: 'with-repo' }),
+      makeTab({ index: 1, kind: 'session:anthropic', session_id: 'no-repo' }),
+    ]
+    const tabSessions = [
+      makeSession({ id: 'with-repo', description: 'Has repo', repo: 'seal-harness' }),
+      makeSession({ id: 'no-repo', description: 'No repo', repo: null }),
+    ]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // with-repo: status · repo · model
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Idle Read·seal-harness·m')
+    // no-repo: status · model (unchanged — no repo segment)
+    expect(screen.getByTestId('tab-status-label-1').textContent).toBe('Idle Read·m')
   })
 
   it('sorts Active Tabs: Idle Unread → Idle Read → Thinking (oldest user msg first within bucket)', () => {

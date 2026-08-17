@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.RepoSpec (spec) where
 
+import Data.Aeson (object, (.=))
+import Data.Either (fromRight)
 import Data.IORef (newIORef)
 import Data.Text qualified as T
 import System.Directory
@@ -11,11 +13,17 @@ import System.Process (callProcess)
 import Test.Hspec
 
 import Seal.ISA.Ops.Repo
-  ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, validateRepoUrl )
+  ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl
+  , sanitizeRepoName, setupRepoPersistId, validateRepoUrl )
+import Seal.ISA.Opcode (OpResult (..))
+import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.SourceControl.Repo
+  ( RepoCredential (CredPat), SourceRepo (..), VcsKind (..)
+  , mkRepoId )
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
@@ -118,6 +126,45 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
 
     it "strips trailing slashes before deriving the name" $
       sanitizeRepoName "https://github.com/foo/bar/" `shouldBe` "bar"
+
+  describe "setupRepoPersistId" $ do
+    let -- a registered repo with id "seal-harness" and a matching url
+        regRepo = SourceRepo
+          { srId = fromRight (error "bad id") (mkRepoId "seal-harness")
+          , srUrl = "https://github.com/seal/seal-harness"
+          , srVcsKind = VcsGitHub
+          , srCredential = CredPat "GITHUB_PAT"
+          , srDeployKeyPublic = Nothing
+          , srKeyfilePath = Nothing
+          }
+        okResult = OpResult [TrpText "Cloned"] False (object ["target" .= ("seal-harness" :: T.Text), "status" .= ("cloned" :: T.Text)])
+        noopResult = OpResult [TrpText "no-op"] False (object ["target" .= ("seal-harness" :: T.Text), "status" .= ("noop" :: T.Text)])
+        conflictResult = OpResult [TrpText "conflict"] True (object ["target" .= ("seal-harness" :: T.Text), "status" .= ("conflict" :: T.Text)])
+        failedResult = OpResult [TrpText "fail"] True (object ["target" .= ("" :: T.Text), "status" .= ("failed" :: T.Text)])
+        inputUrl = object ["url" .= ("https://github.com/seal/seal-harness" :: T.Text)]
+
+    it "returns the registered RepoId when the url matches a registered repo (cloned)" $
+      setupRepoPersistId inputUrl okResult [regRepo] `shouldBe` Just "seal-harness"
+
+    it "returns the registered RepoId on a noop (idempotent re-clone)" $
+      setupRepoPersistId inputUrl noopResult [regRepo] `shouldBe` Just "seal-harness"
+
+    it "falls back to the target dir name when the url is NOT registered (bare-URL clone)" $ do
+      let bareInput = object ["url" .= ("https://example.com/other/repo" :: T.Text)]
+      setupRepoPersistId bareInput okResult [regRepo] `shouldBe` Just "seal-harness"
+
+    it "returns Nothing on a conflict (a different repo occupies the dir)" $
+      setupRepoPersistId inputUrl conflictResult [regRepo] `shouldBe` Nothing
+
+    it "returns Nothing on a failed clone" $
+      setupRepoPersistId inputUrl failedResult [regRepo] `shouldBe` Nothing
+
+    it "returns Nothing when the input has no url field" $
+      setupRepoPersistId (object []) okResult [regRepo] `shouldBe` Nothing
+
+    it "returns Nothing when the result has no target field" $ do
+      let noTarget = OpResult [TrpText "ok"] False (object ["status" .= ("cloned" :: T.Text)])
+      setupRepoPersistId inputUrl noTarget [regRepo] `shouldBe` Nothing
 
   describe "normalizeRepoUrl" $ do
     it "strips an https:// scheme, trailing .git, and lowercases" $
