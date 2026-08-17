@@ -42,6 +42,7 @@
 ## Backlog
 
 - #50 Per-session workdir + optional chroot isolation for untrusted opcodes
+- [ ] GitHub PAT support for repos — pass token to `gh` via env var (`GH_TOKEN`/`GITHUB_TOKEN`) in mode=remote; no unencrypted credentials ever written to disk
 - #40 On-demand opcode schema loading (config flag + OPCODE_DESCRIBE)
 - #5 Refine CONTRIBUTING.md as Phase 2 lands
 
@@ -60,4 +61,4 @@
 - [x] Haskell coder + reviewer skills wired (#84)
 - [x] Human-authorship rule added to CONTRIBUTING.md (#85)
 
-<!-- Last updated: 2026-08-15 by Zoe -->
+<!-- Last updated: 2026-08-17 by Seal session agent -->
