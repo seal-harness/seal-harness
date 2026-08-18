@@ -1,1 +1,59 @@
 packages: .
+
+-- The @trasa@ family + transitive @quantification@/@topaz@ have stale upper
+-- bounds and one GHC 9.10+ prim-op incompatibility. We pin the patched forks:
+--   * quantification + topaz -> mightybyte/quantification@37aee18
+--     ("Update to build with GHC 9.12"; upstream PR open)
+--   * trasa + trasa-server -> mightybyte/trasa@08a2403
+--     ("Update to build with GHC 9.12"; upstream PR pending)
+--   * trasa-openapi-hs -> mightybyte/trasa-openapi-hs@9648496
+--     (generates OpenAPI 3.1 from a trasa API; the §1a UC3 follow-up)
+-- haskell.nix honors @subdir:@ in source-repository-package (it fetches the
+-- repo root, builds a minimal repo, and rewrites the cabal.project to point
+-- at the subdir). Once both upstreams land their own GHC 9.12 fixes and cut
+-- releases, we drop these source-repository-package stanzas in favour of
+-- ordinary Hackage dependencies.
+source-repository-package
+  type: git
+  location: https://github.com/mightybyte/quantification.git
+  tag: 37aee1848936c3caf66e593880a45042326dc41b
+  subdir: quantification
+
+source-repository-package
+  type: git
+  location: https://github.com/mightybyte/quantification.git
+  tag: 37aee1848936c3caf66e593880a45042326dc41b
+  subdir: topaz
+
+source-repository-package
+  type: git
+  location: https://github.com/mightybyte/trasa.git
+  tag: 08a24037b64f757fee8edf6da08ab0905aae53da
+  subdir: trasa
+
+source-repository-package
+  type: git
+  location: https://github.com/mightybyte/trasa.git
+  tag: 08a24037b64f757fee8edf6da08ab0905aae53da
+  subdir: trasa-server
+
+source-repository-package
+  type: git
+  location: https://github.com/mightybyte/trasa-openapi-hs.git
+  tag: 96484960dd38187e92bad5405936c0c826f082ea
+
+-- openapi-hs-5.0.0 was uploaded to Hackage 2026-07-21, after haskell.nix's
+-- pinned Hackage index cutoff (2026-06-26). Source-pin until the flake's
+-- haskell.nix input is bumped to a newer hackage.nix.
+source-repository-package
+  type: git
+  location: https://github.com/shinzui/openapi-hs.git
+  tag: 06fc11713094bf39ac00353b052f4ded5a534567
+
+allow-newer:
+    trasa:*
+  , trasa-server:*
+  , trasa-openapi-hs:*
+  , quantification:*
+  , topaz:*
+  , http-media:*

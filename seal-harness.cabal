@@ -259,6 +259,11 @@ library
       , warp
       , websockets
       , case-insensitive
+      , trasa
+      , trasa-server
+      , trasa-openapi-hs
+      , openapi-hs
+      , http-media
     hs-source-dirs: src
 
 executable seal
