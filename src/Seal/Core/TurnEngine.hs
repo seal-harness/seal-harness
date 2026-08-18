@@ -77,12 +77,11 @@ import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.ISA.Dispatch
-  (DispatchError (..), dispatch, recordGitPushResult, recordSetupRepoResult,
+  (DispatchError (..), dispatch, recordSetupRepoResult,
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
-import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
 import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
 import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
 import Seal.ISA.Ops.Memory
@@ -237,9 +236,7 @@ buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy w
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
       , setupRepoOp cloneDeps wsRoot autonomy
-      , gitFetchOp cloneDeps wsRoot autonomy
-      , gitPullOp cloneDeps wsRoot autonomy
-      , gitPushOp cloneDeps wsRoot autonomy
+      , setupRepoOp cloneDeps wsRoot autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -311,9 +308,6 @@ buildChildRegistry rt cloneDeps backends childWsRoot childSid operatorCeiling
       , filePatchOp childWsRoot
       , shellExecOp childWsRoot securityPolicy
       , setupRepoOp cloneDeps childWsRoot autonomy
-      , gitFetchOp cloneDeps childWsRoot autonomy
-      , gitPullOp cloneDeps childWsRoot autonomy
-      , gitPushOp cloneDeps childWsRoot autonomy
       , binExecOp childWsRoot securityPolicy binAllowList
       , processManageOp childWsRoot securityPolicy
       , webFetchOp webFetchCfg
@@ -656,7 +650,7 @@ debugRequestsPath paths sid eCfg =
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or
 -- file is missing or undecodable. Used by 'callDispatcher' to stamp
--- channel origin into the SKILL_LOAD/GIT_PUSH transcript entry.
+-- channel origin into the SKILL_LOAD transcript entry.
 loadChannelLabel :: SealPaths -> SessionId -> IO (Maybe Text)
 loadChannelLabel paths sid = do
   mMeta <- loadSessionMeta paths sid
@@ -713,9 +707,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $
               autoBindRepoAgent wfs paths sid
             broadcastAgentDefsChanged (tdBroker td)
-          else if opNm == "GIT_PUSH"
-            then recordGitPushResult tHandle callOpName val r (Just channelLabel)
-            else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
+          else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
           Just meta -> broadcastNewEntries (tdBroker td) paths sid (smModel meta) (smCreatedAt meta)
           Nothing   -> pure ()
