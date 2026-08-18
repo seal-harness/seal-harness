@@ -1,0 +1,115 @@
+digraph LayeredHarness {
+    rankdir=TB;
+    fontname="Helvetica";
+    fontsize=11;
+    bgcolor="#1a1b26";
+    node [fontname="Helvetica", fontsize=10, style="filled,rounded"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ── Interaction Surfaces ──
+    subgraph cluster_surfaces {
+        label="Interaction Surfaces (Thin Adapters)";
+        style="filled,rounded";
+        fillcolor="#1f2937";
+        color="#495057";
+        penwidth=2;
+
+        web [label="Web SPA\n(React + Vite)", shape="box", fillcolor="#a5d8ff", color="#1971c2"];
+        tui [label="TUI\n(Haskeline)", shape="box", fillcolor="#b2f2bb", color="#2f9e44"];
+        telegram [label="Telegram\n(Telethon)", shape="box", fillcolor="#ffd8a8", color="#e8590c"];
+        signal [label="Signal\n(signal-cli)", shape="box", fillcolor="#ffd8a8", color="#e8590c"];
+    }
+
+    // ── REST API Layer ──
+    subgraph cluster_api {
+        label="REST API Layer (Single Implementation)";
+        style="filled,rounded";
+        fillcolor="#1a1b26";
+        color="#7048e8";
+        penwidth=2;
+
+        send [label="POST /api/sessions/:id/send\n(The single turn entry)", shape="box", fillcolor="#d0bfff", color="#7048e8", penwidth=2];
+        stop [label="POST /sessions/:id/stop", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+        transcript [label="GET /sessions/:id/transcript", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+        questions [label="Questions\n(ASK_HUMAN)", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+        tabs [label="Tabs CRUD", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+        agents [label="Agents/Skills/Repos\nCRUD", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+        ws [label="WS /stream\n(live updates)", shape="box", fillcolor="#d0bfff", color="#7048e8"];
+
+        // Invisible ordering
+        send -> stop -> transcript -> questions -> tabs -> agents -> ws [style=invis];
+    }
+
+    // ── Core Harness ──
+    subgraph cluster_core {
+        label="Core Harness (One Implementation Each)";
+        style="filled,rounded";
+        fillcolor="#1f2937";
+        color="#2f9e44";
+        penwidth=2;
+
+        turn_engine [label="Turn Engine\n(runTurn / dispatch)", shape="box", fillcolor="#b2f2bb", color="#2f9e44", penwidth=2];
+        isa_reg [label="ISA Registry\n(buildSessionRegistry)", shape="box", fillcolor="#b2f2bb", color="#2f9e44", penwidth=2];
+        session_mgr [label="Session Manager\n(meta + lock + cursor)", shape="box", fillcolor="#d3f9d8", color="#2f9e44"];
+        transcript_mgr [label="Transcript\n(two-file)", shape="cylinder", fillcolor="#c3fae8", color="#0c8599"];
+        sys_prompt [label="System Prompt\n(one resolver)", shape="box", fillcolor="#d3f9d8", color="#2f9e44"];
+        provider [label="Provider Resolve\n(vault-backed)", shape="box", fillcolor="#d3f9d8", color="#2f9e44"];
+
+        // Backends
+        skills [label="Skill Backend\n(workdir-aware)", shape="cylinder", fillcolor="#c3fae8", color="#0c8599"];
+        agent_defs [label="Agent Defs\n(workdir-aware)", shape="cylinder", fillcolor="#c3fae8", color="#0c8599"];
+        memory [label="Memory\n(markdown)", shape="cylinder", fillcolor="#c3fae8", color="#0c8599"];
+
+        // Ordering
+        turn_engine -> isa_reg [style=invis];
+        isa_reg -> session_mgr [style=invis];
+        session_mgr -> transcript_mgr [style=invis];
+        transcript_mgr -> sys_prompt [style=invis];
+        sys_prompt -> provider [style=invis];
+        provider -> skills [style=invis];
+        skills -> agent_defs [style=invis];
+        agent_defs -> memory [style=invis];
+    }
+
+    // ── Surface → API edges ──
+    web -> send [label="HTTP/WS", color="#1971c2", fontcolor="#1971c2"];
+    tui -> send [label="in-process", color="#2f9e44", fontcolor="#2f9e44", style=dashed];
+    telegram -> send [label="in-process\nor HTTP", color="#e8590c", fontcolor="#e8590c"];
+    signal -> send [label="in-process\nor HTTP", color="#e8590c", fontcolor="#e8590c"];
+
+    web -> ws [label="WS", color="#1971c2", fontcolor="#1971c2", style=dashed];
+    web -> tabs [label="HTTP", color="#1971c2", fontcolor="#1971c2", style=dashed];
+    web -> agents [label="HTTP", color="#1971c2", fontcolor="#1971c2", style=dashed];
+    web -> transcript [label="HTTP", color="#1971c2", fontcolor="#1971c2", style=dashed];
+    web -> questions [label="HTTP", color="#1971c2", fontcolor="#1971c2", style=dashed];
+
+    tui -> tabs [label="in-process", color="#2f9e44", fontcolor="#2f9e44", style=dashed];
+    tui -> questions [label="stdin", color="#2f9e44", fontcolor="#2f9e44", style=dashed];
+
+    telegram -> questions [label="inline\nkeyboard", color="#e8590c", fontcolor="#e8590c", style=dashed];
+    signal -> questions [label="next\nmessage", color="#e8590c", fontcolor="#e8590c", style=dashed];
+
+    // ── API → Core edges ──
+    send -> turn_engine [label="calls", color="#7048e8", fontcolor="#7048e8", penwidth=2];
+    send -> isa_reg [label="builds", color="#7048e8", fontcolor="#7048e8"];
+    send -> session_mgr [label="loads", color="#7048e8", fontcolor="#7048e8"];
+    send -> sys_prompt [label="resolves", color="#7048e8", fontcolor="#7048e8"];
+    send -> provider [label="resolves", color="#7048e8", fontcolor="#7048e8"];
+    send -> transcript_mgr [label="writes", color="#7048e8", fontcolor="#7048e8"];
+
+    turn_engine -> isa_reg [label="dispatches\nopcodes", color="#2f9e44", fontcolor="#2f9e44"];
+    turn_engine -> transcript_mgr [label="records", color="#2f9e44", fontcolor="#2f9e44"];
+    isa_reg -> skills [label="reads", color="#0c8599", fontcolor="#0c8599", style=dashed];
+    isa_reg -> agent_defs [label="reads", color="#0c8599", fontcolor="#0c8599", style=dashed];
+    isa_reg -> memory [label="reads/writes", color="#0c8599", fontcolor="#0c8599", style=dashed];
+
+    // ── Cross-cutting: ChannelCaps ──
+    caps [label="ChannelCaps\n(the ONLY medium-specific seam)\nccSend / ccPrompt / ccStreaming",
+          shape="note", fillcolor="#ffec99", color="#e67700", fontsize=9];
+
+    caps -> turn_engine [label="passed into", color="#e67700", fontcolor="#e67700", style=dotted];
+    tui -> caps [label="constructs", color="#e67700", fontcolor="#e67700", style=dotted];
+    telegram -> caps [label="constructs", color="#e67700", fontcolor="#e67700", style=dotted];
+    signal -> caps [label="constructs", color="#e67700", fontcolor="#e67700", style=dotted];
+    web -> caps [label="constructs", color="#e67700", fontcolor="#e67700", style=dotted];
+}
