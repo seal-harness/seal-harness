@@ -42,7 +42,7 @@ import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 
-import Seal.Agent.Def.Backend (AgentDefBackend, adbRead, workdirAgentDefBackend, unionAgentDefBackend)
+import Seal.Agent.Def.Backend (workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
@@ -59,7 +59,7 @@ import Seal.Config.File
   , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
-import Seal.Core.TurnEngine (buildSessionRegistry)
+import Seal.Core.TurnEngine (buildSessionRegistry, resolveSystemPrompt)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -75,7 +75,6 @@ import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
 import Seal.ISA.Ops.Agent (AgentStartWiring (..))
 import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Skills.Autoload (injectAutoloadSkill)
-import Seal.Skills.Backend (SkillBackend)
 import Seal.Skills.Backend qualified as Skill
 import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.Agent.PromptParts (injectStaticGuidance)
@@ -357,40 +356,6 @@ loadSessionMeta paths sid = do
 -- neither is set. The auto-loaded skill (default @seal-usage@, the
 -- fresh-workdir contract) is appended so the model is oriented to its
 -- per-session workspace from turn one. Disabled by setting
--- @[skills] autoload = ""@ in @config.toml@. The @\<available_skills\>@
--- catalog (a grouped listing of all skill ids + descriptions) is then
--- appended so the model discovers and uses skills; disabled by
--- @[skills] available_skills = false@.
-resolveSystemPrompt
-  :: AgentDefBackend
-  -> SkillBackend
-  -> Maybe Text
-  -- ^ The resolved auto-load skill id ('Nothing' disables injection).
-  -> Bool
-  -- ^ Whether to inject the @\<available_skills\>@ catalog.
-  -> Bool
-  -- ^ Whether to inject the parallel tool-call guidance block.
-  -> Bool
-  -- ^ Whether to inject the tool-use enforcement guidance block.
-  -> Bool
-  -- ^ Whether to inject the task-completion guidance block.
-  -> SessionMeta
-  -> IO (Maybe Text)
-resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
-                   parallel toolUse taskCompletion meta = do
-  base <- case smSystemOverride meta of
-    Just t | not (T.null (T.strip t)) -> pure (Just t)
-    _ -> case smAgent meta of
-           Nothing  -> pure Nothing
-           Just aid -> maybe Nothing adSystem <$> adbRead agentDefBackend aid
-  -- Order: static guidance (stable) → autoload body → available-skills
-  -- catalog (volatile, last) — cache-friendly.
-  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
-  withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
-  if injectCatalog
-    then injectAvailableSkills skillBackend withAutoload
-    else pure withAutoload
-
 -- | Run a plain (non-slash) turn through the agent loop. Mirrors
 -- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
 -- and uses the ask/reply-backed 'ChannelCaps' ('webAskCaps') so ASK_HUMAN

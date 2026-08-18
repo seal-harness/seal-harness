@@ -94,7 +94,7 @@ import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, session
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
-import Seal.Core.TurnEngine (buildSessionRegistry)
+import Seal.Core.TurnEngine (buildSessionRegistry, resolveSystemPrompt)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
@@ -780,19 +780,13 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
           -- workdir-wins. Fail-closed on a workdir error.
           workdirAgentDefs <- Def.workdirAgentDefBackend wfs
           let sessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs backends) }
-          mSystem <- case smAgent meta of
-            Nothing  -> pure Nothing
-            Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs sessionBackends) aid
           let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
               injectCatalog = either (const True) resolvedAvailableSkills eCfg
               parallel = either (const True) resolvedParallelToolGuidance eCfg
               toolUse = either (const True) resolvedToolUseEnforcement eCfg
               taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-              withGuidance = injectStaticGuidance parallel toolUse taskCompletion mSystem
-          mSystem' <- injectAutoloadSkill sessionSkills autoloadId withGuidance
-          mSystem'' <- if injectCatalog
-                         then injectAvailableSkills sessionSkills mSystem'
-                         else pure mSystem'
+          mSystem' <- resolveSystemPrompt (bAgentDefs sessionBackends) sessionSkills
+                       autoloadId injectCatalog parallel toolUse taskCompletion meta
           turnAbortFlag <- lookupOrCreateAbortFlag (cdAbortReg deps) sid
           let handleCaps = case mkCaps of
                 Nothing  -> mkHandleCaps h askReply askSid
@@ -824,7 +818,7 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
                   then Nothing
                   else Just (broadcastTabs deps (cdTabs deps))
           let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem'' isaReg tHandle uioEnv
+                       handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle uioEnv
                        (debugRequestsPath paths sid eCfg) autonomy approvals
                        (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
                        onDemand

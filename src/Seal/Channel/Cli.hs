@@ -58,7 +58,7 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Backends (Backends (..), newBackends)
-import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry)
+import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry, resolveSystemPrompt)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
@@ -425,20 +425,13 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       resolveSystem meta wfs = do
         workdirAgentDefs <- Def.workdirAgentDefBackend wfs
         let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
-        base <- case smAgent meta of
-          Nothing  -> pure Nothing
-          Just aid -> maybe Nothing adSystem <$> Def.adbRead sessionAgentDefs aid
         cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
         workdirSkills <- Skill.workdirSkillBackend wfs
         let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills skillBackend
-            withGuidance = injectStaticGuidance (resolvedParallelToolGuidance cfg)
-                                                (resolvedToolUseEnforcement cfg)
-                                                (resolvedTaskCompletionGuidance cfg)
-                                                base
-        withAutoload <- injectAutoloadSkill sessionSkills (resolvedAutoloadSkill cfg) withGuidance
-        if resolvedAvailableSkills cfg
-          then injectAvailableSkills sessionSkills withAutoload
-          else pure withAutoload
+        resolveSystemPrompt sessionAgentDefs sessionSkills
+          (resolvedAutoloadSkill cfg) (resolvedAvailableSkills cfg)
+          (resolvedParallelToolGuidance cfg) (resolvedToolUseEnforcement cfg)
+          (resolvedTaskCompletionGuidance cfg) meta
       -- The per-turn body: open the transcript for `sid`, build the ISA
       -- registry, run a turn under a `withTwoFileTranscript` bracket.
       -- Mirrors `runTurnOnSession` from `Seal.Channels.Loop`. Used by

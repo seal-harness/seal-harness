@@ -11,10 +11,17 @@
 module Seal.Core.TurnEngine
   ( buildSessionRegistry
   , buildChildRegistry
+  , resolveSystemPrompt
   ) where
 
+import Data.Maybe (fromMaybe)
+import Data.Text (Text)
+import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
 
+import Seal.Agent.Def.Backend qualified as Def
+import Seal.Agent.Def.Types (adSystem)
+import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.Paging (defaultPageParams)
@@ -39,7 +46,11 @@ import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Skills
 import Seal.ISA.Opcode (opName)
 import qualified Seal.ISA.Registry as ISA
+import Seal.Skills.Autoload (injectAutoloadSkill)
+import Seal.Skills.Backend qualified as Skill
+import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.Session.Kind (HarnessFlavour (..))
+import Seal.Session.Meta (SessionMeta (..))
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
   (AutonomyLevel, SecurityPolicy (..), AllowList (..))
@@ -63,6 +74,49 @@ unwrapOpt field webCfg deflt =
 -- default is 'Nothing'.
 unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
 unwrapOptMaybe = maybe Nothing
+
+-- | Resolve the system prompt for a session turn. This is the **single**
+-- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
+--
+-- The resolution pipeline:
+-- 1. If @smSystemOverride@ is set (non-empty), use it as the base.
+-- 2. Otherwise, read the bound agent's @adSystem@ from the workdir-aware
+--    agent-def backend.
+-- 3. Inject static guidance (parallel / tool-use / task-completion).
+-- 4. Inject the autoload skill body.
+-- 5. Inject the available-skills catalog (if enabled).
+--
+-- The flags ('autoloadId', 'injectCatalog', 'parallel', 'toolUse',
+-- 'taskCompletion') are passed as explicit args — the caller computes
+-- them from the loaded 'RuntimeConfig'. This matches the web path's
+-- existing convention and avoids re-reading config inside the resolver.
+resolveSystemPrompt
+  :: Def.AgentDefBackend
+  -> Skill.SkillBackend
+  -> Maybe Text
+  -- ^ The resolved auto-load skill id ('Nothing' disables injection).
+  -> Bool
+  -- ^ Whether to inject the @\<available_skills\>@ catalog.
+  -> Bool
+  -- ^ Whether to inject the parallel tool-call guidance block.
+  -> Bool
+  -- ^ Whether to inject the tool-use enforcement guidance block.
+  -> Bool
+  -- ^ Whether to inject the task-completion guidance block.
+  -> SessionMeta
+  -> IO (Maybe Text)
+resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
+                   parallel toolUse taskCompletion meta = do
+  base <- case smSystemOverride meta of
+    Just t | not (T.null (T.strip t)) -> pure (Just t)
+    _ -> case smAgent meta of
+           Nothing  -> pure Nothing
+           Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
+  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
+  withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
+  if injectCatalog
+    then injectAvailableSkills skillBackend withAutoload
+    else pure withAutoload
 
 -- | Build the ISA registry for a session turn. This is the **single**
 -- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
