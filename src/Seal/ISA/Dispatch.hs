@@ -21,7 +21,6 @@ module Seal.ISA.Dispatch
   , dispatch
   , recordSkillLoadResult
   , recordSetupRepoResult
-  , recordGitPushResult
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -295,39 +294,3 @@ recordToolError h name input toolErr timeoutMicros = do
             ]
         }
   tfwRecordAndAck h (TwoFileWrite [] entry)
--- 'EKHarness' transcript entry + a conversation message (mirrors
--- 'recordSetupRepoResult'). The audit is secret-free: the entry's
--- @erMeta@ carries @op.name@ + @input@ + @result.orRecorded@ (which
--- includes @credential_kind@ + @status@ — public strings, NOT the
--- secret). The dispatcher's pre-run ACK ('Dispatch.hs:66', fires for ALL
--- Untrusted opcodes) is the \"records-then-runs\" pre-run audit; this
--- function is the post-run result entry, called at the 3 dispatch sites
--- (Send.hs/Loop.hs/Cli.hs) AFTER @dispatch@ returns a successful 'Right'
--- for a @GIT_PUSH@. Records BOTH success and failure (a failed push is
--- the case the operator most needs to see in the transcript).
-recordGitPushResult :: TwoFileHandle -> OpName -> Value -> OpResult -> Maybe Text -> IO ()
-recordGitPushResult h (OpName nm) input result mChannel = do
-  now <- getCurrentTime
-  let channelMeta = case mChannel of
-        Just ch  -> [("channel", A.String ch)]
-        Nothing  -> []
-      entry = EntryRecord
-        { erId = ""
-        , erTimestamp = now
-        , erKind = EKHarness
-        , erConvLen = 0
-        , erEnvelope = Nothing
-        , erUsage = Nothing
-        , erStop = Nothing
-        , erDurationMs = Nothing
-        , erHarness = Nothing
-        , erCorrelation = Nothing
-        , erMeta = Map.fromList
-            ([ ("op", object ["name" .= OpName nm])
-             , ("input", input)
-             , ("result", orRecorded result)
-             ] <> channelMeta)
-        }
-      bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
-      convMsgs = [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
-  tfwRecordAndAck h (TwoFileWrite convMsgs entry)

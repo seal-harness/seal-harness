@@ -338,19 +338,3 @@ spec = describe "Seal.ISA.Dispatch" $ do
       case conv of
         [m] -> msgRole m `shouldBe` Assistant
         _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
-
-  describe "recordGitPushResult" $ do
-    it "writes the push result as an Assistant message (harness output, not user input)" $ do
-      (h, readState) <- fakeTwoFileTranscript
-      let bodyText :: Text
-          bodyText = "Pushed main to origin."
-      let result = OpResult
-            { orParts = [TrpText bodyText]
-            , orIsError = False
-            , orRecorded = object ["status" .= ("pushed" :: Text)]
-            }
-      recordGitPushResult h (OpName "GIT_PUSH") (object ["workdir" .= ("seal-harness" :: Text), "refspec" .= ("main" :: Text)]) result Nothing
-      (conv, _entries) <- readState
-      case conv of
-        [m] -> msgRole m `shouldBe` Assistant
-        _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
