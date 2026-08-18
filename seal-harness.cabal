@@ -43,6 +43,8 @@ library
         Seal.Core.MessageSource
         Seal.Core.Paging
         Seal.Core.Types
+        Seal.Core.TurnEngine
+        Seal.Core.Backends
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class

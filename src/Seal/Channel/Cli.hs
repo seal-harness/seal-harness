@@ -22,7 +22,6 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
-import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (getCurrentTime)
@@ -53,18 +52,19 @@ import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
-                          rcDebugSessionTranscript, rcDelegation, resolvedAutoloadSkill, resolvedAvailableSkills,
+                          rcDebugSessionTranscript, rcDelegation, rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills,
                           resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance,
                           toolTimeoutConfig)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
-import Seal.Core.Paging (defaultPageParams)
+import Seal.Core.Backends (Backends (..), newBackends)
+import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
-import Seal.Git.Repo (ConfigRepo (..))
 import Seal.Handles.Transcript
   ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Opcode (localBackend, opName)
+import Seal.ISA.Opcode (localBackend)
+import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
@@ -76,40 +76,18 @@ import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Tools.Exec.Abort (AbortFlag, SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Timeout (ToolTimeoutConfig, defaultToolTimeoutConfig)
-import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
-import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
-import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
-import Seal.ISA.Ops.Secret (secretGetOp)
-import qualified Seal.ISA.Registry as ISA
-import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
-import Seal.ISA.Ops.Agent
-  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
-  , agentInterruptOp, AgentStartWiring (..) )
-import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
-import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
-import Seal.ISA.Ops.Bin (binExecOp)
-import Seal.ISA.Ops.Process (processManageOp)
-import Seal.ISA.Ops.Search (searchFilesOp)
-import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.Memory.Backend qualified as Mem
+import Seal.ISA.Ops.Agent (AgentStartWiring (..))
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend qualified as Skill
 import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
-import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
 import Seal.Agent.Runtime.Delegation
-  ( DelegationConfig, defaultDelegationConfig, fromFileConfig
-  , SpawnPauseFlag, newSpawnPauseFlag
-  , ParentActivity, newParentActivity
+  ( fromFileConfig
   , ChildTask (..) )
 import Seal.Agent.Runtime.Delegation.Worker
-  ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
+  ( mkDelegateWorker, DelegationWorkerDeps (..) )
 import Seal.Providers.Class (SomeProvider (..))
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry (parseProvider, resolveProvider)
@@ -121,7 +99,7 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.Security.Policy (SecurityPolicy (..), AllowList (..), AutonomyLevel (..))
+import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
@@ -138,51 +116,8 @@ import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv, envLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
-
--- | The evolutionary-store backends + the in-process agent runtime, created
--- once at startup and shared between the command specs (which read them via
--- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). The three
--- store backends are disk-backed (Markdown files under @config\/@); disk is
--- canonical and git is the versioning + audit layer. The agent runtime is an
--- in-process STM registry (lifecycle only — not persisted). The delegation
--- knobs (config, pause flag, parent-activity cell) are process-global so
--- AGENT_START calls across all channels share one pause / heartbeat state.
-data Backends = Backends
-  { bMemory    :: Mem.MemoryBackend
-  , bSkills    :: Skill.SkillBackend
-  , bAgentDefs :: Def.AgentDefBackend
-  , bRuntime   :: AgentRuntime
-  , bDelegationConfig :: IO DelegationConfig
-    -- ^ Reload the [delegation] config per AGENT_START call (so config
-    -- changes take effect without a restart). The IO action reads
-    -- @config.toml@ and returns the resolved 'DelegationConfig'.
-  , bSpawnPauseFlag :: SpawnPauseFlag
-    -- ^ Process-global spawn-pause flag (operator can freeze new fan-out).
-  , bParentActivity :: ParentActivity
-    -- ^ Process-global parent-activity cell (heartbeat target).
-  }
-
--- | Construct the disk-backed backends for the given config repo. The three
--- stores read their directories on demand (no startup materialization needed
--- — disk is canonical, so @\/skill list@ etc. just enumerate the dir). The
--- delegation knobs are process-global; the config is re-read per AGENT_START
--- call so config changes take effect without a restart.
-newBackends :: FilePath -> ConfigRepo -> IO Backends
-newBackends cfgRoot repo = do
-  let skillsDir    = cfgRoot </> "skills"
-      agentsDir    = cfgRoot </> "agents"
-      memoryDir    = cfgRoot </> "memory"
-  rt          <- newAgentRuntime
-  pauseFlag   <- newSpawnPauseFlag
-  parentAct   <- newParentActivity
-  Backends
-    <$> Mem.markdownMemoryBackend memoryDir repo
-    <*> (Skill.unionSkillBackend <$> Skill.markdownSkillBackend skillsDir repo)
-    <*> Def.markdownAgentDefBackend agentsDir repo
-    <*> pure rt
-    <*> pure (pure defaultDelegationConfig)  -- overridden at call sites that have a config path
-    <*> pure pauseFlag
-    <*> pure parentAct
+import Seal.Harness.Registry (HarnessRegistry)
+import Seal.Harness.Tmux (TmuxRunner)
 
 -- | Map a 'Disposition' to its channel effect.
 --
@@ -301,8 +236,8 @@ onDemandFromCfg eCfg =
 runCliTui
   :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
-  -> AskReplyStore -> SealLogger -> IO ()
-runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger = do
+  -> AskReplyStore -> SealLogger -> HarnessRegistry -> TmuxRunner -> IO ()
+runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner = do
   approvals <- newApprovalCache
   abortReg <- newSessionAbortRegistry
   active0 <- readIORef (srActive sr)
@@ -310,6 +245,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
+      webCfg = either (const Nothing) rcWeb eCfg
       cloneDeps = Clone.CloneDeps
         { Clone.cdVault = rt
         , Clone.cdRepoReg = repoReg
@@ -382,8 +318,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
   -- canonical; git is the versioning + audit layer. No startup
   -- materialization is needed — the backends read their directories on
   -- demand.
-  let memoryBackend    = bMemory backends
-      skillBackend     = bSkills backends
+  let skillBackend     = bSkills backends
       agentDefBackend   = bAgentDefs backends
       agentRuntime      = bRuntime backends
       onDemand          = onDemandFromCfg eCfg
@@ -434,39 +369,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       cliChildRegistryBuilder _def childSid childCaps = do
         childExec <- mkSessionExecCli childSid
         let childWsRoot = seWorkspaceRoot childExec
-        let childBaseOps =
-              [ showHumanOp childCaps
-              , askHumanOp childCaps
-              , fileReadOp childWsRoot operatorCeiling
-              , secretGetOp rt
-              , memoryWriteOp memoryBackend childSid
-              , memoryRecallOp defaultPageParams memoryBackend
-              , memoryDeleteOp memoryBackend
-              , skillWriteOp skillBackend childSid
-              , skillLoadOp skillBackend
-              , skillListOp skillBackend
-              , skillDeleteOp skillBackend
-              , agentDefReadOp agentDefBackend
-              , agentDefListOp agentDefBackend
-              -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
-              -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
-              -- AGENT_INTERRUPT
-              , shellExecOp childWsRoot cliSecurityPolicy
-              , setupRepoOp cloneDeps childWsRoot autonomy
-              , gitFetchOp cloneDeps childWsRoot autonomy
-              , gitPullOp cloneDeps childWsRoot autonomy
-              , gitPushOp cloneDeps childWsRoot autonomy
-              , binExecOp childWsRoot cliSecurityPolicy binAllowList
-              , processManageOp childWsRoot cliSecurityPolicy
-              , fileWriteOp childWsRoot operatorCeiling
-              , filePatchOp childWsRoot
-              , searchFilesOp childWsRoot cliSecurityPolicy operatorCeiling
-              ]
-        pure (ISA.mkRegistry
-                (filterBlocklisted childBaseOps opName
-                   ++ if onDemand
-                        then [opcodeDescribeOp (ISA.mkRegistry []), opcodeListOp (ISA.mkRegistry [])]
-                        else []))
+        pure (buildChildRegistry rt cloneDeps backends childWsRoot childSid
+                operatorCeiling autonomy webCfg (Just (prManager pr)) childCaps)
       -- Build the AGENT_START wiring for a given parent sid. The worker
       -- builder is fixed across turns (it closes over the per-turn
       -- helpers above); only the parent sid varies.
@@ -502,51 +406,11 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           , aswParentDepth = 0
           , aswWorker = mkWorker
           }
-      -- Build the session's ISA registry for a given sid + caps + startWiring.
-      -- `caps'` is the ChannelCaps the showHuman/askHuman opcodes close over
-      -- (the main turn uses `caps`; the /bg runner uses `bgCaps` so bg-spawned
-      -- ASK_HUMAN routes through `askHuman` keyed to bgSid). The recursive
-      -- describe/list ops close over the registry they belong to (let-knot).
-      -- `tHandle` is NOT closed over here — the dispatcher threads it at call
-      -- time.
+      -- Build the session's ISA registry via the unified builder.
       cliIsaReg sid startWiring caps' wsRoot sessionBackends =
-        let reg = ISA.mkRegistry
-              (baseOps reg ++ if onDemand
-                                then [opcodeDescribeOp reg, opcodeListOp reg]
-                                else [])
-            baseOps _reg =
-              [ showHumanOp caps'
-              , askHumanOp caps'
-              , fileReadOp wsRoot operatorCeiling
-              , secretGetOp rt
-              , memoryWriteOp memoryBackend sid
-              , memoryRecallOp defaultPageParams memoryBackend
-              , memoryDeleteOp memoryBackend
-              , skillWriteOp skillBackend sid
-              , skillLoadOp skillBackend
-              , skillListOp skillBackend
-              , skillDeleteOp skillBackend
-              , agentDefWriteOp (bAgentDefs sessionBackends) sid
-              , agentDefReadOp (bAgentDefs sessionBackends)
-              , agentDefListOp (bAgentDefs sessionBackends)
-              , agentDefDeleteOp (bAgentDefs sessionBackends)
-              , agentInstancesOp agentRuntime
-              , agentStartOp startWiring
-              , agentStatusOp agentRuntime
-              , agentStopOp agentRuntime
-              , agentInterruptOp agentRuntime
-               , shellExecOp wsRoot cliSecurityPolicy
-               , setupRepoOp cloneDeps wsRoot autonomy
-               , gitFetchOp cloneDeps wsRoot autonomy
-               , gitPullOp cloneDeps wsRoot autonomy
-               , gitPushOp cloneDeps wsRoot autonomy
-               , binExecOp wsRoot cliSecurityPolicy binAllowList
-              , processManageOp wsRoot cliSecurityPolicy
-              , fileWriteOp wsRoot operatorCeiling
-              , filePatchOp wsRoot
-              , searchFilesOp wsRoot cliSecurityPolicy operatorCeiling
-              ]
-        in reg
+        buildSessionRegistry rt cloneDeps sessionBackends wsRoot sid
+          operatorCeiling autonomy webCfg startWiring harnessReg tmuxRunner
+          (Just (prManager pr)) caps' onDemand
       -- Resolve the bound agent's system prompt (re-read per turn; agent
       -- dirs are small). Nothing when no agent is bound or the def has no
       -- system prompt. The auto-loaded skill (default @seal-usage@, the
@@ -828,14 +692,8 @@ untrustedIOFromSecurity wsRoot cfg =
     _ = wsRoot  -- keep wsRoot referenced under the flag (unused when local absent)
 #endif
 
--- | The CLI security policy: allow all commands. The autonomy level is
--- threaded separately via 'aeAutonomy' (the operator-selected @--yolo@ vs
--- default 'Supervised'); the policy here gates command-name allow-listing
--- (orthogonal to the human-confirmation gate).
-cliSecurityPolicy :: SecurityPolicy
-cliSecurityPolicy = SecurityPolicy AllowAll Supervised
-
--- | The set of binaries BIN_EXEC may run (optional allow-list). 'Nothing'
--- disables the allow-list (any binary, subject only to the autonomy policy).
-binAllowList :: Maybe (Set Text)
-binAllowList = Nothing
+-- The CLI security policy and bin allow-list are now centralized in
+-- 'Seal.Core.TurnEngine.buildSessionRegistry' (the unified ISA registry
+-- builder). The CLI no longer defines its own 'cliSecurityPolicy' or
+-- 'binAllowList' — it passes 'autonomy' to the unified builder, which
+-- constructs 'Policy.SecurityPolicy Policy.AllowAll autonomy' internally.

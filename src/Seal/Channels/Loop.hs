@@ -39,7 +39,6 @@ module Seal.Channels.Loop
   , handleTabCommand
   , plainTurn
   , plainTurnWithCaps
-  , buildIsaRegistry
   , buildChannelRegistry
   , mkBgRunner
   , channelCallDispatcher
@@ -71,7 +70,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Agent.Runtime.Delegation
   ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
 import Seal.Agent.Runtime.Delegation.Worker
-  ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
+  ( mkDelegateWorker, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
@@ -88,14 +87,15 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
   , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
-import Seal.Core.Paging (defaultPageParams)
+import Seal.Core.TurnEngine (buildSessionRegistry)
+import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
@@ -107,32 +107,13 @@ import Seal.Handles.AskReply
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
 import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
-import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
-import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
+import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 import qualified Seal.ISA.Registry as ISA
-import Seal.ISA.Ops.Agent
-  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
-  , agentInterruptOp, AgentStartWiring (..) )
-import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Ops.Bin (binExecOp)
-import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
-import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
-import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
-import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
-import Seal.ISA.Ops.Process (processManageOp)
-import Seal.ISA.Ops.Search (searchFilesOp)
-import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Secret (secretGetOp)
-import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
-import Seal.ISA.Ops.Git (gitFetchOp, gitPullOp, gitPushOp)
-import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
+import Seal.ISA.Ops.Agent (AgentStartWiring (..))
+import Seal.ISA.Opcode (localBackend)
 import Seal.Routing.Route qualified as Route
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
@@ -146,9 +127,7 @@ import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Skills.Backend (SkillBackend)
 import Seal.Skills.Backend qualified as SkillBackend
-import qualified Seal.Security.Policy as Policy
-  ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
-import Seal.Session.Kind (HarnessFlavour (..))
+import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.Lock
   ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
   , replyFanoutMessage, replyMigrateAll
@@ -173,8 +152,6 @@ import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
-import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies a channel turn needs to have full parity with the web
@@ -824,7 +801,7 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
               startWiring = channelStartWiring
                 deps paths sid handleCaps uioEnv appEnv eCfg
                 wsroot operatorCeiling (smChannel meta) isaReg sessionBackends
-              isaReg = buildIsaRegistry
+              isaReg = buildSessionRegistry
                 rt cloneDeps sessionBackends wsroot sid operatorCeiling autonomy
                 (either (const Nothing) rcWeb eCfg)
                 startWiring
@@ -990,7 +967,7 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
         startWiring = channelStartWiring
           deps paths sid caps uioEnv appEnv eCfg
           wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg sessionBackends
-        isaReg = buildIsaRegistry
+        isaReg = buildSessionRegistry
           (cdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
           (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
           (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
@@ -1007,85 +984,6 @@ channelCallDispatcher deps h askReply sidRef callOpName val = do
       Left _  -> pure ()
     pure res
 
--- | Build the ISA registry for a channel turn. Mirrors
--- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set
--- as the web and CLI paths.
-buildIsaRegistry
-  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
-  -> Policy.AutonomyLevel
-  -> Maybe WebConfig
-  -> AgentStartWiring
-  -> HarnessRegistry
-  -> TmuxRunner
-  -> Maybe Manager
-  -> ChannelCaps
-  -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
-  -> ISA.Registry
-buildIsaRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                 startWiring harnessReg tmuxRunner httpManager caps onDemand =
-  reg
-  where
-    baseOps =
-      [ showHumanOp caps
-      , askHumanOp caps
-      , secretGetOp rt
-      , memoryWriteOp (bMemory backends) sid
-      , memoryRecallOp defaultPageParams (bMemory backends)
-      , memoryDeleteOp (bMemory backends)
-      , skillWriteOp (bSkills backends) sid
-      , skillLoadOp (bSkills backends)
-      , skillListOp (bSkills backends)
-      , skillDeleteOp (bSkills backends)
-      , agentDefWriteOp (bAgentDefs backends) sid
-      , agentDefReadOp (bAgentDefs backends)
-      , agentDefListOp (bAgentDefs backends)
-      , agentDefDeleteOp (bAgentDefs backends)
-      , agentInstancesOp (bRuntime backends)
-      , agentStartOp startWiring
-      , agentStatusOp (bRuntime backends)
-      , agentStopOp (bRuntime backends)
-      , agentInterruptOp (bRuntime backends)
-      , searchFilesOp wsRoot securityPolicy operatorCeiling
-      , fileReadOp wsRoot operatorCeiling
-      , fileWriteOp wsRoot operatorCeiling
-      , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
-      , gitFetchOp cloneDeps wsRoot autonomy
-      , gitPullOp cloneDeps wsRoot autonomy
-      , gitPushOp cloneDeps wsRoot autonomy
-      , binExecOp wsRoot securityPolicy binAllowList
-      , processManageOp wsRoot securityPolicy
-      , webFetchOp webFetchCfg
-      , webSearchOp webSearchCfg
-      , harnessListOp harnessReg
-      , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
-          HfGeneric newHarnessId
-      , harnessStopOp harnessReg tmuxRunner
-      ]
-    introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
-    reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
-    securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
-    binAllowList = Nothing
-    webSearchCfg = WebSearchConfig
-      { wscManager     = httpManager
-      , wscProvider    = parseProvider (unwrapOpt wcSearchProvider webCfg "parallel")
-      , wscEndpoint    = unwrapOpt wcSearchEndpoint webCfg ""
-      , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
-      , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
-      , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault       = Just rt
-      , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
-      }
-    webFetchCfg = WebFetchConfig
-      { wfcManager   = httpManager
-      , wfcAllowList = unwrapOpt wcFetchAllowList webCfg []
-      , wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling
-      , wfcAuthKey   = Nothing
-      }
-    harnessSession = either (error "unreachable: seal is a valid TmuxIdent") id (mkTmuxIdent "seal")
-    harnessWindow  = either (error "unreachable: harness is a valid TmuxIdent") id (mkTmuxIdent "harness")
-
 -- | Mint a fresh 'SessionId' for a forked agent instance.
 channelMintSession :: SessionId -> IO SessionId
 channelMintSession fallback = do
@@ -1096,20 +994,6 @@ channelMintSession fallback = do
 
 -- | Build the 'AgentStartWiring' for a channel turn. The wiring closes over
 -- the per-turn 'ChannelDeps' + parent session id + 'ChannelCaps' +
--- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
--- the default when the config section or the field is absent.
-unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
-unwrapOpt field webCfg agentDef =
-  case webCfg of
-    Nothing   -> agentDef
-    Just cfg  -> fromMaybe agentDef (field cfg)
-
--- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
--- section-absent case yields 'Nothing'; the section-present case yields the
--- field's value (which may itself be 'Nothing').
-unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
-unwrapOptMaybe = maybe Nothing
-
 -- 'UIOEnv' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
 -- child's narrowed registry). The worker-builder is 'channelMkWorker'
 -- (below), which runs 'runTurn' with the goal as the first user message and
@@ -1197,56 +1081,10 @@ channelMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorC
       eSecCfg <- loadSecurityConfig (securityFilePath paths)
       childExec <- either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
       let childWsRoot = seWorkspaceRoot childExec
-      let childBaseOps =
-            [ showHumanOp childCaps
-            , askHumanOp childCaps
-            , secretGetOp (cdVault deps)
-            , memoryWriteOp (bMemory (cdBackends deps)) childSid
-            , memoryRecallOp defaultPageParams (bMemory (cdBackends deps))
-            , memoryDeleteOp (bMemory (cdBackends deps))
-            , skillWriteOp (bSkills (cdBackends deps)) childSid
-            , skillLoadOp (bSkills (cdBackends deps))
-            , skillListOp (bSkills (cdBackends deps))
-            , skillDeleteOp (bSkills (cdBackends deps))
-            , agentDefReadOp (bAgentDefs (cdBackends deps))
-            , agentDefListOp (bAgentDefs (cdBackends deps))
-            -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
-            -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
-            -- AGENT_INTERRUPT
-            , searchFilesOp childWsRoot securityPolicy operatorCeiling
-            , fileReadOp childWsRoot operatorCeiling
-            , fileWriteOp childWsRoot operatorCeiling
-            , filePatchOp childWsRoot
-            , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childCloneDeps childWsRoot (cdAutonomy deps)
-            , gitFetchOp childCloneDeps childWsRoot (cdAutonomy deps)
-            , gitPullOp childCloneDeps childWsRoot (cdAutonomy deps)
-            , gitPushOp childCloneDeps childWsRoot (cdAutonomy deps)
-            , binExecOp childWsRoot securityPolicy binAllowList
-            , processManageOp childWsRoot securityPolicy
-            , webFetchOp webFetchCfg
-            , webSearchOp webSearchCfg
-            ]
-      pure (ISA.mkRegistry (filterBlocklisted childBaseOps opName))
-      where
-        securityPolicy = Policy.SecurityPolicy Policy.AllowAll (cdAutonomy deps)
-        binAllowList = Nothing
-        childWebCfg = either (const Nothing) rcWeb eCfg
-        webFetchCfg = WebFetchConfig
-          { wfcManager = cdHttpManager deps
-          , wfcAllowList = unwrapOpt wcFetchAllowList childWebCfg []
-          , wfcMaxBytes = unwrapOpt wcMaxFetchBytes childWebCfg operatorCeiling
-          , wfcAuthKey = Nothing }
-        webSearchCfg = WebSearchConfig
-          { wscManager = cdHttpManager deps
-          , wscProvider = parseProvider (unwrapOpt wcSearchProvider childWebCfg "parallel")
-          , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
-          , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
-          , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
-          , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
-          , wscVault = Just (cdVault deps)
-          , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
-          }
+          childWebCfg = either (const Nothing) rcWeb eCfg
+      pure (TurnEngine.buildChildRegistry (cdVault deps) childCloneDeps (cdBackends deps)
+              childWsRoot childSid operatorCeiling (cdAutonomy deps)
+              childWebCfg (cdHttpManager deps) childCaps)
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing

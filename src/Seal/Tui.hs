@@ -44,6 +44,8 @@ import Seal.Tabs (newTabsHandle, rebindTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
+import Seal.Harness.Registry (newHarnessRegistry)
+import Seal.Harness.Tmux (mkRealTmuxRunner)
 
 -- | Open the vault if both recipient and identity are configured.
 -- Failures print a warning and return 'Nothing' so the TUI still starts;
@@ -176,4 +178,6 @@ runTui autonomy logger = do
         , terseGrammarSpec
         , newCommandSpec newDeps
         ]
-  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger
+  harnessReg <- newHarnessRegistry
+  tmuxRunner <- mkRealTmuxRunner
+  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner
