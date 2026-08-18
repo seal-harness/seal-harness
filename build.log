@@ -1,0 +1,49 @@
+warning: Git tree '/Users/zoe/tmp/seal-harness' is dirty
+Using saved setting for 'extra-substituters = https://cache.iog.io https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk= seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo=' from ~/.local/share/nix/trusted-settings.json.
+evaluation warning: Nixpkgs 26.05 will be the last release to support x86_64-darwin; see https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.05
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: license "LicenseRef-FSL-1.1-MIT" not found
+Build profile: -w ghc-9.12.4 -O1
+In order, the following will be built (use -v for more details):
+ - seal-harness-0.1.0.0 (test:tests) (file test/Seal/Channel/CliSpec.hs changed)
+Preprocessing test suite 'tests' for seal-harness-0.1.0.0...
+Building test suite 'tests' for seal-harness-0.1.0.0...
+[125 of 168] Compiling Seal.Channel.WiringSpec ( test/Seal/Channel/WiringSpec.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Seal/Channel/WiringSpec.o ) [Seal.Channel.Cli changed]
+[126 of 168] Compiling Seal.Channel.CliSpec ( test/Seal/Channel/CliSpec.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Seal/Channel/CliSpec.o ) [Source file changed]
+[131 of 168] Compiling Seal.Gateway.SendSpec ( test/Seal/Gateway/SendSpec.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Seal/Gateway/SendSpec.o ) [Seal.Channel.Cli changed]
+[132 of 168] Compiling Seal.Channels.LoopSpec ( test/Seal/Channels/LoopSpec.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Seal/Channels/LoopSpec.o ) [Seal.Channel.Cli changed]
+[140 of 168] Compiling Seal.Gateway.ApiSpec ( test/Seal/Gateway/ApiSpec.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Seal/Gateway/ApiSpec.o ) [Seal.Channel.Cli changed]
+[168 of 168] Compiling Main             ( test/Main.hs, dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests-tmp/Main.o ) [Seal.Channel.CliSpec changed]
+[169 of 169] Linking dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/build/tests/tests [Objects changed]

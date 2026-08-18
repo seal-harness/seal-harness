@@ -48,7 +48,7 @@ import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), TurnEnv (..), mkSessionAgentEnv, resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
@@ -448,17 +448,29 @@ plainTurn deps meta t = do
                   (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                   (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                   caps onDemand
-                env = mkSessionAgentEnv
-                  caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
-                  (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-                  (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                  onDemand
-                  (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
-                  Nothing
-                  "web"
-                  (Just (replyFanout (sdReplies deps) sid))
-                  turnAbortFlag
-                  (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
+                env = mkSessionAgentEnv TurnEnv
+                  { teCaps          = caps
+                  , teProvider      = prov
+                  , teProviderLabel = smProvider meta
+                  , teModel         = model
+                  , teSession       = sid
+                  , teSystem        = mSystem
+                  , teRegistry      = isaReg
+                  , teTranscript    = tHandle
+                  , teUioEnv        = uioEnv
+                  , teDebugReqPath  = debugPath (sdPaths deps) sid eCfg
+                  , teAutonomy      = sdAutonomy deps
+                  , teApprovals     = sdApprovals deps
+                  , teOnEntry       = broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+                  , teOnDemand      = onDemand
+                  , teLogPath       = Just (sessionLogPath paths sid)
+                  , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
+                  , teOnUserMessage = Nothing
+                  , teChannel       = "web"
+                  , teOnStop        = Just (replyFanout (sdReplies deps) sid)
+                  , teAbortFlag     = turnAbortFlag
+                  , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+                  }
             tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
             result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
               runApp appEnv (runTurn env t)
@@ -583,17 +595,29 @@ plainTurnWithCaps deps meta caps t = do
                 (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
                 (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
                 caps onDemand
-              env = mkSessionAgentEnv
-                caps prov (smProvider meta) model sid mSystem isaReg tHandle uioEnv
-                (debugPath (sdPaths deps) sid eCfg) (sdAutonomy deps) (sdApprovals deps)
-                (broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                onDemand
-                (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg)
-                Nothing
-                "web"
-                (Just (replyFanout (sdReplies deps) sid))
-                turnAbortFlag
-                (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
+              env = mkSessionAgentEnv TurnEnv
+                { teCaps          = caps
+                , teProvider      = prov
+                , teProviderLabel = smProvider meta
+                , teModel         = model
+                , teSession       = sid
+                , teSystem        = mSystem
+                , teRegistry      = isaReg
+                , teTranscript    = tHandle
+                , teUioEnv        = uioEnv
+                , teDebugReqPath  = debugPath (sdPaths deps) sid eCfg
+                , teAutonomy      = sdAutonomy deps
+                , teApprovals     = sdApprovals deps
+                , teOnEntry       = broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+                , teOnDemand      = onDemand
+                , teLogPath       = Just (sessionLogPath paths sid)
+                , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
+                , teOnUserMessage = Nothing
+                , teChannel       = "web"
+                , teOnStop        = Just (replyFanout (sdReplies deps) sid)
+                , teAbortFlag     = turnAbortFlag
+                , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+                }
           tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
           result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
             runApp appEnv (runTurn env t)

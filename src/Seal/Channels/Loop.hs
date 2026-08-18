@@ -74,7 +74,7 @@ import Seal.Agent.Runtime.Delegation.Worker
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), mkSessionAgentEnv
+  ( Backends (..), TurnEnv (..), mkSessionAgentEnv
   , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
@@ -817,19 +817,30 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
                 if shouldAutoTab meta
                   then Nothing
                   else Just (broadcastTabs deps (cdTabs deps))
-          let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem' isaReg tHandle uioEnv
-                       (debugRequestsPath paths sid eCfg) autonomy approvals
-                       (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                       onDemand
-                       (Just (sessionLogPath paths sid))
-                       (either (const defaultMaxTurns) maxTurnsConfig eCfg)
-                       onUserMessage
-                       (smChannel meta)
-                       (Just (replyFanout (cdReplies deps) sid))
-                       turnAbortFlag
-                       (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
-                      { aeMessageSource = mSrc }
+          let env = (mkSessionAgentEnv TurnEnv
+                       { teCaps          = handleCaps
+                       , teProvider      = prov
+                       , teProviderLabel = smProvider meta
+                       , teModel         = model
+                       , teSession       = sid
+                       , teSystem        = mSystem'
+                       , teRegistry      = isaReg
+                       , teTranscript    = tHandle
+                       , teUioEnv        = uioEnv
+                       , teDebugReqPath  = debugRequestsPath paths sid eCfg
+                       , teAutonomy      = autonomy
+                       , teApprovals     = approvals
+                       , teOnEntry       = broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta)
+                       , teOnDemand      = onDemand
+                       , teLogPath       = Just (sessionLogPath paths sid)
+                       , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
+                       , teOnUserMessage = onUserMessage
+                       , teChannel       = smChannel meta
+                       , teOnStop        = Just (replyFanout (cdReplies deps) sid)
+                       , teAbortFlag     = turnAbortFlag
+                       , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+                       })
+                     { aeMessageSource = mSrc }
           eResult <- withExceptionLogging (cdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
             runApp appEnv (runTurn env t)
           case eResult of

@@ -1,0 +1,38 @@
+warning: Git tree '/Users/zoe/tmp/seal-harness' is dirty
+Using saved setting for 'extra-substituters = https://cache.iog.io https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk= seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo=' from ~/.local/share/nix/trusted-settings.json.
+evaluation warning: Nixpkgs 26.05 will be the last release to support x86_64-darwin; see https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.05
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: license "LicenseRef-FSL-1.1-MIT" not found
+No hints

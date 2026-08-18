@@ -9,6 +9,7 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , resolveDefProvider
+  , TurnEnv (..)
   , mkSessionAgentEnv
   , debugRequestsPath
   , untrustedIOFromSecurity
@@ -170,38 +171,62 @@ resolveDefProvider pr providerLabel model =
       mh <- readIORef (vrHandleRef (prVault pr))
       fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
 
--- | Build the per-turn 'AgentEnv' for a session's selected provider+model.
-mkSessionAgentEnv
-  :: ChannelCaps -> SomeProvider -> Text -> ModelId -> SessionId
-  -> Maybe Text -> ISA.Registry -> TwoFileHandle -> UIOEnv
-  -> Maybe FilePath -> AutonomyLevel -> ApprovalCache -> IO () -> Bool
-  -> Maybe FilePath -> Int -> Maybe (IO ()) -> Text -> Maybe (Text -> IO ())
-  -> AbortFlag -> ToolTimeoutConfig
-  -> AgentEnv
-mkSessionAgentEnv caps provider provLabel model sid system isaReg tHandle uioEnv debugReqPath autonomy approvals onEntry onDemand logPath maxTurns onUserMessage channel onStop abortFlag toolTimeout = AgentEnv
-  { aeProvider   = provider
-  , aeProviderLabel = provLabel
-  , aeModel      = model
-  , aeSystem     = system
-  , aeRegistry   = isaReg
-  , aeTranscript = tHandle
+-- | A parameter object bundling the per-turn inputs to 'mkSessionAgentEnv'.
+-- The 22 positional arguments are collected into one record so call sites
+-- construct it with named-field syntax (no positional-counting mistakes)
+-- and future additions are a one-field change. This is the W3 step-1
+-- mechanical refactor: no behavior change, just argument bundling.
+data TurnEnv = TurnEnv
+  { teCaps          :: ChannelCaps
+  , teProvider      :: SomeProvider
+  , teProviderLabel :: Text
+  , teModel         :: ModelId
+  , teSession       :: SessionId
+  , teSystem        :: Maybe Text
+  , teRegistry      :: ISA.Registry
+  , teTranscript    :: TwoFileHandle
+  , teUioEnv        :: UIOEnv
+  , teDebugReqPath  :: Maybe FilePath
+  , teAutonomy      :: AutonomyLevel
+  , teApprovals     :: ApprovalCache
+  , teOnEntry       :: IO ()
+  , teOnDemand      :: Bool
+  , teLogPath       :: Maybe FilePath
+  , teMaxTurns      :: Int
+  , teOnUserMessage :: Maybe (IO ())
+  , teChannel       :: Text
+  , teOnStop        :: Maybe (Text -> IO ())
+  , teAbortFlag     :: AbortFlag
+  , teToolTimeout   :: ToolTimeoutConfig
+  }
+
+-- | Build the per-turn 'AgentEnv' from a 'TurnEnv'. Replaces the 22-argument
+-- positional constructor. All fields come from the parameter object.
+mkSessionAgentEnv :: TurnEnv -> AgentEnv
+mkSessionAgentEnv te = AgentEnv
+  { aeProvider   = teProvider te
+  , aeProviderLabel = teProviderLabel te
+  , aeModel      = teModel te
+  , aeSystem     = teSystem te
+  , aeRegistry   = teRegistry te
+  , aeTranscript = teTranscript te
   , aeBackend    = localBackend
-  , aeUIOEnv     = uioEnv
-  , aeCaps       = caps
-  , aeSession    = sid
-  , aeMaxTurns   = maxTurns
-  , aeChannel    = channel
+  , aeUIOEnv     = teUioEnv te
+  , aeCaps       = teCaps te
+  , aeSession    = teSession te
+  , aeMaxTurns   = teMaxTurns te
+  , aeChannel    = teChannel te
   , aeMessageSource = Nothing
-  , aeAutonomy   = autonomy
-  , aeApprovals  = approvals
-  , aeDebugRequestsPath = debugReqPath
-  , aeOnEntry    = onEntry
-  , aeOnUserMessage = onUserMessage
-  , aeOnStop     = onStop
-  , aeOnDemandSchemas = onDemand
-  , aeLogPath    = logPath
-  , aeAbortFlag  = abortFlag
-  , aeToolTimeout = toolTimeout
+  , aeAutonomy   = teAutonomy te
+  , aeApprovals  = teApprovals te
+  , aeDebugRequestsPath = teDebugReqPath te
+  , aeOnEntry    = teOnEntry te
+  , aeOnUserMessage = teOnUserMessage te
+  , aeOnStop     = teOnStop te
+  , aeOnDemandSchemas = teOnDemand te
+  , aeLogPath    = teLogPath te
+  , aeAbortFlag  = teAbortFlag te
+  , aeToolTimeout = teToolTimeout te
   }
 
 -- | Resolve the optional debug-requests path from the loaded config. When
@@ -502,10 +527,29 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
             Right (prov, mdl) -> do
               mSystem <- resolveSystem meta bgWfs
               bgAbortFlag <- lookupOrCreateAbortFlag abortReg bgSid
-              let env = mkSessionAgentEnv bgCaps prov (smProvider meta) mdl bgSid mSystem bgIsaReg bgTHandle (seUIOEnv bgExec)
-                    (debugRequestsPath paths bgSid eCfg) autonomy approvals (pure ()) onDemand
-                    (Just (sessionLogPath paths bgSid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-                    "cli" Nothing bgAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg)
+              let env = mkSessionAgentEnv TurnEnv
+                    { teCaps          = bgCaps
+                    , teProvider      = prov
+                    , teProviderLabel = smProvider meta
+                    , teModel         = mdl
+                    , teSession       = bgSid
+                    , teSystem        = mSystem
+                    , teRegistry      = bgIsaReg
+                    , teTranscript    = bgTHandle
+                    , teUioEnv        = seUIOEnv bgExec
+                    , teDebugReqPath  = debugRequestsPath paths bgSid eCfg
+                    , teAutonomy      = autonomy
+                    , teApprovals     = approvals
+                    , teOnEntry       = pure ()
+                    , teOnDemand      = onDemand
+                    , teLogPath       = Just (sessionLogPath paths bgSid)
+                    , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
+                    , teOnUserMessage = Nothing
+                    , teChannel       = "cli"
+                    , teOnStop        = Nothing
+                    , teAbortFlag     = bgAbortFlag
+                    , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+                    }
               runApp appEnv (runTurn env prompt)))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher, stopCommandSpec abortReg sr])
       -- The /call dispatcher: dispatch an opcode against the active
@@ -546,10 +590,29 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           exec <- mkSessionExecCli sid
           turnAbortFlag <- lookupOrCreateAbortFlag abortReg sid
           handlePlain
-            (mkSessionAgentEnv caps prov (smProvider meta) model sid mSystem isaReg tHandle (seUIOEnv exec)
-               (debugRequestsPath paths sid eCfg) autonomy approvals (pure ()) onDemand
-               (Just (sessionLogPath paths sid)) (either (const defaultMaxTurns) maxTurnsConfig eCfg) Nothing
-               "cli" Nothing turnAbortFlag (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
+            (mkSessionAgentEnv TurnEnv
+               { teCaps          = caps
+               , teProvider      = prov
+               , teProviderLabel = smProvider meta
+               , teModel         = model
+               , teSession       = sid
+               , teSystem        = mSystem
+               , teRegistry      = isaReg
+               , teTranscript    = tHandle
+               , teUioEnv        = seUIOEnv exec
+               , teDebugReqPath  = debugRequestsPath paths sid eCfg
+               , teAutonomy      = autonomy
+               , teApprovals     = approvals
+               , teOnEntry       = pure ()
+               , teOnDemand      = onDemand
+               , teLogPath       = Just (sessionLogPath paths sid)
+               , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
+               , teOnUserMessage = Nothing
+               , teChannel       = "cli"
+               , teOnStop        = Nothing
+               , teAbortFlag     = turnAbortFlag
+               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+               })
             appEnv t
           -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
           -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).

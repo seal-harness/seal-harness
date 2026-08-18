@@ -1,0 +1,3046 @@
+warning: Git tree '/Users/zoe/tmp/seal-harness' is dirty
+Using saved setting for 'extra-substituters = https://cache.iog.io https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk= seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo=' from ~/.local/share/nix/trusted-settings.json.
+evaluation warning: Nixpkgs 26.05 will be the last release to support x86_64-darwin; see https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.05
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/shinzui/openapi-hs.git ref=(unspecified) rev=06fc11713094bf39ac00353b052f4ded5a534567 download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 06xfribiqidpcnhni92r595qpcjg92hbvv0w02wpabzqlbah5n6r` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/quantification.git ref=(unspecified) rev=37aee1848936c3caf66e593880a45042326dc41b download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 1sy7qm5ffqn1v5v3yan5qram0hr4k4kb385zd5qignp0azmby9dz` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa.git ref=(unspecified) rev=08a24037b64f757fee8edf6da08ab0905aae53da download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 0a9x506b7zarnxfyrv6vc260ij05jfrppd37lw4lb7zlpk0h1x75` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: No sha256 found for source-repository-package https://github.com/mightybyte/trasa-openapi-hs.git ref=(unspecified) rev=96484960dd38187e92bad5405936c0c826f082ea download may fail in restricted mode (hydra)
+trace: Consider adding `--sha256: 077v7gsbqxs0di1p2w5ra3x14p53mqzca9fdhl9j1pwsg9kjn418` to the cabal.project file or passing in a sha256map argument
+trace: WARNING: license "LicenseRef-FSL-1.1-MIT" not found
+Build profile: -w ghc-9.12.4 -O1
+In order, the following will be built (use -v for more details):
+ - seal-harness-0.1.0.0 (test:tests) (ephemeral targets)
+Preprocessing test suite 'tests' for seal-harness-0.1.0.0...
+Building test suite 'tests' for seal-harness-0.1.0.0...
+Running 1 test suites...
+Test suite tests: RUNNING...
+
+Seal.Core.ChannelKind
+  channelKindToText
+    Cli -> cli [✔]
+    Web -> web [✔]
+    Signal -> signal [✔]
+    Telegram -> telegram [✔]
+    Background -> background [✔]
+    Other -> other [✔]
+  channelKindFromText
+    parses lowercase [✔]
+    parses uppercase (case-insensitive) [✔]
+    rejects unknown [✔]
+  enumeration
+    [minBound..maxBound] is exactly the six [✔]
+  properties
+    channelKindFromText . channelKindToText round-trips [✔]
+      +++ OK, passed 100 tests.
+    channelKindToText never empty / control-char [✔]
+      +++ OK, passed 100 tests.
+  JSON
+    round-trips [✔]
+      +++ OK, passed 100 tests.
+Seal.Core.MessageSource
+  mkConversationId
+    accepts a typical id [✔]
+    rejects empty [✔]
+    rejects over-long (>256) [✔]
+    rejects leading dot [✔]
+    rejects control chars [✔]
+    accepts [A-Za-z0-9_:-] up to 256 [✔]
+      +++ OK, passed 100 tests.
+  mkUserId
+    accepts a typical id [✔]
+    rejects empty [✔]
+    rejects over-long [✔]
+    rejects control chars [✔]
+    accepts [A-Za-z0-9_+:-] up to 256 [✔]
+      +++ OK, passed 100 tests.
+  mkMessageSource
+    accepts a minimal source [✔]
+    accepts a user id + open map [✔]
+    rejects a conversationId key in the open map [✔]
+    strips control chars from open-map values [✔]
+    strips control chars from open-map keys [✔]
+    rejects >32 open entries [✔]
+    round-trips through JSON when constructed via mkMessageSource [✔]
+      +++ OK, passed 100 tests.
+Seal.Core.AllowList
+  isAllowed
+    AllowAll admits anything [✔]
+    AllowOnly admits a member [✔]
+    AllowOnly rejects a non-member [✔]
+  properties
+    AllowAll admits everything [✔]
+      +++ OK, passed 100 tests.
+    AllowOnly s admits exactly the members of s [✔]
+      +++ OK, passed 100 tests.
+    AllowOnly never admits an absent element [✔]
+      +++ OK, passed 100 tests; 14 discarded.
+Seal.Core.Types
+  TrustLevel JSON
+    round-trips [✔]
+      +++ OK, passed 100 tests.
+  isValidSessionId
+    rejects empty [✔]
+    rejects leading dot [✔]
+    rejects slash [✔]
+    accepts typical id [✔]
+    accepts any nonempty [A-Za-z0-9_-] not starting with '.' [✔]
+      +++ OK, passed 100 tests.
+  mkSessionId
+    rejects invalid [✔]
+    accepts and unwraps [✔]
+  mkSystemSessionId
+    accepts a known-safe literal [✔]
+    accepts typical system ids [✔]
+Seal.Core.Paging
+  pageSize
+    defaultPageParams on 320 lines = 500 (flat default, coeff=0) [✔]
+    defaultPageParams on 0 lines = floor (500) [✔]
+    defaultPageParams on 1 line = floor (500) [✔]
+    defaultPageParams on a huge total is still 500 (coeff=0, no scaling) [✔]
+    result is always within [ppFloor, ppCeiling] [✔]
+      +++ OK, passed 100 tests; 81 discarded.
+    monotonic non-decreasing in total [✔]
+      +++ OK, passed 100 tests.
+    round 2.5 == 2 (banker's rounding awareness) [✔]
+  windowSize
+    Nothing -> pageSize [✔]
+    Just n within [1,ceiling] is used as-is [✔]
+    Just n above ceiling is clamped to ceiling [✔]
+    Just 0 is clamped up to 1 [✔]
+    Just negative is clamped up to 1 [✔]
+  paginate
+    first window of a 100-item list with defaultPageParams [✔]
+    explicit limit overrides the computed size [✔]
+    explicit limit above ceiling with small list returns all items [✔]
+    explicit limit above ceiling with large list clamps to ceiling [✔]
+    offset past end yields empty window and pgHasMore False [✔]
+    negative offset is clamped to 0 [✔]
+    pgOffset + length pgItems <= pgTotal [✔]
+      +++ OK, passed 100 tests.
+    pgHasMore iff pgOffset + length pgItems < pgTotal [✔]
+      +++ OK, passed 100 tests.
+    pgItems is exactly take size (drop pgOffset items) [✔]
+      +++ OK, passed 100 tests.
+    SECURITY: any offset/limit (incl. negative/huge) -> bounded, offset in [0,total] [✔]
+      +++ OK, passed 100 tests.
+Seal.Gateway.Config
+  defaultGatewayConfig
+    has port 8080, ws_port 8081, host 127.0.0.1 [✔]
+  withGatewayDefaults
+    fills in defaults for missing fields [✔]
+    preserves all set fields [✔]
+  TOML round-trip
+    round-trips a [gateway] section with all fields set [✔]
+    round-trips a [gateway] section with only some fields set (rest default) [✔]
+    absent section decodes as Nothing [✔]
+Seal.Gateway.API
+  GET /api/health returns 200 [✔]
+  GET /api/tabs returns 200 [✔]
+  GET /api/sessions returns 200 [✔]
+  GET /api/nonexistent returns 404 [✔]
+  POST /api/tabs/new with kind=provider returns 200 [✔]
+  POST /api/tabs/new with kind=provider does NOT leave an orphan session when the tab insert fails (full tab list) [✔]
+  POST /api/tabs/new with kind=shell returns 501 [✔]
+  POST /api/sessions/new creates a bare session and returns 200 + session_id [✔]
+  POST /api/sessions/:id/new on a nonexistent session returns 404 [✔]
+  POST /api/sessions/:id/new on an existing session rebinds its tab + returns 200 [✔]
+  GET /api/harnesses returns 200 [✔]
+  GET /api/harnesses/discover returns 200 [✔]
+  POST /api/adopt without consent_confirmed returns 400 [✔]
+  POST /api/adopt with consent_confirmed=true returns 200 [✔]
+  POST /api/tabs/0/close returns 204 after a tab is created [✔]
+  POST /api/tabs/0/close returns 404 when no tab exists [✔]
+  POST /api/tabs/0/dismiss returns 204 [✔]
+  POST /api/tabs/0/acknowledge returns 204 [✔]
+  POST /api/tabs/0/release returns 204 [✔]
+  POST /api/tabs/0/destroy returns 204 [✔]
+  GET /api/sessions returns 200 with a JSON array (empty store) [✔]
+  GET /api/sessions includes firstMessageSnippet from conversation.jsonl [✔]
+  GET /api/sessions truncates long firstMessageSnippet to 80 chars + ellipsis [✔]
+  GET /api/sessions returns null firstMessageSnippet when no conversation exists [✔]
+  GET /api/sessions surfaces lastUserMessageAt = the most recent request entry's timestamp [✔]
+  GET /api/sessions returns null lastUserMessageAt when no conversation exists [✔]
+  GET /api/sessions/archived returns 200 with [] when none archived [✔]
+  GET /api/sessions/<sid>/transcript returns 200 with [] (no file) [✔]
+  GET /api/sessions/<sid>/transcript emits a Server-Timing header (missing source) [✔]
+  GET /api/sessions/<sid>/transcript emits a Server-Timing header naming the source and entry count [✔]
+  GET /api/sessions/<sid>/transcript rewrites conversation.jsonl blocks to Anthropic shape [✔]
+  GET /api/sessions/<sid>/transcript rewrites CbToolUse and CbToolResult blocks to Anthropic shape [✔]
+  GET /api/sessions/<sid>/transcript pulls per-entry timestamps from entries.jsonl [✔]
+  GET /api/sessions/<sid>/transcript includes the system prompt in request payloads (two-file format) [✔]
+  GET /api/sessions/<sid>/transcript lowercases message roles for the frontend (two-file format) [✔]
+  GET /api/sessions/<sid>/transcript falls back to smCreatedAt when entries.jsonl is absent [✔]
+  POST /api/sessions/<sid>/send returns 200 with {kind:assistant} [✔]
+  PUT /api/sessions/<sid>/description returns 200 {ok:true}, persists the description, and surfaces it in /api/sessions [✔]
+  PUT /api/sessions/<sid>/description with an empty/whitespace body clears the description [✔]
+  PUT /api/sessions/<sid>/description returns 404 when the session has no session.json [✔]
+  PUT /api/sessions/<sid>/description returns 400 on invalid JSON [✔]
+  PUT /api/sessions/<sid>/archived returns 200 {ok:true} and moves the session to /archived [✔]
+  GET /api/lists returns 200 with the partitioned shape (empty) [✔]
+  GET /api/lists surfaces thinkingSessionIds from the broker's in-memory thinking set [✔]
+  GET /api/lists partitions: a session with a tab appears in tabSessions, not recentSessions [✔]
+  GET /api/lists partitions: an archived session appears in archivedSessions [✔]
+  GET /api/lists partitions: an archived+tab-bound session appears in tabSessions (tab wins) [✔]
+  PUT /api/sessions/<sid>/archived with archived:false unarchives (removes marker, returns to /sessions) [✔]
+  PUT /api/sessions/<sid>/archived returns 404 when the session doesn't exist [✔]
+  PUT /api/sessions/<sid>/archived returns 400 on a missing archived field [✔]
+  PUT /api/sessions/<sid>/prompt returns 200 when the session exists [✔]
+  PUT /api/sessions/<sid>/prompt with empty body clears the override [✔]
+  PUT /api/sessions/<sid>/prompt returns 404 when the session is missing [✔]
+  PUT /api/sessions/<sid>/agent returns 200 when the session exists [✔]
+  PUT /api/sessions/<sid>/agent with empty body clears the binding [✔]
+  PUT /api/sessions/<sid>/agent returns 404 when the session is missing [✔]
+  PUT /api/sessions/<sid>/agent returns 400 on an invalid agent id [✔]
+  PUT /api/sessions/<sid>/agent atomically clears an existing system_override [✔]
+  PUT /api/sessions/<sid>/prompt atomically clears an existing agent binding [✔]
+  PUT /api/sessions/<sid>/agent with empty body does NOT clobber an active system_override [✔]
+  PUT /api/sessions/<sid>/agent sets agent_name to the agent's id [✔]
+  PUT /api/sessions/<sid>/prompt sets agent_name from the file's frontmatter id [✔]
+  PUT /api/sessions/<sid>/prompt falls back to the name field when no frontmatter id [✔]
+  GET /api/sessions emits agent from agent_name when set [✔]
+  GET /api/agents returns 200 with a JSON array [✔]
+  GET /api/agents marks the configured default agent isDefault=true [✔]
+  GET /api/agents/default returns 200 + {agent: null} when no default configured [✔]
+  PUT /api/agents/default sets the default + persists to config.toml [✔]
+  PUT /api/agents/default with agent=null clears the default [✔]
+  PUT /api/agents/default returns 404 when the named agent doesn't exist [✔]
+  PUT /api/agents/default returns 400 on a malformed agent id [✔]
+  GET /api/agents returns the full def (provider/model/system/tools) [✔]
+  POST /api/agents creates a def and GET /api/agents/:id returns it [✔]
+  POST /api/agents rejects a malformed id with 400 [✔]
+  POST /api/agents rejects a missing id with 400 [✔]
+  PUT /api/agents/:id updates an existing def and preserves created_at [✔]
+  PUT /api/agents/:id on a missing def returns 404 [✔]
+  PUT /api/agents/:id with new_id renames the def (old id gone, new id present) [✔]
+  PUT /api/agents/:id with a malformed new_id returns 400 [✔]
+  DELETE /api/agents/:id returns 204 and the def is gone [✔]
+  DELETE /api/agents/:id is idempotent (204 for missing def) [✔]
+  DELETE /api/agents/:id rejects a malformed id with 400 [✔]
+  GET /api/skills returns 200 with a JSON array [✔]
+  POST /api/skills creates a skill and GET /api/skills/:id returns it [✔]
+  GET /api/skills/:id on a missing skill returns 404 [✔]
+  PUT /api/skills/:id updates an existing skill and preserves created_at [✔]
+  PUT /api/skills/:id on a missing skill returns 404 [✔]
+  PUT /api/skills/:id with new_id renames the skill (old id gone, new id present) [✔]
+  DELETE /api/skills/:id returns 204 and the skill is gone [✔]
+  DELETE /api/skills/:id is idempotent (204 for missing skill) [✔]
+  GET /api/skills lists all skills sorted by id [✔]
+  /api/repos
+    GET /api/repos returns 200 + [] when the registry is empty [✔]
+    POST /api/repos creates a PAT repo (201) and GET /api/repos/:id returns it [✔]
+    POST /api/repos is idempotent upsert (same id, new url → 201 + updated) [✔]
+    POST /api/repos with missing id returns 400 [✔]
+    POST /api/repos with a bad id (slash) returns 400 [✔]
+    POST /api/repos with an empty url returns 400 [✔]
+    POST /api/repos with a malformed url (not SSH/HTTPS) returns 400 [✔]
+    POST /api/repos with a disallowed host returns 400 [✔]
+    POST /api/repos with an unknown credential.kind returns 400 [✔]
+    POST /api/repos with machine_user but no username returns 400 [✔]
+    PUT /api/repos/:id on a missing repo returns 404 [✔]
+    PUT /api/repos/:id updates an existing repo (200 + updated descriptor) [✔]
+    DELETE /api/repos/:id returns 204 and is idempotent [✔]
+    DELETE /api/repos/:id with a malformed id returns 400 [✔]
+    GET /api/repos/:id with a malformed id returns 400 [✔]
+    never leaks a secret value in the repo descriptor (vault_key is a NAME) [✔]
+    GET /api/repos surfaces a corrupt repos.toml as 500 (NOT empty 200) [✔]
+  GET /api/providers returns 200 with a JSON array [✔]
+  GET /api/providers returns only the configured providers [✔]
+  GET /api/providers/anthropic/models returns 200 [✔]
+  GET /api/providers/anthropic/models/claude-sonnet-4-20250514/context returns 200 [✔]
+  GET /api/providers/unknown/models returns 200 with [] [✔]
+  GET /api/ui/state returns 200 with empty state by default [✔]
+  PUT /api/ui/state persists last_options and round-trips via GET [✔]
+  POST /api/ui/custom-models appends and lists via GET [✔]
+  POST /api/ui/repos appends and lists via GET [✔]
+  GET /api/ui/state includes repo_history as an empty array by default [✔]
+  sendOutcomeJson (SendSlash with new sid) includes session_id [✔]
+  /api/sessions/:id/agents (session-scoped agent defs)
+    returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/ [✔]
+    marks agents-md as default when no user default_agent is configured [✔]
+    repo agents.md wins over a configured user default_agent (repo > user precedence) [✔]
+    returns 404 for an unknown session id [✔]
+    GET /api/sessions/:id/agents in mode=remote discovers ≥1 repo-local def via stub-remote WorkdirFs [✔]
+  sendOutcomeJson (SendSlash with no new sid) omits/nulls session_id [✔]
+  POST /api/sessions/<sid>/send with adSend wired returns 404 for a missing session [✔]
+  e2e: tabs/new -> send -> transcript contains the assistant reply [✔]
+  regression: /skill list on a non-active session returns no session_id [✔]
+  regression: /skill load records the SKILL_LOAD entry on the request session [✔]
+Seal.Gateway.Send auto-tab
+  ensureTabForSession
+    inserts a BoundSession tab when none exists [✔]
+    is idempotent — no-op when a tab already binds the sid [✔]
+    uses the given TabKind (KindProvider vs KindAi) [✔]
+    is race-safe: two threads, exactly one tab [✔]
+  handleSend auto-tab
+    Plain route -> auto-tabs after a successful turn (KindProvider) [✔]
+    SendError (404 missing session) -> no auto-tab [✔]
+    TabCommand route -> no auto-tab [✔]
+    Focus route -> no auto-tab [✔]
+    Inject route -> no auto-tab [✔]
+    CurrentTab route -> replies with the tab binding the session (no auto-tab) [✔]
+    CurrentTab route with no binding tab -> 'no current tab' (no auto-tab) [✔]
+    /tab close N does NOT auto-tab (no resurrection) and broadcasts the close [✔]
+  handleSend idle broadcast on turn death
+    broadcasts idle (not just thinking) when the provider throws a synchronous exception [✔]
+    broadcasts idle when the turn thread is killed (async exception) [✔]
+    writes to seal.log when the turn dies (session log records the death) [✔]
+  webAskCaps
+    ccPrompt with options registers a pending ask carrying the options [✔]
+  parseAnswerBody
+    accepts {scope: once} → Left (Left ScopeOnce) [✔]
+    accepts {answer: main} → Left (Right main) [✔]
+    rejects {scope, answer} (both) → Left [✔]
+    rejects {} (neither) → Left [✔]
+  handleAnswerTextDelivery
+    delivers a text answer to a pending ASK_HUMAN question [✔]
+  repo agents.md auto-bind (gateway integration)
+    a session bound to the user default (zoe) uses the repo's agents.md after a clone [✔]
+    a session with no repo in its workdir stays on the user default (zoe) [✔]
+Seal.Gateway.Server
+  gatewayApp routes /api/health to the API [✔]
+  gatewayApp returns 404 for a non-api path with no static dir [✔]
+  gatewayApp serves index.html for the root with a static dir [✔]
+Seal.Gateway.Transcript.reconEntryToFrontend
+  surfaces a SKILL_LOAD harness entry (whitelisted) [✔]
+  surfaces a SETUP_REPO harness entry (whitelisted) [✔]
+  drops a SHELL_EXEC harness entry (not whitelisted, no approval) [✔]
+  surfaces an approval-bearing harness entry (regression guard) [✔]
+  tools rewriting in request entries
+    includes name + description, strips input_schema (Anthropic shape) [✔]
+    raw view preserves input_schema (Anthropic shape) [✔]
+    includes name + description from Ollama function wrapper shape [✔]
+  Seal.Gateway.Transcript.renderServerTiming
+    emits a `tt` token with the total duration [✔]
+    emits one token per measured phase [✔]
+    names the transcript source in a `src` desc token [✔]
+    names legacy / conv-only / missing sources distinctly [✔]
+    includes the entry count in an `n` desc token [✔]
+    emits zero-duration phases for paths that did not run [✔]
+    emits all-zero durations for the missing-source case [✔]
+    setEncodeMs sets the encode phase and bumps the total [✔]
+Seal.AppMain.withDefaultArgs
+  rewrites an empty argument list to --help [✔]
+  passes a non-empty argument list through unchanged [✔]
+  leaves an explicit --help unchanged [✔]
+Seal.Session.Meta
+  round-trips through JSON [✔]
+  uses snake_case keys and preserves the id text [✔]
+  defaults channel to "cli" when absent [✔]
+  defaults agent to Nothing when absent (backwards-compat) [✔]
+  round-trips smAgent = Just aid [✔]
+  round-trips smSystemOverride = Just t [✔]
+  defaults smSystemOverride to Nothing when absent (backwards-compat) [✔]
+  round-trips smAgentName = Just t [✔]
+  defaults smAgentName to Nothing when absent (backwards-compat) [✔]
+  round-trips smDescription = Just t [✔]
+  defaults smDescription to Nothing when absent (backwards-compat) [✔]
+Seal.Session.Store
+  formatSessionId
+    formats as YYYYMMDD-HHMMSS-mmm and is a valid session id [✔]
+  newSession
+    creates a 0700 dir with a 0600 session.json carrying the selection [✔]
+  listSessions
+    returns [] when no sessions exist [✔]
+    lists saved sessions sorted by last_active descending, skipping corrupt [✔]
+  defaultSessionSelection
+    uses the parsed provider's default model when no model is configured [✔]
+    keeps an explicitly configured model [✔]
+    falls back to anthropic + its model when nothing is configured [✔]
+    uses the provider's configured section default when set [✔]
+    still lets a global default_model win when present [✔]
+  initSession
+    creates a session from the config defaults on the cli channel [✔]
+    binds the default agent and lets its provider/model override config [✔]
+warning: default agent missing not found; proceeding without one
+    warns and proceeds without a default agent when the def is missing [✔]
+Seal.Session.Log
+  appendSessionLog Nothing is a no-op (no file written) [✔]
+  appendSessionLog Just writes a timestamped line to the file [✔]
+  appendSessionLog is append-only (multiple calls accumulate) [✔]
+  appendSessionLog swallows IO errors (best-effort, never throws) [✔]
+  logTurnStart writes a TURN start line with turn count [✔]
+  logTurnError writes an ERROR line with the exception text [✔]
+  logMaxTurns writes a WARN line [✔]
+Seal.Session.Lock
+  replySubscribe (accumulate by channel kind)
+    subscribes one handle per channel kind; different kinds accumulate [✔]
+    re-subscribing the same channel kind replaces the old handle (no dup) [✔]
+    three distinct channel kinds all accumulate [✔]
+  replyFanoutMessage (cross-channel mirroring)
+    mirrors a message to all OTHER channels, prefixed with [sender] [✔]
+    excludes the web frontend (sender label 'web' reaches all chat channels) [✔]
+    mirrors to N-1 channels when N are subscribed [✔]
+    is a no-op when only the sender is subscribed [✔]
+  replyFanout (assistant reply — goes to ALL subscribers)
+    sends the reply to every subscribed channel (no exclusion) [✔]
+Seal.Text.LineFile
+  line semantics (T.lines)
+    "a\nb\nc\n" -> 3 lines [✔]
+    "a\nb\nc" (no final newline) -> 3 lines [✔]
+    "" -> 0 lines [✔]
+  windowLines
+    defaultPageParams first window of 1200 lines is 500, hasMore True [✔]
+    offset past end -> empty window, hasMore False [✔]
+    explicit limit is honored (and clamped to ceiling) [✔]
+    explicit limit above ceiling clamps to ceiling [✔]
+    lwEnd == lwStart + length lwLines [✔]
+      +++ OK, passed 100 tests.
+    lwLines is a contiguous slice, order preserved [✔]
+      +++ OK, passed 100 tests.
+    lwHasMore iff lwEnd < lwTotal (pure path, not truncated) [✔]
+      +++ OK, passed 100 tests.
+    REASSEMBLY: paging from 0 with successive lwEnd reconstructs the T.lines list [✔]
+      +++ OK, passed 100 tests.
+  renderWindow
+    final window footer (guard 6) [✔]
+    more-lines footer (guard 5) [✔]
+    offset past end footer (guard 3, non-truncated) [✔]
+    empty file footer (guard 2) [✔]
+    guard 1: empty file truncated footer [✔]
+    guard 3 truncated: empty window on truncated file footer [✔]
+    guard 4: non-empty window on truncated file [✔]
+    NO-INVERTED-RANGE: whenever a footer prints a numeric range, lwStart+1 <= lwEnd [✔]
+      +++ OK, passed 100 tests.
+  readLineWindow
+    reads a small multi-line file: exact window + footer [✔]
+    no-trailing-newline file: lwTotal correct (3, not 4) [✔]
+    empty file: 0 lines, guard-2 footer [✔]
+    file exceeding maxScanBytes: lwTruncated True, read stays bounded [✔]
+    newline-free file exceeding maxScanBytes: guard 1, memory bounded [✔]
+    file with many short lines over the byte ceiling: truncated, partial not counted [✔]
+    offset paging reaches the tail [✔]
+    limit override bounds the window [✔]
+    model-requested smaller maxScanBytes narrows the scan [✔]
+    IO readLineWindow matches windowLines on T.lines-decoded content [✔]
+      +++ OK, passed 100 tests.
+Seal.Tools.Exec.Types
+  mkContainerTarget
+    never yields a Right value beginning with dash [✔]
+      +++ OK, passed 100 tests.
+    Right results never contain slash, backslash, colon, or control chars and never empty [✔]
+      +++ OK, passed 100 tests.
+    round-trips safe input [✔]
+      +++ OK, passed 100 tests.
+    rejects --flag (option injection) [✔]
+    rejects empty [✔]
+    rejects any leading-dash value [✔]
+      +++ OK, passed 100 tests.
+    accepts a clearly-good target [✔]
+    rejects a path separator [✔]
+    rejects a colon (option-injection / port-syntax defense) [✔]
+  mkSshHost
+    rejects control, space, and colon characters [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+  mkSshUser
+    rejects control, space, and colon characters [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+  TerminalBackend
+    constructs all four variants [✔]
+Seal.Tools.Exec.Untrusted
+  mkUntrustedExecBackend
+    accepts TbSsh [✔]
+    rejects TbLocal (Local not permitted for untrusted) [✔]
+    rejects TbTmux (not implemented) [✔]
+    rejects TbContainer (not implemented) [✔]
+    only TbSsh yields Right; all other backends yield Left [✔]
+      +++ OK, passed 100 tests.
+  selectUntrustedBackend
+    mode=remote + TbSsh configured -> Right (the Ssh backend) [✔]
+    mode=remote + no remote configured -> Left ExecRemoteRequired [✔]
+    mode=remote + TbLocal -> Left ExecLocalNotPermittedForUntrusted (never Local) [✔]
+    mode=local + anything -> Left ExecLocalNotPermittedForUntrusted (never yields Local) [✔]
+    mode=remote never yields a Local-capable backend (always Ssh-or-Left) [✔]
+      +++ OK, passed 100 tests.
+    mode=local never yields Right (always Left, never Local) [✔]
+      +++ OK, passed 100 tests.
+  selectExecBackend
+    mode=local + TbLocal -> Right (EbLocal ...) [✔]
+    mode=remote + TbSsh configured -> Right (EbRemote ...) [✔]
+    mode=remote + TbLocal -> Left (no local fallback) [✔]
+    mode=remote + no remote configured + TbSsh -> Left ExecRemoteRequired [✔]
+    mode=remote never yields EbLocal (no local fallback) [✔]
+      +++ OK, passed 100 tests.
+  fail-closed integration (spec §7 row 1+2)
+    mode=remote, no remote configured + TbLocal -> Left ExecLocalNotPermittedForUntrusted (no local fallback) [✔]
+    mode=remote, no remote configured + TbSsh -> Left ExecRemoteRequired (fail-closed at call time) [✔]
+    mode=remote, remote configured + TbSsh -> Right (EbRemote sshCfg) [✔]
+  enforceRemoteOnly (Cabal flag startup check)
+    mode=remote -> Right () [✔]
+    mode=local -> Left (startup error) [✔]
+Seal.Tools.Exec.UntrustedIO (remote arm)
+  uioWriteFile (FILE_WRITE on remote)
+    sends the file content over SSH stdin (not the local FS) [✔]
+    does NOT write the file to the local FS (the reported bug) [✔]
+    append mode produces @tee -a@ (not truncate) [✔]
+    content with shell metacharacters is safe (on stdin, not argv) [✔]
+    rejects a @..@ escape BEFORE any SSH call (SafePath confinement) [✔]
+  uioReadFile (FILE_READ on remote)
+    reads via @ssh ... -- head -c N <path>@ (bounded read over SSH) [✔]
+    rejects a @..@ path before any SSH call [✔]
+  uioShellExec (SHELL_EXEC on remote)
+    runs the command via the SSH argv (not 'not yet wired') [✔]
+    defaults cwd to the workspace root when the caller omits it [✔]
+    rejects a @..@ cwd before any SSH call [✔]
+  host-key mismatch (hard failure, never bypassed)
+    uioShellExec surfaces 'UeExec ExecHostKeyMismatch' [✔]
+    uioWriteFile surfaces 'UeExec ExecHostKeyMismatch' (never writes locally) [✔]
+  SSH argv shape (host-key pinning inherited)
+    the file-op argv pins StrictHostKeyChecking=yes + UserKnownHostsFile [✔]
+  uioSearchFiles (SEARCH_FILES on remote)
+    passes a multi-word pattern to rg as a single quoted argv token [✔]
+    escapes an embedded single quote in the pattern (no argv breakout) [✔]
+  shellQuote (embedded single-quote hardening)
+    wraps a plain string in single quotes [✔]
+    escapes an embedded single quote with the '\'' idiom [✔]
+    preserves spaces as a single token [✔]
+  buildRgCmd
+    quotes a multi-word pattern so it is not word-split [✔]
+    quotes the path argument [✔]
+Seal.Tools.Exec.Local
+  lehExecShell (real /bin/sh -c)
+    returns stdout on exit 0 [✔]
+    returns exit code annotation on non-zero exit (Right, not Left) [✔]
+    returns exit code 127 on command-not-found (Right, not Left) [✔]
+    captures stderr on non-zero exit [✔]
+  lehExecBin (real binary on PATH)
+    returns stdout on exit 0 [✔]
+    returns Left ExecNotImplemented when binary is not on PATH (127) [✔]
+    passes leading-dash args verbatim (flag, not option injection) [✔]
+  mkLocalUntrustedIO (one-root invariant)
+    uioShellExec with no cwd runs in the workdir root, not the process cwd [✔]
+    uioBinExec with no cwd runs in the workdir root, not the process cwd [✔]
+  withManagedProcess (process-group killing)
+    kills the child process group when the action is cancelled (no orphan) [✔]
+    bounded output: truncates at 50KB with a marker (Task 4) [✔]
+Seal.Tools.Exec.Remote
+  sshArgv (pure argv builder)
+    includes StrictHostKeyChecking=yes (host-key pinning) [✔]
+    includes BatchMode=yes (no interactive prompts) [✔]
+    includes the pinned UserKnownHostsFile [✔]
+    includes the host and user [✔]
+    passes the command as a single arg (no shell interpreter) [✔]
+    includes the port when non-default [✔]
+    uses the fixed program path ssh (not /bin/sh -c) [✔]
+    never includes -c (no shell interpreter for the remote command) [✔]
+      +++ OK, passed 100 tests.
+  sshExecArgv opt-in -A invariant (W2)
+    sshExecArgv (non-credential ops) contains NO -A [✔]
+    sshExecArgvForwarding (git-credential ops) contains -A [✔]
+    sshExecArgvForwarding still pins StrictHostKeyChecking + UserKnownHostsFile [✔]
+    sshExecArgvForwarding preserves the @--@ separator + command [✔]
+    sshExecArgvForwarding uses the fixed program path ssh [✔]
+    sshExecArgv NEVER includes -A (any command) [✔]
+      +++ OK, passed 100 tests.
+    sshExecArgvForwarding ALWAYS includes -A (any command) [✔]
+      +++ OK, passed 100 tests.
+  host-key mismatch (spec §7 row 3)
+    a mismatched host key -> Left ExecHostKeyMismatch (hard failure, never bypassed) [✔]
+    a second call after a mismatch still fails (hard, not retried) [✔]
+Seal.Tools.Args
+  mkShellArg
+    never yields a Right value beginning with dash [✔]
+      +++ OK, passed 100 tests.
+    Right results never contain NUL or newline [✔]
+      +++ OK, passed 100 tests.
+    round-trips safe input [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+    rejects a leading dash [✔]
+    rejects NUL [✔]
+    rejects a newline [✔]
+    accepts a clearly-good arg [✔]
+  mkShellCommand
+    Right results never contain NUL [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+    rejects NUL [✔]
+    accepts a simple command [✔]
+  mkBinName
+    Right results never contain NUL and are never empty [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+    rejects NUL [✔]
+    accepts a clearly-good name [✔]
+    accepts a leading-dash name (no shell, so no option injection) [✔]
+    accepts a path (the executor uses RawCommand, paths are allowed) [✔]
+  mkBinArg
+    Right results never contain NUL and are never empty [✔]
+      +++ OK, passed 100 tests.
+    rejects empty [✔]
+    rejects NUL [✔]
+    accepts a leading-dash arg (a flag for the binary, not option injection) [✔]
+Seal.Tools.Ssh.Agent
+  mkRealSshAgentHandle (FD-leak regression — #88)
+    ssh-agent CreateProcess has close_fds = True [✔]
+    ssh-add CreateProcess has close_fds = True [✔]
+    ssh-agent -k CreateProcess has close_fds = True [✔]
+Capability scoping (spec §8 compile-fail fixture)
+  a Trusted opcode whose toRun tries to use an ExecBackend fails to compile [✔]
+Seal.Tools.Exec.UIO
+  local arm (mkLocalUIO)
+    uioRead reads a file written by uioWrite [✔]
+    uioShellExec runs a command [✔]
+  stub arm (mkUIOStub)
+    uioRead returns Left [✔]
+    uioWrite returns Left [✔]
+    uioShellExec returns Left [✔]
+  runUIOWithEnv
+    round-trips a pre-built UIOEnv [✔]
+Seal.Tools.Exec.UIO local/remote parity
+  I1: uioRead parity
+    uioRead: small text file — local reads the file; stub returns Left [✔]
+  I2: uioWrite parity
+    uioWrite: new file, read-back matches — local succeeds; stub fails [✔]
+  I3: uioShellExec parity
+    uioShellExec: echo hello — local succeeds; stub fails [✔]
+  I4: uioSearchFiles parity
+    uioSearchFiles: pattern matching — local succeeds; stub fails [✔]
+  I6: SafePath confinement parity
+    uioRead '../escape': Left on BOTH local and stub arms [✔]
+  I7: Fail-closed parity
+    mkUIOStub: uioRead → Left; uioShellExec → Left; uioWrite → Left [✔]
+Seal.Tools.Exec.WorkdirFs
+  local arm (mkLocalWorkdirFs)
+    wfsReadFile reads a workspace file [✔]
+    wfsDoesFileExist returns True for an existing file [✔]
+    wfsDoesFileExist returns False for a missing file [✔]
+    wfsDoesDirectoryExist returns True for an existing dir [✔]
+    wfsListDirectory returns the children of a dir [✔]
+    wfsListDirectory returns Right [] on a missing dir [✔]
+    wfsFileSize returns the byte size of a file [✔]
+    wfsModificationTime returns a UTCTime for a file [✔]
+    rejects a symlink escaping the workdir [✔]
+    allows a within-workdir symlink [✔]
+    rejects an oversize file with WfsOversize [✔]
+    wfsReadFile returns WfsNotFound for a missing file [✔]
+    rejects a .. path [✔]
+  in-memory stub (mkInMemWorkdirFs)
+    wfsReadFile reads a FileContent entry [✔]
+    wfsDoesFileExist returns True for a FileContent entry [✔]
+    wfsDoesFileExist returns False for a Missing entry [✔]
+    wfsDoesDirectoryExist returns True for a Directory entry [✔]
+    wfsListDirectory returns the Directory's children [✔]
+    wfsListDirectory returns Right [] on a missing dir [✔]
+    wfsFileSize returns the content length [✔]
+    rejects a SymlinkTarget escaping the workspace [✔]
+    allows a within-workdir SymlinkTarget chain [✔]
+    rejects a symlink loop with WfsIo [✔]
+    wfsReadFile returns WfsNotFound for a missing key [✔]
+  fail-closed stub (mkWorkdirFsStub)
+    wfsReadFile returns Left WfsStub [✔]
+    wfsDoesFileExist returns False [✔]
+    wfsDoesDirectoryExist returns False [✔]
+    wfsListDirectory returns Right [] [✔]
+    wfsFileSize returns Left WfsStub [✔]
+    wfsModificationTime returns Left WfsStub [✔]
+  wfsListDirectory missing dir
+    returns Right [] (local arm) [✔]
+    returns Right [] (in-memory stub) [✔]
+  local arm symlink existence
+    wfsDoesFileExist follows a within-workdir symlink [✔]
+    wfsDoesFileExist returns False for an escaping symlink [✔]
+  local arm oversize with default ceiling
+    rejects a file exceeding maxBootstrapFileBytes [✔]
+  local arm empty file
+    wfsReadFile returns WfsNotFound for a whitespace-only file [✔]
+  local arm CWD independence
+    wfsReadFile works regardless of the process CWD [✔]
+  remote arm (mkRemoteWorkdirFs)
+    rejects a .. path BEFORE any SSH call (IORef empty) [✔]
+    rejects an absolute escape path BEFORE any SSH call [✔]
+    wfsReadFile reads a workspace file (readlink → head) [✔]
+    wfsReadFile rejects a readlink-resolved symlink escape [✔]
+    wfsReadFile returns WfsNotFound when readlink reports missing [✔]
+    wfsReadFile bounds oversize via head -c (no stat pre-check, 2 calls) [✔]
+    wfsDoesFileExist returns True (test -f echo y) [✔]
+    wfsDoesFileExist returns False on empty stdout [✔]
+    wfsDoesDirectoryExist returns True (test -d echo y) [✔]
+    wfsListDirectory returns the dir's children (readlink → ls -1) [✔]
+    wfsListDirectory returns Right [] on a missing dir (readlink empty) [✔]
+    wfsListDirectory rejects a readlink-resolved symlink escape [✔]
+    wfsFileSize returns the byte size (readlink → stat -c %s) [✔]
+    wfsFileSize rejects a readlink-resolved symlink escape [✔]
+    wfsModificationTime returns a UTCTime (readlink → stat -c %Y) [✔]
+    wfsModificationTime rejects a readlink-resolved symlink escape [✔]
+  shellQuote property (mkSafePathRemote-validated paths)
+    contains no unescaped shell metacharacter [✔]
+      +++ OK, passed 100 tests.
+UIO restriction (W-A2 compile-fail fixture)
+  a UIO body that calls liftIO fails to compile (no MonadIO instance) [✔]
+  a UIO body that calls ask fails to compile (no MonadReader instance) [✔]
+UIO construction (W-A2 compile-fail fixture)
+  constructing UIO directly fails (constructor not exported from UIO) [✔]
+  accessing unUIO fails (not exported from UIO) [✔]
+  constructing UIOEnv directly fails (not exported from UIO) [✔]
+WEB_SEARCH
+  authorize gate accepts a good query [✔]
+  rejects an empty query [✔]
+  rejects a missing query field [✔]
+  rejects a negative limit [✔]
+  accepts a valid limit [✔]
+  parseProvider maps known names correctly [✔]
+  providerName maps providers to strings [✔]
+  encodeResults produces valid JSON with a results array [✔]
+  Parallel MCP returns search results for a simple query [‐]
+    # PENDING: No reason given
+WEB_FETCH
+  accepts a valid URL [✔]
+  rejects an empty URL [✔]
+  rejects a missing URL field [✔]
+  rejects a URL whose domain is not in the allow-list [✔]
+  accepts a URL whose domain is in the allow-list [✔]
+  allows any domain when the allow-list is empty [✔]
+Seal.Web.UrlSafety
+  isSafeUrl (pure pre-checks)
+    rejects a non-http scheme [✔]
+    rejects a missing host [✔]
+    blocks cloud metadata hostname metadata.google.internal [✔]
+    blocks cloud metadata IP 169.254.169.254 [✔]
+    blocks AWS ECS task metadata IP 169.254.170.2 [✔]
+    blocks Alibaba Cloud metadata 100.100.100.200 [✔]
+    blocks loopback 127.0.0.1 [✔]
+    blocks localhost (literal IP 127.0.0.1) [✔]
+    blocks private 10.x.x.x [✔]
+    blocks private 192.168.x.x [✔]
+    blocks private 172.16.x.x [✔]
+    does NOT block 172.32.x.x (outside the 172.16/12 range) [✔]
+    blocks CGNAT 100.64.x.x [✔]
+    does NOT block 100.128.0.1 (outside CGNAT) [✔]
+    blocks link-local 169.254.x.x (non-metadata) [✔]
+    blocks multicast 224.0.0.1 [✔]
+    allows a public IP [✔]
+    allows a public domain (passes pre-check; DNS may pass or fail) [✔]
+    allows https URLs [✔]
+  isAlwaysBlockedUrl
+    blocks metadata.google.internal [✔]
+    blocks 169.254.169.254 [✔]
+    does NOT block example.com [✔]
+Seal.Session.Workdir
+  ensureSessionWorkdir
+    creates the workdir at <cache>/workdirs/<sid> [✔]
+    is idempotent (second call is a no-op) [✔]
+    returns the workdir path on success [✔]
+    fails on permission denied (WdMkdirFailed) [✔]
+    reuses a stale workdir (does NOT clear it) [✔]
+  cleanupSessionWorkdir
+    removes the workdir [✔]
+    is idempotent (no error if workdir is already gone) [✔]
+  remoteSessionWorkdirPath
+    produces <scWorkspace>/workdirs/<sid> [✔]
+  ensureRemoteSessionWorkdir
+    returns the remote workdir path on success [✔]
+    fails on SSH error (WdRemoteMkdirFailed) [✔]
+  mkSessionExec
+    (a) local mode → local WorkdirFs + local seUIOEnv + local seWorkspaceRoot [✔]
+    (b) remote mode + configured → both remote-shaped, share scWorkspace, one runner [✔]
+    (c) remote mode + misconfigured (remote block absent) → both stubs, runner NOT invoked [✔]
+    (c') remote mode + unreachable (mkdir fails) → both stubs [✔]
+    (d) local mode + workdir mkdir fails → both stubs (fail-closed parity) [✔]
+    (e) mkSessionUntrustedIO ≡ uieUntrustedIO . seUIOEnv <$> mkSessionExec (back-compat) [✔]
+BROWSER_* opcodes (fail-closed default)
+  BROWSER_OPEN
+    accepts a valid URL at the authorize gate [✔]
+    rejects an empty URL [✔]
+    rejects a missing URL field [✔]
+  BROWSER_CLICK
+    accepts a valid selector [✔]
+    rejects an empty selector [✔]
+  BROWSER_READ
+    accepts any input (selector optional) [✔]
+    accepts an empty object (whole page) [✔]
+IMAGE_* opcodes (fail-closed default)
+  IMAGE_GENERATE
+    accepts a valid prompt [✔]
+    rejects an empty prompt [✔]
+    rejects a missing prompt [✔]
+  IMAGE_DESCRIBE
+    accepts a valid image ref [✔]
+    rejects an empty image [✔]
+TEXT_TO_SPEECH (fail-closed default)
+  accepts a valid text [✔]
+  rejects an empty text [✔]
+  rejects a missing text field [✔]
+Config
+  defaultConfig survives a ToJSON → FromJSON-update round trip [✔]
+Seal.Config.Paths
+  resolveSealHome
+    returns SEAL_HOME when the env var is set [✔]
+    returns ~/.seal when SEAL_HOME is not set [✔]
+  getSealPaths
+    derives config, state, keys, and cache sub-paths from home [✔]
+  ensureSealDirs
+    creates config, state, and cache directories [✔]
+    creates the vault's parent directory (so the atomic write succeeds) [✔]
+    creates keys/ with mode 0700 [✔]
+    is idempotent (calling twice does not throw) [✔]
+  path helpers
+    configFilePath returns config/config.toml [✔]
+    vaultFilePath returns config/vault/vault.age [✔]
+    reposFilePath returns config/repos.toml [✔]
+    repoCloneStateDir returns state/repos [✔]
+  session paths
+    derives sessions root, dir, meta and transcript paths under state/ [✔]
+  agentSessionDir
+    nests a sub-agent transcript dir under the parent session dir [✔]
+  workdir paths
+    workdirsRoot is under cache/ [✔]
+    sessionWorkdir is cache/workdirs/<sid> [✔]
+Seal.Security.Crypto
+  sha256Hash
+    known-answer vector for empty input [✔]
+    is stable (same output for same input) [✔]
+    differs for different inputs [✔]
+    returns a 64-byte hex string [✔]
+  constantTimeEq
+    returns True for equal bytestrings [✔]
+    returns False for different bytestrings [✔]
+    returns False for different-length inputs [✔]
+  getRandomBytes
+    returns the requested number of bytes [✔]
+    returns different bytes on successive calls [✔]
+  generateToken
+    hex length equals 2 * requested byte count [✔]
+    returns different tokens on successive calls [✔]
+  encrypt / decrypt
+    roundtrip arbitrary plaintext [✔]
+      +++ OK, passed 100 tests.
+    produces different ciphertext for same plaintext (random IV) [✔]
+    encrypt rejects a non-32-byte key [✔]
+    decrypt rejects a non-32-byte key [✔]
+    decrypt rejects ciphertext shorter than the 16-byte IV [✔]
+    handles empty plaintext (ciphertext is IV-only, decrypts to empty) [✔]
+Seal.Security.Path
+  accepts a file inside the workspace [✔]
+  accepts a nested path within the workspace [✔]
+  rejects parent traversal [✔]
+  rejects an absolute path outside the workspace [✔]
+  rejects blocked .env [✔]
+  rejects blocked .ssh dotfiles [✔]
+  rejects blocked .seal dotfiles [✔]
+  rejects a missing file with PathDoesNotExist [✔]
+  symlink inside workspace resolving outside is rejected [✔]
+  no relative input ever yields a path outside the root [✔]
+    +++ OK, passed 100 tests.
+  KeysRoot and mkSafeKeyPath
+    ensureKeysRoot creates the directory with mode 0700 [✔]
+    accepts a not-yet-existing path under the root [✔]
+    accepts an existing file with mode 0600 [✔]
+    accepts an existing file with mode 0400 [✔]
+    rejects an existing file with mode 0644 (PathInsecureMode) [✔]
+    rejects a .. escape attempt [✔]
+    rejects an absolute path outside the root [✔]
+    rejects a symlink that resolves outside the root [✔]
+    getSafeKeyPath returns a path under the root [✔]
+    show SafeKeyPath does not reveal the path [✔]
+Seal.Security.Secrets
+  ApiKey
+    Show is redacted [✔]
+    withApiKey provides access to the underlying value [✔]
+  BearerToken
+    Show is redacted [✔]
+    withBearerToken provides access to the underlying value [✔]
+  RefreshToken
+    Show is redacted [✔]
+    withRefreshToken provides access to the underlying value [✔]
+  SecretKey
+    Show is redacted [✔]
+    withSecretKey provides access to the underlying value [✔]
+  PairingCode
+    Show is redacted [✔]
+    withPairingCode provides access to the underlying value [✔]
+  Show never contains the secret bytes [✔]
+    +++ OK, passed 100 tests.
+Seal.Security.Vault.Age
+  mock encryptor round-trips [✔]
+  failing encryptor surfaces its error on encrypt [✔]
+  XOR is its own inverse: double-encrypt returns original [✔]
+  encrypts empty bytestring to empty bytestring [✔]
+  failing encryptor surfaces its error on decrypt [✔]
+Seal.Security.Vault
+  put then get round-trips a secret [✔]
+  lists key names but not values [✔]
+  delete removes a key [✔]
+  init twice reports VaultAlreadyExists [✔]
+  reports locked status before unlock [✔]
+  get on a locked startup vault returns VaultLocked [✔]
+  per-access mode reads without an explicit unlock [✔]
+  rekey re-encrypts and verifies before replacing [✔]
+  init creates the vault file on disk [✔]
+  get on a missing key returns VaultKeyNotFound [✔]
+  list returns empty list on a fresh vault [✔]
+  delete on a missing key returns VaultKeyNotFound [✔]
+  lock then unlock cycle preserves data [✔]
+  UnlockOnDemand: get auto-unlocks after explicit lock [✔]
+  UnlockPerAccess: list works without explicit unlock [✔]
+  status: vsLocked is False after unlock [✔]
+  status: vsSecretCount equals number of puts [✔]
+  status: vsKeyType reflects configured key type [✔]
+  concurrent puts both persist under MVar lock [✔]
+  vhUnlock returns VaultNotFound when file does not exist [✔]
+  rekey
+    preserves all secrets when rekeying to a different encryptor [✔]
+    updates vsKeyType in status after rekey [✔]
+    verification failure when decrypt returns invalid JSON [✔]
+    cancelled rekey leaves vault intact with original key type [✔]
+    UnlockPerAccess: rekey leaves cache empty (no residency) but secret still readable [✔]
+  real-age integration
+    round-trips put/get/list with the real age binary [✔]
+Seal.Security.Policy
+  defaultPolicy denies every command [✔]
+    +++ OK, passed 100 tests.
+  defaultPolicy has Deny autonomy [✔]
+  AllowOnly permits listed commands only [✔]
+  AllowAll permits any command [✔]
+    +++ OK, passed 100 tests.
+  AllowOnly membership matches Set.member exactly [✔]
+    +++ OK, passed 100 tests.
+Seal.Security.Command
+  authorizes an allowed program [✔]
+  rejects a disallowed program [✔]
+  rejects everything under Deny autonomy [✔]
+  basename matching preserves full program path [✔]
+  AllowAll Full policy allows any program [✔]
+    +++ OK, passed 100 tests.
+  authorizeShell when shell is allowed returns /bin/sh -c [✔]
+  authorizeShell when shell is not allowed returns CommandNotAllowed [✔]
+  authorizeShell under Deny autonomy returns CommandInAutonomyDeny [✔]
+Seal.Security.Adoption.authorizeAdoption
+  (Just CcCli, True) => Right () [✔]
+  (Just CcSignal, True) => Right () [✔]
+  (Nothing, _) => Left AeHeadlessNoConsent [✔]
+  (Just CcWeb, False) => Left AeConsentMissing [✔]
+  (Nothing, False) => Left AeHeadlessNoConsent (headless wins) [✔]
+Seal.Command.Help
+  renderHelpIndex
+    contains the synthetic 'help' entry [✔]
+    contains every registered command name [✔]
+    contains the synopsis for each command [✔]
+    contains group headers for all groups represented [✔]
+    General group header appears before Vault group header (derived Ord) [✔]
+  renderHelpFor
+    returns a non-empty string for a known command [✔]
+    includes the progDesc in the per-command help [✔]
+    includes the progDesc text set on the ParserInfo [✔]
+    returns an error message for an unknown command [✔]
+    vault help contains its progDesc text and differs from ping help [✔]
+  discoverability invariant
+    every command name appears in renderHelpIndex [✔]
+    every known long option appears in renderHelpFor output [✔]
+    renderHelpFor ping contains --loud [✔]
+    renderHelpFor ping contains --count [✔]
+Seal.Command.Model
+  list shows known providers and the active selection [✔]
+  use updates the active selection and persists it [✔]
+  rejects an unknown provider without mutating the session [✔]
+  list <provider> rejects an unknown provider before any resolution [✔]
+  list anthropic with no vault configured reports the resolve error [✔]
+  default sets a provider's section default model [✔]
+  use without a model uses the provider's default [✔]
+  use without a model and no config falls back to the hardcoded default [✔]
+  list shows a configured section default [✔]
+Seal.Command.Parse
+  tokenize
+    empty input yields empty list [✔]
+    single word [✔]
+    splits on spaces [✔]
+    collapses multiple spaces [✔]
+    strips leading and trailing spaces [✔]
+    double-quoted string becomes a single token [✔]
+    double-quoted token adjacent to plain token concatenates [✔]
+    quoted section containing spaces is one token [✔]
+    empty quoted string is a valid token [✔]
+    unterminated double-quote returns Left [✔]
+    unterminated quote mid-word returns Left [✔]
+    plain words survive a round-trip through tokenize [✔]
+      +++ OK, passed 100 tests.
+    double-quoted word is a single token regardless of spaces inside [✔]
+      +++ OK, passed 100 tests.
+  parseSlash
+    /help -> ParseHelp Nothing [✔]
+    /help ping -> ParseHelp (Just (CommandName "ping")) [✔]
+    /HELP is case-insensitive -> ParseHelp Nothing [✔]
+    /ping --help -> ParseHelp (Just (CommandName "ping")) [✔]
+    /ping -h -> ParseHelp (Just (CommandName "ping")) [✔]
+    /grp -h (sole flag) -> ParseHelp (Just grp): top-level group help [✔]
+    /grp add -h -> renders the ADD subcommand's help, not the group help [✔]
+    /grp add --help -> renders the ADD subcommand's help (long flag) [✔]
+    /unknown -> ParseFailure with the unknown command name [✔]
+    /ping (no flags) -> ParsedAction [✔]
+    /ping --loud -> ParsedAction that sends PONG! [✔]
+    /p (alias) -> ParsedAction [✔]
+    unterminated quote -> ParseFailure [✔]
+Seal.Command.Provider helpers
+  pingRequest
+    uses the given model, one message, no tools, a small token cap [✔]
+  formatTestResult
+    reports success with the output-token count [✔]
+    reports failure with the error text [✔]
+/provider commands
+  add stores the key and seeds defaults when unset [✔]
+  list marks the default and shows credential presence [✔]
+  remove deletes the credential and clears a matching default [✔]
+  list reports auth: oauth when an OAuth blob is stored [✔]
+  list reports auth: api-key when only an API key is stored [✔]
+  list reports auth: none when nothing is stored [✔]
+  list filters out anthropic when no credential is stored [✔]
+  list shows anthropic when an API key is stored [✔]
+  list prints a hint when no providers are configured [✔]
+  remove clears BOTH the API key and the OAuth blob [✔]
+  add ollama saves the base url to config and stores a key when given [✔]
+  add ollama with a blank key configures local (no key stored) [✔]
+  list reports ollama as none (local) when no key is stored [✔]
+  default sets default_provider without needing a vault [✔]
+  default reassigns an already-set default provider [✔]
+  default rejects an unknown provider [✔]
+  rejects an unknown provider [✔]
+  reports when the vault is not configured [✔]
+  the spec is in the Providers group [✔]
+  appears under the Providers group in the help index [✔]
+  live: /provider test anthropic round-trips against the real API [‐]
+    # PENDING: No reason given
+Seal.Command.Session
+  pure renderers
+    marks the active session [✔]
+    includes agent name when present [✔]
+    includes first message snippet when present [✔]
+    does not include the timestamp [✔]
+    info includes id, provider and model [✔]
+  /session commands
+    list shows saved sessions [✔]
+    info prints the active session [✔]
+    session and model appear under their groups in the help index [✔]
+Seal.Command.Serve
+  parses 'serve' as CommandServe Supervised [✔]
+  parses 'serve --yolo' as CommandServe Full [✔]
+  renders --help for the serve subcommand [✔]
+Seal.Command.Skill
+  pure renderers
+    renderSkillLine shows id + description [✔]
+    renderSkillInfo includes id, description, and body [✔]
+  /skill commands
+    list shows defined skills [✔]
+    list reports none when empty [✔]
+    info shows the full body of a skill [✔]
+    info reports not found for a missing skill [✔]
+    info rejects an invalid id [✔]
+  /skill load
+    echoes only the header line on a successful load (body goes to transcript) [✔]
+    reports skill not found when the dispatcher returns an error result [✔]
+    renders a dispatcher Left (OpNotFound) gracefully [✔]
+    forwards the trailing message in the opcode input [✔]
+    omits the message (empty string) when no trailing text is supplied [✔]
+    joins multiple trailing words with spaces [✔]
+Seal.Command.Repo
+  pure renderers
+    renderRepoLine shows id, url, and the human credential label (PAT) [✔]
+    renderRepoLine shows the Bot Account label for a machine user [✔]
+    renderRepoInfo includes id, url, vcs, credential label, and vault key [✔]
+    renderRepoInfo shows username only for MachineUser [✔]
+  /repo list
+    shows defined repos (PAT + MachineUser) [✔]
+    reports none when empty [✔]
+  /repo add
+    adds a PAT repo on the happy path [✔]
+    rejects a bad id [✔]
+    rejects a disallowed host [✔]
+    rejects machine_user without username [✔]
+    adds a machine_user repo with --username [✔]
+  /repo remove
+    removes a repo by id [✔]
+    is idempotent on a missing repo [✔]
+  /repo info
+    shows the descriptor for a known repo [✔]
+    emits a non-blocking vault-key advisory when the key is absent [✔]
+    emits a vault-locked advisory when the vault is locked [✔]
+    reports not found for a missing repo [✔]
+  /repo test
+    echoes the head sha on success [✔]
+    reports vault-locked as 'run /vault unlock' [✔]
+    reports a missing vault key by name [✔]
+    reports a git failure as 'git ls-remote failed' (W3 reconciliation) [✔]
+    reports an unsupported host [✔]
+    reports no-credential-for-url by url [✔]
+    reports unsupported VCS [✔]
+    reports repo not found [✔]
+Seal.Command.Agent
+  pure renderers
+    renderAgentLine shows id + name + provider/model [✔]
+    renderAgentInfo includes id, name, provider, model, system, tools [✔]
+    renderAgentInfo renders an AllowOnly tool list [✔]
+  /agent commands
+    list shows defined agent defs sorted by name [✔]
+    list reports none when empty [✔]
+    info shows the def fields [✔]
+    info reports not found for a missing def [✔]
+    default with no arg reports none set [✔]
+    default with an arg validates, persists, and confirms [✔]
+    default with an unknown def refuses and does not persist [✔]
+    default rejects an invalid id [✔]
+Seal.Command.Background
+  parse
+    /bg with a prompt parses to a ParsedAction [✔]
+    /bg with a quoted multi-word prompt parses to a ParsedAction [✔]
+    /bg re-joins unquoted multi-word args with spaces [✔]
+    /bg with no argument parses then rejects as blank at run time [✔]
+    /bg is case-insensitive [✔]
+  /help
+    includes the /bg command in the index [✔]
+  runBackground (blank prompt)
+    rejects a blank prompt with a usage line and never invokes the runner [✔]
+    rejects a whitespace-only prompt as blank [✔]
+Seal.Command.Call
+  /help includes /call under the Tools group [✔]
+  /call OP {json} dispatches the opcode and prints the result parts [✔]
+  /call OP with no JSON arg passes an empty object [✔]
+  /call with invalid JSON -> error message [✔]
+  /call with unknown opcode -> 'opcode not found' [✔]
+  /call denied by authorize gate -> 'denied: ...' [✔]
+  /call with empty opcode name -> 'invalid opcode name' error [✔]
+  renderOpResult prefixes error results with [error] [✔]
+  renderOpResult for empty parts shows (no output) [✔]
+  renderDispatchError renders OpNotFound [✔]
+  renderDispatchError renders ExecFailed [✔]
+Seal.Command.Channel
+  command spec metadata
+    name is /channel [✔]
+    synopsis mentions signal [✔]
+    synopsis mentions telegram [✔]
+    is InteractiveOnly [✔]
+  /channel signal — signal-cli absent
+    shows an install hint and bails [✔]
+  /channel signal — link flow
+    links, detects the account, and writes the [signal] config [✔]
+  /channel signal — link flow with undetectable account
+    prompts for the phone number when listAccounts finds nothing [✔]
+  /channel signal — link shows URI before timeout failure
+    delivers the sgnl:// URI via the callback even when link ultimately fails [✔]
+  /channel signal — link retries on timeout then succeeds
+    generates a fresh link after a 60s timeout and completes on retry [✔]
+  /channel signal — register flow (no captcha)
+    registers, verifies, and writes config [✔]
+  /channel signal — register flow with captcha
+    loops back through register with the captcha token [✔]
+  /channel signal — lock-down retries on receive timeout
+    captures the sender on the second receive attempt and locks allow_from [✔]
+  /channel signal — lock-down fails after 3 timeouts leaves AllowAll
+    leaves allow_from at AllowAll when no message arrives after 3 tries [✔]
+  /channel signal — invalid choice
+    reports the invalid choice and cancels [✔]
+  /channel signal — invalid phone number
+    rejects a non-E.164 number before calling register [✔]
+  /channel signal — default choice is link (empty input)
+    treats an empty choice as [1] link [✔]
+  writeSignalConfig preserves existing config
+    keeps security.toml (vault_recipient) untouched when adding [signal] to config.toml [✔]
+  /channel telegram — valid token
+    validates the token via getMe, stores in vault, writes [telegram] config [✔]
+  /channel telegram — getMe fails
+    reports the failure and does not write config [✔]
+  /channel telegram — empty token
+    rejects an empty token before calling getMe [✔]
+  /channel telegram — leading-dash token
+    rejects a leading-dash token (option injection) [✔]
+  /channel telegram — no vault configured
+    warns the user to set up the vault first [✔]
+  /channel telegram — preserves existing config
+    keeps security.toml (vault_recipient) untouched when adding [telegram] to config.toml [✔]
+  /channel — unknown subcommand
+    optparse rejects /channel discord [✔]
+  /channel — --help renders both subcommands
+    the --help text mentions signal and telegram [✔]
+Seal.Command.Spec
+  mkRegistry / registrySpecs
+    registrySpecs round-trips through mkRegistry [✔]
+    preserves insertion order [✔]
+  lookupSpec
+    finds a spec by exact name [✔]
+    finds a spec by alias [✔]
+    lookup is case-insensitive on the name [✔]
+    lookup is case-insensitive on the alias [✔]
+    returns Nothing for an unknown command [✔]
+    finds the second spec when the first does not match [✔]
+  CommandAction
+    runCommandAction invokes the captured IO action [✔]
+Seal.Command.Tab
+  /tab list on an empty handle replies 'no tabs' [✔]
+  /tab new creates a tab and replies with 'created' [✔]
+  /tab list after /tab new shows one tab [✔]
+  /tab close 0 closes the first tab [✔]
+  /tab close invokes the TabCloseNotifier with the closed tab's TabRef [✔]
+  /tab rename 0 work sets the label [✔]
+  /help includes the tab family + the terse grammar synopsis [✔]
+  /tab focus 0 (with a tab present) replies 'focused' [✔]
+Seal.Command.New
+  renderNewConfirmation
+    names the new session id [✔]
+    names the provider/model [✔]
+    names the prior session + resume hint [✔]
+  newCommandSpec
+    parses /new with no args [✔]
+    /help index includes /new with the contrast-vs-/tab new synopsis [✔]
+Seal.Config.File
+  defaultRuntimeConfig
+    has all Nothing fields [✔]
+  loadRuntimeConfig
+    returns defaultRuntimeConfig when the file is absent [✔]
+    parses a valid TOML file with a subset of fields [✔]
+    returns Left on malformed TOML [✔]
+  saveRuntimeConfig / loadRuntimeConfig round-trip
+    round-trips a fully-populated RuntimeConfig [✔]
+    round-trips a [workdir] section [✔]
+    round-trips a [skills] section [✔]
+    round-trips [skills] autoload = "" (disabled) [✔]
+    round-trips max_turns [✔]
+  maxTurnsConfig
+    defaults to 90 when max_turns is absent [✔]
+    returns the configured value when set [✔]
+    clamps values below 1 to 1 [✔]
+    clamps negative values to 1 [✔]
+    resolvedAutoloadSkill
+      defaults to seal-usage when [skills] is absent [✔]
+      defaults to seal-usage when autoload key is absent [✔]
+      returns the custom id when autoload is set [✔]
+      returns Nothing when autoload is explicitly empty (disabled) [✔]
+    resolvedAvailableSkills
+      defaults to True when [skills] is absent [✔]
+      defaults to True when available_skills key is absent [✔]
+      returns False when available_skills = False [✔]
+      returns True when available_skills = True [✔]
+    resolvedParallelToolGuidance / resolvedToolUseEnforcement / resolvedTaskCompletionGuidance
+      default to True when [agent] is absent [✔]
+      default to True when the keys are absent [✔]
+      return False when a flag is explicitly False [✔]
+    round-trips defaultRuntimeConfig (all Nothing) [✔]
+    leaves no leftover .tmp file after save [✔]
+  updateRuntimeConfig
+    patches one field and preserves all others [✔]
+    returns Left when the config file is malformed [✔]
+  provider defaults
+    round-trips default_provider and default_model through TOML [✔]
+    defaults to Nothing when the keys are absent [✔]
+  provider sections
+    parses [providers.<label>] sections [✔]
+    has an empty provider map when [providers] is absent [✔]
+    upsertProvider updates one field without clobbering the other [✔]
+    round-trips provider sections through save/load [✔]
+  retrieval section
+    parses a [retrieval] table with max_scan_bytes [✔]
+    round-trips a [retrieval] section through save/load [✔]
+    absent [retrieval] section decodes to Nothing [✔]
+    retrievalMaxScanBytes falls back to the default when [retrieval] is absent [✔]
+    retrievalMaxScanBytes falls back to the default when max_scan_bytes is absent [✔]
+    retrievalMaxScanBytes returns the configured value when present [✔]
+  debug_session_transcript flag
+    absent key decodes to Nothing [✔]
+    parses debug_session_transcript = true [✔]
+    parses debug_session_transcript = false [✔]
+    round-trips through save/load [✔]
+  on_demand_schemas flag
+    absent key decodes to Nothing [✔]
+    parses on_demand_schemas = true [✔]
+    parses on_demand_schemas = false [✔]
+    round-trips through save/load [✔]
+    onDemandSchemas defaults to False when the key is absent [✔]
+    onDemandSchemas returns True when the key is set [✔]
+Seal.Config.Migrate
+  Case 1: security.toml absent, config.toml has legacy fields
+[seal] migrated [untrusted_execution]/vault_* from /private/tmp/nix-shell.HF9B5B/seal-migrate-3b9f6c49a8aae5d0/config/config.toml to /private/tmp/nix-shell.HF9B5B/seal-migrate-3b9f6c49a8aae5d0/security.toml (one-time). Edit /private/tmp/nix-shell.HF9B5B/seal-migrate-3b9f6c49a8aae5d0/security.toml for future changes.
+    migrates [untrusted_execution] and vault_* from config.toml to security.toml [✔]
+  Case 2: both present, config.toml has stale legacy fields
+[seal] removed stale [untrusted_execution]/vault_* from /private/tmp/nix-shell.HF9B5B/seal-migrate-6c83c47e399b068a/config/config.toml (security.toml takes precedence)
+    security.toml wins; stale fields cleaned from config.toml [✔]
+  Case 3: security.toml exists, config.toml clean
+    is a no-op (idempotent) [✔]
+  Case 4: neither exists
+    is a no-op [✔]
+  Idempotency
+[seal] migrated [untrusted_execution]/vault_* from /private/tmp/nix-shell.HF9B5B/seal-migrate-08f496ac974940df/config/config.toml to /private/tmp/nix-shell.HF9B5B/seal-migrate-08f496ac974940df/security.toml (one-time). Edit /private/tmp/nix-shell.HF9B5B/seal-migrate-08f496ac974940df/security.toml for future changes.
+    running migration twice does not duplicate or error [✔]
+  Corrupted [untrusted_execution] input (migration is a move, not validation)
+[seal] migrated [untrusted_execution]/vault_* from /private/tmp/nix-shell.HF9B5B/seal-migrate-9f509589b13eff31/config/config.toml to /private/tmp/nix-shell.HF9B5B/seal-migrate-9f509589b13eff31/security.toml (one-time). Edit /private/tmp/nix-shell.HF9B5B/seal-migrate-9f509589b13eff31/security.toml for future changes.
+    preserves mode=local with no remote block as-is [✔]
+Seal.Config.Security
+  defaultSecurityConfig
+    has all Nothing fields [✔]
+  loadSecurityConfig
+    returns defaultSecurityConfig when the file is absent [✔]
+    parses a valid TOML file with vault fields [✔]
+    returns Left on malformed TOML [✔]
+  saveSecurityConfig / loadSecurityConfig round-trip
+    round-trips a fully-populated SecurityConfig [✔]
+    round-trips defaultSecurityConfig (all Nothing) [✔]
+    leaves no leftover .tmp file after save [✔]
+    writes security.toml with mode 0600 [✔]
+  untrusted_execution section
+    absent [untrusted_execution] section decodes to Nothing [✔]
+    parses [untrusted_execution] with mode = local (default) [✔]
+    parses [untrusted_execution] with mode = remote and a [remote] sub-table [✔]
+    parses mode=remote with no [remote] block (fail-closed is at call time, not parse time) [✔]
+    round-trips an untrusted_execution section through save/load [✔]
+  untrustedExecConfigFromSecurity
+    returns Nothing when the section is absent [✔]
+    returns Nothing when mode=local (no remote needed) [✔]
+  untrustedExecConfigFromSecurity is a pure function of SecurityConfig (unaffected by RuntimeConfig) [✔]
+    +++ OK, passed 100 tests.
+Security scoping (design §9.1 compile-fail fixture)
+  a RuntimeConfig handler that tries to reference scUntrustedExec fails to compile [✔]
+  an updateRuntimeConfig lambda that tries to set a SecurityConfig field fails to compile [✔]
+Capability scoping — WorkdirFs/UIOEnv grep guard (W6 DoD)
+  Env (AppEnv) has no WorkdirFs field [✔]
+  Env (AppEnv) has no UIOEnv field [✔]
+  ISA Registry has no WorkdirFs field [✔]
+  ISA Registry has no UIOEnv field [✔]
+  no module under src/Seal/ISA/Ops/ imports Seal.Tools.Exec.WorkdirFs [✔]
+  no module under src/Seal/ISA/Ops/ imports Seal.Tools.Exec.UIO.Internal [✔]
+  no module under src/Seal/ISA/Ops/ declares a WorkdirFs field [✔]
+  no module under src/Seal/ISA/Ops/ declares a UIOEnv field [✔]
+Seal.Vault.Backend
+  parseUnlockMode
+    Nothing defaults to UnlockOnDemand [✔]
+    "on_demand" -> UnlockOnDemand [✔]
+    "startup" -> UnlockStartup [✔]
+    "per_access" -> UnlockPerAccess [✔]
+    unrecognised value defaults to UnlockOnDemand [✔]
+  filterPluginNames
+    returns suffixes for age-plugin-* entries [✔]
+    ignores files that do not start with age-plugin- [✔]
+    handles empty list [✔]
+    detectAgePlugins returns IO [Text] without error [✔]
+  parsePluginRecipient
+    parses a canonical Recipient line [✔]
+    parses a lowercase recipient: line (case-insensitive) [✔]
+    returns Nothing when no recipient line is present [✔]
+    parses the right-aligned Recipient label from real --generate output [✔]
+  resolveEncryptor
+    returns Left VaultBackendError when recipient is missing [✔]
+    returns Left VaultBackendError when identity is missing [✔]
+    returns Left VaultBackendError when recipient is missing but identity is present [✔]
+    returns Right VaultEncryptor (or Left VaultBackendError if age absent) when both fields are set [✔]
+  setupUserSupplied
+    prompts for recipient then identity path; returns ResolvedKey with rkKeyType=user [✔]
+    ccSend is not called (prompts only) [✔]
+  setupLocalAgeKey
+    generates a local age identity and returns ResolvedKey with rkKeyType=x25519 [✔]
+    rejects a traversing name ("../escape") and creates no file outside keys dir [✔]
+  setupYubiKey
+    generates a yubikey identity and returns ResolvedKey with rkKeyType=yubikey [‐]
+      # PENDING: age-plugin-yubikey: hardware not available
+Seal.Vault.Commands
+  unconfigured runtime
+    list sends 'vault not configured' when handle is Nothing [✔]
+    status sends 'vault not configured' when handle is Nothing [✔]
+  list
+    returns empty list on fresh vault [✔]
+    sends each secret name on its own line [✔]
+  add
+    stores the secret entered via ccPromptSecret [✔]
+    sends a confirmation message after adding [✔]
+    returns 'vault not configured' message when handle is Nothing [✔]
+  get
+    reveals the stored secret value [✔]
+    sends VaultKeyNotFound message for missing key [✔]
+    VaultKeyNotFound message includes the key name [✔]
+  delete
+    removes the secret from the vault [✔]
+    sends a confirmation message [✔]
+    sends 'no such secret' for a missing key [✔]
+  lock / unlock
+    lock leaves vault inaccessible without re-unlock (UnlockStartup mode) [✔]
+    lock sends a confirmation [✔]
+  status
+    reports locked=no, zero secrets on freshly unlocked vault [✔]
+    reports the key type from VaultConfig [✔]
+    reports correct secret count after additions [✔]
+  setup
+    setup with LocalAgeKey creates vault and populates vrHandleRef [✔]
+    setup on existing vault triggers rekey flow [✔]
+    setup on orphaned vault file emits delete-and-retry message [✔]
+    setup creates vault at scVaultPath when set in security.toml [✔]
+    rotation keeps the old key file and preserves secrets (no clobber) [✔]
+    declining rotation on an existing vault leaves it unchanged [✔]
+  full sequence (mock encryptor)
+    add -> get -> list -> delete -> status flow [✔]
+    VaultKeyNotFound error message includes the key name [✔]
+    VaultLocked message when vault is locked and mode is UnlockStartup [✔]
+runChain
+  emptyChain passes input through unchanged [✔]
+  a rejecting stage short-circuits with Left [✔]
+  a passing stage can transform the value [✔]
+  stages run in order; Left from stage 1 skips stage 2 [✔]
+ingest
+  returns PlainMessage for non-slash input [✔]
+  returns DispatchAction for a known slash command and runs it [✔]
+  returns ShowText (help index) for /help [✔]
+  returns ShowText (command help) for /help ping [✔]
+  returns ShowText for an unknown slash command [✔]
+  chain runs BEFORE dispatch — Rejected when chain rejects /ping [✔]
+interpretDisposition
+  ShowText routes the text to ccSend [✔]
+  PlainMessage routes the text to the injected handler [✔]
+  Rejected emits the rejection message [✔]
+  DispatchAction runs the action through caps [✔]
+resolveSessionProvider
+  reports when the vault is not configured [✔]
+  reports an unknown provider label in the session [✔]
+mkSessionAgentEnv
+  carries the session's model and id into the AgentEnv [✔]
+seal tui smoke (interactive — manual)
+  seal tui launches and shows the > prompt [‐]
+    # PENDING: interactive: run `nix develop --command cabal run seal -- tui` and verify the '> ' prompt appears; Ctrl-D exits cleanly
+Seal.Channel.Cli.handlePlain
+  routes a scripted provider response through runTurn to ccSend [✔]
+Seal.Channels.Class
+  toHandle . newFakeChannel yields a handle with the configured streaming flag [✔]
+  driving chSend then getSent yields chronological order [✔]
+  chReceive yields the scripted (MessageSource, Text), then empty [✔]
+  chPrompt returns Right the scripted response, then AsyncQueued [✔]
+Seal.Channels.Loop.channelCallDispatcher
+  returns Left (OpNotFound ...) for an unknown opcode [✔]
+  SKILL_LOAD writes the skill body to conversation.jsonl (the Telegram/Signal path) [✔]
+  buildChannelRegistry
+    channel skill spec shadows a same-named web spec in the base registry [✔]
+    preserves non-colliding specs from the base registry [✔]
+  newChannelDeps sets cdTabs to the passed TabsHandle (unified) [✔]
+  ensureTabForSession is reachable via cdTabs (W3 channel auto-tab wiring) [✔]
+  shouldAutoTab
+    is False for a /bg session (smChannel = "bg") [✔]
+    is True for a Telegram channel session [✔]
+    is True for a Signal channel session [✔]
+    is True for a CLI session [✔]
+    is True for a Web session [✔]
+    does not collide with the Background channel kind ("background") [✔]
+  isBgSlash
+    matches /bg with no prompt [✔]
+    matches /bg with a prompt [✔]
+    matches /bg with a quoted prompt [✔]
+    is case-insensitive (/BG) [✔]
+    does not match /bgx (longer command name) [✔]
+    does not match plain text [✔]
+    does not match /new (a different slash command) [✔]
+    does not match the tab grammar /1 [✔]
+  createConversationSessionHeadless
+    persists the session and sets the cursor but inserts NO tab [✔]
+  createConversationSession cursor-binding
+    binds the cursor even when the tab list is full (Left _) [✔]
+  mkBgRunner lists broadcast
+tests: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:
+
+vrHandleRef: stubbed — bg broadcast test does not read the vault
+
+HasCallStack backtrace:
+  error, called at test/Seal/Channels/LoopSpec.hs:549:29 in seal-harness-0.1.0.0-inplace-tests:Seal.Channels.LoopSpec
+
+    broadcasts a lists snapshot when a bg session is minted (broker present) [✔]
+tests: Uncaught exception ghc-internal:GHC.Internal.Exception.ErrorCall:
+
+vrHandleRef: stubbed — no-broker test does not read the vault
+
+HasCallStack backtrace:
+  error, called at test/Seal/Channels/LoopSpec.hs:592:29 in seal-harness-0.1.0.0-inplace-tests:Seal.Channels.LoopSpec
+
+    does not broadcast when the broker is absent (standalone channel) [✔]
+Seal.Channels.Signal
+  withSignalChannel + chReceive yields scripted envelopes with the right MessageSource [✔]
+  chSend chunks a long message to the configured limit and sends to the last sender [✔]
+  chSend with no last sender is dropped (capture empty) [✔]
+  a non-allow-listed sender is dropped (never reaches chReceive) [✔]
+  chPrompt returns Left Deferred (Signal can't answer inline) [✔]
+Seal.Channels.Telegram
+  withTelegramChannel + chReceive yields scripted updates with the right MessageSource [✔]
+  chSend chunks a long message to the configured limit and sends to the last chat [✔]
+  chSend with no last chat is dropped (capture empty) [✔]
+  a non-allow-listed sender is dropped (never reaches chReceive) [✔]
+  chPrompt returns Left Deferred (Telegram can't answer inline) [✔]
+  chLastChatId returns the last chat id after an update is received [✔]
+  readerLoop calls tgAnswerCallback for callback_query updates [✔]
+  readerLoop does NOT call tgAnswerCallback for regular messages [✔]
+Seal.Channels.Telegram.Buttons
+  mkTelegramHandleCaps ccPrompt
+    ccPrompt with options sends an inline keyboard (1 call, N rows) [✔]
+    ccPrompt with empty opts sends plain text, no keyboard [✔]
+    ccPrompt with options but no chat id falls back to chSend (numbered list) [✔]
+  onTelegramCallback
+    resolves <8hex>:<idx> to the option label and delivers it + sends confirmation [✔]
+    <8hex>:other (legacy) returns False without delivering [✔]
+    out-of-bounds index returns False without delivering [✔]
+    stale prefix returns False [✔]
+    malformed callback body (no colon) returns False [✔]
+    malformed callback body (non-hex prefix) returns False [✔]
+    prop_callbackDataWithin64Bytes: <8hex>:<idx> is <= 64 chars [✔]
+      +++ OK, passed 100 tests.
+  readerLoop spinner dismiss (integration)
+    a callback_query update triggers tgAnswerCallback [✔]
+Seal.Channels.Telegram.Commands.sanitizeTelegramName
+  lowercases and replaces hyphens with underscores [✔]
+  strips invalid chars (only a-z0-9_ allowed) [✔]
+  collapses double underscores [✔]
+  trims leading/trailing underscores [✔]
+  clamps to 32 chars [✔]
+Seal.Channels.Telegram.Commands.telegramBotCommands
+  includes /help first [✔]
+  includes AlwaysAvailable commands [✔]
+  includes InteractiveOnly commands too (they defer or show usage) [✔]
+  excludes the terse /N grammar [✔]
+  sanitizes command names (hyphens to underscores) [✔]
+  truncates descriptions to 256 chars [✔]
+  skips aliases (one entry per canonical command) [✔]
+Seal.Channels.Telegram.Transport.parseTelegramUpdate
+  parses a text message update [✔]
+  rejects an update with no message field [✔]
+  rejects an update missing chat.id [✔]
+  rejects an update missing from.id [✔]
+  yields empty body for a non-text message (sticker, photo) [✔]
+  parses a callback_query update with a String id [✔]
+  parses a callback_query update with a Number id (backward compat) [✔]
+  rejects a callback_query missing the data field [✔]
+Seal.Channels.Telegram.Transport.chunkMessage
+  empty input -> [] [✔]
+  under-limit passes through as one chunk [✔]
+  exact-limit passes through as one chunk [✔]
+  hard-cuts a long line with no separators [✔]
+  splits on paragraph boundary when \n\n fits within the limit [✔]
+  concat . chunkMessage limit == id (chunks carry trailing sep, last has none) [✔]
+    +++ OK, passed 100 tests.
+  every chunk is non-empty and <= limit [✔]
+    +++ OK, passed 100 tests.
+Seal.Channels.Signal.Transport.conversationIdForSignal
+  derives sig:<source>:<sourceUuid> when both present [✔]
+  derives sig:<source> when UUID absent [✔]
+  rejects when source is absent [✔]
+  rejects when source is empty [✔]
+  never reads the body (depends only on peer fields) [✔]
+    +++ OK, passed 100 tests.
+Seal.Channels.Signal.Transport.parseSignalEnvelope
+  parses a raw envelope into a SignalEnvelope [✔]
+  unwraps a JSON-RPC params.envelope message [✔]
+  parses an envelope with source but no sourceUuid [✔]
+  rejects a value missing the source field [✔]
+  rejects a value with no envelope and no params.envelope [✔]
+  rejects a non-object value [✔]
+  ignores a body field named conversationId (server-derived only) [✔]
+Seal.Types.Command.pCommand
+  parses 'signal' as CommandSignal Supervised [✔]
+  parses 'telegram' as CommandTelegram Supervised [✔]
+  renders --help for the signal subcommand [✔]
+Seal.Channels.Signal.Run.runSignalLoop
+  routes /ping (dispatch) and a plain message (runTurn) over a mock Signal channel; threads MessageSource into the transcript erMeta [✔]
+Seal.Channels.Signal.Transport.chunkMessage
+  empty input -> [] [✔]
+  under-limit passes through as one chunk [✔]
+  exact-limit passes through as one chunk [✔]
+  hard-cuts a long line with no separators [✔]
+  splits on paragraph boundary when the \n\n fits within the limit [✔]
+  splits on line boundary when over-limit and no paragraph fits, chunk keeps trailing \n (except last) [✔]
+  prefers paragraph over line boundary when a split is forced and both fit within the limit [✔]
+  hard-cut when a single paragraph exceeds the limit [✔]
+  under-limit with separators stays as one chunk (no unnecessary split) [✔]
+  concat . chunkMessage limit == id (chunks carry trailing sep, last has none) [✔]
+    +++ OK, passed 100 tests.
+  every chunk is non-empty and <= limit [✔]
+    +++ OK, passed 100 tests.
+  covers every character (concat length == input length) [✔]
+    +++ OK, passed 100 tests.
+mkMockSignalTransport
+  stReceive pops scripted values in order, then Left 'inbox empty' [✔]
+  stSend captures (recipient, body) pairs in order [✔]
+  stClose is idempotent [✔]
+Seal.Transcript.Types
+  JSON round-trips through aeson [✔]
+  encodeEntryRaw is a single line with no trailing newline [✔]
+  encodeEntryRaw equals the canonical aeson encoding (view-raw hides nothing) [✔]
+Seal.Transcript.Conv
+  diffNew
+    returns the suffix beyond the written prefix [✔]
+      +++ OK, passed 100 tests.
+    returns the whole incoming when written is empty [✔]
+      +++ OK, passed 100 tests.
+    returns the whole incoming when written is not a prefix (divergence fallback) [✔]
+      +++ OK, passed 100 tests.
+  appendMessages
+    concatenates written and new [✔]
+      +++ OK, passed 100 tests.
+  readConversation . roundTripBody
+    round-trips a message list [✔]
+      +++ OK, passed 100 tests.
+    skips malformed trailing lines (torn tail) [✔]
+    reading an empty file yields no messages [✔]
+  end-to-end write-then-read
+    writing the diff then reading back equals the full conversation [✔]
+      +++ OK, passed 100 tests.
+Seal.Transcript.Entries
+  EntryKind
+    round-trips through JSON [✔]
+    rejects unknown tags [✔]
+  EnvelopeDelta
+    round-trips through JSON [✔]
+      +++ OK, passed 100 tests.
+    emptyEnvelopeDelta round-trips as an empty object [✔]
+    round-trips a stub-schema ToolDefinition (input_schema omitted on encode, restored on decode) [✔]
+    round-trips a null-schema ToolDefinition (input_schema present as null) [✔]
+  applyDelta
+    inherits unchanged fields [✔]
+    applies a model-only delta [✔]
+    distinguishes inherit-system from clear-system [✔]
+  effectiveEnvelope
+    folds deltas so each request sees the envelope in effect at that turn [✔]
+    non-request entries inherit the prior envelope unchanged [✔]
+  EntryRecord JSON
+    round-trips a request entry [✔]
+      +++ OK, passed 100 tests.
+    round-trips a response entry [✔]
+    encodeEntryRecordRaw produces non-empty bytes with no trailing newline [✔]
+Seal.Transcript.Reconstruct
+  reconstructs a request entry with the conversation prefix + envelope [✔]
+  reconstructs a response entry with the assistant content blocks [✔]
+  folds envelope deltas so a later request sees the updated model [✔]
+  compaction entries pass through as boundary markers [✔]
+  reconstruction is total on empty inputs [✔]
+  a response entry's payload does not include the next turn's user message [✔]
+  a harness entry with convLen=0 does not reset the conversation cursor [✔]
+  harnessPayload includes op in the base payload (no approval key) [✔]
+Seal.Handles.AskReply
+  askHuman / deliverAnswer roundtrip
+    blocks until the answer is delivered, then returns Right answer [✔]
+    fires the notify callback with the AskId before blocking [✔]
+  deliverAnswer idempotency
+    rejects a second answer to the same question (returns False) [✔]
+    returns False for an unknown ask id [✔]
+  timeout
+    returns Left AoTimedOut when no answer arrives within the timeout [✔]
+    returns Right answer when the answer arrives before the timeout [✔]
+  cancelAsk
+    unblocks the waiting thread with Left AoCancelled [✔]
+    returns False for an unknown ask id [✔]
+  cancelSessionAsks
+    cancels all pending questions for a session [✔]
+    does not affect other sessions [✔]
+  deliverNextAnswer (FIFO inbox-driven delivery)
+    delivers to the oldest pending question first [✔]
+    returns False when no question is pending (unsolicited message) [✔]
+    only delivers to the matching session [✔]
+  pendingForSession
+    lists all pending questions for the session [✔]
+  lookupAsk
+    returns the session + question for a pending id [✔]
+    returns Nothing after the question is answered [✔]
+  parseAskId / askIdText
+    round-trips a minted AskId [✔]
+    rejects a non-UUID text [✔]
+    rejects an empty string [✔]
+  askHumanWithOptions
+    registers a pending ask with options surfacing in pendingForSession [✔]
+  QuestionOption validation
+    accepts a valid non-empty list of unique-label options [✔]
+      +++ OK, passed 100 tests.
+    rejects an empty list [✔]
+    rejects a list longer than 8 [✔]
+    rejects an empty label [✔]
+    rejects a label exceeding 64 bytes [✔]
+    rejects a label whose UTF-8 encoding exceeds 64 bytes (non-ASCII) [✔]
+    rejects duplicate labels (case-sensitive) [✔]
+    rejects a description exceeding 200 chars [✔]
+  deliverNextAnswerResolved (FIFO + numeric resolution)
+    resolves a 1-based numeric index to the option label [✔]
+    resolves ' 2 ' (whitespace) to the 2nd label after T.strip [✔]
+    resolves '02' (leading zero) to the 2nd label [✔]
+    delivers an out-of-range number as-is ('Other') [✔]
+    delivers non-numeric text as-is ('Other') [✔]
+    delivers text as-is when the ask has no options (open-ended) [✔]
+    returns (body, False) when no question is pending [✔]
+  deliverNextAnswerResolvedAny (session-agnostic FIFO + numeric resolution)
+    resolves a numeric index across all sessions (session-agnostic) [✔]
+    delivers non-numeric text as-is across all sessions [✔]
+    returns (body, False) when no question is pending [✔]
+Seal.Handles.Channel
+  chSend captures to the send list [✔]
+  chSendError / chSendChunk capture separately [✔]
+  chPrompt returns Right the scripted response, then AsyncQueued when empty [✔]
+  chReceive pops the scripted inbox, then (Nothing, "") when empty [✔]
+  chReadSecret is Nothing by default [✔]
+Seal.Handles.Harness.noOpHarnessHandle
+  send succeeds [✔]
+  receive returns Right [] [✔]
+  snapshot returns Right empty [✔]
+  status returns Right HsIdle [✔]
+  stop succeeds [✔]
+Seal.Handles.Harness.stripAnsi
+  plain ASCII is identity [✔]
+  removes a CSI color sequence [✔]
+  removes a cursor-move CSI [✔]
+  empty input -> empty [✔]
+  never emits ESC [✔]
+    +++ OK, passed 100 tests.
+  idempotent [✔]
+    +++ OK, passed 100 tests.
+Seal.Handles.Harness.stripControl
+  removes NUL/BEL/BS/DEL [✔]
+  plain ASCII is identity [✔]
+  idempotent [✔]
+    +++ OK, passed 100 tests.
+  removes all control chars [✔]
+    +++ OK, passed 100 tests.
+Seal.Handles.Tab
+  mkTabIndex
+    accepts 0 [✔]
+    accepts 35 [✔]
+    rejects 36 [✔]
+    rejects -1 [✔]
+  tabIndexToChar / tabIndexFromChar
+    0 -> '0' [✔]
+    9 -> '9' [✔]
+    10 -> 'a' [✔]
+    35 -> 'z' [✔]
+    fromChar '0' -> Right 0 [✔]
+    fromChar 'Z' (case-insensitive) -> Right 35 [✔]
+    fromChar '!' -> Left [✔]
+    round-trips for 0..35 [✔]
+      +++ OK, passed 100 tests; 227 discarded.
+  TabKind
+    has six constructors [✔]
+Seal.Handles.Transcript
+  legacy single-file
+    recordAndAck durably appends one JSONL line per entry [✔]
+    drains a recordAsync entry queued just before scope exit [✔]
+    fakeTranscript records invocation order for assertions [✔]
+  two-file format
+    writes conversation.jsonl and entries.jsonl with one line each per write [✔]
+    grows conversation.jsonl by deltas across turns [✔]
+    redacts CbToolResult parts from secret-producing opcodes so secret values never reach disk [✔]
+    does NOT redact CbToolResult parts from non-secret opcodes (e.g. SHELL_EXEC) [✔]
+    readConversation / readEntries round-trip the written data [✔]
+    fakeTwoFileTranscript records writes in memory [✔]
+    tfwIsAlive returns True for a healthy daemon [✔]
+    tfwIsAlive returns True for fakeTwoFileTranscript [✔]
+    TranscriptError is an Exception [✔]
+    tfwRecordAndAck raises TranscriptError after daemon dies (fd closed externally) [✔]
+Seal.Harness.Id
+  newHarnessId / parseHarnessId / harnessIdToText
+    parseHarnessId . harnessIdToText round-trips a minted id [✔]
+    two minted ids are distinct (probabilistic) [✔]
+    rejects a non-UUID [✔]
+    rejects empty [✔]
+    parseHarnessId round-trips any valid UUID-shaped text [✔]
+      +++ OK, passed 100 tests.
+Seal.Harness.Registry CRUD
+  insert then lookupById finds it [✔]
+  lookupById misses uninserted [✔]
+  lookupByLabel finds by label [✔]
+  modify updates an entry [✔]
+  delete removes an entry [✔]
+  snapshot returns all entries sorted by id [✔]
+Seal.Harness.Registry.mergeReconcile
+  inserts a new observed id as HoDiscovered [✔]
+  preserves origin + updates liveness for an existing id [✔]
+  resets orphan-ticks on a non-orphan observation [✔]
+  increments orphan-ticks on an orphan observation [✔]
+  does not touch an existing entry not in the observed list [✔]
+  lost-update safe: two disjoint merges in one transaction both land [✔]
+    +++ OK, passed 100 tests; 272 discarded:
+     5% 14
+     5% 15
+     5% 22
+     5% 44
+     5% 48
+     4% 19
+     4% 27
+     4% 36
+     4% 47
+     4% 49
+     3% 21
+     3% 30
+     3% 32
+     3% 45
+     3% 9
+     2% 1
+     2% 18
+     2% 2
+     2% 24
+     2% 25
+     2% 28
+     2% 31
+     2% 38
+     2% 4
+     2% 43
+     2% 5
+     2% 50
+     2% 6
+     2% 8
+     1% 0
+     1% 11
+     1% 12
+     1% 13
+     1% 17
+     1% 23
+     1% 29
+     1% 34
+     1% 37
+     1% 39
+     1% 46
+     1% 7
+Seal.Harness.Observer.observeClaudeCode
+  Thinking -> LvThinking [✔]
+  Working -> LvThinking [✔]
+  bare > prompt -> LvAwaitingInput [✔]
+  yes/no confirmation -> LvAwaitingInput [✔]
+  plain output at prompt, not awaiting -> LvIdle [✔]
+  no seal_id + pane_dead -> LvExited [✔]
+  no seal_id, pane alive -> LvOrphaned [✔]
+Seal.Session.Kind.mkHCustom
+  accepts a simple name [✔]
+  rejects / [✔]
+  rejects \ [✔]
+  rejects leading dash [✔]
+  rejects empty [✔]
+Seal.Harness.Reconcile.tickOrphans
+  increments orphan-ticks for unobserved entries [✔]
+  evicts an entry whose ticks exceed the grace limit [✔]
+  does not touch an entry whose id IS in the observed set [✔]
+  never evicts an observed id [✔]
+    +++ OK, passed 100 tests; 77 discarded.
+Seal.Harness.Tmux.validateTmuxIdent
+  accepts a typical window name [✔]
+  accepts a pane id (%5) [✔]
+  accepts dots and underscores [✔]
+  rejects empty [✔]
+  rejects leading dash (option injection) [✔]
+  rejects colon (tmux separator) [✔]
+  rejects control chars [✔]
+  accepts [A-Za-z0-9_.%-] non-empty, no leading dash, no colon [✔]
+    +++ OK, passed 100 tests.
+Seal.Harness.Tmux.mkTmuxIdent
+  round-trips a good ident [✔]
+  rejects a bad ident [✔]
+argv builders
+  sendKeysNamedArgs uses -l -- for literal text [✔]
+  sendEnterNamedArgs sends the Enter key (no -l --) [✔]
+  pasteBufferNamedArgs [✔]
+  captureNamedArgs captures pane content [✔]
+  killWindowNamedArgs [✔]
+  renameWindowNamedArgs [✔]
+  newWindowNamedArgs [✔]
+  setWindowMarkerArgs stamps the seal_id marker [✔]
+  clearWindowMarkerArgs [✔]
+  setRemainOnExitArgs [✔]
+sendKeysNamedArgs option-injection defense
+  a payload starting with - is still literal (the -- separator guards it) [✔]
+Seal.Harness.Tmux IO wrappers
+  sendToWindowNamed passes the expected argv and returns Right () [✔]
+  captureWindowNamed returns the scripted lines [✔]
+  stopHarnessWindowNamed passes kill-window argv [✔]
+  setWindowMarker passes the seal_id marker argv [✔]
+  readMarkers parses the show-options output into a map [✔]
+  returns HeTmuxMissing when the fake scripts a 127 [✔]
+Seal.Harness.Discovery
+  scanDiscoverableIO parses list-windows output, filters managed [✔]
+  guesses codex from the title [✔]
+  returns Left HeTmuxMissing when tmux is absent [✔]
+Seal.Tabs.Types
+  I1 (contiguity)
+    emptyTabList has 0 tabs [✔]
+    insertTab places at slot 0 for an empty list [✔]
+    insertTab places at the lowest free slot (slot 1 after one insert) [✔]
+    removeTab compacts: indices renumber to 0..n-2 [✔]
+    removeTab out of range is Left [✔]
+  I2 (no duplicate refs)
+    insertTab with a duplicate ref is Left [✔]
+    insertTab with a distinct ref is Right [✔]
+  36-slot cap
+    insertTab fails after 36 tabs [✔]
+  I3 (cursor survives compaction)
+    slotOf finds the slot [✔]
+    removeTab j<i shifts the cursor's slot down by 1 [✔]
+    slotOf returns Nothing for a stale ref [✔]
+  lookup
+    lookupTab by index [✔]
+    lookupByRef [✔]
+  renameTab
+    sets the label [✔]
+  QuickCheck invariants
+    I1: indices are contiguous 0..n-1 after any op sequence [✔]
+      +++ OK, passed 100 tests.
+    I2: no two tabs share a TabRef [✔]
+      +++ OK, passed 100 tests.
+    I3: slotOf . lookupByRef round-trips [✔]
+      +++ OK, passed 100 tests.
+    lookupTab tl (tIndex t) == Just t for every tab t [✔]
+      +++ OK, passed 100 tests.
+Seal.Tabs.TabsHandle
+  newTabsHandle is empty [✔]
+  insertTabH places at the lowest free slot [✔]
+  insertTabH with a duplicate ref is Left (I2) [✔]
+  removeTabH compacts (I1) [✔]
+  removeTabH out of range is Left [✔]
+  renameTabH sets the label [✔]
+  focusTabH validates the index is in range [✔]
+  rebindTabH
+    swaps the tab's ref, preserving index/kind/label/status [✔]
+    out-of-range index is Left [✔]
+    I2: new ref already bound to a different tab is Left [✔]
+    rebind-to-same-ref is a no-op Right [✔]
+partitionSessions
+  empty tab list, one non-archived session -> recents [✔]
+  session bound to a tab -> tabSessions, not recents [✔]
+  archived session with no tab -> archivedSessions [✔]
+  archived + tab-bound -> tabSessions (tab wins) [✔]
+  harness tab does not pull a session into tabSessions [✔]
+  mutual exclusion: no session id in two lists [✔]
+  completeness: every input session appears in exactly one output list [✔]
+Seal.Tabs.Persist
+  saveTabList/loadTabList round-trip
+    save then load returns the tab list [✔]
+    missing file -> Nothing [✔]
+    corrupt JSON -> Nothing (does not throw) [✔]
+  auto-save-on-mutation (persisting handle)
+    insertTabH via newPersistingTabsHandle triggers a save (loadTabList returns the new tab) [✔]
+    a second insert is persisted alongside the first [✔]
+  id-validation on load
+    skips a tab with an unparseable SessionId (does not error) [✔]
+    skips a tab with an unparseable HarnessId (does not error) [✔]
+Seal.Tabs.Relay.relayEvent
+  FocusedOnly
+    ChunkOf t -> [t] (verbatim) [✔]
+  ActivityDigest
+    ChunkOf t -> [] (suppress) [✔]
+  Firehose
+    forwards every event (including framing) [✔]
+Seal.Tabs.Wizard
+  buildWizard numbers targets 1..n (skipping 0) [✔]
+  handleReply "0" -> WizardCancel [✔]
+  handleReply "1" -> WizardAttach (first target) [✔]
+  handleReply "2" -> WizardAttach (second target) [✔]
+  handleReply "/ping" -> WizardSlash ping (cancel + run) [✔]
+  handleReply "/tab list" -> WizardSlash tab list [✔]
+  handleReply "99" -> Left (out of range) [✔]
+  handleReply "" -> Left (empty) [✔]
+  handleReply "x" -> Left (not a number) [✔]
+Seal.Routing.Route
+  terse /N grammar
+    /0 -> Focus 0 [✔]
+    /z -> Focus 35 [✔]
+    /1 -> Focus 1 [✔]
+    /1 hello -> Inject 1 hello [✔]
+    /a payload -> Inject 10 payload [✔]
+    /0  -> Focus 0 (trailing space ignored) [✔]
+    /1  multiple   spaces -> Inject 1 (preserved) [✔]
+  /tab commands (bare = CurrentTab; subcommands deferred to the registry)
+    /tab -> CurrentTab [✔]
+    /tab list -> SlashCommand tab list [✔]
+    /tab close 0 -> SlashCommand tab close 0 [✔]
+  other /commands
+    /help -> SlashCommand help [✔]
+    /ping -> SlashCommand ping [✔]
+    /vault setup -> SlashCommand vault (with args) [✔]
+  /new
+    /new -> NewSession [✔]
+    /new with trailing args still NewSession (args ignored by the route) [✔]
+    /newbot -> SlashCommand (not NewSession; /new must be alone or space-delimited) [✔]
+  plain text
+    hello -> Plain hello [✔]
+    empty -> Plain empty [✔]
+    text with slashes inside -> Plain [✔]
+  multi-char disambiguation
+    /vault -> SlashCommand vault (not Inject, no space after v) [✔]
+    /vault setup -> SlashCommand vault setup [✔]
+    /36 -> SlashCommand 36 (two digits, not a single tab char) [✔]
+    /! -> SlashCommand ! [✔]
+    /tabx -> SlashCommand tabx (tab prefix but not a whole word) [✔]
+  QuickCheck
+    /N for valid N never routes to Plain or SlashCommand [✔]
+      +++ OK, passed 100 tests.
+    /N payload for valid N always routes to Inject [✔]
+      +++ OK, passed 100 tests; 863 discarded.
+    plain text (no leading /) always routes to Plain [✔]
+      +++ OK, passed 100 tests.
+Seal.Memory.Types
+  mkMemoryId
+    accepts a valid id [✔]
+    rejects an empty id [✔]
+    rejects a leading-dot id [✔]
+    rejects an id with disallowed chars [✔]
+    round-trips valid ids through the predicate (property) [✔]
+      +++ OK, passed 100 tests.
+  MemoryEntry JSON
+    round-trips through aeson [✔]
+      +++ OK, passed 100 tests.
+    the sample entry round-trips [✔]
+Seal.Memory.Backend
+  encodeMemory / decodeMemory
+    round-trips an entry with tags [✔]
+    round-trips an entry with empty tags [✔]
+    round-trips an entry with no system (empty body) [✔]
+  noneBackend
+    store then recall round-trips [✔]
+    delete removes the entry [✔]
+    list returns all entries [✔]
+  markdownMemoryBackend
+    store writes a file and recall reads it back [✔]
+    store auto-commits to the git repo [✔]
+    list enumerates the directory sorted by id [✔]
+    delete removes the file [✔]
+Seal.Skills.Types
+  mkSkillId
+    accepts a valid id [✔]
+    rejects an empty id [✔]
+    rejects a leading-dot id [✔]
+    rejects an id with disallowed chars [✔]
+    round-trips valid ids through the predicate (property) [✔]
+      +++ OK, passed 100 tests.
+  Skill JSON
+    round-trips through aeson [✔]
+      +++ OK, passed 100 tests.
+    the sample skill round-trips [✔]
+Seal.Skills.Backend
+  encodeSkill / decodeSkill
+    round-trips a skill [✔]
+    round-trips a skill with empty body [✔]
+  noneBackend
+    create then read round-trips [✔]
+    list returns all entries [✔]
+  markdownSkillBackend
+    create writes a file and read reads it back [✔]
+    create auto-commits to the git repo [✔]
+    list enumerates the directory sorted by id [✔]
+  markdownSkillBackend grouped layout
+    writes a grouped skill under <root>/<group>/<id>.md and reads it back [✔]
+    lists skills from group subdirectories, stamped with their group [✔]
+    stamps group from the directory when the frontmatter omitted it [✔]
+    still reads flat-layout skills (back-compat) with no group [✔]
+    deletes a grouped skill from its group directory [✔]
+Seal.Skills.Prompt
+  availableSkillsBlock
+    returns the empty string when there are no skills [✔]
+    wraps a single skill in <available_skills> tags with id + description [✔]
+    groups skills by skGroup with a header per group [✔]
+    renders ungrouped skills under a default '## Skills' header [✔]
+    uses '(no description)' for an empty description [✔]
+    truncates a block that exceeds the budget [✔]
+  injectAvailableSkills
+    appends the catalog after an existing prompt [✔]
+    makes the catalog the entire prompt when there was none [✔]
+    returns the prompt unchanged when the backend has no skills [✔]
+    returns Nothing when the backend has no skills and there was no prompt [✔]
+Seal.Agent.Def.Types
+  mkAgentDefId
+    accepts a valid id [✔]
+    rejects an empty id [✔]
+    rejects a leading-dot id [✔]
+    rejects an id with disallowed chars [✔]
+    round-trips valid ids through the predicate (property) [✔]
+      +++ OK, passed 100 tests.
+  AgentDef JSON
+    round-trips through aeson [✔]
+      +++ OK, passed 100 tests.
+    the sample def round-trips [✔]
+    AllowAll encodes as "all" [✔]
+Seal.Agent.Def.Backend
+  encodeAgentDef / decodeAgentDef
+    round-trips a def with AllowAll tools [✔]
+    round-trips a def with AllowOnly tools [✔]
+    round-trips a def with no system prompt [✔]
+  noneBackend
+    update then read round-trips [✔]
+    list returns all defs [✔]
+  markdownAgentDefBackend
+    update writes a file and read reads it back [✔]
+    update auto-commits to the git repo [✔]
+    list enumerates the directory sorted by id [✔]
+  DirScheme discovery (PureClaw-style subdirectories)
+    discovers a zoe/ directory with SOUL.md + AGENTS.md and composes the prompt [✔]
+    AGENTS.md frontmatter supplies model/provider/tools [✔]
+    DirScheme agent with no bootstrap files returns adSystem = Nothing [✔]
+    per-file truncation marker fires at the configured limit [✔]
+    oversized bootstrap file (>1MiB) is skipped [✔]
+warning: agent def foo has both a flat file and a directory; flat file takes precedence
+warning: agent def foo has both a flat file and a directory; flat file takes precedence
+    flat file takes precedence over directory on conflict [✔]
+warning: agent def foo has both a flat file and a directory; flat file takes precedence
+    AGENT_DEF_UPDATE on a DirScheme agent flattens it: writes foo.md and preserves the composed prompt as the body [✔]
+Seal.Agent.Def.Workdir (no direct FS imports — §3.6)
+  does not import System.Directory [✔]
+  does not import Data.Text.IO [✔]
+Seal.Skills.Backend (no direct FS in workdir functions — §3.6)
+  defers the full no-direct-FS assertion to W6 (module-split) [‐]
+    # PENDING: W6: split workdir skill functions into Seal.Skills.Workdir, then assert no System.Directory / Data.Text.IO imports (mirroring Seal.Agent.Def.BackendNoDirectFsFailSpec).
+  defers the workdirSkillBackendFs export check to W6 [‐]
+    # PENDING: W6: assert workdirSkillBackendFs is the sole workdir entry point once the back-compat FilePath wrapper is removed.
+Seal.Agent.PromptParts
+  staticGuidanceBlock (via injectStaticGuidance)
+    injects all three blocks when all are true [✔]
+    injects only the enabled block when one is true [✔]
+    returns the prompt unchanged when no block is enabled [✔]
+    returns Nothing when no block is enabled and there was no prompt [✔]
+    makes the guidance the entire prompt when there was none [✔]
+  block content
+    parallelToolGuidance mentions batching independent calls [✔]
+    toolUseEnforcement mentions calling rather than describing [✔]
+    taskCompletionGuidance mentions stubs and fabrication [✔]
+Seal.Agent.Runtime.Registry
+  startAgent
+    forks the worker and records the instance as Running [✔]
+  agentStatus
+    returns Nothing when not running [✔]
+    records Crashed when the worker throws [✔]
+  stopAgent
+    removes the instance (a fresh start can proceed) [✔]
+    is idempotent (stopping a non-running subagent id is a success) [✔]
+  interruptAgent
+    sets the status to Interrupted for a running instance [✔]
+    returns False when no instance matches the subagent id [✔]
+  listAgents
+    snapshots running instances [✔]
+Seal.ISA.Ops.Memory
+  MEMORY_WRITE
+    creates a new entry and returns 'stored' with was_new=true [✔]
+    rejects an invalid id [✔]
+    updates an existing entry and returns 'updated' with was_new=false (preserves provenance) [✔]
+  MEMORY_RECALL
+    returns a paged window of all memories [✔]
+    filters by a substring query [✔]
+  MEMORY_DELETE
+    deletes an existing memory [✔]
+    is idempotent on a missing id [✔]
+  secret discipline
+    orRecorded never carries a vault secret (memory content is agent-visible, recorded in full) [✔]
+Seal.ISA.Ops.Skills
+  SKILL_WRITE
+    creates a new skill and returns 'created' with was_new=true [✔]
+    rejects an invalid id [✔]
+    updates an existing skill and returns 'updated' with was_new=false (preserves provenance) [✔]
+  SKILL_LOAD
+    returns the skill body [✔]
+    errors when the skill does not exist [✔]
+    rejects an invalid id [✔]
+  SKILL_LIST
+    returns an empty message when no skills [✔]
+    lists defined skills as id: description lines [✔]
+  SKILL_DELETE
+    deletes an existing skill [✔]
+    is idempotent on a missing id [✔]
+  secret discipline
+    orRecorded carries the skill body (agent-visible data, recorded in full, not a vault secret) [✔]
+Seal.ISA.Ops.Repo
+  validateRepoUrl
+    accepts an https URL [✔]
+    accepts an http URL [✔]
+    accepts a git:// URL [✔]
+    accepts an ssh:// URL [✔]
+    accepts an SCP-style git@host:path URL [✔]
+    rejects an empty url [✔]
+    rejects a whitespace-only url [✔]
+    rejects a url with no acceptable scheme [✔]
+    rejects a url with a shell metacharacter (semicolon) [✔]
+    rejects a url with a backtick [✔]
+    rejects a url with a dollar [✔]
+    trims surrounding whitespace [✔]
+  isShellMetachar
+    flags the usual shell metacharacters [✔]
+    does not flag safe URL characters [✔]
+  sanitizeRepoName
+    takes the last path segment of an https URL [✔]
+    strips a trailing .git [✔]
+    handles an SCP-style url [✔]
+    replaces disallowed chars with dashes [✔]
+    uses the hostname as the name for a bare host (no path) [✔]
+    strips trailing slashes before deriving the name [✔]
+  normalizeRepoUrl
+    strips an https:// scheme, trailing .git, and lowercases [✔]
+    strips an ssh:// scheme [✔]
+    strips a git:// scheme [✔]
+    rewrites an SCP-style git@host:path to host/path [✔]
+    makes git@ and https forms of the same repo compare equal [✔]
+    strips trailing slashes [✔]
+    preserves a port in the host [✔]
+  cloneRepoIO
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-src-517569a8eaba0e63/repo.git/
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-src-517569a8eaba0e63/work/.git/
+[main (root-commit) d3a48cc] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+To /private/tmp/nix-shell.HF9B5B/seal-repo-src-517569a8eaba0e63/repo.git
+ * [new branch]      HEAD -> main
+    clones a local bare repo into <workdir>/<name> (shallow) [✔]
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-src2-405af7a7b03aee00/repo.git/
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-src2-405af7a7b03aee00/work/.git/
+[main (root-commit) 2e11e88] x
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+To /private/tmp/nix-shell.HF9B5B/seal-repo-src2-405af7a7b03aee00/repo.git
+ * [new branch]      HEAD -> main
+    is a no-op when the same repo is already cloned [✔]
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-scheme-ea143888e226f05a/repo.git/
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-scheme-ea143888e226f05a/work/.git/
+[main (root-commit) b3f8a7a] x
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+To /private/tmp/nix-shell.HF9B5B/seal-repo-scheme-ea143888e226f05a/repo.git
+ * [new branch]      HEAD -> main
+    is a no-op when re-cloned via a URL that normalizes to the same repo (trailing .git vs no .git) [✔]
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-conflict-f61b13e7e0a65e9c/a/repo.git/
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-conflict-f61b13e7e0a65e9c/b/repo.git/
+Initialized empty Git repository in /private/tmp/nix-shell.HF9B5B/seal-repo-conflict-f61b13e7e0a65e9c/work/.git/
+[main (root-commit) b9eb753] x
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+To /private/tmp/nix-shell.HF9B5B/seal-repo-conflict-f61b13e7e0a65e9c/a/repo.git
+ * [new branch]      HEAD -> main
+    reports a conflict when a different repo occupies the path [✔]
+    reports CloneFailed (not CloneCloned) when the clone errors — git's non-zero exit is returned as Right by uioShellExec, so the filesystem must be the source of truth [✔]
+Seal.ISA.Ops.Git
+  resolveOriginUrl
+    returns the origin URL from git config [✔]
+    returns Left if no remote.origin.url is configured [✔]
+  GIT_FETCH (deploy key, happy path)
+    succeeds and returns a success message [✔]
+    per-repo scoping: one sahStart + sahAddKey, no sahDeleteAll (one-agent-per-repo) [✔]
+  GIT_FETCH (registry miss)
+    errors naming the origin URL [✔]
+  GIT_FETCH (vault locked)
+    errors with 'vault locked' [✔]
+  GIT_PUSH audit
+    orRecorded carries credential_kind + status (secret-free) [✔]
+    orRecorded on failure carries credential_kind + status=failed [✔]
+  GIT_PULL (PAT, happy path)
+    succeeds with http.extraHeader (no agent calls) [✔]
+  opcode metadata
+    GIT_FETCH is Untrusted [✔]
+    GIT_PULL is Untrusted [✔]
+    GIT_PUSH is Untrusted [✔]
+    opName is GIT_FETCH/GIT_PULL/GIT_PUSH [✔]
+Seal.ISA.Ops.Agent
+  AGENT_DEF_WRITE
+    creates a def and returns 'defined' [✔]
+    rejects an invalid id [✔]
+    accepts an optional system prompt and tools=all [✔]
+    updates an existing def and returns 'updated' with was_new=false (preserves provenance) [✔]
+  AGENT_DEF_READ
+    returns the def fields [✔]
+    errors when the def does not exist [✔]
+  AGENT_DEF_LIST
+    returns an empty message when no defs [✔]
+    lists defined defs with id, name, and provider/model [✔]
+  AGENT_DEF_DELETE
+    deletes an existing def [✔]
+    is idempotent on a missing id [✔]
+  AGENT_START (synchronous, goal-driven)
+    runs a child to completion and returns a summary [✔]
+    AGENT_START errors when the def does not exist [✔]
+    AGENT_START requires a goal (single-task mode) [✔]
+    AGENT_START supports batch mode (tasks array) [✔]
+    AGENT_START rejects when spawn is paused [✔]
+  AGENT_INSTANCES / STATUS / STOP / INTERRUPT (subagent-id keyed)
+    AGENT_INSTANCES reports (no agents running) when the synchronous model has finished [✔]
+    AGENT_STATUS reports not running when absent [✔]
+    AGENT_STOP is idempotent on a non-running subagent id [✔]
+    AGENT_INTERRUPT returns 'subagent not running' when no match [✔]
+  secret discipline
+    orRecorded carries the def fields (agent-visible data, recorded in full, not a vault secret) [✔]
+Seal.ISA.Ops.Registry
+  OPCODE_DESCRIBE
+    renders the opcode's name, description, and schemas [✔]
+    returns an error for an unknown opcode name [✔]
+    rejects input missing the name field [✔]
+    can describe itself (recursive knot includes the describe op) [✔]
+    FILE_PATCH describe output names the 'patch' field and the 'diff' alias [✔]
+  OPCODE_LIST
+    lists every opcode name + description [✔]
+    reports when no opcodes are registered [✔]
+  registryToolDefs' (stub schemas)
+    emits the real schema when useStub is False [✔]
+    emits the stub schema when useStub is True (name + description preserved) [✔]
+Seal.SourceControl.Repo
+  mkRepoId
+    rejects "" [✔]
+    rejects "bad/id" [✔]
+    rejects "../x" [✔]
+    rejects "a/b" [✔]
+    rejects "with space" [✔]
+    rejects "dot.x" [✔]
+    rejects "has.dot" [✔]
+    accepts "ok" [✔]
+    accepts "ok-1" [✔]
+    accepts "ok_2" [✔]
+    accepts "Aaa-Bbb_123" [✔]
+    accepts "x" [✔]
+  repoRegistryCodec round-trip
+    round-trips a map with all three credential kinds [✔]
+    round-trips a single PAT repo [✔]
+    round-trips a single deploy-key repo [✔]
+    round-trips a single machine-user repo [✔]
+    round-trips a git (non-github) vcs_kind [✔]
+  absent repos table
+    decodes empty TOML to an empty map [✔]
+    decodes a TOML with no [repos] table to an empty map [✔]
+  fail-closed decode
+    rejects an unknown credential_kind [✔]
+    rejects a missing vault_key [✔]
+    rejects machine_user without username [✔]
+    rejects an unknown vcs_kind [✔]
+    rejects a missing url [✔]
+    rejects a bad repo id key [✔]
+    accepts machine_user with username [✔]
+  normalizeReposTable
+    WITHOUT normalization yields empty (the tomland implicit-table bug) [✔]
+    WITH normalization yields the non-empty map [✔]
+  parseRepoHost
+    parses an SSH GitHub URL [✔]
+    parses an HTTPS GitHub URL [✔]
+    parses an HTTPS URL without trailing .git [✔]
+    rejects an empty URL [✔]
+    rejects a non-URL string [✔]
+    rejects an scp-form URL missing the colon [✔]
+  hostAllowed
+    allows github.com [✔]
+    rejects an unknown host [✔]
+    githubHosts is the GitHub-first allow-list [✔]
+  urlShapeValid
+    accepts an SSH GitHub URL [✔]
+    accepts an HTTPS GitHub URL [✔]
+    rejects an empty URL [✔]
+    rejects a plain string [✔]
+    valid SSH and HTTPS forms parse to an allowed host [✔]
+      +++ OK, passed 100 tests.
+  vcsKindText / parseVcsKind
+    vcsKindText rounds git/github [✔]
+    parseVcsKind accepts known kinds [✔]
+    parseVcsKind rejects unknown kinds [✔]
+  repoCredentialKindText / parseCredentialKind
+    repoCredentialKindText maps each constructor [✔]
+    parseCredentialKind builds a PAT [✔]
+    parseCredentialKind builds a deploy key [✔]
+    parseCredentialKind builds a machine user with username [✔]
+    parseCredentialKind rejects machine_user without username [✔]
+    parseCredentialKind rejects an unknown kind [✔]
+    parseCredentialKind rejects an empty vault_key [✔]
+  SourceRepo JSON
+    round-trips a PAT repo [✔]
+    round-trips a deploy-key repo [✔]
+    round-trips a machine-user repo [✔]
+    emits the descriptor shape {id,url,vcs_kind,credential:{kind,vault_key}} [✔]
+    credential has username only for machine_user [✔]
+    does NOT emit any field named token/value/secret [✔]
+    machine_user without username is rejected by FromJSON [✔]
+    round-trips via decode . encode for a generated repo [✔]
+      +++ OK, passed 100 tests.
+  lookupRepoByUrl
+    finds an SSH-registered repo via its HTTPS form [✔]
+    finds an SSH-registered repo via its HTTPS form without trailing .git [✔]
+    finds an HTTPS-registered repo via its SSH form [✔]
+    finds a repo registered without .git via its .git form [✔]
+    returns Nothing for an unregistered repo [✔]
+    returns Nothing for an empty registry [✔]
+  normalizeRepoUrl (shared)
+    strips https:// scheme [✔]
+    strips SSH scp-form user@ and converts : to / [✔]
+    strips trailing .git without a trailing slash [✔]
+    lowercases the result [✔]
+    treats SSH and HTTPS forms of the same repo as equal [✔]
+  account_key codec fail-closed
+    parseCredentialKind rejects account_key [✔]
+    TOML credentialCodec rejects credential_kind = account_key [✔]
+    FromJSON rejects credential.kind = account_key [✔]
+Seal.SourceControl.Registry
+  loadRepoRegistry
+    returns an empty registry when the file is absent [✔]
+    returns Left with non-empty error text on a corrupt file [✔]
+  saveRepoRegistry / loadRepoRegistry round-trip
+    round-trips a two-repo registry (PAT + MachineUser) [✔]
+    leaves no .tmp file after saving (atomic rename) [✔]
+  upsertRepo / removeRepo / lookupRepo
+    upsertRepo adds a new repo to an empty registry [✔]
+    upsertRepo overwrites an existing repo by id [✔]
+    removeRepo deletes an existing repo [✔]
+    removeRepo is a no-op for a missing key [✔]
+    lookupRepo finds a present repo and misses an absent one [✔]
+  updateRepoRegistry (concurrency)
+    serializes N concurrent upserts with no lost update [✔]
+    propagates a load error as Left without writing [✔]
+  RepoRegistryHandle
+    fake wiring returns canned results [✔]
+    mkRepoRegistryHandle rrhList loads an absent file as an empty list [✔]
+    mkRepoRegistryHandle rrhList surfaces a corrupt file as Left [✔]
+    mkRepoRegistryHandle rrhMutate persists an upsert [✔]
+Seal.SourceControl.AgentRegistry
+  persist + load round-trip
+    saves and reloads an agent entry [✔]
+    absent dir loads as empty [✔]
+    overwrites an existing entry on re-upsert [✔]
+    removes an entry [✔]
+  probe (liveness check)
+    reports Dead for a non-existent socket [✔]
+    reports Alive for a real running ssh-agent [✔]
+  probeAndSweep
+    removes dead entries and keeps alive ones [✔]
+  reuse-on-restart (the core invariant)
+    a second handle reuses the persisted agent (no new agent needed) [✔]
+Seal.SourceControl.Clone
+  planClone
+    PAT ssh URL → ClonePlanExtraHeader https-url [✔]
+    MachineUser ssh URL → ClonePlanExtraHeader https-url [✔]
+    DeployKey ssh URL → ClonePlanSshKey ssh-url (unchanged) [✔]
+    disallowed host → CloneHostNotSupported [✔]
+    malformed URL → CloneNoCredentialForUrl [✔]
+    VcsGit (non-github) → CloneUnsupportedVcs VcsGit [✔]
+    already-https URL with PAT → ClonePlanExtraHeader same https-url [✔]
+  renderCloneError
+    CloneVaultError VaultLocked → vault locked message [✔]
+    CloneVaultError (VaultKeyNotFound k) → vault key message with name [✔]
+    CloneNoCredentialForUrl u → no credential message with url [✔]
+    CloneUnsupportedVcs VcsGit → unsupported VCS message [✔]
+    CloneHostNotSupported h → host message with name [✔]
+    CloneGitFailed n → exit code message, NO stderr [✔]
+    CloneAgentError msg → agent error message [✔]
+  no-disk invariant (W2)
+    deploy key: passphrase NOT on disk; encrypted keyfile IS on disk (ciphertext) [✔]
+    PAT: token NOT on disk (token only in vault + argv, never written to disk) [✔]
+    deploy key: known_hosts file is public data (pinned GitHub keys, no secrets) [✔]
+    deploy key (remote): no local known_hosts file, ceKnownHostsContent set, no SSH_AUTH_SOCK in extras [✔]
+  per-op scoping (W2)
+    two distinct repos → one sahStart + one sahAddKey per repo, no sahDeleteAll [✔]
+    same repo reused → no second sahStart or sahAddKey (cached agent) [✔]
+  deploy-key env (W2)
+    SSH_AUTH_SOCK in env; encrypted keyfile path NOT in env (only the path via sahAddKey) [✔]
+  PAT env (W2)
+    http.extraHeader in ceGitConfigArgs; token NOT in ceUrl or ceEnvExtras [✔]
+    MachineUser: username in Basic auth header; token NOT in env [✔]
+  vault error surfacing
+    locked vault → Left (CloneVaultError VaultLocked) [✔]
+    missing key → Left (CloneVaultError (VaultKeyNotFound k)) [✔]
+  no-stderr in CloneGitFailed
+    CloneGitFailed carries exit code ONLY (no stderr field) [✔]
+  bracket cleanup (W2)
+    deploy key: known_hosts temp file removed after the continuation (success) [✔]
+    cleanup STILL runs when the continuation throws (bracket semantics) [✔]
+  CloneDeps
+    can be constructed with all fields [✔]
+  mergeEnv (overrides win — security fix HIGH 1)
+    override wins over inherited for the same key [✔]
+    non-colliding keys from both are preserved [✔]
+    ambient SSH_AUTH_SOCK does NOT shadow the per-op socket (per-op scoping) [✔]
+  renderPatHeader (non-UTF-8 token bytes — security fix MEDIUM 3)
+    ASCII token: base64(user:token) round-trips [✔]
+    non-UTF-8 token byte (0xFF) is base64-encoded verbatim (NOT corrupted) [✔]
+    MachineUser uses cUsername as the Basic auth user [✔]
+  known_hosts temp file (TOCTOU fix MEDIUM 2)
+    known_hosts file is written under cdKeyfilesDir (NOT /tmp) [✔]
+    known_hosts file is 0600 (private — path integrity protected) [✔]
+  agent leak on throw-after-add (security fix HIGH 2)
+    sahDeleteAll + sahKill run even if the post-add phase throws [✔]
+Seal.Phase2aSpec
+  MessageSource carries ChannelKind=Signal + the server-derived ConversationId [✔]
+  a FakeChannel's chReceive yields the scripted (MessageSource, Text) [✔]
+  drives /ping and hello through ingest — slash dispatches, plain routes [✔]
+Seal.Phase2bSpec
+  Signal over mock transport: /ping dispatches, plain routes to runTurn, non-allow-listed dropped, replies chunked, MessageSource threaded into erMeta [✔]
+Seal.Phase6aSpec
+  HARNESS_START → registry has one entry → reconcileTick classifies Thinking → HARNESS_LIST sees it → HARNESS_STOP marks Exited [✔]
+  orphan grace evicts after defaultOrphanGraceTicks + 1 ticks [✔]
+Seal.Phase6bSpec
+  /tab new creates a tab at the lowest free slot (I1) [✔]
+  /1 (Focus) switches focus; /1 hello (Inject) routes the payload to the tab [✔]
+  /tab close 0 compacts the list (I1); /tab new reuses slot 0 [✔]
+  /tab new with a duplicate ref is rejected (I2) [✔]
+  a cursor (slotOf) survives a removeTab compaction (I3) [✔]
+  a harness tab's output relays to the focused conversation verbatim and to a background conversation as one breadcrumb per burst [✔]
+  the terse grammar is discoverable via the synopsis [✔]
+  /tab rename 0 work sets the label [✔]
+Seal.Phase7aSpec
+  the assembled gateway serves /api/health (200) [✔]
+  a WS client connects, receives hello + a broadcastLists event [✔]
+  GET /api/tabs returns 200 via the assembled gateway [✔]
+Phase 5 capstone (DoD scenario, git-backed)
+  one chat turn: MEMORY_WRITE + RECALL + SKILL_WRITE + AGENT_DEF_WRITE — files land on disk + git, transcript in two-file format [✔]
+  AGENT_START runs synchronously and returns a summary (Trusted, no Audited log) [✔]
+Seal.Phase4Spec (capstone)
+  SHELL_EXEC then FILE_WRITE: both run, orRecorded secret-free (Object) [✔]
+  mode=remote with no remote configured: selectExecBackend never yields EbLocal [✔]
+  UntrustedExecBackend is only constructible from Ssh (never Local) [✔]
+  enforceRemoteOnly rejects mode=local (Cabal flag startup check) [✔]
+Seal.Signal.Config.mkSignalAccount
+  accepts a phone number [✔]
+  accepts a UUID [✔]
+  rejects empty [✔]
+  rejects leading dash (option injection) [✔]
+  rejects invalid chars (spaces) [✔]
+  accepts [A-Za-z0-9+:-] non-empty, no leading dash [✔]
+    +++ OK, passed 100 tests.
+Seal.Signal.Config.defaultSignalConfig
+  has account=Nothing, chunk limit=default, allow=AllowAll [✔]
+Seal.Signal.Config.resolveSignalConfig
+  resolves a config-only account [✔]
+  vault-supplied account overrides config [✔]
+  rejects when account is missing (no section, no vault) [✔]
+  rejects a malformed allow_from entry [✔]
+  AllowAll passes through [✔]
+[signal] TOML round-trip
+  round-trips a section with all three fields [✔]
+  absent section decodes as Nothing [✔]
+Seal.Telegram.Config.mkTelegramToken
+  accepts a BotFather token [✔]
+  rejects empty [✔]
+  rejects leading dash (option injection) [✔]
+  rejects invalid chars (spaces) [✔]
+  accepts [A-Za-z0-9+:-_] non-empty, no leading dash [✔]
+    +++ OK, passed 100 tests.
+Seal.Telegram.Config.defaultTelegramConfig
+  has token=Nothing, chunk limit=default, allow=AllowAll [✔]
+Seal.Telegram.Config.resolveTelegramConfig
+  resolves a config-only token [✔]
+  vault-supplied token overrides config [✔]
+  rejects when token is missing (no section, no vault) [✔]
+  rejects a malformed allow_from entry [✔]
+  AllowAll passes through [✔]
+[telegram] TOML round-trip
+  round-trips a section with all three fields [✔]
+  absent section decodes as Nothing [✔]
+Seal.Providers.Anthropic
+  encodeRequest emits model + max_tokens + tagged content [✔]
+  encodeRequest includes input_schema for a real tool schema [✔]
+  encodeRequest omits input_schema when the tool schema is the on-demand stub [✔]
+  decodeResponse parses text + stop_reason + usage [✔]
+  decodeResponse parses a tool_use block [✔]
+  live completion (opt-in) [‐]
+    # PENDING: needs ANTHROPIC_API_KEY
+  apiKeyHeaders
+    sends x-api-key and no authorization [✔]
+  oauthHeaders
+    sends Bearer + oauth beta and no x-api-key [✔]
+  httpErrorText
+    429 gives a friendly rate-limit message and does not echo the raw body [✔]
+    other statuses include the code and the full response body [✔]
+  ensureFresh
+    refreshes, updates the ref, and persists when the token is expired [✔]
+    does NOT refresh when the token is still valid [✔]
+Seal.Providers.Anthropic.OAuth
+  codeChallenge
+    matches the RFC 7636 S256 vector [✔]
+  buildAuthorizeUrl
+    renders params in the required order with percent-encoding [✔]
+  parsePastedCode
+    splits CODE#STATE on the first '#' [✔]
+    returns an empty state when no '#' is present [✔]
+    splits on the FIRST '#' only [✔]
+  newPkce
+    produces a 43-char verifier whose challenge matches codeChallenge [✔]
+  parseTokenResponse
+    parses access/refresh and computes expiresAt = now + expires_in [✔]
+    fails clearly when a field is missing [✔]
+  serializeTokens / deserializeTokens
+    round-trips through the vault blob [✔]
+  authorizationCodeBody
+    builds the authorization_code grant body with the verifier [✔]
+  refreshTokenBody
+    builds the refresh_token grant body carrying the refresh token [✔]
+  exchangeCode / refreshTokens (live)
+    needs a real OAuth endpoint [‐]
+      # PENDING: live OAuth flow — exercised manually with a Claude subscription
+Seal.Providers.Class
+  Message round-trips [✔]
+    +++ OK, passed 100 tests.
+  CompletionResponse round-trips [✔]
+    +++ OK, passed 100 tests.
+Seal.Providers.Ollama
+  chatUrl / tagsUrl
+    appends the path, stripping one trailing slash [✔]
+  ollamaHeaders
+    local: content-type only, no authorization [✔]
+    cloud: adds a bearer authorization header [✔]
+  encodeRequest
+    emits model, stream=false, num_predict, and a user message [✔]
+    prepends a system message when crSystem is set [✔]
+    encodes a CbToolUse in an assistant message as tool_calls [✔]
+    expands a User message of tool results into ordered tool messages [✔]
+    includes a tools array only when tools are present [✔]
+    omits parameters when the tool input schema is the on-demand stub [✔]
+  decodeResponse
+    parses a text-only message with usage and stop=end [✔]
+    parses tool_calls into CbToolUse with synthesized ids and object args [✔]
+    maps done_reason=length to StopMaxTokens [✔]
+    defaults usage counts to zero when absent [✔]
+    defaults arguments to an empty object when the function omits it [✔]
+    parses a fully-empty response with no text block, no tool calls, zero usage [✔]
+  claimToolCallIds (concurrency)
+    assigns disjoint id ranges under concurrent callers (no "call_0" collision) [✔]
+  shared counter across Ollama instances (cross-turn uniqueness)
+    two mkOllama calls with the same IORef advance the same counter (no call_0 repeat) [✔]
+  ollamaErrorText / unreachableMsg
+    401 points the user at /provider add ollama [✔]
+    other statuses include the code and body [✔]
+    unreachable mentions the base url and how to start ollama [✔]
+  Provider Ollama (live)
+    chat + tags round-trip against a running ollama [‐]
+      # PENDING: needs a local `ollama serve` at http://localhost:11434
+  ollamaNeedsKey
+    is False for a local daemon [✔]
+    is False for a LAN host [✔]
+    is True for the cloud host [✔]
+    is True for the cloud api host [✔]
+Seal.Providers.Registry vocabulary
+  lists the known providers [✔]
+  labels Anthropic [✔]
+  labels Ollama [✔]
+  maps Anthropic to its ProviderId [✔]
+  parses the label case-insensitively [✔]
+  parses ollama case-insensitively [✔]
+  rejects unknown providers [✔]
+  names the vault credential key [✔]
+  names the Ollama vault credential key [✔]
+  has a default model [✔]
+  has an Ollama default model [✔]
+  completeSome
+    passes the request through to the wrapped provider [✔]
+  listSome
+    passes listModels through the wrapped provider [✔]
+  resolveProvider
+    resolves Anthropic when the credential is present [✔]
+    reports a missing credential with an actionable hint [✔]
+    reports a locked vault [✔]
+    resolves via OAuth tokens when only they are present (no HTTP for a fresh token) [✔]
+    prefers OAuth over an API key: a corrupt OAuth blob fails rather than falling back [✔]
+    reports vault not configured for Anthropic with no vault handle [✔]
+  resolveProvider (ollama)
+    resolves local Ollama with no stored key [✔]
+    resolves cloud Ollama when a key is present [✔]
+    resolves local Ollama with no vault handle at all (keyless, vault untouched) [✔]
+    resolves local Ollama even with a locked vault (vault untouched) [✔]
+    reports a missing key for the cloud host with no vault handle [✔]
+    surfaces a locked vault for the cloud host [✔]
+  resolveDefaultModel
+    uses the configured value when present [✔]
+    falls back to the provider's hardcoded default [✔]
+    falls back to anthropic for an unknown label [✔]
+  configuredProviders
+    includes ollama (local) even with no vault and no credentials [✔]
+    includes ollama (local) with an empty vault [✔]
+    includes anthropic when an API key is stored [✔]
+    includes anthropic when an OAuth blob is stored [✔]
+    excludes anthropic when no credential is stored [✔]
+    excludes ollama when the base URL is cloud and no key is stored [✔]
+    includes ollama when the base URL is cloud and a key is stored [✔]
+    excludes both when the vault is locked [✔]
+Seal.Agent.Loop
+  dispatches a tool call then emits the final text [✔]
+  writes the conversation + entries to the two-file transcript [✔]
+  a second turn loads the prior conversation, no duplication [✔]
+  writes the full CompletionRequest to requests.jsonl when aeDebugRequestsPath is set [✔]
+  reconstructed request payloads match the requests.jsonl debug file [✔]
+  human-confirmation gate
+    Supervised + 'once' reply → the opcode executes, not cached [✔]
+    Supervised + 'rejected' reply → the opcode is denied, not executed [✔]
+    Full autonomy → no prompt, the opcode executes [✔]
+    Supervised + Trusted opcode → no prompt, the opcode executes [✔]
+  logs turn start and end to seal.log when aeLogPath is set [✔]
+  logs provider errors to seal.log [✔]
+  writes a provider error to the transcript as a response entry + assistant message [✔]
+  retries a transient provider error twice then succeeds [✔]
+  does NOT retry a non-retryable (401) provider error [✔]
+  does NOT write seal.log when aeLogPath is Nothing [✔]
+  logs the max-turns stop to seal.log [✔]
+  auto-continues when a text response is truncated (StopMaxTokens) [✔]
+  auto-continues when a truncated response yields no content blocks [✔]
+  surfaces a truncation notice after 3 failed continuation attempts [✔]
+  stops after exactly 3 continuation retries on persistent truncation [✔]
+  auto-continue then tool call: continuation feeds into the tool loop [✔]
+  logs StopMaxTokens continuation to seal.log [✔]
+Seal.ISA.Dispatch
+  Untrusted: ack precedes run [✔]
+  Trusted: async then run (no ACK gate) [✔]
+  missing opcode -> OpNotFound [✔]
+  failed authorization -> Denied, never runs [✔]
+  schema advertisement (Task 8)
+    SHELL_EXEC schema declares the optional 'timeout' field [✔]
+    BIN_EXEC schema declares the optional 'timeout' field [✔]
+  recordSkillLoadResult
+    writes the skill body to conversation.jsonl so the next turn sees it [✔]
+    does not write to conversation.jsonl for non-SKILL_LOAD opcodes [✔]
+    does not write to conversation.jsonl for error results [✔]
+    stamps the channel label into erMeta so the frontend can surface origin [✔]
+    omits the channel key from erMeta when Nothing is supplied [✔]
+    appends the trailing message to conversation.jsonl after the skill body [✔]
+    writes only the skill body when the message is blank [✔]
+    writes only the skill body when the message key is absent [✔]
+    writes the skill body as an Assistant message (harness output, not user input) [✔]
+    writes the trailing message as a User message (actual user input) [✔]
+  recordSetupRepoResult
+    writes the clone result as an Assistant message (harness output, not user input) [✔]
+    writes the clone failure as an Assistant message [✔]
+  recordGitPushResult
+    writes the push result as an Assistant message (harness output, not user input) [✔]
+Seal.ISA.Integration
+  FILE_READ
+    "Read the file notes.txt and show me what's in it." -> FILE_READ -> file contents returned [✔]
+    "end-to-end: read notes.txt" -> runTurn -> final text contains the file contents [✔]
+  FILE_WRITE
+    "Create a todo file with the line 'buy milk'." -> FILE_WRITE -> file on disk has the content [✔]
+  FILE_PATCH
+    "Replace 'foo' with 'bar' in code.txt." -> FILE_PATCH -> file patched in place [✔]
+    "Model sent 'diff' key instead of 'patch'." -> FILE_PATCH -> accepted via 'diff' alias, file patched [✔]
+  SHELL_EXEC
+    "Run 'echo hello' in the shell." -> SHELL_EXEC -> stdout returned [✔]
+    "Run a command." -> SHELL_EXEC under a Deny policy -> Denied at the gate [✔]
+  BIN_EXEC
+    "Run this Python script: print('hi')." -> BIN_EXEC -> binary output [✔]
+    "Run rm." -> BIN_EXEC with non-allow-listed binary -> Denied [✔]
+  PROCESS_MANAGE
+    "List the running processes." -> PROCESS_MANAGE action=list -> ps output returned [✔]
+    "Kill process -1." -> PROCESS_MANAGE pid=-1 -> Denied (validated PID) [✔]
+  SEARCH_FILES
+    "Find every occurrence of 'TODO' under src/." -> SEARCH_FILES -> matches returned [✔]
+    "Search for '-x'." -> SEARCH_FILES pattern starting with - -> Denied (option injection) [✔]
+  MEMORY_WRITE
+    "Remember that the user prefers concise answers." -> MEMORY_WRITE (create) -> memory in the store [✔]
+    "Update the 'pref' memory to say 'very concise'." -> MEMORY_WRITE (update) -> content changed, provenance preserved [✔]
+  MEMORY_RECALL
+    "What do you remember about the user?" -> MEMORY_RECALL -> returns stored memories [✔]
+  MEMORY_DELETE
+    "Forget the 'pref' memory." -> MEMORY_DELETE -> memory removed [✔]
+  SKILL_WRITE
+    "Define a 'greeting' skill that says hello." -> SKILL_WRITE (create) -> skill in the store [✔]
+    "Change the 'greeting' skill body to be more formal." -> SKILL_WRITE (update) -> body changed [✔]
+  SKILL_LOAD
+    "Show me the 'greeting' skill." -> SKILL_LOAD -> skill body returned [✔]
+  SKILL_LIST
+    "List all my skills." -> SKILL_LIST -> ids + descriptions returned [✔]
+  SKILL_DELETE
+    "Delete the 'greeting' skill." -> SKILL_DELETE -> skill removed [✔]
+    "Delete a skill that doesn't exist." -> SKILL_DELETE -> idempotent [✔]
+  AGENT_DEF_WRITE
+    "Define a 'greeter' agent on ollama/llama3." -> AGENT_DEF_WRITE (create) -> def stored [✔]
+    "Rename the 'greeter' agent to 'Polite Greeter'." -> AGENT_DEF_WRITE (update) -> name changed [✔]
+  AGENT_DEF_READ
+    "Show me the 'greeter' agent definition." -> AGENT_DEF_READ -> def returned [✔]
+  AGENT_DEF_LIST
+    "List all agent definitions." -> AGENT_DEF_LIST -> empty when none defined [✔]
+    "List all agent definitions." -> AGENT_DEF_LIST -> defs with id, name, provider/model [✔]
+  AGENT_DEF_DELETE
+    "Delete the 'greeter' agent definition." -> AGENT_DEF_DELETE -> def removed [✔]
+    "Delete a def that doesn't exist." -> AGENT_DEF_DELETE -> idempotent [✔]
+  AGENT_START
+    "Start the 'greeter' agent." -> AGENT_START -> runs synchronously and returns a summary [✔]
+  AGENT_STATUS
+    "Is the 'greeter' agent running?" -> AGENT_STATUS -> reports not running when absent [✔]
+  AGENT_INSTANCES
+    "List the running agents." -> AGENT_INSTANCES -> empty when none running [✔]
+  AGENT_STOP
+    "Stop the 'greeter' agent." -> AGENT_STOP -> idempotent when not running [✔]
+  SECRET_GET
+    "Fetch the 'TOKEN' secret from the vault." -> SECRET_GET -> value returned, not in orRecorded [✔]
+  SHOW_HUMAN
+    "Tell the human that the build is done." -> SHOW_HUMAN -> message sent via channel [✔]
+  ASK_HUMAN
+    "Ask the human which branch to use." -> ASK_HUMAN -> human's reply returned [✔]
+  HARNESS_LIST
+    "List the live harnesses." -> HARNESS_LIST -> text returned when none registered [✔]
+  HARNESS_START
+    "Start a claude-code harness." -> HARNESS_START -> registry has one entry [✔]
+  HARNESS_STOP
+    "Stop harness <id>." -> HARNESS_STOP -> entry marked LvExited [✔]
+  WEB_SEARCH
+    "Search the web for 'Haskell runtime'." -> WEB_SEARCH -> query accepted, fail-closed result (no HTTP manager) [✔]
+    "Search for ''." -> WEB_SEARCH with empty query -> Denied at the gate [✔]
+  WEB_FETCH
+    "Fetch the page at https://example.com." -> WEB_FETCH -> URL accepted, fail-closed result (no HTTP manager) [✔]
+    "Fetch ''." -> WEB_FETCH with empty url -> Denied at the gate [✔]
+  BROWSER_OPEN
+    "Open https://example.com in a browser." -> BROWSER_OPEN -> fail-closed (no driver) [✔]
+    "Open a blank page." -> BROWSER_OPEN with empty url -> Denied [✔]
+  BROWSER_CLICK
+    "Click the 'submit' button." -> BROWSER_CLICK -> fail-closed (no driver) [✔]
+    "Click ''." -> BROWSER_CLICK with empty selector -> Denied [✔]
+  BROWSER_READ
+    "Read the page text." -> BROWSER_READ -> fail-closed (no driver); selector optional [✔]
+    "Read the text of the '#main' element." -> BROWSER_READ with selector -> recorded [✔]
+  IMAGE_GENERATE
+    "Generate an image of a cat." -> IMAGE_GENERATE -> fail-closed (no provider) [✔]
+    "Generate an image with no prompt." -> IMAGE_GENERATE empty prompt -> Denied [✔]
+  IMAGE_DESCRIBE
+    "Describe this image." -> IMAGE_DESCRIBE -> fail-closed (no provider) [✔]
+    "Describe an empty image ref." -> IMAGE_DESCRIBE empty image -> Denied [✔]
+  TEXT_TO_SPEECH
+    "Read 'Hello, world.' aloud." -> TEXT_TO_SPEECH -> fail-closed (no provider) [✔]
+    "Synthesize empty text." -> TEXT_TO_SPEECH empty text -> Denied [✔]
+Seal.ISA.Ops.Human
+  SHOW_HUMAN emits the message and returns no error [✔]
+  ASK_HUMAN returns the human reply as a tool-result part [✔]
+  ASK_HUMAN with options
+    authorizes + runs with valid options; ccPrompt receives the options [✔]
+    still works without options (open-ended, today's behavior) [✔]
+    rejects an empty options array [✔]
+    rejects more than 8 options [✔]
+    rejects an empty label [✔]
+    rejects a label exceeding 64 bytes [✔]
+    rejects duplicate labels [✔]
+Seal.ISA.Ops.File
+  reads a small file inside the workspace root: windowed content + footer [✔]
+  orRecorded captures path + offset + limit + resolved max_scan_bytes (uniform in both branches) [✔]
+  passes offset and limit through to the window and orRecorded [✔]
+  lenient offset/limit/max_scan_bytes: malformed values fall back to defaults (no throw) [✔]
+  negative offset falls back to 0 [✔]
+  offset as a numeric string is coerced (not dropped to 0) [✔]
+  limit as a numeric string is coerced (not dropped to default) [✔]
+  max_scan_bytes as a numeric string is coerced (not dropped to default) [✔]
+  offset as a non-numeric string still falls back to 0 [✔]
+  max_scan_bytes request below operator ceiling narrows the scan (clamp down) [✔]
+  max_scan_bytes request above operator ceiling clamps down to the operator bound [✔]
+  max_scan_bytes = 0 (degenerate) falls back to the operator ceiling [✔]
+  large file returns bounded content, not the whole file [✔]
+  empty file returns the empty-file footer [✔]
+  rejects a traversal escape with an error result (no read) [✔]
+  returns an error for a nonexistent file [✔]
+  returns an error result when the path is a directory (IOError caught) [✔]
+  rejects a file exceeding the char ceiling without offset/limit [✔]
+  allows reading a file exceeding the char ceiling when paginating with limit [✔]
+  allows reading a file exceeding the char ceiling when paginating with offset [✔]
+  FILE_WRITE
+    writes content to a file inside the workspace [✔]
+    appends content when mode = append [✔]
+    orRecorded captures path + mode + byte count (not the content) [✔]
+    rejects a path traversal escape (no write) [✔]
+    rejects oversized content (bounded write) [✔]
+Seal.ISA.Ops.Shell
+  SHELL_EXEC
+    runs a validated shell command via the executor and returns stdout [✔]
+    orRecorded captures the command (secret-free metadata) [✔]
+    Deny policy -> Denied at the authorize gate (never runs the executor) [✔]
+    missing command field -> error result, never runs [✔]
+    executor failure surfaces as an error result [✔]
+Seal.ISA.Ops.Process
+  PROCESS_MANAGE
+    list action runs a shell command and returns bounded output [✔]
+    kill action with a valid PID runs the kill command [✔]
+    kill action rejects a negative PID [✔]
+    kill action rejects a missing PID [✔]
+    missing action field -> error [✔]
+    unknown action -> error [✔]
+    orRecorded captures the action + pid (secret-free) [✔]
+Seal.ISA.Ops.Bin
+  BIN_EXEC
+    runs a binary via an allow-listed name [✔]
+    binary not in allow-list -> Denied [✔]
+    missing binary field -> error [✔]
+    args field is optional (defaults to []) [✔]
+    binary with NUL -> Denied (validated BinName rejects NUL) [✔]
+    arg with NUL -> Denied (validated BinArg rejects NUL) [✔]
+    leading-dash arg is permitted (flag, not option injection) [✔]
+    Nothing allow-list permits any binary (autonomy permitting) [✔]
+    orRecorded captures the binary + arg count (secret-free, not the args) [✔]
+  BIN_EXEC cwd
+    defaults cwd to Nothing when omitted (the executor anchors it to the workdir) [✔]
+    passes a relative cwd as a RemotePath (workspace-relative) [✔]
+    passes an absolute cwd as a RemotePath (not workspace-confined) [✔]
+    rejects a @..@ cwd at the authorize gate (escape before execution) [✔]
+    rejects a blocked-name cwd at the authorize gate [✔]
+    rejects a leading-dash cwd at the authorize gate (option injection) [✔]
+    orRecorded captures the cwd (secret-free metadata) [✔]
+Seal.ISA.Ops.Search
+  SEARCH_FILES
+    runs a search via rg and returns matching lines [✔]
+    rejects a pattern starting with dash (option injection) [✔]
+    missing pattern field -> error [✔]
+    orRecorded captures pattern + path + result count (secret-free) [✔]
+    Deny policy -> Denied [✔]
+    result count is bounded by the operator ceiling [✔]
+FILE_PATCH
+  applies a simple unified diff to an existing file [✔]
+  accepts the short hunk header form @@ -1 +1 @@ (length 1 implied) [✔]
+  accepts the short hunk header form for the new-side only (@@ -1,2 +1 @@) [✔]
+  accepts the short hunk header form for the old-side only (@@ -1 +1,2 @@) [✔]
+  orRecorded captures path + patch hash + line counts (not the patch body) [✔]
+  rejects a path traversal escape (no write) [✔]
+  rejects a nonexistent file [✔]
+  missing path field -> error [✔]
+  'diff' field is accepted as an alias for 'patch' (permissive parsing) [✔]
+  missing both 'patch' and 'diff' fields -> error, not silent no-op success [✔]
+  empty patch string -> error, not silent no-op success [✔]
+  multi-hunk line-number shift (session 20260810-123133-477 regression)
+    applies two hunks where hunk 1 inserts lines and hunk 2 edits a later region [✔]
+    applies two hunks where hunk 1 DELETES lines and hunk 2 edits a later region [✔]
+  stale / wrong line numbers in hunk header
+    applies correctly when the hunk header's oldStart is off by a few lines [✔]
+    fails loudly (not silently corrupts) when context lines don't match anywhere [✔]
+  whitespace tolerance in context lines
+    applies when the patch context has trailing whitespace the file lacks [✔]
+  insert at end of file
+    appends new lines after the last existing line [✔]
+    appends to an empty file [✔]
+  duplicate context disambiguation
+    uses context lines to disambiguate when the removed line is duplicated [✔]
+Seal.Skills.Backend.decodeAgentSkill
+  decodes a valid SKILL.md with name and description [✔]
+  returns Nothing when name is missing [✔]
+  returns Nothing when name has invalid characters [✔]
+  handles empty description gracefully [✔]
+Seal.Skills.Backend.workdirSkillConventions
+  includes .skills as the first convention [✔]
+  includes .agents/skills as the second convention [✔]
+Seal.Skills.Backend.workdirSkillBackend (.skills directory)
+  discovers skills in agentskills.io format [✔]
+Seal.Skills.Backend.workdirSkillBackend (.agents/skills directory)
+  discovers skills in agentskills.io format under .agents/skills/ [✔]
+  returns empty list when workdir has no repos [✔]
+Seal.Skills.Backend.workdirSkillBackend (remote-arm stub parity)
+  discovers a skill in agentskills.io format over a stub-remote WorkdirFs [✔]
+  rejects a symlinked SKILL.md escaping the workspace (stub-remote containment) [✔]
+Seal.Skills.Backend.tripleUnionSkillBackend (no-collision namespacing)
+  shows both user and workdir skills when they share the same raw id [✔]
+Seal.Agent.Def.Backend.workdirAgentDefBackend
+  discovers agent defs from .agents/ directory [✔]
+  returns empty list when workdir has no repos [✔]
+Seal.Agent.Def.Backend.workdirAgentDefBackend (.agents Protocol)
+  discovers .agents/agents/<id>/agent.md sub-agents + .agents/agents.md project def [✔]
+  skips a sub-agent with enabled: false [✔]
+  frontmatter id overrides the subdir name when present and valid [✔]
+  rejects a symlinked agent.md escaping the workdir (SafePath confinement) [✔]
+  allows a within-workdir symlink (target inside workdir, outside .agents/) [✔]
+  falls back to legacy DirScheme for .agents/<id>/SOUL.md (no agents.md/agents/ subdir) [✔]
+  deriveAgentsMdId always passes isValidAgentDefId and ends in '-md' (QuickCheck) [✔]
+  prefixes repo-local agent ids + displayNames with the repo dir name to disambiguate collisions [✔]
+Seal.Agent.Def.Backend.workdirAgentDefBackend (remote-arm stub parity)
+  discovers the same defs as the local arm over an equivalent fixture [✔]
+Seal.Agent.Def.Backend.unionAgentDefBackend
+  workdir defs shadow user defs on id collision [✔]
+Seal.Session.Store.autoBindRepoAgent
+  rebinds smAgent from the user default (zoe) to the repo's agents-md after a clone [✔]
+  is a no-op when the session already has a repo-prefixed agent bound (user picked one) [✔]
+  is a no-op when the workdir has no .agents/agents.md (no repo default) [✔]
+  discovers the repo's agents-md via the in-memory stub WorkdirFs (remote-arm parity) [✔]
+Seal.ISA.Ops.Secret
+  returns the secret value to the model but never serialises it into orRecorded [✔]
+  missing key sets orIsError=True and orRecorded still contains only the key name [✔]
+Seal.ISA.Registry
+  looks up registered opcodes [✔]
+  misses unregistered [✔]
+  derives one ToolDefinition per opcode [✔]
+  emits tool definitions in registration order (not alphabetical) [✔]
+Seal.Logging.Logger
+  logIO
+    emits a log line to the scribe [✔]
+    does not emit when severity is below the threshold [✔]
+    escapes newlines in the message (log injection defense) [✔]
+    does not throw when the scribe fails (logger self-failure defense) [✔]
+  withChannelContext
+    merges context so logIO includes ChannelContext fields [✔]
+    does not replace the baseline context (merge, not replace) [✔]
+  testSealLogger
+    produces a logger that does not crash on logIO [✔]
+  ctxFromSession
+    produces a ChannelContext with the channel kind and session id [✔]
+    hashes the conversation id (PII defense) [✔]
+Seal.Logging.Exceptions
+  withExceptionLogging
+    returns Right result on success [✔]
+    returns Left sanitized text on synchronous exception [✔]
+    passes TranscriptError text through (not sanitized) [✔]
+    rethrows AsyncException (does not swallow ThreadKilled) [✔]
+    logs AsyncException to the session log before rethrowing [✔]
+    logs synchronous exceptions to the session log [✔]
+    includes a correlation id in the sanitized text [✔]
+    logs the full exception to the operator log [✔]
+    escapes newlines in exception text (log injection defense) [✔]
+Seal.Tools.Timeout
+  defaultToolTimeoutConfig
+    has sensible defaults [✔]
+  extractPerCallTimeout
+    absent field → default [✔]
+    null → default [✔]
+    non-integer (string) → default [✔]
+    non-integer (float) → default [✔]
+    non-integer (bool) → default [✔]
+    negative → default [✔]
+    zero → default [✔]
+    positive in range → as-is (converted to microseconds) [✔]
+    positive > max → clamp to max [✔]
+    positive == max → max [✔]
+    positive == 1 (minimum valid) → 1s [✔]
+    output is always in [1s, max] (never negative, never zero, never exceeds max) [✔]
+      +++ OK, passed 100 tests.
+    absent field → default [✔]
+      +++ OK, passed 100 tests.
+  computeRetryDelay
+    attempt 0 → base [✔]
+    attempt 1 → base * factor [✔]
+    monotonically increasing (factor >= 1.0) [✔]
+      +++ OK, passed 100 tests.
+    always positive (for attempt < 30, base < 10^7) [✔]
+      +++ OK, passed 100 tests; 272 discarded.
+    overflow-safe: no wraparound to negative for attempt < 30 [✔]
+      +++ OK, passed 100 tests; 272 discarded.
+  shouldRetry
+    ToolTimeout → yes [✔]
+    ToolIOError → yes [✔]
+    ToolAborted → no [✔]
+    ToolRetriesExhausted → no [✔]
+  errorClass
+    ToolTimeout → "timeout" [✔]
+    ToolAborted → "aborted" [✔]
+    ToolIOError → "io" [✔]
+    ToolRetriesExhausted → "retries_exhausted" [✔]
+    NEVER includes the full ToolIOError Text payload [✔]
+  renderToolError
+    Timeout includes opcode name + timeout in seconds [✔]
+    Aborted includes opcode name [✔]
+    RetriesExhausted includes retry count + last error [✔]
+Seal.Tools.Exec.Abort
+  AbortFlag
+    fresh flag is not aborted [✔]
+    setAbort → isAborted True [✔]
+    clearAbort after setAbort → isAborted False [✔]
+    setAbort is idempotent [✔]
+    clearAbort on a fresh flag is a no-op [✔]
+    waitForAbort returns True after setAbort [✔]
+    waitForAbort returns True immediately if already aborted [✔]
+    waitForAbort polls and detects a delayed setAbort [✔]
+    multiple flags are independent [✔]
+  SessionAbortRegistry
+    lookupOrCreateAbortFlag twice for the same SessionId returns the same flag [✔]
+    setSessionAbort makes isAborted True for that session [✔]
+    clearSessionAbort resets the flag [✔]
+    different sessions are independent [✔]
+    lookupOrCreateAbortFlag is atomic — sequential lookups yield the same flag [✔]
+Seal.Tools.Exec.Timeout
+  runWithTimeoutAbortRetry
+    fast-completing action returns result immediately [✔]
+    hanging action times out (retried then exhausted) [✔]
+    aborted action returns ToolAborted [✔]
+    aborted mid-action returns ToolAborted (detected during race) [✔]
+    transient IO error retried 3x then ToolRetriesExhausted [✔]
+    successful action not retried (returns immediately) [✔]
+    abort during retry sleep: detected before next attempt [✔]
+    ToolAborted is NOT retried (respects user cancellation immediately) [✔]
+    Right result with error semantics is NOT retried [✔]
+
+Finished in 200.4176 seconds
+2141 examples, 0 failures, 9 pending
+Test suite tests: PASS
+Test suite logged to:
+/Users/zoe/tmp/seal-harness/./dist-newstyle/build/aarch64-osx/ghc-9.12.4/seal-harness-0.1.0.0/t/tests/test/seal-harness-0.1.0.0-tests.log
+1 of 1 test suites (1 of 1 test cases) passed.
