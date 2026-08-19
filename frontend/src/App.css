@@ -731,6 +731,7 @@ body {
   color: var(--needs-input);
 }
 .header-stop-btn:hover {
+  color: var(--needs-input);
   border-color: var(--needs-input);
 }
 
