@@ -30,6 +30,7 @@ import Control.Exception (bracket)
 import Control.Monad (unless, when)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
+import Data.Aeson.Types (parseMaybe, withObject, (.:))
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -103,7 +104,7 @@ import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (autoBindRepoAgent, formatSessionId, saveSessionMeta)
+import Seal.Session.Store (autoBindRepoAgent, formatSessionId, saveSessionMeta, updateSessionRepoUrl)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -704,8 +705,13 @@ callDispatcher td caps sid channelLabel callOpName val = do
         if opNm == "SETUP_REPO"
           then do
             recordSetupRepoResult tHandle callOpName val r (Just channelLabel)
-            unless (orIsError r) $
+            unless (orIsError r) $ do
               autoBindRepoAgent wfs paths sid
+              -- Record the repo URL on the session meta so the frontend
+              -- can display the repo ID in the sidebar.
+              let mUrl = parseMaybe (withObject "SETUP_REPO" (.: "url")) val
+              _ <- updateSessionRepoUrl paths sid mUrl
+              pure ()
             broadcastAgentDefsChanged (tdBroker td)
           else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
