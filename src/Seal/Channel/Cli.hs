@@ -8,10 +8,8 @@ module Seal.Channel.Cli
   , interpretDisposition
   , handlePlain
   , resolveSessionProvider
-  , resolveDefProvider
   , mkSessionAgentEnv
   , TurnEnv (..)
-  , debugRequestsPath
   , untrustedIOFromSecurity
   , Backends (..)
   , newBackends
@@ -26,7 +24,6 @@ import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time (getCurrentTime)
 import System.Console.Haskeline
   ( InputT
   , Settings (..)
@@ -38,7 +35,6 @@ import System.Console.Haskeline
   , runInputT
   , withInterrupt
   )
-import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
 import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
@@ -49,54 +45,30 @@ import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Stop (stopCommandSpec)
-import Seal.Command.Provider (ProviderRuntime (..), resolveSessionProvider, resolveDefProvider)
+import Seal.Command.Provider (ProviderRuntime (..), resolveSessionProvider)
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
-import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, retrievalMaxScanBytes,
-                          defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
-                          rcDebugSessionTranscript, rcDelegation, rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills,
-                          resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance,
-                          toolTimeoutConfig)
+import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
+import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
-import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry, resolveSystemPrompt, TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
+import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
 import qualified Seal.Core.TurnEngine as TurnEngine
-import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
-import Seal.Handles.Transcript
-  ( TwoFileHandle (..), withTwoFileTranscript )
+import Seal.Core.Types (mkSessionId)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import qualified Seal.ISA.Registry as ISA
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #else
 import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #endif
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
-import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
-import Seal.Tools.Timeout (defaultToolTimeoutConfig)
-import Seal.ISA.Ops.Agent (AgentStartWiring (..))
-import Seal.Skills.Autoload (injectAutoloadSkill)
-import Seal.Skills.Backend qualified as Skill
-import Seal.Skills.Prompt (injectAvailableSkills)
-import Seal.Agent.PromptParts (injectStaticGuidance)
-import Seal.Agent.Def.Backend qualified as Def
-import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
-import Seal.Agent.Runtime.Delegation
-  ( fromFileConfig
-  , ChildTask (..) )
-import Seal.Agent.Runtime.Delegation.Worker
-  ( mkDelegateWorker, DelegationWorkerDeps (..) )
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry, setSessionAbort)
+import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Routing.Route qualified
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
-import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
-import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
-import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
-import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
-import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
@@ -106,13 +78,12 @@ import Seal.Handles.AskReply
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( SessionRuntime (..), defaultSessionSelection, formatSessionId
+  ( SessionRuntime (..), defaultSessionSelection
   , newSession, resolveDefaultAgent )
 import Seal.Types.App (runApp)
-import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
-import Seal.Types.Env (Env, mkEnv, envLogger)
+import Seal.Types.Env (Env, envLogger)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
@@ -158,28 +129,6 @@ handlePlain agentEnv env t = do
 -- to 'AgentEnv') and re-exported here for backwards compatibility with
 -- existing import sites.
 
--- | Resolve the optional debug-requests path from the loaded config. When
--- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
--- otherwise @Nothing@. The debug file (@requests.jsonl@) records each
--- 'CompletionRequest' in full (including the complete message history) exactly
--- as sent to the LLM, so we can debug whether the two-file storage format is
--- correctly feeding the session history to the provider.
-debugRequestsPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
-debugRequestsPath paths sid eCfg =
-  case eCfg of
-    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
-      Just (sessionRequestsPath paths sid)
-    _ -> Nothing
-
--- | Resolve the on-demand-schemas flag from the loaded config. 'True' when
--- @on_demand_schemas@ is set in the config file; 'False' on load error or
--- when the key is absent (matching the default behavior).
-onDemandFromCfg :: Either a RuntimeConfig -> Bool
-onDemandFromCfg eCfg =
-  case eCfg of
-    Right cfg -> onDemandSchemas cfg
-    _         -> False
-
 -- | Run the Haskeline TUI loop.
 --
 -- History is persisted at @\<state\>\/history@; the agent transcript is written
@@ -197,20 +146,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
   replies <- newReplyRegistry
   locks <- newSessionLocks
   active0 <- readIORef (srActive sr)
-  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
-  eCfg <- loadRuntimeConfig (prConfigPath pr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
-      webCfg = either (const Nothing) rcWeb eCfg
-      cloneDeps = Clone.CloneDeps
-        { Clone.cdVault = rt
-        , Clone.cdRepoReg = repoReg
-        , Clone.cdSshAgent = mkRealSshAgentHandle
-        , Clone.cdAgentRegistry = agentRegH
-        , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-        , Clone.cdKeyfilesDir = repoKeysDir paths
-        , Clone.cdIsRemote = isRemote
-        }
       histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
@@ -232,162 +169,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
   ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
-  appEnv <- mkEnv logger defaultConfig
-  let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-      -- Per-session execution bundle: creates the workdir (local or remote)
-      -- and constructs the UIOEnv + WorkdirFs + WorkspaceRoot. Handles both
-      -- mode=local and mode=remote via mkSessionExec.
-      mkSessionExecCli :: SessionId -> IO SessionExec
-      mkSessionExecCli sid' = case eSecCfg of
-        Left _err -> pure (failClosedSessionExec cloneDeps)
-        Right sec -> mkSessionExec paths sec sid' cloneDeps mkRealRemoteRunner
-  -- Per-turn transcript + ISA registry construction.
-  --
-  -- Previously the CLI opened one `withTwoFileTranscript` bracket at launch
-  -- for `sid0` and built one `isaReg` at launch, baking `sid0` into
-  -- `memoryWriteOp`/`skillWriteOp`/`agentDefWriteOp`. That was "correct by
-  -- accident" while `srActive` never changed after launch — but it's a
-  -- latent audit-trail integrity bug: any future change that swaps
-  -- `srActive` (e.g. `/new`, or a CLI `/tab focus` that rebinds the active
-  -- session) would silently write the new session's transcript + memory +
-  -- skill + agent-def entries to the OLD session's dirs/keys.
-  --
-  -- The fix mirrors `runTurnOnSession` in `Seal.Channels.Loop`: rebuild
-  -- `isaReg` and reopen the transcript **per turn** using `smId meta`
-  -- read fresh from `srActive`. The per-turn helpers (`buildCliIsaReg`,
-  -- `buildCliStartWiring`, `cliChildRegistryBuilder`, `cliResolveChildProvider`,
-  -- `cliChildSystemPrompt`, `cliMintAgentSession`) close over the
-  -- turn-invariant bits (wsRoot, eCfg, backends, caps, rt, paths, autonomy,
-  -- approvals, appEnv, execBackend, askReply, pr, sr) and take `sid` (and
-  -- `caps`/`tHandle` where needed) as parameters. The `withTwoFileTranscript`
-  -- bracket moves inside `plainHandler` and `callDispatcher`. The `/bg`
-  -- runner already opened its own per-invocation bracket, so it's unaffected
-  -- (it mints its own bgSid and never touches `srActive`).
-  --
-  -- File-handle churn is acceptable: the inbox loop already pays this per
-  -- turn. Legacy sessions with an existing `transcript.jsonl` are left
-  -- untouched (the legacy read path handles them); new sessions get the
-  -- `conversation.jsonl` + `entries.jsonl` pair. The evolutionary-store
-  -- backends (memory/skills/agent-defs) are disk-backed Markdown files
-  -- under `config/`, shared with the `/skill` and `/agent` command specs
-  -- (built in `Seal.Tui.runTui` from the same `Backends` record). Disk is
-  -- canonical; git is the versioning + audit layer. No startup
-  -- materialization is needed — the backends read their directories on
-  -- demand.
   let skillBackend     = bSkills backends
       agentDefBackend   = bAgentDefs backends
-      agentRuntime      = bRuntime backends
-      onDemand          = onDemandFromCfg eCfg
-      -- Mint a fresh SessionId for a forked agent instance. Each start
-      -- gets its own timestamped id (a re-start of the same def does not
-      -- append to a prior instance's transcript).
-      mintAgentSession sid = do
-        now <- getCurrentTime
-        case mkSessionId (formatSessionId now) of
-          Right s  -> pure s
-          -- unreachable: formatSessionId only emits digits and dashes
-          Left _e  -> pure sid
-      -- The AGENT_START worker-builder: build a fresh AgentEnv for the
-      -- child (its own two-file transcript under
-      -- @\<parent-session\>\/agents\/\<child-id\>@), run 'runTurn' with the
-      -- goal as the first user message, and capture the final text
-      -- response as the summary. The child's ISA registry is narrowed:
-      -- the delegation blocklist strips AGENT_START/AGENT_DEF_*/lifecycle
-      -- opcodes so the child can't recurse or mutate defs.
-      --
-      -- Provider resolution honors the [delegation] provider/model/base_url
-      -- override when set, else falls back to the def's provider/model
-      -- (which itself falls back to the active session's when empty).
-      cliResolveChildProvider agentDef = do
-        active <- readIORef (srActive sr)
-        let fallBackProvider = if T.null (adProvider agentDef) then smProvider active else adProvider agentDef
-            fallBackModel = case adModel agentDef of
-              ModelId m | T.null m -> smModel active
-                        | otherwise -> m
-        resolveDefProvider pr fallBackProvider (ModelId fallBackModel)
-      cliChildSystemPrompt agentDef task = do
-        let base = adSystem agentDef
-            ctx  = ctContext task
-            basePrompt = case (base, ctx) of
-              (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-              (Just b, _)                       -> Just b
-              (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-              (Nothing, Nothing)                -> Nothing
-        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
-        let withGuidance = injectStaticGuidance (resolvedParallelToolGuidance cfg)
-                                                 (resolvedToolUseEnforcement cfg)
-                                                 (resolvedTaskCompletionGuidance cfg)
-                                                 basePrompt
-        withAutoload <- injectAutoloadSkill skillBackend (resolvedAutoloadSkill cfg) withGuidance
-        if resolvedAvailableSkills cfg
-          then injectAvailableSkills skillBackend withAutoload
-          else pure withAutoload
-      cliChildRegistryBuilder _def childSid childCaps = do
-        childExec <- mkSessionExecCli childSid
-        let childWsRoot = seWorkspaceRoot childExec
-        pure (buildChildRegistry rt cloneDeps backends childWsRoot childSid
-                operatorCeiling autonomy webCfg (Just (prManager pr)) childCaps)
-      -- Build the AGENT_START wiring for a given parent sid. The worker
-      -- builder is fixed across turns (it closes over the per-turn
-      -- helpers above); only the parent sid varies.
-      cliStartWiring sid sessionBackends =
-        let delegateDeps = DelegationWorkerDeps
-              { dwdPaths = paths
-              , dwdParentSid = sid
-              , dwdAppEnv = appEnv
-              , dwdMkUIOEnv = (seUIOEnv <$>) . mkSessionExecCli
-              , dwdAutonomy = autonomy
-              , dwdApprovals = approvals
-              , dwdOnDemand = onDemand
-              , dwdParentDepth = 0
-              , dwdResolveProvider = cliResolveChildProvider
-              , dwdChildRegistry = cliChildRegistryBuilder
-              , dwdChildSystemPrompt = cliChildSystemPrompt
-              , dwdOnEntry = pure ()
-              , dwdChannel = "cli"
-              , dwdAbortFlag = lookupOrCreateAbortFlag abortReg
-              , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-              }
-            mkWorker = mkDelegateWorker delegateDeps
-            delegationCfg = do
-              eCfg' <- loadRuntimeConfig (prConfigPath pr)
-              pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
-        in AgentStartWiring
-          { aswDefBackend = bAgentDefs sessionBackends
-          , aswRuntime = agentRuntime
-          , aswConfig = delegationCfg
-          , aswPauseFlag = bSpawnPauseFlag backends
-          , aswParentActivity = Just (bParentActivity backends)
-          , aswMintSession = mintAgentSession sid
-          , aswParentDepth = 0
-          , aswWorker = mkWorker
-          }
-      -- Build the session's ISA registry via the unified builder.
-      cliIsaReg sid startWiring caps' wsRoot sessionBackends =
-        buildSessionRegistry rt cloneDeps sessionBackends wsRoot sid
-          operatorCeiling autonomy webCfg startWiring harnessReg tmuxRunner
-          (Just (prManager pr)) caps' onDemand
-      -- Resolve the bound agent's system prompt (re-read per turn; agent
-      -- dirs are small). Nothing when no agent is bound or the def has no
-      -- system prompt. The auto-loaded skill (default @seal-usage@, the
-      -- fresh-workdir contract) is appended so the model is oriented to its
-      -- per-session workspace from turn one. Disabled by setting
-      -- @[skills] autoload = ""@ in @config.toml@. The
-      -- @\<available_skills\>@ catalog is then appended so the model
-      -- discovers and uses skills; disabled by
-      -- @[skills] available_skills = false@. The catalog is built from the
-      -- workdir-aware backend (repo-local skills discovered by SETUP_REPO
-      -- ⊕ user ⊕ builtin, workdir-wins).
-      resolveSystem meta wfs = do
-        workdirAgentDefs <- Def.workdirAgentDefBackend wfs
-        let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
-        cfg <- fromRight defaultRuntimeConfig <$> loadRuntimeConfig (prConfigPath pr)
-        workdirSkills <- Skill.workdirSkillBackend wfs
-        let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills skillBackend
-        resolveSystemPrompt sessionAgentDefs sessionSkills
-          (resolvedAutoloadSkill cfg) (resolvedAvailableSkills cfg)
-          (resolvedParallelToolGuidance cfg) (resolvedToolUseEnforcement cfg)
-          (resolvedTaskCompletionGuidance cfg) meta
     -- The /bg runner: mint a fresh persisted session from the config
     -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
     -- (notify = print the question via ccSend, so the confirmation appears
@@ -406,55 +189,49 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
             model    = fromMaybe cfgModel mModel
         meta <- newSession paths provider model "bg" mAgent
         let bgSid = smId meta
-            sessionDirPath' = sessionDir paths bgSid
-        createDirectoryIfMissing True sessionDirPath'
-        void (forkIO (withTwoFileTranscript sessionDirPath' $ \bgTHandle -> do
-          let bgCaps = def
-                { ccSend = ccSend caps
-                , ccPrompt = \(AskPrompt q opts) -> do
-                    outcome <- askHumanWithOptions askReply bgSid q opts
-                                 (\_qid -> ccSend caps (formatQuestionWithOptions q opts))
-                    pure (fromRight "" outcome)
-                , ccPromptSecret = ccPromptSecret caps
-                }
-          bgExec <- mkSessionExecCli bgSid
-          let bgWfs = seWorkdirFs bgExec
-              bgWsRoot = seWorkspaceRoot bgExec
-          bgWorkdirAgentDefs <- Def.workdirAgentDefBackend bgWfs
-          let bgSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend bgWorkdirAgentDefs agentDefBackend }
-              bgStartWiring = cliStartWiring bgSid bgSessionBackends
-              bgIsaReg = cliIsaReg bgSid bgStartWiring bgCaps bgWsRoot bgSessionBackends
-          tfwSetSecretOps bgTHandle (ISA.secretOpNames bgIsaReg)
-          eprov <- resolveSessionProvider pr meta
-          case eprov of
-            Left err -> ccSend caps ("bg failed: " <> err)
-            Right (prov, mdl) -> do
-              mSystem <- resolveSystem meta bgWfs
-              bgAbortFlag <- lookupOrCreateAbortFlag abortReg bgSid
-              let env = mkSessionAgentEnv TurnEnv
-                    { teCaps          = bgCaps
-                    , teProvider      = prov
-                    , teProviderLabel = smProvider meta
-                    , teModel         = mdl
-                    , teSession       = bgSid
-                    , teSystem        = mSystem
-                    , teRegistry      = bgIsaReg
-                    , teTranscript    = bgTHandle
-                    , teUioEnv        = seUIOEnv bgExec
-                    , teDebugReqPath  = debugRequestsPath paths bgSid eCfg
-                    , teAutonomy      = autonomy
-                    , teApprovals     = approvals
-                    , teOnEntry       = pure ()
-                    , teOnDemand      = onDemand
-                    , teLogPath       = Just (sessionLogPath paths bgSid)
-                    , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
-                    , teOnUserMessage = Nothing
-                    , teChannel       = "cli"
-                    , teOnStop        = Nothing
-                    , teAbortFlag     = bgAbortFlag
-                    , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-                    }
-              runApp appEnv (runTurn env prompt)))
+            bgCaps = def
+              { ccSend = ccSend caps
+              , ccPrompt = \(AskPrompt q opts) -> do
+                  outcome <- askHumanWithOptions askReply bgSid q opts
+                               (\_qid -> ccSend caps (formatQuestionWithOptions q opts))
+                  pure (fromRight "" outcome)
+              , ccPromptSecret = ccPromptSecret caps
+              }
+            td = TurnDeps
+              { tdPaths        = paths
+              , tdVault        = rt
+              , tdProvider     = pr
+              , tdResolve      = resolveSessionProvider pr
+              , tdRepoReg      = repoReg
+              , tdAutonomy     = autonomy
+              , tdBroker       = Nothing
+              , tdHarnessReg   = harnessReg
+              , tdTmuxRunner   = tmuxRunner
+              , tdHttpManager  = Just (prManager pr)
+              , tdApprovals    = approvals
+              , tdReplies      = replies
+              , tdLocks        = locks
+              , tdAbortReg     = abortReg
+              , tdTabsHandle   = tabsH
+              , tdLogger       = logger
+              , tdIsRemote     = isRemote
+              , tdBaseBackends = backends
+              }
+            bgAdapter = TurnAdapter
+              { taCaps          = bgCaps
+              , taPreTurn       = \_ _ _ -> pure ()
+              , taChannelLabel  = smChannel
+              , taOnStop        = const Nothing
+              , taOnUserMessage = const Nothing
+              , taPostTurn      = \_ _ -> pure ()
+              , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling m ->
+                  TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling (smChannel m)
+              }
+        void (forkIO (do
+          outcome <- runSessionTurn td bgAdapter meta Nothing prompt
+          case toError outcome of
+            Just err -> ccSend caps ("bg failed: " <> err)
+            Nothing  -> pure ()))
       registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher, stopCommandSpec abortReg sr])
       -- The /call dispatcher: dispatch an opcode against the active
       -- session's ISA registry + transcript under Full autonomy (the
