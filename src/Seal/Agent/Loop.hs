@@ -7,6 +7,9 @@ module Seal.Agent.Loop
   ) where
 
 import Control.Exception (SomeException, catch)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (race)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value (..), object, (.=))
 import Data.Aeson qualified as A
@@ -30,7 +33,7 @@ import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
-import Seal.Tools.Exec.Abort (clearAbort)
+import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
 import Seal.Providers.Class
@@ -209,24 +212,41 @@ runTurn env userText = do
       -- Wrap the stream in a hard timeout so a stalled provider
       -- connection (TCP open but no data) cannot hang the session
       -- forever in "thinking". On timeout, the turn surfaces a provider
-      -- error — logged to seal.log + the transcript — and the bracket
+      -- error — logged to seal.log + the transcript — and the bracket@.
       -- cleanup in the send path fires the idle broadcast.
+      -- Race the provider stream against the abort-poll so a /stop
+      -- (web POST /api/sessions/:id/stop, CLI Ctrl+C, channel /stop)
+      -- interrupts the in-flight LLM call, not just tool calls. When
+      -- abort wins the race, the stream is cancelled and a "(stopped)"
+      -- message is recorded — the user can immediately send a new
+      -- prompt. The abort poll interval matches the tool-call poll
+      -- (100ms, from ttcAbortPollMicros).
+      let abortPoll = do
+            aborted <- isAborted (aeAbortFlag env)
+            if aborted then pure () else do
+              threadDelay 100_000
+              abortPoll
       mResult <- liftIO (timeout streamTimeoutUs $
-        providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
-          case ev of
-            StreamTextChunk delta
-              | streamSends -> do
-              ccSend (aeCaps env) delta
-            _ -> pure ()
-          modifyIORef' collectedRef (++ [ev])
-          pure True))
+        race abortPoll
+             (providerStreamWithRetry (aeProvider env) isTransient req (\ev -> do
+               case ev of
+                 StreamTextChunk delta
+                   | streamSends -> ccSend (aeCaps env) delta
+                 _ -> pure ()
+               modifyIORef' collectedRef (++ [ev])
+               pure True)))
       let estream = case mResult of
             Nothing -> Left "stream timed out (no data for 5 minutes)"
-            Just r  -> r
+            Just (Left ()) -> Left "(stopped)"
+            Just (Right r) -> r
       case estream of
         Left err -> liftIO $ do
-          logProviderError (aeLogPath env) err
-          let errMsg = "provider error: " <> err
+          -- Distinguish a user-initiated stop from a genuine provider
+          -- error. "(stopped)" is the abort-signal message; everything
+          -- else is a provider failure.
+          let isStop = err == "(stopped)"
+          unless isStop $ logProviderError (aeLogPath env) err
+          let errMsg = if isStop then err else "provider error: " <> err
               assistantMsg = Message Assistant [CbText errMsg]
               conv = msgs <> [assistantMsg]
           now <- getCurrentTime
