@@ -61,13 +61,12 @@ import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecCo
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry, resolveSystemPrompt, TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
+import qualified Seal.Core.TurnEngine as TurnEngine
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Handles.Transcript
   ( TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Opcode (localBackend)
 import qualified Seal.ISA.Registry as ISA
-import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #else
@@ -108,7 +107,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, formatSessionId
-  , newSession, resolveDefaultAgent, saveSessionMeta )
+  , newSession, resolveDefaultAgent )
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Logging.Logger (SealLogger)
@@ -467,28 +466,27 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       callDispatcher callOpName val = do
         meta <- readIORef (srActive sr)
         let sid = smId meta
-            sessionDirPath' = sessionDir paths sid
-        createDirectoryIfMissing True sessionDirPath'
-        saveSessionMeta paths meta
-        withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          exec <- mkSessionExecCli sid
-          let wfs = seWorkdirFs exec
-              wsRoot = seWorkspaceRoot exec
-          callWorkdirAgentDefs <- Def.workdirAgentDefBackend wfs
-          let callSessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend callWorkdirAgentDefs agentDefBackend }
-              startWiring = cliStartWiring sid callSessionBackends
-              isaReg = cliIsaReg sid startWiring caps wsRoot callSessionBackends
-          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          callAbortFlag <- lookupOrCreateAbortFlag abortReg sid
-          res <- runApp appEnv (dispatch isaReg tHandle localBackend (seUIOEnv exec) (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
-          case res of
-            Right r -> do
-              let opNm = case callOpName of OpName n -> n
-              if opNm == "GIT_PUSH"
-                then recordGitPushResult tHandle callOpName val r (Just "cli")
-                else recordSkillLoadResult tHandle callOpName val r (Just "cli")
-            Left _  -> pure ()
-          pure res
+            td = TurnDeps
+              { tdPaths        = paths
+              , tdVault        = rt
+              , tdProvider     = pr
+              , tdResolve      = resolveSessionProvider pr
+              , tdRepoReg      = repoReg
+              , tdAutonomy     = autonomy
+              , tdBroker       = Nothing
+              , tdHarnessReg   = harnessReg
+              , tdTmuxRunner   = tmuxRunner
+              , tdHttpManager  = Just (prManager pr)
+              , tdApprovals    = approvals
+              , tdReplies      = replies
+              , tdLocks        = locks
+              , tdAbortReg     = abortReg
+              , tdTabsHandle   = tabsH
+              , tdLogger       = logger
+              , tdIsRemote     = isRemote
+              , tdBaseBackends = backends
+              }
+        TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
         meta <- readIORef (srActive sr)
         let td = TurnDeps
@@ -518,8 +516,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , taOnStop        = const Nothing
               , taOnUserMessage = const Nothing
               , taPostTurn      = \_ _ -> pure ()
-              , taStartWiring   = \sessionBackends sid _wsRoot _uioEnv _appEnv _eCfg _operatorCeiling _meta ->
-                  cliStartWiring sid sessionBackends
+              , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling _meta ->
+                  TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling "cli"
               }
         outcome <- runSessionTurn td adapter meta Nothing t
         for_ (toError outcome) (ccSend caps)
