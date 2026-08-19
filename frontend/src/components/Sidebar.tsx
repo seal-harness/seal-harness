@@ -269,14 +269,6 @@ export function Sidebar({
     return sanitizeRepoName(session.repoUrl)
   }
 
-  // The agent name from the session's `agent` field, or empty string when
-  // no agent is bound or no backing session.
-  const tabAgentName = (tab: TabInfo): string => {
-    if (!tab.session_id) return ''
-    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
-    return session?.agent ?? ''
-  }
-
   // Active Tabs sort: Idle Unread → Idle Read → Thinking, oldest
   // last-user-message first within each bucket. The activity state comes
   // from the per-session stream; the sort key is the backing session's
@@ -315,7 +307,6 @@ export function Sidebar({
           tabModel={tabModel}
           tabAgeText={tabAgeText}
           tabRepoId={tabRepoId}
-          tabAgentName={tabAgentName}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -332,7 +323,6 @@ export function Sidebar({
           tabModel={tabModel}
           tabAgeText={tabAgeText}
           tabRepoId={tabRepoId}
-          tabAgentName={tabAgentName}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}

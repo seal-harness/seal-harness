@@ -48,7 +48,6 @@ describe('ActiveTabs', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -71,7 +70,6 @@ describe('ActiveTabs', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -93,7 +91,6 @@ describe('ActiveTabs', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -116,7 +113,6 @@ describe('ActiveTabs', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -234,7 +230,6 @@ describe('RunningHarnesses', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -254,7 +249,6 @@ describe('RunningHarnesses', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -275,7 +269,6 @@ describe('RunningHarnesses', () => {
         tabModel={() => ''}
         tabAgeText={() => ''}
         tabRepoId={() => ''}
-        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -701,14 +694,13 @@ describe('Sidebar — tab second line (repo ID + agent name)', () => {
         onReleaseTab={() => {}}
       />,
     )
-    // The second line should show "my-repo · my-agent" (not Thinking/Idle).
+    // The second line should show "my-repo" (not Thinking/Idle).
     expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-repo')
-    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-agent')
     expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Thinking')
     expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Idle')
   })
 
-  it('shows only agent name when no repo is attached', () => {
+  it('falls back to status label when no repo is attached', () => {
     const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
     const tabSessions = [makeSession({ id: 's1', description: 'My Tab', agent: 'my-agent', repoUrl: null })]
     render(
@@ -729,7 +721,8 @@ describe('Sidebar — tab second line (repo ID + agent name)', () => {
         onReleaseTab={() => {}}
       />,
     )
-    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-agent')
+    // No repo → fallback to status label (Idle Read/etc).
+    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('Idle')
     expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Thinking')
   })
 
