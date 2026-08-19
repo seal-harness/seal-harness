@@ -18,7 +18,7 @@ sampleMeta =
   let sid = fromRight (error "bad id") (mkSessionId "20260701-120000-042")
   in SessionMeta
        { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing, smRepoUrl = Nothing
        , smDescription = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 

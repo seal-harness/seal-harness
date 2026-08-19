@@ -32,7 +32,7 @@ mkMeta s =
     , smChannel = "cli"
     , smAgent = Nothing
     , smSystemOverride = Nothing
-    , smAgentName = Nothing
+    , smAgentName = Nothing, smRepoUrl = Nothing
     , smDescription = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime

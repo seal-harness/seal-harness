@@ -9,6 +9,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     id: 's1',
     agent: null,
+    repoUrl: null,
     runtime: 'session:anthropic',
     model: 'm',
     lastActive: new Date().toISOString(),
@@ -46,6 +47,8 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -67,6 +70,8 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -87,6 +92,8 @@ describe('ActiveTabs', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
         onCloseTab={() => {}}
@@ -108,6 +115,8 @@ describe('ActiveTabs', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
         onCloseTab={() => {}}
@@ -224,6 +233,8 @@ describe('RunningHarnesses', () => {
         tabLabel={() => 'x'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -242,6 +253,8 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -261,6 +274,8 @@ describe('RunningHarnesses', () => {
         tabLabel={(t) => t.label ?? '…'}
         tabModel={() => ''}
         tabAgeText={() => ''}
+        tabRepoId={() => ''}
+        tabAgentName={() => ''}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
         onDismiss={() => {}}
@@ -654,5 +669,90 @@ describe('Sidebar — tab age pill', () => {
     const tabRow = screen.getByText('raw shell').closest('.agent-row')
     const agePill = tabRow!.querySelector('.pill.token-count')
     expect(agePill).toBeNull()
+  })
+})
+
+// ── Tab second line: repo ID + agent name ──────────────────────────────
+
+describe('Sidebar — tab second line (repo ID + agent name)', () => {
+  it('shows repo ID and agent name instead of status label when a session backs the tab', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({
+      id: 's1',
+      description: 'My Tab',
+      agent: 'my-agent',
+      repoUrl: 'https://github.com/foo/my-repo.git',
+    })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // The second line should show "my-repo · my-agent" (not Thinking/Idle).
+    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-repo')
+    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-agent')
+    expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Thinking')
+    expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Idle')
+  })
+
+  it('shows only agent name when no repo is attached', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', session_id: 's1' })]
+    const tabSessions = [makeSession({ id: 's1', description: 'My Tab', agent: 'my-agent', repoUrl: null })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        tabSessions={tabSessions}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('tab-status-label-0').textContent).toContain('my-agent')
+    expect(screen.getByTestId('tab-status-label-0').textContent).not.toContain('Thinking')
+  })
+
+  it('falls back to status label when no session backs the tab (dead tab)', () => {
+    const tabs = [makeTab({ index: 0, kind: 'session:anthropic', status: 'exited', session_id: null, label: 'Dead' })]
+    render(
+      <Sidebar
+        tabs={tabs}
+        sessions={[]}
+        archivedSessions={[]}
+        selectedId={null}
+        onSelectTab={() => {}}
+        onSelectSession={() => {}}
+        onNewTab={() => {}}
+        onArchiveSession={() => {}}
+        onUnarchiveSession={() => {}}
+        onCloseTab={() => {}}
+        onDismissTab={() => {}}
+        onAcknowledgeTab={() => {}}
+        onReleaseTab={() => {}}
+      />,
+    )
+    // No backing session → fallback to status label.
+    expect(screen.getByTestId('tab-status-label-0').textContent).toBe('Exited')
   })
 })

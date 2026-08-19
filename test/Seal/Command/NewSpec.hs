@@ -67,7 +67,7 @@ spec = describe "Seal.Command.New" $ do
           , smChannel = "cli"
           , smAgent = Nothing
           , smSystemOverride = Nothing
-          , smAgentName = Nothing
+          , smAgentName = Nothing, smRepoUrl = Nothing
           , smDescription = Nothing
           , smCreatedAt = error "unused"
           , smLastActive = error "unused"

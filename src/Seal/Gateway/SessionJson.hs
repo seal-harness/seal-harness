@@ -81,6 +81,7 @@ sessionInfoJson :: Maybe Text -> Maybe Text -> SessionMeta -> Value
 sessionInfoJson mSnippet mLastUserMessageAt m = object
   [ "id" .= sessionIdText (smId m)
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
+  , "repoUrl" .= smRepoUrl m
   , "runtime" .= ("session:" <> smProvider m)
   , "model" .= smModel m
   , "lastActive" .= smLastActive m

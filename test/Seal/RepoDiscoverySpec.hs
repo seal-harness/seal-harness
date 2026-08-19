@@ -478,7 +478,7 @@ spec = do
               meta = SessionMeta
                 { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
                 , smChannel = "web", smAgent = Just zoe
-                , smSystemOverride = Nothing, smAgentName = Just "zoe"
+                , smSystemOverride = Nothing, smAgentName = Just "zoe", smRepoUrl = Nothing
                 , smDescription = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
@@ -521,7 +521,7 @@ spec = do
           meta = SessionMeta
             { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
             , smChannel = "web", smAgent = pickedId
-            , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
+            , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent", smRepoUrl = Nothing
             , smDescription = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta

@@ -51,7 +51,7 @@ import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( defaultSessionSelection, newSession, resolveDefaultAgent )
+  ( defaultSessionSelection, newSession, resolveDefaultAgent, updateSessionRepoUrl )
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 
@@ -194,7 +194,11 @@ newCmd deps mProvider mModel mRepo = CommandAction $ \caps -> do
       eRes <- setupFn (smId meta) repoUrl
       case eRes of
         Left err -> ccSend caps ("repo setup failed: " <> err)
-        Right _  -> pure ()
+        Right _ -> do
+          -- Record the repo URL on the session meta so the frontend can
+          -- display the repo ID in the sidebar.
+          _ <- updateSessionRepoUrl (ndPaths deps) (smId meta) (Just repoUrl)
+          pure ()
     _ -> pure ()
   ccSend caps (renderNewConfirmation meta oldSid)
 

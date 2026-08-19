@@ -25,7 +25,7 @@ module Seal.Gateway.Send
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Exception (bracket)
-import Control.Monad (unless, when)
+import Control.Monad (void, unless, when)
 import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
@@ -123,7 +123,7 @@ import qualified Seal.SourceControl.Clone as Clone
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..), SecurityPolicy (..), AllowList (..))
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (SessionRuntime (..), formatSessionId, autoBindRepoAgent)
+import Seal.Session.Store (SessionRuntime (..), formatSessionId, autoBindRepoAgent, updateSessionRepoUrl)
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
   , SessionLocks, withSessionLock )
@@ -1099,12 +1099,16 @@ handleSetupRepo deps sid url =
           res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
           -- Restore srActive.
           writeIORef (srActive sr) activeBefore
+          -- Record the repo URL on the session meta so the frontend can
+          -- display the repo ID in the sidebar. Only on success (non-error
+          -- result) — a failed clone does not update the meta.
           case res of
             Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
-            Right opRes ->
-              if orIsError opRes
-                then pure (Left (opResultText opRes))
-                else pure (Right (opResultText opRes))
+            Right opRes
+              | orIsError opRes -> pure (Left (opResultText opRes))
+              | otherwise -> do
+                  void (updateSessionRepoUrl (sdPaths deps) sid (Just cleanUrl))
+                  pure (Right (opResultText opRes))
 
 -- | Join the text parts of an 'OpResult' into a single message (the
 -- clone/no-op/conflict/failure text from SETUP_REPO).

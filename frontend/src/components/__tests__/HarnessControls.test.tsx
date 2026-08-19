@@ -9,6 +9,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     id: 's1',
     agent: 'dev',
+    repoUrl: null,
     runtime: 'session:anthropic',
     model: 'claude-sonnet-4-20250514',
     lastActive: new Date().toISOString(),

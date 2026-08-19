@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import type { SessionInfo, TabInfo } from '../types'
-import { findSession, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel } from '../types'
+import { findSession, sanitizeRepoName, sessionDisplayTitle, sessionSubtitle, shortenModel, tabDisplayLabel } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { sortTabsForSidebar, formatAge } from '../lib/tabStatus'
 import { ActiveTabs } from './ActiveTabs'
@@ -258,6 +258,25 @@ export function Sidebar({
     return formatAge(activity?.lastEntryAt ?? session.lastActive) || 'now'
   }
 
+  // The display repo ID derived from the session's `repoUrl` (via
+  // `sanitizeRepoName`), or empty string when no repo is attached or no
+  // backing session. Centralized here so both ActiveTabs and
+  // RunningHarnesses share the same session-join.
+  const tabRepoId = (tab: TabInfo): string => {
+    if (!tab.session_id) return ''
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    if (!session || !session.repoUrl) return ''
+    return sanitizeRepoName(session.repoUrl)
+  }
+
+  // The agent name from the session's `agent` field, or empty string when
+  // no agent is bound or no backing session.
+  const tabAgentName = (tab: TabInfo): string => {
+    if (!tab.session_id) return ''
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.agent ?? ''
+  }
+
   // Active Tabs sort: Idle Unread → Idle Read → Thinking, oldest
   // last-user-message first within each bucket. The activity state comes
   // from the per-session stream; the sort key is the backing session's
@@ -295,6 +314,8 @@ export function Sidebar({
           tabLabel={tabLabel}
           tabModel={tabModel}
           tabAgeText={tabAgeText}
+          tabRepoId={tabRepoId}
+          tabAgentName={tabAgentName}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
           onCloseTab={onCloseTab}
@@ -310,6 +331,8 @@ export function Sidebar({
           tabLabel={tabLabel}
           tabModel={tabModel}
           tabAgeText={tabAgeText}
+          tabRepoId={tabRepoId}
+          tabAgentName={tabAgentName}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}
           onDismiss={onDismissTab}

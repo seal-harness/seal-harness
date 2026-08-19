@@ -76,6 +76,8 @@ export function TabRow({
   activity,
   model,
   ageText,
+  repoId,
+  agentName,
 }: {
   tab: TabInfo
   /** Resolved display label for this tab (session title, harness fallback,
@@ -95,6 +97,13 @@ export function TabRow({
   /** Coarse age pill ("now"/"Nm"/"Nh"/"Nd") rendered on the trailing edge,
    *  mirroring the Recent Sessions age pill. Empty string → no pill. */
   ageText?: string
+  /** The display repo ID derived from the session's `repoUrl` (via
+   *  `sanitizeRepoName`), or empty string when no repo is attached.
+   *  Shown on the second line instead of the status label. */
+  repoId?: string
+  /** The agent name from the session's `agent` field, or empty string
+   *  when no agent is bound. Shown on the second line after the repo ID. */
+  agentName?: string
 }) {
   // Defensive lookup: an unknown status string (malformed backend payload)
   // must not crash the render — fall back to a neutral glyph/label.
@@ -281,7 +290,16 @@ export function TabRow({
         style={{ color: 'var(--text-muted)', lineHeight: 'var(--leading-tight)' }}
         data-testid={`tab-status-label-${tab.index}`}
       >
-        {isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]}
+        {(() => {
+          const parts: string[] = []
+          if (repoId) parts.push(repoId)
+          if (agentName) parts.push(agentName)
+          if (parts.length > 0) return parts.join(' · ')
+          // Fallback: when neither repo ID nor agent name is available,
+          // show the status label (preserves the old behavior for tabs
+          // with no backing session, e.g. raw shell tabs).
+          return isDead ? (statusLabel[tab.status] ?? tab.status) : kindLabel[kind]
+        })()}
         {model && (
           <>
             <span style={{ color: 'var(--text-faint)' }}>·</span>
@@ -300,6 +318,8 @@ export function ActiveTabs({
   tabModel,
   tabLabel,
   tabAgeText,
+  tabRepoId,
+  tabAgentName,
   onSelectTab,
   onNewTab,
   onCloseTab,
@@ -324,6 +344,14 @@ export function ActiveTabs({
    *  Centralized by the parent so Active Tabs and Running Harnesses agree
    *  with the Recent Sessions age pill. */
   tabAgeText: (tab: TabInfo) => string
+  /** Resolve a tab to the display repo ID derived from its session's
+   *  `repoUrl` (via `sanitizeRepoName`), or empty string when no repo
+   *  is attached or no backing session. Centralized by the parent. */
+  tabRepoId: (tab: TabInfo) => string
+  /** Resolve a tab to the agent name from its session's `agent` field,
+   *  or empty string when no agent is bound or no backing session.
+   *  Centralized by the parent. */
+  tabAgentName: (tab: TabInfo) => string
   onSelectTab: (index: number) => void
   onNewTab: () => void
   onCloseTab: (index: number) => void
@@ -368,6 +396,8 @@ export function ActiveTabs({
           activity={tab.session_id ? sessionActivity?.[tab.session_id] : undefined}
           model={tabModel(tab)}
           ageText={tabAgeText(tab)}
+          repoId={tabRepoId(tab)}
+          agentName={tabAgentName(tab)}
         />
       ))}
     </>

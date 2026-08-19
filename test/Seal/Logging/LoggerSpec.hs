@@ -87,7 +87,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smChannel = "telegram"
               , smAgent = Nothing
               , smSystemOverride = Nothing
-              , smAgentName = Nothing
+              , smAgentName = Nothing, smRepoUrl = Nothing
               , smDescription = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
@@ -111,7 +111,7 @@ spec = describe "Seal.Logging.Logger" $ do
               , smChannel = "signal"
               , smAgent = Nothing
               , smSystemOverride = Nothing
-              , smAgentName = Nothing
+              , smAgentName = Nothing, smRepoUrl = Nothing
               , smDescription = Nothing
               , smCreatedAt = error "unused"
               , smLastActive = error "unused"
@@ -140,7 +140,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smChannel = "telegram"
             , smAgent = Nothing
             , smSystemOverride = Nothing
-            , smAgentName = Nothing
+            , smAgentName = Nothing, smRepoUrl = Nothing
             , smDescription = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"
@@ -163,7 +163,7 @@ spec = describe "Seal.Logging.Logger" $ do
             , smChannel = "signal"
             , smAgent = Nothing
             , smSystemOverride = Nothing
-            , smAgentName = Nothing
+            , smAgentName = Nothing, smRepoUrl = Nothing
             , smDescription = Nothing
             , smCreatedAt = error "unused"
             , smLastActive = error "unused"

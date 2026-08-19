@@ -19,6 +19,7 @@ module Seal.Session.Store
   , updateSessionAgent
   , updateSessionSystemOverride
   , updateSessionDescription
+  , updateSessionRepoUrl
   , autoBindRepoAgent
   , SessionRuntime (..)
   ) where
@@ -85,6 +86,7 @@ newSessionMeta _paths provider model channel mAgent = do
   pure SessionMeta
     { smId = sid, smProvider = provider, smModel = model
     , smChannel = channel, smAgent = mAgent
+    , smRepoUrl = Nothing
     , smSystemOverride = Nothing, smAgentName = Nothing
     , smDescription = Nothing
     , smCreatedAt = now, smLastActive = now }
@@ -347,6 +349,27 @@ updateSessionDescription paths sid mDesc = do
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing
       Nothing                      -> Nothing
+
+-- | Update (or clear) the repo URL attached to a session. Called after a
+-- successful SETUP_REPO dispatch (whether by the LLM, @/new -r@, or the
+-- web combo box). 'Just url' records the cloned repo's URL so the frontend
+-- can display the repo ID in the sidebar; 'Nothing' clears it. Returns
+-- 'False' when the session's @session.json@ can't be found or parsed;
+-- 'True' on a successful write. Only touches 'smRepoUrl'.
+updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepoUrl paths sid mUrl = do
+  let mp = sessionMetaPath paths sid
+  exists <- doesFileExist mp
+  if not exists
+    then pure False
+    else do
+      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+      case mMeta of
+        Nothing  -> pure False
+        Just meta -> do
+          let next = meta { smRepoUrl = mUrl }
+          saveSessionMeta paths next
+          pure True
 
 -- | Parse the @id@ field from an uploaded agent file's TOML frontmatter.
 -- Returns 'Nothing' when the file has no frontmatter or no @id@ key.

@@ -4,6 +4,7 @@ import {
   sessionDisplayTitle,
   shortenModel,
   sessionSubtitle,
+  sanitizeRepoName,
   tabDisplayLabel,
   findSession,
 } from '../types'
@@ -13,6 +14,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     id: 's-1',
     agent: null,
+    repoUrl: null,
     runtime: 'session:provider',
     model: '',
     lastActive: new Date().toISOString(),
@@ -138,5 +140,35 @@ describe('findSession', () => {
 
   it('returns undefined for an unknown id', () => {
     expect(findSession('zzz', [a, b], [c], [])).toBeUndefined()
+  })
+})
+
+describe('sanitizeRepoName', () => {
+  it('extracts the repo name from an https URL', () => {
+    expect(sanitizeRepoName('https://github.com/seal-harness/seal-harness.git')).toBe('seal-harness')
+  })
+
+  it('extracts the repo name from an SSH URL', () => {
+    expect(sanitizeRepoName('ssh://git@github.com/seal-harness/seal-harness.git')).toBe('seal-harness')
+  })
+
+  it('extracts the repo name from an SCP-style URL', () => {
+    expect(sanitizeRepoName('git@github.com:seal-harness/seal-harness.git')).toBe('seal-harness')
+  })
+
+  it('handles URLs without .git suffix', () => {
+    expect(sanitizeRepoName('https://github.com/foo/bar')).toBe('bar')
+  })
+
+  it('strips trailing slashes', () => {
+    expect(sanitizeRepoName('https://github.com/foo/bar/')).toBe('bar')
+  })
+
+  it('replaces non-alphanumeric chars with dashes', () => {
+    expect(sanitizeRepoName('https://github.com/foo/my.repo.name')).toBe('my-repo-name')
+  })
+
+  it('falls back to "repo" for empty input', () => {
+    expect(sanitizeRepoName('')).toBe('repo')
   })
 })

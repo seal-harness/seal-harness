@@ -38,6 +38,12 @@ export interface SessionInfo {
   /** The agent definition bound to this session at init (from `default_agent`
    *  in `config.toml`), or null. */
   agent: string | null
+  /** The URL of the repo cloned into the session's workdir via SETUP_REPO
+   *  (whether by the LLM, `/new -r`, or the web combo box). Null when no
+   *  repo has been attached. The frontend derives a display repo ID from
+   *  this URL (the last path segment, stripped of `.git`) for the sidebar
+   *  tab row's second line. */
+  repoUrl: string | null
   /** `"session:<provider>"` — the runtime kind + provider label. */
   runtime: string
   model: string
@@ -90,6 +96,31 @@ export function sessionSubtitle(s: { agent?: string | null; channel?: string | n
   if (s.agent) parts.push(s.agent)
   if (s.channelUserId) parts.push(`${s.channel ?? ''}:${s.channelUserId}`)
   return parts.join(' · ')
+}
+
+/** Derive a display repo ID from a repo URL — mirrors the backend's
+ *  `sanitizeRepoName` (Seal.ISA.Ops.Repo). Takes the last `/` segment
+ *  (or the `:` split for SCP-style `git@host:path`), strips `.git`, and
+ *  replaces non-alphanumeric/`_`/`-` chars with `-`. Returns an empty
+ *  string when the URL is empty/null. */
+export function sanitizeRepoName(url: string): string {
+  const trimmed = url.replace(/\/+$/, '')
+  let lastSeg: string
+  const slashIdx = trimmed.lastIndexOf('/')
+  if (slashIdx >= 0 && slashIdx < trimmed.length - 1) {
+    lastSeg = trimmed.slice(slashIdx + 1)
+  } else {
+    const colonIdx = trimmed.lastIndexOf(':')
+    if (colonIdx >= 0 && colonIdx < trimmed.length - 1) {
+      lastSeg = trimmed.slice(colonIdx + 1)
+    } else {
+      lastSeg = trimmed
+    }
+  }
+  const withoutGit = lastSeg.replace(/\.git$/, '')
+  const sanitized = withoutGit.replace(/[^A-Za-z0-9_-]/g, '-')
+  const trimmedName = sanitized.replace(/^[-]+|[-]+$/g, '')
+  return trimmedName || 'repo'
 }
 
 // ── Tab ─────────────────────────────────────────────────────────────────

@@ -53,7 +53,7 @@ module Seal.Channels.Loop
 
 import Control.Concurrent (forkIO)
 import Control.Exception (bracket)
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
@@ -121,7 +121,7 @@ import Seal.ISA.Ops.Agent
   ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, AgentStartWiring (..) )
-import Seal.ISA.Opcode (localBackend, opName)
+import Seal.ISA.Opcode (localBackend, opName, orIsError)
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
@@ -159,7 +159,7 @@ import Seal.Session.Lock
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( autoBindRepoAgent, defaultSessionSelection, formatSessionId, newSessionMeta
-  , resolveDefaultAgent, saveSessionMeta )
+  , resolveDefaultAgent, saveSessionMeta, updateSessionRepoUrl )
 import Seal.Tabs
   ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
   , renameTabH, snapshotTabs )
@@ -571,7 +571,11 @@ handleNewSession deps h tabsH kind oldMeta argsText key askReply = do
         eRes <- dispatcher (OpName "SETUP_REPO") (object ["url" .= repoUrl])
         case eRes of
           Left dErr -> chSend h ("repo setup failed: " <> renderDispatchError dErr)
-          Right _   -> pure ()
+          Right opRes ->
+            -- Record the repo URL on the session meta so the frontend can
+            -- display the repo ID in the sidebar.
+            unless (orIsError opRes) $
+              void (updateSessionRepoUrl (cdPaths deps) (smId newMeta) (Just repoUrl))
   chSend h
     ("new session " <> sessionIdText (smId newMeta)
        <> " (" <> smProvider newMeta <> "/" <> smModel newMeta <> ")"
@@ -1275,6 +1279,7 @@ channelMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorC
     fallbackMeta t = SessionMeta
       { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
       , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+      , smRepoUrl = Nothing
       , smDescription = Nothing
       , smCreatedAt = t, smLastActive = t }
     loadMeta p sid = do

@@ -7,6 +7,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     id: 's1',
     agent: null,
+    repoUrl: null,
     runtime: 'session:provider',
     model: '',
     lastActive: '2024-01-01T00:00:00.000Z',
