@@ -20,7 +20,7 @@ import Test.Hspec
 
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Channels.Loop
-  ( channelCallDispatcher, newChannelDeps, ChannelDeps (..)
+  ( channelCallDispatcher, mkChannelTurnDeps, newChannelDeps, ChannelDeps (..)
   , shouldAutoTab, isBgSlash, createConversationSession, createConversationSessionHeadless
   , mkBgRunner, buildChannelRegistry )
 import Seal.Command.Background (BgRunner (..))
@@ -136,7 +136,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
     sidRef <- newIORef sid
-    let dispatcher = channelCallDispatcher deps stubHandle askReply sidRef
+    let dispatcher = channelCallDispatcher deps (mkChannelTurnDeps deps) stubHandle askReply sidRef
     res <- dispatcher (OpName "BOGUS_OP") (object [])
     case res of
       Left (OpNotFound (OpName n)) -> n `shouldBe` "BOGUS_OP"
@@ -195,7 +195,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "skillload-test")
     sidRef <- newIORef sid
-    let dispatcher = channelCallDispatcher deps stubHandle askReply sidRef
+    let dispatcher = channelCallDispatcher deps (mkChannelTurnDeps deps) stubHandle askReply sidRef
     res <- dispatcher (OpName "SKILL_LOAD") (object ["id" .= ("greet" :: Text)])
     case res of
       Left e -> expectationFailure ("expected Right, got Left: " <> show e)

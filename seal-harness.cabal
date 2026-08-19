@@ -43,6 +43,8 @@ library
         Seal.Core.MessageSource
         Seal.Core.Paging
         Seal.Core.Types
+        Seal.Core.TurnEngine
+        Seal.Core.Backends
         Seal.Providers.Anthropic
         Seal.Providers.Anthropic.OAuth
         Seal.Providers.Class
@@ -155,6 +157,7 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.API
+        Seal.Gateway.Route
         Seal.Gateway.Send
         Seal.Gateway.SessionJson
         Seal.Gateway.ListsSnapshot
@@ -258,6 +261,11 @@ library
       , warp
       , websockets
       , case-insensitive
+      , trasa
+      , trasa-server
+      , trasa-openapi-hs
+      , openapi-hs
+      , http-media
     hs-source-dirs: src
 
 executable seal
@@ -315,6 +323,7 @@ test-suite tests
         Seal.Core.TypesSpec
         Seal.Core.PagingSpec
         Seal.Gateway.ConfigSpec
+        Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.SendSpec
         Seal.Gateway.ServerSpec

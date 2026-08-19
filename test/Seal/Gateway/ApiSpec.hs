@@ -45,7 +45,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
 import Seal.Gateway.API
-import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher)
+import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps)
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -3345,7 +3345,7 @@ spec = describe "Seal.Gateway.API" $ do
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
-          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps) ]
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt
@@ -3458,7 +3458,7 @@ spec = describe "Seal.Gateway.API" $ do
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
-          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps) ]
+          registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
             , sdVault      = rt

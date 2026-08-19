@@ -14,7 +14,7 @@ import Test.Hspec
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
-import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider)
+import Seal.Channel.Cli (interpretDisposition, mkSessionAgentEnv, resolveSessionProvider, TurnEnv (..))
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
@@ -141,10 +141,29 @@ spec = do
       (th, _)   <- fakeTwoFileTranscript
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
-          env = mkSessionAgentEnv caps (SomeProvider StubProvider) "anthropic"
-                  (ModelId "claude-haiku-4-5") sid Nothing (ISA.mkRegistry []) th (mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps)
-                  Nothing Full approvals (pure ()) False Nothing 90 Nothing "cli" Nothing
-                  testAbortFlag defaultToolTimeoutConfig
+          env = mkSessionAgentEnv TurnEnv
+                  { teCaps          = caps
+                  , teProvider      = SomeProvider StubProvider
+                  , teProviderLabel = "anthropic"
+                  , teModel         = ModelId "claude-haiku-4-5"
+                  , teSession       = sid
+                  , teSystem        = Nothing
+                  , teRegistry      = ISA.mkRegistry []
+                  , teTranscript    = th
+                  , teUioEnv        = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                  , teDebugReqPath  = Nothing
+                  , teAutonomy      = Full
+                  , teApprovals     = approvals
+                  , teOnEntry       = pure ()
+                  , teOnDemand      = False
+                  , teLogPath       = Nothing
+                  , teMaxTurns      = 90
+                  , teOnUserMessage = Nothing
+                  , teChannel       = "cli"
+                  , teOnStop        = Nothing
+                  , teAbortFlag     = testAbortFlag
+                  , teToolTimeout   = defaultToolTimeoutConfig
+                  }
       aeModel env   `shouldBe` ModelId "claude-haiku-4-5"
       aeSession env `shouldBe` sid
       aeDebugRequestsPath env `shouldBe` Nothing
