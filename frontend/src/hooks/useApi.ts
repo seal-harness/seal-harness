@@ -378,7 +378,16 @@ export function useSendMessage(sessionId: string | null, onComplete: () => void)
     }
   }, [sessionId, sending, onComplete])
 
-  return { send, sending }
+  /** Reset the optimistic `sending` flag without waiting for the POST
+   *  /send round-trip to complete. Called when the user clicks the stop
+   *  button — the POST /api/sessions/:id/stop endpoint signals the backend
+   *  to abort the in-flight turn, and the frontend optimistically clears
+   *  the thinking indicator so the UI responds instantly. */
+  const resetSending = useCallback(() => {
+    setSending(false)
+  }, [])
+
+  return { send, sending, resetSending }
 }
 
 // ── Session mutators ────────────────────────────────────────────────────
@@ -537,6 +546,25 @@ export async function cancelQuestion(sessionId: string, askId: string): Promise<
     return data.cancelled === true
   } catch {
     return false
+  }
+}
+
+/** Stop the session's in-flight turn. Calls POST /api/sessions/:id/stop,
+ *  which sets the session's abort flag. The backend aborts the currently-
+ *  running tool call (if any) and the turn ends, returning control to the
+ *  user for the next prompt. Returns `{aborted, pending}` where `pending`
+ *  is true when no turn was in flight (the flag is set but will be a
+ *  no-op). */
+export async function stopSession(sessionId: string): Promise<{ aborted: boolean; pending: boolean } | null> {
+  try {
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/stop`,
+      { method: 'POST' },
+    )
+    if (!res.ok) return null
+    return (await res.json().catch(() => null)) as { aborted: boolean; pending: boolean } | null
+  } catch {
+    return null
   }
 }
 

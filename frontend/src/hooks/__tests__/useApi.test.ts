@@ -42,6 +42,7 @@ import {
   useSendMessage,
   useAgents,
   useSessionAgents,
+  stopSession,
   fetchSessionAgents,
   useConfiguredProviders,
   setSessionDescription,
@@ -305,9 +306,40 @@ describe('useSendMessage', () => {
     const rs = resolveSend as ((v: { kind: string }) => void) | null
     if (rs !== null) rs({ kind: 'assistant' })
   })
+
+  it('resetSending immediately clears the sending flag', async () => {
+    let resolveSend: ((v: { kind: string }) => void) | null = null
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      fetchCalls.push({ url })
+      return new Promise<Response>((resolve) => {
+        resolveSend = (v: { kind: string }) => resolve(new Response(JSON.stringify(v), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }))
+      })
+    }))
+    const { result } = renderHook(() => useSendMessage('s1', () => {}))
+    // Kick off a send — POST stays in flight.
+    await act(async () => { void result.current.send('hi') })
+    await act(async () => { await Promise.resolve() })
+    expect(result.current.sending).toBe(true)
+    // resetSending clears the flag without waiting for the POST to resolve.
+    await act(async () => { result.current.resetSending() })
+    expect(result.current.sending).toBe(false)
+    // Resolve the in-flight POST so the test does not leak a pending promise.
+    const rs = resolveSend as ((v: { kind: string }) => void) | null
+    if (rs !== null) rs({ kind: 'assistant' })
+  })
 })
 
 describe('session mutators', () => {
+  it('stopSession POSTs /api/sessions/:id/stop and returns {aborted, pending}', async () => {
+    setNextResponse({ aborted: true, pending: false })
+    const result = await stopSession('s1')
+    expect(result).toEqual({ aborted: true, pending: false })
+    const call = fetchCalls.find((c) => c.url === '/api/sessions/s1/stop')!
+    expect(call.init!.method).toBe('POST')
+  })
+
   it('setSessionDescription PUTs /api/sessions/:id/description with {description}', async () => {
     setNextResponse('{}')
     const ok = await setSessionDescription('s1', 'new desc')

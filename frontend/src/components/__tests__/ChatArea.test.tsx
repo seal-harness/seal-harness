@@ -1392,4 +1392,109 @@ describe('AskHumanForm', () => {
     fireEvent.keyDown(ta, { key: 'Escape' })
     expect(onCancel).toHaveBeenCalledWith('q1')
   })
+
+  // ── Stop button tests ───────────────────────────────────────────────
+  describe('StopButton', () => {
+    function makeThinkingMessage(): Message {
+      return {
+        id: 'm1',
+        entryId: 'e1',
+        agentName: 'claude-sonnet-4-20250514',
+        agentStatus: 'thinking',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'Thinking…' }],
+      }
+    }
+
+    it('renders the stop button when sending is true and onStop is provided', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={true}
+          onStop={onStop}
+        />,
+      )
+      const btn = screen.getByLabelText('Stop the current turn')
+      expect(btn).toBeTruthy()
+    })
+
+    it('does not render the stop button when sending is false', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={false}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.queryByLabelText('Stop the current turn')).toBeNull()
+    })
+
+    it('does not render the stop button when onStop is not provided', () => {
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={true}
+        />,
+      )
+      expect(screen.queryByLabelText('Stop the current turn')).toBeNull()
+    })
+
+    it('calls onStop when the stop button is clicked', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={true}
+          onStop={onStop}
+        />,
+      )
+      const btn = screen.getByLabelText('Stop the current turn')
+      fireEvent.click(btn)
+      expect(onStop).toHaveBeenCalledTimes(1)
+    })
+
+    it('stop button disappears when sending transitions from true to false', () => {
+      const onStop = vi.fn()
+      const session = makeSession({ id: 's1' })
+      const messages = [makeThinkingMessage()]
+      const { rerender } = render(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'thinking' })}
+          selectedSession={session}
+          messages={messages}
+          sending={true}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.getByLabelText('Stop the current turn')).toBeTruthy()
+      rerender(
+        <ChatArea
+          selectedAgent={makeAgent({ status: 'idle' })}
+          selectedSession={session}
+          messages={messages}
+          sending={false}
+          onStop={onStop}
+        />,
+      )
+      expect(screen.queryByLabelText('Stop the current turn')).toBeNull()
+    })
+  })
 })
