@@ -39,145 +39,84 @@ module Seal.Channels.Loop
   , handleTabCommand
   , plainTurn
   , plainTurnWithCaps
-  , buildIsaRegistry
   , buildChannelRegistry
   , mkBgRunner
   , channelCallDispatcher
+  , mkChannelTurnDeps
   , mkTabCloseNotifier
   , shouldAutoTab
   , isBgSlash
-  , isNewSlash
   , createConversationSession
   , createConversationSessionHeadless
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (bracket)
 import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
-import Data.Foldable (for_)
 import Data.Text (Text)
-import Data.Aeson (object, (.=))
 import Data.Text qualified as T
-import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
-import System.Directory (createDirectoryIfMissing, doesFileExist)
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
-import Katip (Severity (..), ls)
-import Seal.Agent.Def.Backend qualified as Def
-import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
-import Seal.Agent.Env (AgentEnv (..))
-import Seal.Agent.Loop (runTurn)
-import Seal.Agent.Runtime.Delegation
-  ( fromFileConfig, ChildTask (..), AgentWorkerBuilder )
-import Seal.Agent.Runtime.Delegation.Worker
-  ( mkDelegateWorker, filterBlocklisted, DelegationWorkerDeps (..) )
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), mkSessionAgentEnv
-  , resolveDefProvider, resolveSessionProvider, debugRequestsPath )
+  ( Backends (..), resolveSessionProvider )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
-  ( CursorStore, cursorLookup, cursorSet, cursorClearAll, newCursorStore )
+  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll, newCursorStore )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
-import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
+import Seal.Command.Call (CallDispatcher, callCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.New (NewArgs (..), parseNewArgs, resolveRepoUrl)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
-  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, WebConfig (..), rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
-  , toolTimeoutConfig )
-import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sessionMetaPath, sshAgentsDir)
+  ( RuntimeConfig )
+import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
-import Seal.Core.Paging (defaultPageParams)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered)
-import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
-import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+import Seal.Core.TurnEngine
+  (TurnDeps (..), TurnAdapter (..),
+   runSessionTurn, shouldAutoTab)
+import qualified Seal.Core.TurnEngine as TurnEngine
+import Seal.Core.Types (SessionId, mkSessionId, sessionIdText)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
-  , formatQuestionWithOptions
-  )
+  , formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
 import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
-import Seal.Handles.Transcript (withTwoFileTranscript, tfwSetSecretOps)
-import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
-import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
+import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
-import Seal.ISA.Dispatch (dispatch, recordSkillLoadResult)
-import qualified Seal.ISA.Registry as ISA
-import Seal.ISA.Ops.Agent
-  ( agentDefDeleteOp, agentDefListOp, agentDefReadOp, agentDefWriteOp
-  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
-  , agentInterruptOp, AgentStartWiring (..) )
-import Seal.ISA.Opcode (localBackend, opName)
-import Seal.ISA.Ops.Bin (binExecOp)
-import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
-import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
-import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
-import Seal.ISA.Ops.Memory
-  ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
-import Seal.ISA.Ops.Process (processManageOp)
-import Seal.ISA.Ops.Search (searchFilesOp)
-import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Secret (secretGetOp)
-import Seal.ISA.Ops.Shell (shellExecOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
-import Seal.ISA.Ops.Skills
-  ( skillDeleteOp, skillListOp, skillLoadOp, skillWriteOp )
 import Seal.Routing.Route qualified as Route
-import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
-import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
-import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
-import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
-import qualified Seal.SourceControl.Clone as Clone
-import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
-import Seal.Skills.Autoload (injectAutoloadSkill)
-import Seal.Skills.Prompt (injectAvailableSkills)
-import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Skills.Backend (SkillBackend)
-import Seal.Skills.Backend qualified as SkillBackend
-import qualified Seal.Security.Policy as Policy
-  ( AutonomyLevel (..), SecurityPolicy (..), AllowList (..) )
-import Seal.Session.Kind (HarnessFlavour (..))
+import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.Lock
   ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
   , replyFanoutMessage, replyMigrateAll
-  , SessionLocks, newSessionLocks, withSessionLock )
+  , SessionLocks, newSessionLocks )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
-  ( autoBindRepoAgent, defaultSessionSelection, formatSessionId, newSessionMeta
+  ( defaultSessionSelection, newSessionMeta
   , resolveDefaultAgent, saveSessionMeta )
 import Seal.Tabs
-  ( TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH
-  , renameTabH, snapshotTabs )
+  ( TabsHandle, focusTabH, insertTabH, removeTabH
+  , renameTabH, rebindTabH, snapshotTabs )
 import Seal.Tabs.Types
   ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
   , tabCount, tlTabs, lookupByRef )
-import Seal.Tools.Exec.UIO.Internal (UIOEnv)
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
-import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry)
-import Seal.Tools.Timeout (defaultToolTimeoutConfig)
-import Seal.Types.App (runApp)
-import Seal.Types.Config (defaultConfig)
-import Seal.Logging.Logger (SealLogger, logIO)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
-import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
-import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies a channel turn needs to have full parity with the web
@@ -237,23 +176,67 @@ data ChannelDeps = ChannelDeps
     -- startup via 'withSealLogger', threaded through all channel turns.
   }
 
--- | Build 'Clone.CloneDeps' from a 'ChannelDeps' (the in-scope vault runtime
--- + repo registry handle + paths). Used by the 2 'buildIsaRegistry' call
--- sites + the 1 'buildChildRegistry' site in this module. The ssh-agent is
--- real (production: 'mkRealSshAgentHandle'); the pinned host
--- keys are compile-time-embedded.
-mkCloneDepsFromChannel :: ChannelDeps -> IO Clone.CloneDeps
-mkCloneDepsFromChannel deps = do
-  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (cdPaths deps))
-  pure Clone.CloneDeps
-    { Clone.cdVault = cdVault deps
-    , Clone.cdRepoReg = cdRepoReg deps
-    , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentRegH
-    , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
-    , Clone.cdKeyfilesDir = repoKeysDir (cdPaths deps)
-    , Clone.cdIsRemote = cdIsRemote deps
-    }
+-- | Build a 'TurnDeps' from a 'ChannelDeps'. The unified turn engine takes a
+-- 'TurnDeps'; this adapter builder is the only place the channel's
+-- 'ChannelDeps' shape meets the engine's 'TurnDeps' shape. After W4
+-- collapses 'SendDeps' + 'ChannelDeps' + the CLI closures into one
+-- 'TurnDeps', this builder is dropped.
+mkChannelTurnDeps :: ChannelDeps -> TurnDeps
+mkChannelTurnDeps deps = TurnDeps
+  { tdPaths        = cdPaths deps
+  , tdVault        = cdVault deps
+  , tdProvider     = cdProvider deps
+  , tdResolve      = resolveSessionProvider (cdProvider deps)
+  , tdRepoReg      = cdRepoReg deps
+  , tdAutonomy     = cdAutonomy deps
+  , tdBroker       = cdBroker deps
+  , tdHarnessReg   = cdHarnessRegistry deps
+  , tdTmuxRunner   = cdTmuxRunner deps
+  , tdHttpManager  = cdHttpManager deps
+  , tdApprovals    = cdApprovals deps
+  , tdReplies      = cdReplies deps
+  , tdLocks        = cdLocks deps
+  , tdAbortReg     = cdAbortReg deps
+  , tdTabsHandle   = cdTabs deps
+  , tdLogger       = cdLogger deps
+  , tdIsRemote     = cdIsRemote deps
+  , tdBaseBackends = cdBackends deps
+  }
+
+-- | Build the channel 'TurnAdapter' for a given 'ChannelHandle' +
+-- 'ChannelCaps'. The channel adapter:
+-- * @taPreTurn@ — 'replySubscribe's the channel handle to the session's
+--   replies (so the post-turn fan-out delivers the assistant response to
+--   this channel) + 'replyFanoutMessage' mirrors the user's message to
+--   every OTHER subscribed channel (cross-channel mirroring, the handle's
+--   label).
+-- * @taChannelLabel@ — the session's 'smChannel' (an inbox session is
+--   always created on the channel its messages arrive on).
+-- * @taOnStop@ — 'Just' the reply fan-out so subscribed channels receive
+--   the final reply.
+-- * @taOnUserMessage@ — for /bg turns, 'Just' a 'broadcastTabs' refresh so
+--   the sidebar shows the session name as soon as the user message is
+--   durable; 'Nothing' for normal turns (the post-turn 'taPostTurn'
+--   refresh covers them).
+-- * @taPostTurn@ — 'broadcastTabs' so the sidebar reflects the new tab +
+--   the first-message snippet. Runs for both auto-tab and /bg paths.
+-- * @taStartWiring@ — the engine-owned 'TurnEngine.buildStartWiring' (W4
+--   collapsed the per-surface builders into this single one).
+mkChannelTurnAdapter :: ChannelDeps -> TurnDeps -> ChannelHandle -> ChannelCaps -> TurnAdapter
+mkChannelTurnAdapter deps td h caps = TurnAdapter
+  { taCaps          = caps
+  , taPreTurn       = \sid _meta t -> do
+      _ <- replySubscribe (cdReplies deps) h sid
+      replyFanoutMessage (cdReplies deps) sid (chLabel h) t
+  , taChannelLabel  = smChannel
+  , taOnStop        = Just . replyFanout (cdReplies deps)
+  , taOnUserMessage = \meta -> if shouldAutoTab meta
+                                 then Nothing
+                                 else Just (broadcastTabs deps (cdTabs deps))
+  , taPostTurn      = \_ _ -> broadcastTabs deps (cdTabs deps)
+  , taStartWiring   = \sessionBackends sid appEnv eCfg operatorCeiling meta ->
+      TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling (smChannel meta)
+  }
 
 -- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
 -- given config loader. Used by 'Seal.Command.Serve' and the standalone
@@ -369,8 +352,9 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
     -- initial bottom is never read: the loop writes the real sid before
     -- any /bg dispatch.
     bgConvSid <- newIORef (error "bgConvSid: set before first dispatch" :: SessionId)
-    let bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
-        callDispatcher = channelCallDispatcher deps h askReply bgConvSid
+    let td = mkChannelTurnDeps deps
+        bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
+        callDispatcher = channelCallDispatcher deps td h askReply bgConvSid
         registryWithBg = buildChannelRegistry
           (bSkills (cdBackends deps)) bgRunner callDispatcher registry
     loop h registryWithBg bgConvSid
@@ -382,7 +366,6 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
         Just ms -> do
           let key = convKey ms
               bgRoute = isBgSlash body
-              newRoute = isNewSlash body
           -- Resolve the conversation's session (create if first message).
           -- For a /bg command, take the headless path: the conversation needs
           -- an anchor session (its sid keys the bg runner's confirmation ask
@@ -397,10 +380,10 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
               case mMeta of
                 Just m  -> pure m
                 Nothing
-                  | bgRoute || newRoute -> createConversationSessionHeadless deps key (msChannelKind ms)
+                  | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
                   | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
             Nothing
-              | bgRoute || newRoute -> createConversationSessionHeadless deps key (msChannelKind ms)
+              | bgRoute  -> createConversationSessionHeadless deps key (msChannelKind ms)
               | otherwise -> createConversationSession deps h key (msChannelKind ms) tabsH
           let sid = smId meta
           -- Record the conversation's active session so the /bg runner
@@ -447,8 +430,8 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                     Just t  -> chSend h (renderCurrentTab t)
                     Nothing -> chSend h "no current tab"
                   loop h reg bgConvSid
-                Right (Route.NewSession args) -> do
-                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta args key askReply
+                Right (Route.NewSession _args) -> do
+                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
                   loop h reg bgConvSid
                 Right (Route.SlashCommand _) -> do
                   d <- ingest reg chain (RawInbound body)
@@ -502,76 +485,47 @@ resolveTabSession deps ref = case ref of
       else decodeFileStrict mp :: IO (Maybe SessionMeta)
   BoundHarness _   -> pure Nothing
 
--- | Load a session's channel provenance label (e.g. @"telegram"@, @"web"@,
--- @"cli"@) from its @session.json@. Returns 'Nothing' when the session
--- directory or file is missing or undecodable. Used by
--- 'channelCallDispatcher' to stamp channel origin into the SKILL_LOAD
--- transcript entry so the frontend can surface it in the skill-load row's
--- source label.
-loadChannelLabel :: SealPaths -> SessionId -> IO (Maybe Text)
-loadChannelLabel paths sid = do
-  let mp = sessionDir paths sid </> "session.json"
-  exists <- doesFileExist mp
-  if not exists
-    then pure Nothing
-    else do
-      mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
-      pure (smChannel <$> mMeta)
-
--- | Handle @\/new [args]@ on an inbox channel: parse the optional
--- @-p@\/@-m@\/@-r@ flags, mint a fresh session (using the old session's
--- provider/model as defaults when not overridden), insert a NEW tab into
--- the shared 'TabsHandle', set the conversation's cursor to the new tab,
--- optionally clone a repo via SETUP_REPO, and send the confirmation line.
--- The old session is kept on disk (still in @/session list@).
+-- | Handle @\/new@ on an inbox channel: mint a fresh session from config
+-- defaults, rebind the conversation's current tab (if any) to the new sid,
+-- migrate every OTHER conversation cursor pointing at the old ref to the
+-- new ref (per the user's "a tab has one session at a time; all channels
+-- focused on the tab follow the rebind" model), and send the confirmation
+-- line. The old session is kept on disk (still in @/session list@).
 --
--- This creates a new tab (matching the web "Start a new tab" form), NOT a
--- rebind. The conversation's cursor moves to the new tab; the old tab
--- remains in the tab list for other channels/web that may be focused on
--- it.
---
--- Lives at the loop level because the conversation key + cursor aren't
--- available to a registry 'CommandAction' (architect review issue C). The
--- fresh @meta@ is NOT used to run a turn -- the next inbound message's
--- cursor lookup resolves to the new session automatically (the cursor-set
--- ensures that).
+-- Mirrors the CLI's @\/new@ path but lives at the loop level because the
+-- conversation key + cursor aren't available to a registry CommandAction
+-- (architect review issue C). The fresh @meta@ is NOT used to run a turn —
+-- the next inbound message's cursor lookup resolves to the new session
+-- automatically (the cursor migrate ensures that).
 handleNewSession
   :: ChannelDeps -> ChannelHandle -> TabsHandle
-  -> ChannelKind -> SessionMeta -> Text -> (Text, Text) -> AskReplyStore -> IO ()
-handleNewSession deps h tabsH kind oldMeta argsText key askReply = do
+  -> ChannelKind -> SessionMeta -> IO ()
+handleNewSession deps h tabsH kind oldMeta = do
+  -- Preserve the old session's provider/model/agent (so mid-session
+  -- /model use changes survive /new). The new session gets a fresh id +
+  -- timestamps; everything else is copied from the old meta.
   let channelLabel = channelKindToText kind
       oldSid = smId oldMeta
-      args = parseNewArgs argsText
-      provider = fromMaybe (smProvider oldMeta) (naProvider args)
-      model    = fromMaybe (smModel oldMeta) (naModel args)
-  newMeta <- newSessionMeta (cdPaths deps) provider model
+      oldRef = BoundSession oldSid
+  newMeta <- newSessionMeta (cdPaths deps) (smProvider oldMeta) (smModel oldMeta)
                             channelLabel (smAgent oldMeta)
   saveSessionMeta (cdPaths deps) newMeta
-  -- Insert a NEW tab bound to the new session (matching the web "Start a
-  -- new tab" form). The old tab stays in the list for other channels/web.
-  r <- insertTabH tabsH (BoundSession (smId newMeta)) KindAi Nothing
-  case r of
-    Left e  -> chSend h ("warning: /new tab insert failed: " <> e)
-    Right _ -> do
-      broadcastTabs deps tabsH
-      -- Set THIS conversation's cursor to the new tab so subsequent
-      -- messages route to the new session.
-      cursorSet (cdCursors deps)
-        key
-        (BoundSession (smId newMeta))
-      -- Migrate reply subscriptions from the old session to the new one so
-      -- future fan-outs (including tab-close notifications) reach attached
-      -- channels under the new session id.
-      _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
-      -- Optionally clone a repo into the new session's workdir.
-      for_ (naRepo args) $ \repoVal -> do
-        repoUrl <- resolveRepoUrl (cdRepoReg deps) repoVal
-        sidRef <- newIORef (smId newMeta)
-        let dispatcher = channelCallDispatcher deps h askReply sidRef
-        eRes <- dispatcher (OpName "SETUP_REPO") (object ["url" .= repoUrl])
-        case eRes of
-          Left dErr -> chSend h ("repo setup failed: " <> renderDispatchError dErr)
-          Right _   -> pure ()
+  -- Rebind the tab (if any) bound to the old sid to the new sid.
+  snap <- snapshotTabs tabsH
+  case [ t | t <- tlTabs snap, tRef t == oldRef ] of
+    []       -> pure ()  -- no tab bound to old sid; cursor-only swap below
+    (tab : _) -> rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) >>= \case
+      Left e  -> chSend h ("warning: /new tab rebind failed: " <> e)
+      Right _ -> broadcastTabs deps tabsH
+  -- Migrate every conversation cursor pointing at the old ref to the new
+  -- ref (includes THIS conversation's cursor). Per the user's model: a tab
+  -- has one session at a time; all channels focused on it follow the
+  -- rebind to the new session.
+  _count <- cursorMigrateAll (cdCursors deps) oldRef (BoundSession (smId newMeta))
+  -- Migrate reply subscriptions from the old session to the new one so
+  -- future fan-outs (including tab-close notifications) reach attached
+  -- channels under the new session id.
+  _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
   chSend h
     ("new session " <> sessionIdText (smId newMeta)
        <> " (" <> smProvider newMeta <> "/" <> smModel newMeta <> ")"
@@ -646,16 +600,6 @@ isBgSlash body =
     Right (Route.SlashCommand rest) ->
       let cmd = T.toCaseFold (T.takeWhile (/= ' ') rest)
       in cmd == "bg"
-    _ -> False
--- | True when @body@ is a @\/new@ command (with or without args). Used by
--- the loop's pre-routing session-resolution to take the headless path (no
--- tab creation) — 'handleNewSession' will mint the session + insert the
--- tab. Without this, the loop would create a conversation session + tab in
--- the pre-routing, and 'handleNewSession' would create a second tab.
-isNewSlash :: Text -> Bool
-isNewSlash body =
-  case Route.route body of
-    Right (Route.NewSession _) -> True
     _ -> False
 
 -- | Push the current tab-list snapshot to WS subscribers (the web frontend
@@ -767,181 +711,13 @@ runTurnOnSession
   -> Maybe (ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps)
   -> SessionId -> SessionMeta -> Maybe MessageSource -> Text -> IO ()
 runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
-  let pr = cdProvider deps
-      paths = cdPaths deps
-      backends = cdBackends deps
-      rt = cdVault deps
-      autonomy = cdAutonomy deps
-      approvals = cdApprovals deps
-      sid = smId meta
-  eprov <- resolveSessionProvider pr meta
-  case eprov of
-    Left err -> logIO (cdLogger deps) ErrorS (ls err)
-    Right (prov, model) -> do
-      let sessionDirPath = sessionDir paths sid
-      createDirectoryIfMissing True sessionDirPath
-      saveSessionMeta paths meta
-      -- Subscribe this channel handle to the session's replies (so the
-      -- reply fan-out after the turn delivers the assistant response to
-      -- this channel). The guard is stored so we can unsubscribe later
-      -- (e.g. when the conversation focuses a different tab).
-      _guard <- replySubscribe (cdReplies deps) h sid
-      -- Cross-channel message mirroring: fan out the user's message to
-      -- every OTHER append-only channel subscribed to this session,
-      -- prefixed with the sender's channel label (e.g. "[telegram] hi").
-      -- The sender is excluded (it already has the message); the web
-      -- frontend sees the message via the transcript, not this registry.
-      replyFanoutMessage (cdReplies deps) sid (chLabel h) t
-      -- Signal the turn start so the web sidebar transitions the tab to
-      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
-      -- below, which runs on EVERY exit path (success, synchronous
-      -- exceptions, AND async exceptions like ThreadKilled) so a turn
-      -- that dies mid-way cannot leave the tab stuck in Thinking.
-      broadcastHarnessStatus (cdBroker deps) sid "thinking"
-      bracket
-        (pure ())
-        (\_ -> do
-          -- Guaranteed cleanup: signal idle + reply-delivered so the
-          -- web sidebar transitions the tab back to Idle regardless of
-          -- how the turn exited.
-          broadcastHarnessStatus (cdBroker deps) sid "idle"
-          broadcastReplyDelivered (cdBroker deps) sid)
-        (\_ ->
-        withSessionLock (cdLocks deps) sid $ do
-        withTwoFileTranscript sessionDirPath $ \tHandle -> do
-          appEnv <- mkEnv (cdLogger deps) defaultConfig
-          eCfg <- loadRuntimeConfig (prConfigPath pr)
-          eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
-          let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-          -- Per-session execution bundle: each session gets a fresh
-          -- directory at ~/.seal/cache/workdirs/<sid> (local) or
-          -- <scWorkspace>/workdirs/<sid> (remote). Handles both local
-          -- and remote via mkSessionExec.
-          cloneDeps <- mkCloneDepsFromChannel deps
-          exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
-          let wsroot = seWorkspaceRoot exec
-              wfs = seWorkdirFs exec
-              uioEnv = seUIOEnv exec
-          -- Workdir-aware skill backend: repo-local (SETUP_REPO) ⊕ user ⊕
-          -- builtin, workdir-wins. Fail-closed on a workdir error.
-          -- Auto-bind the repo's default agent (from .agents/agents.md)
-          -- if the session has no agent bound yet. Mirrors the web
-          -- gateway's autoBindRepoAgent call (Send.hs). Re-load meta
-          -- after the (possible) bind so the agent resolution below
-          -- sees the updated smAgent.
-          autoBindRepoAgent wfs paths sid
-          mMetaAfterBind <- decodeFileStrict (sessionMetaPath paths sid) :: IO (Maybe SessionMeta)
-          let meta' = fromMaybe meta mMetaAfterBind
-          workdirSkills <- SkillBackend.workdirSkillBackend wfs
-          let sessionSkills = SkillBackend.tripleUnionSkillBackend workdirSkills (bSkills backends)
-          -- Workdir-aware agent def backend: repo-local (.agents/) + user,
-          -- workdir-wins. Fail-closed on a workdir error.
-          workdirAgentDefs <- Def.workdirAgentDefBackend wfs
-          let sessionBackends = backends { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs backends) }
-          mSystem <- case smAgent meta' of
-            Nothing  -> pure Nothing
-            Just aid -> maybe Nothing adSystem <$> Def.adbRead (bAgentDefs sessionBackends) aid
-          let autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-              injectCatalog = either (const True) resolvedAvailableSkills eCfg
-              parallel = either (const True) resolvedParallelToolGuidance eCfg
-              toolUse = either (const True) resolvedToolUseEnforcement eCfg
-              taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-              withGuidance = injectStaticGuidance parallel toolUse taskCompletion mSystem
-          mSystem' <- injectAutoloadSkill sessionSkills autoloadId withGuidance
-          mSystem'' <- if injectCatalog
-                         then injectAvailableSkills sessionSkills mSystem'
-                         else pure mSystem'
-          turnAbortFlag <- lookupOrCreateAbortFlag (cdAbortReg deps) sid
-          let handleCaps = case mkCaps of
-                Nothing  -> mkHandleCaps h askReply askSid
-                Just f   -> f h askReply askSid
-              onDemand = either (const False) onDemandSchemas eCfg
-              startWiring = channelStartWiring
-                deps paths sid handleCaps uioEnv appEnv eCfg
-                wsroot operatorCeiling (smChannel meta) isaReg sessionBackends
-              isaReg = buildIsaRegistry
-                rt cloneDeps sessionBackends wsroot sid operatorCeiling autonomy
-                (either (const Nothing) rcWeb eCfg)
-                startWiring
-                (cdHarnessRegistry deps) (cdTmuxRunner deps)
-                (cdHttpManager deps) handleCaps onDemand
-          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          -- For a /bg turn, broadcast a lists snapshot as soon as the user
-          -- message is durable on disk: the snapshot's first-user-message
-          -- snippet is now populated, so the web sidebar shows the session
-          -- name immediately (the pre-turn broadcast in mkBgRunner fired
-          -- before the transcript write, so its snippet was empty and only
-          -- the agent name showed). The hook runs inside runTurn right after
-          -- a synchronous (fsync'd) tfwRecordAndAck of the user message,
-          -- eliminating the race an async write + immediate read would have.
-          -- Normal channel turns pass Nothing (no fsync latency at turn
-          -- start); they get their snippet refresh from the post-turn
-          -- broadcastTabs below.
-          let onUserMessage =
-                if shouldAutoTab meta
-                  then Nothing
-                  else Just (broadcastTabs deps (cdTabs deps))
-          let env = (mkSessionAgentEnv
-                       handleCaps prov (smProvider meta) model sid mSystem'' isaReg tHandle uioEnv
-                       (debugRequestsPath paths sid eCfg) autonomy approvals
-                       (broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-                       onDemand
-                       (Just (sessionLogPath paths sid))
-                       (either (const defaultMaxTurns) maxTurnsConfig eCfg)
-                       onUserMessage
-                       (smChannel meta)
-                       (Just (replyFanout (cdReplies deps) sid))
-                       turnAbortFlag
-                       (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg))
-                      { aeMessageSource = mSrc }
-          eResult <- withExceptionLogging (cdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
-            runApp appEnv (runTurn env t)
-          case eResult of
-            Left errMsg -> logIO (cdLogger deps) ErrorS ("[channel] turn failed: " <> ls errMsg)
-            Right _     -> pure ()
-        broadcastNewEntries (cdBroker deps) paths sid (modelText model) (smCreatedAt meta))
-      -- W3 invariant 2: auto-tab the session after a channel turn. Idempotent
-      -- (no-op if a tab already binds sid — e.g. createConversationSession
-      -- already inserted one on first message). Uses KindAi (channel/CLI
-      -- tab kind, wire "session:ai"). Sources sid from smId meta only.
-      --
-      -- Gated on 'shouldAutoTab' to honor the @mkBgRunner@ contract
-      -- (Loop.hs:624-636): a @/bg@ turn runs on a fresh, headless session
-      -- that must NOT get a tab — the tab would be bound to the bg
-      -- session's sid while the reply/ask-key is wired to the originating
-      -- conversation's sid, producing a dead-looking tab. But a @/bg@
-      -- session DOES legitimately surface in the sidebar's
-      -- @recentSessions@ (it's a real, persisted, one-shot session), so
-      -- we still broadcast a @lists@ snapshot after the turn — now that
-      -- the transcript holds the user prompt, the snapshot's snippet
-      -- populates the session name. Without this refresh the sidebar
-      -- keeps the pre-turn snapshot (snippet null → only the agent name
-      -- shows) until a hard refresh.
-      if shouldAutoTab meta
-        then do
-          ensureTabForSession (cdTabs deps) KindAi sid
-          -- Refresh the sidebar lists so the tab label updates with the
-          -- first-message snippet now that the transcript has content. Without
-          -- this, a freshly-created tab shows the agent name (snippet was null
-          -- at creation time) and never refreshes until a web-originated action.
-          broadcastTabs deps (cdTabs deps)
-        else
-          -- /bg path: no tab, but still push a lists snapshot so the
-          -- session's recentSessions row picks up the now-populated
-          -- first-user-message snippet as its name.
-          broadcastTabs deps (cdTabs deps)
-
--- | Should 'runTurnOnSession' auto-tab the session after a turn? 'True' for
--- normal channel turns (W3 invariant 2: every channel-originated session is
--- visible in the sidebar). 'False' for @/bg@ sessions, whose 'smChannel' is
--- @"bg"@ (set at Loop.hs:645 and Cli.hs:551): a @/bg@ turn runs headless on a
--- fresh session that must NOT surface in the web sidebar (see the
--- 'mkBgRunner' contract at Loop.hs:636-656). The label @"bg"@ is the
--- established convention shared by both bg runner sites; 'channelKindToText'
--- never produces it (the 'Background' kind maps to @"background"@), so there
--- is no collision with any real channel kind.
-shouldAutoTab :: SessionMeta -> Bool
-shouldAutoTab meta = smChannel meta /= "bg"
+  let td = mkChannelTurnDeps deps
+      handleCaps = case mkCaps of
+        Nothing  -> mkHandleCaps h askReply askSid
+        Just f   -> f h askReply askSid
+      adapter = mkChannelTurnAdapter deps td h handleCaps
+  _ <- runSessionTurn td adapter meta mSrc t
+  pure ()
 
 -- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
 -- a fresh persisted session from the config defaults (channel label
@@ -997,303 +773,19 @@ mkBgRunner deps h askReply bgConvSid tabsH = BgRunner $ \prompt -> do
 -- @/call@ and @/skill load@ dispatch against the same per-session registry
 -- + transcript. Mirrors 'webCallDispatcher' at
 -- 'Seal.Gateway.Send.hs:516-541'.
+-- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.
+-- Delegates to the unified 'TurnEngine.callDispatcher'. Reads the session
+-- id from the supplied 'IORef' fresh on each invocation — the
+-- 'runChannelLoop' body writes the cursor-resolved 'sid' to this IORef
+-- every turn, so the dispatcher always sees the active session.
 channelCallDispatcher
-  :: ChannelDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> CallDispatcher
-channelCallDispatcher deps h askReply sidRef callOpName val = do
+  :: ChannelDeps -> TurnDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> CallDispatcher
+channelCallDispatcher deps td h askReply sidRef callOpName val = do
   sid <- readIORef sidRef
-  let paths = cdPaths deps
-      sessionDirPath = sessionDir paths sid
-  createDirectoryIfMissing True sessionDirPath
-  -- Load the session's channel provenance (smChannel, e.g. "telegram") so
-  -- recordSkillLoadResult can stamp it into the SKILL_LOAD entry's erMeta,
-  -- surfacing channel origin in the frontend's skill-load row.
-  mChannel <- loadChannelLabel paths sid
-  withTwoFileTranscript sessionDirPath $ \tHandle -> do
-    appEnv <- mkEnv (cdLogger deps) defaultConfig
-    eCfg <- loadRuntimeConfig (prConfigPath (cdProvider deps))
-    eSecCfg <- loadSecurityConfig (securityFilePath (cdPaths deps))
-    let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-    cloneDeps <- mkCloneDepsFromChannel deps
-    exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
-    let wfs = seWorkdirFs exec
-        wsRoot = seWorkspaceRoot exec
-        uioEnv = seUIOEnv exec
-    workdirAgentDefs <- Def.workdirAgentDefBackend wfs
-    let caps = mkHandleCaps h askReply sid
-        onDemand = either (const False) onDemandSchemas eCfg
-        sessionBackends = (cdBackends deps) { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (cdBackends deps)) }
-        startWiring = channelStartWiring
-          deps paths sid caps uioEnv appEnv eCfg
-          wsRoot operatorCeiling (fromMaybe "cli" mChannel) isaReg sessionBackends
-        isaReg = buildIsaRegistry
-          (cdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
-          (cdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
-          (cdHarnessRegistry deps) (cdTmuxRunner deps) (cdHttpManager deps)
-          caps onDemand
-    tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-    callAbortFlag <- lookupOrCreateAbortFlag (cdAbortReg deps) sid
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
-    case res of
-      Right r -> recordSkillLoadResult tHandle callOpName val r mChannel
-      Left _  -> pure ()
-    pure res
-
--- | Build the ISA registry for a channel turn. Mirrors
--- 'Seal.Gateway.Send.buildWebRegistry' so channels have the SAME tool set
--- as the web and CLI paths.
-buildIsaRegistry
-  :: VaultRuntime -> Clone.CloneDeps -> Backends -> WorkspaceRoot -> SessionId -> Int
-  -> Policy.AutonomyLevel
-  -> Maybe WebConfig
-  -> AgentStartWiring
-  -> HarnessRegistry
-  -> TmuxRunner
-  -> Maybe Manager
-  -> ChannelCaps
-  -> Bool                     -- ^ on-demand schemas: register OPCODE_DESCRIBE/OPCODE_LIST
-  -> ISA.Registry
-buildIsaRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                 startWiring harnessReg tmuxRunner httpManager caps onDemand =
-  reg
-  where
-    baseOps =
-      [ showHumanOp caps
-      , askHumanOp caps
-      , secretGetOp rt
-      , memoryWriteOp (bMemory backends) sid
-      , memoryRecallOp defaultPageParams (bMemory backends)
-      , memoryDeleteOp (bMemory backends)
-      , skillWriteOp (bSkills backends) sid
-      , skillLoadOp (bSkills backends)
-      , skillListOp (bSkills backends)
-      , skillDeleteOp (bSkills backends)
-      , agentDefWriteOp (bAgentDefs backends) sid
-      , agentDefReadOp (bAgentDefs backends)
-      , agentDefListOp (bAgentDefs backends)
-      , agentDefDeleteOp (bAgentDefs backends)
-      , agentInstancesOp (bRuntime backends)
-      , agentStartOp startWiring
-      , agentStatusOp (bRuntime backends)
-      , agentStopOp (bRuntime backends)
-      , agentInterruptOp (bRuntime backends)
-      , searchFilesOp wsRoot securityPolicy operatorCeiling
-      , fileReadOp wsRoot operatorCeiling
-      , fileWriteOp wsRoot operatorCeiling
-      , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
-      , binExecOp wsRoot securityPolicy binAllowList
-      , processManageOp wsRoot securityPolicy
-      , webFetchOp webFetchCfg
-      , webSearchOp webSearchCfg
-      , harnessListOp harnessReg
-      , harnessStartOp harnessReg tmuxRunner harnessSession harnessWindow
-          HfGeneric newHarnessId
-      , harnessStopOp harnessReg tmuxRunner
-      ]
-    introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]
-    reg = ISA.mkRegistry (baseOps ++ if onDemand then introspectionOps else [])
-    securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
-    binAllowList = Nothing
-    webSearchCfg = WebSearchConfig
-      { wscManager     = httpManager
-      , wscProvider    = parseProvider (unwrapOpt wcSearchProvider webCfg "parallel")
-      , wscEndpoint    = unwrapOpt wcSearchEndpoint webCfg ""
-      , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
-      , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
-      , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault       = Just rt
-      , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
-      }
-    webFetchCfg = WebFetchConfig
-      { wfcManager   = httpManager
-      , wfcAllowList = unwrapOpt wcFetchAllowList webCfg []
-      , wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling
-      , wfcAuthKey   = Nothing
-      }
-    harnessSession = either (error "unreachable: seal is a valid TmuxIdent") id (mkTmuxIdent "seal")
-    harnessWindow  = either (error "unreachable: harness is a valid TmuxIdent") id (mkTmuxIdent "harness")
+  mChannel <- TurnEngine.loadChannelLabel (cdPaths deps) sid
+  let channelLabel = fromMaybe "cli" mChannel
+      caps = mkHandleCaps h askReply sid
+  TurnEngine.callDispatcher td caps sid channelLabel callOpName val
 
 -- | Mint a fresh 'SessionId' for a forked agent instance.
-channelMintSession :: SessionId -> IO SessionId
-channelMintSession fallback = do
-  now <- getCurrentTime
-  case mkSessionId (formatSessionId now) of
-    Right s  -> pure s
-    Left _e  -> pure fallback
-
--- | Build the 'AgentStartWiring' for a channel turn. The wiring closes over
--- the per-turn 'ChannelDeps' + parent session id + 'ChannelCaps' +
--- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
--- the default when the config section or the field is absent.
-unwrapOpt :: (WebConfig -> Maybe a) -> Maybe WebConfig -> a -> a
-unwrapOpt field webCfg agentDef =
-  case webCfg of
-    Nothing   -> agentDef
-    Just cfg  -> fromMaybe agentDef (field cfg)
-
--- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
--- section-absent case yields 'Nothing'; the section-present case yields the
--- field's value (which may itself be 'Nothing').
-unwrapOptMaybe :: (WebConfig -> Maybe a) -> Maybe WebConfig -> Maybe a
-unwrapOptMaybe = maybe Nothing
-
--- 'UIOEnv' + 'Env' + loaded config + wsRoot + operatorCeiling (for the
--- child's narrowed registry). The worker-builder is 'channelMkWorker'
--- (below), which runs 'runTurn' with the goal as the first user message and
--- captures the final text response as the summary.
-channelStartWiring
-  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text -> ISA.Registry -> Backends -> AgentStartWiring
-channelStartWiring deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel _isaReg sessionBackends =
-  AgentStartWiring
-    { aswDefBackend = bAgentDefs sessionBackends
-    , aswRuntime = bRuntime (cdBackends deps)
-    , aswConfig = do
-        eCfg' <- loadRuntimeConfig (prConfigPath (cdProvider deps))
-        pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
-    , aswPauseFlag = bSpawnPauseFlag (cdBackends deps)
-    , aswParentActivity = Just (bParentActivity (cdBackends deps))
-    , aswMintSession = channelMintSession parentSid
-    , aswParentDepth = 0
-    , aswWorker = channelMkWorker deps paths parentSid caps uioEnv appEnv eCfg wsRoot operatorCeiling channel
-    }
-
--- | The AGENT_START worker-builder for inbox-driven channels. Resolves the
--- def's provider+model (falling back to the parent session meta when the def
--- fields are empty), opens a fresh two-file transcript under
--- @\<parent-session\>\/agents\/\<child-id\>@, builds a narrowed child ISA
--- registry (blocklist strips AGENT_START/AGENT_DEF_*/lifecycle opcodes), and
--- runs 'runTurn' with the goal as the first user message. The final text
--- response is captured via a 'ChannelCaps' whose 'ccSend' writes to an
 -- IORef; the worker reads it after the run and returns it as the summary.
-channelMkWorker
-  :: ChannelDeps -> SealPaths -> SessionId -> ChannelCaps -> UIOEnv -> Env
-  -> Either a RuntimeConfig -> WorkspaceRoot -> Int -> Text
-  -> AgentWorkerBuilder
-channelMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorCeiling channel =
-  mkDelegateWorker DelegationWorkerDeps
-    { dwdPaths = paths
-    , dwdParentSid = parentSid
-    , dwdAppEnv = appEnv
-    , dwdMkUIOEnv = \childSid -> do
-        childCloneDeps <- mkCloneDepsFromChannel deps
-        eSecCfg <- loadSecurityConfig (securityFilePath paths)
-        seUIOEnv <$> either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
-    , dwdAutonomy = cdAutonomy deps
-    , dwdApprovals = cdApprovals deps
-    , dwdOnDemand = either (const False) onDemandSchemas eCfg
-    , dwdParentDepth = 0
-    , dwdResolveProvider = resolveChild
-    , dwdChildRegistry = buildChildRegistry
-    , dwdChildSystemPrompt = childSystemPrompt
-    , dwdOnEntry = pure ()  -- child onEntry: no live broadcast (would need the broker + child sid)
-    , dwdChannel = channel
-    , dwdAbortFlag = lookupOrCreateAbortFlag (cdAbortReg deps)
-    , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-    }
-  where
-    resolveChild agentDef = do
-      mParentMeta <- loadMeta paths parentSid
-      now <- getCurrentTime
-      let parent = fromMaybe (fallbackMeta now) mParentMeta
-          fallBackProvider = if T.null (adProvider agentDef) then smProvider parent else adProvider agentDef
-          fallBackModel = case adModel agentDef of
-            ModelId m | T.null m -> smModel parent
-                      | otherwise -> m
-      resolveDefProvider (cdProvider deps) fallBackProvider (ModelId fallBackModel)
-    childSystemPrompt agentDef task = do
-      let base = adSystem agentDef
-          ctx  = ctContext task
-          basePrompt = case (base, ctx) of
-            (Just b, Just c) | not (T.null c) -> Just (b <> "\n\nCONTEXT:\n" <> c)
-            (Just b, _)                       -> Just b
-            (Nothing, Just c)                 -> Just ("CONTEXT:\n" <> c)
-            (Nothing, Nothing)                -> Nothing
-          autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-          injectCatalog = either (const True) resolvedAvailableSkills eCfg
-          parallel = either (const True) resolvedParallelToolGuidance eCfg
-          toolUse = either (const True) resolvedToolUseEnforcement eCfg
-          taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-          withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
-      withAutoload <- injectAutoloadSkill (bSkills (cdBackends deps)) autoloadId withGuidance
-      if injectCatalog
-        then injectAvailableSkills (bSkills (cdBackends deps)) withAutoload
-        else pure withAutoload
-    buildChildRegistry _def childSid childCaps = do
-      childCloneDeps <- mkCloneDepsFromChannel deps
-      eSecCfg <- loadSecurityConfig (securityFilePath paths)
-      childExec <- either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg childSid childCloneDeps mkRealRemoteRunner
-      let childWsRoot = seWorkspaceRoot childExec
-      let childBaseOps =
-            [ showHumanOp childCaps
-            , askHumanOp childCaps
-            , secretGetOp (cdVault deps)
-            , memoryWriteOp (bMemory (cdBackends deps)) childSid
-            , memoryRecallOp defaultPageParams (bMemory (cdBackends deps))
-            , memoryDeleteOp (bMemory (cdBackends deps))
-            , skillWriteOp (bSkills (cdBackends deps)) childSid
-            , skillLoadOp (bSkills (cdBackends deps))
-            , skillListOp (bSkills (cdBackends deps))
-            , skillDeleteOp (bSkills (cdBackends deps))
-            , agentDefReadOp (bAgentDefs (cdBackends deps))
-            , agentDefListOp (bAgentDefs (cdBackends deps))
-            -- blocklisted: AGENT_DEF_WRITE, AGENT_DEF_DELETE,
-            -- AGENT_INSTANCES, AGENT_START, AGENT_STATUS, AGENT_STOP,
-            -- AGENT_INTERRUPT
-            , searchFilesOp childWsRoot securityPolicy operatorCeiling
-            , fileReadOp childWsRoot operatorCeiling
-            , fileWriteOp childWsRoot operatorCeiling
-            , filePatchOp childWsRoot
-            , shellExecOp childWsRoot securityPolicy
-            , setupRepoOp childCloneDeps childWsRoot (cdAutonomy deps)
-            , binExecOp childWsRoot securityPolicy binAllowList
-            , processManageOp childWsRoot securityPolicy
-            , webFetchOp webFetchCfg
-            , webSearchOp webSearchCfg
-            ]
-      pure (ISA.mkRegistry (filterBlocklisted childBaseOps opName))
-      where
-        securityPolicy = Policy.SecurityPolicy Policy.AllowAll (cdAutonomy deps)
-        binAllowList = Nothing
-        childWebCfg = either (const Nothing) rcWeb eCfg
-        webFetchCfg = WebFetchConfig
-          { wfcManager = cdHttpManager deps
-          , wfcAllowList = unwrapOpt wcFetchAllowList childWebCfg []
-          , wfcMaxBytes = unwrapOpt wcMaxFetchBytes childWebCfg operatorCeiling
-          , wfcAuthKey = Nothing }
-        webSearchCfg = WebSearchConfig
-          { wscManager = cdHttpManager deps
-          , wscProvider = parseProvider (unwrapOpt wcSearchProvider childWebCfg "parallel")
-          , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
-          , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
-          , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
-          , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
-          , wscVault = Just (cdVault deps)
-          , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
-          }
-    fallbackMeta t = SessionMeta
-      { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-      , smDescription = Nothing
-      , smCreatedAt = t, smLastActive = t }
-    loadMeta p sid = do
-      let mp = sessionDir p sid </> "session.json"
-      exists <- doesFileExist mp
-      if not exists
-        then pure Nothing
-        else decodeFileStrict mp :: IO (Maybe SessionMeta)
-
--- | Extract the 'Text' from a 'ModelId'.
-modelText :: ModelId -> Text
-modelText (ModelId t) = t
-
--- | Broadcast new transcript entries over the WS broker.
-broadcastNewEntries
-  :: Maybe StreamBroker -> SealPaths -> SessionId -> Text -> UTCTime -> IO ()
-broadcastNewEntries mBroker paths sid model createdAt =
-  case mBroker of
-    Nothing -> pure ()
-    Just broker -> do
-      entries <- readTranscriptEntries paths model (showIso createdAt) sid
-      mapM_ (broadcast broker . BeEntryRecorded sid) entries

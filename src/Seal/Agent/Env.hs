@@ -2,6 +2,8 @@
 -- loop is fully fakeable (no concrete provider/IO in its type).
 module Seal.Agent.Env
   ( AgentEnv (..)
+  , TurnEnv (..)
+  , mkSessionAgentEnv
   ) where
 
 import Data.Text (Text)
@@ -11,7 +13,7 @@ import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Types (ModelId, SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (TwoFileHandle (..))
-import Seal.ISA.Opcode (BackendExec)
+import Seal.ISA.Opcode (BackendExec, localBackend)
 import Seal.ISA.Registry (Registry)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AutonomyLevel)
@@ -145,4 +147,67 @@ data AgentEnv = AgentEnv
     -- Records ONLY events not already in @entries.jsonl@ / @conversation.jsonl@.
     -- 'Nothing' disables per-session logging (the default for tests / fake
     -- transcripts).
+  }
+
+-- | A parameter object bundling the per-turn inputs to 'mkSessionAgentEnv'.
+-- The fields are collected into one record so call sites construct it with
+-- named-field syntax (no positional-counting mistakes) and future additions
+-- are a one-field change. Lives here (next to 'AgentEnv') so the unified
+-- turn engine ('Seal.Core.TurnEngine') can import it without a cycle with
+-- 'Seal.Channel.Cli'.
+data TurnEnv = TurnEnv
+  { teCaps          :: ChannelCaps
+  , teProvider      :: SomeProvider
+  , teProviderLabel :: Text
+  , teModel         :: ModelId
+  , teSession       :: SessionId
+  , teSystem        :: Maybe Text
+  , teRegistry      :: Registry
+  , teTranscript    :: TwoFileHandle
+  , teUioEnv        :: UIOEnv
+  , teDebugReqPath  :: Maybe FilePath
+  , teAutonomy      :: AutonomyLevel
+  , teApprovals     :: ApprovalCache
+  , teOnEntry       :: IO ()
+  , teOnDemand      :: Bool
+  , teLogPath       :: Maybe FilePath
+  , teMaxTurns      :: Int
+  , teOnUserMessage :: Maybe (IO ())
+  , teChannel       :: Text
+  , teOnStop        :: Maybe (Text -> IO ())
+  , teAbortFlag     :: AbortFlag
+  , teToolTimeout   :: ToolTimeoutConfig
+  }
+
+-- | Build the per-turn 'AgentEnv' from a 'TurnEnv'. The 'aeBackend' is
+-- always 'localBackend' (Trusted/Audited opcodes run in-process; Untrusted
+-- opcodes source their backend from 'aeUIOEnv', not from here). The
+-- 'aeMessageSource' is left 'Nothing' here — the unified turn engine sets
+-- it via a record update after construction (it's an inbound-property, not
+-- a per-turn-env field).
+mkSessionAgentEnv :: TurnEnv -> AgentEnv
+mkSessionAgentEnv te = AgentEnv
+  { aeProvider   = teProvider te
+  , aeProviderLabel = teProviderLabel te
+  , aeModel      = teModel te
+  , aeSystem     = teSystem te
+  , aeRegistry   = teRegistry te
+  , aeTranscript = teTranscript te
+  , aeBackend    = localBackend
+  , aeUIOEnv     = teUioEnv te
+  , aeCaps       = teCaps te
+  , aeSession    = teSession te
+  , aeMaxTurns   = teMaxTurns te
+  , aeChannel    = teChannel te
+  , aeMessageSource = Nothing
+  , aeAutonomy   = teAutonomy te
+  , aeApprovals  = teApprovals te
+  , aeDebugRequestsPath = teDebugReqPath te
+  , aeOnEntry    = teOnEntry te
+  , aeOnUserMessage = teOnUserMessage te
+  , aeOnStop     = teOnStop te
+  , aeOnDemandSchemas = teOnDemand te
+  , aeLogPath    = teLogPath te
+  , aeAbortFlag  = teAbortFlag te
+  , aeToolTimeout = teToolTimeout te
   }

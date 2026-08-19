@@ -1,0 +1,6 @@
+warning: Git tree '/Users/zoe/tmp/seal-harness' is dirty
+Using saved setting for 'extra-substituters = https://cache.iog.io https://seal-harness-nix-cache.s3.us-east-1.amazonaws.com' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = hydra.iohk.io:f/Ya9RnKHEt2yyMf9YYkqxOQfvgrYqaqI1mjGZHkqbk= seal-harness-cache-1:CV7Ptf9uZ7QxK2GuHWdk0EVFqho0kc2Ftjd+gz64uCo=' from ~/.local/share/nix/trusted-settings.json.
+evaluation warning: Nixpkgs 26.05 will be the last release to support x86_64-darwin; see https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.05
+trace: WARNING: license "LicenseRef-FSL-1.1-MIT" not found
+Up to date
