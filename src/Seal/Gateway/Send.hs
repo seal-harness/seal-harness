@@ -20,6 +20,7 @@ module Seal.Gateway.Send
   , parseAnswerBody
   , handleAskCancel
   , webCallDispatcher
+  , mkWebTurnDeps
   , webAskCaps
   ) where
 
@@ -30,7 +31,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (readIORef, writeIORef)
+import Data.IORef (readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -42,8 +43,9 @@ import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..) )
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Call (CallDispatcher, renderDispatchError)
-import Seal.Command.Spec (CommandAction (..), Registry)
+import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
+import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
 import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
@@ -160,8 +162,17 @@ data SendDeps = SendDeps
     -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
+-- | Replace the @call@ and @skill@ specs in a registry with per-request
+-- versions (W5: the call dispatcher closes over the request's explicit
+-- 'SessionId' instead of reading the process-global @srActive@). The other
+-- specs are reused as-is from the startup-built @sdRegistry@.
+replaceCallSkillSpecs :: Registry -> CommandSpec -> CommandSpec -> Registry
+replaceCallSkillSpecs baseReg skillSpec callSpec =
+  mkRegistry (filter notCallOrSkill (registrySpecs baseReg) <> [skillSpec, callSpec])
+  where
+    notCallOrSkill s = let CommandName n = csName s in n `notElem` ["call", "skill"]
+
 -- | Build a 'TurnDeps' from a 'SendDeps' (the web wiring). The unified turn
--- engine ('Seal.Core.TurnEngine.runSessionTurn') takes a 'TurnDeps'; this
 -- adapter builder is the only place the web's 'SendDeps' shape meets the
 -- engine's 'TurnDeps' shape. After W4 collapses 'SendDeps' + 'ChannelDeps'
 -- + the CLI closures into one 'TurnDeps', this builder is dropped.
@@ -266,25 +277,12 @@ handleSend deps sid rawText = do
             triggerBroadcast deps
             pure SendAssistant
       Right (SlashCommand cmdName) -> do
-        -- The web gateway is multi-session: srActive is a process-global ref
-        -- that may point at a DIFFERENT session than this request targets.
-        -- Slash commands like /skill load and /call dispatch an opcode via
-        -- 'webCallDispatcher', which reads srActive to decide which
-        -- session's transcript to record the result entry on. Without
-        -- scoping srActive to the request's session for the duration of
-        -- the dispatch, a /skill load issued against session A while
-        -- srActive points at session B records the SKILL_LOAD entry on B
-        -- — so the frontend (focused on A) never sees the skill-load
-        -- tool-call box (it only appears after a reload re-seeds from B,
-        -- which the frontend isn't viewing). Bracket the dispatch so
-        -- srActive points at the request's session, then restore the
-        -- pre-call value. /new is routed to NewSession (below) and
-        -- intentionally keeps its swap, so this restore does NOT fight
-        -- /new.
-        activeBefore <- readIORef (srActive (sdSession deps))
-        writeIORef (srActive (sdSession deps)) meta
+        -- W5: no srActive swap bracket. The per-request call/skill
+        -- dispatcher closes over the request's explicit sid (see
+        -- 'runSlash'). /new still swaps srActive via its ndRebind (the
+        -- swap is how /new communicates the new session to
+        -- 'newSessionIdIfChangedFrom').
         r <- runSlash deps meta rawText
-        writeIORef (srActive (sdSession deps)) activeBefore
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -394,6 +392,16 @@ runSlash deps meta fullLine = do
   outVar <- newMVar ([] :: [Text])
   let askCaps = webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
       caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
+      sid = smId meta
+      td = mkWebTurnDeps deps
+      -- W5: build a per-request call dispatcher that closes over the
+      -- request's explicit sid (no srActive swap). The sdRegistry is
+      -- rebuilt per-request by replacing the call/skill specs with
+      -- per-request versions; the rest of the specs are reused as-is.
+      perRequestCallDispatcher = webCallDispatcher deps td sid
+      perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
+        (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)
+        (callCommandSpec perRequestCallDispatcher)
   -- Snapshot the active-session ref BEFORE the action runs. The web
   -- gateway is multi-session: @srActive@ is a process-global ref that
   -- points at whatever session the last @\/new@ (or session creation)
@@ -406,7 +414,7 @@ runSlash deps meta fullLine = do
   -- swapped @srActive@ during THIS call (e.g. @\/new@) reports a
   -- change.
   activeBefore <- readIORef (srActive (sdSession deps))
-  d <- ingest (sdRegistry deps) (sdPreprocess deps) (RawInbound fullLine)
+  d <- ingest perRequestRegistry (sdPreprocess deps) (RawInbound fullLine)
   case d of
     DispatchAction (CommandAction act) -> do
       act caps
@@ -459,18 +467,12 @@ plainTurnWithCaps deps meta caps t = do
 -- typing @/call@). Mirrors 'plainTurnWithCaps' but invokes 'dispatch'
 -- directly instead of 'runTurn'. Returns the structured result for
 -- 'Seal.Command.Call.renderOpResult' to render.
--- | Build a 'CallDispatcher' for the web channel. Resolves the active
--- session at call time and delegates to the unified
--- 'TurnEngine.callDispatcher'. The web gateway is multi-session: @srActive@
--- is a process-global ref that may point at a DIFFERENT session than this
--- request targets; 'handleSend' brackets the dispatch so @srActive@ points
--- at the request's session for the duration (see 'handleSend').
-webCallDispatcher :: SendDeps -> CallDispatcher
-webCallDispatcher deps callOpName val = do
-  meta <- readIORef (srActive (sdSession deps))
-  let td = mkWebTurnDeps deps
-      sid = smId meta
-      caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+-- | Build a 'CallDispatcher' for the web channel. Closes over the request's
+-- explicit 'SessionId' (W5: no longer reads the process-global @srActive@).
+-- Delegates to the unified 'TurnEngine.callDispatcher'.
+webCallDispatcher :: SendDeps -> TurnDeps -> SessionId -> CallDispatcher
+webCallDispatcher deps td sid callOpName val = do
+  let caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
   TurnEngine.callDispatcher td caps sid "web" callOpName val
 
 -- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend' is a
@@ -536,20 +538,16 @@ handleSetupRepo deps sid url =
   case validateRepoUrl url of
     Left err -> pure (Left ("invalid url: " <> err))
     Right cleanUrl -> do
-      -- Scope srActive to the target session for the dispatch.
-      let sr = sdSession deps
-      activeBefore <- readIORef (srActive sr)
       mMeta <- loadSessionMeta (sdPaths deps) sid
       case mMeta of
         Nothing -> pure (Left "session not found")
-        Just targetMeta -> do
-          writeIORef (srActive sr) targetMeta
+        Just _targetMeta -> do
           -- Dispatch SETUP_REPO via the audited path (records into the
           -- transcript + broadcasts the entry so the frontend sees it).
-          let dispatcher = webCallDispatcher deps
+          -- W5: the dispatcher takes the explicit sid (no srActive swap).
+          let td = mkWebTurnDeps deps
+              dispatcher = webCallDispatcher deps td sid
           res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
-          -- Restore srActive.
-          writeIORef (srActive sr) activeBefore
           case res of
             Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
             Right opRes ->

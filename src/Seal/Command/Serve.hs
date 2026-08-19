@@ -31,14 +31,16 @@ import Seal.Channels.Telegram (withTelegramChannel)
 import Seal.Channels.Telegram.Run (mkTelegramHandleCaps, onTelegramCallback)
 import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Call (callCommandSpec)
+import Seal.Command.Skill (skillCommandSpec)
+import Seal.Core.Types (OpName (..))
+import Seal.ISA.Dispatch (DispatchError (OpNotFound))
 import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
 import Seal.Command.Repo (RepoTestSeam (..), repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
-import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (mkRegistry, Registry)
-import Seal.Gateway.Send (SendDeps (..), webCallDispatcher)
+import Seal.Gateway.Send (SendDeps (..))
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
@@ -201,16 +203,21 @@ runServeMain autonomy logger = do
       -- The slash-command registry mirrors the TUI's. Web slash commands are
       -- best-effort: interactive-only specs (which prompt via ccPrompt) are
       -- included but the web caps return "" — a deferral story is a later phase.
+      -- W5: the call/skill specs here are placeholders — 'runSlash' replaces
+      -- them per-request with a dispatcher that closes over the request's
+      -- explicit sid (see 'replaceCallSkillSpecs'). The placeholder never
+      -- runs.
+      placeholderDispatcher _ _ = pure (Left (OpNotFound (OpName "placeholder")))
       registry = mkRegistry
         [ vaultCommandSpec rt
         , providerCommandSpec pr
         , sessionCommandSpec sr
         , modelCommandSpec pr sr
-        , skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps)
+        , skillCommandSpec (bSkills backends) placeholderDispatcher
         , agentCommandSpec (bAgentDefs backends) cfgPath
         , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
         , terseGrammarSpec
-        , callCommandSpec (webCallDispatcher sendDeps)
+        , callCommandSpec placeholderDispatcher
         , newCommandSpec newDeps
         , repoCommandSpec repoRegH repoSeam
         ]
