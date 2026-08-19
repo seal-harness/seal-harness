@@ -9,8 +9,8 @@ module Seal.Channel.Cli
   , handlePlain
   , resolveSessionProvider
   , resolveDefProvider
-  , TurnEnv (..)
   , mkSessionAgentEnv
+  , TurnEnv (..)
   , debugRequestsPath
   , untrustedIOFromSecurity
   , Backends (..)
@@ -21,6 +21,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
+import Data.Foldable (for_)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
@@ -40,7 +41,7 @@ import System.Console.Haskeline
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
-import Seal.Agent.Env (AgentEnv (..))
+import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
 import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
@@ -48,10 +49,10 @@ import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Stop (stopCommandSpec)
-import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Provider (ProviderRuntime (..), resolveSessionProvider, resolveDefProvider)
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
-import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, retrievalMaxScanBytes,
+import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig, retrievalMaxScanBytes,
                           defaultRetrievalMaxScanBytes, defaultMaxTurns, onDemandSchemas, maxTurnsConfig,
                           rcDebugSessionTranscript, rcDelegation, rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills,
                           resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance,
@@ -59,10 +60,10 @@ import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig,
 import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionDir, sessionRequestsPath, sessionLogPath, securityFilePath, sshAgentsDir)
 import Seal.Core.Backends (Backends (..), newBackends)
-import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry, resolveSystemPrompt)
+import Seal.Core.TurnEngine (buildSessionRegistry, buildChildRegistry, resolveSystemPrompt, TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Handles.Transcript
-  ( TwoFileHandle, TwoFileHandle (..), withTwoFileTranscript )
+  ( TwoFileHandle (..), withTwoFileTranscript )
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.ISA.Opcode (localBackend)
 import qualified Seal.ISA.Registry as ISA
@@ -74,9 +75,8 @@ import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStu
 #endif
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
-import Seal.Tools.Exec.Abort (AbortFlag, SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
-import Seal.Tools.Exec.UIO.Internal (UIOEnv)
-import Seal.Tools.Timeout (ToolTimeoutConfig, defaultToolTimeoutConfig)
+import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag, newSessionAbortRegistry, setSessionAbort)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.ISA.Ops.Agent (AgentStartWiring (..))
 import Seal.Skills.Autoload (injectAutoloadSkill)
 import Seal.Skills.Backend qualified as Skill
@@ -89,10 +89,8 @@ import Seal.Agent.Runtime.Delegation
   , ChildTask (..) )
 import Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker, DelegationWorkerDeps (..) )
-import Seal.Providers.Class (SomeProvider (..))
-import Seal.Providers.Ollama (defaultOllamaBaseUrl)
-import Seal.Providers.Registry (parseProvider, resolveProvider)
 import Seal.Routing.Route qualified
+import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
@@ -101,10 +99,10 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Policy (AutonomyLevel (..))
-import Seal.Tabs (TabsHandle, ensureTabForSession, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
+import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
 import Seal.Tabs.Types (TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, Tab(..), TabRef (..), lookupByRef)
 import Seal.Handles.AskReply
-  ( ApprovalCache, AskReplyStore, deliverNextAnswerResolvedAny
+  ( AskReplyStore, deliverNextAnswerResolvedAny
   , askHumanWithOptions, formatQuestionWithOptions, newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Session.Meta (SessionMeta (..))
@@ -147,87 +145,19 @@ handlePlain agentEnv env t = do
 
 -- | Resolve the active session's provider from the vault, or explain why not.
 -- Key bytes never surface: 'resolveProvider' returns an opaque 'SomeProvider'.
-resolveSessionProvider
-  :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
-resolveSessionProvider pr meta =
-  case parseProvider (smProvider meta) of
-    Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
-    Just kp -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
-          model   = ModelId (smModel meta)
-      mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
-
--- | Resolve a provider+model from explicit labels (for AGENT_START, which
--- builds a fresh AgentEnv from a def rather than the active session).
-resolveDefProvider :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
-resolveDefProvider pr providerLabel model =
-  case parseProvider providerLabel of
-    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel))
-    Just kp -> do
-      eCfg <- loadRuntimeConfig (prConfigPath pr)
-      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
-      mh <- readIORef (vrHandleRef (prVault pr))
-      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
+--
+-- 'resolveSessionProvider' and 'resolveDefProvider' are defined in
+-- 'Seal.Command.Provider' and re-exported here for backwards compatibility.
 
 -- | A parameter object bundling the per-turn inputs to 'mkSessionAgentEnv'.
 -- The 22 positional arguments are collected into one record so call sites
 -- construct it with named-field syntax (no positional-counting mistakes)
 -- and future additions are a one-field change. This is the W3 step-1
 -- mechanical refactor: no behavior change, just argument bundling.
-data TurnEnv = TurnEnv
-  { teCaps          :: ChannelCaps
-  , teProvider      :: SomeProvider
-  , teProviderLabel :: Text
-  , teModel         :: ModelId
-  , teSession       :: SessionId
-  , teSystem        :: Maybe Text
-  , teRegistry      :: ISA.Registry
-  , teTranscript    :: TwoFileHandle
-  , teUioEnv        :: UIOEnv
-  , teDebugReqPath  :: Maybe FilePath
-  , teAutonomy      :: AutonomyLevel
-  , teApprovals     :: ApprovalCache
-  , teOnEntry       :: IO ()
-  , teOnDemand      :: Bool
-  , teLogPath       :: Maybe FilePath
-  , teMaxTurns      :: Int
-  , teOnUserMessage :: Maybe (IO ())
-  , teChannel       :: Text
-  , teOnStop        :: Maybe (Text -> IO ())
-  , teAbortFlag     :: AbortFlag
-  , teToolTimeout   :: ToolTimeoutConfig
-  }
-
--- | Build the per-turn 'AgentEnv' from a 'TurnEnv'. Replaces the 22-argument
--- positional constructor. All fields come from the parameter object.
-mkSessionAgentEnv :: TurnEnv -> AgentEnv
-mkSessionAgentEnv te = AgentEnv
-  { aeProvider   = teProvider te
-  , aeProviderLabel = teProviderLabel te
-  , aeModel      = teModel te
-  , aeSystem     = teSystem te
-  , aeRegistry   = teRegistry te
-  , aeTranscript = teTranscript te
-  , aeBackend    = localBackend
-  , aeUIOEnv     = teUioEnv te
-  , aeCaps       = teCaps te
-  , aeSession    = teSession te
-  , aeMaxTurns   = teMaxTurns te
-  , aeChannel    = teChannel te
-  , aeMessageSource = Nothing
-  , aeAutonomy   = teAutonomy te
-  , aeApprovals  = teApprovals te
-  , aeDebugRequestsPath = teDebugReqPath te
-  , aeOnEntry    = teOnEntry te
-  , aeOnUserMessage = teOnUserMessage te
-  , aeOnStop     = teOnStop te
-  , aeOnDemandSchemas = teOnDemand te
-  , aeLogPath    = teLogPath te
-  , aeAbortFlag  = teAbortFlag te
-  , aeToolTimeout = teToolTimeout te
-  }
+--
+-- 'TurnEnv' and 'mkSessionAgentEnv' are defined in 'Seal.Agent.Env' (next
+-- to 'AgentEnv') and re-exported here for backwards compatibility with
+-- existing import sites.
 
 -- | Resolve the optional debug-requests path from the loaded config. When
 -- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
@@ -265,6 +195,8 @@ runCliTui
 runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner = do
   approvals <- newApprovalCache
   abortReg <- newSessionAbortRegistry
+  replies <- newReplyRegistry
+  locks <- newSessionLocks
   active0 <- readIORef (srActive sr)
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   eCfg <- loadRuntimeConfig (prConfigPath pr)
@@ -457,33 +389,6 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           (resolvedAutoloadSkill cfg) (resolvedAvailableSkills cfg)
           (resolvedParallelToolGuidance cfg) (resolvedToolUseEnforcement cfg)
           (resolvedTaskCompletionGuidance cfg) meta
-      -- The per-turn body: open the transcript for `sid`, build the ISA
-      -- registry, run a turn under a `withTwoFileTranscript` bracket.
-      -- Mirrors `runTurnOnSession` from `Seal.Channels.Loop`. Used by
-      -- `plainHandler` (for plain-text turns). `callDispatcher` uses
-      -- `withCliTurnDispatch` below (it needs to return the structured
-      -- `Either DispatchError OpResult`).
-      withCliTurn meta act = do
-        let sid = smId meta
-            sessionDirPath' = sessionDir paths sid
-        createDirectoryIfMissing True sessionDirPath'
-        saveSessionMeta paths meta
-        withTwoFileTranscript sessionDirPath' $ \tHandle -> do
-          exec <- mkSessionExecCli sid
-          let wfs = seWorkdirFs exec
-              wsRoot = seWorkspaceRoot exec
-          workdirAgentDefs <- Def.workdirAgentDefBackend wfs
-          let sessionAgentDefs = Def.unionAgentDefBackend workdirAgentDefs agentDefBackend
-              sessionBackends = backends { bAgentDefs = sessionAgentDefs }
-              startWiring = cliStartWiring sid sessionBackends
-              isaReg = cliIsaReg sid startWiring caps wsRoot sessionBackends
-          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          eprov <- resolveSessionProvider pr meta
-          case eprov of
-            Left err -> ccSend caps err
-            Right (prov, model) -> do
-              mSystem <- resolveSystem meta wfs
-              act sid tHandle isaReg prov model mSystem
     -- The /bg runner: mint a fresh persisted session from the config
     -- defaults, build a ChannelCaps whose ccPrompt routes through askHuman
     -- (notify = print the question via ccSend, so the confirmation appears
@@ -586,37 +491,38 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           pure res
       plainHandler t = do
         meta <- readIORef (srActive sr)
-        withCliTurn meta $ \sid tHandle isaReg prov model mSystem -> do
-          exec <- mkSessionExecCli sid
-          turnAbortFlag <- lookupOrCreateAbortFlag abortReg sid
-          handlePlain
-            (mkSessionAgentEnv TurnEnv
-               { teCaps          = caps
-               , teProvider      = prov
-               , teProviderLabel = smProvider meta
-               , teModel         = model
-               , teSession       = sid
-               , teSystem        = mSystem
-               , teRegistry      = isaReg
-               , teTranscript    = tHandle
-               , teUioEnv        = seUIOEnv exec
-               , teDebugReqPath  = debugRequestsPath paths sid eCfg
-               , teAutonomy      = autonomy
-               , teApprovals     = approvals
-               , teOnEntry       = pure ()
-               , teOnDemand      = onDemand
-               , teLogPath       = Just (sessionLogPath paths sid)
-               , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
-               , teOnUserMessage = Nothing
-               , teChannel       = "cli"
-               , teOnStop        = Nothing
-               , teAbortFlag     = turnAbortFlag
-               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-               })
-            appEnv t
-          -- W3 invariant 2: auto-tab the session after a CLI turn. Idempotent
-          -- (no-op if a tab already binds sid). Uses KindAi (CLI tab kind).
-          ensureTabForSession tabsH KindAi sid
+        let td = TurnDeps
+              { tdPaths        = paths
+              , tdVault        = rt
+              , tdProvider     = pr
+              , tdResolve      = resolveSessionProvider pr
+              , tdRepoReg      = repoReg
+              , tdAutonomy     = autonomy
+              , tdBroker       = Nothing  -- CLI has no WS broker
+              , tdHarnessReg   = harnessReg
+              , tdTmuxRunner   = tmuxRunner
+              , tdHttpManager  = Just (prManager pr)
+              , tdApprovals    = approvals
+              , tdReplies      = replies
+              , tdLocks        = locks
+              , tdAbortReg     = abortReg
+              , tdTabsHandle   = tabsH
+              , tdLogger       = logger
+              , tdIsRemote     = isRemote
+              , tdBaseBackends = backends
+              }
+            adapter = TurnAdapter
+              { taCaps          = caps
+              , taPreTurn       = \_ _ _ -> pure ()
+              , taChannelLabel  = const "cli"
+              , taOnStop        = const Nothing
+              , taOnUserMessage = const Nothing
+              , taPostTurn      = \_ _ -> pure ()
+              , taStartWiring   = \sessionBackends sid _wsRoot _uioEnv _appEnv _eCfg _operatorCeiling _meta ->
+                  cliStartWiring sid sessionBackends
+              }
+        outcome <- runSessionTurn td adapter meta Nothing t
+        for_ (toError outcome) (ccSend caps)
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg abortReg)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> SessionAbortRegistry -> InputT IO ()

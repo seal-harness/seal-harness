@@ -24,19 +24,15 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Exception (bracket)
 import Control.Monad (unless, when)
-import Data.Foldable (for_)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (readIORef, writeIORef)
-import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -44,22 +40,22 @@ import System.FilePath ((</>))
 
 import Seal.Agent.Def.Backend (workdirAgentDefBackend, unionAgentDefBackend)
 import Seal.Agent.Def.Types (adModel, adProvider, adSystem, AgentDef (..))
-import Seal.Agent.Loop (runTurn)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
-  ( Backends (..), TurnEnv (..), mkSessionAgentEnv, resolveDefProvider )
+  ( Backends (..), resolveDefProvider )
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, renderDispatchError)
 import Seal.Command.Spec (CommandAction (..), Registry)
 import Seal.Config.File
-  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig, retrievalMaxScanBytes
-  , rcWeb
-  , onDemandSchemas, maxTurnsConfig, rcDelegation, rcDebugSessionTranscript, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  ( RuntimeConfig, defaultRetrievalMaxScanBytes, loadRuntimeConfig, retrievalMaxScanBytes
+  , onDemandSchemas, rcDelegation, rcWeb, resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
   , toolTimeoutConfig )
 import Seal.Config.Security (loadSecurityConfig)
-import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir, sessionRequestsPath, sessionLogPath, sshAgentsDir)
-import Seal.Core.TurnEngine (buildSessionRegistry, resolveSystemPrompt)
+import Seal.Config.Paths (SealPaths, repoKeysDir, securityFilePath, sessionDir, sessionLogPath, sshAgentsDir)
+import Seal.Core.TurnEngine
+  (TurnDeps (..), TurnAdapter (..),
+   TurnOutcome (..), runSessionTurn, buildSessionRegistry)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -75,7 +71,6 @@ import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
 import Seal.ISA.Ops.Agent (AgentStartWiring (..))
 import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Skills.Autoload (injectAutoloadSkill)
-import Seal.Skills.Backend qualified as Skill
 import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Agent.Runtime.Delegation
@@ -86,11 +81,11 @@ import Seal.ISA.Opcode (OpResult (..), localBackend)
 import qualified Seal.ISA.Registry as ISA
 import Seal.ISA.Dispatch (dispatch, recordGitPushResult, recordSkillLoadResult, recordSetupRepoResult)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), SomeProvider, ToolResultPart (..) )
+  ( SomeProvider, ToolResultPart (..) )
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastHarnessStatus, broadcastReplyDelivered, broadcastAgentDefsChanged)
+import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -104,8 +99,8 @@ import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), formatSessionId, autoBindRepoAgent)
 import Seal.Session.Lock
-  ( ReplyRegistry, replyFanout, replyFanoutMessage, replySubscriberCount
-  , SessionLocks, withSessionLock )
+  ( ReplyRegistry, replyFanout, replyFanoutMessage
+  , SessionLocks )
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
@@ -116,7 +111,7 @@ import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | The dependencies the send handler needs (the agent-loop plumbing). Built
 -- once in 'Seal.Command.Serve.runServeMain' and shared across requests. The
@@ -197,6 +192,58 @@ data SendDeps = SendDeps
     -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
+-- | Build a 'TurnDeps' from a 'SendDeps' (the web wiring). The unified turn
+-- engine ('Seal.Core.TurnEngine.runSessionTurn') takes a 'TurnDeps'; this
+-- adapter builder is the only place the web's 'SendDeps' shape meets the
+-- engine's 'TurnDeps' shape. After W4 collapses 'SendDeps' + 'ChannelDeps'
+-- + the CLI closures into one 'TurnDeps', this builder is dropped.
+mkWebTurnDeps :: SendDeps -> TurnDeps
+mkWebTurnDeps deps = TurnDeps
+  { tdPaths        = sdPaths deps
+  , tdVault        = sdVault deps
+  , tdProvider     = sdProvider deps
+  , tdResolve      = sdResolve deps
+  , tdRepoReg      = sdRepoReg deps
+  , tdAutonomy     = sdAutonomy deps
+  , tdBroker       = sdBroker deps
+  , tdHarnessReg   = sdHarnessRegistry deps
+  , tdTmuxRunner   = sdTmuxRunner deps
+  , tdHttpManager  = sdHttpManager deps
+  , tdApprovals    = sdApprovals deps
+  , tdReplies      = sdReplies deps
+  , tdLocks        = sdLocks deps
+  , tdAbortReg     = sdAbortReg deps
+  , tdTabsHandle   = sdTabsHandle deps
+  , tdLogger       = sdLogger deps
+  , tdIsRemote     = sdIsRemote deps
+  , tdBaseBackends = sdBackends deps
+  }
+
+-- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:
+-- * @taPreTurn@ — fans out the user's message to subscribed chat channels
+--   (cross-channel mirroring, @"web"@ label). No 'replySubscribe' (the web
+--   isn't an inbox-driven channel handle).
+-- * @taChannelLabel@ — constant @"web"@.
+-- * @taOnStop@ — 'Just' the reply fan-out so chat channels subscribed to
+--   this session receive the final reply.
+-- * @taOnUserMessage@ — 'Nothing' (web turns aren't /bg).
+-- * @taPostTurn@ — @pure ()@ (the web's @lists@ snapshot is refreshed by
+--   'triggerBroadcast' in 'handleSend', not here).
+-- * @taStartWiring@ — the web's 'webStartWiring' builder (W4 collapses this
+--   into the engine-owned @buildStartWiring@).
+mkWebTurnAdapter :: SendDeps -> ChannelCaps -> TurnAdapter
+mkWebTurnAdapter deps caps = TurnAdapter
+  { taCaps          = caps
+  , taPreTurn       = \sid _meta t -> replyFanoutMessage (sdReplies deps) sid "web" t
+  , taChannelLabel  = const "web"
+  , taOnStop        = Just . replyFanout (sdReplies deps)
+  , taOnUserMessage = const Nothing
+  , taPostTurn      = \_ _ -> pure ()
+  , taStartWiring   = \sessionBackends sid wsRoot uioEnv appEnv eCfg operatorCeiling _meta ->
+      webStartWiring deps (sdPaths deps) sid caps uioEnv appEnv eCfg
+        wsRoot operatorCeiling "web" sessionBackends
+  }
+
 -- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
 -- this into the JSON response body the frontend's @SendResult@ parses.
 data SendOutcome
@@ -223,17 +270,6 @@ sendOutcomeJson = \case
       ])
   SendAssistant  -> (200, object [ "kind" .= ("assistant" :: Text), "response" .= ("" :: Text) ])
   SendError c m  -> (c, object [ "error" .= m ])
-
--- | Resolve the optional debug-requests path from the loaded config. When
--- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
--- otherwise @Nothing@. The debug file records each 'CompletionRequest' in
--- full (including the complete message history) exactly as sent to the LLM.
-debugPath :: SealPaths -> SessionId -> Either a RuntimeConfig -> Maybe FilePath
-debugPath paths sid eCfg =
-  case eCfg of
-    Right cfg | Just True <- rcDebugSessionTranscript cfg ->
-      Just (sessionRequestsPath paths sid)
-    _ -> Nothing
 
 -- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
@@ -368,114 +404,12 @@ loadSessionMeta paths sid = do
 -- send on a channel-origin tab also delivers the reply to the channel.
 plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
 plainTurn deps meta t = do
-  eprov <- sdResolve deps meta
-  case eprov of
-    Left err -> pure (Left err)
-    Right (prov, model) -> do
-      let paths = sdPaths deps
-          sid = smId meta
-          sessionDirPath = sessionDir paths sid
-      createDirectoryIfMissing True sessionDirPath
-      -- Signal the turn start so the web sidebar transitions the tab to
-      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
-      -- below, which runs on EVERY exit path (success, synchronous
-      -- exceptions, AND async exceptions like ThreadKilled) so a turn that
-      -- dies mid-way cannot leave the tab stuck in Thinking.
-      broadcastHarnessStatus (sdBroker deps) sid "thinking"
-      -- Cross-channel message mirroring: fan out the web user's message
-      -- to every append-only channel subscribed to this session, prefixed
-      -- with "[web]". The web frontend sees the message directly (it's
-      -- the sender), so it is excluded by the "web" label (no chat channel
-      -- has that label, so all subscribed channels receive the mirror).
-      replyFanoutMessage (sdReplies deps) sid "web" t
-      bracket
-        (pure ())
-        (\_ -> do
-          -- Guaranteed cleanup: signal idle so the web sidebar
-          -- transitions the tab back to Idle regardless of how the turn
-          -- exited (success, exception, ThreadKilled). Then fan out the
-          -- reply to chat channels subscribed to this session.
-          broadcastHarnessStatus (sdBroker deps) sid "idle"
-          fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid)
-        (\_ -> withSessionLock (sdLocks deps) sid
-             (withTwoFileTranscript sessionDirPath (\tHandle -> do
-            appEnv <- mkEnv (sdLogger deps) defaultConfig
-            eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
-            eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
-            let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-            cloneDeps <- mkCloneDepsFromSend deps
-            exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
-            let wfs = seWorkdirFs exec
-                wsroot = seWorkspaceRoot exec
-                uioEnv = seUIOEnv exec
-                caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
-            -- Auto-bind: if the workdir now contains a repo shipping
-            -- .agents/agents.md (from a prior SETUP_REPO — whether invoked
-            -- by the LLM as a tool call, via /call, or via the web combo
-            -- box) and the session is still bound to its creation-time
-            -- default_agent (not already repo-prefixed), rebind smAgent to
-            -- the repo's agents-md so this turn's resolveSystemPrompt picks
-            -- up the project instructions. Idempotent + non-clobbering
-            -- (see autoBindRepoAgent). Runs over the same WorkdirFs the
-            -- turn uses, so mode=local and mode=remote behave identically.
-            -- Re-load meta after the (possible) rebind so resolveSystemPrompt
-            -- sees the updated smAgent.
-            autoBindRepoAgent wfs paths sid
-            mMetaAfterBind <- loadSessionMeta paths sid
-            let meta' = fromMaybe meta mMetaAfterBind
-            -- Build the workdir-aware skill backend: repo-local skills
-            -- (discovered by SETUP_REPO) ⊕ user ⊕ builtin, workdir-wins.
-            -- Fail-closed: a workdir error → no workdir skills (the user ⊕
-            -- builtin union still applies).
-            workdirSkills <- Skill.workdirSkillBackend wfs
-            workdirAgentDefs <- workdirAgentDefBackend wfs
-            let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
-                sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
-                agentDefBackend = bAgentDefs sessionBackends
-                autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-                injectCatalog = either (const True) resolvedAvailableSkills eCfg
-                parallel = either (const True) resolvedParallelToolGuidance eCfg
-                toolUse = either (const True) resolvedToolUseEnforcement eCfg
-                taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-            mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta'
-            turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
-            let onDemand = either (const False) onDemandSchemas eCfg
-                startWiring = webStartWiring
-                  deps paths sid caps uioEnv appEnv eCfg
-                  wsroot operatorCeiling "web" sessionBackends
-                isaReg = buildSessionRegistry
-                  (sdVault deps) cloneDeps sessionBackends wsroot sid operatorCeiling
-                  (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
-                  (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-                  caps onDemand
-                env = mkSessionAgentEnv TurnEnv
-                  { teCaps          = caps
-                  , teProvider      = prov
-                  , teProviderLabel = smProvider meta
-                  , teModel         = model
-                  , teSession       = sid
-                  , teSystem        = mSystem
-                  , teRegistry      = isaReg
-                  , teTranscript    = tHandle
-                  , teUioEnv        = uioEnv
-                  , teDebugReqPath  = debugPath (sdPaths deps) sid eCfg
-                  , teAutonomy      = sdAutonomy deps
-                  , teApprovals     = sdApprovals deps
-                  , teOnEntry       = broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-                  , teOnDemand      = onDemand
-                  , teLogPath       = Just (sessionLogPath paths sid)
-                  , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
-                  , teOnUserMessage = Nothing
-                  , teChannel       = "web"
-                  , teOnStop        = Just (replyFanout (sdReplies deps) sid)
-                  , teAbortFlag     = turnAbortFlag
-                  , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-                  }
-            tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-            result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turn" $
-              runApp appEnv (runTurn env t)
-            broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-            pure result)))
+  let td = mkWebTurnDeps deps
+      adapter = mkWebTurnAdapter deps (webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta))
+  outcome <- runSessionTurn td adapter meta Nothing t
+  pure (case toError outcome of
+          Just err -> Left err
+          Nothing  -> Right ())
 
 -- | Run a slash command. The output is collected via a 'ChannelCaps' whose
 -- 'ccSend' appends to an MVar-backed list, then returned as the @response@.
@@ -544,85 +478,12 @@ newSessionIdIfChangedFrom deps beforeSid = do
 -- claim it). Mirrors 'plainTurn' but takes the caller's caps.
 plainTurnWithCaps :: SendDeps -> SessionMeta -> ChannelCaps -> Text -> IO (Either Text ())
 plainTurnWithCaps deps meta caps t = do
-  eprov <- sdResolve deps meta
-  case eprov of
-    Left err -> pure (Left err)
-    Right (prov, model) -> do
-      let paths = sdPaths deps
-          sid = smId meta
-          sessionDirPath = sessionDir paths sid
-      createDirectoryIfMissing True sessionDirPath
-      -- Cross-channel message mirroring (see plainTurn for the rationale).
-      replyFanoutMessage (sdReplies deps) sid "web" t
-      -- Signal the turn start so the web sidebar transitions the tab to
-      -- Thinking. Paired with the idle signal in the 'bracket' cleanup
-      -- below, which runs on EVERY exit path (success, synchronous
-      -- exceptions, AND async exceptions like ThreadKilled).
-      broadcastHarnessStatus (sdBroker deps) sid "thinking"
-      bracket
-        (pure ())
-        (\_ -> do
-          broadcastHarnessStatus (sdBroker deps) sid "idle"
-          fanoutLastReply (sdReplies deps) (sdBroker deps) paths sid)
-        (\_ -> withTwoFileTranscript sessionDirPath $ \tHandle -> do
-          appEnv <- mkEnv (sdLogger deps) defaultConfig
-          eCfg <- loadRuntimeConfig (prConfigPath (sdProvider deps))
-          eSecCfg <- loadSecurityConfig (securityFilePath (sdPaths deps))
-          let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-          cloneDeps <- mkCloneDepsFromSend deps
-          exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
-          let wfs = seWorkdirFs exec
-              wsRoot = seWorkspaceRoot exec
-              uioEnv = seUIOEnv exec
-          workdirSkills <- Skill.workdirSkillBackend wfs
-          workdirAgentDefs <- workdirAgentDefBackend wfs
-          let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (sdBackends deps))
-              sessionBackends = (sdBackends deps) { bAgentDefs = unionAgentDefBackend workdirAgentDefs (bAgentDefs (sdBackends deps)) }
-              agentDefBackend = bAgentDefs sessionBackends
-              autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
-              injectCatalog = either (const True) resolvedAvailableSkills eCfg
-              parallel = either (const True) resolvedParallelToolGuidance eCfg
-              toolUse = either (const True) resolvedToolUseEnforcement eCfg
-              taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
-          mSystem <- resolveSystemPrompt agentDefBackend sessionSkills autoloadId injectCatalog parallel toolUse taskCompletion meta
-          turnAbortFlag <- lookupOrCreateAbortFlag (sdAbortReg deps) sid
-          let onDemand = either (const False) onDemandSchemas eCfg
-              startWiring = webStartWiring
-                deps paths sid caps uioEnv appEnv eCfg
-                wsRoot operatorCeiling "web" sessionBackends
-              isaReg = buildSessionRegistry
-                (sdVault deps) cloneDeps sessionBackends wsRoot sid operatorCeiling
-                (sdAutonomy deps) (either (const Nothing) rcWeb eCfg) startWiring
-                (sdHarnessRegistry deps) (sdTmuxRunner deps) (sdHttpManager deps)
-                caps onDemand
-              env = mkSessionAgentEnv TurnEnv
-                { teCaps          = caps
-                , teProvider      = prov
-                , teProviderLabel = smProvider meta
-                , teModel         = model
-                , teSession       = sid
-                , teSystem        = mSystem
-                , teRegistry      = isaReg
-                , teTranscript    = tHandle
-                , teUioEnv        = uioEnv
-                , teDebugReqPath  = debugPath (sdPaths deps) sid eCfg
-                , teAutonomy      = sdAutonomy deps
-                , teApprovals     = sdApprovals deps
-                , teOnEntry       = broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-                , teOnDemand      = onDemand
-                , teLogPath       = Just (sessionLogPath paths sid)
-                , teMaxTurns      = either (const defaultMaxTurns) maxTurnsConfig eCfg
-                , teOnUserMessage = Nothing
-                , teChannel       = "web"
-                , teOnStop        = Just (replyFanout (sdReplies deps) sid)
-                , teAbortFlag     = turnAbortFlag
-                , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
-                }
-          tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-          result <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath paths sid)) "turnWithCaps" $
-            runApp appEnv (runTurn env t)
-          broadcastNewEntries (sdBroker deps) paths sid (modelText model) (smCreatedAt meta)
-          pure result)
+  let td = mkWebTurnDeps deps
+      adapter = mkWebTurnAdapter deps caps
+  outcome <- runSessionTurn td adapter meta Nothing t
+  pure (case toError outcome of
+          Just err -> Left err
+          Nothing  -> Right ())
 
 -- | Build a 'CallDispatcher' for the web channel. Resolves the active
 -- session at call time, opens its transcript, builds the session's ISA
@@ -797,10 +658,6 @@ webMkWorker deps paths parentSid _caps _uioEnv appEnv eCfg _wsRoot operatorCeili
       pure (TurnEngine.buildChildRegistry (sdVault deps) childCloneDeps (sdBackends deps)
               childWsRoot childSid operatorCeiling (sdAutonomy deps)
               childWebCfg (sdHttpManager deps) childCaps)
-
--- | Extract the 'Text' from a 'ModelId'.
-modelText :: ModelId -> Text
-modelText (ModelId t) = t
 
 -- | Broadcast new transcript entries over the WS broker so the frontend
 -- updates live without a page refresh. Reads the full transcript from disk
@@ -994,39 +851,3 @@ handleAskCancel deps sid qidTxt =
       when cancelled $
         broadcastAskResolved (sdBroker deps) sid qid "cancelled"
       pure (Right cancelled)
-
--- | Read the last assistant message from a session's transcript and fan
--- it out to every chat channel subscribed to the session. The web frontend
--- already received entries via the WS broker; only chat channels need the
--- explicit 'chSend'. Reads @conversation.jsonl@ directly (the two-file
--- format), parsing the last 'Assistant' message's text content blocks.
--- When the fan-out reaches ≥1 subscribed chat channel, emits a
--- @reply-delivered@ activity signal so the web sidebar marks the tab as
--- Idle Read (the last assistant message was delivered to a channel the
--- user is expected to see).
-fanoutLastReply :: ReplyRegistry -> Maybe StreamBroker -> SealPaths -> SessionId -> IO ()
-fanoutLastReply replies mBroker paths sid = do
-  let convPath = sessionConversationPath paths sid
-  exists <- doesFileExist convPath
-  if not exists
-    then pure ()
-    else do
-      raw <- readFileTextStrict convPath
-      let lines' = filter (not . T.null) (T.lines raw)
-          msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]
-      for_ (lastAssistantText msgs) $ \reply -> do
-        replyFanout replies sid reply
-        -- If ≥1 chat channel is subscribed, the reply was delivered to a
-        -- channel the user is expected to read — mark the session seen.
-        count <- replySubscriberCount replies sid
-        when (count > 0) (broadcastReplyDelivered mBroker sid)
-
--- | Extract the concatenated text content of the last 'Assistant' message
--- in a list. Tool-use blocks are skipped (only 'CbText' is extracted).
-lastAssistantText :: [Message] -> Maybe Text
-lastAssistantText msgs =
-  case reverse (filter (\m -> msgRole m == Assistant) msgs) of
-    (m : _) -> case [t | CbText t <- msgContent m] of
-      (t : _) -> Just t
-      []      -> Nothing
-    [] -> Nothing

@@ -8,6 +8,8 @@ module Seal.Command.Provider
   , formatTestResult
   , ProviderRuntime (..)
   , providerCommandSpec
+  , resolveSessionProvider
+  , resolveDefProvider
   ) where
 
 import Control.Exception (SomeException, try)
@@ -32,7 +34,7 @@ import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig
   , providerBaseUrl, providerDefaultModel, updateRuntimeConfig, upsertProvider )
 import Seal.Core.Types (ModelId (..))
-import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), ToolChoice (..), Usage (..), textMsg)
+import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), SomeProvider, ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.Registry
   ( KnownProvider, completeSome, configuredProviders, defaultModelFor
@@ -40,6 +42,7 @@ import Seal.Providers.Registry
   , resolveProvider, vaultErrText, vaultKeyName )
 import Seal.Security.Vault (VaultHandle, vhDelete, vhGet, vhPut)
 import Seal.Security.Vault.Age (VaultError (..))
+import Seal.Session.Meta (SessionMeta (..))
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | The vault key under which Anthropic OAuth tokens are stored.
@@ -327,3 +330,32 @@ removeCmd pr lbl = CommandAction $ \caps ->
 
 modelText :: ModelId -> Text
 modelText (ModelId t) = t
+
+-- | Resolve the active session's provider from the vault, or explain why
+-- not. Key bytes never surface: 'resolveProvider' returns an opaque
+-- 'SomeProvider'. Reads the session's 'smProvider'/'smModel' and the
+-- configured Ollama base URL (falling back to 'defaultOllamaBaseUrl').
+resolveSessionProvider
+  :: ProviderRuntime -> SessionMeta -> IO (Either Text (SomeProvider, ModelId))
+resolveSessionProvider pr meta =
+  case parseProvider (smProvider meta) of
+    Nothing -> pure (Left ("unknown provider in session: " <> smProvider meta))
+    Just kp -> do
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
+          model   = ModelId (smModel meta)
+      mh <- readIORef (vrHandleRef (prVault pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
+
+-- | Resolve a provider+model from explicit labels (for AGENT_START, which
+-- builds a fresh AgentEnv from a def rather than the active session).
+resolveDefProvider
+  :: ProviderRuntime -> Text -> ModelId -> IO (Either Text (SomeProvider, ModelId))
+resolveDefProvider pr providerLabel' model =
+  case parseProvider providerLabel' of
+    Nothing -> pure (Left ("unknown provider in agent def: " <> providerLabel'))
+    Just kp -> do
+      eCfg <- loadRuntimeConfig (prConfigPath pr)
+      let baseUrl = fromMaybe defaultOllamaBaseUrl (either (const Nothing) (`providerBaseUrl` "ollama") eCfg)
+      mh <- readIORef (vrHandleRef (prVault pr))
+      fmap (fmap (, model)) (resolveProvider mh (prManager pr) baseUrl kp model (prCallCounter pr))
