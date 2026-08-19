@@ -727,7 +727,7 @@ body {
 
 /* Stop button: same base as header-scroll-btn, with a red accent to
    signal its destructive/interrupting nature. */
-.header-stop-btn:hover {
+.header-stop-btn {
   color: var(--needs-input);
   border-color: var(--needs-input);
 }
