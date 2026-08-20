@@ -332,13 +332,15 @@ writeSkill root repo s = do
   _ <- gitCommitAll repo rel ("seal: SKILL write " <> skillIdText (skId s))
   pure ()
 
--- | Read one skill by id. Probes the grouped layout first (searching each
--- group subdirectory), then falls back to the flat layout
--- (@\<root\>\/\<id\>.md@) for back-compat. Returns 'Nothing' if no file is
--- found or every candidate is malformed. The returned skill's 'skGroup' is
--- filled from the directory when the frontmatter omitted it (the common
--- case), so a grouped file reads back as grouped regardless of whether its
--- frontmatter redundantly declares a group.
+-- | Read one skill by id. Probes, in order: the native grouped layout
+-- (@\<group\>\/\<id\>.md@), the agentskills.io grouped layout
+-- (@\<group\>\/\<id\>\/SKILL.md@), the native flat layout
+-- (@\<id\>.md@), then the agentskills.io top-level layout
+-- (@\<id\>\/SKILL.md@). Returns 'Nothing' if no file is found or every
+-- candidate is malformed. The returned skill's 'skGroup' is filled from the
+-- directory when the frontmatter omitted it (the common case), so a grouped
+-- file reads back as grouped regardless of whether its frontmatter
+-- redundantly declares a group.
 --
 -- The reads go through the 'WorkdirFs' handle (via 'userDirFs') so they
 -- share the single confined code path (§3.6) while remaining local-FS.
@@ -346,12 +348,13 @@ readSkill :: FilePath -> SkillId -> IO (Maybe Skill)
 readSkill root sid = do
   let fs = userDirFs root
       base = skillIdText sid <> ".md"
+      dir = skillIdText sid
   groups <- listSubdirs fs
-  found <- firstMatchM [ readAndStampGroup fs (g <> "/" <> base) (Just g)
-                       | g <- groups ]
-  case found of
-    Just s  -> pure (Just s)
-    Nothing -> readAndStampGroup fs base Nothing
+  let nativeGrouped   = [ readAndStampGroup fs (g <> "/" <> base) (Just g) | g <- groups ]
+      agentGrouped    = [ readAgentSkillAt fs (g <> "/" <> dir) (Just g) | g <- groups ]
+      nativeFlat      = readAndStampGroup fs base Nothing
+      agentTop        = readAgentSkillAt fs dir Nothing
+  firstMatchM (nativeGrouped ++ agentGrouped ++ [nativeFlat, agentTop])
 
 -- | Read a skill file at @\<anchor\>\/\<rel\>@ (via the 'WorkdirFs') and,
 -- if it decodes, fill in 'skGroup' from the directory when the frontmatter
@@ -401,19 +404,23 @@ firstMatchM (a:as)   = do
     Nothing -> firstMatchM as
 
 -- | Enumerate all skills in @dir@: top-level @.md@ files (flat layout,
--- back-compat) plus @.md@ files one directory down (grouped layout).
--- Malformed files are skipped (a partial write never breaks the list).
--- Each skill's 'skGroup' is filled from its directory when the frontmatter
--- omitted one. Results are sorted by id for deterministic output.
+-- back-compat) plus @.md@ files one directory down (grouped layout), plus
+-- agentskills.io @\<name\>\/SKILL.md@ skills at both levels (top-level and
+-- @\<group\>\/\<name\>\/SKILL.md@). Malformed files are skipped (a partial
+-- write never breaks the list). Each skill's 'skGroup' is filled from its
+-- directory when the frontmatter omitted one. Results are sorted by id for
+-- deterministic output.
 --
 -- The reads go through the 'WorkdirFs' handle (via 'userDirFs') so they
 -- share the single confined code path (§3.6) while remaining local-FS.
 listSkills :: FilePath -> IO [Skill]
 listSkills dir = do
   let fs = userDirFs dir
-  topLevels <- listTopLevelSkills fs
-  grouped   <- listGroupedSkills fs
-  pure (sortOn (skillIdText . skId) (catMaybes (topLevels ++ grouped)))
+  topNative   <- listTopLevelSkills fs
+  grouped     <- listGroupedSkills fs
+  agentTop    <- listTopLevelAgentSkills fs
+  agentGrouped <- listGroupedAgentSkills fs
+  pure (sortOn (skillIdText . skId) (catMaybes (topNative ++ grouped ++ agentTop ++ agentGrouped)))
 
 -- | Read the flat-layout skills: @.md@ files directly under the 'WorkdirFs'
 -- anchor. Returns one 'Maybe Skill' per file (the outer list, not the inner
@@ -438,6 +445,32 @@ listGroupedSkills fs = do
     let entries = fromRight [] eEntries
         mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` e]
     forM mdFiles $ \e -> readAndStampGroup fs (g <> "/" <> e) (Just g)
+  pure (concat results)
+
+-- | Read the agentskills.io skills at the top level: each immediate
+-- subdirectory @\<name\>@ of the anchor that contains a @SKILL.md@. The
+-- skill id comes from the @name@ frontmatter field (the spec requires it to
+-- match the directory name); the group is 'Nothing' (top-level skills are
+-- ungrouped, matching the flat native layout). Malformed skills are
+-- skipped ('Nothing').
+listTopLevelAgentSkills :: WorkdirFs -> IO [Maybe Skill]
+listTopLevelAgentSkills fs = do
+  subdirs <- listSubdirs fs
+  forM subdirs $ \subdir -> readAgentSkillAt fs subdir Nothing
+
+-- | Read the agentskills.io skills within Seal group directories: for each
+-- group @g@, each immediate subdirectory @\<name\>@ under @g/@ that contains
+-- a @SKILL.md@ is decoded and stamped with 'skGroup' = @'Just' g@ when the
+-- frontmatter omitted one. Results from all groups are concatenated. This
+-- composes the Seal grouped-layout convention with the agentskills.io
+-- per-skill directory convention (@\<group\>\/\<name\>\/SKILL.md@).
+listGroupedAgentSkills :: WorkdirFs -> IO [Maybe Skill]
+listGroupedAgentSkills fs = do
+  groups <- listSubdirs fs
+  results <- forM groups $ \g -> do
+    let subFs = reanchorFs fs g
+    subdirs <- listSubdirs subFs
+    forM subdirs $ \subdir -> readAgentSkillAt fs (g <> "/" <> subdir) (Just g)
   pure (concat results)
 
 -- | Delete one skill file and auto-commit. Idempotent (no-op if the file is
@@ -486,25 +519,48 @@ deleteSkill dir repo sid = do
 listAgentSkillsDir :: WorkdirFs -> IO [Maybe Skill]
 listAgentSkillsDir fs = do
   subdirs <- listSubdirs fs
-  forM subdirs $ \subdir -> do
-    let subFs = reanchorFs fs subdir
-    mdExists <- wfsDoesFileExist subFs =<< rpOrDie "SKILL.md"
-    if not mdExists
-      then pure Nothing
-      else do
-        eContent <- wfsReadFile subFs =<< rpOrDie "SKILL.md"
-        case eContent of
-          Left _ -> pure Nothing
-          Right content -> pure (decodeAgentSkill content)
+  forM subdirs $ \subdir -> readAgentSkillAt fs subdir Nothing
+
+-- | Read a @\<dir\>\/SKILL.md@ agentskills.io skill relative to a
+-- 'WorkdirFs' anchor, decoding it and stamping 'skGroup' = @mGroup@ when
+-- the frontmatter omitted one (mirrors 'readAndStampGroup' for the native
+-- codec). Returns 'Nothing' when the subdirectory has no @SKILL.md@ or the
+-- file fails to decode. Used by both the workdir scanner
+-- ('listAgentSkillsDir') and the user-store auto-detection
+-- ('listTopLevelAgentSkills' \/ 'listGroupedAgentSkills').
+readAgentSkillAt :: WorkdirFs -> Text -> Maybe Text -> IO (Maybe Skill)
+readAgentSkillAt fs dir mGroup = do
+  let subFs = reanchorFs fs dir
+  mdExists <- wfsDoesFileExist subFs =<< rpOrDie "SKILL.md"
+  if not mdExists
+    then pure Nothing
+    else do
+      eContent <- wfsReadFile subFs =<< rpOrDie "SKILL.md"
+      case eContent of
+        Left _   -> pure Nothing
+        Right c -> pure (stampGroup (decodeAgentSkillWithGroup mGroup c))
+  where
+    stampGroup (Just s) = case skGroup s of
+      Just _  -> Just s
+      Nothing -> Just s { skGroup = mGroup }
+    stampGroup Nothing = Nothing
 
 -- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter
--- uses @name@ (required, maps to 'skId') and @description@ (required, maps
--- to 'skDescription'). The body after the frontmatter becomes 'skBody'.
+-- uses @name@ (required, maps to 'skId') and @description@ (required, maps to
+-- 'skDescription'). The body after the frontmatter becomes 'skBody'.
 -- Timestamps default to epoch zero (repo-local skills have no provenance
 -- timestamps). The session is set to a system "manual" session (matching
--- the DirScheme agent def pattern).
+-- the DirScheme agent def pattern). The 'skGroup' is set to the supplied
+-- stamp ('Nothing' for a top-level agentskills.io skill; @'Just' g@ for one
+-- discovered under a Seal group directory).
 decodeAgentSkill :: Text -> Maybe Skill
-decodeAgentSkill content =
+decodeAgentSkill = decodeAgentSkillWithGroup Nothing
+
+-- | The general form of 'decodeAgentSkill' that pre-stamps 'skGroup'. Used
+-- internally so the user-store grouped scanner can fill the group from the
+-- on-disk directory (mirroring 'readAndStampGroup' for the native codec).
+decodeAgentSkillWithGroup :: Maybe Text -> Text -> Maybe Skill
+decodeAgentSkillWithGroup mGroup content =
   case decodeDoc content of
     (fm, body) -> do
       nameT <- fmLookup "name" fm
@@ -513,7 +569,7 @@ decodeAgentSkill content =
         { skId = sid
         , skDescription = fromMaybe "" (fmLookup "description" fm)
         , skBody = body
-        , skGroup = Nothing
+        , skGroup = mGroup
         , skCreatedAt = agentSkillEpoch
         , skUpdatedAt = agentSkillEpoch
         , skSession = mkSystemSessionId "manual"
