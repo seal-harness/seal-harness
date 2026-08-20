@@ -24,7 +24,7 @@ import Seal.Command.Provider (ProviderRuntime, providerCommandSpec)
 import Seal.Command.Repo (RepoTestSeam, repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
 import Seal.Command.Spec (CommandSpec)
-import Seal.Command.Stop (stopCommandSpec)
+import Seal.Command.Stop (StopTranscriptWriter, stopCommandSpec)
 import Seal.Command.Tab (TabCloseNotifier, tabCommandSpec, terseGrammarSpec)
 import Seal.Config.Paths (SealPaths)
 import Seal.Session.Store (SessionRuntime)
@@ -65,6 +65,10 @@ data CoreCommandDeps = CoreCommandDeps
   , ccdAbortReg    :: SessionAbortRegistry
     -- ^ For @\/stop@ (the single-session variant; the web rebuilds
     -- per-request).
+  , ccdStopWriter  :: StopTranscriptWriter
+    -- ^ Writes the stop message to the session's transcript + broadcasts
+    -- it so the stop appears cross-channel. Built at the wiring site from
+    -- 'SealPaths' + the broker.
   , ccdRepoReg     :: RepoRegistryHandle
     -- ^ For @\/repo@ (list/add/remove/info/test).
   , ccdRepoSeam    :: Maybe RepoTestSeam
@@ -101,7 +105,7 @@ coreCommandSpecs d =
   , modelCommandSpec (ccdProvider d) (ccdSession d)
   , agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)
   , tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)
-  , stopCommandSpec (ccdAbortReg d) (ccdSession d)
+  , stopCommandSpec (ccdAbortReg d) (ccdSession d) (ccdStopWriter d)
   , terseGrammarSpec
   ]
   <> [ repoCommandSpec (ccdRepoReg d) seam | Just seam <- [ccdRepoSeam d] ]

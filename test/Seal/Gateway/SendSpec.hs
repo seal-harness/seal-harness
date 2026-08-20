@@ -50,12 +50,14 @@ import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted)
+import Seal.Transcript.Conv (readConversation)
+import Data.ByteString qualified as BS
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.Tabs (newTabsHandle, insertTabH, snapshotTabs)
 import Seal.Tabs.Types (TabRef (BoundSession), tlTabs, tRef, tabCount)
 import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier)
-import Seal.Command.Stop (stopCommandSpecForSession)
+import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter, noStopTranscriptWriter)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 sampleTime :: UTCTime
@@ -648,7 +650,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- stopCommandSpecForSession closing over the request's sid. Simulate
         -- that here: the registry carries the per-request stop spec for
         -- targetSid, so the command aborts targetSid (not srActive).
-        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) targetSid
+        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) targetSid noStopTranscriptWriter
             sendDeps = baseDeps
               { sdTabsHandle = tabsH
               , sdRegistry = mkRegistry [stopSpec]
@@ -667,3 +669,36 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- must not read srActive on the multi-session web.
         activeFlag <- lookupOrCreateAbortFlag (sdAbortReg sendDeps) activeSid
         isAborted activeFlag `shouldReturn` False
+
+    it "writes a stop entry to the transcript so it appears cross-channel" $
+      withSystemTempDirectory "stop-transcript" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let targetSid = mkSid "20260819-130000-stop-transcript"
+        seedSession paths targetSid
+        let stopSpec = stopCommandSpecForSession (sdAbortReg baseDeps) targetSid
+                         (mkStopTranscriptWriter paths Nothing)
+            sendDeps = baseDeps
+              { sdTabsHandle = tabsH
+              , sdRegistry = mkRegistry [stopSpec]
+              }
+        outcome <- handleSend sendDeps targetSid "/stop"
+        case outcome of
+          SendSlash _ _ -> pure ()
+          other         -> expectationFailure ("expected SendSlash, got " <> show other)
+        -- The transcript's conversation.jsonl must contain the stop
+        -- message as an assistant entry so the web frontend (and any
+        -- other channel) sees it on reload/poll.
+        let convPath = sessionDir paths targetSid </> "conversation.jsonl"
+        raw <- BS.readFile convPath
+        let msgs = readConversation raw
+        -- The stop message should be the last assistant message.
+        case reverse (filter (\m -> msgRole m == Assistant) msgs) of
+          (m : _) -> case [t | CbText t <- msgContent m] of
+            (t : _) -> t `shouldSatisfy` ("stopped" `T.isInfixOf`)
+            []      -> expectationFailure "last assistant message has no text"
+          []      -> expectationFailure "no assistant message in the transcript — /stop did not write to the transcript"

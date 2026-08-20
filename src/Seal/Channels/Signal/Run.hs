@@ -37,6 +37,7 @@ import Seal.Command.Channel
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
+import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
@@ -315,6 +316,7 @@ runSignalMain autonomy logger = do
         , ccdTabs        = tabsH
         , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , ccdAbortReg    = cdAbortReg chanDeps
+        , ccdStopWriter  = mkStopTranscriptWriter paths (cdBroker chanDeps)
         , ccdRepoReg     = repoRegH
         , ccdRepoSeam    = Nothing
         }

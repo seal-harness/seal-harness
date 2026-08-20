@@ -46,7 +46,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
 import Seal.Command.Skill (skillCommandSpec)
 
-import Seal.Command.Stop (stopCommandSpecForSession)
+import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
 import Seal.Core.TurnEngine
@@ -407,7 +407,8 @@ runSlash deps meta fullLine = do
       perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
         (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)
         (callCommandSpec perRequestCallDispatcher)
-        (stopCommandSpecForSession (sdAbortReg deps) sid)
+        (stopCommandSpecForSession (sdAbortReg deps) sid
+           (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))
   -- Snapshot the active-session ref BEFORE the action runs. The web
   -- gateway is multi-session: @srActive@ is a process-global ref that
   -- points at whatever session the last @\/new@ (or session creation)

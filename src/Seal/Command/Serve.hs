@@ -37,6 +37,7 @@ import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
+import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry, Registry)
 import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
 import Seal.Logging.Logger (SealLogger, logIO)
@@ -214,6 +215,7 @@ runServeMain autonomy logger = do
         , ccdTabs        = tabsH
         , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , ccdAbortReg    = cdAbortReg chanDeps
+        , ccdStopWriter  = mkStopTranscriptWriter paths (Just broker)
         , ccdRepoReg     = repoRegH
         , ccdRepoSeam    = Just repoSeam
         }
