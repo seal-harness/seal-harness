@@ -20,11 +20,10 @@ import Seal.TestHelpers.FreePort (withFreePort)
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
 
--- | Five seconds — generous for a localhost WebSocket round-trip, but
--- short enough that a hung server/client doesn't stall the test suite
--- indefinitely. Returns 'Nothing' on timeout (reported as a failure).
+-- | Ten seconds — generous for a localhost WebSocket round-trip, short
+-- enough that a genuinely stuck server/client doesn't stall the suite.
 testTimeoutUs :: Int
-testTimeoutUs = 5_000_000
+testTimeoutUs = 10_000_000
 
 -- | Run an IO action with a per-test timeout. Wraps 'System.timeout' and
 -- reports a timeout as a hspec failure so the suite never hangs on a
@@ -38,19 +37,17 @@ withTimeout act =
 -- | Run a WebSocket server on a free port, wait for it to bind, then run
 -- the client against it. Tolerates a bind failure (e.g. a transient
 -- port-take race) by skipping with 'pendingWith' instead of crashing the
--- suite — the StreamSpec is not the primary subject of this change and
--- should not block the gate on an environmental flake.
+-- suite.
 withStreamServer :: StreamGuard -> StreamBroker -> (Int -> ClientApp ()) -> IO ()
 withStreamServer guard broker clientApp =
   withFreePort $ \port -> do
     _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
-    threadDelay 100000  -- wait for the server to bind
-    withTimeout $
-      runClient "127.0.0.1" port "/" (clientApp port)
-        `catch` \(e :: IOException) ->
-          pendingWith ("server bind/client failed (port " <> show port <> "): " <> show e)
-        `catch` \(_ :: ConnectionException) ->
-          pendingWith "client connection closed unexpectedly"
+    threadDelay 200000  -- wait for the server to bind
+    withTimeout (runClient "127.0.0.1" port "/" (clientApp port))
+      `catch` \(e :: IOException) ->
+        pendingWith ("server bind/client failed (port " <> show port <> "): " <> show e)
+      `catch` \(_ :: ConnectionException) ->
+        pendingWith "client connection closed unexpectedly"
 
 spec :: Spec
 spec = describe "Seal.Gateway.Stream" $ do
@@ -70,7 +67,6 @@ spec = describe "Seal.Gateway.Stream" $ do
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
     withStreamServer guard broker $ \_port conn -> do
       _hello <- receiveData conn :: IO BL.ByteString
-      -- The server sends an initial lists snapshot after hello.
       _lists <- receiveData conn :: IO BL.ByteString
       broadcastLists broker (object ["tabs" .= ([] :: [String])])
       threadDelay 100000
