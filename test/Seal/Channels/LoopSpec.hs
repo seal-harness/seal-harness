@@ -560,7 +560,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       tabsH <- newTabsHandle
       broker <- newStreamBroker 10
       eventsRef <- newIORef ([] :: [BrokerEvent])
-      _ <- subscribe broker (either (error "sid") id (mkSessionId "any")) (\e -> modifyIORef' eventsRef (e :))
+      _ <- subscribe broker (either (error "sid") id (mkSessionId "any")) (\e -> modifyIORef' eventsRef (e :)) (pure ())
       logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised (Just broker)
                         harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger

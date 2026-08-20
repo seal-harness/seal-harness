@@ -20,7 +20,7 @@ module Seal.Gateway.StreamBroker
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (when, filterM)
+import Control.Monad (when, filterM, forM_)
 import Data.Aeson (Value)
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -40,12 +40,17 @@ data BrokerEvent
   | BeReposChanged                     -- ^ the source-control repo registry was mutated; clients should re-fetch /api/repos
   deriving stock (Eq, Show)
 
--- | The per-subscriber state: the focused session (via an 'IORef' so the
--- connection thread can update it on focus without re-subscribing) + a
--- send action.
+-- | The per-subscriber state: the focused session (via an 'TVar' so the
+-- connection thread can update it on focus without re-subscribing), a
+-- send action, and an optional close action. The close action is called
+-- when 'subSend' throws (dead connection) so the WS socket is actively
+-- closed — this triggers the client's @onclose@ handler and reconnect
+-- rather than leaving a zombie connection that never receives another
+-- event but also never detects the failure.
 data Subscriber = Subscriber
   { subSessionRef :: TVar SessionId
-  , subSend    :: BrokerEvent -> IO ()
+  , subSend       :: BrokerEvent -> IO ()
+  , subClose      :: IO ()
   }
 
 -- | The in-process broker. STM-backed: a 'TVar' of subscribers + a global
@@ -68,13 +73,18 @@ newStreamBroker cap =
 -- is a no-op (the over-cap subscriber is never added — it should close).
 -- Returns the session 'TVar' so the caller can update the focused session
 -- via 'updateSubscriberSession' when the client sends a @focus@ op.
-subscribe :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO (TVar SessionId)
-subscribe broker session sendfn = do
+--
+-- The @close@ action is called when the broker detects this subscriber's
+-- send has thrown (dead connection), so the WS socket is actively closed
+-- and the client reconnects. Pass @pure ()@ when no cleanup is needed
+-- (tests).
+subscribe :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO () -> IO (TVar SessionId)
+subscribe broker session sendfn closefn = do
   ref <- newTVarIO session
   atomically $ do
     subs <- readTVar (sbSubs broker)
     when (length subs < sbCap broker) $
-      writeTVar (sbSubs broker) (subs <> [Subscriber ref sendfn])
+      writeTVar (sbSubs broker) (subs <> [Subscriber ref sendfn closefn])
   pure ref
 
 -- | Update a subscriber's focused session. Called when the client sends a
@@ -88,19 +98,27 @@ updateSubscriberSession ref sid = atomically (writeTVar ref sid)
 -- regardless of focus.
 --
 -- A subscriber whose 'subSend' throws (e.g. a closed WebSocket connection
--- raising 'Network.WebSockets.ConnectionClosed') is silently dropped from
--- the subscriber list and skipped for this event — a dead connection must
--- never propagate an exception to the caller (e.g. a @seal serve@ request
--- thread running 'triggerBroadcast' after a slash command). Without this,
--- any slash command that triggers a lists broadcast 500s the HTTP response
--- once the single WS subscriber's connection has dropped.
+-- raising 'Network.WebSockets.ConnectionClosed') is pruned from the
+-- subscriber list and its 'subClose' action is invoked. Closing the
+-- connection actively (rather than just silently removing it from the
+-- list) ensures the client's @onclose@ fires and it reconnects — without
+-- this, a dead connection would linger as a zombie: the reader loop is
+-- still alive, the client thinks it's connected, but no events arrive.
+-- The close action is best-effort (swallowed if it throws) so a failure
+-- during cleanup never propagates to the caller (e.g. a @seal serve@
+-- request thread running 'triggerBroadcast' after a slash command).
 broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
   subs <- readTVarIO (sbSubs broker)
   live <- filterM (deliverTo event) subs
-  -- Drop any subscribers whose send threw (dead connections). The length
-  -- check avoids a needless STM write when everyone survived.
-  when (length live < length subs) $ atomically $ writeTVar (sbSubs broker) live
+  -- Drop any subscribers whose send threw (dead connections). Call their
+  -- close actions so the WS socket is actively closed and the client
+  -- reconnects. The length check avoids a needless STM write when everyone
+  -- survived.
+  when (length live < length subs) $ do
+    let dead = filter (\s -> subSessionRef s `notElem` map subSessionRef live) subs
+    forM_ dead $ \s -> subClose s `catch` \(_ :: SomeException) -> pure ()
+    atomically $ writeTVar (sbSubs broker) live
   where
     deliverTo ev s =
       (do
