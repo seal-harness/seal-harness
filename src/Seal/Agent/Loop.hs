@@ -366,29 +366,65 @@ runTurn env userText = do
                   notifyStop (prefix <> T.intercalate "\n" texts)
         else do
           results <- mapM dispatchOne toolUses
-          let assistantMsg = Message Assistant (rsContent resp)
-              resultMsg = Message User results
-          liftIO $ do
-            now2 <- getCurrentTime
-            let conv2 = msgs <> [assistantMsg, resultMsg]
-                entry2 = EntryRecord
-                  { erId = ""
-                  , erTimestamp = now2
-                  , erKind = EKRequest
-                  , erConvLen = length conv2
-                  , erEnvelope = Nothing
-                  , erUsage = Nothing
-                  , erStop = Nothing
-                  , erDurationMs = Nothing
-                  , erHarness = Nothing
-                  , erCorrelation = Nothing
-                  , erMeta = Map.empty
-                  }
-            tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
-            aeOnEntry env'
-          tEnd <- liftIO getCurrentTime
-          liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
-          go (n - 1) 0 (msgs <> [assistantMsg, resultMsg])
+          -- Abort guard: if a tool call was aborted mid-flight (the user
+          -- clicked stop, set the abort flag), terminate the turn
+          -- immediately instead of feeding the aborted tool results back
+          -- to the LLM and continuing. Without this guard the loop would
+          -- recurse into `go`, the LLM would emit a follow-up response,
+          -- and the tab would stay "thinking" until that response
+          -- completes — the user-visible stop button would appear to do
+          -- nothing. Mirrors the stream-abort `Left "(stopped)"` path
+          -- above so the bracket cleanup fires the idle broadcast.
+          aborted <- liftIO (isAborted (aeAbortFlag env'))
+          if aborted
+            then liftIO $ do
+              let stopMsg = "(stopped)"
+                  assistantMsg = Message Assistant (rsContent resp)
+                  resultMsg = Message User results
+                  conv = msgs <> [assistantMsg, resultMsg]
+                          <> [Message Assistant [CbText stopMsg]]
+              now <- getCurrentTime
+              let entry = EntryRecord
+                    { erId = ""
+                    , erTimestamp = now
+                    , erKind = EKResponse
+                    , erConvLen = length conv
+                    , erEnvelope = Nothing
+                    , erUsage = Nothing
+                    , erStop = Nothing
+                    , erDurationMs = Nothing
+                    , erHarness = Nothing
+                    , erCorrelation = Nothing
+                    , erMeta = Map.empty
+                    }
+              tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)
+              aeOnEntry env'
+              ccSend (aeCaps env') stopMsg
+              notifyStop stopMsg
+            else do
+              let assistantMsg = Message Assistant (rsContent resp)
+                  resultMsg = Message User results
+              liftIO $ do
+                now2 <- getCurrentTime
+                let conv2 = msgs <> [assistantMsg, resultMsg]
+                    entry2 = EntryRecord
+                      { erId = ""
+                      , erTimestamp = now2
+                      , erKind = EKRequest
+                      , erConvLen = length conv2
+                      , erEnvelope = Nothing
+                      , erUsage = Nothing
+                      , erStop = Nothing
+                      , erDurationMs = Nothing
+                      , erHarness = Nothing
+                      , erCorrelation = Nothing
+                      , erMeta = Map.empty
+                      }
+                tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)
+                aeOnEntry env'
+              tEnd <- liftIO getCurrentTime
+              liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))
+              go (n - 1) 0 (msgs <> [assistantMsg, resultMsg])
 
     dispatchOne :: ContentBlock -> App ContentBlock
     dispatchOne (CbToolUse tcid name input) = do
