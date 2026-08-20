@@ -479,6 +479,7 @@ test-suite tests
         Seal.ISA.Ops.FileSpec
         Seal.ISA.Ops.ShellSpec
         Seal.ISA.Ops.ProcessSpec
+        Seal.ISA.Ops.BinGitSpec
         Seal.ISA.Ops.BinSpec
         Seal.ISA.Ops.SearchSpec
         Seal.ISA.Ops.PatchSpec

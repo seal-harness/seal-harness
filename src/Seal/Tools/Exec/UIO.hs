@@ -32,6 +32,7 @@ module Seal.Tools.Exec.UIO
   , uioShellExecEnv
   , uioShellExecGitEnv
   , uioBinExecEnv
+  , uioBinExecGitEnv
   , uioLiftIO
   , uioUntrustedIO
   , WriteMode (..)

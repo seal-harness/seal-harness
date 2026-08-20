@@ -171,6 +171,18 @@ data UntrustedIO = UntrustedIO
     -- 'uioShellExecEnv') and an optional cwd. Used by the PAT clone path
     -- (@http.extraHeader@ is an argv element, but the env override is
     -- still needed for @GIT_TERMINAL_PROMPT=0@).
+
+  , uioBinExecGitEnv :: [(String, String)] -> Maybe BS.ByteString
+                   -> BinName -> [BinArg] -> Maybe RemotePath
+                   -> IO (Either UntrustedErr Text)
+    -- ^ Like 'uioBinExecEnv' but with optional @known_hosts@ content for
+    -- the REMOTE deploy-key path (mirrors 'uioShellExecGitEnv'). The
+    -- local arm delegates to 'uioBinExecEnv' (ignoring the content). The
+    -- remote arm uses @ssh -A@ (agent forwarding) + strips
+    -- @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ from the remote env prefix (the
+    -- forwarded socket replaces them). Used by BIN_EXEC when the binary
+    -- is @git@ and the cwd is inside a registered repo with a deploy-key
+    -- credential.
   }
 
 -- | Write mode for 'uioWriteFile': truncate + create (@'WMWrite'@, the
@@ -330,6 +342,11 @@ mkLocalUntrustedIO wsRoot =
       in case resolveBinCwd wsRoot mCwd of
            Left pe       -> pure (Left (UePath pe))
            Right cwdAbs -> runLocalFixedArgvEnv True argv (Just cwdAbs) extras
+  , uioBinExecGitEnv = \extras _mKnownHosts bin bargs mCwd ->
+      -- Local arm: the known_hosts temp file is already written by
+      -- resolveCloneTarget (cdIsRemote=False path); ignore the content
+      -- + delegate to uioBinExecEnv.
+      uioBinExecEnv (mkLocalUntrustedIO wsRoot) extras bin bargs mCwd
   }
 
 -- | Build the @rg@ command string from a validated 'SearchPattern' + an
@@ -623,6 +640,26 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
              let cdPart = T.pack ("cd " <> shellQuote cwdPath <> " && ")
                  cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
              in runRemoteShellText runner sshCfg (cdPart <> envPrefix <> cmd)
+    , uioBinExecGitEnv = \extras _mKnownHosts bin bargs mCwd ->
+        -- Remote deploy-key path: mirrors uioShellExecGitEnv. Strip
+        -- SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix (the
+        -- forwarded agent replaces them). Keep them in the LOCAL ssh -A
+        -- process env so the right agent is forwarded.
+        let localEnv = [ (k, v) | (k, v) <- extras
+                      , k == "SSH_AUTH_SOCK" || k == "SSH_AGENT_PID"
+                      ]
+            remoteExtras = [ (k, v) | (k, v) <- extras
+                           , k /= "SSH_AUTH_SOCK"
+                           , k /= "SSH_AGENT_PID"
+                           ]
+            argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
+            remoteEnvPrefix = T.pack (renderEnvPrefix remoteExtras)
+        in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of
+           Left pe  -> pure (Left (UePath pe))
+           Right cwdPath ->
+             let cdPart = T.pack ("cd " <> shellQuote cwdPath <> " && ")
+                 cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
+             in runRemoteShellForwardingEnvText runner sshCfg localEnv (cdPart <> remoteEnvPrefix <> cmd)
    }
 
 -- | A stub remote executor that fails-closed on every method (preserving
@@ -642,6 +679,7 @@ mkRemoteUntrustedIOStub = UntrustedIO
   , uioShellExecEnv = \_ _ _    -> pure (Left (UeExec ExecNotImplemented))
   , uioShellExecGitEnv = \_ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   , uioBinExecEnv   = \_ _ _ _  -> pure (Left (UeExec ExecNotImplemented))
+  , uioBinExecGitEnv = \_ _ _ _ _ -> pure (Left (UeExec ExecNotImplemented))
   }
 
 -- | The workspace root for remote confinement. The 'SshConfig' carries
