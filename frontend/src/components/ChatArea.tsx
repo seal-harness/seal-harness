@@ -108,6 +108,27 @@ function useFragmentAnchor<T extends HTMLElement>(anchorId: string | undefined, 
   return targeted
 }
 
+/** Stop button for the chat header — shown only when the session is
+ *  actively thinking. Clicking calls onStop, which POSTs to the backend's
+ *  /api/sessions/:id/stop endpoint and optimistically clears the thinking
+ *  indicator. Renders a square (stop) icon, matching the header-scroll-btn
+ *  styling. */
+function StopButton({ onStop }: { onStop: () => void }) {
+  return (
+    <button
+      className="header-scroll-btn header-stop-btn"
+      title="Stop generating"
+      aria-label="Stop the current turn"
+      onClick={onStop}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"
+        aria-hidden="true">
+        <rect x="4" y="4" width="8" height="8" rx="1.5" />
+      </svg>
+    </button>
+  )
+}
+
 /** Copy-session-id button for the chat header. Renders a small ID-style
  *  icon; clicking copies the session id to the clipboard with a brief
  *  "Copied!" tooltip as feedback. Uses the same copyTextToClipboard helper
@@ -1968,6 +1989,7 @@ export function ChatArea({
   onModelChange,
   pendingQuestions,
   onAnswerQuestion,
+  onStop,
   onAnswerQuestionText,
   onCancelQuestion,
 }: {
@@ -2047,12 +2069,25 @@ export function ChatArea({
   onAnswerQuestionText?: (qid: string, answer: string) => Promise<boolean> | void
   /** Called when the human dismisses a pending question. */
   onCancelQuestion?: (qid: string) => void
+  /** Called when the user clicks the stop button in the header. The
+   *  parent POSTs to /api/sessions/:id/stop and optimistically clears
+   *  the thinking state. Only rendered when the session is actively
+   *  thinking (see `isThinking` below). */
+  onStop?: () => void
 }) {
   const [input, setInput] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const wasAtBottom = useRef(true)
+
+  // Whether the session is actively thinking — drives the stop button's
+  // visibility. The parent (App.tsx) derives this from the live activity
+  // stream + the optimistic `sending` flag and passes it down via the
+  // `sending` prop (true when the POST /send is in flight and no pending
+  // questions block the agent). We also check the selected agent's status
+  // for harness-driven thinking.
+  const isThinking = sending === true
 
   // Focus the message textarea on any user-initiated arrival at a session,
   // so the user can start typing immediately without an extra click.
@@ -2203,6 +2238,7 @@ export function ChatArea({
         })()}
         {messages.length > 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
+           {isThinking && onStop && <StopButton onStop={onStop} />}
             {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
@@ -2235,6 +2271,7 @@ export function ChatArea({
         )}
         {selectedSession && messages.length === 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
+           {isThinking && onStop && <StopButton onStop={onStop} />}
             <CopySessionIdButton sessionId={selectedSession.id} />
           </div>
         )}

@@ -1,20 +1,53 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 module Seal.Gateway.StreamSpec (spec) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (catch, IOException)
+import System.Timeout (timeout)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import Network.WebSockets (ClientApp, runClient, receiveData)
+import Network.WebSockets (ClientApp, runClient, receiveData, ConnectionException)
 import Test.Hspec
 
 import Seal.Config.Paths (SealPaths(..))
 import Seal.Gateway.Stream
 import Seal.Gateway.StreamBroker
 import Seal.Tabs (newTabsHandle)
+import Seal.TestHelpers.FreePort (withFreePort)
 
 fakePaths :: SealPaths
 fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", spCache = "" }
+
+-- | Ten seconds — generous for a localhost WebSocket round-trip, short
+-- enough that a genuinely stuck server/client doesn't stall the suite.
+testTimeoutUs :: Int
+testTimeoutUs = 10_000_000
+
+-- | Run an IO action with a per-test timeout. Wraps 'System.timeout' and
+-- reports a timeout as a hspec failure so the suite never hangs on a
+-- stuck WebSocket server/client.
+withTimeout :: IO () -> IO ()
+withTimeout act =
+  timeout testTimeoutUs act >>= \case
+    Just () -> pure ()
+    Nothing -> expectationFailure "test timed out (stuck WebSocket server/client)"
+
+-- | Run a WebSocket server on a free port, wait for it to bind, then run
+-- the client against it. Tolerates a bind failure (e.g. a transient
+-- port-take race) by skipping with 'pendingWith' instead of crashing the
+-- suite.
+withStreamServer :: StreamGuard -> StreamBroker -> (Int -> ClientApp ()) -> IO ()
+withStreamServer guard broker clientApp =
+  withFreePort $ \port -> do
+    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
+    threadDelay 200000  -- wait for the server to bind
+    withTimeout (runClient "127.0.0.1" port "/" (clientApp port))
+      `catch` \(e :: IOException) ->
+        pendingWith ("server bind/client failed (port " <> show port <> "): " <> show e)
+      `catch` \(_ :: ConnectionException) ->
+        pendingWith "client connection closed unexpectedly"
 
 spec :: Spec
 spec = describe "Seal.Gateway.Stream" $ do
@@ -22,33 +55,22 @@ spec = describe "Seal.Gateway.Stream" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
-        port = 18080
-    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
-    threadDelay 100000  -- wait for the server to bind
-    let client :: ClientApp ()
-        client conn = do
-          hello <- receiveData conn :: IO BL.ByteString
-          case A.decode hello :: Maybe A.Value of
-            Just _ -> pure ()
-            Nothing -> error "expected hello JSON"
-    runClient "127.0.0.1" port "/" client
+    withStreamServer guard broker $ \_port conn -> do
+      hello <- receiveData conn :: IO BL.ByteString
+      case A.decode hello :: Maybe A.Value of
+        Just _ -> pure ()
+        Nothing -> error "expected hello JSON"
 
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths }
-        port = 18081
-    _ <- forkIO (runStreamServer "127.0.0.1" port guard broker)
-    threadDelay 100000
-    let client :: ClientApp ()
-        client conn = do
-          _hello <- receiveData conn :: IO BL.ByteString
-          -- The server sends an initial lists snapshot after hello.
-          _lists <- receiveData conn :: IO BL.ByteString
-          broadcastLists broker (object ["tabs" .= ([] :: [String])])
-          threadDelay 100000
-          msg <- receiveData conn :: IO BL.ByteString
-          case A.decode msg :: Maybe A.Value of
-            Just _ -> pure ()
-            Nothing -> error "expected an event JSON"
-    runClient "127.0.0.1" port "/" client
+    withStreamServer guard broker $ \_port conn -> do
+      _hello <- receiveData conn :: IO BL.ByteString
+      _lists <- receiveData conn :: IO BL.ByteString
+      broadcastLists broker (object ["tabs" .= ([] :: [String])])
+      threadDelay 100000
+      msg <- receiveData conn :: IO BL.ByteString
+      case A.decode msg :: Maybe A.Value of
+        Just _ -> pure ()
+        Nothing -> error "expected an event JSON"

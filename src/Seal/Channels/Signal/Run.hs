@@ -35,12 +35,9 @@ import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
   , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (CommandAction (..), Registry, mkRegistry)
-import Seal.Command.Agent (agentCommandSpec)
-import Seal.Command.Session (sessionCommandSpec)
-import Seal.Command.Model (modelCommandSpec)
-import Seal.Command.Stop (stopCommandSpec)
-import Seal.Command.Tab (tabCommandSpec, terseGrammarSpec)
+import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
@@ -309,15 +306,25 @@ runSignalMain autonomy logger = do
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
-  let registry = mkRegistry
-        [ sessionCommandSpec sr
-        , modelCommandSpec pr sr
-        , agentCommandSpec (bAgentDefs backends) cfgPath
-        , channelCommandSpec channelRt
-        , tabCommandSpec paths tabsH (mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps))
-        , stopCommandSpec (cdAbortReg chanDeps) sr
-        , terseGrammarSpec
-        ]
+  let coreDeps = CoreCommandDeps
+        { ccdVault       = rt
+        , ccdProvider    = pr
+        , ccdSession     = sr
+        , ccdAgentDefs   = bAgentDefs backends
+        , ccdCfgPath     = cfgPath
+        , ccdPaths       = paths
+        , ccdTabs        = tabsH
+        , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
+        , ccdAbortReg    = cdAbortReg chanDeps
+        , ccdStopWriter  = mkStopTranscriptWriter paths (cdBroker chanDeps)
+        , ccdRepoReg     = repoRegH
+        , ccdRepoSeam    = Nothing
+        }
+      registry = mkRegistry
+        ( coreCommandSpecs coreDeps
+          <> [ channelCommandSpec channelRt
+             ]
+        )
   case resolveSignalConfig (rcSignal cfg) Nothing of
     Left err -> logIO logger ErrorS ("seal signal: " <> ls err)
     Right resolved -> runSignal chanDeps registry emptyChain tabsH resolved askReply

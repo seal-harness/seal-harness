@@ -28,6 +28,7 @@ import {
   answerQuestion,
   answerQuestionText,
   cancelQuestion,
+  stopSession,
   type SendResult,
   type NewTabResponse,
 } from './hooks/useApi'
@@ -334,7 +335,7 @@ export default function App() {
   const { sessions: sessionActivity } = useSessionActivityStream(currentSessionId, undefined, thinkingSessionIds)
   const entries = streamEntries
 
-  const { send, sending } = useSendMessage(currentSessionId, refresh)
+  const { send, sending, resetSending } = useSendMessage(currentSessionId, refresh)
 
   // ── Pending optimistic message + slash bubbles ────────────────────────
   const [pendingMessage, setPendingMessage] = useState<string | null>(null)
@@ -674,6 +675,19 @@ export default function App() {
     handleSendResult(r, seq)
   }, [send, entries.length, currentSessionId, archivedSessions, sessions, tabSessions, modelOverride, lastTranscriptModel, handleSendResult])
 
+  /** Stop the current session's in-flight turn. POSTs to the backend's
+   *  /api/sessions/:id/stop endpoint (sets the abort flag), then
+   *  optimistically clears the `sending` flag and the pending message so
+   *  the UI reverts to idle immediately. The backend's next harness-status
+   *  event will confirm the idle state via the activity stream. */
+  const handleStop = useCallback(() => {
+    if (!currentSessionId) return
+    resetSending()
+    setPendingMessage(null)
+    setPendingMessageModel(null)
+    void stopSession(currentSessionId)
+  }, [currentSessionId, resetSending])
+
   // ── Selection handlers ────────────────────────────────────────────────
   const handleSelectTab = useCallback((index: number) => {
     const id = `tab:${index}`
@@ -922,6 +936,7 @@ export default function App() {
               loading={loading}
               onSend={currentSessionId ? handleSend : undefined}
               sending={sending}
+              onStop={sessionIsThinking ? handleStop : undefined}
               tokensUsed={tokensUsed}
               sessionStart={selectedSession?.createdAt ?? null}
               agents={agents}

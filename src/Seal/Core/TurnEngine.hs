@@ -24,6 +24,8 @@ module Seal.Core.TurnEngine
   , buildStartWiring
   , buildWorker
   , loadChannelLabel
+  , broadcastNewEntries
+  , loadSessionMeta
   ) where
 
 import Control.Exception (bracket)

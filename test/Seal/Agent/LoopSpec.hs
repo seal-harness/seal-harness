@@ -41,7 +41,7 @@ import Seal.Types.Env (mkEnv)
 import Seal.Agent.Env
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.SourceControl.Clone (stubCloneDeps)
-import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
+import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag, setAbort)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -63,6 +63,20 @@ instance Provider ScriptProvider where
     rs <- readIORef ref
     case rs of
       (x:xs) -> writeIORef ref xs >> pure (Right x)
+      [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+
+-- | A provider that returns a scripted list of responses (one per call)
+-- and counts how many times it was called. Used to assert the loop does
+-- not recurse into a second LLM call after a mid-turn abort.
+newtype ScriptProviderCounting = ScriptProviderCounting (IORef Int, IORef [CompletionResponse])
+
+instance Provider ScriptProviderCounting where
+  listModels _ = pure (Right [])
+  complete (ScriptProviderCounting (countRef, scriptRef)) _ = do
+    modifyIORef' countRef (+ 1)
+    rs <- readIORef scriptRef
+    case rs of
+      (x:xs) -> writeIORef scriptRef xs >> pure (Right x)
       [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
 
 -- | A provider that always fails with a fixed error message.
@@ -1219,3 +1233,75 @@ spec = describe "Seal.Agent.Loop" $ do
       content <- readFile (fromJust logPath)
       content `shouldContain` "truncated"
       content `shouldContain` "continuation"
+
+  -- When a tool call is aborted mid-flight (the user clicked stop, set the
+  -- abort flag), the loop must terminate the turn immediately instead of
+  -- feeding the aborted tool result back to the LLM and continuing. Without
+  -- this guard the turn keeps running — the LLM emits a follow-up response
+  -- and the tab stays "thinking" until that response completes, so the
+  -- user-visible stop button appears to do nothing.
+  it "stops the turn when a tool call is aborted" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    providerCalls <- newIORef (0 :: Int)
+    -- A provider that counts calls. Script: first a tool call, then a
+    -- text "all done". If the abort guard works, only the first call
+    -- fires; the second is never consumed.
+    let script =
+          [ CompletionResponse
+              [CbToolUse (ToolCallId "t1") (OpName "SELFSTOP") (object [])]
+              StopToolUse
+              (Usage 0 0)
+          , CompletionResponse [CbText "all done"] StopEnd (Usage 0 0)
+          ]
+    scriptRef <- newIORef script
+    let countingScript = ScriptProviderCounting (providerCalls, scriptRef)
+    -- The tool sets the session's abort flag during its run (simulating the
+    -- /stop endpoint racing the in-flight tool call).
+    abortFlag <- newAbortFlag
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
+        selfStopOp = TrustedOpcode (OpName "SELFSTOP") Trusted "sets the abort flag"
+                        (object []) (object [])
+                        (const (Right ()))
+                        (\_ _ -> do
+                           liftIO (setAbort abortFlag)
+                           pure (OpResult [TrpText "stopped"] False Null))
+    (h, _) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider countingScript
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry [selfStopOp]
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnStop = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                , aeAbortFlag = abortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
+                }
+    runTestApp (runTurn env "hello")
+    -- The provider must be called exactly once (the tool-call turn). The
+    -- second scripted response ("all done") must NOT be consumed — the
+    -- abort guard terminates the loop before recursing into `go`.
+    providerCallCount <- readIORef providerCalls
+    providerCallCount `shouldBe` 1
+    -- The "(stopped)" message must be sent to the channel so the user
+    -- sees a clean stop.
+    sentMsgs <- readIORef sent
+    sentMsgs `shouldSatisfy` any ("(stopped)" `T.isInfixOf`)
+    -- The "all done" follow-up must NOT be sent.
+    sentMsgs `shouldSatisfy` not . any ("all done" `T.isInfixOf`)
