@@ -18,6 +18,4 @@ frontend/dist/
 
 # Stray session dirs from test runs (shouldn't be created, but safety net)
 sessions/
--e build.log
-test.log
-lint.log
+*.log
