@@ -10,16 +10,14 @@ import Network.HTTP.Client.TLS (newTlsManager)
 
 import Seal.Channel.Cli (Backends (..), newBackends, runCliTui)
 import Seal.Logging.Logger (SealLogger)
-import Seal.Command.Agent (agentCommandSpec)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
   , mkRealTelegramBotApi, mkRealVaultStore )
-import Seal.Command.Model (modelCommandSpec)
 import Seal.Command.New (NewDeps (..), newCommandSpec)
-import Seal.Command.Provider (ProviderRuntime (..), providerCommandSpec)
-import Seal.Command.Session (sessionCommandSpec)
-import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec)
+import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
@@ -43,8 +41,9 @@ import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle, insertTabH)
 import Seal.Tabs.Types (TabRef (..))
 import Seal.Handles.Tab (TabKind (..))
+import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
-import Seal.Vault.Commands (VaultRuntime (..), vaultCommandSpec)
+import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 
@@ -143,6 +142,7 @@ runTui autonomy logger = do
   -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
   askReply <- newAskReplyStore 0
   repoReg <- mkRepoRegistryHandle (reposFilePath paths)
+  abortReg <- newSessionAbortRegistry
   -- The /new command: mints a fresh session and inserts a new tab into
   -- the TabsHandle. The ndInsertTab closure reads the old sid from
   -- srActive BEFORE swapping, inserts a new tab bound to the new session,
@@ -165,17 +165,25 @@ runTui autonomy logger = do
         , ndSetupRepo = Nothing
         , ndRepoReg = Just repoReg
         }
-  let registry = mkRegistry
-        [ vaultCommandSpec rt
-        , providerCommandSpec pr
-        , sessionCommandSpec sr
-        , modelCommandSpec pr sr
-        , agentCommandSpec (bAgentDefs backends) cfgPath
-        , channelCommandSpec channelRt
-        , tabCommandSpec paths tabsH noTabCloseNotifier
-        , terseGrammarSpec
-        , newCommandSpec newDeps
-        ]
+  let coreDeps = CoreCommandDeps
+        { ccdVault       = rt
+        , ccdProvider    = pr
+        , ccdSession     = sr
+        , ccdAgentDefs   = bAgentDefs backends
+        , ccdCfgPath     = cfgPath
+        , ccdPaths       = paths
+        , ccdTabs        = tabsH
+        , ccdTabCloseNotifier = noTabCloseNotifier
+        , ccdAbortReg    = abortReg
+        , ccdRepoReg     = repoReg
+        , ccdRepoSeam    = Nothing
+        }
+      registry = mkRegistry
+        ( coreCommandSpecs coreDeps
+          <> [ channelCommandSpec channelRt
+             , newCommandSpec newDeps
+             ]
+        )
   harnessReg <- newHarnessRegistry
   tmuxRunner <- mkRealTmuxRunner
-  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner
+  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg

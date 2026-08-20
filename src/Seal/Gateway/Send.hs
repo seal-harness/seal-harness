@@ -45,6 +45,8 @@ import Seal.Channel.Cli
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
 import Seal.Command.Skill (skillCommandSpec)
+
+import Seal.Command.Stop (stopCommandSpecForSession)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
 import Seal.Core.TurnEngine
@@ -162,15 +164,18 @@ data SendDeps = SendDeps
     -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
   }
 
--- | Replace the @call@ and @skill@ specs in a registry with per-request
--- versions (W5: the call dispatcher closes over the request's explicit
--- 'SessionId' instead of reading the process-global @srActive@). The other
--- specs are reused as-is from the startup-built @sdRegistry@.
-replaceCallSkillSpecs :: Registry -> CommandSpec -> CommandSpec -> Registry
-replaceCallSkillSpecs baseReg skillSpec callSpec =
-  mkRegistry (filter notCallOrSkill (registrySpecs baseReg) <> [skillSpec, callSpec])
+-- | Replace the @call@, @skill@, and @stop@ specs in a registry with
+-- per-request versions (W5: the call/skill dispatcher closes over the
+-- request's explicit 'SessionId' instead of reading the process-global
+-- @srActive@; the stop spec likewise targets the request's session so a
+-- @\/stop@ typed in tab N aborts tab N, not whatever @srActive@ points
+-- at). The other specs are reused as-is from the startup-built
+-- @sdRegistry@.
+replaceCallSkillSpecs :: Registry -> CommandSpec -> CommandSpec -> CommandSpec -> Registry
+replaceCallSkillSpecs baseReg skillSpec callSpec stopSpec =
+  mkRegistry (filter notCallSkillOrStop (registrySpecs baseReg) <> [skillSpec, callSpec, stopSpec])
   where
-    notCallOrSkill s = let CommandName n = csName s in n `notElem` ["call", "skill"]
+    notCallSkillOrStop s = let CommandName n = csName s in n `notElem` ["call", "skill", "stop"]
 
 -- | Build a 'TurnDeps' from a 'SendDeps' (the web wiring). The unified turn
 -- adapter builder is the only place the web's 'SendDeps' shape meets the
@@ -402,6 +407,7 @@ runSlash deps meta fullLine = do
       perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
         (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)
         (callCommandSpec perRequestCallDispatcher)
+        (stopCommandSpecForSession (sdAbortReg deps) sid)
   -- Snapshot the active-session ref BEFORE the action runs. The web
   -- gateway is multi-session: @srActive@ is a process-global ref that
   -- points at whatever session the last @\/new@ (or session creation)
