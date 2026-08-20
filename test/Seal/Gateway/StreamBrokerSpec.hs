@@ -4,7 +4,9 @@ module Seal.Gateway.StreamBrokerSpec (spec) where
 import Data.Aeson (object, (.=))
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text qualified as T
+import Control.Concurrent.STM (TVar)
 import Control.Exception (Exception, throwIO)
+import Control.Monad (void)
 import Test.Hspec
 
 import Seal.Core.Types (mkSessionId, SessionId)
@@ -21,14 +23,18 @@ data DeadConnection = DeadConnection
 
 instance Exception DeadConnection
 
+-- | Subscribe with a no-op close action (tests don't need real WS close).
+subscribeTest :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO (TVar SessionId)
+subscribeTest broker sid sendfn = subscribe broker sid sendfn (pure ())
+
 spec :: Spec
 spec = describe "Seal.Gateway.StreamBroker" $ do
   it "broadcast fans events to subscribers filtered by session" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refB (e :))
     let entry = object ["id" .= ("e1" :: T.Text)]
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
     a <- readIORef refA
@@ -40,8 +46,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refB (e :))
     let snap = object ["tabs" .= ([] :: [T.Text])]
     broadcastLists broker snap
     a <- readIORef refA
@@ -53,8 +59,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 1
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))  -- over cap
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refB (e :))  -- over cap
     -- the first subscriber still works
     let entry = object ["id" .= ("e1" :: T.Text)]
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
@@ -70,7 +76,7 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     -- triggers depend on.
     broker <- newStreamBroker 10
     ref <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' ref (e :))
     let snap = object ["type" .= ("lists" :: T.Text), "tabs" .= ([] :: [T.Text])]
     broadcastLists broker snap
     events <- readIORef ref
@@ -82,8 +88,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
     refB <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refA (e :))
-    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refB (e :))
     let payload = object ["kind" .= ("harness-status" :: T.Text), "status" .= ("thinking" :: T.Text)]
     broadcast broker (BeActivity (mkSid "a") payload)
     a <- readIORef refA
@@ -103,8 +109,8 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
   it "broadcast swallows a throwing subscriber and does not propagate" $ do
     broker <- newStreamBroker 10
     refHealthy <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\_e -> throwIO DeadConnection)
-    _ <- subscribe broker (mkSid "a") (\e -> modifyIORef' refHealthy (e :))
+    void $ subscribeTest broker (mkSid "a") (\_e -> throwIO DeadConnection)
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refHealthy (e :))
     let entry = object ["id" .= ("e1" :: T.Text)]
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
     -- The healthy subscriber still received the event.
@@ -117,11 +123,24 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
   it "broadcast swallows a throwing subscriber for BeListsSnapshot (all-subscriber)" $ do
     broker <- newStreamBroker 10
     refHealthy <- newIORef ([] :: [BrokerEvent])
-    _ <- subscribe broker (mkSid "a") (\_e -> throwIO DeadConnection)
-    _ <- subscribe broker (mkSid "b") (\e -> modifyIORef' refHealthy (e :))
+    void $ subscribeTest broker (mkSid "a") (\_e -> throwIO DeadConnection)
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refHealthy (e :))
     let snap = object ["tabs" .= ([] :: [T.Text])]
     broadcastLists broker snap
     h <- readIORef refHealthy
     length h `shouldBe` 1
     count <- subscriberCount broker
     count `shouldBe` 1
+
+  it "broadcast calls subClose when a subscriber's send throws" $ do
+    -- When a subscriber is evicted (send threw), the broker should call
+    -- its subClose action so the WS connection is actively closed and the
+    -- client reconnects (rather than silently lingering as a zombie).
+    broker <- newStreamBroker 10
+    closedRef <- newIORef False
+    void $ subscribe broker (mkSid "a") (\_e -> throwIO DeadConnection)
+           (modifyIORef' closedRef (const True))
+    let entry = object ["id" .= ("e1" :: T.Text)]
+    broadcast broker (BeEntryRecorded (mkSid "a") entry)
+    closed <- readIORef closedRef
+    closed `shouldBe` True

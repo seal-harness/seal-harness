@@ -187,3 +187,98 @@ spec = describe "Seal.Skills.Backend" $ do
         doesFileExist (skillsDir </> "core" </> "del.md") `shouldReturn` True
         sbDelete backend sid
         doesFileExist (skillsDir </> "core" </> "del.md") `shouldReturn` False
+
+  describe "markdownSkillBackend agentskills.io auto-detection" $ do
+    -- A skill in agentskills.io format: <name>/SKILL.md with `name` +
+    -- `description` frontmatter. The user store should auto-detect these
+    -- alongside the native flat/grouped .md layout, deriving the skill id
+    -- from the `name` field (per the agentskills.io spec, name must match the
+    -- parent directory name).
+    let agentSkillMd name desc body =
+          "---\nname: " <> name <> "\ndescription: " <> desc <> "\n---\n\n" <> body <> "\n"
+
+    it "lists a top-level <name>/SKILL.md skill (ungrouped)" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (skillsDir </> "pdf-processing")
+        TIO.writeFile (skillsDir </> "pdf-processing" </> "SKILL.md")
+          (agentSkillMd "pdf-processing" "Extract PDF text." "Do the thing.")
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        skills <- sbList backend
+        case [ s | s <- skills, skillIdText (skId s) == "pdf-processing" ] of
+          [s] -> do
+            skDescription s `shouldBe` "Extract PDF text."
+            skBody s `shouldBe` "Do the thing."
+            skGroup s `shouldBe` Nothing
+          _   -> expectationFailure "agentskills.io skill not listed"
+
+    it "lists a <group>/<name>/SKILL.md skill, stamped with the group" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (skillsDir </> "core" </> "my-skill")
+        TIO.writeFile (skillsDir </> "core" </> "my-skill" </> "SKILL.md")
+          (agentSkillMd "my-skill" "A grouped agent skill." "Body here.")
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        skills <- sbList backend
+        case [ s | s <- skills, skillIdText (skId s) == "my-skill" ] of
+          [s] -> do
+            skDescription s `shouldBe` "A grouped agent skill."
+            skBody s `shouldBe` "Body here."
+            skGroup s `shouldBe` Just "core"
+          _   -> expectationFailure "grouped agentskills.io skill not listed"
+
+    it "reads a single agentskills.io skill by id via sbRead" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (skillsDir </> "code-review")
+        TIO.writeFile (skillsDir </> "code-review" </> "SKILL.md")
+          (agentSkillMd "code-review" "Review code." "Instructions.")
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        m <- sbRead backend (case mkSkillId "code-review" of Right i -> i; Left _ -> sampleSkillId)
+        case m of
+          Just s  -> do
+            skDescription s `shouldBe` "Review code."
+            skBody s `shouldBe` "Instructions."
+          Nothing -> expectationFailure "agentskills.io skill not read back"
+
+    it "skips an agentskills.io skill whose name fails mkSkillId" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        -- '.' is not in mkSkillId's charset, so the name fails validation
+        createDirectoryIfMissing True (skillsDir </> "bad.name")
+        TIO.writeFile (skillsDir </> "bad.name" </> "SKILL.md")
+          (agentSkillMd "bad.name" "Bad name." "Body.")
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        skills <- sbList backend
+        case [ s | s <- skills, skillIdText (skId s) == "bad.name" ] of
+          []  -> pure ()
+          _   -> expectationFailure "invalid-name agentskills.io skill should be skipped"
+
+    it "still lists native flat .md files alongside agentskills.io skills" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        -- native flat
+        let native = "---\nid: native-flat\ndescription: a native skill.\n\
+                     \created_at: 2026-07-05T00:00:00Z\n\
+                     \updated_at: 2026-07-05T00:00:00Z\n\
+                     \session: manual\n---\n\nnative body\n"
+        TIO.writeFile (skillsDir </> "native-flat.md") native
+        -- agentskills.io
+        createDirectoryIfMissing True (skillsDir </> "agent-dir")
+        TIO.writeFile (skillsDir </> "agent-dir" </> "SKILL.md")
+          (agentSkillMd "agent-dir" "An agent skill." "agent body")
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        skills <- sbList backend
+        let ids = map (skillIdText . skId) skills
+        "native-flat" `elem` ids `shouldBe` True
+        "agent-dir"   `elem` ids `shouldBe` True

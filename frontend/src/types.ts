@@ -246,6 +246,7 @@ export interface AgentDefInput {
 export interface SkillInfo {
   id: string
   description: string
+  group: string | null
   body: string
   created_at: string
   updated_at: string
@@ -258,6 +259,7 @@ export interface SkillInfo {
 export interface SkillInput {
   id?: string
   new_id?: string
+  group?: string | null
   description?: string
   body?: string
 }
