@@ -100,6 +100,73 @@ function groupSkills(skills: SkillInfo[]): SkillGroup[] {
   return groups
 }
 
+// ── Collapsible group section ────────────────────────────────────────────
+
+/** A collapsible group of skills in the list pane.  Starts expanded; the
+ *  header shows the group label + count and a ▾/▸ indicator.  Clicking the
+ *  header toggles expansion.  Auto-expands when the currently-edited skill
+ *  is inside this group so the selection is never hidden behind a
+ *  collapsed header (mirrors the RunningHarnesses auto-expand pattern). */
+function SkillGroupSection({
+  group,
+  editingId,
+  creating,
+  confirmingDelete,
+  onSelectSkill,
+}: {
+  group: SkillGroup
+  editingId: string | null
+  creating: boolean
+  confirmingDelete: string | null
+  onSelectSkill: (id: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+
+  return (
+    <div data-testid={`skill-group-${group.label}`}>
+      <div
+        className="px-3 pt-2 pb-1 flex items-center justify-between cursor-pointer"
+        style={{ color: 'var(--text-faint)', letterSpacing: '0.06em' }}
+        data-testid={`skill-group-header-${group.label}`}
+        onClick={() => setExpanded((e) => !e)}
+      >
+        <span className="text-xs font-semibold uppercase">
+          {group.label} ({group.skills.length})
+        </span>
+        <span data-testid={`skill-group-collapse-${group.label}`} style={{ fontSize: 12 }}>
+          {expanded ? '▾' : '▸'}
+        </span>
+      </div>
+      {expanded && group.skills.map((s) => {
+        const isActive = (creating ? false : editingId === s.id) && !confirmingDelete
+        return (
+          <div
+            key={s.id}
+            data-testid={`skill-row-${s.id}`}
+            className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
+            onClick={() => onSelectSkill(s.id)}
+          >
+            <div
+              className="text-sm truncate"
+              style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
+              title={s.id}
+            >
+              {s.id}
+            </div>
+            <div
+              className="text-xs mt-0.5 truncate"
+              style={{ color: 'var(--text-faint)' }}
+              title={s.description}
+            >
+              {s.description}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── Component ───────────────────────────────────────────────────────────
 
 /** The Skills CRUD view. Lists every skill on the left; the right pane is
@@ -109,7 +176,9 @@ function groupSkills(skills: SkillInfo[]): SkillGroup[] {
  *
  *  Skills are grouped in the list pane by their `group` field, mirroring
  *  the on-disk directory layout (config/skills/<group>/<id>.md). Ungrouped
- *  skills appear under a "Skills" heading. */
+ *  skills appear under a "Skills" heading. Each group is independently
+ *  collapsible (click the header to toggle), following the same pattern as
+ *  the Archived section in the Sessions sidebar. */
 export function SkillsView() {
   const { skills, loaded, error, refresh } = useSkills()
 
@@ -228,6 +297,12 @@ export function SkillsView() {
     setFormError(null)
   }
 
+  const handleSelectSkill = (id: string) => {
+    if (confirmingDelete === id) setConfirmingDelete(null)
+    setCreating(false)
+    setEditing(id)
+  }
+
   return (
     <div className="flex flex-1 min-h-0" style={{ background: 'var(--bg-base)' }}>
       {/* List pane */}
@@ -272,45 +347,14 @@ export function SkillsView() {
             </div>
           )}
           {grouped.map((grp) => (
-            <div key={grp.label}>
-              <div
-                className="px-3 pt-2 pb-1 text-xs font-semibold uppercase"
-                style={{ color: 'var(--text-faint)', letterSpacing: '0.06em' }}
-                data-testid={`skill-group-header-${grp.label}`}
-              >
-                {grp.label}
-              </div>
-              {grp.skills.map((s) => {
-                const isActive = (creating ? false : editing === s.id) && !confirmingDelete
-                return (
-                  <div
-                    key={s.id}
-                    data-testid={`skill-row-${s.id}`}
-                    className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
-                    onClick={() => {
-                      if (confirmingDelete === s.id) setConfirmingDelete(null)
-                      setCreating(false)
-                      setEditing(s.id)
-                    }}
-                  >
-                    <div
-                      className="text-sm truncate"
-                      style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
-                      title={s.id}
-                    >
-                      {s.id}
-                    </div>
-                    <div
-                      className="text-xs mt-0.5 truncate"
-                      style={{ color: 'var(--text-faint)' }}
-                      title={s.description}
-                    >
-                      {s.description}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
+            <SkillGroupSection
+              key={grp.label}
+              group={grp}
+              editingId={editing}
+              creating={creating}
+              confirmingDelete={confirmingDelete}
+              onSelectSkill={handleSelectSkill}
+            />
           ))}
         </div>
       </div>

@@ -96,6 +96,69 @@ describe('SkillsView', () => {
     expect(screen.getByTestId('skill-row-reviewer')).toBeTruthy()
   })
 
+  it('collapses a group when its header is clicked', () => {
+    skillsState = [
+      makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
+      makeSkill({ id: 'haskell-coder', description: 'Haskell', group: 'core' }),
+      makeSkill({ id: 'coding', description: 'Coding', group: null }),
+    ]
+    render(<SkillsView />)
+    // Skills in the "core" group are visible initially
+    expect(screen.getByTestId('skill-row-seal-usage')).toBeTruthy()
+    expect(screen.getByTestId('skill-row-haskell-coder')).toBeTruthy()
+    // Click the header to collapse
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    // The rows are now hidden
+    expect(screen.queryByTestId('skill-row-seal-usage')).toBeNull()
+    expect(screen.queryByTestId('skill-row-haskell-coder')).toBeNull()
+    // The "Skills" (ungrouped) group is still expanded
+    expect(screen.getByTestId('skill-row-coding')).toBeTruthy()
+  })
+
+  it('expands a collapsed group when its header is clicked again', () => {
+    skillsState = [
+      makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
+      makeSkill({ id: 'coding', description: 'Coding', group: null }),
+    ]
+    render(<SkillsView />)
+    // Collapse
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    expect(screen.queryByTestId('skill-row-seal-usage')).toBeNull()
+    // Expand
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    expect(screen.getByTestId('skill-row-seal-usage')).toBeTruthy()
+  })
+
+  it('shows the collapse indicator (▾ expanded / ▸ collapsed)', () => {
+    skillsState = [
+      makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
+    ]
+    render(<SkillsView />)
+    // Initially expanded
+    expect(screen.getByTestId('skill-group-collapse-core').textContent).toBe('▾')
+    // Collapse
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    expect(screen.getByTestId('skill-group-collapse-core').textContent).toBe('▸')
+    // Expand
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    expect(screen.getByTestId('skill-group-collapse-core').textContent).toBe('▾')
+  })
+
+  it('collapsing one group does not affect other groups', () => {
+    skillsState = [
+      makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
+      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'metaswarm' }),
+      makeSkill({ id: 'coding', description: 'Coding', group: null }),
+    ]
+    render(<SkillsView />)
+    // Collapse core
+    fireEvent.click(screen.getByTestId('skill-group-header-core'))
+    expect(screen.queryByTestId('skill-row-seal-usage')).toBeNull()
+    // metaswarm and Skills are still expanded
+    expect(screen.getByTestId('skill-row-reviewer')).toBeTruthy()
+    expect(screen.getByTestId('skill-row-coding')).toBeTruthy()
+  })
+
   it('shows the load error banner when error=true', () => {
     skillsError = true
     render(<SkillsView />)
