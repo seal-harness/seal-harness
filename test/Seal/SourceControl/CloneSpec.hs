@@ -22,6 +22,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
 import Data.IORef
+import Data.Either (isRight)
 import Data.Maybe (isJust)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.List (isPrefixOf, tails)
@@ -96,7 +97,23 @@ spec = describe "Seal.SourceControl.Clone" $ do
       planClone (deployRepo "git@github.com:owner/repo.git")
         `shouldBe` Right (ClonePlanSshKey "git@github.com:owner/repo.git" "GITHUB_DEPLOYKEY")
 
-    it "disallowed host → CloneHostNotSupported" $
+    it "VcsGit + PAT → CloneUnsupportedVcs (no HTTPS injection path for plain git)" $
+      let r = SourceRepo rid "git@github.com:o/r.git" VcsGit (CredPat "K") Nothing Nothing
+      in planClone r `shouldBe` Left (CloneUnsupportedVcs VcsGit)
+
+    it "VcsGit + MachineUser → CloneUnsupportedVcs" $
+      let r = SourceRepo rid "git@github.com:o/r.git" VcsGit (CredMachineUser "K" "bot") Nothing Nothing
+      in planClone r `shouldBe` Left (CloneUnsupportedVcs VcsGit)
+
+    it "VcsGit + DeployKey → ClonePlanSshKey (operator's own git server over SSH)" $
+      let r = SourceRepo rid "ssh://zoe@neb-arrakis:zoe.git" VcsGit (CredDeployKey "K") Nothing Nothing
+      in planClone r `shouldBe` Right (ClonePlanSshKey "ssh://zoe@neb-arrakis:zoe.git" "K")
+
+    it "VcsGit + DeployKey + scp-form URL → ClonePlanSshKey" $
+      let r = SourceRepo rid "git@neb-arrakis:zoe.git" VcsGit (CredDeployKey "K") Nothing Nothing
+      in planClone r `shouldBe` Right (ClonePlanSshKey "git@neb-arrakis:zoe.git" "K")
+
+    it "VcsGitHub + disallowed host → CloneHostNotSupported" $
       planClone (patRepo "git@evil.com:owner/repo.git")
         `shouldBe` Left (CloneHostNotSupported "evil.com")
 
@@ -104,9 +121,9 @@ spec = describe "Seal.SourceControl.Clone" $ do
       planClone (patRepo "not-a-url")
         `shouldBe` Left (CloneNoCredentialForUrl "not-a-url")
 
-    it "VcsGit (non-github) → CloneUnsupportedVcs VcsGit" $
-      let r = SourceRepo rid "git@github.com:o/r.git" VcsGit (CredPat "K") Nothing Nothing
-      in planClone r `shouldBe` Left (CloneUnsupportedVcs VcsGit)
+    it "VcsGit + any host → not CloneHostNotSupported (git repos allow any host)" $
+      let r = SourceRepo rid "ssh://zoe@192.168.80.201:zoe.git" VcsGit (CredDeployKey "K") Nothing Nothing
+      in planClone r `shouldSatisfy` isRight
 
     it "already-https URL with PAT → ClonePlanExtraHeader same https-url" $
       planClone (patRepo "https://github.com/owner/repo.git")

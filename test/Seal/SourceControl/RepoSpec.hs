@@ -257,14 +257,35 @@ spec = describe "Seal.SourceControl.Repo" $ do
     it "rejects an scp-form URL missing the colon" $
       parseRepoHost "git@github.com-owner/repo.git" `shouldSatisfy` isLeft
 
+    it "parses an ssh:// GitHub URL" $
+      parseRepoHost "ssh://git@github.com/seal-harness/seal-harness.git" `shouldBe` Right "github.com"
+
+    it "parses an ssh:// URL without a user@" $
+      parseRepoHost "ssh://github.com/seal-harness/seal-harness.git" `shouldBe` Right "github.com"
+
+    it "parses an ssh:// URL with a port" $
+      parseRepoHost "ssh://git@github.com:2222/seal-harness/seal-harness.git" `shouldBe` Right "github.com"
+
+    it "rejects an ssh:// URL with no host" $
+      parseRepoHost "ssh:///path/to/repo" `shouldSatisfy` isLeft
+
   describe "hostAllowed" $ do
-    it "allows github.com" $
-      hostAllowed "github.com" `shouldBe` True
+    it "allows github.com for github repos" $
+      hostAllowed VcsGitHub "github.com" `shouldBe` True
 
-    it "rejects an unknown host" $
-      hostAllowed "evil.example.org" `shouldBe` False
+    it "rejects an unknown host for github repos" $
+      hostAllowed VcsGitHub "evil.example.org" `shouldBe` False
 
-    it "githubHosts is the GitHub-first allow-list" $
+    it "allows any host for git repos" $ do
+      hostAllowed VcsGit "evil.example.org" `shouldBe` True
+      hostAllowed VcsGit "192.168.80.201" `shouldBe` True
+      hostAllowed VcsGit "neb-arrakis" `shouldBe` True
+
+    it "isGithubHost identifies GitHub hosts" $ do
+      isGithubHost "github.com" `shouldBe` True
+      isGithubHost "evil.example.org" `shouldBe` False
+
+    it "githubHosts is the GitHub allow-list" $
       githubHosts `shouldBe` ["github.com"]
 
   describe "urlShapeValid" $ do
@@ -273,6 +294,12 @@ spec = describe "Seal.SourceControl.Repo" $ do
 
     it "accepts an HTTPS GitHub URL" $
       urlShapeValid "https://github.com/owner/repo.git" `shouldBe` True
+
+    it "accepts an ssh:// URL" $
+      urlShapeValid "ssh://git@github.com/owner/repo.git" `shouldBe` True
+
+    it "accepts an ssh:// URL without user@" $
+      urlShapeValid "ssh://github.com/owner/repo.git" `shouldBe` True
 
     it "rejects an empty URL" $
       urlShapeValid "" `shouldBe` False
@@ -284,13 +311,17 @@ spec = describe "Seal.SourceControl.Repo" $ do
       \(NonEmptyText' owner) (NonEmptyText' repo) ->
         let ssh    = "git@github.com:" <> owner <> "/" <> repo <> ".git"
             https  = "https://github.com/" <> owner <> "/" <> repo <> ".git"
+            sshScheme = "ssh://git@github.com/" <> owner <> "/" <> repo <> ".git"
         in conjoin
              [ parseRepoHost ssh   === Right "github.com"
-             , hostAllowed (fromRight' (parseRepoHost ssh)) === True
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost ssh)) === True
              , urlShapeValid ssh === True
              , parseRepoHost https === Right "github.com"
-             , hostAllowed (fromRight' (parseRepoHost https)) === True
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost https)) === True
              , urlShapeValid https === True
+             , parseRepoHost sshScheme === Right "github.com"
+             , hostAllowed VcsGitHub (fromRight' (parseRepoHost sshScheme)) === True
+             , urlShapeValid sshScheme === True
              ]
 
   --------------------------------------------------------------------------

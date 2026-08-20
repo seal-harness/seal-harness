@@ -114,7 +114,7 @@ idArg = T.pack <$> strArgument (metavar "ID" <> help "Repo id (e.g. myrepo)")
 
 -- | Required repo URL argument.
 urlArg :: Parser Text
-urlArg = T.pack <$> strArgument (metavar "URL" <> help "Repo URL (git@github.com:owner/repo.git or https://github.com/owner/repo.git)")
+urlArg = T.pack <$> strArgument (metavar "URL" <> help "Repo URL (git@github.com:owner/repo.git, ssh://host/path, or https://github.com/owner/repo.git)")
 
 -- | @--vcs@ option (default @github@).
 vcsOpt :: Parser Text
@@ -212,11 +212,11 @@ validateAdd rawId url rawVcs rawCred vaultKey mUsername = do
   vcs       <- parseVcsKind rawVcs
   -- URL shape (defense in depth on top of host allow-list).
   if not (urlShapeValid url)
-    then Left "URL is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+    then Left "URL is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
     else do
       host <- parseRepoHost url
-      if not (hostAllowed host)
-        then Left ("host " <> host <> " not supported (only github.com is supported in this pass)")
+      if not (hostAllowed vcs host)
+        then Left ("host " <> host <> " not supported (github repos must use github.com; git repos allow any host)")
         else do
           cred <- parseCredentialKind rawCred vaultKey mUsername
           Right SourceRepo
@@ -337,7 +337,7 @@ renderRepoTestError = \case
   CloneUnsupportedVcs v ->
     "unsupported VCS: " <> vcsKindText v
   CloneHostNotSupported h ->
-    "host " <> h <> " not supported (only github.com is supported in this pass)"
+    "host " <> h <> " not supported (github repos must use github.com; git repos allow any host)"
   CloneGitFailed n ->
     "git ls-remote failed (exit " <> T.pack (show n) <> ")"
   CloneAgentError msg ->

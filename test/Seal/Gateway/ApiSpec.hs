@@ -2485,11 +2485,25 @@ spec = describe "Seal.Gateway.API" $ do
           (A.encode (A.object
             [ "id"       .= ("r4" :: T.Text)
             , "url"      .= ("git@evil.com:owner/repo.git" :: T.Text)
-            , "vcs_kind" .= ("git" :: T.Text)
+            , "vcs_kind" .= ("github" :: T.Text)
             , "credential" .= A.object [ "kind" .= ("pat" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
             ]))
         status <- runAppStatus app req
         status `shouldBe` 400
+
+    it "POST /api/repos with a git-kind repo and non-github host succeeds (any host allowed)" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        deps <- mkRepoApp tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("r4b" :: T.Text)
+            , "url"      .= ("ssh://zoe@neb-arrakis:zoe.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object [ "kind" .= ("deploy_key" :: T.Text), "vault_key" .= ("k" :: T.Text) ]
+            ]))
+        status <- runAppStatus app req
+        status `shouldBe` 201
 
     it "POST /api/repos with an unknown credential.kind returns 400" $
       withSystemTempDirectory "seal-repos" $ \tmp -> do

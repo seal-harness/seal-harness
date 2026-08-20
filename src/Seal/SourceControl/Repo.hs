@@ -32,6 +32,7 @@ module Seal.SourceControl.Repo
   , lookupRepoByUrl
   , parseRepoHost
   , hostAllowed
+  , isGithubHost
   , urlShapeValid
   , githubHosts
   , repoCredentialKindText
@@ -341,14 +342,29 @@ normalizeReposTable t =
 -- URL helpers (pure — used by planClone in W3 + REST/slash validation in W4/W5)
 ----------------------------------------------------------------------------
 
--- | The GitHub-first host allow-list. This pass restricts clones to
--- @github.com@; a per-credential @cHost@ may widen this in a follow-up.
+-- | The GitHub host allow-list. Repos with 'VcsKind' @github@ are
+-- restricted to hosts in this list (defense-in-depth against the
+-- credential-exfiltration threat in design §5.3 — an attacker who poisons
+-- a @github@-kind registry entry can only send the vault credential to a
+-- host in this list). Repos with 'VcsKind' @git@ are /not/ restricted to
+-- this list: a @git@-kind repo uses SSH (deploy key) and the host is the
+-- operator's own server (frequently an @~/.ssh/config@ alias), so an
+-- allow-list of known-public hosts would be wrong.
 githubHosts :: [Text]
 githubHosts = ["github.com"]
 
--- | Is the parsed host in 'githubHosts'?
-hostAllowed :: Text -> Bool
-hostAllowed h = h `elem` githubHosts
+-- | Is the parsed host a GitHub host (in 'githubHosts')?
+isGithubHost :: Text -> Bool
+isGithubHost h = h `elem` githubHosts
+
+-- | Is the parsed host allowed for the given 'VcsKind'?
+--
+-- * @github@ → the host must be in 'githubHosts' (the allow-list).
+-- * @git@ → any host is allowed (the operator's own git server, often an
+--   @~/.ssh/config@ alias).
+hostAllowed :: VcsKind -> Text -> Bool
+hostAllowed VcsGitHub h = isGithubHost h
+hostAllowed VcsGit    _ = True
 
 -- | Parse the host from an SSH (@git@github.com:owner\/repo.git@) or HTTPS
 -- (@https://github.com/owner/repo.git@) URL. Returns @Left@ with a clear
@@ -361,7 +377,8 @@ parseRepoHost url
   | "git@" `T.isPrefixOf` url = parseSsh
   | "https://" `T.isPrefixOf` url = parseHttps
   | "http://" `T.isPrefixOf` url = parseHttps
-  | otherwise = Left "URL is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+  | "ssh://" `T.isPrefixOf` url = parseSshScheme
+  | otherwise = Left "URL is neither SSH (git@<host>:... or ssh://<host>/...) nor HTTPS (https://<host>/...)"
   where
     parseSsh :: Either Text Text
     parseSsh =
@@ -372,6 +389,20 @@ parseRepoHost url
              | T.null host -> Left "empty host in scp-form URL"
              | otherwise   -> Right host
 
+    -- | Parse an @ssh:\/\/[user\@]host[:port]\/path@ URL. Strip the scheme,
+    -- strip an optional @user\@@, then take the host up to the first @\/@,
+    -- @:@ (port), @?@, or @#@.
+    parseSshScheme :: Either Text Text
+    parseSshScheme =
+      let afterScheme = T.drop (T.length "ssh://") url
+          afterUser = case T.breakOn "@" afterScheme of
+            (_, rest) | not (T.null rest) -> T.drop 1 rest
+            _ -> afterScheme
+          host = T.takeWhile (\c -> c /= '/' && c /= ':' && c /= '?' && c /= '#') afterUser
+      in if T.null host
+           then Left "empty host in ssh:// URL"
+           else Right host
+
     parseHttps :: Either Text Text
     parseHttps =
       let rest = fromMaybe url (T.stripPrefix "https://" url <|> T.stripPrefix "http://" url)
@@ -380,12 +411,12 @@ parseRepoHost url
            then Left "empty host in HTTPS URL"
            else Right host
 
--- | True iff the URL is non-empty AND matches one of the two supported shapes
--- (SSH @git\@\<host\>:...@ or HTTPS @https://\<host\>/...@).
+-- | True iff the URL is non-empty AND matches one of the supported shapes
+-- (SSH @git\@\<host\>:...@ or @ssh:\/\/...@, or HTTPS @https://\<host\>/...@).
 urlShapeValid :: Text -> Bool
 urlShapeValid url = not (T.null url) && (isSsh url || isHttps url)
   where
-    isSsh u   = "git@" `T.isPrefixOf` u && T.isInfixOf ":" u
+    isSsh u   = ("git@" `T.isPrefixOf` u && T.isInfixOf ":" u) || "ssh://" `T.isPrefixOf` u
     isHttps u = "https://" `T.isPrefixOf` u || "http://" `T.isPrefixOf` u
 
 ----------------------------------------------------------------------------
