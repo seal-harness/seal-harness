@@ -396,7 +396,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         broker <- newStreamBroker 10
         eventsRef <- newIORef ([] :: [BrokerEvent])
-        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :))
+        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :)) (pure ())
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
             sid = mkSid "20260701-130000-201"
         seedSession paths sid
@@ -432,7 +432,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         broker <- newStreamBroker 10
         eventsRef <- newIORef ([] :: [BrokerEvent])
-        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :))
+        _ <- subscribe broker (mkSid "any") (\e -> modifyIORef' eventsRef (e :)) (pure ())
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
             sid = mkSid "20260701-130000-202"
         seedSession paths sid

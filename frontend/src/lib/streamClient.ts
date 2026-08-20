@@ -9,6 +9,12 @@
  * with the most recent entry id as `since` on reconnect so the server can
  * replay missed entries.
  *
+ * A heartbeat watchdog force-closes and reconnects when no message (data
+ * frame or server ping) arrives within HEARTBEAT_TIMEOUT_MS. The server
+ * sends pings every 30s, so 90s of silence means the connection is dead
+ * (half-open NAT, sleep/wake, etc.) — the browser won't detect this on
+ * its own.
+ *
  * Exposes `createStreamClient(url)` as a factory for tests so each test can
  * spin up a fresh instance; production uses the `streamClient()` singleton.
  */
@@ -26,6 +32,7 @@ import type { TranscriptEntry } from '../types'
 
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
+const HEARTBEAT_TIMEOUT_MS = 90_000
 // Exponent ceiling for the backoff calc. Past this the delay is already
 // pinned at RECONNECT_MAX_MS, and it keeps `reconnectAttempt` from feeding
 // an unbounded value into Math.pow during a very long outage.
@@ -45,6 +52,7 @@ class StreamClientImpl implements StreamClient {
   private _lastServerStartedAt: string | null = null
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null
   private closedByUser = false
   private _lastError: string | null = null
   private statusListeners = new Set<(s: StreamStatus) => void>()
@@ -165,6 +173,10 @@ class StreamClientImpl implements StreamClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    if (this.heartbeatTimer !== null) {
+      clearTimeout(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
     if (this.ws !== null) {
       try {
         this.ws.close(1000, 'client closed')
@@ -204,6 +216,7 @@ class StreamClientImpl implements StreamClient {
 
   private handleOpen(): void {
     this.setStatus('live')
+    this.resetHeartbeat()
     if (this.focusState.kind === 'focused') {
       const since =
         this.lastEntryId !== null && this.focusState.sessionId !== null
@@ -245,6 +258,7 @@ class StreamClientImpl implements StreamClient {
   }
 
   private handleMessage(ev: MessageEvent): void {
+    this.resetHeartbeat()
     let parsed: unknown
     try {
       parsed = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data))
@@ -334,6 +348,10 @@ class StreamClientImpl implements StreamClient {
   }
 
   private handleClose(ev: CloseEvent): void {
+    if (this.heartbeatTimer !== null) {
+      clearTimeout(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
     if (this.closedByUser) {
       this.setStatus('closed')
       return
@@ -370,6 +388,27 @@ class StreamClientImpl implements StreamClient {
     if (this._status === s) return
     this._status = s
     for (const cb of this.statusListeners) cb(s)
+  }
+
+  /** Reset the heartbeat watchdog. Called on every received message (data
+   *  frame or ping). If no message arrives within HEARTBEAT_TIMEOUT_MS,
+   *  the connection is considered dead and force-closed so reconnect fires. */
+  private resetHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearTimeout(this.heartbeatTimer)
+    }
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null
+      if (this.closedByUser) return
+      // The server's 30s ping should keep this from firing. 90s of silence
+      // means the connection is half-open (NAT timeout, sleep/wake, etc.)
+      // and the browser hasn't noticed. Force-close so onclose fires and
+      // the reconnect logic kicks in.
+      this._lastError = 'heartbeat timeout — connection appears dead'
+      if (this.ws !== null) {
+        try { this.ws.close(4000, 'heartbeat timeout') } catch { /* ignore */ }
+      }
+    }, HEARTBEAT_TIMEOUT_MS)
   }
 }
 

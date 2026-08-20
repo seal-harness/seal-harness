@@ -202,4 +202,53 @@ describe('streamClient', () => {
     ref.socket!.simulateClose(1006, '', false)
     expect(statuses).toEqual(['live', 'reconnecting'])
   })
+
+  it('force-closes and reconnects when the heartbeat times out (no messages for 90s)', async () => {
+    ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+    // Advance time past the heartbeat timeout (90s). No messages have
+    // arrived, so the watchdog fires and force-closes the socket.
+    vi.advanceTimersByTime(90_001)
+    await Promise.resolve()
+    expect(client.status).toBe('reconnecting')
+    // A new socket should be created by the reconnect logic.
+    vi.advanceTimersByTime(300)
+    expect(ref.instances).toHaveLength(2)
+    ref.socket!.simulateOpen()
+    expect(client.status).toBe('live')
+  })
+
+  it('heartbeat watchdog is reset by incoming messages', async () => {
+    ref.socket!.simulateOpen()
+    // Send a message at 60s — resets the watchdog.
+    vi.advanceTimersByTime(60_000)
+    ref.socket!.simulateMessage({ type: 'lists', tabs: [], recentSessions: [], archivedSessions: [], tabSessions: [] })
+    // Advance another 60s (total 120s from open, but only 60s since the
+    // last message) — the watchdog should NOT have fired yet.
+    vi.advanceTimersByTime(60_000)
+    expect(client.status).toBe('live')
+    // Advance past the remaining 30s+1 — now it fires.
+    vi.advanceTimersByTime(31_000)
+    await Promise.resolve()
+    expect(client.status).toBe('reconnecting')
+  })
+
+  it('transitions from replaying to live on replay-end event', () => {
+    ref.socket!.simulateOpen()
+    client.focus('sess-1', 'entry-3')
+    expect(client.status).toBe('replaying')
+    // Server sends replay-end after replaying missed entries.
+    ref.socket!.simulateMessage({ type: 'replay-end', sessionId: 'sess-1', lastReplayedEntryId: 'entry-7' })
+    expect(client.status).toBe('live')
+    // lastEntryId should be updated to the last replayed entry id.
+    expect((client as StreamClient & { lastEntryId: string | null }).lastEntryId).toBe('entry-7')
+  })
+
+  it('handles replay-end with null lastReplayedEntryId (no entries to replay)', () => {
+    ref.socket!.simulateOpen()
+    client.focus('sess-1', 'entry-99')
+    expect(client.status).toBe('replaying')
+    ref.socket!.simulateMessage({ type: 'replay-end', sessionId: 'sess-1', lastReplayedEntryId: null })
+    expect(client.status).toBe('live')
+  })
 })
