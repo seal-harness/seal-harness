@@ -32,6 +32,7 @@ function makeSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
     id: 'coding',
     description: 'Coding skill',
     body: '## Coding\n\nWrite code carefully.',
+    group: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     session: 'web',
@@ -75,6 +76,26 @@ describe('SkillsView', () => {
     expect(screen.getByTestId('skill-row-writer')).toBeTruthy()
   })
 
+  it('groups skills by group field with headers', () => {
+    skillsState = [
+      makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
+      makeSkill({ id: 'coding', description: 'Coding', group: null }),
+      makeSkill({ id: 'haskell-coder', description: 'Haskell', group: 'core' }),
+      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'metaswarm' }),
+    ]
+    render(<SkillsView />)
+    // Ungrouped skills appear under "Skills" header
+    expect(screen.getByTestId('skill-group-header-Skills')).toBeTruthy()
+    // Named groups get their own headers
+    expect(screen.getByTestId('skill-group-header-core')).toBeTruthy()
+    expect(screen.getByTestId('skill-group-header-metaswarm')).toBeTruthy()
+    // All rows are present
+    expect(screen.getByTestId('skill-row-coding')).toBeTruthy()
+    expect(screen.getByTestId('skill-row-seal-usage')).toBeTruthy()
+    expect(screen.getByTestId('skill-row-haskell-coder')).toBeTruthy()
+    expect(screen.getByTestId('skill-row-reviewer')).toBeTruthy()
+  })
+
   it('shows the load error banner when error=true', () => {
     skillsError = true
     render(<SkillsView />)
@@ -99,6 +120,14 @@ describe('SkillsView', () => {
     expect(idEl.value).toBe('coding')
     const bodyEl = document.getElementById('skill-body') as HTMLTextAreaElement
     expect(bodyEl.value).toBe('b')
+  })
+
+  it('clicking a row seeds the group field', () => {
+    skillsState = [makeSkill({ id: 'coding', description: 'Coding', body: 'b', group: 'core' })]
+    render(<SkillsView />)
+    fireEvent.click(screen.getByTestId('skill-row-coding'))
+    const groupEl = document.getElementById('skill-group') as HTMLInputElement
+    expect(groupEl.value).toBe('core')
   })
 
   it('create validates the id charset and surfaces an error for spaces', () => {
@@ -127,6 +156,35 @@ describe('SkillsView', () => {
     expect(body.body).toBe('## Coding')
   })
 
+  it('create sends the group field when filled', async () => {
+    createSkill.mockResolvedValue(makeSkill({ id: 'coding', group: 'core' }))
+    skillsState = []
+    render(<SkillsView />)
+    fireEvent.click(screen.getByLabelText('New skill'))
+    fireEvent.change(document.getElementById('skill-id') as HTMLInputElement, { target: { value: 'coding' } })
+    fireEvent.change(document.getElementById('skill-group') as HTMLInputElement, { target: { value: 'core' } })
+    fireEvent.change(document.getElementById('skill-description') as HTMLInputElement, { target: { value: 'Coding' } })
+    fireEvent.change(document.getElementById('skill-body') as HTMLTextAreaElement, { target: { value: '## Coding' } })
+    fireEvent.click(screen.getByLabelText('Create skill'))
+    await waitFor(() => expect(createSkill).toHaveBeenCalledTimes(1))
+    const body = createSkill.mock.calls[0]![0] as { id?: string; group?: string | null }
+    expect(body.group).toBe('core')
+  })
+
+  it('create sends group=null when group is empty', async () => {
+    createSkill.mockResolvedValue(makeSkill({ id: 'coding' }))
+    skillsState = []
+    render(<SkillsView />)
+    fireEvent.click(screen.getByLabelText('New skill'))
+    fireEvent.change(document.getElementById('skill-id') as HTMLInputElement, { target: { value: 'coding' } })
+    fireEvent.change(document.getElementById('skill-description') as HTMLInputElement, { target: { value: 'Coding' } })
+    fireEvent.change(document.getElementById('skill-body') as HTMLTextAreaElement, { target: { value: '## Coding' } })
+    fireEvent.click(screen.getByLabelText('Create skill'))
+    await waitFor(() => expect(createSkill).toHaveBeenCalledTimes(1))
+    const body = createSkill.mock.calls[0]![0] as { id?: string; group?: string | null }
+    expect(body.group).toBeNull()
+  })
+
   it('Save on an existing skill PUTs /api/skills/:id (no id in the body)', async () => {
     updateSkill.mockResolvedValue(makeSkill({ id: 'coding', description: 'Coding 2' }))
     skillsState = [makeSkill({ id: 'coding', description: 'Coding' })]
@@ -139,6 +197,18 @@ describe('SkillsView', () => {
     const body = updateSkill.mock.calls[0]![1] as { id?: string; description?: string }
     expect(body.id).toBeUndefined()
     expect(body.description).toBe('Coding 2')
+  })
+
+  it('Save on an existing skill preserves the group when unchanged', async () => {
+    updateSkill.mockResolvedValue(makeSkill({ id: 'coding', description: 'Coding', group: 'core' }))
+    skillsState = [makeSkill({ id: 'coding', description: 'Coding', group: 'core' })]
+    render(<SkillsView />)
+    fireEvent.click(screen.getByTestId('skill-row-coding'))
+    fireEvent.change(document.getElementById('skill-description') as HTMLInputElement, { target: { value: 'Coding 2' } })
+    fireEvent.click(screen.getByLabelText('Save skill'))
+    await waitFor(() => expect(updateSkill).toHaveBeenCalledTimes(1))
+    const body = updateSkill.mock.calls[0]![1] as { group?: string | null }
+    expect(body.group).toBe('core')
   })
 
   it('Delete opens a confirm step; confirming DELETEs the skill', async () => {

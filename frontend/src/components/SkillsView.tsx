@@ -59,18 +59,64 @@ function skillToInput(s: SkillInfo): SkillInput {
   return { id: s.id, description: s.description, body: s.body }
 }
 
+// ── Grouping ─────────────────────────────────────────────────────────────
+
+/** The display label for a skill's group.  Ungrouped skills (group === null
+ *  or empty string) fall under the default "Skills" heading, matching the
+ *  behaviour of the backend's available-skills catalog (Prompt.hs) and
+ *  the flat on-disk layout (no subdirectory). */
+function groupLabel(group: string | null): string {
+  const g = group?.trim()
+  if (!g) return 'Skills'
+  return g
+}
+
+/** Partition skills into groups in display order.  Ungrouped skills come
+ *  first (under "Skills"), then named groups in alphabetical order —
+ *  matching the sorting in Prompt.hs (groupKey sorts Nothing before all
+ *  named groups). */
+interface SkillGroup {
+  label: string
+  skills: SkillInfo[]
+}
+
+function groupSkills(skills: SkillInfo[]): SkillGroup[] {
+  const sorted = [...skills].sort((a, b) => {
+    const ga = a.group?.trim() ?? ''
+    const gb = b.group?.trim() ?? ''
+    if (ga !== gb) return ga.localeCompare(gb)
+    return a.id.localeCompare(b.id)
+  })
+  const groups: SkillGroup[] = []
+  for (const s of sorted) {
+    const label = groupLabel(s.group)
+    const last = groups[groups.length - 1]
+    if (last && last.label === label) {
+      last.skills.push(s)
+    } else {
+      groups.push({ label, skills: [s] })
+    }
+  }
+  return groups
+}
+
 // ── Component ───────────────────────────────────────────────────────────
 
 /** The Skills CRUD view. Lists every skill on the left; the right pane is
  *  an editor (create or edit). Creating POSTs /api/skills; editing PUTs
  *  /api/skills/:id; the trash button DELETEs. The list re-fetches after
- *  every mutation. The id is [A-Za-z0-9_-]+ — validated client-side. */
+ *  every mutation. The id is [A-Za-z0-9_-]+ — validated client-side.
+ *
+ *  Skills are grouped in the list pane by their `group` field, mirroring
+ *  the on-disk directory layout (config/skills/<group>/<id>.md). Ungrouped
+ *  skills appear under a "Skills" heading. */
 export function SkillsView() {
   const { skills, loaded, error, refresh } = useSkills()
 
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<SkillInput>(emptyInput())
+  const [groupField, setGroupField] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
@@ -86,6 +132,7 @@ export function SkillsView() {
   useEffect(() => {
     if (creating) {
       setForm(emptyInput())
+      setGroupField('')
       setFormError(null)
       return
     }
@@ -93,6 +140,7 @@ export function SkillsView() {
       const s = skillsRef.current.find((x) => x.id === editing)
       if (s) {
         setForm(skillToInput(s))
+        setGroupField(s.group ?? '')
         setFormError(null)
       }
     }
@@ -102,6 +150,8 @@ export function SkillsView() {
     () => (editing ? skills.find((s) => s.id === editing) ?? null : null),
     [editing, skills],
   )
+
+  const grouped = useMemo(() => groupSkills(skills), [skills])
 
   const validateForm = (): string | null => {
     const id = (form.id ?? '').trim()
@@ -116,10 +166,13 @@ export function SkillsView() {
     setSubmitting(true)
     setFormError(null)
     const trimmedId = (form.id ?? '').trim()
+    const trimmedGroup = groupField.trim()
+    const groupPayload = trimmedGroup.length > 0 ? trimmedGroup : null
     if (creating) {
       const payload: SkillInput = {
         ...form,
         id: trimmedId,
+        group: groupPayload,
         description: form.description ?? '',
         body: form.body ?? '',
       }
@@ -140,6 +193,7 @@ export function SkillsView() {
         ...form,
         id: undefined,
         new_id: trimmedId !== editing ? trimmedId : undefined,
+        group: groupPayload,
         description: form.description ?? '',
         body: form.body ?? '',
       }
@@ -217,36 +271,47 @@ export function SkillsView() {
               No skills yet. Click + to create one.
             </div>
           )}
-          {skills.map((s) => {
-            const isActive = (creating ? false : editing === s.id) && !confirmingDelete
-            return (
+          {grouped.map((grp) => (
+            <div key={grp.label}>
               <div
-                key={s.id}
-                data-testid={`skill-row-${s.id}`}
-                className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
-                onClick={() => {
-                  if (confirmingDelete === s.id) setConfirmingDelete(null)
-                  setCreating(false)
-                  setEditing(s.id)
-                }}
+                className="px-3 pt-2 pb-1 text-xs font-semibold uppercase"
+                style={{ color: 'var(--text-faint)', letterSpacing: '0.06em' }}
+                data-testid={`skill-group-header-${grp.label}`}
               >
-                <div
-                  className="text-sm truncate"
-                  style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
-                  title={s.id}
-                >
-                  {s.id}
-                </div>
-                <div
-                  className="text-xs mt-0.5 truncate"
-                  style={{ color: 'var(--text-faint)' }}
-                  title={s.description}
-                >
-                  {s.description}
-                </div>
+                {grp.label}
               </div>
-            )
-          })}
+              {grp.skills.map((s) => {
+                const isActive = (creating ? false : editing === s.id) && !confirmingDelete
+                return (
+                  <div
+                    key={s.id}
+                    data-testid={`skill-row-${s.id}`}
+                    className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
+                    onClick={() => {
+                      if (confirmingDelete === s.id) setConfirmingDelete(null)
+                      setCreating(false)
+                      setEditing(s.id)
+                    }}
+                  >
+                    <div
+                      className="text-sm truncate"
+                      style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
+                      title={s.id}
+                    >
+                      {s.id}
+                    </div>
+                    <div
+                      className="text-xs mt-0.5 truncate"
+                      style={{ color: 'var(--text-faint)' }}
+                      title={s.description}
+                    >
+                      {s.description}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -288,6 +353,18 @@ export function SkillsView() {
                 onChange={(e) => setForm((f) => ({ ...f, id: e.target.value }))}
                 style={inputStyle}
                 placeholder="e.g. coding"
+                autoComplete="off"
+              />
+            </Row>
+
+            <Row label="Group" htmlFor="skill-group" hint="Optional category for display grouping and on-disk layout (config/skills/<group>/<id>.md). Leave empty for ungrouped.">
+              <input
+                id="skill-group"
+                type="text"
+                value={groupField}
+                onChange={(e) => setGroupField(e.target.value)}
+                style={inputStyle}
+                placeholder="e.g. core"
                 autoComplete="off"
               />
             </Row>

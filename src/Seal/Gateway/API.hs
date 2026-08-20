@@ -1777,6 +1777,7 @@ skillInfoJson :: Skill -> Value
 skillInfoJson s = A.object
   [ "id" .= skillIdText (skId s)
   , "description" .= skDescription s
+  , "group" .= skGroup s
   , "body" .= skBody s
   , "created_at" .= skCreatedAt s
   , "updated_at" .= skUpdatedAt s
