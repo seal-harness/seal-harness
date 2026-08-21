@@ -18,6 +18,7 @@ module Seal.TestHelpers.ApiTestHarness
     -- * Helpers
   , callApiNewTab
   , sendMsgToSession
+  , sendMsgToSessionRaw
   , getTranscript
   , assertTranscriptContains
   , setScript
@@ -65,10 +66,11 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig )
+  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
+  , saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
 import Seal.Gateway.Send (SendDeps (..))
@@ -132,7 +134,9 @@ setupDummyRepo :: FilePath -> DummyRepoConfig -> IO DummyRepo
 setupDummyRepo tmp cfg = do
   let repoIdText = drcRepoId cfg
       bareRepoPath = tmp </> "bare.git"
-      keyfilesDir = tmp </> "keys"
+      -- The keyfiles dir must match repoKeysDir paths (spState </> "repos" </> "keys")
+      -- so mkCloneDepsTurn finds the keyfile.
+      keyfilesDir = tmp </> "state" </> "repos" </> "keys"
       keyfilePath = keyfilesDir </> T.unpack repoIdText
   createDirectoryIfMissing True keyfilesDir
 
@@ -273,7 +277,7 @@ buildTestEnv tmp mode mRepo = do
 
   let paths = SealPaths
         { spHome = tmp, spState = stateRoot, spConfig = configRoot
-        , spKeys = tmp </> "keys", spCache = ""
+        , spKeys = tmp </> "keys", spCache = tmp </> "cache"
         }
   providerRef <- newIORef []
 
@@ -317,9 +321,12 @@ buildTestEnv tmp mode mRepo = do
         }
 
   -- Security config: remote mode needs untrusted_execution.remote.
+  -- Write it to security.toml so runTurnBody picks it up (the turn
+  -- engine loads SecurityConfig from disk, not from ApiDeps).
   let secCfg = if mode == "remote"
         then buildRemoteSecurityConfig tmp
         else defaultSecurityConfig
+  saveSecurityConfig (securityFilePath paths) secCfg
 
   logger <- testSealLogger
   let sendDeps = SendDeps
@@ -390,8 +397,8 @@ buildRemoteSecurityConfig tmp =
             , uerfcUser = Nothing  -- defaults to current user
             , uerfcPort = Nothing
             , uerfcIdentity = Nothing
-            , uerfcKnownHosts = Just (tmp </> "keys" </> "known_hosts")
-            , uerfcWorkspace = Just (T.pack (tmp </> "remote-workspace"))
+            , uerfcKnownHosts = Just (tmp </> "state" </> "repos" </> "keys" </> "known_hosts")
+            , uerfcWorkspace = Just (T.pack (tmp </> "cache" </> "remote-workspace"))
             }
         }
     }
@@ -419,12 +426,21 @@ callApiNewTab env provider model = do
       _ -> error "callApiNewTab: invalid JSON response"
 
 -- | Send a message to a session via POST /api/sessions/:id/send.
-sendMsgToSession :: ApiTestEnv -> Text -> Text -> IO ()
+-- Returns the response body for inspection.
+sendMsgToSession :: ApiTestEnv -> Text -> Text -> IO BL.ByteString
 sendMsgToSession env sid msg = do
   req <- testPost ["api", "sessions", sid, "send"]
     (A.encode (A.object ["message" .= msg]))
-  (st, _body) <- runAppBody (ateApp env) req
-  when (st /= 200) (error ("sendMsgToSession: expected 200, got " <> show st))
+  (st, body) <- runAppBody (ateApp env) req
+  when (st /= 200) (error ("sendMsgToSession: expected 200, got " <> show st <> ": " <> show body))
+  pure body
+
+-- | Like 'sendMsgToSession' but returns the (status, body) for debugging.
+sendMsgToSessionRaw :: ApiTestEnv -> Text -> Text -> IO (Int, BL.ByteString)
+sendMsgToSessionRaw env sid msg = do
+  req <- testPost ["api", "sessions", sid, "send"]
+    (A.encode (A.object ["message" .= msg]))
+  runAppBody (ateApp env) req
 
 -- | Get the transcript as a JSON array.
 getTranscript :: ApiTestEnv -> Text -> IO [A.Value]

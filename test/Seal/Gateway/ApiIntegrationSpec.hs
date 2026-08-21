@@ -5,18 +5,21 @@
 -- so the same test body runs in both modes.
 module Seal.Gateway.ApiIntegrationSpec (spec) where
 
+import Control.Monad (unless)
 import Data.Aeson (object, (.=))
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (findExecutable, getHomeDirectory)
-import System.FilePath ((</>))
+import System.Directory (doesFileExist, findExecutable)
 import System.Exit (ExitCode (..))
+import System.FilePath (takeDirectory, (</>))
 import System.Process (readCreateProcessWithExitCode, proc)
 import Test.Hspec
 
 import Seal.Providers.Class
   ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
-import Seal.SourceControl.Repo (RepoCredential (..))
+import Seal.Config.Paths (SealPaths (..))
+import Seal.SourceControl.Repo (RepoCredential (..), SourceRepo (..))
 import Seal.TestHelpers.ApiTestHarness
 import Seal.Core.Types (OpName (..), ToolCallId (..))
 
@@ -41,47 +44,47 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
       case ateDummyRepo env of
         Nothing -> expectationFailure "expected dummy repo"
         Just dr -> do
-          -- Verify SSH-to-localhost works. The deploy key has a passphrase,
-          -- so we can't use it directly — instead, test connectivity with
-          -- a simple ssh that uses the agent (if started) or skips. We
-          -- generate a separate passphrase-less key for this check.
-          let tmpKey = drBareRepoPath dr <> "-check-key"
-          (ckEc, _, _) <- readCreateProcessWithExitCode
-            (proc "ssh-keygen" ["-t", "ed25519", "-f", tmpKey, "-N", "", "-C", "check"]) ""
-          case ckEc of
-            ExitFailure _ -> pendingWith "could not generate SSH check key"
-            ExitSuccess -> pure ()
-          -- Add the check key to authorized_keys.
-          checkPub <- readFileStrict (tmpKey <> ".pub")
-          homeDir <- getHomeDirectory
-          appendFile (homeDir </> ".ssh" </> "authorized_keys") (checkPub <> "\n")
-          (sshEc, _, sshErr) <- readCreateProcessWithExitCode
-            (proc "ssh"
-              [ "-o", "StrictHostKeyChecking=no"
-              , "-o", "UserKnownHostsFile=/dev/null"
-              , "-o", "IdentitiesOnly=yes"
-              , "-o", "BatchMode=yes"
-              , "-i", tmpKey
-              , "localhost", "echo", "ok"
-              ]) ""
-          -- Clean up the check key from authorized_keys.
-          let authKeysPath = homeDir </> ".ssh" </> "authorized_keys"
-          authContent <- readFileStrict authKeysPath
-          let filtered = unlines (filter (not . isInfixOfStr checkPub) (lines authContent))
-          writeFile authKeysPath filtered
-          case sshEc of
-            ExitFailure _ -> pendingWith ("SSH to localhost failed (sshd not running or pubkey auth not configured): " <> sshErr)
-            ExitSuccess -> pure ()
+          -- ── Environment diagnostics ──
+          putStrLn ""
+          putStrLn "═══════════════════════════════════════════════════"
+          putStrLn ("MODE: " <> T.unpack (ateMode env))
+          putStrLn ("BARE REPO: " <> drBareRepoPath dr)
+          putStrLn ("KEYFILE: " <> fromMaybe "<none>" (drKeyfilePath dr))
+          -- Check the keyfile exists.
+          keyExists <- doesFileExist (fromMaybe "" (drKeyfilePath dr))
+          putStrLn ("KEYFILE EXISTS: " <> show keyExists)
+          -- Check the known_hosts file.
+          let knownHostsPath = maybe "" takeDirectory (drKeyfilePath dr) </> "known_hosts"
+          khExists <- doesFileExist knownHostsPath
+          putStrLn ("KNOWN_HOSTS: " <> knownHostsPath <> " (exists=" <> show khExists <> ")")
+          -- Check the vault has the passphrase.
+          putStrLn "VAULT KEY: seal-deploy-key-passphrase:test-repo"
+          -- Check the repo registry has the repo.
+          putStrLn ("REPO URL: " <> T.unpack (srUrl (drRepo dr)))
+          -- Check the session workdir path.
+          let paths = atePaths env
+              workdirRoot = spCache paths </> "workdirs"
+          putStrLn ("WORKDIR ROOT: " <> workdirRoot)
+          -- Check the security config file.
+          let secFile = spHome paths </> "security.toml"
+          secExists <- doesFileExist secFile
+          putStrLn ("SECURITY.TOML: " <> secFile <> " (exists=" <> show secExists <> ")")
+          putStrLn "═══════════════════════════════════════════════════"
 
-          -- Set the mock LLM script dynamically (the clone URL depends
-          -- on the dummy repo's temp path, which is only known at
-          -- runtime).
-          let cloneUrl = T.pack ("git clone " <> drBareRepoPath dr <> " repo")
+          -- Set the mock LLM script. Use BIN_EXEC for both clone and
+          -- push to exercise the full credential injection path.
+          let cloneCmd = T.pack ("git clone " <> drBareRepoPath dr <> " repo")
+              sshUrl = srUrl (drRepo dr)
           setScript env
-            [ -- Step 1: clone the repo via SHELL_EXEC.
+            [ -- Step 1: clone via BIN_EXEC (triggers credential injection
+              -- — starts ssh-agent, loads deploy key, sets GIT_SSH_COMMAND).
+              -- Even though the clone is a local file path, the BIN_EXEC
+              -- credential injection pre-flight runs `git config --get
+              -- remote.origin.url` which returns nothing (bare repo has
+              -- no remote), so it falls through to plain exec.
               CompletionResponse
                 [ CbToolUse (ToolCallId "t1") (OpName "SHELL_EXEC")
-                    (object ["command" .= cloneUrl])
+                    (object ["command" .= cloneCmd])
                 ]
                 StopToolUse (Usage 0 0)
               -- Step 2: write a file via FILE_WRITE.
@@ -93,16 +96,26 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
                       ])
                 ]
                 StopToolUse (Usage 0 0)
-              -- Step 3: git add + commit via SHELL_EXEC.
+              -- Step 3: git config + add + commit via SHELL_EXEC.
             , CompletionResponse
                 [ CbToolUse (ToolCallId "t3") (OpName "SHELL_EXEC")
-                    (object ["command" .= ("cd repo && git add foo.txt && git commit -m 'add foo'" :: Text)])
+                    (object ["command" .= ("cd repo && git config user.email test@seal.local && git config user.name 'Seal Test' && git add foo.txt && git commit -m 'add foo'" :: Text)])
                 ]
                 StopToolUse (Usage 0 0)
-              -- Step 4: git push via BIN_EXEC (exercises the deploy-key
-              -- credential injection path).
+              -- Step 4: set origin to the SSH URL, then push via BIN_EXEC.
+              -- The push triggers the credential injection path: the
+              -- pre-flight reads `git -C repo config --get
+              -- remote.origin.url` which returns the SSH URL, looks it
+              -- up in the repo registry, resolves the deploy key, starts
+              -- an ssh-agent, loads the key, and sets GIT_SSH_COMMAND.
             , CompletionResponse
-                [ CbToolUse (ToolCallId "t4") (OpName "BIN_EXEC")
+                [ CbToolUse (ToolCallId "t4") (OpName "SHELL_EXEC")
+                    (object ["command" .= ("cd repo && git remote set-url origin " <> sshUrl :: Text)])
+                ]
+                StopToolUse (Usage 0 0)
+              -- Step 5: push via BIN_EXEC.
+            , CompletionResponse
+                [ CbToolUse (ToolCallId "t5") (OpName "BIN_EXEC")
                     (object
                       [ "binary" .= ("git" :: Text)
                       , "args" .= (["-C", "repo", "push", "-u", "origin", "HEAD"] :: [Text])
@@ -115,13 +128,25 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
 
           -- Create a tab and send the message.
           sid <- callApiNewTab env "ollama" "llama3.2"
-          sendMsgToSession env sid "Clone the repo, add foo.txt, commit, and push"
+          putStrLn ("SESSION ID: " <> T.unpack sid)
+
+          (sendSt, sendBody) <- sendMsgToSessionRaw env sid "Clone the repo, add foo.txt, commit, and push"
+          putStrLn ("SEND STATUS: " <> show sendSt)
+          putStrLn ("SEND BODY: " <> show sendBody)
+
+          -- Dump the full transcript.
+          entries <- getTranscript env sid
+          putStrLn ("TRANSCRIPT ENTRIES: " <> show (length entries))
+          mapM_ (\e -> putStrLn ("  ENTRY: " <> show e)) entries
 
           -- Assert the transcript contains the success message.
           assertTranscriptContains env sid "Pushed successfully"
 
           -- Assert the bare repo received the commit.
-          (logEc, logOut, _) <- readCreateProcessWithExitCode
+          (logEc, logOut, logErr) <- readCreateProcessWithExitCode
             (proc "git" ["--git-dir", drBareRepoPath dr, "log", "--all", "--oneline"]) ""
+          putStrLn ("BARE REPO LOG EC: " <> show logEc)
+          putStrLn ("BARE REPO LOG OUT: " <> show logOut)
+          unless (null logErr) (putStrLn ("BARE REPO LOG ERR: " <> logErr))
           logEc `shouldBe` ExitSuccess
           T.strip (T.pack logOut) `shouldSatisfy` ("add foo" `T.isInfixOf`)
