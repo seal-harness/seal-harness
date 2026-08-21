@@ -48,7 +48,7 @@ import Seal.Security.Path
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.SourceControl.Clone (CloneEnv (..), renderCloneError)
 import Seal.SourceControl.Repo (lookupRepoByUrl, RepoRegistry (..), SourceRepo (srId))
-import Seal.Tools.Args (BinArg, BinName, mkBinName, mkBinArg, textBinName)
+import Seal.Tools.Args (BinArg, BinName, mkBinName, mkBinArg, textBinArg, textBinName)
 import Seal.Tools.Exec.UIO
   ( UIO, renderUntrustedErr, uioBinExec, uioBinExecEnv, uioBinExecGitEnv
   )
@@ -158,8 +158,10 @@ runGitWithCredentials
 runGitWithCredentials bin args mCwdPath recorded = do
   -- Pre-flight: resolve the remote URL from the cwd's .git/config.
   -- `git config --get remote.origin.url` reads local config only — no
-  -- network, no auth needed.
-  mRemoteUrl <- resolveRemoteUrl bin mCwdPath
+  -- network, no auth needed. Parse -C <path> / --git-dir=<path> from the
+  -- git args so the pre-flight reads config from the right repo (the
+  -- agent may pass `git -C subdir push ...`).
+  mRemoteUrl <- resolveRemoteUrl bin args mCwdPath
   case mRemoteUrl of
     Left err -> pure (OpResult [TrpText err] True recorded)
     Right Nothing -> do
@@ -213,12 +215,22 @@ runGitWithCredentials bin args mCwdPath recorded = do
 --   * @Right Nothing@ — the cwd is not inside a git repo, or the repo
 --     has no @remote.origin.url@ (fall through to plain exec).
 --   * @Right (Just url)@ — the remote URL, trimmed.
-resolveRemoteUrl :: BinName -> Maybe RemotePath -> UIO (Either Text (Maybe Text))
-resolveRemoteUrl bin mCwdPath = do
+--
+-- Parses @-C <path>@ and @--git-dir=<path>@ from the git args (the agent
+-- may pass @git -C subdir push ...@) so the pre-flight reads config from
+-- the right repo, not the workdir root.
+resolveRemoteUrl :: BinName -> [BinArg] -> Maybe RemotePath -> UIO (Either Text (Maybe Text))
+resolveRemoteUrl bin args mCwdPath = do
   let arg t = case mkBinArg t of
         Right a -> a
         Left _  -> error "unreachable: mkBinArg rejected a literal"
-  res <- uioBinExec bin [arg "config", arg "--get", arg "remote.origin.url"] mCwdPath
+      -- Extract -C <path> or --git-dir=<path> from the git args so the
+      -- pre-flight reads config from the right repo.
+      mGitDir = extractGitDir (map textBinArg args)
+      preflightArgs = case mGitDir of
+        Just dir -> [arg "-C", arg dir, arg "config", arg "--get", arg "remote.origin.url"]
+        Nothing  -> [arg "config", arg "--get", arg "remote.origin.url"]
+  res <- uioBinExec bin preflightArgs mCwdPath
   pure $ case res of
     Left err -> Left ("BIN_EXEC: pre-flight git config failed: " <> renderUntrustedErr err)
     Right out ->
@@ -287,3 +299,25 @@ cwdEscapeErr (PathEscapesWorkspace _) = "BIN_EXEC: cwd escapes the workspace"
 cwdEscapeErr (PathIsBlocked _)        = "BIN_EXEC: cwd touches a blocked location"
 cwdEscapeErr (PathDoesNotExist _)     = "BIN_EXEC: cwd does not exist"
 cwdEscapeErr (PathInsecureMode _)     = "BIN_EXEC: cwd has insecure mode"
+
+-- | Extract a @-C <path>@ or @--git-dir=<path>@ value from a git argv
+-- list. Returns 'Nothing' when neither flag is present (the pre-flight
+-- reads config from the workdir root / cwd). Handles both the
+-- space-separated form (@-C subdir@) and the joined form (@-Csubdir@,
+-- @--git-dir=subdir@). Only the first occurrence is used (git itself
+-- takes the last, but for a single git invocation the first is
+-- sufficient — the agent doesn't pass multiple -C flags).
+extractGitDir :: [Text] -> Maybe Text
+extractGitDir = go
+  where
+    go [] = Nothing
+    go (x : xs)
+      | x == "-C" = case xs of
+          (p : _) -> Just p
+          []      -> Nothing
+      | "-C" `T.isPrefixOf` x
+      , x /= "-C"
+      = Just (T.drop 2 x)
+      | "--git-dir=" `T.isPrefixOf` x
+      = Just (T.drop (T.length "--git-dir=") x)
+      | otherwise = go xs

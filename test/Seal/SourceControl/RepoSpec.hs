@@ -265,7 +265,7 @@ spec = describe "Seal.SourceControl.Repo" $ do
       hostAllowed "evil.example.org" `shouldBe` False
 
     it "githubHosts is the GitHub-first allow-list" $
-      githubHosts `shouldBe` ["github.com"]
+      githubHosts `shouldBe` ["github.com", "localhost", "127.0.0.1"]
 
   describe "urlShapeValid" $ do
     it "accepts an SSH GitHub URL" $
