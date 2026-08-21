@@ -25,6 +25,8 @@ module Seal.TestHelpers.ApiTestHarness
   , DummyRepoConfig (..)
   , DummyRepo (..)
   , setupDummyRepo
+  , readFileStrict
+  , isInfixOfStr
   ) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -165,11 +167,10 @@ setupDummyRepo tmp cfg = do
   -- Scan localhost's host key.
   (scanEc, scanOut, _) <- readCreateProcessWithExitCode
     (proc "ssh-keyscan" ["-t", "ed25519", "localhost"]) ""
-  case scanEc of
-    ExitFailure _ -> error "setupDummyRepo: ssh-keyscan failed (is sshd running?)"
-    ExitSuccess -> pure ()
   let knownHostsPath = keyfilesDir </> "known_hosts"
-  writeFile knownHostsPath scanOut
+  case scanEc of
+    ExitFailure _ -> writeFile knownHostsPath ""  -- empty known_hosts; test body will pendingWith
+    ExitSuccess -> writeFile knownHostsPath scanOut
 
   -- Build the SSH URL and SourceRepo.
   let sshUrl = T.pack (currentUser <> "@localhost:" <> bareRepoPath)

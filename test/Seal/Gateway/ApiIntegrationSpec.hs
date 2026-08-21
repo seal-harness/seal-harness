@@ -8,7 +8,8 @@ module Seal.Gateway.ApiIntegrationSpec (spec) where
 import Data.Aeson (object, (.=))
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (findExecutable)
+import System.Directory (findExecutable, getHomeDirectory)
+import System.FilePath ((</>))
 import System.Exit (ExitCode (..))
 import System.Process (readCreateProcessWithExitCode, proc)
 import Test.Hspec
@@ -40,6 +41,38 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
       case ateDummyRepo env of
         Nothing -> expectationFailure "expected dummy repo"
         Just dr -> do
+          -- Verify SSH-to-localhost works. The deploy key has a passphrase,
+          -- so we can't use it directly — instead, test connectivity with
+          -- a simple ssh that uses the agent (if started) or skips. We
+          -- generate a separate passphrase-less key for this check.
+          let tmpKey = drBareRepoPath dr <> "-check-key"
+          (ckEc, _, _) <- readCreateProcessWithExitCode
+            (proc "ssh-keygen" ["-t", "ed25519", "-f", tmpKey, "-N", "", "-C", "check"]) ""
+          case ckEc of
+            ExitFailure _ -> pendingWith "could not generate SSH check key"
+            ExitSuccess -> pure ()
+          -- Add the check key to authorized_keys.
+          checkPub <- readFileStrict (tmpKey <> ".pub")
+          homeDir <- getHomeDirectory
+          appendFile (homeDir </> ".ssh" </> "authorized_keys") (checkPub <> "\n")
+          (sshEc, _, sshErr) <- readCreateProcessWithExitCode
+            (proc "ssh"
+              [ "-o", "StrictHostKeyChecking=no"
+              , "-o", "UserKnownHostsFile=/dev/null"
+              , "-o", "IdentitiesOnly=yes"
+              , "-o", "BatchMode=yes"
+              , "-i", tmpKey
+              , "localhost", "echo", "ok"
+              ]) ""
+          -- Clean up the check key from authorized_keys.
+          let authKeysPath = homeDir </> ".ssh" </> "authorized_keys"
+          authContent <- readFileStrict authKeysPath
+          let filtered = unlines (filter (not . isInfixOfStr checkPub) (lines authContent))
+          writeFile authKeysPath filtered
+          case sshEc of
+            ExitFailure _ -> pendingWith ("SSH to localhost failed (sshd not running or pubkey auth not configured): " <> sshErr)
+            ExitSuccess -> pure ()
+
           -- Set the mock LLM script dynamically (the clone URL depends
           -- on the dummy repo's temp path, which is only known at
           -- runtime).
