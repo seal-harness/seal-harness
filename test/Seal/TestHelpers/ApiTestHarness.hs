@@ -48,7 +48,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
-import Network.Socket
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (methodGet, methodPost, statusCode)
 import Network.Wai
@@ -56,7 +55,8 @@ import Network.Wai
   , requestMethod, responseStatus, setRequestBodyChunks )
 import Network.Wai.Internal (ResponseReceived (..), Response (..))
 import System.Directory
-  ( createDirectoryIfMissing, doesFileExist, findExecutable, getHomeDirectory )
+  ( createDirectoryIfMissing, doesFileExist, findExecutable
+  , getHomeDirectory, getTemporaryDirectory )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -247,11 +247,14 @@ runApiTestRemote mRepoCfg body = it "remote" $ do
     (_, _, Nothing, _) -> pendingWith "ssh-keyscan not available"
     (_, _, _, Nothing) -> pendingWith "sshd not available (cannot SSH to localhost)"
     _ -> do
-      -- Verify sshd is actually running (not just installed) by
-      -- attempting a TCP connection to localhost:22.
-      sshdRunning <- isPortOpen "localhost" 22
-      if not sshdRunning
-        then pendingWith "sshd is not running on localhost (port 22 closed)"
+      -- Verify sshd is actually running AND SSH auth works by attempting
+      -- a real SSH connection. Just checking port 22 isn't enough — the
+      -- CI runner may have sshd listening but not configured for pubkey
+      -- auth, or authorized_keys may not be set up. We test by generating
+      -- a throwaway key, adding it to authorized_keys, and SSHing.
+      sshWorks <- testSshToLocalhost
+      if not sshWorks
+        then pendingWith "SSH to localhost not working (sshd not running or pubkey auth not configured)"
         else withSystemTempDirectory "seal-api-test" $ \tmp -> do
           mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
           env <- buildTestEnv tmp "remote" mRepo
@@ -546,18 +549,41 @@ isInfixOfStr needle = go
     prefix _ [] = False
     prefix (p : ps) (q : qs) = p == q && prefix ps qs
 
--- | Check if a TCP port is open on the given host. Returns True if a
--- connection can be established within 2 seconds, False otherwise.
--- Used to verify sshd is running on localhost before attempting remote-mode
--- tests.
-isPortOpen :: String -> Int -> IO Bool
-isPortOpen host port =
+-- | Test that SSH to localhost works: generate a throwaway passphrase-less
+-- key, add it to authorized_keys, attempt an SSH echo, then clean up.
+-- Returns True if SSH works, False otherwise.
+testSshToLocalhost :: IO Bool
+testSshToLocalhost =
   catch
     (do
-      let hints = defaultHints { addrSocketType = Stream }
-      addr : _ <- getAddrInfo (Just hints) (Just host) (Just (show port))
-      sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-      connect sock (addrAddress addr) `catch` \(_ :: SomeException) -> pure ()
-      close sock
-      pure True)
+      tmp <- getTemporaryDirectory
+      let keyPath = tmp </> "seal-ssh-test-key"
+      -- Generate a throwaway key.
+      (genEc, _, _) <- readCreateProcessWithExitCode
+        (proc "ssh-keygen" ["-t", "ed25519", "-f", keyPath, "-N", "", "-C", "seal-ssh-test"]) ""
+      if genEc /= ExitSuccess then pure False else do
+        -- Add the public key to authorized_keys.
+        homeDir <- getHomeDirectory
+        let sshDir = homeDir </> ".ssh"
+            authKeysPath = sshDir </> "authorized_keys"
+        createDirectoryIfMissing True sshDir
+        pubKey <- readFileStrict (keyPath <> ".pub")
+        appendFile authKeysPath (pubKey <> "\n")
+        -- Try SSH.
+        (sshEc, _, _) <- readCreateProcessWithExitCode
+          (proc "ssh"
+            [ "-o", "StrictHostKeyChecking=no"
+            , "-o", "UserKnownHostsFile=/dev/null"
+            , "-o", "IdentitiesOnly=yes"
+            , "-o", "BatchMode=yes"
+            , "-i", keyPath
+            , "localhost", "echo", "ok"
+            ]) ""
+        -- Clean up the key from authorized_keys.
+        exists <- doesFileExist authKeysPath
+        when exists $ do
+          content <- readFileStrict authKeysPath
+          let filtered = unlines (filter (not . isInfixOfStr pubKey) (lines content))
+          writeFile authKeysPath filtered
+        pure (sshEc == ExitSuccess))
     (\(_ :: SomeException) -> pure False)

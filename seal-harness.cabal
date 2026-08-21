@@ -299,7 +299,6 @@ test-suite tests
       , http-client
       , http-client-tls
       , katip
-      , network
       , optparse-applicative
       , stm
       , temporary
