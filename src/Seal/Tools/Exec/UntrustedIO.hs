@@ -62,6 +62,7 @@ import Seal.Security.Path
   ( PathError (..), SafePath, WorkspaceRoot (..), getSafePath, mkSafePath
   , mkSafePathForWrite, mkSafePathRemote
   )
+import Seal.Logging.Global (globalLogIO)
 import Seal.Text.LineFile
   ( LineWindow (..) )
 import Seal.Tools.Args
@@ -77,6 +78,9 @@ import Seal.Tools.Exec.Remote
 import Seal.Tools.Exec.Types
   ( ExecError (..), RemotePath, SshConfig (..), getRemotePath
   )
+
+import Katip (Severity (..))
+import Katip qualified as K (ls)
 
 -- | The unified capability handle. Each field is an IO action the opcode
 -- calls; the smart constructors wire the local or remote implementation.
@@ -430,6 +434,7 @@ runLocalFixedArgvEnv treat127AsMissing argv mCwd extras = do
   let (program, args) = case argv of
         (p : as) -> (p, as)
         []       -> error "runLocalFixedArgvEnv: empty argv (unreachable)"
+  logExecDebug "[local]" argv mCwd extras
   inherited <- getEnvironment
   let env' = Just (mergeEnv inherited extras)
       cp = (proc program args)
@@ -480,6 +485,46 @@ formatExitResult n out err =
   let parts = [ t | t <- [out, err], not (T.null (T.strip t)) ]
       body  = if null parts then "" else T.intercalate "\n" parts
   in body <> "\n[exit code: " <> T.pack (show n) <> "]"
+
+-- | Emit a debug-level log line showing the exact command the UntrustedIO
+-- executor is about to run. Covers both the local arm (a fixed-argv
+-- subprocess) and the remote arm (an @ssh@ argv, including @-A@ for
+-- agent-forwarding git ops). The @tag@ prefixes the line so the reader
+-- can distinguish local vs remote vs remote-with-agent at a glance:
+--
+--   * @"[local]"@        — a local subprocess (@runLocalFixedArgvEnv@)
+--   * @"[remote ssh]"@   — a remote SSH exec (no agent forwarding)
+--   * @"[remote ssh -A]"@ — a remote SSH exec with agent forwarding
+--                          (deploy-key git ops)
+--
+-- For the remote arm, the full SSH argv is logged (e.g.
+-- @ssh -o StrictHostKeyChecking=yes ... agent@exec.internal -- cd ... && git pull@),
+-- so the complete command — including the SSH portion — is visible when
+-- @mode=remote@. Env overrides (e.g. @SSH_AUTH_SOCK=...@,
+-- @GIT_SSH_COMMAND=...@) are shown as @KEY=VAL@ tokens. The cwd is shown
+-- as @cd <path> &&@ when set.
+logExecDebug :: String -> [String] -> Maybe String -> [(String, String)] -> IO ()
+logExecDebug tag argv mCwd extras =
+  globalLogIO DebugS (K.ls msg)
+  where
+    msg = T.pack (unwords (filter (not . null) parts))
+    parts =
+      [ tag ]
+      <> envPart
+      <> cwdPart
+      <> [ unwords (map shellQuoteArgv argv) ]
+    envPart = case extras of
+      [] -> []
+      xs -> [ unwords (map (\(k, v) -> k <> "=" <> v) xs) ]
+    cwdPart = case mCwd of
+      Just c  -> ["cd " <> c <> " &&"]
+      Nothing -> []
+    -- Quote an argv token for log readability: wrap in single quotes if
+    -- it contains spaces or shell metacharacters. This is display-only
+    -- (the actual subprocess argv is passed verbatim, never shell-parsed).
+    shellQuoteArgv s
+      | any (\c -> c == ' ' || c == '\'' || c == '"' || c == '$' || c == '`') s = "'" <> s <> "'"
+      | otherwise = s
 
 -- ---------------------------------------------------------------------------
 -- The remote arm
@@ -764,6 +809,7 @@ runRemoteShellForwardingEnvText runner cfg localEnv cmdText =
     Left e    -> pure (Left e)
     Right cmd -> do
       let argv = sshExecArgvForwarding cfg (textShellCommand cmd)
+      logExecDebug "[remote ssh -A]" argv Nothing localEnv
       res <- runRemoteEnv runner localEnv argv
       pure (either (Left . UeExec) Right res)
 
@@ -776,6 +822,8 @@ runRemoteShellText runner cfg cmdText =
   case shellCmd cmdText of
     Left e    -> pure (Left e)
     Right cmd -> do
+      let argv = sshExecArgv cfg (textShellCommand cmd)
+      logExecDebug "[remote ssh]" argv Nothing []
       res <- runRemoteShell runner cfg cmd
       pure (either (Left . UeExec) Right res)
 

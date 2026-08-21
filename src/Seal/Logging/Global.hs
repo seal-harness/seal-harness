@@ -11,6 +11,7 @@
 -- no-op (best-effort — the logger must never crash the caller).
 module Seal.Logging.Global
   ( setGlobalLogger
+  , unsetGlobalLogger
   , globalLogIO
   ) where
 
@@ -32,6 +33,14 @@ globalLoggerRef = unsafePerformIO (newIORef Nothing)
 -- 'Seal.AppMain.dispatch', inside the 'withSealLogger' bracket).
 setGlobalLogger :: SealLogger -> IO ()
 setGlobalLogger = writeIORef globalLoggerRef . Just
+
+-- | Unset the process-global logger (set the ref to 'Nothing'). Used by
+-- tests that install a capture logger via 'setGlobalLogger' and want to
+-- restore the no-op default after the test so subsequent tests are
+-- unaffected. Not called in production (the logger lives for the process
+-- lifetime).
+unsetGlobalLogger :: IO ()
+unsetGlobalLogger = writeIORef globalLoggerRef Nothing
 
 -- | Emit a log line via the process-global logger. If no logger has been
 -- set (e.g. in tests that don't call 'setGlobalLogger'), this is a no-op.
