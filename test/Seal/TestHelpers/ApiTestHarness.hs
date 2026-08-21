@@ -148,13 +148,15 @@ setupDummyRepo tmp cfg = do
   -- Get the current user for the SSH URL.
   currentUser <- whoami
 
-  -- Generate a real SSH keypair with a passphrase.
-  let passphrase = "test-passphrase-12345"
+  -- Generate a real SSH keypair. No passphrase — the integration test
+  -- uses SHELL_EXEC (not BIN_EXEC credential injection), so the key
+  -- doesn't need to be in an ssh-agent. A passphrase-less key works
+  -- directly with ssh -i.
   (ec, _, err) <- readCreateProcessWithExitCode
     (proc "ssh-keygen"
       [ "-t", "ed25519"
       , "-f", keyfilePath
-      , "-N", passphrase
+      , "-N", ""
       , "-C", "seal-test"
       ]) ""
   case ec of
@@ -300,7 +302,7 @@ buildTestEnv tmp mode mRepo = do
           _ -> Nothing
         Nothing -> Nothing
   vaultRt <- case vaultKey of
-    Just vk -> makeFakeVaultRuntime [(vk, "test-passphrase-12345")]
+    Just vk -> makeFakeVaultRuntime [(vk, "")]  -- no passphrase (key is passphrase-less)
     Nothing -> makeFakeVaultRuntime []
 
   -- Session runtime.
@@ -336,8 +338,9 @@ buildTestEnv tmp mode mRepo = do
   -- Write it to security.toml so runTurnBody picks it up (the turn
   -- engine loads SecurityConfig from disk, not from ApiDeps).
   currentUser <- if mode == "remote" then whoami else pure ""
-  let secCfg = if mode == "remote"
-        then buildRemoteSecurityConfig tmp currentUser
+  let mKeyfilePath = mRepo >>= drKeyfilePath
+      secCfg = if mode == "remote"
+        then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
   saveSecurityConfig (securityFilePath paths) secCfg
 
@@ -400,8 +403,11 @@ buildTestEnv tmp mode mRepo = do
     }
 
 -- | Build a SecurityConfig for remote mode (SSH to localhost).
-buildRemoteSecurityConfig :: FilePath -> String -> SecurityConfig
-buildRemoteSecurityConfig tmp user =
+-- The identity (private key) must be set so sshExecArgv passes @-i <key>@.
+-- Without it, SSH falls back to default keys (~/.ssh/id_*) and the agent,
+-- neither of which has the test key.
+buildRemoteSecurityConfig :: FilePath -> String -> Maybe FilePath -> SecurityConfig
+buildRemoteSecurityConfig tmp user mKeyfilePath =
   defaultSecurityConfig
     { scUntrustedExec = Just UntrustedExecFileConfig
         { uefcMode = "remote"
@@ -409,7 +415,7 @@ buildRemoteSecurityConfig tmp user =
             { uerfcHost = Just "localhost"
             , uerfcUser = Just (T.pack user)
             , uerfcPort = Nothing
-            , uerfcIdentity = Nothing
+            , uerfcIdentity = mKeyfilePath
             , uerfcKnownHosts = Just (tmp </> "state" </> "repos" </> "keys" </> "known_hosts")
             , uerfcWorkspace = Just (T.pack (tmp </> "cache" </> "remote-workspace"))
             }
