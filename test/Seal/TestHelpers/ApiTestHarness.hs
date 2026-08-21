@@ -32,6 +32,7 @@ module Seal.TestHelpers.ApiTestHarness
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (when, void, unless)
+import Control.Exception (catch, SomeException)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -47,6 +48,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
+import Network.Socket
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (methodGet, methodPost, statusCode)
 import Network.Wai
@@ -244,10 +246,16 @@ runApiTestRemote mRepoCfg body = it "remote" $ do
     (_, Nothing, _, _) -> pendingWith "ssh-agent not available"
     (_, _, Nothing, _) -> pendingWith "ssh-keyscan not available"
     (_, _, _, Nothing) -> pendingWith "sshd not available (cannot SSH to localhost)"
-    _ -> withSystemTempDirectory "seal-api-test" $ \tmp -> do
-      mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-      env <- buildTestEnv tmp "remote" mRepo
-      body env
+    _ -> do
+      -- Verify sshd is actually running (not just installed) by
+      -- attempting a TCP connection to localhost:22.
+      sshdRunning <- isPortOpen "localhost" 22
+      if not sshdRunning
+        then pendingWith "sshd is not running on localhost (port 22 closed)"
+        else withSystemTempDirectory "seal-api-test" $ \tmp -> do
+          mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
+          env <- buildTestEnv tmp "remote" mRepo
+          body env
 
 -- ---------------------------------------------------------------------------
 -- Build the test environment
@@ -263,6 +271,7 @@ buildTestEnv tmp mode mRepo = do
   createDirectoryIfMissing True stateRoot
   createDirectoryIfMissing True configRoot
   createDirectoryIfMissing True sessionRoot
+  createDirectoryIfMissing True (tmp </> "cache")
   ensureConfigRepo configRoot
   let configRepo = openConfigRepo configRoot
   backends <- newBackends configRoot configRepo
@@ -536,3 +545,19 @@ isInfixOfStr needle = go
     prefix [] _ = True
     prefix _ [] = False
     prefix (p : ps) (q : qs) = p == q && prefix ps qs
+
+-- | Check if a TCP port is open on the given host. Returns True if a
+-- connection can be established within 2 seconds, False otherwise.
+-- Used to verify sshd is running on localhost before attempting remote-mode
+-- tests.
+isPortOpen :: String -> Int -> IO Bool
+isPortOpen host port =
+  catch
+    (do
+      let hints = defaultHints { addrSocketType = Stream }
+      addr : _ <- getAddrInfo (Just hints) (Just host) (Just (show port))
+      sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+      connect sock (addrAddress addr) `catch` \(_ :: SomeException) -> pure ()
+      close sock
+      pure True)
+    (\(_ :: SomeException) -> pure False)

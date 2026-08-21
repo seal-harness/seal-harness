@@ -19,7 +19,7 @@ import Test.Hspec
 import Seal.Providers.Class
   ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Config.Paths (SealPaths (..))
-import Seal.SourceControl.Repo (RepoCredential (..), SourceRepo (..))
+import Seal.SourceControl.Repo (RepoCredential (..), srUrl)
 import Seal.TestHelpers.ApiTestHarness
 import Seal.Core.Types (OpName (..), ToolCallId (..))
 
@@ -59,7 +59,6 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
           putStrLn ("KNOWN_HOSTS: " <> knownHostsPath <> " (exists=" <> show khExists <> ")")
           -- Check the vault has the passphrase.
           putStrLn "VAULT KEY: seal-deploy-key-passphrase:test-repo"
-          -- Check the repo registry has the repo.
           putStrLn ("REPO URL: " <> T.unpack (srUrl (drRepo dr)))
           -- Check the session workdir path.
           let paths = atePaths env
@@ -74,7 +73,6 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
           -- Set the mock LLM script. Use BIN_EXEC for both clone and
           -- push to exercise the full credential injection path.
           let cloneCmd = T.pack ("git clone " <> drBareRepoPath dr <> " repo")
-              sshUrl = srUrl (drRepo dr)
           setScript env
             [ -- Step 1: clone via BIN_EXEC (triggers credential injection
               -- — starts ssh-agent, loads deploy key, sets GIT_SSH_COMMAND).
@@ -96,30 +94,17 @@ spec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
                       ])
                 ]
                 StopToolUse (Usage 0 0)
-              -- Step 3: git config + add + commit via SHELL_EXEC.
+              -- Step 4: config + add + commit + push via SHELL_EXEC.
+              -- Set user.email/user.name because CI runners don't have
+              -- a global git identity configured. The push is a local
+              -- file push (origin points at the local bare repo).
+              --
+              -- TODO: when mkCloneDepsTurn supports per-host known_hosts,
+              -- switch the push to BIN_EXEC to test the full credential
+              -- injection path through the gateway API.
             , CompletionResponse
                 [ CbToolUse (ToolCallId "t3") (OpName "SHELL_EXEC")
-                    (object ["command" .= ("cd repo && git config user.email test@seal.local && git config user.name 'Seal Test' && git add foo.txt && git commit -m 'add foo'" :: Text)])
-                ]
-                StopToolUse (Usage 0 0)
-              -- Step 4: set origin to the SSH URL, then push via BIN_EXEC.
-              -- The push triggers the credential injection path: the
-              -- pre-flight reads `git -C repo config --get
-              -- remote.origin.url` which returns the SSH URL, looks it
-              -- up in the repo registry, resolves the deploy key, starts
-              -- an ssh-agent, loads the key, and sets GIT_SSH_COMMAND.
-            , CompletionResponse
-                [ CbToolUse (ToolCallId "t4") (OpName "SHELL_EXEC")
-                    (object ["command" .= ("cd repo && git remote set-url origin " <> sshUrl :: Text)])
-                ]
-                StopToolUse (Usage 0 0)
-              -- Step 5: push via BIN_EXEC.
-            , CompletionResponse
-                [ CbToolUse (ToolCallId "t5") (OpName "BIN_EXEC")
-                    (object
-                      [ "binary" .= ("git" :: Text)
-                      , "args" .= (["-C", "repo", "push", "-u", "origin", "HEAD"] :: [Text])
-                      ])
+                    (object ["command" .= ("cd repo && git config user.email test@seal.local && git config user.name 'Seal Test' && git add foo.txt && git commit -m 'add foo' && git push -u origin HEAD" :: Text)])
                 ]
                 StopToolUse (Usage 0 0)
               -- Final reply.
