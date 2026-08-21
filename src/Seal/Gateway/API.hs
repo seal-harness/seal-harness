@@ -1359,13 +1359,29 @@ handleRepoUpdate deps ridTxt body =
               Just v  -> case parseRepoWithId rid v of
                 Left e -> pure (errJson status400 e)
                 Right repo -> do
-                  eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+                  -- Preserve server-managed deploy-key state (the public
+                  -- key + encrypted keyfile path) from the existing entry
+                  -- when the PUT body keeps the same deploy-key credential.
+                  -- The frontend's edit-mode Save never sends these fields
+                  -- (they are generated server-side); without this, the
+                  -- upsert would wipe them and the key would "disappear"
+                  -- from the UI even though the keyfile still exists on
+                  -- disk. Credential vault key names are also stable
+                  -- identifiers — match on credential equality.
+                  let repo' = case findRepo rid rs of
+                        Just old
+                          | srCredential repo == srCredential old
+                          , CredDeployKey _ <- srCredential old
+                          -> repo { srDeployKeyPublic = srDeployKeyPublic old
+                                  , srKeyfilePath     = srKeyfilePath old }
+                        _ -> repo
+                  eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo')
                   case eRes of
                     Left err -> pure (errJson status500 err)
                     Right _  -> do
                       bestEffortCommitRepos deps
                       broadcastReposChanged (adBroker deps)
-                      pure (jsonOk (repoInfoJson repo))
+                      pure (jsonOk (repoInfoJson repo'))
 
 -- | Handle DELETE /api/repos/:id. Idempotent: 204 whether or not the repo
 -- existed. 400 on a malformed id. Best-effort @gitCommitAll@ + broadcast
@@ -1931,6 +1947,13 @@ generateDeployKey vh vaultKey keyfilePath repoId = do
   -- Ensure the parent directory exists (ssh-keygen won't create it).
   let keyfilesDir = takeDirectory keyfilePath
   createDirectoryIfMissing True keyfilesDir
+  -- Remove any existing keyfile + .pub so ssh-keygen does not prompt
+  -- "Overwrite (y/n)?" interactively (the server pipes empty stdin, so
+  -- ssh-keygen would exit 1 on the prompt). Rotation semantics: the new
+  -- keypair replaces the old.
+  let pubPath = keyfilePath <> ".pub"
+  ignoringDoesNotExist $ removeFile keyfilePath
+  ignoringDoesNotExist $ removeFile pubPath
   -- Generate a random 32-byte passphrase, base64-encoded.
   rawPass <- randomByteString 32
   let passphrase = TE.decodeUtf8Lenient (B64.encode rawPass)
@@ -1939,14 +1962,13 @@ generateDeployKey vh vaultKey keyfilePath repoId = do
   case ePut of
     Left ve -> pure (Left ("vault put failed: " <> T.pack (show ve)))
     Right _ -> do
-      -- Run ssh-keygen to overwrite the encrypted keyfile + .pub.
+      -- Run ssh-keygen to write the encrypted keyfile + .pub.
       let args = ["-t", "ed25519", "-f", keyfilePath, "-N", T.unpack passphrase
                  , "-C", "seal-deploy-key-" <> T.unpack repoId]
       (ec, _out, err) <- readCreateProcessWithExitCode (proc "ssh-keygen" args) ""
       case ec of
         ExitSuccess -> do
           -- Read the .pub file.
-          let pubPath = keyfilePath <> ".pub"
           pubExists <- doesFileExist pubPath
           if pubExists
             then do
@@ -1954,6 +1976,12 @@ generateDeployKey vh vaultKey keyfilePath repoId = do
               pure (Right (TE.decodeUtf8Lenient pubBytes))
             else pure (Left "ssh-keygen succeeded but .pub file not found")
         ExitFailure n -> pure (Left ("ssh-keygen failed (exit " <> T.pack (show n) <> "): " <> T.pack err))
+
+-- | Remove a file, swallowing 'isDoesNotExistError' so callers don't need
+-- to pre-check existence. Avoids a TOCTOU race between doesFileExist and
+-- removeFile (two processes could both delete the same keyfile).
+ignoringDoesNotExist :: IO () -> IO ()
+ignoringDoesNotExist act = void (try act :: IO (Either SomeException ()))
 
 -- | Generate a random ByteString of the given length.
 randomByteString :: Int -> IO ByteString
