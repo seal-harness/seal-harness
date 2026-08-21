@@ -323,8 +323,9 @@ buildTestEnv tmp mode mRepo = do
   -- Security config: remote mode needs untrusted_execution.remote.
   -- Write it to security.toml so runTurnBody picks it up (the turn
   -- engine loads SecurityConfig from disk, not from ApiDeps).
+  currentUser <- if mode == "remote" then whoami else pure ""
   let secCfg = if mode == "remote"
-        then buildRemoteSecurityConfig tmp
+        then buildRemoteSecurityConfig tmp currentUser
         else defaultSecurityConfig
   saveSecurityConfig (securityFilePath paths) secCfg
 
@@ -387,14 +388,14 @@ buildTestEnv tmp mode mRepo = do
     }
 
 -- | Build a SecurityConfig for remote mode (SSH to localhost).
-buildRemoteSecurityConfig :: FilePath -> SecurityConfig
-buildRemoteSecurityConfig tmp =
+buildRemoteSecurityConfig :: FilePath -> String -> SecurityConfig
+buildRemoteSecurityConfig tmp user =
   defaultSecurityConfig
     { scUntrustedExec = Just UntrustedExecFileConfig
         { uefcMode = "remote"
         , uefcRemote = Just UntrustedExecRemoteFileConfig
             { uerfcHost = Just "localhost"
-            , uerfcUser = Nothing  -- defaults to current user
+            , uerfcUser = Just (T.pack user)
             , uerfcPort = Nothing
             , uerfcIdentity = Nothing
             , uerfcKnownHosts = Just (tmp </> "state" </> "repos" </> "keys" </> "known_hosts")
