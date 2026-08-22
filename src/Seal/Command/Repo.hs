@@ -22,6 +22,7 @@ module Seal.Command.Repo
   , RepoTestSeam (..)
   ) where
 
+import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -55,6 +56,9 @@ data RepoTestSeam = RepoTestSeam
     -- ^ The @git ls-remote@ seam (production: 'lsRemoteRepo').
   , rtsVaultList :: IO (Either VaultError [Text])
     -- ^ The vault key list (production: 'vhList') for the /repo info advisory.
+  , rtsVaultPut :: Text -> ByteString -> IO (Either VaultError ())
+    -- ^ The vault put seam (production: 'vhPut') for /repo add's PAT/MachineUser
+    -- token ingestion (hidden stdin prompt → vault, never argv/disk).
   }
 
 ----------------------------------------------------------------------------
