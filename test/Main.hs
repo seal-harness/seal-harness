@@ -154,6 +154,7 @@ import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
 import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
+import qualified Seal.ISA.Ops.BinGhSpec
 import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
@@ -317,6 +318,7 @@ main = hspec $ do
   Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
   Seal.ISA.Ops.BinSpec.spec
+  Seal.ISA.Ops.BinGhSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
   Seal.RepoDiscoverySpec.spec

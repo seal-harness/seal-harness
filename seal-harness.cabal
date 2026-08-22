@@ -485,6 +485,7 @@ test-suite tests
         Seal.ISA.Ops.ProcessSpec
         Seal.ISA.Ops.BinGitSpec
         Seal.ISA.Ops.BinSpec
+        Seal.ISA.Ops.BinGhSpec
         Seal.ISA.Ops.SearchSpec
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec
