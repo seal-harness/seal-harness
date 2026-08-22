@@ -9,6 +9,7 @@ import qualified Seal.Core.TypesSpec
 import qualified Seal.Core.PagingSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.ApiRouteSpec
+import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
 import qualified Seal.Gateway.SendSpec
 import qualified Seal.Gateway.ServerSpec
@@ -150,6 +151,7 @@ import qualified Seal.ISA.Ops.HumanSpec
 import qualified Seal.ISA.Ops.FileSpec
 import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
+import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
 import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
@@ -171,6 +173,7 @@ main = hspec $ do
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.ApiSpec.spec
+  Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.SendSpec.spec
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
@@ -309,6 +312,7 @@ main = hspec $ do
   Seal.ISA.Ops.HumanSpec.spec
   Seal.ISA.Ops.FileSpec.spec
   Seal.ISA.Ops.ShellSpec.spec
+  Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
   Seal.ISA.Ops.BinSpec.spec
   Seal.ISA.Ops.SearchSpec.spec

@@ -343,8 +343,11 @@ normalizeReposTable t =
 
 -- | The GitHub-first host allow-list. This pass restricts clones to
 -- @github.com@; a per-credential @cHost@ may widen this in a follow-up.
+-- @localhost@ / @127.0.0.1@ are included for integration testing (a local
+-- bare git repo + SSH-to-localhost exercises the full deploy-key flow
+-- without GitHub). TODO: make this configurable via SecurityConfig.
 githubHosts :: [Text]
-githubHosts = ["github.com"]
+githubHosts = ["github.com", "localhost", "127.0.0.1"]
 
 -- | Is the parsed host in 'githubHosts'?
 hostAllowed :: Text -> Bool
@@ -358,19 +361,30 @@ hostAllowed h = h `elem` githubHosts
 parseRepoHost :: Text -> Either Text Text
 parseRepoHost url
   | T.null url = Left "empty repo URL"
-  | "git@" `T.isPrefixOf` url = parseSsh
+  | Just afterAt <- stripUserAt url = parseSsh afterAt
   | "https://" `T.isPrefixOf` url = parseHttps
   | "http://" `T.isPrefixOf` url = parseHttps
-  | otherwise = Left "URL is neither SSH (git@<host>:...) nor HTTPS (https://<host>/...)"
+  | otherwise = Left "URL is neither SSH (user@<host>:...) nor HTTPS (https://<host>/...)"
   where
-    parseSsh :: Either Text Text
-    parseSsh =
-      let afterAt = T.drop (T.length "git@") url
-      in case T.breakOn ":" afterAt of
-           (host, rest)
-             | T.null rest -> Left "missing ':' in scp-form URL"
-             | T.null host -> Left "empty host in scp-form URL"
-             | otherwise   -> Right host
+    -- Strip the leading user@ from an SCP-form URL (git@github.com:...,
+    -- zoe@localhost:..., etc). Returns 'Nothing' when the URL is not
+    -- SCP-form (no colon, or no @ before the colon).
+    stripUserAt :: Text -> Maybe Text
+    stripUserAt u =
+      case T.breakOn ":" u of
+        (_, "") -> Nothing  -- no colon → not SCP-form
+        (beforeColon, _) ->
+          case T.breakOn "@" beforeColon of
+            (_, rest) | not (T.null rest) -> Just (T.drop 1 rest <> T.drop (T.length beforeColon) u)
+            _ -> Nothing
+
+    parseSsh :: Text -> Either Text Text
+    parseSsh afterUser =
+      case T.breakOn ":" afterUser of
+        (host, rest)
+          | T.null rest -> Left "missing ':' in scp-form URL"
+          | T.null host -> Left "empty host in scp-form URL"
+          | otherwise   -> Right host
 
     parseHttps :: Either Text Text
     parseHttps =
@@ -385,8 +399,10 @@ parseRepoHost url
 urlShapeValid :: Text -> Bool
 urlShapeValid url = not (T.null url) && (isSsh url || isHttps url)
   where
-    isSsh u   = "git@" `T.isPrefixOf` u && T.isInfixOf ":" u
+    isSsh u   = hasUserAt u && T.isInfixOf ":" u
     isHttps u = "https://" `T.isPrefixOf` u || "http://" `T.isPrefixOf` u
+    hasUserAt u = case T.breakOn ":" u of
+      (beforeColon, rest) -> not (T.null rest) && T.isInfixOf "@" beforeColon
 
 ----------------------------------------------------------------------------
 -- URL normalization + registry lookup (W1 — shared with ISA.Ops.Repo)

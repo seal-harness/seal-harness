@@ -37,6 +37,7 @@ module Seal.Tools.Exec.UIO.Internal
   , uioShellExecEnv
   , uioShellExecGitEnv
   , uioBinExecEnv
+  , uioBinExecGitEnv
   , uioLiftIO
   , uioUntrustedIO
   , WriteMode (..)
@@ -70,7 +71,7 @@ import Seal.Tools.Exec.UntrustedIO
 import Seal.Tools.Exec.UntrustedIO qualified as UIORec
   ( uioReadFile, uioWriteFile, uioPatchFile, uioShellExec, uioBinExec
   , uioProcessList, uioProcessKill, uioSearchFiles
-  , uioShellExecEnv, uioShellExecGitEnv, uioBinExecEnv )
+  , uioShellExecEnv, uioShellExecGitEnv, uioBinExecEnv, uioBinExecGitEnv )
 
 -- | The restricted monad. Exposes 'Functor', 'Applicative', 'Monad' — and
 -- deliberately **no** 'MonadIO', no 'MonadReader', no 'MonadThrow', no
@@ -218,6 +219,16 @@ uioBinExecEnv :: [(String, String)] -> BinName -> [BinArg] -> Maybe RemotePath
 uioBinExecEnv extras bin bargs mCwd = UIO $ do
   env <- ask
   liftIO' (UIORec.uioBinExecEnv (uieUntrustedIO env) extras bin bargs mCwd)
+
+-- | Like 'uioBinExecEnv' but with optional @known_hosts@ content for the
+-- REMOTE deploy-key path (mirrors 'uioShellExecGitEnv'). Used by BIN_EXEC
+-- when @binary == "git"@ and the cwd is inside a registered repo with a
+-- deploy-key credential.
+uioBinExecGitEnv :: [(String, String)] -> Maybe ByteString -> BinName -> [BinArg]
+                 -> Maybe RemotePath -> UIO (Either UntrustedErr Text)
+uioBinExecGitEnv extras mKnownHosts bin bargs mCwd = UIO $ do
+  env <- ask
+  liftIO' (UIORec.uioBinExecGitEnv (uieUntrustedIO env) extras mKnownHosts bin bargs mCwd)
 
 -- | Internal: lift an 'IO' action into the 'ReaderT' carrier. This is the
 -- ONE place 'liftIO' is used in this module — it is NOT exposed to opcode

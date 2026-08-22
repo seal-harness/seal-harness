@@ -327,6 +327,7 @@ test-suite tests
         Seal.Gateway.ConfigSpec
         Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
+        Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.SendSpec
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
@@ -461,10 +462,12 @@ test-suite tests
         Seal.TestHelpers.CompileFail
         Seal.TestHelpers.FakeCaps
         Seal.TestHelpers.FakeChannel
-       Seal.TestHelpers.FakeRegistry
-       Seal.TestHelpers.FakeVault
-       Seal.TestHelpers.FixtureRepo
-       Seal.TestHelpers.FreePort
+        Seal.TestHelpers.FakeRegistry
+        Seal.TestHelpers.FakeVault
+        Seal.TestHelpers.FixtureRepo
+        Seal.TestHelpers.FreePort
+        Seal.TestHelpers.ScriptProvider
+        Seal.TestHelpers.ApiTestHarness
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
@@ -479,6 +482,7 @@ test-suite tests
         Seal.ISA.Ops.FileSpec
         Seal.ISA.Ops.ShellSpec
         Seal.ISA.Ops.ProcessSpec
+        Seal.ISA.Ops.BinGitSpec
         Seal.ISA.Ops.BinSpec
         Seal.ISA.Ops.SearchSpec
         Seal.ISA.Ops.PatchSpec

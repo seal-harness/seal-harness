@@ -27,7 +27,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -66,7 +66,7 @@ import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
 import Seal.Security.Vault (VaultHandle)
-import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
@@ -2564,6 +2564,106 @@ spec = describe "Seal.Gateway.API" $ do
               _ -> expectationFailure "expected credential object"
           _ -> expectationFailure "expected JSON object for PUT repo"
 
+    it "PUT /api/repos/:id preserves deploy_key_public + keyfile_path from the existing entry" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        -- Regression: handleRepoUpdate parsed a fresh SourceRepo from the
+        -- PUT body with srDeployKeyPublic=Nothing, srKeyfilePath=Nothing,
+        -- then upsertRepo replaced the entry — wiping the deploy-key state
+        -- even though the keyfile still existed on disk. The frontend
+        -- triggers this when, after creating a deploy-key repo, the user
+        -- clicks Save in the (now-edit) form.
+        keygenExe <- findExecutable "ssh-keygen"
+        case keygenExe of
+          Nothing -> pendingWith "ssh-keygen not available in this environment"
+          Just _  -> pure ()
+        vault <- makeFakeVaultRuntime []
+        let paths = fakePaths { spState = tmp }
+            mkDeps = do
+              tabsH <- newTabsHandle
+              reg   <- newHarnessRegistry
+              adb   <- noneBackend
+              skills <- Skill.noneBackend
+              activeRef <- newIORef fakeMeta
+              uiState <- newUiStateHandle paths
+              repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+              let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+              pure ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adSkills          = skills
+                , adProviders       = pure knownProviders
+                , adUiState         = uiState
+                , adSend            = Nothing
+                , adDefaultAgent    = pure Nothing
+                , adBroker          = Nothing
+                , adTabCloseNotifier = noTabCloseNotifier
+                , adRepoRegistry     = repoRegH
+                , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = vault
+                , adPaths            = paths
+                , adWsPort           = 8081
+                , adAbortReg         = testAbortReg
+                , adSecurityConfig   = defaultSecurityConfig
+                , adMkSessionExec    = Nothing
+                }
+        deps <- mkDeps
+        let app = apiApp deps
+        -- Create a deploy-key repo with generate_key=true.
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"           .= ("dkr" :: T.Text)
+            , "url"          .= ("git@github.com:owner/dkr.git" :: T.Text)
+            , "vcs_kind"     .= ("git" :: T.Text)
+            , "generate_key" .= True
+            , "credential"   .= A.object
+                [ "kind"      .= ("deploy_key" :: T.Text)
+                , "vault_key" .= ("seal-deploy-key-passphrase:dkr" :: T.Text)
+                ]
+            ]))
+        (createSt, createBody) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        let initialPub = case A.decode createBody :: Maybe A.Value of
+              Just (A.Object o) -> case lookupK "deploy_key_public" o of
+                Just (A.String pk) -> Just pk
+                _ -> Nothing
+              _ -> Nothing
+        case initialPub of
+          Nothing -> expectationFailure "expected deploy_key_public after create"
+          Just _  -> pure ()
+        -- PUT a body the way the frontend's edit-mode Save does: NO
+        -- deploy_key_public, NO keyfile_path, NO generate_key.
+        putReq <- testPut ["api", "repos", "dkr"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/dkr.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("deploy_key" :: T.Text)
+                , "vault_key" .= ("seal-deploy-key-passphrase:dkr" :: T.Text)
+                ]
+            ]))
+        (putSt, putBody) <- runAppBody app putReq
+        putSt `shouldBe` 200
+        -- The deploy_key_public + keyfile_path must survive the PUT.
+        case A.decode putBody :: Maybe A.Value of
+          Just (A.Object o) -> do
+            case lookupK "deploy_key_public" o of
+              Just (A.String pk) -> pk `shouldBe` fromJust initialPub
+              _ -> expectationFailure "deploy_key_public was wiped by PUT"
+            case lookupK "keyfile_path" o of
+              Just (A.String _) -> pure ()
+              _ -> expectationFailure "keyfile_path was wiped by PUT"
+          _ -> expectationFailure "expected JSON object after PUT"
+        -- And the registry (GET) must still carry the fields.
+        (_, getBody) <- runAppBody app (testRequest methodGet ["api", "repos", "dkr"])
+        case A.decode getBody :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "deploy_key_public" o of
+            Just (A.String pk) -> pk `shouldBe` fromJust initialPub
+            _ -> expectationFailure "deploy_key_public missing from GET after PUT"
+          _ -> expectationFailure "expected JSON object for GET after PUT"
+
     it "DELETE /api/repos/:id returns 204 and is idempotent" $
       withSystemTempDirectory "seal-repos" $ \tmp -> do
         deps <- mkRepoApp tmp
@@ -2650,6 +2750,91 @@ spec = describe "Seal.Gateway.API" $ do
         (_, oneBody) <- runAppBody app (testRequest methodGet ["api", "repos", "sec"])
         let oneText = T.pack (BC.unpack (BL.toStrict oneBody))
         secretValue `T.isInfixOf` oneText `shouldBe` False
+
+    it "POST /api/repos with generate_key=true twice (re-register deploy-key repo) overwrites the keyfile without ssh-keygen prompting" $
+      withSystemTempDirectory "seal-repos" $ \tmp -> do
+        -- ssh-keygen prompts "Overwrite (y/n)?" interactively when the
+        -- keyfile already exists; the server pipes empty stdin, so ssh-keygen
+        -- exits 1 and the POST returns 500. The handler must remove the
+        -- existing keyfile + .pub before invoking ssh-keygen.
+        keygenExe <- findExecutable "ssh-keygen"
+        case keygenExe of
+          Nothing -> pendingWith "ssh-keygen not available in this environment"
+          Just _  -> pure ()
+        -- An UNLOCKED in-memory vault (deploy-key generation writes the
+        -- passphrase via vhPut) + real adPaths pointing at the tmp dir so
+        -- repoKeysDir resolves to a writable location.
+        vault <- makeFakeVaultRuntime []
+        let paths = fakePaths { spState = tmp }
+            mkDeps = do
+              tabsH <- newTabsHandle
+              reg   <- newHarnessRegistry
+              adb   <- noneBackend
+              skills <- Skill.noneBackend
+              activeRef <- newIORef fakeMeta
+              uiState <- newUiStateHandle paths
+              repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+              let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+              pure ApiDeps
+                { adSessionRuntime  = sr
+                , adTabsHandle      = tabsH
+                , adHarnessRegistry = reg
+                , adAdoptConsent    = Just CcWeb
+                , adAgentDefs       = adb
+                , adSkills          = skills
+                , adProviders       = pure knownProviders
+                , adUiState         = uiState
+                , adSend            = Nothing
+                , adDefaultAgent    = pure Nothing
+                , adBroker          = Nothing
+                , adTabCloseNotifier = noTabCloseNotifier
+                , adRepoRegistry     = repoRegH
+                , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = vault
+                , adPaths            = paths
+                , adWsPort           = 8081
+                , adAbortReg         = testAbortReg
+                , adSecurityConfig   = defaultSecurityConfig
+                , adMkSessionExec    = Nothing
+                }
+        deps <- mkDeps
+        let app = apiApp deps
+        let postRepo = testPost ["api", "repos"]
+              (A.encode (A.object
+                [ "id"           .= ("dkr" :: T.Text)
+                , "url"          .= ("git@github.com:owner/dkr.git" :: T.Text)
+                , "vcs_kind"     .= ("git" :: T.Text)
+                , "generate_key" .= True
+                , "credential"   .= A.object
+                    [ "kind"      .= ("deploy_key" :: T.Text)
+                    , "vault_key" .= ("seal-deploy-key-passphrase:dkr" :: T.Text)
+                    ]
+                ]))
+        -- First POST → 201 with a public key.
+        req1 <- postRepo
+        (st1, body1) <- runAppBody app req1
+        st1 `shouldBe` 201
+        case A.decode body1 :: Maybe A.Value of
+          Just (A.Object o) ->
+            case lookupK "deploy_key_public" o of
+              Just (A.String pk) -> T.length pk `shouldSatisfy` (> 0)
+              _ -> expectationFailure "expected deploy_key_public string after first POST"
+          _ -> expectationFailure "expected JSON object after first POST"
+        -- The encrypted keyfile + .pub must exist on disk.
+        let keyfile = tmp </> "repos" </> "keys" </> "dkr"
+        doesFileExist keyfile      `shouldReturn` True
+        doesFileExist (keyfile <> ".pub") `shouldReturn` True
+        -- Second POST (re-register, same id) → must NOT 500. Before the fix
+        -- ssh-keygen prompted "Overwrite (y/n)?", read EOF, exited 1.
+        req2 <- postRepo
+        (st2, body2) <- runAppBody app req2
+        st2 `shouldBe` 201
+        case A.decode body2 :: Maybe A.Value of
+          Just (A.Object o) ->
+            case lookupK "deploy_key_public" o of
+              Just (A.String pk) -> T.length pk `shouldSatisfy` (> 0)
+              _ -> expectationFailure "expected deploy_key_public string after second POST"
+          _ -> expectationFailure "expected JSON object after second POST"
 
     it "GET /api/repos surfaces a corrupt repos.toml as 500 (NOT empty 200)" $ do
       -- Build an ApiDeps whose adRepoRegistry returns Left on rrhList
