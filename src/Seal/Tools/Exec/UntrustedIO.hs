@@ -41,6 +41,7 @@ module Seal.Tools.Exec.UntrustedIO
   , shellQuote
   , renderEnvPrefix
   , mergeEnv
+  , logExecDebug
   ) where
 
 import Control.Exception (IOException, try)

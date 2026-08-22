@@ -26,6 +26,7 @@ import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
+import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
@@ -189,6 +190,7 @@ main = hspec $ do
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
+  Seal.Tools.Exec.LogRedactionSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Ssh.AgentSpec.spec
