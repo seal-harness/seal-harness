@@ -11,7 +11,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Set qualified as Set
 import Test.Hspec
-import Test.QuickCheck (property, (==>))
+import Test.QuickCheck (property)
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun, uoAuthorize)
@@ -27,6 +27,7 @@ import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
 import Seal.Logging.Logger (testSealLogger)
+import Seal.TestHelpers.Arbitrary ()  -- Arbitrary Text
 
 -- | Local replacement for the removed uoRunLegacy: runs the opcode's uoRun
 -- in a UIOEnv built from the UntrustedIO + optional CloneDeps.

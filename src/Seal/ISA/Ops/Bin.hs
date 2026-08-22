@@ -28,6 +28,7 @@
 module Seal.ISA.Ops.Bin
   ( binExecOp
   , binExecSchema
+  , extractGhRepoFlag
   ) where
 
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
@@ -320,4 +321,38 @@ extractGitDir = go
       = Just (T.drop 2 x)
       | "--git-dir=" `T.isPrefixOf` x
       = Just (T.drop (T.length "--git-dir=") x)
+      | otherwise = go xs
+
+-- | Extract the @-R owner\/repo@ or @--repo owner\/repo@ value from a
+-- @gh@ argv list. Returns 'Just' the first value or 'Nothing' when
+-- neither flag is present. @gh@ (cobra/pflag) accepts four forms:
+--
+--   * @-R value@ (space-separated short)
+--   * @-Rvalue@ (joined short — pflag supports this for string
+--     shorthand flags)
+--   * @--repo value@ (space-separated long)
+--   * @--repo=value@ (joined long with @=@)
+--
+-- Scans the ENTIRE argv (global flags may appear after the subcommand:
+-- @gh pr create -R owner\/repo@ is valid). Only the first occurrence is
+-- used (the return value is only used for the "is @-R@ present?" skip
+-- decision, not for credential lookup — first-vs-last is irrelevant).
+-- Mirrors 'extractGitDir' (which handles both space and joined forms for
+-- @-C@ / @--git-dir=@).
+extractGhRepoFlag :: [Text] -> Maybe Text
+extractGhRepoFlag = go
+  where
+    go [] = Nothing
+    go (x : xs)
+      | x == "-R" = case xs of
+          (v : _) -> Just v
+          []      -> Nothing
+      | "-R" `T.isPrefixOf` x
+      , x /= "-R"
+      = Just (T.drop 2 x)
+      | x == "--repo" = case xs of
+          (v : _) -> Just v
+          []      -> Nothing
+      | "--repo=" `T.isPrefixOf` x
+      = Just (T.drop (T.length "--repo=") x)
       | otherwise = go xs
