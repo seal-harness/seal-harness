@@ -315,6 +315,18 @@ data CloneEnv = CloneEnv
     -- 'Nothing' otherwise (the local arm writes its own temp file). The
     -- remote arm of 'uioShellExecGitEnv' writes this to a remote temp
     -- file + rewrites @GIT_SSH_COMMAND@ to reference it.
+  , ceRawToken :: Maybe ByteString
+    -- ^ The raw PAT/MachineUser token bytes for the @gh@ credential
+    -- injection path (design §3.4 Option A). 'Just' the raw bytes for
+    -- PAT/MachineUser (the @gh@ path injects @GH_TOKEN@ from these
+    -- bytes); 'Nothing' for deploy keys (@gh@ can't use SSH, falls
+    -- through to plain exec). The @git@ path ignores this field (it
+    -- uses 'ceGitConfigArgs' for the base64 @http.extraHeader@). Same
+    -- security category as 'ceGitConfigArgs' (which carries the
+    -- base64-encoded header — trivially reversible); CPS-scoped via
+    -- 'withCloneTarget' (the value is only obtainable inside the
+    -- continuation). 'CloneEnv' has NO 'Show' instance by design — a
+    -- stray @show@/log/exception cannot leak any field.
   , ceCleanup :: IO ()
     -- ^ Removes the per-op @known_hosts@ temp file + kills the agent. Run
     -- by 'withCloneTarget' after the continuation (bracket — on success AND
@@ -372,6 +384,7 @@ resolveCloneTarget deps repo =
                       , ceSshCommand = Nothing
                       , ceEnvExtras = envExtras
                       , ceKnownHostsContent = Nothing
+                      , ceRawToken = Just tokenBytes
                       , ceCleanup = pure ()
                       }
                 pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
@@ -438,6 +451,7 @@ resolveCloneTarget deps repo =
                           , ceSshCommand = Nothing
                           , ceEnvExtras = envExtras
                           , ceKnownHostsContent = Nothing
+                          , ceRawToken = Nothing
                           , ceCleanup = pure ()
                           }
                     pure (Right CloneTarget { ctEnv = env, ctCleanup = pure () })
@@ -477,6 +491,7 @@ resolveCloneTarget deps repo =
                           , ceSshCommand = Just sshCmd
                           , ceEnvExtras = authEnv ++ envExtras
                           , ceKnownHostsContent = Nothing
+                          , ceRawToken = Nothing
                           , ceCleanup = knownHostsCleanup
                           }
                     pure (Right CloneTarget { ctEnv = env, ctCleanup = knownHostsCleanup })
