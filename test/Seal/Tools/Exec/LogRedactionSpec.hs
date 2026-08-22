@@ -9,7 +9,8 @@
 --
 -- Strategy: install a capture scribe as the process-global logger via
 -- 'setGlobalLogger' (the same seam 'logExecDebug' uses via 'globalLogIO'),
--- call 'logExecDebug' with secret-bearing extras, assert the captured
+-- call 'logExecDebug' (directly, and via the remote-arm 'uioBinExecEnv'
+-- which routes through 'runRemoteShellTextEnv'), assert the captured
 -- log lines contain @KEY=<redacted>@ and NOT the raw secret. The global
 -- logger is restored to the no-op default via 'unsetGlobalLogger' after
 -- each test so subsequent tests are unaffected.
@@ -22,7 +23,12 @@ import Test.Hspec
 
 import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
 import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
-import Seal.Tools.Exec.UntrustedIO (logExecDebug)
+import Seal.Tools.Args (mkBinArg, mkBinName)
+import Seal.Tools.Exec.Remote (mkFakeRemoteRunner)
+import Seal.Tools.Exec.Types
+  ( SshConfig (..), mkRemotePath, mkSshHost, mkSshUser
+  )
+import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), logExecDebug, mkRemoteUntrustedIO)
 
 import Katip (Severity (..), Scribe (..), permitItem, jsonFormat, Verbosity (V2))
 
@@ -96,25 +102,35 @@ spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug redaction" $ do
     allText `shouldSatisfy` ("GIT_TERMINAL_PROMPT=0" `T.isInfixOf`)
     allText `shouldSatisfy` ("SSH_AUTH_SOCK=/tmp/agent.sock" `T.isInfixOf`)
 
-  it "redacts the baked env prefix in the remote arm's logged argv" $ do
-    -- The remote arm builds the command as @env GH_TOKEN='<token>' gh ...@
-    -- and passes the full command string as a single argv element to
-    -- 'logExecDebug'. The redaction must apply to the argv rendering too
-    -- (the token is in argv, not extras, on the remote arm). We simulate
-    -- the remote-arm call shape: argv carries the baked env prefix,
-    -- extras is empty (the pre-redaction shape from 'runRemoteShellText').
-    -- After the fix, the remote arm passes the secret extras separately
-    -- so 'logExecDebug' redacts them and the logged argv omits the env
-    -- prefix. This test asserts the INVARIANT: the logged message must
-    -- not contain the raw token, regardless of which arm produced it.
+  it "redacts the token in the remote arm's logged message (uioBinExecEnv)" $ do
+    -- The remote arm's 'uioBinExecEnv' builds the command with an
+    -- @env GH_TOKEN='<token>'@ prefix baked into the SSH command string.
+    -- 'runRemoteShellTextEnv' splits the env prefix out of the logged
+    -- argv and passes the extras separately to 'logExecDebug', which
+    -- redacts them. The INVARIANT: the logged message must not contain
+    -- the raw token. This exercises the real remote-arm path with a fake
+    -- runner (so no real SSH call is made) + the capture global logger.
+    let runner = mkFakeRemoteRunner (Right "")
+        uio = mkRemoteUntrustedIO sshCfg runner
+    bin <- either (const (error "fixture")) pure (mkBinName "gh")
+    arg <- either (const (error "fixture")) pure (mkBinArg "pr")
     (_, lines_) <- withCaptureGlobalLogger $
-      logExecDebug "[remote ssh]"
-        [ "ssh", "-o", "StrictHostKeyChecking=yes"
-        , "agent@exec.internal", "--"
-        , "cd '/srv/agent-workspace' && env GH_TOKEN='ghp_secretXYZ' gh pr create"
-        ]
-        Nothing
-        [("GH_TOKEN", "ghp_secretXYZ")]
+      uioBinExecEnv uio [("GH_TOKEN", "ghp_secretXYZ")] bin [arg] Nothing
     let allText = T.unlines lines_
     allText `shouldSatisfy` ("GH_TOKEN=<redacted>" `T.isInfixOf`)
     allText `shouldNotSatisfy` ("ghp_secretXYZ" `T.isInfixOf`)
+
+-- | A placeholder SSH config for the remote-arm test (the fake runner
+-- ignores the connection details; only the workspace root matters for
+-- SafePath confinement).
+sshCfg :: SshConfig
+sshCfg = SshConfig
+  { scHost       = either (error "fixture") id (mkSshHost "exec.internal")
+  , scUser       = either (error "fixture") id (mkSshUser "agent")
+  , scPort       = 22
+  , scIdentity   = Nothing
+  , scKnownHosts = "/home/agent/.ssh/known_hosts"
+  , scWorkspace  = case mkRemotePath "/srv/agent-workspace" of
+      Right rp -> rp
+      Left e  -> error ("fixture: bad remote path: " <> T.unpack e)
+  }
