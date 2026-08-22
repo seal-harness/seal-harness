@@ -11,6 +11,7 @@ import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.PatIngestionSpec
 import qualified Seal.Gateway.SendSpec
 import qualified Seal.Gateway.ServerSpec
 import qualified Seal.Gateway.StreamBrokerSpec
@@ -176,6 +177,7 @@ main = hspec $ do
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
+  Seal.Gateway.PatIngestionSpec.spec
   Seal.Gateway.SendSpec.spec
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec

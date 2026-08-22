@@ -328,6 +328,7 @@ test-suite tests
         Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiIntegrationSpec
+        Seal.Gateway.PatIngestionSpec
         Seal.Gateway.SendSpec
         Seal.Gateway.ServerSpec
         Seal.Gateway.StreamBrokerSpec
