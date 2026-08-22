@@ -11,6 +11,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Set qualified as Set
 import Test.Hspec
+import Test.QuickCheck (property, (==>))
 
 import Seal.Core.AllowList (AllowList (..))
 import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun, uoAuthorize)
@@ -204,3 +205,63 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
         , "arg_count" .= (Nothing :: Maybe Int)
         , "cwd" .= ("subdir" :: String)
         ]
+
+  describe "extractGhRepoFlag" $ do
+
+    it "-R space-separated short: returns Just value" $
+      extractGhRepoFlag ["-R", "owner/repo", "pr", "create"]
+        `shouldBe` Just "owner/repo"
+
+    it "-R joined short (-Rvalue): returns Just value" $
+      extractGhRepoFlag ["-Rowner/repo", "pr", "create"]
+        `shouldBe` Just "owner/repo"
+
+    it "--repo space-separated long: returns Just value" $
+      extractGhRepoFlag ["--repo", "owner/repo", "pr", "create"]
+        `shouldBe` Just "owner/repo"
+
+    it "--repo= joined long: returns Just value" $
+      extractGhRepoFlag ["--repo=owner/repo", "pr", "create"]
+        `shouldBe` Just "owner/repo"
+
+    it "global flag AFTER subcommand: returns Just value" $
+      extractGhRepoFlag ["pr", "create", "-R", "owner/repo"]
+        `shouldBe` Just "owner/repo"
+
+    it "no -R/--repo flag: returns Nothing" $
+      extractGhRepoFlag ["pr", "create", "--title", "x"]
+        `shouldBe` Nothing
+
+    it "empty argv: returns Nothing" $
+      extractGhRepoFlag [] `shouldBe` Nothing
+
+    it "-R at end with no value: returns Nothing" $
+      extractGhRepoFlag ["pr", "create", "-R"] `shouldBe` Nothing
+
+    it "first -R value wins (when multiple -R flags)" $
+      extractGhRepoFlag ["-R", "first/repo", "-R", "second/repo"]
+        `shouldBe` Just "first/repo"
+
+    it "QuickCheck: never crashes, returns Just first -R/--repo value or Nothing" $
+      property $ \argv ->
+        case extractGhRepoFlag argv of
+          Just _  -> True
+          Nothing -> not (hasAnyRepoFlag argv)
+    where
+      hasAnyRepoFlag :: [Text] -> Bool
+      hasAnyRepoFlag = go
+        where
+          go [] = False
+          go (x : xs)
+            | x == "-R" = case xs of
+                (_ : _) -> True
+                []      -> False
+            | "-R" `T.isPrefixOf` x
+            , x /= "-R"
+            = True
+            | x == "--repo" = case xs of
+                (_ : _) -> True
+                []      -> False
+            | "--repo=" `T.isPrefixOf` x
+            = True
+            | otherwise = go xs
