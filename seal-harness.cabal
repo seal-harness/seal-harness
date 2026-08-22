@@ -433,19 +433,20 @@ test-suite tests
         Seal.SourceControl.AgentRegistrySpec
         Seal.SourceControl.CloneSpec
         Seal.Text.LineFileSpec
-        Seal.Tools.Ssh.AgentSpec
-        Seal.Tools.Exec.TypesSpec
-        Seal.Tools.Exec.UntrustedSpec
-        Seal.Tools.Exec.UntrustedIORemoteSpec
-        Seal.Web.UrlSafetySpec
-        Seal.Config.WorkdirSpec
-        Seal.Tools.Exec.LocalSpec
-        Seal.Tools.Exec.RemoteSpec
-         Seal.Tools.ArgsSpec
-         Seal.Tools.Exec.CapabilityScopingFailSpec
-         Seal.Tools.Exec.UIOSpec
-         Seal.Tools.Exec.UIOParitySpec
-         Seal.Tools.Exec.WorkdirFsSpec
+         Seal.Tools.Ssh.AgentSpec
+         Seal.Tools.Exec.TypesSpec
+         Seal.Tools.Exec.UntrustedSpec
+         Seal.Tools.Exec.UntrustedIORemoteSpec
+         Seal.Web.UrlSafetySpec
+         Seal.Config.WorkdirSpec
+         Seal.Tools.Exec.LocalSpec
+         Seal.Tools.Exec.RemoteSpec
+          Seal.Tools.ArgsSpec
+          Seal.Tools.Exec.CapabilityScopingFailSpec
+          Seal.Tools.Exec.UIOSpec
+          Seal.Tools.Exec.UIOParitySpec
+          Seal.Tools.Exec.WorkdirFsSpec
+          Seal.Tools.Exec.LogRedactionSpec
          Seal.ISA.Ops.UIOUnrestrictedFailSpec
          Seal.ISA.Ops.UIOConstructionFailSpec
          Seal.Tools.TimeoutSpec
@@ -484,6 +485,7 @@ test-suite tests
         Seal.ISA.Ops.ProcessSpec
         Seal.ISA.Ops.BinGitSpec
         Seal.ISA.Ops.BinSpec
+        Seal.ISA.Ops.BinGhSpec
         Seal.ISA.Ops.SearchSpec
         Seal.ISA.Ops.PatchSpec
         Seal.ISA.Ops.SecretSpec

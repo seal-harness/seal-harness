@@ -41,12 +41,17 @@ module Seal.Tools.Exec.UntrustedIO
   , shellQuote
   , renderEnvPrefix
   , mergeEnv
+  , logExecDebug
+  , secretEnvKeys
+  , redactEnv
   ) where
 
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as BS
 import Data.Char (isDigit, isSpace)
 import Data.Map.Strict qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -486,6 +491,29 @@ formatExitResult n out err =
       body  = if null parts then "" else T.intercalate "\n" parts
   in body <> "\n[exit code: " <> T.pack (show n) <> "]"
 
+-- | Env keys whose values are redacted in debug logs. These carry raw
+-- secrets injected by credential-injection paths (gh: 'GH_TOKEN';
+-- 'GITHUB_TOKEN' is the older env var that some CI runners set, shadowed
+-- by 'GH_TOKEN' at precedence; the git PAT path's 'http.extraHeader' is
+-- an argv element, not env, but is listed here for defense-in-depth so a
+-- value that accidentally reaches the env extras surface is still
+-- redacted). Add to this set as new credential-injection paths introduce
+-- new secret env keys.
+secretEnvKeys :: Set String
+secretEnvKeys = Set.fromList
+  [ "GH_TOKEN"
+  , "GITHUB_TOKEN"
+  , "http.extraHeader"
+  ]
+
+-- | Replace the values of keys in 'secretEnvKeys' with @"<redacted>"@,
+-- preserving the key (so the reader sees that an env override was
+-- applied) and redacting only the value. Keys NOT in 'secretEnvKeys' pass
+-- through unchanged.
+redactEnv :: [(String, String)] -> [(String, String)]
+redactEnv = map (\(k, v) ->
+  if k `Set.member` secretEnvKeys then (k, "<redacted>") else (k, v))
+
 -- | Emit a debug-level log line showing the exact command the UntrustedIO
 -- executor is about to run. Covers both the local arm (a fixed-argv
 -- subprocess) and the remote arm (an @ssh@ argv, including @-A@ for
@@ -503,6 +531,14 @@ formatExitResult n out err =
 -- @mode=remote@. Env overrides (e.g. @SSH_AUTH_SOCK=...@,
 -- @GIT_SSH_COMMAND=...@) are shown as @KEY=VAL@ tokens. The cwd is shown
 -- as @cd <path> &&@ when set.
+--
+-- Secret-bearing env keys (see 'secretEnvKeys') are redacted via
+-- 'redactEnv' before the @KEY=VAL@ tokens are rendered, so a value like
+-- @GH_TOKEN=ghp_secret...@ appears as @GH_TOKEN=<redacted>@ in the log.
+-- This is a defense-in-depth seam on 'logExecDebug' itself, not caller
+-- discipline — the redaction fires regardless of which arm produced the
+-- call (the remote arm passes the secret extras separately via
+-- 'runRemoteShellTextEnv' so the same redaction path covers it).
 logExecDebug :: String -> [String] -> Maybe String -> [(String, String)] -> IO ()
 logExecDebug tag argv mCwd extras =
   globalLogIO DebugS (K.ls msg)
@@ -513,7 +549,7 @@ logExecDebug tag argv mCwd extras =
       <> envPart
       <> cwdPart
       <> [ unwords (map shellQuoteArgv argv) ]
-    envPart = case extras of
+    envPart = case redactEnv extras of
       [] -> []
       xs -> [ unwords (map (\(k, v) -> k <> "=" <> v) xs) ]
     cwdPart = case mCwd of
@@ -637,17 +673,16 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
             Right sp -> runRemoteShellText runner sshCfg (buildRgCmd pat (Just sp))
     , uioShellExecEnv = \extras cmd mCwd ->
        let prefixCd p = "cd " <> shellQuote p <> " && "
-           envPrefix  = T.pack (renderEnvPrefix extras)
        in case mCwd of
-         Nothing -> runRemoteShellText runner sshCfg
-                      (T.pack (prefixCd wsRootPath) <> envPrefix
+         Nothing -> runRemoteShellTextEnv runner sshCfg extras
+                      (T.pack (prefixCd wsRootPath)
                                <> T.pack (T.unpack (textShellCommand cmd)))
          Just rp ->
            case mkSafePathRemote (wsRootFromCfg sshCfg) (T.unpack (getRemotePath rp)) of
              Left pe  -> pure (Left (UePath pe))
              Right sp ->
                let cdCmd = "cd " <> shellQuote (getSafePath sp) <> " && "
-               in runRemoteShellText runner sshCfg (T.pack cdCmd <> envPrefix <> T.pack (T.unpack (textShellCommand cmd)))
+               in runRemoteShellTextEnv runner sshCfg extras (T.pack cdCmd <> T.pack (T.unpack (textShellCommand cmd)))
     , uioShellExecGitEnv = \extras _mKnownHosts cmd mCwd ->
         -- Remote deploy-key path (simple approach): ssh -A forwards the
         -- SEAL agent to the remote machine. The remote git clone uses the
@@ -678,13 +713,12 @@ mkRemoteUntrustedIOFromRunner sshCfg runner =
                 in runRemoteShellForwardingEnvText runner sshCfg localEnv fullCmd
      , uioBinExecEnv = \extras bin bargs mCwd ->
         let argv' = T.unpack (textBinName bin) : map (T.unpack . textBinArg) bargs
-            envPrefix = T.pack (renderEnvPrefix extras)
         in case resolveBinCwd (wsRootFromCfg sshCfg) mCwd of
            Left pe  -> pure (Left (UePath pe))
            Right cwdPath ->
              let cdPart = T.pack ("cd " <> shellQuote cwdPath <> " && ")
                  cmd = T.pack (T.unpack (T.intercalate " " (map (T.pack . shellQuote) argv')))
-             in runRemoteShellText runner sshCfg (cdPart <> envPrefix <> cmd)
+             in runRemoteShellTextEnv runner sshCfg extras (cdPart <> cmd)
     , uioBinExecGitEnv = \extras _mKnownHosts bin bargs mCwd ->
         -- Remote deploy-key path: mirrors uioShellExecGitEnv. Strip
         -- SSH_AUTH_SOCK/SSH_AGENT_PID from the REMOTE env prefix (the
@@ -826,6 +860,35 @@ runRemoteShellText runner cfg cmdText =
       logExecDebug "[remote ssh]" argv Nothing []
       res <- runRemoteShell runner cfg cmd
       pure (either (Left . UeExec) Right res)
+
+-- | Like 'runRemoteShellText' but with env overrides baked into the
+-- command string for the subprocess (via 'renderEnvPrefix') while the
+-- 'logExecDebug' call receives the extras SEPARATELY so 'redactEnv' can
+-- redact secret-bearing keys before the log message is rendered. The
+-- invariant (design §3.7): the logged message must not contain any value
+-- from a key in 'secretEnvKeys'. The @cmdNoEnv@ is the command WITHOUT
+-- the env prefix (what the reader sees in the log); the @extras@ are the
+-- env overrides (logged as redacted @KEY=<redacted>@ tokens, applied to
+-- the subprocess via the @env@ prefix baked into the full command
+-- string). Used by the remote arm's 'uioShellExecEnv' and
+-- 'uioBinExecEnv' so the same 'logExecDebug' redaction path covers both
+-- arms.
+runRemoteShellTextEnv
+  :: RemoteRunner -> SshConfig -> [(String, String)] -> Text
+  -> IO (Either UntrustedErr Text)
+runRemoteShellTextEnv runner cfg extras cmdNoEnv =
+  let envPrefix = T.pack (renderEnvPrefix extras)
+      fullCmdText = envPrefix <> cmdNoEnv
+  in case shellCmd fullCmdText of
+       Left e     -> pure (Left e)
+       Right full -> do
+         logCmd <- case shellCmd cmdNoEnv of
+           Left _      -> pure full
+           Right noEnv -> pure noEnv
+         let argv = sshExecArgv cfg (textShellCommand logCmd)
+         logExecDebug "[remote ssh]" argv Nothing extras
+         res <- runRemoteShell runner cfg full
+         pure (either (Left . UeExec) Right res)
 
 -- ---------------------------------------------------------------------------
 -- Pure diff applier (lifted from Seal.ISA.Ops.File so the local AND remote

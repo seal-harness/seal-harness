@@ -26,6 +26,7 @@ import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
+import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
@@ -153,6 +154,7 @@ import qualified Seal.ISA.Ops.ShellSpec
 import qualified Seal.ISA.Ops.ProcessSpec
 import qualified Seal.ISA.Ops.BinGitSpec
 import qualified Seal.ISA.Ops.BinSpec
+import qualified Seal.ISA.Ops.BinGhSpec
 import qualified Seal.ISA.Ops.SearchSpec
 import qualified Seal.ISA.Ops.PatchSpec
 import qualified Seal.ISA.Ops.SecretSpec
@@ -189,6 +191,7 @@ main = hspec $ do
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
+  Seal.Tools.Exec.LogRedactionSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
   Seal.Tools.Ssh.AgentSpec.spec
@@ -315,6 +318,7 @@ main = hspec $ do
   Seal.ISA.Ops.BinGitSpec.spec
   Seal.ISA.Ops.ProcessSpec.spec
   Seal.ISA.Ops.BinSpec.spec
+  Seal.ISA.Ops.BinGhSpec.spec
   Seal.ISA.Ops.SearchSpec.spec
   Seal.ISA.Ops.PatchSpec.spec
   Seal.RepoDiscoverySpec.spec
