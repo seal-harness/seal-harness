@@ -13,7 +13,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Builder qualified as BSB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromJust, isJust)
 import Data.Set qualified as Set
@@ -65,8 +65,8 @@ import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
-import Seal.Security.Vault (VaultHandle)
-import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime)
+import Seal.Security.Vault (VaultHandle (vhGet))
+import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime, makeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
@@ -82,6 +82,10 @@ import Seal.Tabs.Types (TabRef (BoundSession, BoundHarness))
 import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
+
+import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
 testAbortReg :: SessionAbortRegistry
@@ -187,6 +191,36 @@ runAppBodyHeaders app req = do
     putMVar mv (st, body, hdrs)
     pure ResponseReceived)
   takeMVar mv
+
+-- | A test scribe that captures log items into an IORef for assertions.
+-- Mirrors 'Seal.Logging.LoggerSpec.mkCaptureScribe' and the pattern in
+-- 'Seal.Tools.Exec.LogRedactionSpec'.
+mkCaptureScribe :: IO (Scribe, IORef [T.Text])
+mkCaptureScribe = do
+  ref <- newIORef []
+  let scribe = Scribe
+        { liPush = \item -> do
+            let rendered = jsonFormat False V2 item
+            modifyIORef' ref (T.pack (show rendered) :)
+        , scribePermitItem = permitItem DebugS
+        , scribeFinalizer = pure ()
+        }
+  pure (scribe, ref)
+
+-- | Install a capture scribe as the global logger, run an action, then close
+-- the logger and return the captured lines. The global logger ref is always
+-- restored to the no-op default (Nothing) after, via 'unsetGlobalLogger', so
+-- subsequent tests are unaffected.
+withCaptureGlobalLogger :: IO a -> IO (a, [T.Text])
+withCaptureGlobalLogger action = do
+  (scribe, ref) <- mkCaptureScribe
+  logger <- newSealLoggerWithScribe scribe DebugS
+  setGlobalLogger logger
+  result <- action
+  closeSealLogger logger
+  lines_ <- readIORef ref
+  unsetGlobalLogger
+  pure (result, lines_)
 
 -- | Build 'ApiDeps' against the given paths with the common test fakes.
 -- Used by the transcript tests that need a per-test temp dir.
@@ -2874,6 +2908,337 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode body :: Maybe A.Value of
         Just (A.Object o) -> lookupK "error" o `shouldSatisfy` isJust
         _ -> expectationFailure "expected a 500 error JSON object"
+
+  -- ── PAT token ingestion (WU-A) ────────────────────────────────────────
+  -- The `token` field: a top-level, write-only request field. When present
+  -- and the credential is PAT/MachineUser, the server `vhPut`s it into the
+  -- vault before upserting the repo descriptor (which carries only the vault
+  -- key NAME). The token never appears in repos.toml, the response, or logs.
+  describe "PAT token ingestion (WU-A)" $ do
+    -- Build ApiDeps with an UNLOCKED in-memory vault + a real repos.toml in
+    -- a per-test temp dir (so POSTed repos persist and the vault handle is
+    -- queryable). Mirrors the deploy-key test's mkDeps.
+    let mkVaultApp :: VaultRuntime -> FilePath -> IO ApiDeps
+        mkVaultApp vr tmp = do
+          tabsH <- newTabsHandle
+          reg   <- newHarnessRegistry
+          adb   <- noneBackend
+          skills <- Skill.noneBackend
+          activeRef <- newIORef fakeMeta
+          let paths = fakePaths { spState = tmp }
+          uiState <- newUiStateHandle paths
+          repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+          let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
+          pure ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = adb
+            , adSkills          = skills
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Nothing
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = repoRegH
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+            , adVault            = vr
+            , adPaths            = paths
+            , adWsPort           = 8081
+            , adAbortReg         = testAbortReg
+            , adSecurityConfig   = defaultSecurityConfig
+            , adMkSessionExec    = Nothing
+            }
+
+    it "POST /api/repos with token: \"xyz\" + PAT → 201; vault has xyz; repos.toml has no xyz; response has no xyz" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime []
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("patrepo" :: T.Text)
+            , "url"      .= ("git@github.com:owner/patrepo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-patrepo" :: T.Text)
+                ]
+            , "token"    .= ("xyz" :: T.Text)
+            ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        -- Response has no token value.
+        let bodyText = T.pack (BC.unpack (BL.toStrict body))
+        "xyz" `T.isInfixOf` bodyText `shouldBe` False
+        -- Vault has the token under the key.
+        mh <- readIORef (vrHandleRef vr)
+        case mh of
+          Just vh -> vhGet vh "seal-pat-patrepo" `shouldReturn` Right "xyz"
+          Nothing -> expectationFailure "vault handle missing"
+        -- repos.toml has no token value.
+        tomlExists <- doesFileExist (tmp </> "repos.toml")
+        tomlExists `shouldBe` True
+        tomlBytes <- BL.readFile (tmp </> "repos.toml")
+        let tomlText = T.pack (BC.unpack (BL.toStrict tomlBytes))
+        "xyz" `T.isInfixOf` tomlText `shouldBe` False
+
+    it "POST /api/repos with token + vault locked → 500 \"vault locked\"" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeLockedVaultRuntime
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("patlocked" :: T.Text)
+            , "url"      .= ("git@github.com:owner/patlocked.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-patlocked" :: T.Text)
+                ]
+            , "token"    .= ("xyz" :: T.Text)
+            ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 500
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "error" o of
+            Just (A.String e) -> "vault locked" `T.isInfixOf` e `shouldBe` True
+            _ -> expectationFailure "expected error string"
+          _ -> expectationFailure "expected error JSON object"
+
+    it "POST /api/repos with token + deploy_key → 400 \"token is only valid for pat/machine_user\"" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime []
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("dkrepo" :: T.Text)
+            , "url"      .= ("git@github.com:owner/dkrepo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("deploy_key" :: T.Text)
+                , "vault_key" .= ("seal-dk-dkrepo" :: T.Text)
+                ]
+            , "token"    .= ("xyz" :: T.Text)
+            ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 400
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "error" o of
+            Just (A.String e) -> "token is only valid for pat/machine_user" `T.isInfixOf` e `shouldBe` True
+            _ -> expectationFailure "expected error string"
+          _ -> expectationFailure "expected error JSON object"
+
+    it "PUT /api/repos/:id with token (same kind) → vault overwritten (rotation)" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime [("seal-pat-rot", "xyz")]
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        -- Create the repo first (no token — vault pre-seeded).
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("rot" :: T.Text)
+            , "url"      .= ("git@github.com:owner/rot.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-rot" :: T.Text)
+                ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        -- Rotate the token via PUT (same credential kind).
+        putReq <- testPut ["api", "repos", "rot"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/rot.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-rot" :: T.Text)
+                ]
+            , "token"    .= ("abc" :: T.Text)
+            ]))
+        (st, _) <- runAppBody app putReq
+        st `shouldBe` 200
+        -- Vault now has "abc" (overwritten).
+        mh <- readIORef (vrHandleRef vr)
+        case mh of
+          Just vh -> vhGet vh "seal-pat-rot" `shouldReturn` Right "abc"
+          Nothing -> expectationFailure "vault handle missing"
+
+    it "PUT /api/repos/:id without token (same kind) → vault unchanged" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime [("seal-pat-keep", "xyz")]
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("keep" :: T.Text)
+            , "url"      .= ("git@github.com:owner/keep.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-keep" :: T.Text)
+                ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        -- PUT without a token (same kind) — vault must be untouched.
+        putReq <- testPut ["api", "repos", "keep"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/keep.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-keep" :: T.Text)
+                ]
+            ]))
+        (st, _) <- runAppBody app putReq
+        st `shouldBe` 200
+        mh <- readIORef (vrHandleRef vr)
+        case mh of
+          Just vh -> vhGet vh "seal-pat-keep" `shouldReturn` Right "xyz"
+          Nothing -> expectationFailure "vault handle missing"
+
+    it "PUT /api/repos/:id changing kind PAT→MachineUser WITH token → old key vhDelete'd, new key populated" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime [("seal-pat-chg", "xyz")]
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("chg" :: T.Text)
+            , "url"      .= ("git@github.com:owner/chg.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-chg" :: T.Text)
+                ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        -- Change kind PAT → MachineUser, supplying a token.
+        putReq <- testPut ["api", "repos", "chg"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/chg.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("machine_user" :: T.Text)
+                , "vault_key" .= ("seal-machine_user-chg" :: T.Text)
+                , "username"  .= ("bot-account" :: T.Text)
+                ]
+            , "token"    .= ("abc" :: T.Text)
+            ]))
+        (st, _) <- runAppBody app putReq
+        st `shouldBe` 200
+        -- Old key deleted, new key has the token.
+        mh <- readIORef (vrHandleRef vr)
+        case mh of
+          Just vh -> do
+            rOld <- vhGet vh "seal-pat-chg"
+            case rOld of
+              Left _  -> pure ()
+              Right _ -> expectationFailure "old vault key should have been deleted"
+            vhGet vh "seal-machine_user-chg" `shouldReturn` Right "abc"
+          Nothing -> expectationFailure "vault handle missing"
+
+    it "PUT /api/repos/:id changing kind WITHOUT token → 400" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime [("seal-pat-chg2", "xyz")]
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("chg2" :: T.Text)
+            , "url"      .= ("git@github.com:owner/chg2.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-chg2" :: T.Text)
+                ]
+            ]))
+        (createSt, _) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        -- Change kind PAT → MachineUser, NO token → 400.
+        putReq <- testPut ["api", "repos", "chg2"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/chg2.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("machine_user" :: T.Text)
+                , "vault_key" .= ("seal-machine_user-chg2" :: T.Text)
+                , "username"  .= ("bot-account" :: T.Text)
+                ]
+            ]))
+        (status, body) <- runAppBody app putReq
+        status `shouldBe` 400
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "error" o of
+            Just (A.String e) -> "no token supplied" `T.isInfixOf` e `shouldBe` True
+            _ -> expectationFailure "expected error string"
+          _ -> expectationFailure "expected error JSON object"
+
+    it "PUT /api/repos/:id response body never contains the token value" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime [("seal-pat-resp", "xyz")]
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        createReq <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("resp" :: T.Text)
+            , "url"      .= ("git@github.com:owner/resp.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-resp" :: T.Text)
+                ]
+            ]))
+        (createSt, createBody) <- runAppBody app createReq
+        createSt `shouldBe` 201
+        let createText = T.pack (BC.unpack (BL.toStrict createBody))
+        "xyz" `T.isInfixOf` createText `shouldBe` False
+        putReq <- testPut ["api", "repos", "resp"]
+          (A.encode (A.object
+            [ "url"      .= ("git@github.com:owner/resp.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-resp" :: T.Text)
+                ]
+            , "token"    .= ("abc" :: T.Text)
+            ]))
+        (putSt, putBody) <- runAppBody app putReq
+        putSt `shouldBe` 200
+        let putText = T.pack (BC.unpack (BL.toStrict putBody))
+        "abc" `T.isInfixOf` putText `shouldBe` False
+        -- The 200 body has no top-level `token` field.
+        case A.decode putBody :: Maybe A.Value of
+          Just (A.Object o) -> lookupK "token" o `shouldBe` Nothing
+          _ -> expectationFailure "expected JSON object for PUT"
+
+    it "POST /api/repos with token does not leak the token into gateway logs" $
+      withSystemTempDirectory "seal-pat" $ \tmp -> do
+        vr <- makeFakeVaultRuntime []
+        deps <- mkVaultApp vr tmp
+        let app = apiApp deps
+        req <- testPost ["api", "repos"]
+          (A.encode (A.object
+            [ "id"       .= ("logrepo" :: T.Text)
+            , "url"      .= ("git@github.com:owner/logrepo.git" :: T.Text)
+            , "vcs_kind" .= ("git" :: T.Text)
+            , "credential" .= A.object
+                [ "kind"      .= ("pat" :: T.Text)
+                , "vault_key" .= ("seal-pat-logrepo" :: T.Text)
+                ]
+            , "token"    .= ("xyz" :: T.Text)
+            ]))
+        (_, lines_) <- withCaptureGlobalLogger (runAppBody app req)
+        let allText = T.unlines lines_
+        "xyz" `T.isInfixOf` allText `shouldBe` False
 
   it "GET /api/providers returns 200 with a JSON array" $ do
     app <- mkApp
