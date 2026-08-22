@@ -135,10 +135,16 @@ debug logs (the redaction seam from #123 handles the last).
   through the ISA transcript; but the `repos.toml` audit-commit (the
   `bestEffortCommitRepos` `gitCommitAll`) must not capture the token
   either — it only commits `repos.toml`, which has no token field.
-- **No `--token` CLI flag for `/repo add` (this pass).** The CLI
-  already has the `/vault add` out-of-band path. The form flow is the
-  gap. A `--token` flag is a follow-up (low priority — the form is the
-  primary surface).
+- **No `--token` flag for `/repo add`.** A `--token` flag would leak
+  the token into shell history and `ps` output. Instead, `/repo add
+  --cred pat` (or `--cred machine_user`) prompts the user to paste the
+  token on stdin with **hidden input** (no-echo), mirroring the
+  existing `/vault add` flow (`Vault/Commands.hs:312` uses
+  `ccPromptSecret`, which in the CLI channel uses `getPassword` from
+  haskeline with `*` masking — `Channel/Cli.hs:159-161`). The token
+  goes from stdin → `ccPromptSecret` → `vhPut` → vault, never touching
+  argv or disk. The CLI `/repo add` becomes a single-step flow matching
+  the form.
 - **No token re-display in the edit form.** The edit form does NOT
   pre-populate the token (it's not retrievable from the vault via the
   API without a new, dangerous endpoint). The operator pastes a new
@@ -457,8 +463,12 @@ a bonus, not essential for v1).
 |---|---|
 | `frontend/src/components/ReposView.tsx` | Add `<input type="password">` for PAT/MachineUser token; form state; validation; `handleSubmit` sends `token`. |
 | `frontend/src/types.ts` | Add `token?: string` to `RepoInput` (write-only, create/rotate). NOT to `RepoCredential` or `RepoInfo`. |
-| `src/Seal/Gateway/API.hs` | Extract `token` in `handleRepoCreate` / `handleRepoUpdate`; `vhPut` to vault for PAT/MachineUser; `isPatOrMachineUser` helper. |
-| `test/Seal/Gateway/PatIngestionSpec.hs` (new) OR `ApiIntegrationSpec.hs` (extend) | The cross-layer integration test (§3.6). |
+| `src/Seal/Gateway/API.hs` | Extract `token`; `vhPut` to vault for PAT/MachineUser; `isPatOrMachineUser` helper; 400 for token+deploy_key; `vhDelete` on kind-change. |
+| `src/Seal/Command/Repo.hs` | `/repo add --cred pat` (or `machine_user`) prompts for the token via `ccPromptSecret` (hidden stdin input), then `vhPut` to vault before the repo upsert. No `--token` flag. |
+| `src/Seal/Security/Vault.hs` | `vhDelete` (if not already present — verify) |
+| `test/Seal/Gateway/PatIngestionSpec.hs` (new) | The cross-layer integration test (§3.6). |
+| `test/Seal/Gateway/ApiSpec.hs` | API unit tests: POST with token → 201 + vault has token; POST with token + vault locked → 500; PUT with token → vault overwritten; response has no token field; `repos.toml` has no token. |
+| `test/Seal/Command/RepoSpec.hs` | CLI unit tests: `/repo add --cred pat` prompts via `ccPromptSecret`, `vhPut`s the token, creates the repo. |
 | `seal-harness.cabal` | Add the new spec to `other-modules` (if a new file). |
 | `test/Main.hs` | Import + run the new spec (if a new file). |
 | `test/Seal/Gateway/ApiSpec.hs` | Extend with unit tests: POST with token → 201 + vault has token; POST with token + vault locked → 500; PUT with token → vault overwritten; response has no token field; `repos.toml` has no token. |
@@ -526,4 +536,4 @@ In `PatIngestionSpec.hs` (new) or `ApiIntegrationSpec.hs` (extend):
 2. **Should the edit form pre-populate the token?** RESOLVED — No. The token is not retrievable from the vault via the API (no `GET` endpoint exposes secret values). The edit form's password field is empty with a "paste new PAT to rotate" placeholder. Empty means "no change."
 3. **The `repos.toml` audit-commit.** RESOLVED — `repos.toml` has no token field by construction (the `SourceRepo` ADT has no token field). The test asserts this explicitly (read `repos.toml` after POST and assert no token bytes).
 4. **Request-body logging.** RESOLVED — No request-body logging exists (verified across `Server.hs`, `API.hs`, `Stream.hs`). No scrubbing seam needed. A defensive test (§5.2 #9) guards against future additions.
-5. **Should this also add a `--token` flag to the `/repo add` CLI?** RESOLVED — No (non-goal §2). The form is the gap; the CLI has `/vault add`.
+5. **Should this also add a `--token` flag to the `/repo add` CLI?** RESOLVED — No `--token` flag (would leak into shell history / `ps`). Instead, `/repo add --cred pat` prompts for the token on stdin with hidden input (no-echo), mirroring `/vault add`'s `ccPromptSecret` flow. The CLI becomes a single-step flow matching the form.
