@@ -60,6 +60,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Session.Workdir (SessionExec (..))
+import Seal.Session.ExecCache (newSessionExecCache)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -3306,6 +3307,7 @@ spec = describe "Seal.Gateway.API" $ do
       skills <- Skill.noneBackend
       activeRef <- newIORef fakeMeta
       uiState <- newUiStateHandle (fakePaths { spState = tmp })
+      execCache404 <- newSessionExecCache
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
@@ -3331,6 +3333,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdTabsHandle  = error "sdTabsHandle: unused on the 404 path"
             , sdLogger      = error "sdLogger: unused on the 404 path"
             , sdIsRemote    = False
+            , sdExecCache   = execCache404
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3391,6 +3394,7 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           paths = SealPaths
@@ -3427,6 +3431,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
+            , sdExecCache   = execCache
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3527,6 +3532,7 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
@@ -3555,6 +3561,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
+            , sdExecCache   = execCache
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3640,6 +3647,7 @@ spec = describe "Seal.Gateway.API" $ do
       vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
       mgr <- newManager defaultManagerSettings
       cntRef <- newIORef 0
+      execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
           pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
@@ -3668,6 +3676,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdTabsHandle  = tabsH
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
+            , sdExecCache   = execCache
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

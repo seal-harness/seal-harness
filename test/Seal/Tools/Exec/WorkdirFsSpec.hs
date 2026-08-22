@@ -432,6 +432,181 @@ spec = describe "Seal.Tools.Exec.WorkdirFs" $ do
       r `shouldSatisfy` isWfsPath
 
   --------------------------------------------------------------------------
+  -- wfsSnapshot (one-round-trip structural enumeration for discovery)
+  --------------------------------------------------------------------------
+
+  describe "wfsSnapshot (local arm)" $ do
+    it "enumerates dirs + files as sorted relative entries" $
+      withSystemTempDirectory "seal-wfs-snap" $ \root -> do
+        createDirectoryIfMissing True (root </> "repo/.agents/agents/foo")
+        BS.writeFile (root </> "repo/.agents/agents.md") "x"
+        BS.writeFile (root </> "top.md") "y"
+        let fs = mkLocalWorkdirFs (WorkspaceRoot root) 1048576
+        r <- wfsSnapshot fs
+        case r of
+          Left e -> expectationFailure ("expected Right, got " <> show e)
+          Right snap ->
+            snapEntries snap `shouldBe`
+              [ SnapshotEntry "repo" True
+              , SnapshotEntry "repo/.agents" True
+              , SnapshotEntry "repo/.agents/agents" True
+              , SnapshotEntry "repo/.agents/agents.md" False
+              , SnapshotEntry "repo/.agents/agents/foo" True
+              , SnapshotEntry "top.md" False
+              ]
+
+    it "returns no entries for an empty workdir" $
+      withSystemTempDirectory "seal-wfs-snap" $ \root -> do
+        let fs = mkLocalWorkdirFs (WorkspaceRoot root) 1048576
+        r <- wfsSnapshot fs
+        fmap snapEntries r `shouldBe` Right []
+
+    it "skips symlinks entirely (never follows them)" $
+      withSystemTempDirectory "seal-wfs-snap" $ \root ->
+        withSystemTempDirectory "seal-wfs-outside" $ \outside -> do
+          BS.writeFile (outside </> "secret.txt") "s"
+          createFileLink (outside </> "secret.txt") (root </> "evil.txt")
+          createDirectoryIfMissing True (root </> "d")
+          createFileLink outside (root </> "evil-dir")
+          BS.writeFile (root </> "d" </> "ok.txt") "x"
+          let fs = mkLocalWorkdirFs (WorkspaceRoot root) 1048576
+          r <- wfsSnapshot fs
+          fmap snapEntries r `shouldBe` Right [SnapshotEntry "d" True, SnapshotEntry "d/ok.txt" False]
+
+    it "caps depth at snapshotMaxDepth levels below the workspace root" $
+      withSystemTempDirectory "seal-wfs-snap" $ \root -> do
+        createDirectoryIfMissing True (root </> "l1/l2/l3/l4/l5")
+        let deep = T.intercalate "/" ["l1", "l2", "l3", "l4"]
+        BS.writeFile (root </> T.unpack deep </> "at-depth-5.txt") "x"
+        let fs = mkLocalWorkdirFs (WorkspaceRoot root) 1048576
+        r <- wfsSnapshot fs
+        case r of
+          Left e -> expectationFailure ("expected Right, got " <> show e)
+          Right snap -> do
+            let paths = map snapRelPath (snapEntries snap)
+            paths `shouldContain` [deep]
+            paths `shouldNotContain` [deep <> "/l5"]
+            paths `shouldNotContain` [deep <> "/at-depth-5.txt"]
+
+    it "includes hidden entries (convention dirs are dot-dirs)" $
+      withSystemTempDirectory "seal-wfs-snap" $ \root -> do
+        createDirectoryIfMissing True (root </> "repo/.agents")
+        let fs = mkLocalWorkdirFs (WorkspaceRoot root) 1048576
+        r <- wfsSnapshot fs
+        fmap (map snapRelPath . snapEntries) r
+          `shouldBe` Right ["repo", "repo/.agents"]
+
+  describe "wfsSnapshot (in-memory stub arm)" $ do
+    it "derives dir/file entries from Directory + FileContent seeds" $ do
+      let seed = Map.fromList
+            [ (rp ".", Directory ["my-repo"])
+            , (rp "my-repo", Directory [".agents"])
+            , (rp "my-repo/.agents", Directory ["agents.md"])
+            , (rp "my-repo/.agents/agents.md", FileContent "x")
+            ]
+          fs = mkInMemWorkdirFs seed
+      r <- wfsSnapshot fs
+      fmap snapEntries r `shouldBe` Right
+        [ SnapshotEntry "my-repo" True
+        , SnapshotEntry "my-repo/.agents" True
+        , SnapshotEntry "my-repo/.agents/agents.md" False
+        ]
+
+    it "reports a listed child with no seed entry as a file" $ do
+      let seed = Map.fromList [(rp "d", Directory ["a.txt", "b.txt"])]
+          fs = mkInMemWorkdirFs seed
+      r <- wfsSnapshot fs
+      fmap snapEntries r `shouldBe` Right
+        [ SnapshotEntry "d" True
+        , SnapshotEntry "d/a.txt" False
+        , SnapshotEntry "d/b.txt" False
+        ]
+
+    it "skips SymlinkTarget entries (structure never follows symlinks)" $ do
+      let seed = Map.fromList
+            [ (rp "d", Directory ["leak", "real.md"])
+            , (rp "d/leak", Directory ["SKILL.md"])
+            , (rp "d/leak/SKILL.md", SymlinkTarget (rp "/etc/shadow"))
+            , (rp "d/real.md", FileContent "x")
+            ]
+          fs = mkInMemWorkdirFs seed
+      r <- wfsSnapshot fs
+      -- 'leak' itself is still a real directory; only its symlinked FILE is
+      -- invisible to the structure scan.
+      fmap snapEntries r `shouldBe` Right
+        [ SnapshotEntry "d" True
+        , SnapshotEntry "d/leak" True
+        , SnapshotEntry "d/real.md" False
+        ]
+
+    it "skips Missing entries listed in a parent Directory" $ do
+      let seed = Map.fromList
+            [ (rp "d", Directory ["ghost", "real.txt"])
+            , (rp "d/ghost", Missing)
+            , (rp "d/real.txt", FileContent "x")
+            ]
+          fs = mkInMemWorkdirFs seed
+      r <- wfsSnapshot fs
+      fmap snapEntries r `shouldBe` Right
+        [ SnapshotEntry "d" True, SnapshotEntry "d/real.txt" False ]
+
+  describe "wfsSnapshot (fail-closed stub)" $ do
+    it "returns Left WfsStub" $
+      wfsSnapshot mkWorkdirFsStub `shouldReturn` Left WfsStub
+
+  describe "wfsSnapshot (remote arm)" $ do
+    it "parses dirs + files from ONE scripted SSH call" $ do
+      calls <- newIORef []
+      let out = T.unlines
+            [ "."
+            , "./repo"
+            , "./repo/.agents"
+            , "__SEAL_FILES__"
+            , "./repo/.agents/agents.md"
+            ]
+          -- The ceiling is large enough that the output is not mistaken for
+          -- a truncated read.
+          cap = 1048576
+      fs <- mkRemoteFs calls [Right out] cap
+      r <- wfsSnapshot fs
+      fmap snapEntries r `shouldBe` Right
+        [ SnapshotEntry "repo" True
+        , SnapshotEntry "repo/.agents" True
+        , SnapshotEntry "repo/.agents/agents.md" False
+        ]
+      recorded <- readIORef calls
+      length recorded `shouldBe` 1
+      case recorded of
+        (cmd : _) -> do
+          T.unpack cmd `shouldContain` "find . -maxdepth "
+          T.unpack cmd `shouldContain` "-type d"
+          T.unpack cmd `shouldContain` "-type f"
+          T.unpack cmd `shouldContain` ("head -c " ++ show cap)
+        _ -> expectationFailure "expected one recorded command"
+
+    it "maps truncated output (length == ceiling) to WfsOversize" $ do
+      calls <- newIORef []
+      let cap = 64
+          out = T.justifyRight cap 'x' ""  -- exactly `cap` chars
+      fs <- mkRemoteFs calls [Right out] cap
+      r <- wfsSnapshot fs
+      r `shouldSatisfy` isWfsOversize
+
+    it "maps malformed output (no marker, under ceiling) to WfsIo" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Right "./repo\n"] 1048576
+      r <- wfsSnapshot fs
+      r `shouldSatisfy` isWfsIo
+
+    it "maps an exec failure to WfsExec" $ do
+      calls <- newIORef []
+      fs <- mkRemoteFs calls [Left ExecRemoteUnreachable] 1048576
+      r <- wfsSnapshot fs
+      r `shouldSatisfy` \case
+        Left (WfsExec _) -> True
+        _ -> False
+
+  --------------------------------------------------------------------------
   -- QuickCheck: shellQuote has no unescaped shell metacharacters for
   -- every path that passes mkSafePathRemote.
   --------------------------------------------------------------------------

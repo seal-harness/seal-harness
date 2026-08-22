@@ -2,6 +2,7 @@
 module Seal.RepoDiscoverySpec (spec) where
 
 import Control.Exception (SomeException, catch)
+import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing, mapMaybe)
 import qualified Data.Text as T
@@ -35,13 +36,20 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (saveSessionMeta, autoBindRepoAgent)
 import Seal.Text.LineFile (maxScanBytes)
-import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+import Seal.Tools.Exec.Types
+  ( ExecError, RemotePath, SshConfig (..), mkRemotePath, mkSshHost, mkSshUser
+  )
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs
   , mkLocalWorkdirFs
   , mkInMemWorkdirFs
+  , mkRemoteWorkdirFs
   , StubEntry (..)
   )
+import Seal.Tools.Exec.Remote (RemoteRunner (..))
+import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIO)
+import Seal.TestHelpers.FixtureRepo (stubCloneDeps)
 import Seal.Util.StrictIO (decodeFileStrict)
 
 aTime :: UTCTime
@@ -572,9 +580,134 @@ spec = do
       smAgent afterMeta `shouldBe` (case mkAgentDefId "my-repo--agents-md" of Right a -> Just a; Left _ -> Nothing)
       cleanup tmp
 
+  describe "workdir discovery round-trip economy (remote arm)" $ do
+    -- The remote-mode scanners must enumerate workspace structure with a
+    -- single batched snapshot call instead of one SSH round trip per probe
+    -- (test -d / ls -1). File CONTENT still goes through the per-file
+    -- secure read (readlink → head), 2 calls per file. These tests pin the
+    -- exact call counts + forbid the probe-style commands.
+    it "agent-defs scan over a protocol repo issues exactly 5 SSH calls" $ do
+      calls <- newIORef []
+      let agentsMd = "---\nkind: agents\n---\n# Project\nDo good work.\n"
+          fooMd = "---\nname: Foo Agent\nprovider: ollama\nmodel: llama3\nenabled: true\n---\nYou are a foo specialist.\n"
+          snapOut = T.unlines
+            [ "."
+            , "./my-repo"
+            , "./my-repo/.agents"
+            , "./my-repo/.agents/agents"
+            , "./my-repo/.agents/agents/foo-agent"
+            , "__SEAL_FILES__"
+            , "./my-repo/.agents/agents.md"
+            , "./my-repo/.agents/agents/foo-agent/agent.md"
+            ]
+          canned =
+            [ Right snapOut
+            , Right "/srv/agent-workspace/my-repo/.agents/agents.md"
+            , Right agentsMd
+            , Right "/srv/agent-workspace/my-repo/.agents/agents/foo-agent/agent.md"
+            , Right fooMd
+            ]
+      fs <- mkRemoteScanFs calls canned
+      backend <- workdirAgentDefBackend fs
+      defs <- adbList backend
+      map (agentDefIdText . adId) defs
+        `shouldMatchList` ["my-repo--agents-md", "my-repo--foo-agent"]
+      recorded <- readIORef calls
+      length recorded `shouldBe` 5
+      -- No probe-style commands remain: every call is either the snapshot
+      -- find or a bounded content read.
+      recorded `shouldNotSatisfy` any probeStyle
+
+    it "skills scan over a .skills repo issues exactly 3 SSH calls" $ do
+      calls <- newIORef []
+      let skillMd = "---\nname: my-skill\ndescription: A stub skill.\n---\nBody.\n"
+          snapOut = T.unlines
+            [ "."
+            , "./my-repo"
+            , "./my-repo/.skills"
+            , "./my-repo/.skills/my-skill"
+            , "__SEAL_FILES__"
+            , "./my-repo/.skills/my-skill/SKILL.md"
+            ]
+          canned =
+            [ Right snapOut
+            , Right "/srv/agent-workspace/my-repo/.skills/my-skill/SKILL.md"
+            , Right skillMd
+            ]
+      fs <- mkRemoteScanFs calls canned
+      backend <- workdirSkillBackend fs
+      skills <- sbList backend
+      map (skillIdText . skId) skills `shouldBe` ["my-repo--my-skill"]
+      recorded <- readIORef calls
+      length recorded `shouldBe` 3
+      recorded `shouldNotSatisfy` any probeStyle
+
 cleanup :: FilePath -> IO ()
 cleanup path =
   removeDirectoryRecursive path `catch` \(_ :: SomeException) -> pure ()
+
+-- ---------------------------------------------------------------------------
+-- Remote-arm round-trip fixtures (scripted SSH runner + remote WorkdirFs)
+-- ---------------------------------------------------------------------------
+
+-- | The fixture SSH config for the scan round-trip tests. The workspace
+-- root is a fixed absolute path (the canned @readlink -f@ outputs must
+-- resolve under it for the SafePath containment re-check to pass).
+scanSshCfg :: SshConfig
+scanSshCfg = SshConfig
+  { scHost       = either (error "fixture") id (mkSshHost "exec.internal")
+  , scUser       = either (error "fixture") id (mkSshUser "agent")
+  , scPort       = 22
+  , scIdentity   = Nothing
+  , scKnownHosts = "/home/agent/.ssh/known_hosts"
+  , scWorkspace  = rp "/srv/agent-workspace"
+  }
+
+-- | A probe-style discovery command (the per-op SSH round trips this
+-- feature eliminates): existence tests and directory listings.
+probeStyle :: T.Text -> Bool
+probeStyle cmd =
+  "test -d" `T.isInfixOf` cmd
+    || "test -f" `T.isInfixOf` cmd
+    || "ls -1" `T.isInfixOf` cmd
+
+-- | A scripted 'RemoteRunner' that records every call's command string
+-- (the text after the @--@ separator in the SSH argv) into a recording
+-- 'IORef' and returns the next canned result. Runs out of results →
+-- returns @Right ""@.
+scriptedScanRunner :: IORef [T.Text] -> [Either ExecError T.Text] -> IO RemoteRunner
+scriptedScanRunner recRef canned0 = do
+  qRef <- newIORef canned0
+  pure RemoteRunner
+    { runRemote      = recordAndPop recRef qRef . extractCmd
+    , runRemoteStdin = \argv _stdin -> recordAndPop recRef qRef (extractCmd argv)
+    , runRemoteEnv   = \_env argv -> recordAndPop recRef qRef (extractCmd argv)
+    }
+  where
+    recordAndPop :: IORef [T.Text] -> IORef [Either ExecError T.Text] -> T.Text
+                 -> IO (Either ExecError T.Text)
+    recordAndPop recRef' qRef cmdText = do
+      modifyIORef' recRef' (++ [cmdText])
+      atomicModifyIORef' qRef $ \case
+        (y:ys) -> (ys, y)
+        []     -> ([], Right "")
+    extractCmd :: [String] -> T.Text
+    extractCmd argv = case dropWhile (/= "--") argv of
+      (_sep : rest) -> T.pack (unwords rest)
+      _             -> T.pack (unwords argv)
+
+-- | Build a remote 'WorkdirFs' wired to the scripted runner backed by the
+-- recording 'IORef', anchored at 'scanSshCfg''s workspace root with the
+-- standard scan ceiling.
+mkRemoteScanFs :: IORef [T.Text] -> [Either ExecError T.Text] -> IO WorkdirFs
+mkRemoteScanFs recRef canned = do
+  deps <- stubCloneDeps
+  runner <- scriptedScanRunner recRef canned
+  let uio = mkRemoteUntrustedIO scanSshCfg runner
+      env = mkTestUIOEnv uio deps
+  pure (mkRemoteWorkdirFs env scanSshCfg wsRoot maxScanBytes)
+  where
+    wsRoot = WorkspaceRoot "/srv/agent-workspace"
 
 -- | Build a local 'WorkdirFs' anchored at @tmp@ (the mechanical W4 adapter:
 -- @workdirAgentDefBackend . mkLocalWorkdirFs . WorkspaceRoot@).

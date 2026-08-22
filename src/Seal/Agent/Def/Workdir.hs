@@ -42,6 +42,8 @@ module Seal.Agent.Def.Workdir
     -- * Workdir backend
   , workdirAgentDefBackend
   , listWorkdirAgentDefs
+  , listWorkdirAgentDefsSnap
+  , staticAgentDefBackend
     -- * DirScheme composition (WorkdirFs-anchored)
   , composeDirSystemPrompt
   , readSection
@@ -111,6 +113,10 @@ import Seal.Store.Markdown
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..)
+  , WorkspaceSnapshot
+  , snapChildDirsAt, snapChildFilesAt, snapIsDirectoryAt, snapIsFileAt
+  , snapTopDirs
+  , wfsSnapshot
   )
 
 -- ---------------------------------------------------------------------------
@@ -590,31 +596,108 @@ workdirAgentDefBackend fs = pure AgentDefBackend
 -- merges workdir ⊕ user. The @--@ separator is charset-safe
 -- (@isValidAgentDefId@); the @/@ in the display name is for human
 -- readability only.
+--
+-- /Round-trip economy/: all structural questions (which repos exist, which
+-- convention dirs exist, which entries are dirs) are answered from ONE
+-- 'wfsSnapshot' call; only file CONTENTS are read through 'wfsReadFile'
+-- (the symlink-containment chokepoint). On @mode=remote@ this collapses a
+-- scan from one SSH round trip per probe to one round trip + two calls per
+-- discovered def file.
 listWorkdirAgentDefs :: WorkdirFs -> IO [AgentDef]
 listWorkdirAgentDefs fs = do
-  eDirs <- wfsListDirectory fs =<< rpOrDie "."
-  let dirs = visibleSubdirs (fromRight [] eDirs)
-  perRepo <- forM dirs $ \repo -> do
+  eSnap <- wfsSnapshot fs
+  case eSnap of
+    -- Fail-soft-to-empty: a missing/stub/failing workdir yields no defs —
+    -- the same terminal state as today's empty listings.
+    Left _  -> pure []
+    Right snap -> listWorkdirAgentDefsSnap snap fs
+
+-- | 'listWorkdirAgentDefs' over a caller-supplied snapshot — lets a
+-- consumer (the discovery cache) fetch ONE workspace snapshot and serve
+-- both scanners from it.
+listWorkdirAgentDefsSnap :: WorkspaceSnapshot -> WorkdirFs -> IO [AgentDef]
+listWorkdirAgentDefsSnap snap fs = do
+  let repos = snapTopDirs snap
+  perRepo <- forM repos $ \repo -> do
     defs <- concat <$> forM workdirAgentDefConventions (\conv -> do
       let convRp = repo <> "/" <> T.pack conv
-      cExists <- wfsDoesDirectoryExist fs =<< rpOrDie convRp
-      if not cExists
+      if not (snapIsDirectoryAt snap convRp)
         then pure []
         else
           -- Dispatch: .agents/ is protocol-aware; the rest use legacy.
           if conv == ".agents"
-            then listAgentsDotAgents (reanchorFs fs convRp)
-            else listAgentDefsFs (reanchorFs fs convRp))
+            then listAgentsDotAgentsSnap snap fs convRp
+            else listAgentDefsFsSnap snap fs convRp)
     pure (mapMaybe (prefixWorkdirDef repo) defs)
   let merge m [] = m
       merge m (d:ds) = merge (Map.insertWith (\_new old -> old) (adId d) d m) ds
       merged = merge Map.empty (concat perRepo)
   pure (Map.elems merged)
 
--- | The visible (non-hidden) immediate subdirectory names from a
--- 'wfsListDirectory' listing, sorted for deterministic output.
-visibleSubdirs :: [Text] -> [Text]
-visibleSubdirs = sortOn id . filter (not . T.isPrefixOf ".")
+-- | Basename of a snapshot-relative path (@a\/b\/c@ → @c@). Inputs are
+-- snapshot-derived paths, never user input.
+snapBasename :: Text -> Text
+snapBasename = snd . T.breakOnEnd "/"
+
+-- | A read-only backend serving a PRE-COMPUTED def list (the discovery
+-- cache's point-in-time scan of the workdir). Mirrors
+-- 'workdirAgentDefBackend''s semantics: reads from memory, writes/deletes
+-- are no-ops (repo-local defs are immutable from the model's perspective).
+staticAgentDefBackend :: [AgentDef] -> IO AgentDefBackend
+staticAgentDefBackend defs = pure AgentDefBackend
+  { adbRead   = \aid -> pure (Map.lookup aid (Map.fromList [(adId d, d) | d <- defs]))
+  , adbUpdate = \_ -> pure ()
+  , adbList   = pure defs
+  , adbDelete = \_ -> pure ()
+  }
+
+-- | Snapshot-driven dispatch for the @.agents\/@ convention dir: protocol-
+-- root detection (§3.3) answered from the snapshot, contents read through
+-- the anchored 'WorkdirFs'. Mirrors 'listAgentsDotAgents'.
+listAgentsDotAgentsSnap :: WorkspaceSnapshot -> WorkdirFs -> Text -> IO [AgentDef]
+listAgentsDotAgentsSnap snap fs anchor
+  | snapIsFileAt snap (anchor <> "/agents.md")
+      || snapIsDirectoryAt snap (anchor <> "/agents")
+  = listProtocolAgentDefsSnap snap fs anchor
+  | otherwise = listAgentDefsFsSnap snap fs anchor
+
+-- | Snapshot-driven protocol allow-list scan (§3.3): @agents.md@ (project
+-- def) + @agents\/\<id\>\/agent.md@ (sub-agents), mirroring
+-- 'listProtocolAgentDefs' with structure from the snapshot.
+listProtocolAgentDefsSnap :: WorkspaceSnapshot -> WorkdirFs -> Text -> IO [AgentDef]
+listProtocolAgentDefsSnap snap fs anchor = do
+  let anchored = reanchorFs fs anchor
+      agentsPath = anchor <> "/agents"
+  mProject <- loadProjectAgentDef anchored
+  subDefs <-
+    if not (snapIsDirectoryAt snap agentsPath)
+      then pure []
+      else do
+        let candidates =
+              filter isValidAgentDefId (map snapBasename (snapChildDirsAt snap agentsPath))
+        catMaybes <$> mapM (loadProtocolSubAgent anchored) candidates
+  pure (sortOn (agentDefIdText . adId) (catMaybes [mProject] <> subDefs))
+
+-- | Snapshot-driven legacy enumerator (flat + DirScheme), mirroring
+-- 'listAgentDefsFs' with structure from the snapshot. Flat @\<id\>.md@
+-- files win on collision with same-id dirs.
+listAgentDefsFsSnap :: WorkspaceSnapshot -> WorkdirFs -> Text -> IO [AgentDef]
+listAgentDefsFsSnap snap fs anchor = do
+  let mdFiles = [p | p <- snapChildFilesAt snap anchor, ".md" `T.isSuffixOf` p]
+  flatDefs <- forM mdFiles $ \rel -> do
+    eContent <- wfsReadFile fs =<< rpOrDie rel
+    pure $ case eContent of
+      Left _    -> Nothing
+      Right txt -> decodeAgentDef txt
+  let flatIds = Set.fromList (map (agentDefIdText . adId) (catMaybes flatDefs))
+      dirNames =
+        [ n | n <- map snapBasename (snapChildDirsAt snap anchor)
+            , isValidAgentDefId n, not (Set.member n flatIds) ]
+  dirDefs <- forM dirNames $ \n ->
+    case mkAgentDefId n of
+      Left _   -> pure Nothing
+      Right aid -> loadDirAgentDef (reanchorFs fs anchor) aid
+  pure (sortOn (agentDefIdText . adId) (catMaybes flatDefs <> catMaybes dirDefs))
 
 -- | Prefix a workdir-discovered def's id with @\<repo\>--\<id\>@ and its
 -- @adName@ with @\<repo\>\/\<name\>@. The id prefix uses @"--"@ (charset-safe
@@ -692,12 +775,15 @@ collectDirsFs fs entries flatIds = do
 -- (e.g. @"my-repo\/.agents"@); the join uses @\/@ as the separator.
 reanchorFs :: WorkdirFs -> Text -> WorkdirFs
 reanchorFs fs prefix = WorkdirFs
-  { wfsReadFile            = wfsReadFile fs            <=< joinRp prefix
-  , wfsDoesFileExist       = wfsDoesFileExist fs       <=< joinRp prefix
-  , wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs  <=< joinRp prefix
-  , wfsListDirectory       = wfsListDirectory fs       <=< joinRp prefix
-  , wfsFileSize            = wfsFileSize fs            <=< joinRp prefix
-  , wfsModificationTime    = wfsModificationTime fs    <=< joinRp prefix
+  { wfsReadFile            = wfsReadFile fs           <=< joinRp prefix
+  , wfsDoesFileExist       = wfsDoesFileExist fs      <=< joinRp prefix
+  , wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs <=< joinRp prefix
+  , wfsListDirectory       = wfsListDirectory fs      <=< joinRp prefix
+  , wfsFileSize            = wfsFileSize fs           <=< joinRp prefix
+  , wfsModificationTime    = wfsModificationTime fs   <=< joinRp prefix
+  , wfsSnapshot            = wfsSnapshot fs
+    -- ^ Whole-workspace: re-anchoring changes where relative reads land,
+    -- never the snapshot's root-relative frame.
   }
 
 -- | Join a prefix and a (possibly @"\.@) relative 'RemotePath' into a single

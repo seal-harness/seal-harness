@@ -65,6 +65,7 @@ import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Routing.Route qualified
+import Seal.Session.ExecCache (newSessionExecCache)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
@@ -144,6 +145,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
   approvals <- newApprovalCache
   replies <- newReplyRegistry
   locks <- newSessionLocks
+  execCache <- newSessionExecCache
   active0 <- readIORef (srActive sr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
@@ -215,6 +217,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdLogger       = logger
               , tdIsRemote     = isRemote
               , tdBaseBackends = backends
+              , tdExecCache    = execCache
               }
             bgAdapter = TurnAdapter
               { taCaps          = bgCaps
@@ -261,6 +264,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdLogger       = logger
               , tdIsRemote     = isRemote
               , tdBaseBackends = backends
+              , tdExecCache    = execCache
               }
         TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
@@ -284,6 +288,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdLogger       = logger
               , tdIsRemote     = isRemote
               , tdBaseBackends = backends
+              , tdExecCache    = execCache
               }
             adapter = TurnAdapter
               { taCaps          = caps

@@ -250,6 +250,9 @@ runServeMain autonomy logger = do
         , sdTabsHandle  = tabsH
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
+        , sdExecCache   = cdExecCache chanDeps
+          -- ^ ONE shared instance: turns (web + channels), /call dispatches,
+          -- and GET /api/sessions/:id/agents all hit the same cache.
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)

@@ -20,6 +20,7 @@ module Seal.Session.Store
   , updateSessionSystemOverride
   , updateSessionDescription
   , autoBindRepoAgent
+  , autoBindRepoAgentWith
   , SessionRuntime (..)
   ) where
 
@@ -381,6 +382,12 @@ autoBindRepoAgent :: WorkdirFs -> SealPaths -> SessionId -> IO ()
 autoBindRepoAgent wfs paths sid = do
   backend <- workdirAgentDefBackend wfs
   defs <- adbList backend
+  autoBindRepoAgentWith defs paths sid
+
+-- | 'autoBindRepoAgent' over PRE-COMPUTED defs — the turn engine calls this
+-- with the discovery cache's scan result so no extra scan is issued.
+autoBindRepoAgentWith :: [AgentDef] -> SealPaths -> SessionId -> IO ()
+autoBindRepoAgentWith defs paths sid =
   case agentsMdDef defs of
     Nothing      -> pure ()
     Just agentsMdAid -> do

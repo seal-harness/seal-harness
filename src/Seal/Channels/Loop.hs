@@ -99,6 +99,7 @@ import Seal.Routing.Route qualified as Route
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Skills.Backend (SkillBackend)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
+import Seal.Session.ExecCache (SessionExecCache, newSessionExecCache)
 import Seal.Session.Lock
   ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
   , replyFanoutMessage, replyMigrateAll
@@ -174,6 +175,11 @@ data ChannelDeps = ChannelDeps
   , cdLogger      :: SealLogger
     -- ^ The shared logger for structured katip logging. Built once at
     -- startup via 'withSealLogger', threaded through all channel turns.
+  , cdExecCache   :: SessionExecCache
+    -- ^ The per-process session-exec + workdir-discovery cache (created by
+    -- 'newChannelDeps'). Under @seal serve@ the SAME instance backs the
+    -- web 'SendDeps'/'ApiDeps' so a scan runs once per session across all
+    -- surfaces.
   }
 
 -- | Build a 'TurnDeps' from a 'ChannelDeps'. The unified turn engine takes a
@@ -201,6 +207,7 @@ mkChannelTurnDeps deps = TurnDeps
   , tdLogger       = cdLogger deps
   , tdIsRemote     = cdIsRemote deps
   , tdBaseBackends = cdBackends deps
+  , tdExecCache    = cdExecCache deps
   }
 
 -- | Build the channel 'TurnAdapter' for a given 'ChannelHandle' +
@@ -256,6 +263,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
   replies <- newReplyRegistry
   locks   <- newSessionLocks
   abortReg <- newSessionAbortRegistry
+  execCache <- newSessionExecCache
   pure ChannelDeps
     { cdPaths      = paths
     , cdVault      = vault
@@ -276,6 +284,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
     , cdConfig      = loadCfg
     , cdIsRemote    = isRemote
     , cdLogger      = logger
+    , cdExecCache   = execCache
     }
 
 -- | The conversation key for the cursor store: (channel-kind-text,

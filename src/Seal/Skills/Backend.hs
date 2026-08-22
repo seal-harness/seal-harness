@@ -24,6 +24,9 @@ module Seal.Skills.Backend
   , markdownSkillBackend
   , unionSkillBackend
   , workdirSkillBackend
+  , listWorkdirSkills
+  , listWorkdirSkillsSnap
+  , staticSkillBackend
   , workdirSkillConventions
   , tripleUnionSkillBackend
   , encodeSkill
@@ -60,7 +63,13 @@ import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
-import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..), mkLocalWorkdirFs)
+import Seal.Tools.Exec.WorkdirFs
+  ( WorkdirFs (..)
+  , WorkspaceSnapshot
+  , mkLocalWorkdirFs
+  , snapChildDirsAt, snapChildFilesAt, snapIsDirectoryAt, snapTopDirs
+  , wfsSnapshot
+  )
 data SkillBackend = SkillBackend
   { sbCreate :: Skill -> IO ()
   -- ^ Insert or replace a skill by id (writes the file + auto-commits).
@@ -197,45 +206,90 @@ workdirSkillBackend fs = pure SkillBackend
 -- directory format (each subdirectory contains a @SKILL.md@). For the
 -- other conventions, skills are loaded from Seal's native flat/grouped
 -- @.md@ layout.
+--
+-- /Round-trip economy/: all structural questions (which repos exist, which
+-- convention dirs exist, which entries are dirs or files) are answered
+-- from ONE 'wfsSnapshot' call; only file CONTENTS are read through
+-- 'wfsReadFile' (the symlink-containment chokepoint). On @mode=remote@
+-- this collapses a scan from one SSH round trip per probe to one round
+-- trip + two calls per discovered skill file.
 listWorkdirSkills :: WorkdirFs -> IO [Skill]
 listWorkdirSkills fs = do
-  exists <- wfsDoesDirectoryExist fs =<< rpOrDie "."
-  if not exists
-    then pure []
-    else do
-      eDirs <- wfsListDirectory fs =<< rpOrDie "."
-      let dirs = visibleSubdirs (fromRight [] eDirs)
-      perRepo <- forM dirs $ \repo -> do
-        raw <- concat <$> forM workdirSkillConventions (\conv -> do
-          let convRp = repo <> "/" <> T.pack conv
-          cExists <- wfsDoesDirectoryExist fs =<< rpOrDie convRp
-          if not cExists
-            then pure []
-            else if conv `elem` [".skills", ".agents/skills"]
-                   then do
-                     -- agentskills.io format: subdirectories with SKILL.md
-                     let subFs = reanchorFs fs convRp
-                     agentSkills <- listAgentSkillsDir subFs
-                     pure (catMaybes agentSkills)
-                   else do
-                     -- Seal native format: flat/grouped .md files
-                     let subFs = reanchorFs fs convRp
-                     x <- listTopLevelSkills subFs
-                     y <- listGroupedSkills subFs
-                     pure (catMaybes (x ++ y)))
-        -- Stamp each repo-local skill with a group derived from the repo
-        -- directory name so the <available_skills> catalog groups them
-        -- under a "<repo> project skills" heading.
-        pure (mapMaybe (prefixWorkdirSkill repo . stampProjectGroup repo) raw)
-      let merge m [] = m
-          merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
-          merged = merge Map.empty (concat perRepo)
-      pure (Map.elems merged)
+  eSnap <- wfsSnapshot fs
+  case eSnap of
+    -- Fail-soft-to-empty: a missing/stub/failing workdir yields no skills.
+    Left _  -> pure []
+    Right snap -> listWorkdirSkillsSnap snap fs
 
--- | The visible (non-hidden) immediate subdirectory names from a
--- 'wfsListDirectory' listing, sorted for deterministic output.
-visibleSubdirs :: [Text] -> [Text]
-visibleSubdirs = sortOn id . filter (not . T.isPrefixOf ".")
+-- | 'listWorkdirSkills' over a caller-supplied snapshot — lets a consumer
+-- (the discovery cache) fetch ONE workspace snapshot and serve both
+-- scanners from it.
+listWorkdirSkillsSnap :: WorkspaceSnapshot -> WorkdirFs -> IO [Skill]
+listWorkdirSkillsSnap snap fs = do
+  let repos = snapTopDirs snap
+  perRepo <- forM repos $ \repo -> do
+    raw <- concat <$> forM workdirSkillConventions (\conv -> do
+      let convRp = repo <> "/" <> T.pack conv
+      if not (snapIsDirectoryAt snap convRp)
+        then pure []
+        else if conv `elem` [".skills", ".agents/skills"]
+               then do
+                 -- agentskills.io format: <conv>/<name>/SKILL.md. The
+                 -- SKILL.md existence check is folded into the read
+                 -- (NotFound ⇒ skipped).
+                 catMaybes <$> mapM (readAgentSkillDirect fs Nothing)
+                                    (snapChildDirsAt snap convRp)
+               else do
+                 -- Seal native format: flat/grouped .md files
+                 let flatMd =
+                       [p | p <- snapChildFilesAt snap convRp
+                          , ".md" `T.isSuffixOf` p]
+                     groups = snapChildDirsAt snap convRp
+                 flat <- mapM (\rel -> readAndStampGroup fs rel Nothing) flatMd
+                 grouped <- forM groups $ \g ->
+                   let gBase = snd (T.breakOnEnd "/" g)
+                   in mapM (\rel -> readAndStampGroup fs rel (Just gBase))
+                           [p | p <- snapChildFilesAt snap g
+                              , ".md" `T.isSuffixOf` p]
+                 pure (catMaybes (flat <> concat grouped)))
+    -- Stamp each repo-local skill with a group derived from the repo
+    -- directory name so the <available_skills> catalog groups them
+    -- under a "<repo> project skills" heading.
+    pure (mapMaybe (prefixWorkdirSkill repo . stampProjectGroup repo) raw)
+  let merge m [] = m
+      merge m (s:ss) = merge (Map.insertWith (\_new old -> old) (skId s) s m) ss
+      merged = merge Map.empty (concat perRepo)
+  pure (Map.elems merged)
+
+-- | A read-only backend serving a PRE-COMPUTED skill list (the discovery
+-- cache's point-in-time scan of the workdir). Mirrors
+-- 'workdirSkillBackend''s semantics: reads from memory, writes/deletes are
+-- no-ops (repo-local skills are immutable from the model's perspective).
+staticSkillBackend :: [Skill] -> IO SkillBackend
+staticSkillBackend skills = pure SkillBackend
+  { sbCreate = \_ -> pure ()
+  , sbRead   = \sid -> pure (Map.lookup sid (Map.fromList [(skId s, s) | s <- skills]))
+  , sbList   = pure skills
+  , sbUpdate = \_ -> pure ()
+  , sbDelete = \_ -> pure ()
+  }
+
+-- | Read one agentskills.io @\<dir\>\/SKILL.md@ skill by DIRECT read against
+-- a 'WorkdirFs' anchored at the workspace root (no existence probe first —
+-- 'WfsNotFound' ⇒ 'Nothing'). Mirrors 'readAgentSkillAt' minus the
+-- separate does-file-exist round trip. @dirRel@ is the full workspace-
+-- relative path of the skill directory.
+readAgentSkillDirect :: WorkdirFs -> Maybe Text -> Text -> IO (Maybe Skill)
+readAgentSkillDirect fs mGroup dirRel = do
+  eContent <- wfsReadFile fs =<< rpOrDie (dirRel <> "/SKILL.md")
+  case eContent of
+    Left _   -> pure Nothing
+    Right c -> pure (stampGroupDirect (decodeAgentSkillWithGroup mGroup c))
+  where
+    stampGroupDirect (Just s) = case skGroup s of
+      Just _  -> Just s
+      Nothing -> Just s { skGroup = mGroup }
+    stampGroupDirect Nothing = Nothing
 
 -- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
 -- so the @\<available_skills\>@ catalog groups them under a per-repo
@@ -589,12 +643,15 @@ decodeAgentSkillWithGroup mGroup content =
 -- (Mirrors 'Seal.Agent.Def.Workdir.reanchorFs'.)
 reanchorFs :: WorkdirFs -> Text -> WorkdirFs
 reanchorFs fs prefix = WorkdirFs
-  { wfsReadFile            = wfsReadFile fs            <=< joinRp prefix
-  , wfsDoesFileExist       = wfsDoesFileExist fs       <=< joinRp prefix
-  , wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs  <=< joinRp prefix
-  , wfsListDirectory       = wfsListDirectory fs       <=< joinRp prefix
-  , wfsFileSize            = wfsFileSize fs            <=< joinRp prefix
-  , wfsModificationTime    = wfsModificationTime fs    <=< joinRp prefix
+  { wfsReadFile            = wfsReadFile fs           <=< joinRp prefix
+  , wfsDoesFileExist       = wfsDoesFileExist fs      <=< joinRp prefix
+  , wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs <=< joinRp prefix
+  , wfsListDirectory       = wfsListDirectory fs      <=< joinRp prefix
+  , wfsFileSize            = wfsFileSize fs           <=< joinRp prefix
+  , wfsModificationTime    = wfsModificationTime fs   <=< joinRp prefix
+  , wfsSnapshot            = wfsSnapshot fs
+    -- ^ Whole-workspace: re-anchoring changes where relative reads land,
+    -- never the snapshot's root-relative frame.
   }
 
 -- | Join a prefix and a (possibly @"\. "@) relative 'RemotePath' into a single
