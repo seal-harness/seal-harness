@@ -53,10 +53,19 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
     it "records Crashed when the worker throws" $ do
       rt <- newAgentRuntime
       _ <- startAgent rt sampleDefId sampleSubagentId sampleSession 0 (throwIO (userError "boom"))
-      -- give the fork a moment to throw
-      threadDelay 50000
-      mStatus <- agentStatus rt sampleSubagentId
-      mStatus `shouldSatisfy` maybe False isCrashed
+      -- Poll for the async crash transition instead of one fixed sleep:
+      -- under full-suite load a bare 50ms wait can observe Running and
+      -- flake. Bounded at ~2s (200 × 10ms) so the suite stays fast.
+      let pollUntilCrashed :: Int -> IO Bool
+          pollUntilCrashed n
+            | n <= (0 :: Int) = pure False
+            | otherwise = do
+                mStatus <- agentStatus rt sampleSubagentId
+                case mStatus of
+                  Just s | isCrashed s -> pure True
+                  _ -> threadDelay 10000 >> pollUntilCrashed (n - 1)
+      crashed <- pollUntilCrashed 200
+      crashed `shouldBe` True
       _ <- stopAgent rt sampleSubagentId
       pure ()
 
