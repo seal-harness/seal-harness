@@ -304,6 +304,14 @@ export interface RepoInput {
    *  deploy keypair (ssh-keygen) + stores the encrypted keyfile + the
    *  passphrase in the vault. The response carries the public key. */
   generate_key?: boolean
+  /** Write-only: the PAT (or machine-user bot token) the operator pastes in
+   *  the form. Sent to the server ONLY on create or rotation (PUT with a
+   *  non-empty token). On create with credential.kind pat/machine_user the
+   *  server vhPut's it into the vault under credential.vault_key. NEVER
+   *  persisted in repos.toml, NEVER returned by the API (RepoInfo has no
+   *  token field), NEVER echoed back to the UI. Optional: when absent the
+   *  server leaves the vault untouched (the out-of-band /vault add path). */
+  token?: string
 }
 
 /** The response from GET /api/repos/:id/deploy-key + POST
