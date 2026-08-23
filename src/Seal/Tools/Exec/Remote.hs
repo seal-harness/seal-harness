@@ -6,6 +6,30 @@
 -- failure ('ExecHostKeyMismatch'), never bypassed. Batch mode
 -- (@BatchMode=yes@) prevents interactive prompts (a headless run cannot
 -- confirm a new host key, so adoption fail-closes).
+--
+-- == Connection multiplexing
+--
+-- Every invocation joins one of TWO DISJOINT @ControlMaster=auto@ pools,
+-- keyed by the 'ControlPath' suffix:
+--
+--   * @m-%C@ — plain sessions (never @-A@): discovery snapshots, file
+--     reads/writes, shell execs.
+--   * @a-%C@ — agent-forwarding sessions only (the git-credential ops that
+--     pass @-A@).
+--
+-- The split preserves the §5.6 opt-in invariant: agent forwarding over a
+-- multiplexed connection requires the /master/ process to have been started
+-- with @-A@, so a plain op can never ride an agent-forwarding master (and a
+-- forwarding op never upgrades the shared plain pool). The first op to each
+-- pool pays the TCP + key-exchange + auth handshake; every subsequent op for
+-- ~10 minutes ('ControlPersist') rides the persistent master socket — turning
+-- N serialized round trips from N handshakes into 1 + N fast channel opens.
+--
+-- Security posture is unchanged: the master itself was established under the
+-- same pinning options (same argv shape ⇒ same config), @BatchMode=yes@
+-- still forbids interactive prompts, and a stale socket (master killed) is
+-- detected by @ControlMaster=auto@, which falls back to a fresh direct
+-- connection. The socket directory is private (mode 0700) under @~/.seal/@.
 module Seal.Tools.Exec.Remote
   ( sshExecArgv
   , sshExecArgvForwarding
@@ -26,9 +50,13 @@ import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
 import System.IO (hClose)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Posix.Files (setFileMode)
 import System.Process
   ( CreateProcess (..), StdStream (..), proc, waitForProcess
   )
@@ -63,6 +91,7 @@ sshExecArgv cfg cmd =
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
   ]
+  <> muxArgs "m"
   <> portArg
   <> identityArg
   <> [ userAtHost
@@ -99,6 +128,7 @@ sshExecArgvForwarding cfg cmd =
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
   ]
+  <> muxArgs "a"
   <> portArg
   <> identityArg
   <> [ userAtHost
@@ -114,6 +144,35 @@ sshExecArgvForwarding cfg cmd =
     identityArg = case scIdentity cfg of
       Nothing -> []
       Just f  -> ["-i", f]
+
+-- | The multiplexing options for one master pool. @pool@ is @\"m\"@ (plain)
+-- or @\"a\"@ (agent-forwarding); the ControlPath suffix keeps the pools
+-- disjoint. @%C@ is ssh's hash of |local host|local port|remote host|remote
+-- port, so each target gets its own master even within one pool.
+muxArgs :: String -> [String]
+muxArgs pool =
+  [ "-o", "ControlMaster=auto"
+  , "-o", "ControlPath=" <> sshMuxBaseDir </> (pool <> "-%C")
+  , "-o", "ControlPersist=600"
+  ]
+
+-- | The absolute mux socket directory, @~/.seal/ssh-mux@ (mode 0700),
+-- created once at first use. An absolute path (not a @~@-form) so the argv
+-- builder stays pure without relying on ssh's tilde expansion of @-o@
+-- values; 'ensureMuxDir' re-ensures it before every spawn.
+{-# NOINLINE sshMuxBaseDir #-}
+sshMuxBaseDir :: FilePath
+sshMuxBaseDir = unsafePerformIO $ do
+  home <- getHomeDirectory
+  let d = home </> ".seal" </> "ssh-mux"
+  ensureMuxDirAt d
+  pure d
+
+-- | Idempotently create the mux socket directory with private permissions.
+ensureMuxDirAt :: FilePath -> IO ()
+ensureMuxDirAt d = do
+  createDirectoryIfMissing True d
+  setFileMode d 0o700
 
 -- | The SSH runner seam — a record of two IO actions:
 --
@@ -151,6 +210,9 @@ mkRealRemoteRunner = RemoteRunner
   where
     runReal :: Maybe ByteString -> [(String, String)] -> [String] -> IO (Either ExecError Text)
     runReal mStdin envExtras argv = do
+      -- Re-ensure the mux socket dir before every spawn (guards against a
+      -- mid-run deletion; ssh fatals if ControlPath is uncreatable).
+      ensureMuxDirAt sshMuxBaseDir
       let (program, args) = case argv of
             (p : as) -> (p, as)
             []       -> error "runReal: empty argv (unreachable)"
