@@ -210,13 +210,29 @@ runGitWithCredentials bin args mCwdPath recorded = do
                     let envExtras = ceEnvExtras cloneEnv
                         mKnownHosts = ceKnownHostsContent cloneEnv
                         -- Deploy keys use uioBinExecGitEnv (agent forwarding);
-                        -- PATs use uioBinExecEnv (no agent, just env overrides).
-                        -- The distinction: deploy keys have SSH_AUTH_SOCK in
-                        -- ceEnvExtras; PATs don't.
+                        -- PATs use uioBinExecEnv (no agent, just env overrides
+                        -- + the http.extraHeader git config args). The
+                        -- distinction: deploy keys have SSH_AUTH_SOCK in
+                        -- ceEnvExtras; PATs don't. For PATs, ceGitConfigArgs
+                        -- carries ["-c", "http.extraHeader=Authorization:
+                        -- Basic <base64>"] — these MUST be prepended to the
+                        -- git argv or git push/fetch/pull won't authenticate.
                         hasAgent = any (\(k, _) -> k == "SSH_AUTH_SOCK") envExtras
                     res <- if hasAgent
                              then uioBinExecGitEnv envExtras mKnownHosts bin args mCwdPath
-                             else uioBinExecEnv envExtras bin args mCwdPath
+                             else do
+                               let -- Prepend ceGitConfigArgs to the git argv
+                                   -- so the http.extraHeader (PAT auth) is
+                                   -- applied. ceGitConfigArgs is a list of
+                                   -- complete argv tokens (e.g. ["-c",
+                                   -- "http.extraHeader=..."]); convert each
+                                   -- to a BinArg via mkBinArg (the literal
+                                   -- is safe — it's harness-built, not
+                                   -- user-supplied).
+                                   configArgs = case traverse mkBinArg (ceGitConfigArgs cloneEnv) of
+                                     Right as -> as
+                                     Left _   -> []
+                               uioBinExecEnv envExtras bin (configArgs ++ args) mCwdPath
                     pure $ case res of
                       Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                       Right out -> OpResult [TrpText out] False recorded
