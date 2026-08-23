@@ -307,6 +307,34 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
         , "cwd" .= (Nothing :: Maybe String)
         ]
 
+    it "gh auth is blocked (writes secrets to disk)" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (runOp mkRemoteUntrustedIOStub Nothing op (object
+        [ "binary" .= ("gh" :: String)
+        , "args" .= (["auth", "login"] :: [String])
+        ]))
+      orIsError r `shouldBe` True
+      let partsText = [t | TrpText t <- orParts r]
+      partsText `shouldSatisfy` any (\t -> "gh auth" `T.isInfixOf` t && "blocked" `T.isInfixOf` t)
+
+    it "gh auth token is blocked (prints secret to stdout)" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      r <- runTestApp (runOp mkRemoteUntrustedIOStub Nothing op (object
+        [ "binary" .= ("gh" :: String)
+        , "args" .= (["auth", "token"] :: [String])
+        ]))
+      orIsError r `shouldBe` True
+      let partsText = [t | TrpText t <- orParts r]
+      partsText `shouldSatisfy` any (\t -> "gh auth" `T.isInfixOf` t && "blocked" `T.isInfixOf` t)
+
+    it "gh pr create is NOT blocked (authenticates via GH_TOKEN)" $ do
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      -- The authorize gate should pass (gh pr create is not blocked).
+      uoAuthorize op (object
+        [ "binary" .= ("gh" :: String)
+        , "args" .= (["pr", "create", "--title", "test"] :: [String])
+        ]) `shouldBe` Right ()
+
   describe "BIN_EXEC cwd" $ do
 
     it "defaults cwd to Nothing when omitted (the executor anchors it to the workdir)" $ do

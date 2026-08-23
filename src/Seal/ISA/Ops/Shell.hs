@@ -16,6 +16,7 @@ module Seal.ISA.Ops.Shell
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Text (Text)
+import qualified Data.Text as T
 
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
@@ -45,7 +46,9 @@ shellExecOp _wsRoot policy = UntrustedOpcode
           Left _err -> Left "SHELL_EXEC: invalid command"
           Right _ -> case spAutonomy policy of
             Deny -> Left "SHELL_EXEC denied by autonomy policy"
-            _   -> Right ()
+            _   -> if "gh auth" `T.isInfixOf` cmd
+                     then Left "SHELL_EXEC: `gh auth` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use `gh pr create` / `gh repo clone` / etc. directly."
+                     else Right ()
   , uoRun = \v -> do
       let mCmd = commandField v
           mCwd = cwdField v

@@ -121,15 +121,28 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
                         Left _err ->
                           pure (OpResult [TrpText "BIN_EXEC: invalid cwd"] True recorded)
                         Right mCwdPath -> do
-                          if textBinName bin == "git"
-                            then runGitWithCredentials bin args mCwdPath recorded
-                            else if textBinName bin == "gh"
-                              then runGhWithCredentials bin args mCwdPath recorded
-                              else do
-                                res <- uioBinExec bin args mCwdPath
-                                pure $ case res of
-                                  Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
-                                  Right out -> OpResult [TrpText out] False recorded
+                           if textBinName bin == "git"
+                             then runGitWithCredentials bin args mCwdPath recorded
+                             else if textBinName bin == "gh"
+                               then case args of
+                                 -- Block `gh auth` subcommands — they write
+                                 -- secrets to disk on the untrusted machine
+                                 -- (e.g. `gh auth login` stores a token in
+                                 -- ~/.config/gh/hosts.yml; `gh auth token`
+                                 -- prints the token to stdout → transcript).
+                                 -- The harness injects GH_TOKEN from the
+                                 -- vault; `gh auth` is never needed and
+                                 -- always unsafe.
+                                 (firstArg : _) | textBinArg firstArg == "auth" ->
+                                   pure (OpResult
+                                     [ TrpText "BIN_EXEC: `gh auth` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use gh pr create / gh repo clone / etc. directly — they authenticate via the injected GH_TOKEN."
+                                     ] True recorded)
+                                 _ -> runGhWithCredentials bin args mCwdPath recorded
+                               else do
+                                 res <- uioBinExec bin args mCwdPath
+                                 pure $ case res of
+                                   Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                                   Right out -> OpResult [TrpText out] False recorded
   }
 
 binExecSchema :: Value
