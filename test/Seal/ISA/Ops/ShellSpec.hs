@@ -94,17 +94,22 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
     it "gh auth login is blocked at the authorize gate (writes secrets to disk)" $ do
       let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
       uoAuthorize op (object ["command" .= ("gh auth login" :: String)])
-        `shouldBe` Left "SHELL_EXEC: `gh auth` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use `gh pr create` / `gh repo clone` / etc. directly."
+        `shouldSatisfy` isLeft
 
     it "gh auth token is blocked (prints secret to stdout → transcript)" $ do
       let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
       uoAuthorize op (object ["command" .= ("gh auth token" :: String)])
         `shouldSatisfy` isLeft
 
-    it "gh auth in a compound command is blocked" $ do
+    it "gh auth setup-git in a compound command is blocked" $ do
       let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
       uoAuthorize op (object ["command" .= ("cd repo && gh auth setup-git && git push" :: String)])
         `shouldSatisfy` isLeft
+
+    it "gh auth status is NOT blocked (read-only, no disk writes)" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("gh auth status" :: String)])
+        `shouldBe` Right ()
 
     it "non-gh-auth commands are NOT blocked" $ do
       let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)

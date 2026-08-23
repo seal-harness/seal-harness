@@ -123,21 +123,24 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
                         Right mCwdPath -> do
                            if textBinName bin == "git"
                              then runGitWithCredentials bin args mCwdPath recorded
-                             else if textBinName bin == "gh"
-                               then case args of
-                                 -- Block `gh auth` subcommands — they write
-                                 -- secrets to disk on the untrusted machine
-                                 -- (e.g. `gh auth login` stores a token in
-                                 -- ~/.config/gh/hosts.yml; `gh auth token`
-                                 -- prints the token to stdout → transcript).
-                                 -- The harness injects GH_TOKEN from the
-                                 -- vault; `gh auth` is never needed and
-                                 -- always unsafe.
-                                 (firstArg : _) | textBinArg firstArg == "auth" ->
-                                   pure (OpResult
-                                     [ TrpText "BIN_EXEC: `gh auth` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use gh pr create / gh repo clone / etc. directly — they authenticate via the injected GH_TOKEN."
-                                     ] True recorded)
-                                 _ -> runGhWithCredentials bin args mCwdPath recorded
+                              else if textBinName bin == "gh"
+                                then case args of
+                                  -- Block dangerous `gh auth` subcommands
+                                  -- — they write secrets to disk on the
+                                  -- untrusted machine (gh auth login stores
+                                  -- a token in ~/.config/gh/hosts.yml; gh
+                                  -- auth token prints the token to stdout →
+                                  -- transcript; gh auth setup-git configures
+                                  -- a credential helper that writes to disk).
+                                  -- `gh auth status` is read-only and allowed.
+                                  (firstArg : secondArg : _)
+                                    | textBinArg firstArg == "auth"
+                                    , let sub = textBinArg secondArg
+                                    , sub `elem` ["login", "token", "setup-git", "refresh", "git-credential"] ->
+                                      pure (OpResult
+                                      [ TrpText ("BIN_EXEC: `gh auth " <> sub <> "` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use gh pr create / gh repo clone / etc. directly — they authenticate via the injected GH_TOKEN.")
+                                      ] True recorded)
+                                  _ -> runGhWithCredentials bin args mCwdPath recorded
                                else do
                                  res <- uioBinExec bin args mCwdPath
                                  pure $ case res of

@@ -27,6 +27,17 @@ import Seal.Tools.Exec.UIO (renderUntrustedErr, uioShellExec)
 import Seal.Tools.Exec.Types (mkRemotePath)
 import Seal.Providers.Class (ToolResultPart (..))
 
+-- | @gh auth@ subcommands that write secrets to disk or print them to
+-- stdout. @gh auth status@ is read-only and allowed.
+dangerousGhAuthCmds :: [Text]
+dangerousGhAuthCmds =
+  [ "gh auth login"
+  , "gh auth token"
+  , "gh auth setup-git"
+  , "gh auth refresh"
+  , "gh auth git-credential"
+  ]
+
 -- | SHELL_EXEC opcode: run a validated shell command. Input: @{
 -- command: ShellCommand, cwd?: RemotePath }@. Authorize: the
 -- 'SecurityPolicy' must not be 'Deny' and the command must parse as a
@@ -46,8 +57,8 @@ shellExecOp _wsRoot policy = UntrustedOpcode
           Left _err -> Left "SHELL_EXEC: invalid command"
           Right _ -> case spAutonomy policy of
             Deny -> Left "SHELL_EXEC denied by autonomy policy"
-            _   -> if "gh auth" `T.isInfixOf` cmd
-                     then Left "SHELL_EXEC: `gh auth` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use `gh pr create` / `gh repo clone` / etc. directly."
+            _   -> if any (`T.isInfixOf` cmd) dangerousGhAuthCmds
+                     then Left "SHELL_EXEC: `gh auth login/token/setup-git` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use `gh pr create` / `gh repo clone` / etc. directly."
                      else Right ()
   , uoRun = \v -> do
       let mCmd = commandField v

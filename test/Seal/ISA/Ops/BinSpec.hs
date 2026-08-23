@@ -307,7 +307,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
         , "cwd" .= (Nothing :: Maybe String)
         ]
 
-    it "gh auth is blocked (writes secrets to disk)" $ do
+    it "gh auth login is blocked (writes secrets to disk)" $ do
       let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
       r <- runTestApp (runOp mkRemoteUntrustedIOStub Nothing op (object
         [ "binary" .= ("gh" :: String)
