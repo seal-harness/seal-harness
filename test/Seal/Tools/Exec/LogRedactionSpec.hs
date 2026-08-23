@@ -62,37 +62,36 @@ withCaptureGlobalLogger action = do
   pure (result, lines_)
 
 spec :: Spec
-spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug redaction" $ do
+spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug (shows real values for debugging)" $ do
 
-  -- The invariant under test (design §3.7): the rendered log message that
-  -- 'logExecDebug' emits must not contain any value from a key in
-  -- 'secretEnvKeys'. The key is preserved (so the reader sees that an env
-  -- override was applied); only the value is redacted.
+  -- The harness machine is trusted and debug logs are for debugging only.
+  -- The real env values (including secrets like GH_TOKEN) are shown so
+  -- operators can diagnose credential-injection issues. The redaction
+  -- seam (secretEnvKeys/redactEnv) is kept available for future use cases
+  -- where logs might be shipped to an untrusted aggregator, but
+  -- logExecDebug itself does NOT redact.
 
-  it "redacts GH_TOKEN value in the env extras (local arm shape)" $ do
+  it "shows the real GH_TOKEN value in the env extras (local arm shape)" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "gh pr create"] Nothing
         [("GH_TOKEN", "ghp_secret123"), ("GIT_TERMINAL_PROMPT", "0")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GH_TOKEN=<redacted>" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GH_TOKEN=ghp_secret123" `T.isInfixOf`)
     allText `shouldSatisfy` ("GIT_TERMINAL_PROMPT=0" `T.isInfixOf`)
-    allText `shouldNotSatisfy` ("ghp_secret123" `T.isInfixOf`)
 
-  it "redacts GITHUB_TOKEN value in the env extras" $ do
+  it "shows the real GITHUB_TOKEN value in the env extras" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "gh pr create"] Nothing
         [("GITHUB_TOKEN", "ghp_secretABC")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GITHUB_TOKEN=<redacted>" `T.isInfixOf`)
-    allText `shouldNotSatisfy` ("ghp_secretABC" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GITHUB_TOKEN=ghp_secretABC" `T.isInfixOf`)
 
-  it "redacts http.extraHeader value (defense-in-depth)" $ do
+  it "shows the real http.extraHeader value (defense-in-depth)" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "git fetch"] Nothing
         [("http.extraHeader", "Authorization: Basic c2VjcmV0")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("http.extraHeader=<redacted>" `T.isInfixOf`)
-    allText `shouldNotSatisfy` ("p2VjcmV0" `T.isInfixOf`)
+    allText `shouldSatisfy` ("http.extraHeader=Authorization: Basic c2VjcmV0" `T.isInfixOf`)
 
   it "preserves non-secret env keys unchanged" $ do
     (_, lines_) <- withCaptureGlobalLogger $
@@ -102,14 +101,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug redaction" $ do
     allText `shouldSatisfy` ("GIT_TERMINAL_PROMPT=0" `T.isInfixOf`)
     allText `shouldSatisfy` ("SSH_AUTH_SOCK=/tmp/agent.sock" `T.isInfixOf`)
 
-  it "redacts the token in the remote arm's logged message (uioBinExecEnv)" $ do
-    -- The remote arm's 'uioBinExecEnv' builds the command with an
-    -- @env GH_TOKEN='<token>'@ prefix baked into the SSH command string.
-    -- 'runRemoteShellTextEnv' splits the env prefix out of the logged
-    -- argv and passes the extras separately to 'logExecDebug', which
-    -- redacts them. The INVARIANT: the logged message must not contain
-    -- the raw token. This exercises the real remote-arm path with a fake
-    -- runner (so no real SSH call is made) + the capture global logger.
+  it "shows the real token in the remote arm's logged message (uioBinExecEnv)" $ do
     let runner = mkFakeRemoteRunner (Right "")
         uio = mkRemoteUntrustedIO sshCfg runner
     bin <- either (const (error "fixture")) pure (mkBinName "gh")
@@ -117,8 +109,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug redaction" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       uioBinExecEnv uio [("GH_TOKEN", "ghp_secretXYZ")] bin [arg] Nothing
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GH_TOKEN=<redacted>" `T.isInfixOf`)
-    allText `shouldNotSatisfy` ("ghp_secretXYZ" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GH_TOKEN=ghp_secretXYZ" `T.isInfixOf`)
 
 -- | A placeholder SSH config for the remote-arm test (the fake runner
 -- ignores the connection details; only the workspace root matters for

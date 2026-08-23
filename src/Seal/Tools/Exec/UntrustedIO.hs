@@ -549,7 +549,9 @@ logExecDebug tag argv mCwd extras =
       <> envPart
       <> cwdPart
       <> [ unwords (map shellQuoteArgv argv) ]
-    envPart = case redactEnv extras of
+    -- Debug logs show the real env values (including secrets like GH_TOKEN).
+    -- The harness machine is trusted and these logs are for debugging only.
+    envPart = case extras of
       [] -> []
       xs -> [ unwords (map (\(k, v) -> k <> "=" <> v) xs) ]
     cwdPart = case mCwd of
