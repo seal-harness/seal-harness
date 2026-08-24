@@ -22,9 +22,11 @@ module Seal.Command.Repo
   , RepoTestSeam (..)
   ) where
 
+import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
+import qualified Data.Text.Encoding as TE
 import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
@@ -55,6 +57,9 @@ data RepoTestSeam = RepoTestSeam
     -- ^ The @git ls-remote@ seam (production: 'lsRemoteRepo').
   , rtsVaultList :: IO (Either VaultError [Text])
     -- ^ The vault key list (production: 'vhList') for the /repo info advisory.
+  , rtsVaultPut :: Text -> ByteString -> IO (Either VaultError ())
+    -- ^ The vault put seam (production: 'vhPut') for /repo add's PAT/MachineUser
+    -- token ingestion (hidden stdin prompt → vault, never argv/disk).
   }
 
 ----------------------------------------------------------------------------
@@ -89,7 +94,7 @@ repoParser regH seam = hsubparser
        (info (pure (listCmd regH))
              (progDesc "List all registered repos (id, url, credential kind)"))
   <> command "add"
-       (info (addCmd regH <$> idArg <*> urlArg <*> vcsOpt <*> credOpt
+       (info (addCmd regH seam <$> idArg <*> urlArg <*> vcsOpt <*> credOpt
                       <*> vaultKeyOpt <*> usernameOpt)
              (progDesc "Add or replace a source-control repo"))
   <> command "remove"
@@ -184,6 +189,7 @@ listCmd regH = CommandAction $ \caps -> do
 -- On a successful mutation, echoes @added repo \<id\>@.
 addCmd
   :: RepoRegistryHandle
+  -> RepoTestSeam  -- ^ vault put seam (for PAT/MachineUser token ingestion)
   -> Text   -- ^ raw id
   -> Text   -- ^ url
   -> Text   -- ^ vcs kind (text)
@@ -191,15 +197,27 @@ addCmd
   -> Text   -- ^ vault key name
   -> Maybe Text  -- ^ optional username (machine_user only)
   -> CommandAction
-addCmd regH rawId url rawVcs rawCred vaultKey mUsername =
+addCmd regH seam rawId url rawVcs rawCred vaultKey mUsername =
   CommandAction $ \caps -> do
     case validateAdd rawId url rawVcs rawCred vaultKey mUsername of
       Left err -> ccSend caps err
-      Right repo -> do
-        res <- rrhMutate regH (upsertRepo repo)
-        case res of
-          Left e  -> ccSend caps e
-          Right _ -> ccSend caps ("added repo " <> repoIdText (srId repo))
+      Right repo -> case srCredential repo of
+        CredDeployKey _      -> doUpsert caps repo
+        CredPat _            -> doTokenPrompt caps repo
+        CredMachineUser _ _ -> doTokenPrompt caps repo
+  where
+    doUpsert caps repo = do
+      res <- rrhMutate regH (upsertRepo repo)
+      case res of
+        Left e  -> ccSend caps e
+        Right _ -> ccSend caps ("added repo " <> repoIdText (srId repo))
+    doTokenPrompt caps repo = do
+      token <- ccPromptSecret caps ("PAT for " <> repoIdText (srId repo) <> ": ")
+      ePut <- rtsVaultPut seam (cVaultKey (srCredential repo)) (TE.encodeUtf8 token)
+      case ePut of
+        Left VaultLocked -> ccSend caps "vault locked — run /vault unlock"
+        Left _           -> ccSend caps "vault error — could not store token"
+        Right _          -> doUpsert caps repo
 
 -- | Pure validation for @/repo add@. Runs every write-time check from the
 -- security table (§Security): id charset, URL shape, host allow-list, VCS

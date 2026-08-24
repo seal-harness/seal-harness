@@ -32,12 +32,12 @@
 -- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
 -- credential via the no-disk seam ('Seal.SourceControl.Clone.resolveCloneTarget'
 -- using @cdVault@/@cdSshAgent@/@cdPinnedKnownHosts@/@cdKeyfilesDir@) and
--- run @git clone@ via 'uioShellExecEnv' (deploy key: @SSH_AUTH_SOCK@ +
--- @GIT_SSH_COMMAND@) or 'uioBinExecEnv' (PAT: @http.extraHeader@ argv) with
--- the resolved env. If the URL is NOT registered, fall through to a
--- bare-URL clone (public repos, backward-compat). Stays Untrusted;
--- credential resolution via 'liftIO' in the trusted plane. NO
--- @runLocal@/@BackendExec@.
+-- clones via @gh repo clone@ with @GH_TOKEN@ (PAT/MachineUser: the raw
+-- token from 'ceRawToken' injected as @GH_TOKEN@ env) or @git clone@ via
+-- 'uioShellExecGitEnv' (deploy key: @SSH_AUTH_SOCK@ + @GIT_SSH_COMMAND@).
+-- If the URL is NOT registered, fall through to a bare-URL clone (public
+-- repos, backward-compat). Stays Untrusted; credential resolution via
+-- 'liftIO' in the trusted plane. NO @runLocal@/@BackendExec@.
 module Seal.ISA.Ops.Repo
   ( setupRepoOp
   , validateRepoUrl
@@ -51,6 +51,7 @@ module Seal.ISA.Ops.Repo
 import Data.Aeson (Value, object, withObject, (.:), (.=))
 import Data.Aeson.Types (parseMaybe)
 import Data.Char (isAlphaNum)
+import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -71,7 +72,7 @@ import Seal.Tools.Exec.UIO
   ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 import Seal.Tools.Exec.UntrustedIO qualified as UIORec
-  (UntrustedIO (uioShellExec, uioShellExecGitEnv))
+  (UntrustedIO (uioShellExec, uioShellExecEnv, uioShellExecGitEnv))
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 
 -- | SETUP_REPO opcode. Input: @{url: Text}@. Authorize: autonomy must not
@@ -236,10 +237,19 @@ cloneRepoIO deps uio url = do
             Just repo -> cloneWithCredential deps uio repo repoName mCwdPath
             Nothing   -> cloneBareUrl uio cleanUrl repoName mCwdPath
 
--- | Clone a registered repo via the no-disk seam (deploy key or PAT).
--- Resolves the credential via 'resolveCloneTarget' + runs @git clone@ with
--- the resolved env (deploy key: 'uioShellExecEnv'; PAT: 'uioBinExecEnv' —
--- both merge the auth env over the inherited env).
+-- | Clone a registered repo via the no-disk seam. Resolves the credential
+-- via 'resolveCloneTarget', then branches on the credential kind:
+--
+--   * **PAT/MachineUser** ('ceRawToken' is 'Just'): clones via
+--     @gh repo clone <url> <dest> -- --depth 1@ with @GH_TOKEN@ injected
+--     into the process env. This mirrors the BIN_EXEC @gh@ path
+--     ('runGhWithCredentials' in "Seal.ISA.Ops.Bin") — the raw token
+--     bytes (from 'ceRawToken') go to @GH_TOKEN@, never to argv or disk.
+--     @gh@ authenticates via the token, not via @http.extraHeader@.
+--
+--   * **Deploy key** ('ceRawToken' is 'Nothing'): clones via
+--     @git clone@ with the agent-forwarding env (@SSH_AUTH_SOCK@ /
+--     @GIT_SSH_COMMAND@) — @gh@ cannot use an SSH agent.
 cloneWithCredential
   :: CloneDeps -> UntrustedIO -> SourceRepo -> Text -> Maybe RemotePath
   -> IO CloneResult
@@ -248,13 +258,24 @@ cloneWithCredential deps uio repo repoName mCwdPath = do
   case eTarget of
     Left err -> pure (CloneFailed ("credential resolution failed: " <> renderCloneError err))
     Right target -> withCloneTarget target $ \env -> do
-      let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
-          cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
-                     <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
-      cloneRes <- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
-      case cloneRes of
-        Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
-        Right _out -> verifyClone uio repoName _out mCwdPath
+      case ceRawToken env of
+        Just tokenBytes -> do
+          let token = map (toEnum . fromIntegral) (BS.unpack tokenBytes)
+              envExtras = ("GH_TOKEN", token) : ceEnvExtras env
+              ghCmd = "gh repo clone " <> shellQ (ceUrl env) <> " "
+                      <> shellQ repoName <> " -- --depth 1"
+          cloneRes <- UIORec.uioShellExecEnv uio envExtras (shellCmd ghCmd) mCwdPath
+          case cloneRes of
+            Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+            Right _out -> verifyClone uio repoName _out mCwdPath
+        Nothing -> do
+          let gitConfigArgs = map T.unpack (ceGitConfigArgs env)
+              cloneCmd = "git " <> T.unwords (map T.pack gitConfigArgs)
+                         <> " clone --depth 1 -- " <> shellQ (ceUrl env) <> " " <> shellQ repoName
+          cloneRes <- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath
+          case cloneRes of
+            Left err -> pure (CloneFailed ("clone failed: " <> renderUntrustedErr err))
+            Right _out -> verifyClone uio repoName _out mCwdPath
 
 -- | Clone a bare URL (no credential — public repo, backward-compat).
 cloneBareUrl :: UntrustedIO -> Text -> Text -> Maybe RemotePath -> IO CloneResult

@@ -49,11 +49,15 @@ function Row({
 }
 
 function emptyInput(): RepoInput {
-  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'deploy_key', vault_key: '' } }
+  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'deploy_key', vault_key: '' }, token: '' }
 }
 
 function repoToInput(r: RepoInfo): RepoInput {
-  return { id: r.id, url: r.url, vcs_kind: r.vcs_kind, credential: { ...r.credential } }
+  // The edit form does NOT pre-populate the token — it is not retrievable
+  // from the vault via the API. The operator pastes a new token only when
+  // rotating; an empty token field means "no change" (the PUT omits `token`
+  // and the server leaves the vault entry untouched).
+  return { id: r.id, url: r.url, vcs_kind: r.vcs_kind, credential: { ...r.credential }, token: '' }
 }
 
 /** Extract the GitHub deploy-keys settings URL from a repo URL.
@@ -143,6 +147,15 @@ export function ReposView() {
     if (form.credential.kind === 'machine_user' && !(form.credential.username ?? '').trim()) {
       return 'username is required for a Bot Account (machine_user)'
     }
+    // The PAT / bot-token is required on CREATE for pat/machine_user (the
+    // server must vhPut it into the vault — there's no other way to get the
+    // token in). On EDIT the token is optional (empty = no change / no vault
+    // touch — the operator only pastes a new token to rotate).
+    if (creating && (form.credential.kind === 'pat' || form.credential.kind === 'machine_user')) {
+      if (!(form.token ?? '').trim()) {
+        return form.credential.kind === 'pat' ? 'PAT is required' : 'Bot token is required'
+      }
+    }
     return null
   }
 
@@ -156,6 +169,7 @@ export function ReposView() {
     const vaultKey = autoVaultKey(trimmedId, form.credential.kind)
     const username = form.credential.username?.trim()
     if (creating) {
+      const token = form.token?.trim()
       const payload: RepoInput = {
         id: trimmedId,
         url,
@@ -169,6 +183,10 @@ export function ReposView() {
         // deploy_key (the server runs ssh-keygen + stores the encrypted
         // keyfile + the passphrase in the vault).
         ...(form.credential.kind === 'deploy_key' ? { generate_key: true } : {}),
+        // Write-only: send the PAT/bot-token for pat/machine_user so the
+        // server vhPut's it into the vault under vaultKey. (Validation
+        // already guaranteed a non-empty token for these kinds on create.)
+        ...((form.credential.kind === 'pat' || form.credential.kind === 'machine_user') && token ? { token } : {}),
       }
       const res = await createRepo(payload)
       setSubmitting(false)
@@ -181,6 +199,7 @@ export function ReposView() {
       }
     } else if (editing) {
       // PUT: id from path; ids are stable — NO new_id.
+      const token = form.token?.trim()
       const payload: RepoInput = {
         url,
         vcs_kind: form.vcs_kind,
@@ -189,6 +208,10 @@ export function ReposView() {
           vault_key: vaultKey,
           ...(form.credential.kind === 'machine_user' && username ? { username } : {}),
         },
+        // On edit, send the token ONLY if non-empty (rotation). An empty
+        // token means "no change" — the server leaves the vault entry
+        // untouched (assuming the credential kind is unchanged).
+        ...(token ? { token } : {}),
       }
       const res = await updateRepo(editing, payload)
       setSubmitting(false)
@@ -381,6 +404,11 @@ export function ReposView() {
                   const kind = e.target.value as RepoCredentialKind
                   setForm((f) => ({
                     ...f,
+                    // Clear the token when switching credential kinds so a
+                    // PAT typed then switched to deploy_key doesn't leak into
+                    // a later payload. (The token is create-only/rotate-only;
+                    // it has no meaning under a different credential kind.)
+                    token: '',
                     credential: {
                       kind,
                       vault_key: f.credential.vault_key,
@@ -396,16 +424,6 @@ export function ReposView() {
                 ))}
               </select>
             </Row>
-            {credKind === 'pat' && (
-              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
-                Note: deploy_key is preferred for lower exposure (PAT token is in memory during the clone).
-              </div>
-            )}
-            {credKind === 'machine_user' && (
-              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
-                Note: deploy_key is preferred for lower exposure (machine-user token is in memory during the clone).
-              </div>
-            )}
 
             {credKind === 'machine_user' && (
               <Row label="Username" htmlFor="repo-username" hint="The bot account username (machine_user only).">
@@ -419,6 +437,48 @@ export function ReposView() {
                   autoComplete="off"
                 />
               </Row>
+            )}
+
+            {/* PAT / Bot-token password field — write-only. Shown for the
+                two token-bearing credential kinds (pat, machine_user). The
+                field is the primary interaction; the advisory note (below)
+                moves under it so the field is prominent, not the note. On
+                edit the field is empty (no pre-population — the token is not
+                retrievable from the vault via the API); a non-empty value
+                rotates the vault entry. */}
+            {(credKind === 'pat' || credKind === 'machine_user') && (
+              <Row
+                label={credKind === 'pat' ? 'PAT' : 'Bot token'}
+                htmlFor="repo-token"
+                hint={creating
+                  ? undefined
+                  : 'Paste a new token to rotate (leave empty to keep the existing one).'}
+              >
+                <input
+                  id="repo-token"
+                  type="password"
+                  value={form.token ?? ''}
+                  onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
+                  style={inputStyle}
+                  placeholder={creating
+                    ? (credKind === 'pat' ? 'ghp_...' : 'ghp_...')
+                    : 'Paste new token to rotate (leave empty to keep)'}
+                  autoComplete="off"
+                />
+              </Row>
+            )}
+
+            {/* Advisory note — now below the token field so the field is the
+                primary interaction, not the note. */}
+            {credKind === 'pat' && (
+              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
+                Note: deploy_key is preferred for lower exposure (PAT token is in memory during the clone).
+              </div>
+            )}
+            {credKind === 'machine_user' && (
+              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
+                Note: deploy_key is preferred for lower exposure (machine-user token is in memory during the clone).
+              </div>
             )}
 
             {!creating && selected?.deploy_key_public && (() => {

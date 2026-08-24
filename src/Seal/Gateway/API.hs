@@ -86,7 +86,8 @@ import Seal.Security.Adoption
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
-  , parseCredentialKind, parseRepoHost, parseVcsKind, repoIdText, urlShapeValid )
+  , parseCredentialKind, parseRepoHost, parseVcsKind, repoCredentialKindText
+  , repoIdText, urlShapeValid )
 import Seal.SourceControl.Registry
   ( RepoRegistryHandle (..), removeRepo, upsertRepo )
 import Seal.Security.Vault (VaultHandle (vhDelete, vhPut))
@@ -1329,15 +1330,43 @@ handleRepoCreate deps body =
                         bestEffortCommitRepos deps
                         broadcastReposChanged (adBroker deps)
                         pure (jsonCreated (repoInfoJson repo'))
-          else do
-            -- Standard upsert (no key generation).
-            eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
-            case eRes of
-              Left err -> pure (errJson status500 err)
-              Right _  -> do
-                bestEffortCommitRepos deps
-                broadcastReposChanged (adBroker deps)
-                pure (jsonCreated (repoInfoJson repo))
+          else case extractToken v of
+            Just _ | isDeployKeyCred (srCredential repo) ->
+              -- A token is only meaningful for PAT/MachineUser credentials
+              -- (the two token-bearing kinds); a deploy key's secret is
+              -- server-generated via generate_key. Fail closed (400).
+              pure (errJson status400 "token is only valid for pat/machine_user credentials")
+            Just token -> do
+              -- PAT/MachineUser: store the token in the vault under the
+              -- repo's vault key BEFORE upserting the descriptor (mirrors
+              -- generateDeployKey's vhPut-before-upsert ordering). The
+              -- descriptor carries only the vault key NAME — never the token.
+              mh <- readIORef (vrHandleRef (adVault deps))
+              case mh of
+                Nothing -> pure (errJson status500 "vault locked — run /vault unlock")
+                Just vh -> do
+                  ePut <- vhPut vh (cVaultKey (srCredential repo)) (TE.encodeUtf8 token)
+                  case ePut of
+                    Left ve -> pure (errJson status500 ("vault put failed: " <> T.pack (show ve)))
+                    Right _ -> do
+                      eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+                      case eRes of
+                        Left err -> pure (errJson status500 err)
+                        Right _  -> do
+                          bestEffortCommitRepos deps
+                          broadcastReposChanged (adBroker deps)
+                          pure (jsonCreated (repoInfoJson repo))
+            Nothing -> do
+              -- Standard upsert (no token, no key generation). The vault is
+              -- untouched — the operator may have pre-populated the token
+              -- out-of-band via /vault add.
+              eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo)
+              case eRes of
+                Left err -> pure (errJson status500 err)
+                Right _  -> do
+                  bestEffortCommitRepos deps
+                  broadcastReposChanged (adBroker deps)
+                  pure (jsonCreated (repoInfoJson repo))
 
 -- | Handle PUT /api/repos/:id. The path id is authoritative; the body must
 -- carry @url@, @vcs_kind@, and @credential@ (the id may be omitted — it is
@@ -1368,20 +1397,73 @@ handleRepoUpdate deps ridTxt body =
                   -- from the UI even though the keyfile still exists on
                   -- disk. Credential vault key names are also stable
                   -- identifiers — match on credential equality.
-                  let repo' = case findRepo rid rs of
+                  let mOld = findRepo rid rs
+                      repo' = case mOld of
                         Just old
                           | srCredential repo == srCredential old
                           , CredDeployKey _ <- srCredential old
                           -> repo { srDeployKeyPublic = srDeployKeyPublic old
                                   , srKeyfilePath     = srKeyfilePath old }
                         _ -> repo
-                  eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo')
-                  case eRes of
-                    Left err -> pure (errJson status500 err)
-                    Right _  -> do
-                      bestEffortCommitRepos deps
-                      broadcastReposChanged (adBroker deps)
-                      pure (jsonOk (repoInfoJson repo'))
+                      kindChanged = case mOld of
+                        Just old -> srCredential repo' /= srCredential old
+                        Nothing  -> False
+                      mOldVaultKey = case mOld of
+                        Just old | kindChanged -> Just (cVaultKey (srCredential old))
+                        _                       -> Nothing
+                  case extractToken v of
+                    Just _ | isDeployKeyCred (srCredential repo') ->
+                      pure (errJson status400 "token is only valid for pat/machine_user credentials")
+                    Just token -> do
+                      -- Token present + PAT/MachineUser. If the credential
+                      -- kind changed, best-effort delete the old vault key
+                      -- (the old entry is inert without a repo descriptor,
+                      -- but cleaning it up avoids orphan accumulation). Then
+                      -- vhPut the new token under the new vault key BEFORE
+                      -- upserting the descriptor (fail-closed 500 on vault
+                      -- error, mirroring POST).
+                      mh <- readIORef (vrHandleRef (adVault deps))
+                      case mh of
+                        Nothing -> pure (errJson status500 "vault locked — run /vault unlock")
+                        Just vh -> do
+                          case mOldVaultKey of
+                            Just oldKey -> void (vhDelete vh oldKey)
+                            Nothing     -> pure ()
+                          ePut <- vhPut vh (cVaultKey (srCredential repo')) (TE.encodeUtf8 token)
+                          case ePut of
+                            Left ve -> pure (errJson status500 ("vault put failed: " <> T.pack (show ve)))
+                            Right _ -> do
+                              eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo')
+                              case eRes of
+                                Left err -> pure (errJson status500 err)
+                                Right _  -> do
+                                  bestEffortCommitRepos deps
+                                  broadcastReposChanged (adBroker deps)
+                                  pure (jsonOk (repoInfoJson repo'))
+                    Nothing
+                      | kindChanged, not (isDeployKeyCred (srCredential repo')) ->
+                        -- Kind changed to a token-bearing credential (PAT or
+                        -- MachineUser) but no token was supplied: the new vault
+                        -- key has no entry. Fail closed (400) — the operator
+                        -- must paste a token to re-authenticate under the new
+                        -- kind. (Switching TO a deploy key needs no token —
+                        -- its secret is server-generated via generate_key, so
+                        -- that falls through to the standard upsert.)
+                        pure (errJson status400
+                               ("credential kind changed but no token supplied — paste a "
+                              <> repoCredentialKindText (srCredential repo')
+                              <> " token to re-authenticate"))
+                      | otherwise -> do
+                        -- No token + kind unchanged (or switching to a deploy
+                        -- key): preserve the existing vault entry (the PUT
+                        -- doesn't touch the vault).
+                        eRes <- rrhMutate (adRepoRegistry deps) (upsertRepo repo')
+                        case eRes of
+                          Left err -> pure (errJson status500 err)
+                          Right _  -> do
+                            bestEffortCommitRepos deps
+                            broadcastReposChanged (adBroker deps)
+                            pure (jsonOk (repoInfoJson repo'))
 
 -- | Handle DELETE /api/repos/:id. Idempotent: 204 whether or not the repo
 -- existed. 400 on a malformed id. Best-effort @gitCommitAll@ + broadcast
@@ -1439,6 +1521,27 @@ bestEffortCommitRepos deps =
 -- only @rrhList@, so a single-repo lookup filters the whole list).
 findRepo :: RepoId -> [SourceRepo] -> Maybe SourceRepo
 findRepo rid = foldr (\r acc -> if srId r == rid then Just r else acc) Nothing
+
+-- | Extract a top-level, write-only @token@ field from the raw JSON request
+-- body (mirrors the @genKey@ extraction). Returns @Just t@ when the field is a
+-- non-empty (post-trim) string; @Nothing@ when absent, null, or empty. The
+-- token is ephemeral — it is never persisted in the 'SourceRepo' (which
+-- carries only the vault key NAME); it goes straight to the vault via 'vhPut'.
+extractToken :: A.Value -> Maybe Text
+extractToken (A.Object o) = case KeyMap.lookup (Key.fromText "token") o of
+  Just (A.String t)
+    | not (T.null (T.strip t)) -> Just (T.strip t)
+    | otherwise                -> Nothing
+  Just A.Null -> Nothing
+  Just _      -> Nothing
+  Nothing     -> Nothing
+extractToken _ = Nothing
+
+-- | True iff the credential is a deploy key (the one credential kind that
+-- never carries a user-supplied token — its secret is server-generated).
+isDeployKeyCred :: RepoCredential -> Bool
+isDeployKeyCred CredDeployKey{} = True
+isDeployKeyCred _               = False
 
 -- | Parse a 'SourceRepo' from a POST /api/repos body. The @id@ field is
 -- authoritative and validated via 'mkRepoId'. Validates URL shape, host

@@ -182,6 +182,12 @@ describe('ReposView', () => {
     // secret VALUE (token/value/secret/password). The only credential
     // input is username (a bot account name) — never the secret itself.
     // The vault key is auto-generated from the repo id + credential kind.
+    //
+    // The PAT/Bot-token password field (`repo-token`, type="password") is
+    // the deliberate, write-only exception: it IS a secret-value field by
+    // design, but one that is sent to the server only on create/rotate and
+    // never persisted in the UI state beyond the form's ephemeral
+    // `form.token`. It is excluded from the forbidden-id check below.
     reposState = []
     render(<ReposView />)
     fireEvent.click(screen.getByLabelText('New repo'))
@@ -191,6 +197,8 @@ describe('ReposView', () => {
     for (const el of inputs) {
       const id = (el as HTMLElement).getAttribute('id') ?? ''
       const name = (el as HTMLElement).getAttribute('name') ?? ''
+      // The write-only PAT/Bot-token password field is the sanctioned exception.
+      if (id === 'repo-token') continue
       for (const bad of forbiddenIds) {
         expect(id.toLowerCase()).not.toContain(bad)
         expect(name.toLowerCase()).not.toContain(bad)
@@ -198,5 +206,67 @@ describe('ReposView', () => {
     }
     // Sanity: the vault-key field is NOT present (auto-generated, no UI).
     expect(document.getElementById('repo-vault-key')).toBeNull()
+  })
+
+  // ── PAT / Bot-token password field (WU-D) ────────────────────────────────
+
+  it('renders a password field when pat is selected', () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    // Default credential kind is deploy_key → no token field.
+    expect(document.getElementById('repo-token')).toBeNull()
+    // Select "Personal Access Token" (pat) → password field appears.
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    const tokenEl = document.getElementById('repo-token') as HTMLInputElement
+    expect(tokenEl).not.toBeNull()
+    expect(tokenEl.type).toBe('password')
+  })
+
+  it('validation requires the token on create (submit with empty token + pat)', async () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
+    fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    // Leave the token empty → submit.
+    fireEvent.click(screen.getByLabelText('Create repo'))
+    expect(screen.getByTestId('repo-form-error')).toBeTruthy()
+    expect(screen.getByText(/PAT is required/i)).toBeTruthy()
+    expect(createRepo).not.toHaveBeenCalled()
+  })
+
+  it('sends token in the payload on create (submit with token xyz)', async () => {
+    createRepo.mockResolvedValue({ ok: true, repo: makeRepo({ id: 'myrepo' }) })
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
+    fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    fireEvent.change(document.getElementById('repo-token') as HTMLInputElement, { target: { value: 'xyz' } })
+    fireEvent.click(screen.getByLabelText('Create repo'))
+    await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
+    const body = createRepo.mock.calls[0]![0] as { token?: string; credential: { kind: string } }
+    expect(body.token).toBe('xyz')
+    expect(body.credential.kind).toBe('pat')
+  })
+
+  it('clears the token on credential-kind switch', () => {
+    reposState = []
+    render(<ReposView />)
+    fireEvent.click(screen.getByLabelText('New repo'))
+    // Select pat, type a token.
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    fireEvent.change(document.getElementById('repo-token') as HTMLInputElement, { target: { value: 'xyz' } })
+    expect((document.getElementById('repo-token') as HTMLInputElement).value).toBe('xyz')
+    // Switch to deploy_key → token field disappears AND the token value
+    // is cleared from form state (so it can't leak into a later payload).
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'deploy_key' } })
+    expect(document.getElementById('repo-token')).toBeNull()
+    // Switch back to pat → the field is empty (token was cleared).
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    expect((document.getElementById('repo-token') as HTMLInputElement).value).toBe('')
   })
 })

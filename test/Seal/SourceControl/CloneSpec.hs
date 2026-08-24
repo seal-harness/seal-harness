@@ -496,6 +496,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
           -- Walk the disk: no token on disk
           files <- collectAllFiles stateDir
           any (\(_, c) -> token `BS.isInfixOf` c) files `shouldBe` False
+          -- ceRawToken carries the raw token bytes (the gh injection
+          -- payload), and the raw token bytes do NOT leak into ceUrl,
+          -- ceEnvExtras, or the non-header parts of ceGitConfigArgs.
+          ceRawToken env `shouldBe` Just token
 
     it "MachineUser: username in Basic auth header; token NOT in env" $
       withSystemTempDirectory "seal-home" $ \homeDir -> do
