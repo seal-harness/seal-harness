@@ -33,7 +33,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 
 import Seal.Core.Types (ModelId (..))
-import Seal.Providers.Class (Message (..), ToolChoice (..))
+import Seal.Providers.Class (Message (..), ToolChoice (..), ToolDefinition (..))
 import Seal.Transcript.Entries
 import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 
@@ -77,17 +77,21 @@ reconstruct conv = go 0 Nothing
               -- Delta-only: the NEW messages added since the prior turn
               -- (conv[start:end]), NOT the cumulative prefix.
               msgs = take (end - start) (drop start conv)
-              -- Only include the system prompt when it CHANGED from the
-              -- prior effective envelope. The frontend deduplicates system
-              -- prompts via `seenSystemPrompts`, so shipping the same
-              -- 15KB system prompt in all 73 request entries of a 146-turn
-              -- session wastes ~1.1MB. Omitting it when unchanged lets the
-              -- frontend skip the system row for that entry (it only
-              -- renders the first occurrence of each unique prompt).
+              -- Only include envelope fields when they CHANGED from the
+              -- prior effective envelope. The frontend deduplicates System
+              -- Prompt and Tools rows independently, so shipping the same
+              -- 36KB system prompt + 14KB tools array in all 73 request
+              -- entries of a 146-turn session wastes ~3.6MB. Omitting
+              -- unchanged fields lets the frontend skip the rows for those
+              -- entries (it only renders the first occurrence of each
+              -- unique system prompt / tools pair).
               sys = if envSystem env /= (envSystem =<< mEnv)
                       then envSystem env
                       else Nothing
-              payload = requestPayload env sys msgs
+              tools = if envTools env /= maybe [] envTools mEnv
+                        then Just (envTools env)
+                        else Nothing
+              payload = requestPayload env sys tools msgs
               entry = toEntry e Request payload
           in entry : go end (Just env) es
         EKResponse ->
@@ -127,23 +131,26 @@ reconstruct conv = go 0 Nothing
 
 -- | Build the old 'Request' payload: a 'CompletionRequest'-shaped JSON object
 -- carrying the model, system, tools, toolChoice, maxTokens, and the message
--- prefix in effect at this turn. The @sys@ argument is the system prompt to
--- include — 'Nothing' means "omit the system field" (used when the prompt is
--- unchanged from the prior request, so the frontend skips the redundant
--- system row). Mirrors the old 'ToJSON CompletionRequest' encoding so a
--- "view raw" reproduces the bytes the old format stored.
-requestPayload :: Envelope -> Maybe Text -> [Message] -> Value
-requestPayload env sys msgs = object $
+-- prefix in effect at this turn. The @sys@ and @tools@ arguments are the
+-- system prompt and tools to include — 'Nothing' means "omit the field"
+-- (used when the value is unchanged from the prior request, so the frontend
+-- skips the redundant row). Mirrors the old 'ToJSON CompletionRequest'
+-- encoding so a "view raw" reproduces the bytes the old format stored.
+requestPayload :: Envelope -> Maybe Text -> Maybe [ToolDefinition] -> [Message] -> Value
+requestPayload env sys mTools msgs = object $
   [ "model"      .= envModel env
   , "messages"   .= msgs
-  , "tools"      .= envTools env
-  , "toolChoice" .= envToolChoice env
-  , "maxTokens"  .= envMaxTokens env
-  ] <> systemField
+  ] <> toolsField
+    <> [ "toolChoice" .= envToolChoice env
+       , "maxTokens"  .= envMaxTokens env
+       ] <> systemField
   where
     systemField = case sys of
       Nothing -> []  -- unchanged from prior; omit so frontend skips
       Just s  -> ["system" .= s]
+    toolsField = case mTools of
+      Nothing -> []  -- unchanged from prior; omit so frontend skips
+      Just ts -> ["tools" .= ts]
 
 -- | Build the old 'Response' payload: the assistant content blocks (drawn
 -- from the conversation lines added since the prior turn) plus the usage /

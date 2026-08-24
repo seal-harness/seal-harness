@@ -6,6 +6,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 
@@ -13,7 +14,8 @@ import qualified Data.Vector as V
 
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), Usage (..) )
+  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), Usage (..)
+  , ToolDefinition (..) )
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Entries
 import Seal.Transcript.Reconstruct
@@ -137,6 +139,42 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
       [e1, _, e3] -> do
         payloadField "model" e1 `shouldBe` Just (String "m1")
         payloadField "model" e3 `shouldBe` Just (String "m2")
+      _ -> expectationFailure "expected exactly three reconstructed entries"
+
+  it "omits the tools field from subsequent requests when unchanged (omit-if-unchanged)" $ do
+    -- The frontend deduplicates Tools rows independently. Reconstruct must
+    -- NOT re-include the tools array in every request payload when it's
+    -- unchanged from the prior request — only the first request carries
+    -- the full tools array; subsequent requests omit the `tools` key so the
+    -- frontend skips the Tools row for those entries.
+    let conv = [ Message User [CbText "a"], Message Assistant [CbText "b"], Message User [CbText "c"] ]
+        tools = [ToolDefinition (OpName "SHELL_EXEC") "run a command" Null]
+        entries =
+          [ reqEntry emptyEnvelopeDelta { edTools = Just tools } 1
+          , respEntry 2
+          , reqEntry emptyEnvelopeDelta 3  -- no delta → inherit tools
+          ]
+    case reconstruct conv entries of
+      [e1, _, e3] -> do
+        -- First request: tools present.
+        payloadField "tools" e1 `shouldSatisfy` isJust
+        -- Second request: tools OMITTED (unchanged from prior).
+        payloadField "tools" e3 `shouldBe` Nothing
+      _ -> expectationFailure "expected exactly three reconstructed entries"
+
+  it "includes the tools field when they change between requests" $ do
+    let conv = [ Message User [CbText "a"], Message Assistant [CbText "b"], Message User [CbText "c"] ]
+        tools1 = [ToolDefinition (OpName "SHELL_EXEC") "run a command" Null]
+        tools2 = [ToolDefinition (OpName "FILE_READ") "read a file" Null]
+        entries =
+          [ reqEntry emptyEnvelopeDelta { edTools = Just tools1 } 1
+          , respEntry 2
+          , reqEntry emptyEnvelopeDelta { edTools = Just tools2 } 3
+          ]
+    case reconstruct conv entries of
+      [e1, _, e3] -> do
+        payloadField "tools" e1 `shouldSatisfy` isJust
+        payloadField "tools" e3 `shouldSatisfy` isJust
       _ -> expectationFailure "expected exactly three reconstructed entries"
 
   it "compaction entries pass through as boundary markers" $
