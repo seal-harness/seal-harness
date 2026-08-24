@@ -1608,7 +1608,15 @@ function extractToolDefs(tools: unknown[]): { names: string[]; descriptions: str
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
+  // Dedup System Prompt and Tools INDEPENDENTLY. The backend omits the
+  // `system` field from subsequent request entries when it's unchanged
+  // (Reconstruct.hs omit-if-unchanged), so a combined (system + tools)
+  // dedup key would re-render the Tools row whenever the system prompt
+  // was omitted — producing a duplicate Tools row. Separate sets ensure
+  // an unchanged tools array never re-renders just because the system
+  // prompt was elided, and vice versa.
   const seenSystemPrompts = new Set<string>()
+  const seenTools = new Set<string>()
   const toolResults = buildToolResultIndex(entries)
 
   for (const e of entries) {
@@ -1713,12 +1721,8 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // Extract system prompt + tools as TWO top-level rows (first
-        // occurrence only): a "System" row for the system prompt and a
-        // "Tools" row for the tool definitions. Splitting them (rather than
-        // nesting tools inside the System block) gives each its own header,
-        // permalink, and "View raw JSON" affordance. Both rows carry
-        // `rawJson` so the user can view the full request payload.
+        // Dedup System Prompt and Tools INDEPENDENTLY (separate sets).
+        // See the comment at the top of `transcriptToMessages` for why.
         const sysPrompt = parsed.system as string | undefined
         const tools = parsed.tools
         const hasTools = Array.isArray(tools) && tools.length > 0
@@ -1729,31 +1733,27 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               return { count: names.length, names, descriptions, json: toolsJson }
             })()
           : undefined
-        // Dedup key: system prompt text + tools JSON. Only the first
-        // occurrence of a given (system, tools) pair renders rows.
-        const dedupKey = (sysPrompt ?? '') + '\u0000' + toolsJson
-        if ((sysPrompt || hasTools) && !seenSystemPrompts.has(dedupKey)) {
-          seenSystemPrompts.add(dedupKey)
-          if (sysPrompt) {
-            messages.push({
-              id: e.id + '-sys',
-              agentName: 'System Prompt',
-              agentStatus: 'idle',
-              timestamp: ts,
-              blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
-              rawJson,
-            })
-          }
-          if (toolDefsBlock) {
-            messages.push({
-              id: e.id + '-tools',
-              agentName: 'Tools',
-              agentStatus: 'idle',
-              timestamp: ts,
-              blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
-              rawJson,
-            })
-          }
+        if (sysPrompt && !seenSystemPrompts.has(sysPrompt)) {
+          seenSystemPrompts.add(sysPrompt)
+          messages.push({
+            id: e.id + '-sys',
+            agentName: 'System Prompt',
+            agentStatus: 'idle',
+            timestamp: ts,
+            blocks: [{ id: 'sys-' + e.id, collapsedText: sysPrompt }],
+            rawJson,
+          })
+        }
+        if (toolDefsBlock && !seenTools.has(toolsJson)) {
+          seenTools.add(toolsJson)
+          messages.push({
+            id: e.id + '-tools',
+            agentName: 'Tools',
+            agentStatus: 'idle',
+            timestamp: ts,
+            blocks: [{ id: 'tools-' + e.id, toolDefs: toolDefsBlock }],
+            rawJson,
+          })
         }
         // Extract only the LAST message from the request — it's the new
         // one being sent. Earlier messages in the array are conversation

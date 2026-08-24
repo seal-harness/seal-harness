@@ -244,6 +244,43 @@ describe('transcriptToMessages', () => {
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
+  it('dedups System and Tools rows independently (backend omits unchanged system on second request)', () => {
+    // Mirrors the real two-file reconstruct path: the backend omits the
+    // `system` field from subsequent request entries when it's unchanged
+    // from the prior request (Reconstruct.hs omit-if-unchanged). The tools
+    // array is still present. The combined (system + tools) dedup key used
+    // to produce a SECOND Tools row because the key differed (system was
+    // undefined on the second entry). System and Tools must dedup
+    // independently so an unchanged tools array doesn't re-render just
+    // because the system prompt was omitted.
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'p1',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys', tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'first' }] }] }),
+        raw: '{}',
+      }),
+      makeEntry({
+        id: 'p2',
+        direction: 'response',
+        model: 'm',
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }),
+        raw: '{}',
+      }),
+      // Second request: system OMITTED (unchanged), tools present.
+      makeEntry({
+        id: 'p3',
+        direction: 'request',
+        payload: JSON.stringify({ tools, messages: [{ role: 'user', content: [{ type: 'text', text: 'second' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    expect(msgs.filter((m) => m.agentName === 'System Prompt')).toHaveLength(1)
+    expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
+  })
+
   it('omits tool defs when tools array is empty or absent', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
