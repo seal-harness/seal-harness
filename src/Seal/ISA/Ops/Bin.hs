@@ -25,13 +25,25 @@
 -- @git fetch@ / @git pull@ / @git push@ authenticate without the model
 -- needing to know the credential mechanism. Unregistered repos and
 -- non-git binaries fall through to the plain 'uioBinExec' path.
+--
+-- **gh credential injection:** when @binary == "gh"@, the opcode mirrors
+-- the git path's pre-flight + registry lookup, but differs in the final
+-- exec step: for a PAT/MachineUser repo it injects @GH_TOKEN@ (the raw
+-- token bytes from 'ceRawToken') into the env via 'uioBinExecEnv' (gh
+-- authenticates via @GH_TOKEN@, not @http.extraHeader@ or SSH). Deploy-key
+-- repos fall through to plain exec (gh can't use SSH). When the argv
+-- contains @-R@ / @--repo@ (gh acts on a different repo than the cwd's
+-- @origin@), credential injection is skipped (plain exec + a non-secret
+-- NOTE in 'orParts' so the agent learns the skip was deliberate).
 module Seal.ISA.Ops.Bin
   ( binExecOp
   , binExecSchema
+  , extractGhRepoFlag
   ) where
 
 import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson.Types (parseMaybe)
+import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
@@ -69,7 +81,7 @@ binExecOp
   -> Opcode
 binExecOp wsRoot policy mAllowList = UntrustedOpcode
   { uoName = OpName "BIN_EXEC"
-  , uoDesc = "Run a named binary with argv args (no shell, optional allow-list). Git binary gets credential injection from registered repos."
+  , uoDesc = "Run a named binary with argv args (no shell, optional allow-list). Git and gh binaries get credential injection from registered repos."
   , uoInSchema = binExecSchema
   , uoOutSchema = object []
   , uoAuthorize = \v ->
@@ -105,17 +117,35 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
               case traverse mkBinArg (fromMaybe [] mArgs) of
                    Left err -> pure (OpResult [TrpText ("BIN_EXEC: invalid arg: " <> err)] True recorded)
                    Right args ->
-                     case resolveCwd wsRoot mCwd of
-                       Left _err ->
-                         pure (OpResult [TrpText "BIN_EXEC: invalid cwd"] True recorded)
-                       Right mCwdPath -> do
-                         if textBinName bin == "git"
-                           then runGitWithCredentials bin args mCwdPath recorded
-                           else do
-                             res <- uioBinExec bin args mCwdPath
-                             pure $ case res of
-                               Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
-                               Right out -> OpResult [TrpText out] False recorded
+                      case resolveCwd wsRoot mCwd of
+                        Left _err ->
+                          pure (OpResult [TrpText "BIN_EXEC: invalid cwd"] True recorded)
+                        Right mCwdPath -> do
+                           if textBinName bin == "git"
+                             then runGitWithCredentials bin args mCwdPath recorded
+                              else if textBinName bin == "gh"
+                                then case args of
+                                  -- Block dangerous `gh auth` subcommands
+                                  -- — they write secrets to disk on the
+                                  -- untrusted machine (gh auth login stores
+                                  -- a token in ~/.config/gh/hosts.yml; gh
+                                  -- auth token prints the token to stdout →
+                                  -- transcript; gh auth setup-git configures
+                                  -- a credential helper that writes to disk).
+                                  -- `gh auth status` is read-only and allowed.
+                                  (firstArg : secondArg : _)
+                                    | textBinArg firstArg == "auth"
+                                    , let sub = textBinArg secondArg
+                                    , sub `elem` ["login", "token", "setup-git", "refresh", "git-credential"] ->
+                                      pure (OpResult
+                                      [ TrpText ("BIN_EXEC: `gh auth " <> sub <> "` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use gh pr create / gh repo clone / etc. directly — they authenticate via the injected GH_TOKEN.")
+                                      ] True recorded)
+                                  _ -> runGhWithCredentials bin args mCwdPath recorded
+                               else do
+                                 res <- uioBinExec bin args mCwdPath
+                                 pure $ case res of
+                                   Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                                   Right out -> OpResult [TrpText out] False recorded
   }
 
 binExecSchema :: Value
@@ -196,16 +226,121 @@ runGitWithCredentials bin args mCwdPath recorded = do
                     let envExtras = ceEnvExtras cloneEnv
                         mKnownHosts = ceKnownHostsContent cloneEnv
                         -- Deploy keys use uioBinExecGitEnv (agent forwarding);
-                        -- PATs use uioBinExecEnv (no agent, just env overrides).
-                        -- The distinction: deploy keys have SSH_AUTH_SOCK in
-                        -- ceEnvExtras; PATs don't.
+                        -- PATs use uioBinExecEnv (no agent, just env overrides
+                        -- + the http.extraHeader git config args). The
+                        -- distinction: deploy keys have SSH_AUTH_SOCK in
+                        -- ceEnvExtras; PATs don't. For PATs, ceGitConfigArgs
+                        -- carries ["-c", "http.extraHeader=Authorization:
+                        -- Basic <base64>"] — these MUST be prepended to the
+                        -- git argv or git push/fetch/pull won't authenticate.
                         hasAgent = any (\(k, _) -> k == "SSH_AUTH_SOCK") envExtras
                     res <- if hasAgent
                              then uioBinExecGitEnv envExtras mKnownHosts bin args mCwdPath
-                             else uioBinExecEnv envExtras bin args mCwdPath
+                             else do
+                               let -- Prepend ceGitConfigArgs to the git argv
+                                   -- so the http.extraHeader (PAT auth) is
+                                   -- applied. ceGitConfigArgs is a list of
+                                   -- complete argv tokens (e.g. ["-c",
+                                   -- "http.extraHeader=..."]); convert each
+                                   -- to a BinArg via mkBinArg (the literal
+                                   -- is safe — it's harness-built, not
+                                   -- user-supplied).
+                                   configArgs = case traverse mkBinArg (ceGitConfigArgs cloneEnv) of
+                                     Right as -> as
+                                     Left _   -> []
+                               uioBinExecEnv envExtras bin (configArgs ++ args) mCwdPath
                     pure $ case res of
                       Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
                       Right out -> OpResult [TrpText out] False recorded
+
+-- | Run a @gh@ binary with credential injection when the cwd is inside a
+-- registered repo with a PAT/MachineUser credential. Mirrors
+-- 'runGitWithCredentials' in shape (same pre-flight + registry lookup +
+-- credential resolution) but differs in the final exec step: gh
+-- authenticates via @GH_TOKEN@ in the env (not @http.extraHeader@ in
+-- argv, and not SSH). When the argv contains @-R@ / @--repo@ (gh acts on
+-- a different repo than the cwd's @origin@), credential injection is
+-- skipped (plain exec + a non-secret NOTE in 'orParts'). Deploy-key repos
+-- fall through to plain exec (gh can't use SSH). Unregistered repos and
+-- non-git-cwd repos fall through to plain exec. Errors from the
+-- pre-flight or credential resolution are surfaced (not silently
+-- swallowed). The pre-flight always runs @git@ (not @gh@) — @gh@ doesn't
+-- expose @git config@.
+runGhWithCredentials
+  :: BinName -> [BinArg] -> Maybe RemotePath -> Value -> UIO OpResult
+runGhWithCredentials bin args mCwdPath recorded =
+  case extractGhRepoFlag (map textBinArg args) of
+    Just _ -> do
+      -- -R/--repo present: gh acts on a different repo than the cwd's
+      -- origin. Skip injection (plain exec) + surface a non-secret NOTE
+      -- so the agent learns the skip was deliberate (not an opaque auth
+      -- failure).
+      res <- uioBinExec bin args mCwdPath
+      pure $ case res of
+        Left err -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+        Right out -> OpResult
+          [ TrpText out
+          , TrpText "BIN_EXEC: gh -R/--repo detected — credential injection skipped (gh uses ambient auth). Run gh from the target repo's workdir for credential injection."
+          ] False recorded
+    Nothing -> do
+      -- Pre-flight: resolve the remote URL from the cwd's .git/config.
+      -- Uses `git` (not `gh`) — gh doesn't expose `git config`.
+      mRemoteUrl <- resolveRemoteUrl gitBin args mCwdPath
+      case mRemoteUrl of
+        Left err -> pure (OpResult [TrpText err] True recorded)
+        Right Nothing -> do
+          -- Not a git repo (or no origin) — fall through to plain exec.
+          res <- uioBinExec bin args mCwdPath
+          pure $ case res of
+            Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+            Right out -> OpResult [TrpText out] False recorded
+        Right (Just remoteUrl) -> do
+          eRepos <- uioCdRepoRegList
+          case eRepos of
+            Left err -> pure (OpResult [TrpText ("BIN_EXEC: repo registry error: " <> err)] True recorded)
+            Right repos -> do
+              let registry = RepoRegistry (Map.fromList [(srId r, r) | r <- repos])
+                  mRepo = lookupRepoByUrl remoteUrl registry
+              case mRepo of
+                Nothing -> do
+                  -- URL not registered — fall through to plain exec.
+                  res <- uioBinExec bin args mCwdPath
+                  pure $ case res of
+                    Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                    Right out -> OpResult [TrpText out] False recorded
+                Just repo -> do
+                  eTarget <- uioResolveClone repo
+                  case eTarget of
+                    Left cloneErr ->
+                      pure (OpResult [TrpText ("BIN_EXEC: credential resolution failed: " <> renderCloneError cloneErr)] True recorded)
+                    Right target ->
+                      uioWithClone target $ \cloneEnv ->
+                        case ceRawToken cloneEnv of
+                          Nothing -> do
+                            -- Deploy key: gh can't use SSH. Fall through
+                            -- to plain exec (gh surfaces its own auth error).
+                            res <- uioBinExec bin args mCwdPath
+                            pure $ case res of
+                              Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                              Right out -> OpResult [TrpText out] False recorded
+                          Just tokenBytes -> do
+                            -- PAT/MachineUser: inject GH_TOKEN (byte-accurate
+                            -- — map each Word8 to the Char with that
+                            -- codepoint via toEnum . fromIntegral, avoiding
+                            -- the U+FFFD corruption of decodeUtf8Lenient on
+                            -- non-UTF-8 tokens; mirrors renderPatHeader's
+                            -- raw-bytes discipline).
+                            let token = map (toEnum . fromIntegral) (BS.unpack tokenBytes)
+                                envExtras = ("GH_TOKEN", token)
+                                          : ceEnvExtras cloneEnv
+                            res <- uioBinExecEnv envExtras bin args mCwdPath
+                            pure $ case res of
+                              Left err   -> OpResult [TrpText (renderUntrustedErr err)] True recorded
+                              Right out -> OpResult [TrpText out] False recorded
+  where
+    -- The pre-flight always runs `git` (not `gh`) — gh doesn't expose
+    -- `git config`. The literal "git" always parses as a valid BinName.
+    gitBin = either (error "unreachable: mkBinName rejected a literal") id (mkBinName "git")
 
 -- | Pre-flight: resolve the @remote.origin.url@ from the cwd's git
 -- config. Runs @git config --get remote.origin.url@ via 'uioBinExec'
@@ -320,4 +455,38 @@ extractGitDir = go
       = Just (T.drop 2 x)
       | "--git-dir=" `T.isPrefixOf` x
       = Just (T.drop (T.length "--git-dir=") x)
+      | otherwise = go xs
+
+-- | Extract the @-R owner\/repo@ or @--repo owner\/repo@ value from a
+-- @gh@ argv list. Returns 'Just' the first value or 'Nothing' when
+-- neither flag is present. @gh@ (cobra/pflag) accepts four forms:
+--
+--   * @-R value@ (space-separated short)
+--   * @-Rvalue@ (joined short — pflag supports this for string
+--     shorthand flags)
+--   * @--repo value@ (space-separated long)
+--   * @--repo=value@ (joined long with @=@)
+--
+-- Scans the ENTIRE argv (global flags may appear after the subcommand:
+-- @gh pr create -R owner\/repo@ is valid). Only the first occurrence is
+-- used (the return value is only used for the "is @-R@ present?" skip
+-- decision, not for credential lookup — first-vs-last is irrelevant).
+-- Mirrors 'extractGitDir' (which handles both space and joined forms for
+-- @-C@ / @--git-dir=@).
+extractGhRepoFlag :: [Text] -> Maybe Text
+extractGhRepoFlag = go
+  where
+    go [] = Nothing
+    go (x : xs)
+      | x == "-R" = case xs of
+          (v : _) -> Just v
+          []      -> Nothing
+      | "-R" `T.isPrefixOf` x
+      , x /= "-R"
+      = Just (T.drop 2 x)
+      | x == "--repo" = case xs of
+          (v : _) -> Just v
+          []      -> Nothing
+      | "--repo=" `T.isPrefixOf` x
+      = Just (T.drop (T.length "--repo=") x)
       | otherwise = go xs

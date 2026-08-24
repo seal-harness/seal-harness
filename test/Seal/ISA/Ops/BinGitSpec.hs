@@ -235,7 +235,7 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
   --------------------------------------------------------------------
 
   describe "PAT repo — local mode" $ do
-    it "injects GIT_TERMINAL_PROMPT via uioBinExecEnv" $ do
+    it "injects GIT_TERMINAL_PROMPT + http.extraHeader via uioBinExecEnv" $ do
       deps <- mkPatDeps [patRepo] False
       seen <- newIORef []
       let uio = fakeUio seen "git@github.com:owner/test-repo.git\n" "done\n"
@@ -244,13 +244,19 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
       orParts result `shouldBe` [TrpText "done\n"]
       (_, second) <- getTwoExecs seen 2
       reBinary second `shouldBe` "git"
-      reArgs second `shouldBe` ["fetch"]
+      -- The http.extraHeader config args are prepended to the git argv
+      -- so git push/fetch/pull authenticate via the PAT.
+      reArgs second `shouldBe`
+        [ "-c"
+        , "http.extraHeader=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX0ZBS0VfVE9LRU5fMTIzNDU="
+        , "fetch"
+        ]
       reUsedEnv second `shouldBe` True
       reUsedGitEnv second `shouldBe` False
       reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_TERMINAL_PROMPT")
 
   describe "PAT repo — remote mode" $ do
-    it "injects GIT_TERMINAL_PROMPT via uioBinExecEnv" $ do
+    it "injects GIT_TERMINAL_PROMPT + http.extraHeader via uioBinExecEnv" $ do
       deps <- mkPatDeps [patRepo] True
       seen <- newIORef []
       let uio = fakeUio seen "git@github.com:owner/test-repo.git\n" "done\n"
@@ -259,7 +265,11 @@ spec = describe "Seal.ISA.Ops.Bin (git credential injection)" $ do
       orParts result `shouldBe` [TrpText "done\n"]
       (_, second) <- getTwoExecs seen 2
       reBinary second `shouldBe` "git"
-      reArgs second `shouldBe` ["fetch"]
+      reArgs second `shouldBe`
+        [ "-c"
+        , "http.extraHeader=Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX0ZBS0VfVE9LRU5fMTIzNDU="
+        , "fetch"
+        ]
       reUsedEnv second `shouldBe` True
       reUsedGitEnv second `shouldBe` False
       reEnvExtras second `shouldSatisfy` any (\(k, _) -> k == "GIT_TERMINAL_PROMPT")

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.ShellSpec (spec) where
 import Control.Monad.IO.Class (liftIO)
+import Data.Either (isLeft)
 import Data.Maybe (fromMaybe)
 import Seal.Tools.Exec.UIO (runUIOWithEnv)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -89,3 +90,28 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
           op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
       r <- runTestApp (runOp uio Nothing op (object ["command" .= ("false" :: String)]))
       orIsError r `shouldBe` True
+
+    it "gh auth login is blocked at the authorize gate (writes secrets to disk)" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("gh auth login" :: String)])
+        `shouldSatisfy` isLeft
+
+    it "gh auth token is blocked (prints secret to stdout → transcript)" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("gh auth token" :: String)])
+        `shouldSatisfy` isLeft
+
+    it "gh auth setup-git in a compound command is blocked" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("cd repo && gh auth setup-git && git push" :: String)])
+        `shouldSatisfy` isLeft
+
+    it "gh auth status is NOT blocked (read-only, no disk writes)" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("gh auth status" :: String)])
+        `shouldBe` Right ()
+
+    it "non-gh-auth commands are NOT blocked" $ do
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      uoAuthorize op (object ["command" .= ("gh pr create --title test" :: String)])
+        `shouldBe` Right ()

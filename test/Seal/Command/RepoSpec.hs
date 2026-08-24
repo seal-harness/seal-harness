@@ -9,10 +9,12 @@
 -- or vault is touched.
 module Seal.Command.RepoSpec (spec) where
 
+import Data.ByteString (ByteString)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import qualified Data.Text.Encoding as TE
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
 import Test.Hspec
 
@@ -83,11 +85,13 @@ mkFakeHandle repos = do
         }
   pure (h, ref)
 
--- | A seam whose ls-remote always errors and whose vault-list is empty.
+-- | A seam whose ls-remote always errors, vault-list is empty, and vault-put
+-- succeeds. Individual tests override fields as needed.
 noOpSeam :: RepoTestSeam
 noOpSeam = RepoTestSeam
   { rtsLsRemote  = \_ -> pure (Left (CloneGitFailed 1))
   , rtsVaultList = pure (Right [])
+  , rtsVaultPut  = \_ _ -> pure (Right ())
   }
 
 ----------------------------------------------------------------------------
@@ -109,6 +113,16 @@ runRepo
 runRepo h seam argv fc =
   case execParserPure defaultPrefs (csParserInfo (repoCommandSpec h seam)) argv of
     Success act -> runCommandAction act (capsFrom fc)
+    _           -> expectationFailure ("parse failed: " <> show argv)
+
+-- | Parse argv against the /repo command and run the resulting action with
+-- a caller-provided 'ChannelCaps' (for tests that need to override
+-- 'ccPromptSecret' or record calls).
+runRepoWithCaps
+  :: RepoRegistryHandle -> RepoTestSeam -> [String] -> ChannelCaps -> IO ()
+runRepoWithCaps h seam argv caps =
+  case execParserPure defaultPrefs (csParserInfo (repoCommandSpec h seam)) argv of
+    Success act -> runCommandAction act caps
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 ----------------------------------------------------------------------------
@@ -221,6 +235,121 @@ spec = describe "Seal.Command.Repo" $ do
         fc
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("added" `T.isInfixOf`)
+      rr <- readIORef ref
+      case Map.lookup (mkRid "botrepo") (rrRepos rr) of
+        Nothing -> expectationFailure "bot repo not added"
+        Just r  -> srCredential r `shouldBe` CredMachineUser "BK" "bot"
+
+    it "prompts for a PAT and stores it in the vault (--cred pat)" $ do
+      promptCalled <- newIORef ([] :: [Text])
+      putCalled    <- newIORef ([] :: [(Text, ByteString)])
+      (fc, _) <- makeFakeCaps []
+      (h, ref) <- mkFakeHandle []
+      let seam = noOpSeam
+            { rtsVaultPut = \k v -> do
+                modifyIORef' putCalled ((k, v) :)
+                pure (Right ())
+            }
+          caps = (capsFrom fc)
+            { ccPromptSecret = \prompt -> do
+                modifyIORef' promptCalled (prompt :)
+                pure "xyz"
+            }
+      runRepoWithCaps h seam
+        ["add", "myrepo", "git@github.com:o/r.git",
+         "--cred", "pat", "--vault-key", "K"]
+        caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("added" `T.isInfixOf`)
+      propts <- readIORef promptCalled
+      propts `shouldSatisfy` (not . null)
+      puts <- readIORef putCalled
+      puts `shouldBe` [("K", TE.encodeUtf8 "xyz")]
+      rr <- readIORef ref
+      case Map.lookup (mkRid "myrepo") (rrRepos rr) of
+        Nothing -> expectationFailure "repo not added"
+        Just r  -> srCredential r `shouldBe` CredPat "K"
+
+    it "aborts on vault-locked during PAT prompt (--cred pat)" $ do
+      putCalled <- newIORef ([] :: [(Text, ByteString)])
+      (fc, _) <- makeFakeCaps []
+      (h, ref) <- mkFakeHandle []
+      let seam = noOpSeam
+            { rtsVaultPut = \k v -> do
+                modifyIORef' putCalled ((k, v) :)
+                pure (Left VaultLocked)
+            }
+          caps = (capsFrom fc)
+            { ccPromptSecret = \_ -> pure "xyz"
+            }
+      runRepoWithCaps h seam
+        ["add", "myrepo", "git@github.com:o/r.git",
+         "--cred", "pat", "--vault-key", "K"]
+        caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("vault locked" `T.isInfixOf`)
+      T.unlines sent `shouldNotSatisfy` ("added" `T.isInfixOf`)
+      puts <- readIORef putCalled
+      puts `shouldBe` [("K", TE.encodeUtf8 "xyz")]
+      rr <- readIORef ref
+      Map.lookup (mkRid "myrepo") (rrRepos rr) `shouldBe` Nothing
+
+    it "does not prompt for deploy_key (--cred deploy_key)" $ do
+      promptCalled <- newIORef ([] :: [Text])
+      putCalled    <- newIORef ([] :: [(Text, ByteString)])
+      (fc, _) <- makeFakeCaps []
+      (h, ref) <- mkFakeHandle []
+      let seam = noOpSeam
+            { rtsVaultPut = \k v -> do
+                modifyIORef' putCalled ((k, v) :)
+                pure (Right ())
+            }
+          caps = (capsFrom fc)
+            { ccPromptSecret = \prompt -> do
+                modifyIORef' promptCalled (prompt :)
+                pure "xyz"
+            }
+      runRepoWithCaps h seam
+        ["add", "dkrepo", "git@github.com:o/dk.git",
+         "--cred", "deploy_key", "--vault-key", "DK"]
+        caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("added" `T.isInfixOf`)
+      propts <- readIORef promptCalled
+      propts `shouldBe` []
+      puts <- readIORef putCalled
+      puts `shouldBe` []
+      rr <- readIORef ref
+      case Map.lookup (mkRid "dkrepo") (rrRepos rr) of
+        Nothing -> expectationFailure "deploy_key repo not added"
+        Just r  -> srCredential r `shouldBe` CredDeployKey "DK"
+
+    it "prompts for a MachineUser token and stores it in the vault (--cred machine_user --username)" $ do
+      promptCalled <- newIORef ([] :: [Text])
+      putCalled    <- newIORef ([] :: [(Text, ByteString)])
+      (fc, _) <- makeFakeCaps []
+      (h, ref) <- mkFakeHandle []
+      let seam = noOpSeam
+            { rtsVaultPut = \k v -> do
+                modifyIORef' putCalled ((k, v) :)
+                pure (Right ())
+            }
+          caps = (capsFrom fc)
+            { ccPromptSecret = \prompt -> do
+                modifyIORef' promptCalled (prompt :)
+                pure "xyz"
+            }
+      runRepoWithCaps h seam
+        [ "add", "botrepo", "https://github.com/o/bot.git"
+        , "--cred", "machine_user", "--vault-key", "BK", "--username", "bot"
+        ]
+        caps
+      sent <- getSent fc
+      T.unlines sent `shouldSatisfy` ("added" `T.isInfixOf`)
+      propts <- readIORef promptCalled
+      propts `shouldSatisfy` (not . null)
+      puts <- readIORef putCalled
+      puts `shouldBe` [("BK", TE.encodeUtf8 "xyz")]
       rr <- readIORef ref
       case Map.lookup (mkRid "botrepo") (rrRepos rr) of
         Nothing -> expectationFailure "bot repo not added"

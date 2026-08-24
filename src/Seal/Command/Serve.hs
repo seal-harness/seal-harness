@@ -341,6 +341,11 @@ mkRepoTestSeam rt repoRegH paths = do
       case mh of
         Nothing -> pure (Left VaultLocked)
         Just vh -> vhList vh
+  , rtsVaultPut = \k v -> do
+      mh <- readIORef (vrHandleRef rt)
+      case mh of
+        Nothing -> pure (Left VaultLocked)
+        Just vh -> vhPut vh k v
   }
 
 -- | Open the vault if both recipient and identity are configured. Mirrors
