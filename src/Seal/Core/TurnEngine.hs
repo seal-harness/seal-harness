@@ -544,15 +544,6 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) (taCaps adapter) onDemand
   tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
-  -- [engine] Preamble entry: record a synthetic EKRequest entry (convLen=0,
-  -- full envelope, no messages) BEFORE the first user message so the
-  -- frontend's System Prompt + Tools rows appear above the first message,
-  -- not interleaved with it. Only emitted on the first turn (when no prior
-  -- EKRequest entry exists). The frontend renders an entry with an empty
-  -- messages array as just the System + Tools rows — no user message row.
-  priorEntries <- tfwReadEntries tHandle
-  unless (any (\e -> erKind e == EKRequest) priorEntries) $
-    recordPreamble tHandle model mSystem isaReg
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
               { teCaps          = taCaps adapter
@@ -793,9 +784,18 @@ callDispatcher td caps sid channelLabel callOpName val = do
                     toolUse = either (const True) resolvedToolUseEnforcement eCfg
                     taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
                 freshSkills <- Skill.staticSkillBackend freshSkillsList
-                let sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
+                -- Rebuild sessionBackends with the FRESH agent defs (after
+                -- autoBindRepoAgent re-bound the agent to the repo's
+                -- .agents/agents.md). The original sessionBackends was built
+                -- BEFORE the fresh scan, so it doesn't include the repo's
+                -- agent definition — using it would produce a preamble with
+                -- a stale (or missing) system prompt.
+                freshAgentDefs <- Def.staticAgentDefBackend freshDefs
+                let freshBackends = sessionBackends
+                      { bAgentDefs = Def.unionAgentDefBackend freshAgentDefs (bAgentDefs (tdBaseBackends td)) }
+                    sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
                 mSystem <- resolveSystemPrompt
-                  (bAgentDefs sessionBackends) sessionSkills
+                  (bAgentDefs freshBackends) sessionSkills
                   autoloadId injectCatalog parallel toolUse taskCompletion meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg

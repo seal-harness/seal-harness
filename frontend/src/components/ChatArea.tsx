@@ -1608,15 +1608,6 @@ function extractToolDefs(tools: unknown[]): { names: string[]; descriptions: str
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
-  // Dedup System Prompt and Tools INDEPENDENTLY. The backend omits the
-  // `system` field from subsequent request entries when it's unchanged
-  // (Reconstruct.hs omit-if-unchanged), so a combined (system + tools)
-  // dedup key would re-render the Tools row whenever the system prompt
-  // was omitted — producing a duplicate Tools row. Separate sets ensure
-  // an unchanged tools array never re-renders just because the system
-  // prompt was elided, and vice versa.
-  const seenSystemPrompts = new Set<string>()
-  const seenTools = new Set<string>()
   const toolResults = buildToolResultIndex(entries)
 
   for (const e of entries) {
@@ -1721,8 +1712,10 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           })
           continue
         }
-        // Dedup System Prompt and Tools INDEPENDENTLY (separate sets).
-        // See the comment at the top of `transcriptToMessages` for why.
+        // System Prompt and Tools rows: render every occurrence as it
+        // appears in the transcript. No deduplication — the user should
+        // see the true transcript, including when the system prompt or
+        // tools change between turns.
         const sysPrompt = parsed.system as string | undefined
         const tools = parsed.tools
         const hasTools = Array.isArray(tools) && tools.length > 0
@@ -1733,8 +1726,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               return { count: names.length, names, descriptions, json: toolsJson }
             })()
           : undefined
-        if (sysPrompt && !seenSystemPrompts.has(sysPrompt)) {
-          seenSystemPrompts.add(sysPrompt)
+        if (sysPrompt) {
           messages.push({
             id: e.id + '-sys',
             agentName: 'System Prompt',
@@ -1744,8 +1736,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
             rawJson,
           })
         }
-        if (toolDefsBlock && !seenTools.has(toolsJson)) {
-          seenTools.add(toolsJson)
+        if (toolDefsBlock) {
           messages.push({
             id: e.id + '-tools',
             agentName: 'Tools',
