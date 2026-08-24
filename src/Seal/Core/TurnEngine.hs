@@ -130,7 +130,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
@@ -378,6 +378,14 @@ data TurnDeps = TurnDeps
     -- ^ The per-process session-exec + workdir-discovery cache. Memoizes
     -- 'mkSessionExec' (the remote @mkdir -p@ bootstrap) and the agent-def +
     -- skill scans so each happens once per session, not once per turn.
+  , tdRemoteRunner :: Maybe RemoteRunner
+    -- ^ Test seam: when 'Just', replaces 'mkRealRemoteRunner' as the SSH
+    -- runner used to build the session exec in mode=remote. 'Nothing'
+    -- (production wiring) always uses the real runner. Integration tests
+    -- inject a recording fake so the composed ssh argv — the fully-rendered
+    -- remote command — is observable without a live SSH host. Never set in
+    -- production; the field exists solely so gateway API integration tests
+    -- can assert local/remote parity of the composed untrusted commands.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -505,8 +513,8 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
   exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
-                 eSecCfg sid cloneDeps mkRealRemoteRunner
+                 (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
+                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
       uioEnv = seUIOEnv exec
@@ -739,8 +747,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
     exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
-                   eSecCfg sid cloneDeps mkRealRemoteRunner
+                   (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
+                   eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
@@ -857,8 +865,8 @@ buildWorker td parentSid appEnv eCfg operatorCeiling channel =
         childCloneDeps <- mkCloneDepsTurn td
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
         seUIOEnv <$> either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
-                            eSecCfg childSid childCloneDeps mkRealRemoteRunner
+                            (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
+                            eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -895,8 +903,8 @@ buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
-                      eSecCfg childSid childCloneDeps mkRealRemoteRunner
+                      (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
+                      eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
   pure (buildChildRegistry (tdVault td) childCloneDeps (tdBaseBackends td)

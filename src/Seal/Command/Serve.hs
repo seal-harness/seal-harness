@@ -251,6 +251,7 @@ runServeMain autonomy logger = do
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
         , sdExecCache   = cdExecCache chanDeps
+        , sdRemoteRunner = Nothing
           -- ^ ONE shared instance: turns (web + channels), /call dispatches,
           -- and GET /api/sessions/:id/agents all hit the same cache.
         }
