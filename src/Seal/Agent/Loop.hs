@@ -4,6 +4,7 @@
 -- after Seal.Ingest has classified input as a PlainMessage. Bounded by aeMaxTurns.
 module Seal.Agent.Loop
   ( runTurn
+  , defaultMaxTokens
   ) where
 
 import Control.Exception (SomeException, catch)

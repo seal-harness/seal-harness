@@ -34,6 +34,7 @@ import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -46,7 +47,7 @@ import System.FilePath ((</>))
 import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
-import Seal.Agent.Loop (runTurn)
+import Seal.Agent.Loop (runTurn, defaultMaxTokens)
 import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig)
@@ -74,7 +75,9 @@ import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
-import Seal.Handles.Transcript (TwoFileHandle, withTwoFileTranscript, tfwSetSecretOps)
+import Seal.Handles.Transcript
+  ( TwoFileHandle, withTwoFileTranscript, tfwSetSecretOps, tfwReadEntries
+  , tfwRecordAndAck, TwoFileWrite (..) )
 import Seal.Harness.Id (newHarnessId)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
@@ -99,7 +102,9 @@ import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
-  (ContentBlock (..), Message (..), Role (..), SomeProvider)
+  (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
+import Seal.Transcript.Entries
+  ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
 import Seal.Session.ExecCache
   ( SessionExecCache, cachedSessionExec, cachedWorkdirScan
   , invalidateWorkdirScan
@@ -539,6 +544,15 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) (taCaps adapter) onDemand
   tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
+  -- [engine] Preamble entry: record a synthetic EKRequest entry (convLen=0,
+  -- full envelope, no messages) BEFORE the first user message so the
+  -- frontend's System Prompt + Tools rows appear above the first message,
+  -- not interleaved with it. Only emitted on the first turn (when no prior
+  -- EKRequest entry exists). The frontend renders an entry with an empty
+  -- messages array as just the System + Tools rows — no user message row.
+  priorEntries <- tfwReadEntries tHandle
+  unless (any (\e -> erKind e == EKRequest) priorEntries) $
+    recordPreamble tHandle model mSystem isaReg
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
               { teCaps          = taCaps adapter
@@ -573,6 +587,38 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
       -- sequence; the per-entry live broadcast already fired via aeOnEntry).
       broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       pure Nothing
+
+-- | Record a synthetic 'EKRequest' preamble entry (convLen=0, full envelope,
+-- no messages) before the first user message so the frontend's System Prompt
+-- + Tools rows appear above the first message, not interleaved with it. The
+-- entry carries the resolved system prompt + the ISA registry's tool defs so
+-- the frontend can render both rows from this single entry. The preamble is
+-- recorded ONCE per session (the caller checks for prior EKRequest entries).
+-- Broadcasts the entry so a live-connected frontend sees it immediately.
+recordPreamble :: TwoFileHandle -> ModelId -> Maybe Text -> ISA.Registry -> IO ()
+recordPreamble tHandle model mSystem isaReg = do
+  now <- getCurrentTime
+  let env0 = EnvelopeDelta
+        { edModel = Just model
+        , edSystem = Just mSystem
+        , edTools = Just (ISA.registryToolDefs isaReg)
+        , edToolChoice = Just ToolAuto
+        , edMaxTokens = Just defaultMaxTokens
+        }
+      entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKRequest
+        , erConvLen = 0
+        , erEnvelope = Just env0
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.empty
+        }
+  tfwRecordAndAck tHandle (TwoFileWrite [] entry)
 
 -- | Build 'Clone.CloneDeps' from a 'TurnDeps' (the in-scope vault runtime +
 -- repo registry handle + paths). The ssh-agent is real (production:

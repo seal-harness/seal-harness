@@ -281,6 +281,43 @@ describe('transcriptToMessages', () => {
     expect(msgs.filter((m) => m.agentName === 'Tools')).toHaveLength(1)
   })
 
+  it('renders System Prompt and Tools rows BEFORE the first user message (preamble entry)', () => {
+    // The backend records a preamble EKRequest entry (convLen=0, full
+    // envelope, no messages) before the first user message entry so the
+    // System Prompt and Tools rows appear above the first message, not
+    // interleaved with it. The preamble entry has an empty messages array
+    // (convLen=0), so the frontend renders only the System + Tools rows
+    // from it — no user message row.
+    const tools = [{ name: 'shell', description: 'sh', input_schema: {} }]
+    const entries: TranscriptEntry[] = [
+      // Preamble: full envelope, no messages.
+      makeEntry({
+        id: 'pre',
+        direction: 'request',
+        payload: JSON.stringify({ system: 'sys', tools, messages: [] }),
+        raw: '{}',
+      }),
+      // First user message: no envelope (unchanged), one user message.
+      makeEntry({
+        id: 'u1',
+        direction: 'request',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }),
+        raw: '{}',
+      }),
+    ]
+    const msgs = transcriptToMessages(entries)
+    // System Prompt and Tools rows exist.
+    const sysIdx = msgs.findIndex((m) => m.agentName === 'System Prompt')
+    const toolsIdx = msgs.findIndex((m) => m.agentName === 'Tools')
+    const userIdx = msgs.findIndex((m) => m.agentName === 'You')
+    expect(sysIdx).toBeGreaterThanOrEqual(0)
+    expect(toolsIdx).toBeGreaterThanOrEqual(0)
+    expect(userIdx).toBeGreaterThanOrEqual(0)
+    // System Prompt and Tools appear BEFORE the first user message.
+    expect(sysIdx).toBeLessThan(userIdx)
+    expect(toolsIdx).toBeLessThan(userIdx)
+  })
+
   it('omits tool defs when tools array is empty or absent', () => {
     const entries: TranscriptEntry[] = [
       makeEntry({
