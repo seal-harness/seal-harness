@@ -111,6 +111,41 @@ resets to your workdir on the next call, so a `cwd` does not leak across
 calls. Prefer relative, workdir-contained `cwd` values; use an absolute or
 home path only when the task explicitly needs it.
 
+### CLI tool pitfalls
+
+**`gh` does not support `-C`.** The `git -C <path>` pattern for running a
+command inside a specific directory is git-specific — `gh` (GitHub CLI) has
+no equivalent flag. Passing `-C` to `gh` fails immediately with "unknown
+shorthand flag: C". To run `gh` against a repo inside your workdir, use the
+`cwd` parameter on `BIN_EXEC` instead:
+
+```
+# Wrong — gh has no -C flag:
+BIN_EXEC { "binary": "gh", "args": ["-C", "seal-harness", "pr", "create", ...] }
+
+# Right — use cwd to scope the command:
+BIN_EXEC { "binary": "gh", "args": ["pr", "create", ...], "cwd": "seal-harness" }
+```
+
+As a general rule, `-C` is a git-specific flag, not a universal CLI
+convention. When in doubt, use the `cwd` parameter rather than a `-C` flag.
+
+**`gh pr create` needs `--head` in shallow clones.** In a shallow clone
+(which is what `SETUP_REPO` and most agent environments produce), `git
+push -u` may not reliably persist upstream tracking config to `.git/config`.
+The `gh pr create` command relies on that tracking config to detect the
+remote branch, and fails with "you must first push the current branch"
+even when the branch exists on the remote. Always pass `--head
+<branch-name>` to bypass tracking detection entirely:
+
+```
+BIN_EXEC { "binary": "gh", "args": ["pr", "create", "--head", "my-feature-branch", "--draft", "--fill"], "cwd": "seal-harness" }
+```
+
+This is the safe default for PR creation from any cloned repo in a Seal
+session, not just shallow clones — there is no downside to passing
+`--head` explicitly.
+
 ### Why this matters
 
 - **Isolation.** Your workdir is per-session. Parallel sessions get
