@@ -49,6 +49,7 @@ module Seal.Agent.Def.Backend
   , markdownAgentDefBackend
     -- * Workdir-scoped discovery (re-exported from Seal.Agent.Def.Workdir)
   , workdirAgentDefBackend
+  , staticAgentDefBackend
     -- * Codecs + DirScheme helpers (re-exported from Seal.Agent.Def.Workdir)
   , encodeAgentDef
   , decodeAgentDef

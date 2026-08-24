@@ -35,6 +35,7 @@ getSafePath :: SafePath -> FilePath
 getSafePath (SafePath p) = p
 
 newtype WorkspaceRoot = WorkspaceRoot FilePath
+  deriving stock (Eq, Show)
 
 data PathError
   = PathEscapesWorkspace FilePath

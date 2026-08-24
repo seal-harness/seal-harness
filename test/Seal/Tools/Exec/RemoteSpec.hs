@@ -1,7 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tools.Exec.RemoteSpec (spec) where
 
+import Data.List (isSuffixOf)
 import Data.Text (Text)
+import System.Directory (getHomeDirectory)
+import System.FilePath ((</>))
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 
@@ -112,6 +115,53 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
       r2 <- fakeRunner []
       r1 `shouldBe` Left ExecHostKeyMismatch
       r2 `shouldBe` Left ExecHostKeyMismatch
+
+  -- -----------------------------------------------------------------------
+  -- SSH connection multiplexing (one handshake, many ops)
+  --
+  -- Two DISJOINT master pools keyed by ControlPath suffix:
+  --   m-%C — plain ops (never -A);  a-%C — agent-forwarding ops only.
+  -- The split preserves the §5.6 opt-in invariant: agent forwarding over a
+  -- muxed connection requires the MASTER to have been started with -A, so
+  -- plain ops must never be able to ride an agent-forwarding master (and
+  -- vice versa a git -A op must not silently upgrade the plain pool).
+  -- -----------------------------------------------------------------------
+  describe "SSH connection multiplexing" $ do
+
+    it "plain argv enables ControlMaster=auto" $ do
+      let argv = sshExecArgv sshCfg "echo hi"
+      checkAdjacentPair argv "ControlMaster" "auto"
+
+    it "plain argv keeps a persistent master (ControlPersist=600)" $ do
+      let argv = sshExecArgv sshCfg "echo hi"
+      checkAdjacentPair argv "ControlPersist" "600"
+
+    it "plain argv uses the plain mux pool under ~/.seal/ssh-mux" $ do
+      home <- getHomeDirectory
+      let argv = sshExecArgv sshCfg "echo hi"
+      checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/m-%C")
+
+    it "forwarding argv uses the agent mux pool (never the plain one)" $ do
+      home <- getHomeDirectory
+      let argv = sshExecArgvForwarding sshCfg "git fetch"
+      checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/a-%C")
+      (home </> ".seal/ssh-mux/m-%C") `shouldNotSatisfy` (`elem` argv)
+
+    it "plain argv never joins the agent pool" $ do
+      home <- getHomeDirectory
+      let argv = sshExecArgv sshCfg "echo hi"
+      (home </> ".seal/ssh-mux/a-%C") `shouldNotSatisfy` (`elem` argv)
+
+    prop "the two mux pools stay disjoint for any command" $ \cmd -> do
+      let a = sshExecArgv sshCfg (cmd :: Text)
+          b = sshExecArgvForwarding sshCfg cmd
+      not (any ("-a-%C" `isSuffixOf`) a) && not (any ("-m-%C" `isSuffixOf`) b)
+
+    it "multiplexing does not weaken host-key pinning" $ do
+      let argv = sshExecArgv sshCfg "echo hi"
+      checkAdjacentPair argv "StrictHostKeyChecking" "yes"
+      checkAdjacentPair argv "UserKnownHostsFile" (scKnownHosts sshCfg)
+      checkAdjacentPair argv "BatchMode" "yes"
 
 -- | Assert two argv entries are present, either as @key=value@ (joined)
 -- or as adjacent @key value@ (separate args).

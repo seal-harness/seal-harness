@@ -100,13 +100,19 @@ import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
   (ContentBlock (..), Message (..), Role (..), SomeProvider)
+import Seal.Session.ExecCache
+  ( SessionExecCache, cachedSessionExec, cachedWorkdirScan
+  , invalidateWorkdirScan
+  )
 import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
 import Seal.Session.Meta (SessionMeta (..))
-import Seal.Session.Store (autoBindRepoAgent, formatSessionId, saveSessionMeta)
-import Seal.Session.Workdir (mkSessionExec, SessionExec (..), failClosedSessionExec)
+import Seal.Session.Store
+  ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
+  )
+import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
   (AutonomyLevel, SecurityPolicy (..), AllowList (..))
@@ -363,6 +369,10 @@ data TurnDeps = TurnDeps
   , tdLogger       :: SealLogger
   , tdIsRemote     :: Bool
   , tdBaseBackends :: Backends
+  , tdExecCache    :: SessionExecCache
+    -- ^ The per-process session-exec + workdir-discovery cache. Memoizes
+    -- 'mkSessionExec' (the remote @mkdir -p@ bootstrap) and the agent-def +
+    -- skill scans so each happens once per session, not once per turn.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -489,21 +499,27 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
-  exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+  exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                 (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
+                 eSecCfg sid cloneDeps mkRealRemoteRunner
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
       uioEnv = seUIOEnv exec
+  -- [engine] One discovery scan per session (cache-backed): the result
+  -- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn
+  -- costs zero extra scans after the first (or after SETUP_REPO).
+  (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+  workdirSkills <- Skill.staticSkillBackend workdirSkillsList
+  workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
   -- [engine] autoBindRepoAgent (design §5.2 step 3b — currently web-only;
   -- unifying means channels/CLI gain it, the desired behavioural
-  -- convergence). Runs over the same WorkdirFs the turn uses, so mode=local
-  -- and mode=remote behave identically.
-  autoBindRepoAgent wfs paths sid
+  -- convergence). Runs over the SAME cached defs — no extra scan.
+  autoBindRepoAgentWith workdirDefs paths sid
   mMetaAfterBind <- loadSessionMeta paths sid
   let meta' = fromMaybe meta mMetaAfterBind
   -- [engine] Workdir-aware backends (per-turn merge; tdBaseBackends is the
-  -- base, never mutated).
-  workdirSkills <- Skill.workdirSkillBackend wfs
-  workdirAgentDefs <- Def.workdirAgentDefBackend wfs
+  -- base, never mutated). The workdir halves are static backends over the
+  -- cache's scan result (see above).
   let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td))
       sessionBackends = (tdBaseBackends td)
         { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td)) }
@@ -685,11 +701,14 @@ callDispatcher td caps sid channelLabel callOpName val = do
     eSecCfg <- loadSecurityConfig (securityFilePath paths)
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
-    exec <- either (const (const (const (const (pure (failClosedSessionExec cloneDeps) :: IO SessionExec))))) (mkSessionExec paths) eSecCfg sid cloneDeps mkRealRemoteRunner
+    exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                   (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
+                   eSecCfg sid cloneDeps mkRealRemoteRunner
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
-    workdirAgentDefs <- Def.workdirAgentDefBackend wfs
+    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+    workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (tdBaseBackends td)
           { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td)) }
@@ -706,8 +725,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
         if opNm == "SETUP_REPO"
           then do
             recordSetupRepoResult tHandle callOpName val r (Just channelLabel)
-            unless (orIsError r) $
-              autoBindRepoAgent wfs paths sid
+            unless (orIsError r) $ do
+              -- The clone changed the workdir's structure: drop the cached
+              -- discovery scan, re-scan fresh, and bind from the fresh defs.
+              invalidateWorkdirScan (tdExecCache td) sid
+              (freshDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+              autoBindRepoAgentWith freshDefs paths sid
             broadcastAgentDefsChanged (tdBroker td)
           else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
@@ -765,7 +788,9 @@ buildWorker td parentSid appEnv eCfg operatorCeiling channel =
     , dwdMkUIOEnv = \childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
-        seUIOEnv <$> either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec (tdPaths td)) eSecCfg childSid childCloneDeps mkRealRemoteRunner
+        seUIOEnv <$> either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
+                            (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
+                            eSecCfg childSid childCloneDeps mkRealRemoteRunner
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -801,7 +826,9 @@ buildChildRegistryAdapter
 buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
-  childExec <- either (const (const (const (const (pure (failClosedSessionExec childCloneDeps) :: IO SessionExec))))) (mkSessionExec (tdPaths td)) eSecCfg childSid childCloneDeps mkRealRemoteRunner
+  childExec <- either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
+                      (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
+                      eSecCfg childSid childCloneDeps mkRealRemoteRunner
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
   pure (buildChildRegistry (tdVault td) childCloneDeps (tdBaseBackends td)

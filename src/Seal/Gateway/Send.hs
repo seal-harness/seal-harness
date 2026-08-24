@@ -74,6 +74,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
+import Seal.Session.ExecCache (SessionExecCache)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Lock
@@ -162,6 +163,10 @@ data SendDeps = SendDeps
     -- ^ Whether the untrusted executor runs commands over SSH (remote
     -- mode from the security config). Threaded into 'CloneDeps' so the
     -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
+  , sdExecCache :: SessionExecCache
+    -- ^ The per-process session-exec + workdir-discovery cache, shared with
+    -- the gateway's 'ApiDeps' so a scan runs once per session across ALL
+    -- surfaces (turns, /call dispatches, GET /api/sessions/:id/agents).
   }
 
 -- | Replace the @call@, @skill@, and @stop@ specs in a registry with
@@ -201,6 +206,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdLogger       = sdLogger deps
   , tdIsRemote     = sdIsRemote deps
   , tdBaseBackends = sdBackends deps
+  , tdExecCache    = sdExecCache deps
   }
 
 -- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:

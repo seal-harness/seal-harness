@@ -2,6 +2,7 @@
 module Seal.Gateway.SendSpec (spec) where
 
 import Control.Exception (catch, SomeException, throwIO)
+import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
@@ -161,6 +162,7 @@ mkSendDepsWith paths resolveStub = do
   vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
+  execCache <- newSessionExecCache
   let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
       pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
       sendDeps = SendDeps
@@ -187,6 +189,7 @@ mkSendDepsWith paths resolveStub = do
         , sdTabsHandle  = error "sdTabsHandle: set via record update in the test"
         , sdLogger      = logger
         , sdIsRemote    = False
+        , sdExecCache   = execCache
         }
   pure sendDeps
 

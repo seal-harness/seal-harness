@@ -31,6 +31,7 @@ module Seal.TestHelpers.ApiTestHarness
   ) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Seal.Session.ExecCache (newSessionExecCache)
 import Control.Monad (when, void, unless)
 import Control.Exception (catch, SomeException)
 import Data.Aeson ((.=))
@@ -345,6 +346,7 @@ buildTestEnv tmp mode mRepo = do
   saveSecurityConfig (securityFilePath paths) secCfg
 
   logger <- testSealLogger
+  execCache <- newSessionExecCache
   let sendDeps = SendDeps
         { sdPaths = paths
         , sdVault = rt
@@ -369,6 +371,7 @@ buildTestEnv tmp mode mRepo = do
         , sdTabsHandle = tabsH
         , sdLogger = logger
         , sdIsRemote = mode == "remote"
+        , sdExecCache = execCache
         }
       deps = ApiDeps
         { adSessionRuntime = sr

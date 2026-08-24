@@ -42,7 +42,10 @@ import System.FilePath (takeDirectory, (</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import System.Random (randomRIO)
 
-import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend, unionAgentDefBackend)
+import Seal.Agent.Def.Backend
+  ( AgentDefBackend (..), workdirAgentDefBackend, unionAgentDefBackend
+  , staticAgentDefBackend
+  )
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
 import Seal.Core.AllowList (AllowList (..))
@@ -52,6 +55,7 @@ import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (SecurityConfig)
+import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
@@ -825,13 +829,30 @@ handleSessionAgents deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      exec <- case adMkSessionExec deps of
-        Just mk -> mk sid
-        Nothing -> do
-          cloneDeps <- cloneDepsForApiDeps deps
-          mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+      -- Production: build the session exec through the SHARED cache (same
+      -- instance the turn engine uses) so the remote mkdir -p bootstrap and
+      -- the workdir discovery scan each run once per session, not once per
+      -- frontend fetch. The adMkSessionExec seam (tests) bypasses the cache.
+      (exec, mCache) <- case adMkSessionExec deps of
+        Just mk -> do
+          e <- mk sid
+          pure (e, Nothing)
+        Nothing -> case adSend deps of
+          Just sendDeps -> do
+            cloneDeps <- cloneDepsForApiDeps deps
+            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+            pure (e, Just (sdExecCache sendDeps))
+          Nothing -> do
+            cloneDeps <- cloneDepsForApiDeps deps
+            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
+            pure (e, Nothing)
       let wfs = seWorkdirFs exec
-      workdirBackend <- workdirAgentDefBackend wfs
+      workdirBackend <- case mCache of
+        Just cache -> do
+          -- One shared scan; serve the union from a static backend.
+          (workdirDefs, _) <- cachedWorkdirScan cache sid wfs (seWorkspaceRoot exec)
+          staticAgentDefBackend workdirDefs
+        Nothing -> workdirAgentDefBackend wfs
       let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)
       defs <- adbList unionBackend
       mDefaultId <- adDefaultAgent deps

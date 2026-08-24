@@ -13,6 +13,7 @@ module Seal.Session.Workdir
   , SessionExec (..)
   , mkSessionExec
   , failClosedSessionExec
+  , isFailClosedSessionExec
   ) where
 
 import Control.Exception (IOException, try)
@@ -214,6 +215,11 @@ failClosedSessionExec cloneDeps = SessionExec
   , seWorkdirFs     = mkWorkdirFsStub
   , seWorkspaceRoot = failClosedRoot
   }
+
+-- | Did this exec fail closed? (The workdir bootstrap failed and every
+-- handle is a stub.) The exec cache uses this to avoid memoizing failures.
+isFailClosedSessionExec :: SessionExec -> Bool
+isFailClosedSessionExec e = seWorkspaceRoot e == failClosedRoot
 
 -- | Construct the per-session 'UntrustedIO' from the 'SecurityConfig':
 --

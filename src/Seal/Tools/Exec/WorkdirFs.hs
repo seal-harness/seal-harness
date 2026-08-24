@@ -13,18 +13,32 @@
 module Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..)
   , WorkdirFsErr (..)
+  , SnapshotEntry (..)
+  , WorkspaceSnapshot (..)
   , mkLocalWorkdirFs
   , mkRemoteWorkdirFs
   , mkInMemWorkdirFs
   , mkWorkdirFsStub
   , StubEntry (..)
+  , snapshotMaxDepth
+  , maxSnapshotEntries
+    -- * Snapshot accessors (pure; consumed by the discovery scanners)
+  , snapIsDirectoryAt
+  , snapIsFileAt
+  , snapTopDirs
+  , snapChildDirsAt
+  , snapChildFilesAt
   ) where
 
 import Control.Exception (IOException, try)
 import Data.Char (isDigit, isSpace)
 import Data.Char qualified as Char
+import Data.Either (fromRight)
+import Data.List (sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (mapMaybe)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -34,15 +48,16 @@ import Data.Time.Clock (secondsToDiffTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import System.Directory
   ( doesDirectoryExist, doesFileExist, getFileSize, getModificationTime
-  , listDirectory
+  , listDirectory, pathIsSymbolicLink
   )
+import System.FilePath ((</>))
 
 import Seal.Security.Path
   ( PathError (..), WorkspaceRoot (..), getSafePath, mkSafePath
   , mkSafePathRemote
   )
 import Seal.Tools.Args (mkShellCommand)
-import Seal.Tools.Exec.Types (RemotePath, SshConfig, getRemotePath)
+import Seal.Tools.Exec.Types (RemotePath, SshConfig, getRemotePath, mkRemotePath)
 import Seal.Tools.Exec.UIO (runUIOWithEnv, uioShellExec)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv)
 import Seal.Tools.Exec.UntrustedIO (UntrustedErr (..), shellQuote)
@@ -57,7 +72,49 @@ data WorkdirFs = WorkdirFs
   , wfsListDirectory       :: RemotePath -> IO (Either WorkdirFsErr [Text])
   , wfsFileSize            :: RemotePath -> IO (Either WorkdirFsErr Integer)
   , wfsModificationTime    :: RemotePath -> IO (Either WorkdirFsErr UTCTime)
+  , wfsSnapshot            :: IO (Either WorkdirFsErr WorkspaceSnapshot)
+    -- ^ A depth-limited structural snapshot of the whole workspace in ONE
+    -- operation (one SSH round trip on the remote arm). Enumerates regular
+    -- directories + files only — symlinks are never followed and never
+    -- appear as structure. Consumed by the discovery scanners
+    -- ("Seal.Agent.Def.Workdir", "Seal.Skills.Backend") to replace the
+    -- per-probe round trips; file CONTENT is still read via 'wfsReadFile'
+    -- (the symlink-containment chokepoint).
   }
+
+-- | One entry of a 'WorkspaceSnapshot'. @snapRelPath@ is a @\/@-separated
+-- path relative to the workspace root (@@"repo\/.agents"@@) — no leading
+-- @.\/@, no @.@ component, root itself not included.
+data SnapshotEntry = SnapshotEntry
+  { snapRelPath :: !Text
+  , snapIsDir   :: !Bool
+  } deriving stock (Eq, Ord, Show)
+
+-- | A depth-limited structural snapshot of the workspace: every regular
+-- directory + file at depth ≤ 'snapshotMaxDepth', sorted by 'snapRelPath'.
+newtype WorkspaceSnapshot = WorkspaceSnapshot
+  { snapEntries :: [SnapshotEntry]
+  } deriving stock (Eq, Show)
+
+-- | The maximum path depth (components below the workspace root) the
+-- snapshot enumerates. Covers every convention location the discovery
+-- scanners need structurally: @\<repo\>\/.agents\/agents\/\<id\>\/@ (depth 4,
+-- protocol sub-agent dirs), @\<repo\>\/\<conv\>\/\<group\>\/@ (depth 4, grouped
+-- skills). File CONTENTS are never part of the snapshot.
+snapshotMaxDepth :: Int
+snapshotMaxDepth = 4
+
+-- | The maximum number of entries a snapshot may carry before it is
+-- rejected with 'WfsOversize' (a runaway tree must not be silently
+-- truncated into wrong discovery results).
+maxSnapshotEntries :: Int
+maxSnapshotEntries = 8192
+
+-- | The output marker separating the @find -type d@ section from the
+-- @find -type f@ section of the remote snapshot command. A find line can
+-- never collide with it (every find line starts with @./@).
+snapshotFilesMarker :: Text
+snapshotFilesMarker = "__SEAL_FILES__"
 
 -- | The error ADT for 'WorkdirFs' methods. Pinned for exhaustive
 -- pattern-match under @-Wall -Werror@.
@@ -163,7 +220,49 @@ mkLocalWorkdirFs wsRoot ceilingBytes = WorkdirFs
           pure $ case eMtime of
             Left _ -> Left WfsNotFound
             Right mtime -> Right mtime
+  , wfsSnapshot = localSnapshot wsRoot
   }
+
+-- | The depth-limited structural walk for the local arm ('wfsSnapshot').
+-- Enumerates regular dirs + files only; symlinks are skipped entirely
+-- (never followed — mirrors the remote @find -P@ semantics so both arms
+-- agree on structure). Depth- and count-bounded.
+localSnapshot :: WorkspaceRoot -> IO (Either WorkdirFsErr WorkspaceSnapshot)
+localSnapshot wsRoot = do
+  entries <- walkDir root "" snapshotMaxDepth
+  pure $!
+    if length entries > maxSnapshotEntries
+      then Left WfsOversize
+      else Right (WorkspaceSnapshot (sortOn snapRelPath entries))
+  where
+    root = case wsRoot of WorkspaceRoot p -> p
+    walkDir :: FilePath -> Text -> Int -> IO [SnapshotEntry]
+    walkDir dir relPrefix remaining
+      | remaining <= 0 = pure []
+      | otherwise = do
+          eNames <- try (listDirectory dir) :: IO (Either IOException [FilePath])
+          case eNames of
+            Left _     -> pure []   -- unreadable subtree: fail-soft
+            Right names -> concat <$> mapM step (sort names)
+      where
+        step name = do
+          let childRel = if T.null relPrefix
+                           then T.pack name
+                           else relPrefix <> "/" <> T.pack name
+              fsPath = dir </> name
+          eLink <- try (pathIsSymbolicLink fsPath)
+                     :: IO (Either IOException Bool)
+          if fromRight True eLink
+            then pure []   -- symlink (or vanished): never followed
+            else do
+              isDir <- doesDirectoryExist fsPath
+              if isDir
+                then do
+                  sub <- walkDir fsPath childRel (remaining - 1)
+                  pure (SnapshotEntry childRel True : sub)
+                else do
+                  isFile <- doesFileExist fsPath
+                  pure [SnapshotEntry childRel False | isFile]
 
 -- | Stat-first (reject 'WfsOversize' if > ceiling), then read + decode to
 -- 'Text', truncate to 'defaultSectionCharLimit'. Returns 'WfsNotFound' if
@@ -240,7 +339,62 @@ mkRemoteWorkdirFs uioEnv sshCfg wsRoot ceilingBytes = WorkdirFs
             Right txt -> case parseInteger txt of
               Nothing -> pure (Left (WfsIo "stat mtime: non-numeric stdout"))
               Just n  -> pure (Right (posixSecondsToUTCTime (fromIntegral n)))
+  , wfsSnapshot = remoteSnapshot uioEnv ceilingBytes
   }
+
+-- | The depth-limited structural snapshot for the remote arm
+-- ('wfsSnapshot'): ONE shell command runs two @find@ passes (directories,
+-- then files) over the workspace root, separated by a marker line, with
+-- the total output bounded by @head -c <ceiling>@.
+--
+-- /Portability/: @-maxdepth@ is not POSIX but is supported by GNU findutils,
+-- BSD find, macOS find, and busybox — same de-facto-universal status as the
+-- @readlink -f@ choice above. Symlinks are never followed (the default
+-- @-P@ mode matches neither @-type d@ nor @-type f@), so an escaping symlink
+-- can never contribute structure. Names containing newlines cannot be
+-- represented in the line-based output — the same limitation as the
+-- line-splitting of @ls -1@ elsewhere in this module.
+remoteSnapshot :: UIOEnv -> Int -> IO (Either WorkdirFsErr WorkspaceSnapshot)
+remoteSnapshot uioEnv ceilingBytes = do
+  let cmd = T.pack $
+        "{ find . -maxdepth " <> show snapshotMaxDepth <> " -type d -print;"
+          <> " printf '\\n" <> T.unpack snapshotFilesMarker <> "\\n';"
+          <> " find . -maxdepth " <> show snapshotMaxDepth <> " -type f -print; }"
+          <> " 2>/dev/null | head -c " <> show ceilingBytes
+  res <- remoteExecText uioEnv cmd
+  pure $ case res of
+    Left e  -> Left e
+    Right out -> fmap WorkspaceSnapshot (parseSnapshotOutput ceilingBytes out)
+
+-- | Parse the remote snapshot output: @find -type d@ lines (@./@-prefixed),
+-- the 'snapshotFilesMarker' line, then @find -type f@ lines. Output at or
+-- over the byte ceiling is treated as truncated ('WfsOversize' — a silently
+-- truncated tree would yield wrong discovery results); a missing marker is
+-- malformed output ('WfsIo'). The @.@ root line and any non-@./@ line are
+-- skipped. Entries are sorted by path.
+parseSnapshotOutput :: Int -> Text -> Either WorkdirFsErr [SnapshotEntry]
+parseSnapshotOutput ceilingBytes out
+  | T.length out >= ceilingBytes = Left WfsOversize
+  | otherwise = case break (== snapshotFilesMarker) (T.lines out) of
+      (dirLines, _marker : fileLines) -> do
+        let entries =
+              mapMaybe pathEntry dirLines  -- dirs
+                <>
+              [ SnapshotEntry p False | Just p <- map pathLine fileLines ]
+        if length entries > maxSnapshotEntries
+          then Left WfsOversize
+          else Right (sortOn snapRelPath entries)
+      _ -> Left (WfsIo "snapshot output missing files marker")
+  where
+    -- A find output line "./a/b" → the relative path "a/b". The bare "."
+    -- root line and anything unexpected are skipped.
+    pathLine :: Text -> Maybe Text
+    pathLine ln =
+      case T.stripPrefix "./" ln of
+        Just rest | not (T.null rest) -> Just rest
+        _ -> Nothing
+    pathEntry :: Text -> Maybe SnapshotEntry
+    pathEntry ln = SnapshotEntry <$> pathLine ln <*> pure True
 
 -- | Run a remote shell command (a 'Text' command string) via 'uioShellExec'
 -- in the shared 'UIOEnv'. The command runs with no cwd override (the paths
@@ -411,7 +565,49 @@ mkInMemWorkdirFs seed = WorkdirFs
   , wfsListDirectory = pure . stubListDirectory seed
   , wfsFileSize = pure . stubFileSize seed
   , wfsModificationTime = \_ -> pure (Right epochZero)
+  , wfsSnapshot = pure (stubSnapshot seed)
   }
+
+-- | Derive the structural snapshot from the in-memory seed ('wfsSnapshot'
+-- on the stub arm). Mirrors the real arms' semantics:
+--
+--   * 'Directory' entries become dir entries; their listed children are
+--     classified by seed lookup — 'FileContent' or an absent key ⇒ file,
+--     another 'Directory' ⇒ dir (recursed), 'Missing' or 'SymlinkTarget'
+--     ⇒ skipped (structure never follows symlinks).
+--   * Depth- and count-bounded like the local/remote arms.
+stubSnapshot :: Map RemotePath StubEntry -> Either WorkdirFsErr WorkspaceSnapshot
+stubSnapshot seed =
+  let rootNames = case Map.lookup (stubKey ".") seed of
+        Just (Directory ns) -> sort ns
+        _ -> let comps = sort [ firstComp (getRemotePath k)
+                              | k <- Map.keys seed, getRemotePath k /= "." ]
+             in Set.toAscList (Set.fromList comps)   -- sorted-dedup
+      walk prefix names remaining
+        | remaining <= 0 = []
+        | otherwise = concatMap (step prefix remaining) names
+      step prefix remaining name =
+        let childRel = joinRel prefix name
+        in case Map.lookup (stubKey childRel) seed of
+             Just (Directory ns) ->
+               SnapshotEntry childRel True : walk childRel (sort ns) (remaining - 1)
+             Just Missing -> []
+             Just (SymlinkTarget _) -> []   -- structure never follows symlinks
+             Just (FileContent _) -> [SnapshotEntry childRel False]
+             Nothing -> [SnapshotEntry childRel False]  -- implicit child = file
+      entries = walk "" rootNames snapshotMaxDepth
+  in if length entries > maxSnapshotEntries
+       then Left WfsOversize
+       else Right (WorkspaceSnapshot (sortOn snapRelPath entries))
+  where
+    stubKey t = case mkRemotePath t of
+      Right k  -> k
+      Left err -> error ("stubSnapshot: invalid seeded path: " <> T.unpack err
+                         <> ": " <> T.unpack t)
+    firstComp = T.takeWhile (/= '/')
+    joinRel prefix name
+      | T.null prefix = name
+      | otherwise     = prefix <> "/" <> name
 
 -- | Resolve a 'RemotePath' through 'SymlinkTarget' chains, re-checking
 -- containment on the resolved path at each step. Returns 'Right' with the
@@ -521,7 +717,65 @@ mkWorkdirFsStub = WorkdirFs
   , wfsListDirectory = \_ -> pure (Right [])
   , wfsFileSize = \_ -> pure (Left WfsStub)
   , wfsModificationTime = \_ -> pure (Left WfsStub)
+  , wfsSnapshot = pure (Left WfsStub)
   }
+
+-- ---------------------------------------------------------------------------
+-- Snapshot accessors (pure; consumed by the discovery scanners)
+-- ---------------------------------------------------------------------------
+
+-- | The workspace root-relative path of a direct child of @base@
+-- (@""@ = the root itself).
+snapJoin :: Text -> Text -> Text
+snapJoin base name
+  | T.null base = name
+  | otherwise   = base <> "/" <> name
+
+-- | Does @path@ exist in the snapshot as a directory? Convention dirs are
+-- dot-dirs reached by DIRECT path (e.g. @@repo/.agents@@), so lookups are
+-- unfiltered.
+snapIsDirectoryAt :: WorkspaceSnapshot -> Text -> Bool
+snapIsDirectoryAt snap path =
+  any (\e -> snapRelPath e == path && snapIsDir e) (snapEntries snap)
+
+-- | Does @path@ exist in the snapshot as a regular file?
+snapIsFileAt :: WorkspaceSnapshot -> Text -> Bool
+snapIsFileAt snap path =
+  any (\e -> snapRelPath e == path && not (snapIsDir e)) (snapEntries snap)
+
+-- | The immediate child NAMES (both kinds) of @base@ whose basename is
+-- visible (non-hidden — parity with @ls -1@). Sorted.
+snapChildNamesAt :: WorkspaceSnapshot -> Text -> [Text]
+snapChildNamesAt snap base =
+  sort
+    [ name
+    | e <- snapEntries snap
+    , let rel = snapRelPath e
+    , T.isPrefixOf prefix rel
+    , T.length rel > T.length prefix
+    , let name = T.drop (T.length prefix) rel
+    , not (T.isInfixOf "/" name)
+    , not ("." `T.isPrefixOf` name)
+    ]
+  where
+    prefix = if T.null base then "" else base <> "/"
+
+-- | The immediate visible child DIRECTORIES of @base@, as full relative
+-- paths, sorted. Hidden children are excluded (parity with @ls -1@).
+snapChildDirsAt :: WorkspaceSnapshot -> Text -> [Text]
+snapChildDirsAt snap base =
+  [ snapJoin base n | n <- snapChildNamesAt snap base, snapIsDirectoryAt snap (snapJoin base n) ]
+
+-- | The immediate visible child FILES of @base@, as full relative paths,
+-- sorted. Hidden children are excluded (parity with @ls -1@).
+snapChildFilesAt :: WorkspaceSnapshot -> Text -> [Text]
+snapChildFilesAt snap base =
+  [ snapJoin base n | n <- snapChildNamesAt snap base, snapIsFileAt snap (snapJoin base n) ]
+
+-- | The top-level visible directories of the snapshot (the cloned repo
+-- names), sorted.
+snapTopDirs :: WorkspaceSnapshot -> [Text]
+snapTopDirs snap = snapChildDirsAt snap ""
 
 -- ---------------------------------------------------------------------------
 -- Internal helpers
