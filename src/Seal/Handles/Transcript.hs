@@ -60,13 +60,14 @@ import System.Posix.Types (Fd, FileMode)
 import System.Posix.Unistd (fileSynchronise)
 
 import Katip (Severity (..), ls)
-import Seal.Core.Types (OpName, ToolCallId)
+import Seal.Core.Types (OpName, ToolCallId, ModelId (..))
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), ToolResultPart (..) )
+  ( ContentBlock (..), Message (..), ToolResultPart (..), ToolChoice (..) )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine, readConversation)
 import Seal.Transcript.Entries
-  ( EntryRecord (..), encodeEntryRecordRaw )
+  ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
+  , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
 
@@ -242,6 +243,13 @@ data TwoFileState = TwoFileState
   -- can set it after building the registry (the registry construction may
   -- depend on values only available inside the 'withTwoFileTranscript'
   -- callback, e.g. session id or worker functions).
+  , tfsPriorEnv :: Maybe Envelope
+  -- ^ The effective envelope at the most recent 'EKRequest' entry. Used by
+  -- 'writeOne' to compute a minimal 'EnvelopeDelta' — only fields that
+  -- differ from the prior envelope are emitted, so a stable system prompt
+  -- + tools array isn't re-serialized on every turn (a 146-turn session
+  -- with a 36KB system prompt would otherwise waste ~5MB). 'Nothing' until
+  -- the first request entry lands.
   }
 
 -- | A work item for the two-file daemon.
@@ -274,10 +282,27 @@ withTwoFileTranscript dir action = do
         -- 1. Append new conversation lines, fsync.
         mapM_ (\m -> writeFd (tfsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) redacted
         fileSynchronise (tfsConvFd st)
-        -- 2. Append the entry line, fsync.
-        writeFd (tfsEntriesFd st) (encodeEntryRecordRaw entry <> "\n")
+        -- 2. Compute a minimal envelope delta for EKRequest entries. The
+        -- caller passes a FULL delta (every field set to 'Just'); the writer
+        -- compares it against the prior effective envelope and emits only
+        -- the fields that differ. This keeps a stable system prompt + tools
+        -- array from being re-serialized on every turn (a 146-turn session
+        -- with a 36KB system prompt would otherwise waste ~5MB). The first
+        -- request (no prior envelope) emits the full delta so
+        -- reconstruction has a baseline to fold from.
+        let (entry', mNextEnv) = case erKind entry of
+              EKRequest -> case erEnvelope entry of
+                Just delta ->
+                  let baseline = fromMaybe defaultEnv (tfsPriorEnv st)
+                      nextEnv = applyDelta baseline delta
+                      minimal = minimalDelta (tfsPriorEnv st) nextEnv
+                  in (entry { erEnvelope = minimal }, Just nextEnv)
+                Nothing -> (entry, tfsPriorEnv st)
+              _ -> (entry, tfsPriorEnv st)
+        -- 3. Append the entry line, fsync.
+        writeFd (tfsEntriesFd st) (encodeEntryRecordRaw entry' <> "\n")
         fileSynchronise (tfsEntriesFd st)
-        pure st { tfsWritten = tfsWritten st <> redacted }
+        pure st { tfsWritten = tfsWritten st <> redacted, tfsPriorEnv = mNextEnv }
       drain st = do
         next <- atomically (tryReadTQueue q)
         case next of
@@ -321,7 +346,7 @@ withTwoFileTranscript dir action = do
         shutdown convFd entriesFd done)
     $ \(convFd, entriesFd) -> do
         secretOpsRef <- newIORef Set.empty
-        let st0 = TwoFileState convFd entriesFd existingConv secretOpsRef
+        let st0 = TwoFileState convFd entriesFd existingConv secretOpsRef Nothing
             -- The daemon with an exception handler: if writeOne throws, mark
             -- the daemon dead, fail every queued ACK (so callers blocked on
             -- takeTMVar unblock immediately), and log to stderr. The daemon
@@ -468,3 +493,33 @@ redactMessages secretOps allMsgs newMsgs =
         redactPart (TrpText t)
           | not (T.null t) = TrpText "<redacted:secret>"
           | otherwise      = TrpText t
+
+-- | A neutral baseline envelope used when no prior envelope exists (the
+-- first request). Mirrors 'Seal.Transcript.Reconstruct.defaultEnv'.
+defaultEnv :: Envelope
+defaultEnv = Envelope (ModelId "") Nothing [] ToolAuto 0
+
+-- | Compute the minimal 'EnvelopeDelta' that, when applied to the prior
+-- envelope, yields the next envelope. 'Nothing' fields mean "inherit" — so
+-- a field that's unchanged from the prior is emitted as 'Nothing' and
+-- omitted from the on-disk JSON entirely. When there is no prior envelope
+-- (the first request), the full delta is returned so reconstruction has a
+-- baseline to fold from.
+minimalDelta :: Maybe Envelope -> Envelope -> Maybe EnvelopeDelta
+minimalDelta mPrior next = case mPrior of
+  Nothing -> Just EnvelopeDelta
+    { edModel = Just (envModel next)
+    , edSystem = Just (envSystem next)
+    , edTools = Just (envTools next)
+    , edToolChoice = Just (envToolChoice next)
+    , edMaxTokens = Just (envMaxTokens next)
+    }
+  Just prior ->
+    let d = EnvelopeDelta
+          { edModel = if envModel next == envModel prior then Nothing else Just (envModel next)
+          , edSystem = if envSystem next == envSystem prior then Nothing else Just (envSystem next)
+          , edTools = if envTools next == envTools prior then Nothing else Just (envTools next)
+          , edToolChoice = if envToolChoice next == envToolChoice prior then Nothing else Just (envToolChoice next)
+          , edMaxTokens = if envMaxTokens next == envMaxTokens prior then Nothing else Just (envMaxTokens next)
+          }
+    in if d == emptyEnvelopeDelta then Nothing else Just d

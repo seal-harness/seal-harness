@@ -6,16 +6,18 @@ import Data.Aeson (object, (.=))
 import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
-import Data.Time (getCurrentTime)
+import Data.Text (Text)
+import Data.Time (getCurrentTime, UTCTime)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..) )
-import Seal.Core.Types (OpName (..), ToolCallId (..))
+  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
+  , ToolChoice (..), ToolDefinition (..) )
+import Seal.Core.Types (OpName (..), ToolCallId (..), ModelId (..))
 import Seal.Transcript.Entries
-  ( EntryKind (..), EntryRecord (..), emptyEnvelopeDelta )
+  ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..), emptyEnvelopeDelta )
 import Seal.Transcript.Types
 import Seal.Handles.Transcript
 
@@ -50,6 +52,22 @@ mkEntryRecord = do
     , erCorrelation = Nothing
     , erMeta = Map.empty
     }
+
+-- | A configurable entry record for the two-file writer tests.
+mkEntryRecordAt :: UTCTime -> EntryKind -> Int -> Maybe EnvelopeDelta -> EntryRecord
+mkEntryRecordAt ts kind convLen env = EntryRecord
+  { erId = "r1"
+  , erTimestamp = ts
+  , erKind = kind
+  , erConvLen = convLen
+  , erEnvelope = env
+  , erUsage = Nothing
+  , erStop = Nothing
+  , erDurationMs = Nothing
+  , erHarness = Nothing
+  , erCorrelation = Nothing
+  , erMeta = Map.empty
+  }
 
 spec :: Spec
 spec = describe "Seal.Handles.Transcript" $ do
@@ -202,3 +220,36 @@ spec = describe "Seal.Handles.Transcript" $ do
           tfwRecordAndAck h (TwoFileWrite [Message User [CbText "ok"]] e)
           alive <- tfwIsAlive h
           alive `shouldBe` True
+
+    it "emits a minimal envelope delta (only changed fields) on the second request" $
+      withSystemTempDirectory "seal-twofile" $ \dir -> do
+        -- Two request entries with IDENTICAL envelopes. The writer should
+        -- emit the full envelope on the first request (no prior to delta
+        -- against) and an EMPTY delta on the second (nothing changed). The
+        -- `envelope` field must be ABSENT from the second entry's on-disk
+        -- JSON — not present with all fields, which would waste ~50KB per
+        -- turn on stable-system-prompt sessions.
+        let sys = Just ("you are helpful" :: Text)
+            tools = [] :: [ToolDefinition]
+            env0 = emptyEnvelopeDelta
+              { edModel = Just (ModelId "m1")
+              , edSystem = Just sys
+              , edTools = Just tools
+              , edToolChoice = Just ToolAuto
+              , edMaxTokens = Just 1024
+              }
+        now1 <- getCurrentTime
+        let e1 = mkEntryRecordAt now1 EKRequest 1 (Just env0)
+        now2 <- getCurrentTime
+        let e2 = mkEntryRecordAt now2 EKRequest 2 (Just env0)
+            turn1 = [Message User [CbText "q1"]]
+            turn2 = turn1 <> [Message Assistant [CbText "a1"], Message User [CbText "q2"]]
+        withTwoFileTranscript dir $ \h -> do
+          tfwRecordAndAck h (TwoFileWrite turn1 e1)
+          tfwRecordAndAck h (TwoFileWrite turn2 e2)
+        entriesContents <- BS8.readFile (dir </> "entries.jsonl")
+        let entryLines = BS8.lines entriesContents
+        length entryLines `shouldBe` 2
+        -- The second line must NOT contain an "envelope" key (the delta was
+        -- empty, so the writer omits it entirely).
+        BS8.unpack (entryLines !! 1) `shouldNotContain` "\"envelope\""
