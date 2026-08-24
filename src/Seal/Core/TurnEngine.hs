@@ -775,8 +775,30 @@ callDispatcher td caps sid channelLabel callOpName val = do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               invalidateWorkdirScan (tdExecCache td) sid
-              (freshDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+              (freshDefs, freshSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
               autoBindRepoAgentWith freshDefs paths sid
+              -- Record a preamble entry (System Prompt + Tools) now that
+              -- the workdir is set up and the agent is bound. This makes
+              -- the System Prompt + Tools rows appear in the frontend
+              -- BEFORE the first user message, not after it. Only recorded
+              -- when no prior EKRequest entry exists (first time only).
+              priorEntries <- tfwReadEntries tHandle
+              unless (any (\e -> erKind e == EKRequest) priorEntries) $ do
+                mMetaAfterBind <- loadSessionMeta paths sid
+                let meta' = fromMaybe metaFallback mMetaAfterBind
+                    metaFallback = fromMaybe (error "callDispatcher: SETUP_REPO without session meta") mMeta
+                    autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
+                    injectCatalog = either (const True) resolvedAvailableSkills eCfg
+                    parallel = either (const True) resolvedParallelToolGuidance eCfg
+                    toolUse = either (const True) resolvedToolUseEnforcement eCfg
+                    taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+                freshSkills <- Skill.staticSkillBackend freshSkillsList
+                let sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
+                mSystem <- resolveSystemPrompt
+                  (bAgentDefs sessionBackends) sessionSkills
+                  autoloadId injectCatalog parallel toolUse taskCompletion meta'
+                let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
+                recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
           else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
