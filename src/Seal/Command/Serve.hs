@@ -35,6 +35,7 @@ import Seal.Core.Types (OpName (..))
 import Seal.ISA.Dispatch (DispatchError (OpNotFound))
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Repo (RepoTestSeam (..))
 import Seal.Command.Stop (mkStopTranscriptWriter)
@@ -221,6 +222,7 @@ runServeMain autonomy logger = do
         , ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , ccdAbortReg    = cdAbortReg chanDeps
         , ccdStopWriter  = mkStopTranscriptWriter paths (Just broker)
+        , ccdModelWriter = mkModelTranscriptWriter paths (Just broker)
         , ccdRepoReg     = repoRegH
         , ccdRepoSeam    = Just repoSeam
         }

@@ -15,6 +15,7 @@ import Seal.Command.Channel
   , mkRealTelegramBotApi, mkRealVaultStore )
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
+import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
@@ -177,6 +178,7 @@ runTui autonomy logger = do
         , ccdTabCloseNotifier = noTabCloseNotifier
         , ccdAbortReg    = abortReg
         , ccdStopWriter  = mkStopTranscriptWriter paths Nothing
+        , ccdModelWriter = mkModelTranscriptWriter paths Nothing
         , ccdRepoReg     = repoReg
         , ccdRepoSeam    = Nothing
         }

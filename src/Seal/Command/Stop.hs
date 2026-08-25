@@ -119,7 +119,7 @@ stopCommandSpecWith abortReg resolveSid writer = CommandSpec
 
 stopParserInfo :: SessionAbortRegistry -> IO SessionId -> StopTranscriptWriter -> ParserInfo CommandAction
 stopParserInfo abortReg resolveSid writer =
-  info (pure (stopAction abortReg resolveSid writer))
+  info (pure (stopAction abortReg resolveSid writer) <**> helper)
     (  progDesc "Abort the active session's in-flight tool call"
     <> header   "stop — abort the active session's in-flight tool call"
     )

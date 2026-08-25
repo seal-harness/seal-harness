@@ -285,6 +285,7 @@ test-suite tests
     import: settings
     type: exitcode-stdio-1.0
     main-is: Main.hs
+    ghc-options: -threaded -rtsopts
     build-depends:
         base
       , seal-harness

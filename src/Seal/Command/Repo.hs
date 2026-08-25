@@ -142,9 +142,9 @@ credOpt = T.pack <$> strOption
   <> showDefault
   <> help ( "Credential kind: pat (Personal Access Token: a token stored in "
          <> "the vault, used to clone over HTTPS — token never in URL or "
-         <> "process list; note: deploy_key is preferred for lower exposure); "
-         <> "deploy_key (SSH deploy key: an encrypted keyfile on the harness "
-         <> "disk + a passphrase in the vault — preferred, lowest exposure); "
+        <> "process list); "
+        <> "deploy_key (SSH deploy key: an encrypted keyfile on the harness "
+        <> "disk + a passphrase in the vault); "
          <> "machine_user (bot account: a username + token stored in the vault, "
          <> "used to clone over HTTPS as the bot user — requires --username)"
          )

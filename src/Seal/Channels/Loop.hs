@@ -70,6 +70,7 @@ import Seal.Channels.Cursor
   ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll, newCursorStore )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (CallDispatcher, callCommandSpec)
+import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
@@ -296,7 +297,8 @@ convKey :: MessageSource -> (Text, Text)
 convKey ms = (channelKindToText (msChannelKind ms), conversationIdText (msConversationId ms))
 
 -- | Build the channel's slash-command registry from a supplied base
--- 'Registry' plus the channel-specific @bg@, @call@, and @skill@ specs.
+-- 'Registry' plus the channel-specific @bg@, @call@, @skill@, and @model@
+-- specs.
 --
 -- The channel-appended specs bind to the channel's per-session
 -- 'channelCallDispatcher' (which reads the conversation's cursor-resolved
@@ -306,16 +308,24 @@ convKey ms = (channelKindToText (msChannelKind ms), conversationIdText (msConver
 -- out, a @/skill load@ issued from Telegram dispatches via the FIRST
 -- matching spec — the web one — and records the SKILL_LOAD entry on
 -- whatever session @srActive@ points at, NOT the Telegram conversation's
--- session. The channel-dispatcher versions must win, so drop any incoming
--- spec whose primary name collides with a channel-appended spec before
--- appending them. 'lookupSpec' returns the first match, so the appended
--- channel specs then resolve correctly.
+-- session. The same hazard applies to @/model use@ (the core spec writes
+-- @srActive@'s session.json, not the conversation's). The channel-dispatcher
+--   versions must win, so drop any incoming spec whose primary name collides
+--   with a channel-appended spec before appending them. 'lookupSpec' returns
+--   the first match, so the appended channel specs then resolve correctly.
+--
+-- The @model@ spec is built from the channel's 'ProviderRuntime' + 'SealPaths'
+-- + broker (passed explicitly rather than reading the whole 'ChannelDeps' so
+-- the registry builder stays decoupled from the full deps record — the
+-- pure-registry tests don't need to construct a full 'ChannelDeps').
 buildChannelRegistry
-  :: SkillBackend -> BgRunner -> CallDispatcher -> Registry -> Registry
-buildChannelRegistry skillBackend bgRunner callDispatcher registry =
+  :: ProviderRuntime -> SealPaths -> Maybe StreamBroker
+  -> SkillBackend -> BgRunner -> CallDispatcher
+  -> IORef SessionId -> Registry -> Registry
+buildChannelRegistry pr paths mBroker skillBackend bgRunner callDispatcher sidRef registry =
   mkRegistry (baseSpecs <> channelSpecs)
   where
-    channelSpecNames = ["bg", "call", "skill"] :: [Text]
+    channelSpecNames = ["bg", "call", "skill", "model"] :: [Text]
     baseSpecs = filter
       (\s -> let CommandName n = csName s in n `notElem` channelSpecNames)
       (registrySpecs registry)
@@ -323,6 +333,9 @@ buildChannelRegistry skillBackend bgRunner callDispatcher registry =
       [ backgroundCommandSpec bgRunner
       , callCommandSpec callDispatcher
       , skillCommandSpec skillBackend callDispatcher
+      , modelCommandSpecForSession
+          pr paths (readIORef sidRef)
+          (mkModelTranscriptWriter paths mBroker)
       ]
 
 -- | The inbox-driven loop. Spawns the channel via the supplied bracket,
@@ -366,7 +379,8 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
         bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
         callDispatcher = channelCallDispatcher deps td h askReply bgConvSid
         registryWithBg = buildChannelRegistry
-          (bSkills (cdBackends deps)) bgRunner callDispatcher registry
+          (cdProvider deps) (cdPaths deps) (cdBroker deps)
+          (bSkills (cdBackends deps)) bgRunner callDispatcher bgConvSid registry
     loop h registryWithBg bgConvSid
   where
     loop h reg bgConvSid = do

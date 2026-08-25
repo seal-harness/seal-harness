@@ -46,6 +46,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
 import Seal.Command.Skill (skillCommandSpec)
 
+import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
 import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
@@ -177,18 +178,19 @@ data SendDeps = SendDeps
     -- live SSH host.
   }
 
--- | Replace the @call@, @skill@, and @stop@ specs in a registry with
+-- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
 -- per-request versions (W5: the call/skill dispatcher closes over the
 -- request's explicit 'SessionId' instead of reading the process-global
 -- @srActive@; the stop spec likewise targets the request's session so a
--- @\/stop@ typed in tab N aborts tab N, not whatever @srActive@ points
--- at). The other specs are reused as-is from the startup-built
--- @sdRegistry@.
-replaceCallSkillSpecs :: Registry -> CommandSpec -> CommandSpec -> CommandSpec -> Registry
-replaceCallSkillSpecs baseReg skillSpec callSpec stopSpec =
-  mkRegistry (filter notCallSkillOrStop (registrySpecs baseReg) <> [skillSpec, callSpec, stopSpec])
+-- @\/stop@ typed in tab N aborts tab N, not whatever @srActive@ points at;
+-- the model spec targets the request's session so a @\/model use@ in tab N
+-- updates tab N's @session.json@, not @srActive@'s). The other specs are
+-- reused as-is from the startup-built @sdRegistry@.
+replaceCallSkillSpecs :: Registry -> CommandSpec -> CommandSpec -> CommandSpec -> CommandSpec -> Registry
+replaceCallSkillSpecs baseReg skillSpec callSpec stopSpec modelSpec =
+  mkRegistry (filter notPerRequestSpec (registrySpecs baseReg) <> [skillSpec, callSpec, stopSpec, modelSpec])
   where
-    notCallSkillOrStop s = let CommandName n = csName s in n `notElem` ["call", "skill", "stop"]
+    notPerRequestSpec s = let CommandName n = csName s in n `notElem` ["call", "skill", "stop", "model"]
 
 -- | Build a 'TurnDeps' from a 'SendDeps' (the web wiring). The unified turn
 -- adapter builder is the only place the web's 'SendDeps' shape meets the
@@ -424,6 +426,8 @@ runSlash deps meta fullLine = do
         (callCommandSpec perRequestCallDispatcher)
         (stopCommandSpecForSession (sdAbortReg deps) sid
            (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))
+        (modelCommandSpecForSession (sdProvider deps) (sdPaths deps) (pure sid)
+           (mkModelTranscriptWriter (sdPaths deps) (sdBroker deps)))
   -- Snapshot the active-session ref BEFORE the action runs. The web
   -- gateway is multi-session: @srActive@ is a process-global ref that
   -- points at whatever session the last @\/new@ (or session creation)
