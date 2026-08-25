@@ -49,7 +49,7 @@ function Row({
 }
 
 function emptyInput(): RepoInput {
-  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'deploy_key', vault_key: '' }, token: '' }
+  return { id: '', url: '', vcs_kind: 'github', credential: { kind: 'pat', vault_key: '' }, token: '' }
 }
 
 function repoToInput(r: RepoInfo): RepoInput {
@@ -466,19 +466,6 @@ export function ReposView() {
                   autoComplete="off"
                 />
               </Row>
-            )}
-
-            {/* Advisory note — now below the token field so the field is the
-                primary interaction, not the note. */}
-            {credKind === 'pat' && (
-              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
-                Note: deploy_key is preferred for lower exposure (PAT token is in memory during the clone).
-              </div>
-            )}
-            {credKind === 'machine_user' && (
-              <div className="text-xs" style={{ color: 'var(--text-faint)', marginTop: -4, marginBottom: 8 }}>
-                Note: deploy_key is preferred for lower exposure (machine-user token is in memory during the clone).
-              </div>
             )}
 
             {!creating && selected?.deploy_key_public && (() => {
