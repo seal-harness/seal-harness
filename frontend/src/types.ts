@@ -217,6 +217,7 @@ export interface AgentDefInfo {
   model: string
   system: string | null
   tools: ToolsAllowList
+  group: string | null
   created_at: string
   updated_at: string
   session: string
@@ -236,6 +237,7 @@ export interface AgentDefInput {
   model?: string
   system?: string | null
   tools?: ToolsAllowList
+  group?: string | null
 }
 
 // ── Skill CRUD ─────────────────────────────────────────────────────────

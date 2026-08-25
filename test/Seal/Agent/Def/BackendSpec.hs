@@ -37,6 +37,7 @@ mkDef name = AgentDef
   , adModel = ModelId "llama3"
   , adSystem = Just "be nice"
   , adTools = AllowAll
+  , adGroup = Nothing
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = mkSystemSessionId "s1"
@@ -106,6 +107,100 @@ spec = describe "Seal.Agent.Def.Backend" $ do
           Left _    -> expectationFailure "invalid id"
         defs <- adbList backend
         map (agentDefIdText . adId) defs `shouldBe` ["alpha", "zeta"]
+
+  describe "markdownAgentDefBackend grouped layout" $ do
+    it "writes a grouped def under <root>/<group>/<id>.md and reads it back" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        case mkAgentDefId "greet" of
+          Right gid -> do
+            let d = (mkDef "greeter") { adId = gid, adGroup = Just "core" }
+            adbUpdate backend d
+            doesFileExist (agentsDir </> "core" </> "greet.md") `shouldReturn` True
+            m <- adbRead backend gid
+            case m of
+              Just d' -> adGroup d' `shouldBe` Just "core"
+              Nothing -> expectationFailure "grouped def not read back"
+          Left _ -> expectationFailure "invalid id"
+
+    it "lists defs from group subdirectories, stamped with their group" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        let mkG sid nm grp = case mkAgentDefId sid of
+              Right i -> (mkDef nm) { adId = i, adGroup = Just grp }
+              Left _  -> (mkDef nm) { adGroup = Just grp }
+        adbUpdate backend (mkG "alpha" "a" "core")
+        adbUpdate backend (mkG "beta"  "b" "ops")
+        adbUpdate backend (mkG "gamma" "g" "core")
+        defs <- adbList backend
+        map (agentDefIdText . adId) defs `shouldBe` ["alpha", "beta", "gamma"]
+        let byId = [ (agentDefIdText (adId d), adGroup d) | d <- defs ]
+        byId `shouldBe`
+          [ ("alpha", Just "core")
+          , ("beta", Just "ops")
+          , ("gamma", Just "core")
+          ]
+
+    it "stamps group from the directory when the frontmatter omitted it" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        let raw = "---\nid: dropped\n\
+                  \name: hand-dropped\n\
+                  \provider: ollama\n\
+                  \model: llama3\n\
+                  \tools: all\n\
+                  \created_at: 2026-07-05T00:00:00Z\n\
+                  \updated_at: 2026-07-05T00:00:00Z\n\
+                  \session: manual\n\
+                  \---\n\n\
+                  \be nice\n"
+        createDirectoryIfMissing True (agentsDir </> "core")
+        TIO.writeFile (agentsDir </> "core" </> "dropped.md") raw
+        defs <- adbList backend
+        case [ d | d <- defs, agentDefIdText (adId d) == "dropped" ] of
+          [d] -> adGroup d `shouldBe` Just "core"
+          _   -> expectationFailure "hand-dropped grouped def not listed"
+
+    it "still reads flat-layout defs (back-compat) with no group" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        case mkAgentDefId "flat" of
+          Right fid -> do
+            let d = (mkDef "flat") { adId = fid, adGroup = Nothing }
+            adbUpdate backend d
+            doesFileExist (agentsDir </> "flat.md") `shouldReturn` True
+            m <- adbRead backend fid
+            case m of
+              Just d' -> adGroup d' `shouldBe` Nothing
+              Nothing -> expectationFailure "flat def not read back"
+          Left _ -> expectationFailure "invalid id"
+
+    it "deletes a grouped def from its group directory" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+        case mkAgentDefId "del" of
+          Right did -> do
+            let d = (mkDef "d") { adId = did, adGroup = Just "core" }
+            adbUpdate backend d
+            doesFileExist (agentsDir </> "core" </> "del.md") `shouldReturn` True
+            adbDelete backend did
+            doesFileExist (agentsDir </> "core" </> "del.md") `shouldReturn` False
+          Left _ -> expectationFailure "invalid id"
 
   describe "DirScheme discovery (PureClaw-style subdirectories)" $ do
     it "discovers a zoe/ directory with SOUL.md + AGENTS.md and composes the prompt" $
@@ -208,6 +303,7 @@ spec = describe "Seal.Agent.Def.Backend" $ do
                   , adModel = ModelId "llama3"
                   , adSystem = Just "flat system"
                   , adTools = AllowAll
+                  , adGroup = Nothing
                   , adCreatedAt = sampleTime
                   , adUpdatedAt = sampleTime
                   , adSession = mkSystemSessionId "s1"

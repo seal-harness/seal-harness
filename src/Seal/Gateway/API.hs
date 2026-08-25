@@ -1150,6 +1150,11 @@ stampAgentDef _deps aid v mExisting = do
         Nothing                            -> Nothing
         _                                  -> Nothing
       tools       = maybe AllowAll allowListFromValue (lookupVal "tools")
+      mGroup      = T.strip <$> lookupStr "group"
+      group_      = case (mGroup, mExisting) of
+        (Just g, _) | not (T.null g) -> Just g
+        (Nothing, Just ex)           -> adGroup ex
+        _                            -> Nothing
       createdAt   = maybe now adCreatedAt mExisting
       session     = maybe (mkSystemSessionId "web") adSession mExisting
   pure AgentDef
@@ -1159,6 +1164,7 @@ stampAgentDef _deps aid v mExisting = do
     , adModel     = model
     , adSystem    = mSystem
     , adTools     = tools
+    , adGroup     = group_
     , adCreatedAt = createdAt
     , adUpdatedAt = now
     , adSession   = session
@@ -1915,6 +1921,7 @@ agentInfoJson mDefaultId d = A.object
   , "model" .= adModel d
   , "system" .= adSystem d
   , "tools" .= allowListToValue (adTools d)
+  , "group" .= adGroup d
   , "created_at" .= adCreatedAt d
   , "updated_at" .= adUpdatedAt d
   , "session" .= adSession d

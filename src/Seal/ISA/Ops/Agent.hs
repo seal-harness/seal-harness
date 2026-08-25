@@ -110,6 +110,16 @@ toolsField v =
     Just (Just (Array xs))     -> AllowOnly (Set.fromList [ OpName t | String t <- V.toList xs ])
     _                          -> AllowAll
 
+-- | Resolve the @group@ field from the opcode input, preserving the existing
+-- def's group when the input omits it (mirrors the gateway @stampAgentDef@
+-- and the skill @stampSkill@ back-compat policy). An explicit empty string
+-- clears the group (sets 'Nothing'); a non-empty stripped value sets it.
+groupField :: Value -> Maybe AgentDef -> Maybe Text
+groupField v mExisting =
+  case textFieldMaybe "group" v of
+    Just g  -> let g' = T.strip g in if T.null g' then Nothing else Just g'
+    Nothing -> adGroup =<< mExisting
+
 -- ---------------------------------------------------------------------------
 -- AGENT_DEF_WRITE
 -- ---------------------------------------------------------------------------
@@ -152,6 +162,10 @@ agentDefWriteOp backend session = TrustedOpcode
               [ "type" .= ("array" :: Text)
               , "description" .= ("Allowed opcode names, or \"all\"." :: Text)
               ]
+          , fromText "group" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional display group (e.g. \"core\"). Omit for the default (ungrouped) section." :: Text)
+              ]
           ]
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
@@ -170,6 +184,7 @@ agentDefWriteOp backend session = TrustedOpcode
                       { adName = textField "name" v
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
+                      , adGroup = groupField v (Just existing)
                       , adUpdatedAt = now
                       }
                   , False
@@ -182,6 +197,7 @@ agentDefWriteOp backend session = TrustedOpcode
                       , adModel = ModelId (textField "model" v)
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
+                      , adGroup = groupField v Nothing
                       , adCreatedAt = now
                       , adUpdatedAt = now
                       , adSession = session
@@ -611,6 +627,7 @@ encodeDefRecorded d wasNew = object
   , "model"      .= adModel d
   , "system"     .= adSystem d
   , "tools"      .= encodeTools (adTools d)
+  , "group"      .= adGroup d
   , "created_at" .= adCreatedAt d
   , "updated_at" .= adUpdatedAt d
   , "session"    .= adSession d

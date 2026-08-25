@@ -256,7 +256,7 @@ encodeAgentDef d = encodeDoc fm body
   where
     ModelId modelName = adModel d
     body = fromMaybe "" (adSystem d)
-    fm = Map.fromList
+    fm = Map.fromList $
       [ ("id", agentDefIdText (adId d))
       , ("name", adName d)
       , ("provider", adProvider d)
@@ -265,7 +265,7 @@ encodeAgentDef d = encodeDoc fm body
       , ("created_at", isoTime (adCreatedAt d))
       , ("updated_at", isoTime (adUpdatedAt d))
       , ("session", sessionIdText (adSession d))
-      ]
+      ] ++ maybe [] (\g -> [("group", g)]) (adGroup d)
 
 -- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
 -- field is missing or fails 'mkAgentDefId'.
@@ -282,6 +282,7 @@ decodeAgentDef content =
         , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
         , adSystem = if T.null body then Nothing else Just body
         , adTools = decodeTools fm
+        , adGroup = fmLookup "group" fm
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
         , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
@@ -404,6 +405,7 @@ loadDirAgentDef fs aid = do
         , adModel = ModelId (fromMaybe "" (dacModel cfg))
         , adSystem = if T.null body then Nothing else Just body
         , adTools = decodeDirTools (dacTools cfg)
+        , adGroup = Nothing
         , adCreatedAt = mtime
         , adUpdatedAt = mtime
         , adSession = mkSystemSessionId "manual"
@@ -454,6 +456,7 @@ decodeProjectAgentsMd content =
           , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
           , adSystem = if T.null body then Nothing else Just body
           , adTools = decodeTools fm
+          , adGroup = Nothing
           , adCreatedAt = epochZero
           , adUpdatedAt = epochZero
           , adSession = mkSystemSessionId "manual"
@@ -481,6 +484,7 @@ decodeProtocolAgentMd subDirName content =
                  , adModel = ModelId (fromMaybe "" (fmLookup "model" fm))
                  , adSystem = if T.null body then Nothing else Just body
                  , adTools = decodeTools fm
+                 , adGroup = Nothing
                  , adCreatedAt = epochZero
                  , adUpdatedAt = epochZero
                  , adSession = mkSystemSessionId "manual"

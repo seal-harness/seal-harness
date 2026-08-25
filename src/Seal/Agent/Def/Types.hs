@@ -54,6 +54,14 @@ agentDefIdText (AgentDefId t) = t
 -- are recorded in full in both the session transcript and the Audited log.
 -- 'adSession' is the originating session (provenance). 'adUpdatedAt' is bumped
 -- on each 'AGENT_DEF_UPDATE'.
+--
+-- 'adGroup' is an optional category for display grouping, mirroring 'skGroup'
+-- on 'Seal.Skills.Types.Skill'. It is derived from the on-disk parent
+-- directory name (@config\/agents\/\<group\>\/\<id\>.md@) and may be
+-- overridden via a @group:@ frontmatter key. 'Nothing' means the def belongs
+-- to the default (ungrouped) section. The def /id/ stays flat regardless of
+-- group (the charset predicate forbids @\/@), so group is purely display
+-- metadata — opcodes, file mapping, and lookups all key on 'adId'.
 data AgentDef = AgentDef
   { adId        :: AgentDefId
   , adName      :: Text
@@ -61,6 +69,7 @@ data AgentDef = AgentDef
   , adModel     :: ModelId
   , adSystem    :: Maybe Text
   , adTools     :: AllowList OpName
+  , adGroup     :: Maybe Text
   , adCreatedAt :: UTCTime
   , adUpdatedAt :: UTCTime
   , adSession   :: SessionId
@@ -91,6 +100,7 @@ instance ToJSON AgentDef where
     , "model"      .= adModel d
     , "system"     .= adSystem d
     , "tools"      .= allowListToValue (adTools d)
+    , "group"      .= adGroup d
     , "created_at" .= adCreatedAt d
     , "updated_at" .= adUpdatedAt d
     , "session"    .= adSession d
@@ -104,6 +114,7 @@ instance FromJSON AgentDef where
     <*> o .:  "model"
     <*> o .:? "system"
     <*> (allowListFromValue <$> o .: "tools")
+    <*> o .:? "group"
     <*> o .:  "created_at"
     <*> o .:  "updated_at"
     <*> o .:  "session"

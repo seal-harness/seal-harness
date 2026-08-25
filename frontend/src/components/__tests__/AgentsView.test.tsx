@@ -46,6 +46,7 @@ function makeAgent(overrides: Partial<AgentDefInfo> = {}): AgentDefInfo {
     model: 'claude-sonnet-4',
     system: 'plan tasks',
     tools: 'all',
+    group: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     session: 'web',
@@ -294,5 +295,71 @@ describe('AgentsView', () => {
     render(<AgentsView />)
     // Only one "default" pill in the list pane (after the fetch resolves).
     await waitFor(() => expect(screen.getAllByText('default')).toHaveLength(1))
+  })
+
+  // ── Grouping ─────────────────────────────────────────────────────────
+
+  it('groups agents by their group field with ungrouped under "Agents"', () => {
+    agentDefsState = [
+      makeAgent({ id: 'planner', displayName: 'Planner', group: 'core' }),
+      makeAgent({ id: 'coder', displayName: 'Coder', group: null }),
+      makeAgent({ id: 'reviewer', displayName: 'Reviewer', group: 'core' }),
+    ]
+    render(<AgentsView />)
+    // Ungrouped agents appear under "Agents" header
+    expect(screen.getByTestId('agent-group-header-Agents')).toBeTruthy()
+    expect(screen.getByTestId('agent-group-header-core')).toBeTruthy()
+    // Each row is present
+    expect(screen.getByTestId('agent-row-planner')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-coder')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-reviewer')).toBeTruthy()
+  })
+
+  it('collapses and expands a group on header click', () => {
+    agentDefsState = [
+      makeAgent({ id: 'planner', displayName: 'Planner', group: 'core' }),
+      makeAgent({ id: 'coder', displayName: 'Coder', group: null }),
+    ]
+    render(<AgentsView />)
+    // The "core" group starts expanded
+    expect(screen.getByTestId('agent-group-collapse-core').textContent).toBe('▾')
+    // Collapse it
+    fireEvent.click(screen.getByTestId('agent-group-header-core'))
+    expect(screen.getByTestId('agent-group-collapse-core').textContent).toBe('▸')
+    // The "Agents" (ungrouped) group is still expanded
+    expect(screen.getByTestId('agent-group-collapse-Agents').textContent).toBe('▾')
+  })
+
+  it('sends group in the create payload', async () => {
+    createAgentDef.mockResolvedValue(makeAgent({ id: 'coder', displayName: 'Coder', group: 'core' }))
+    agentDefsState = []
+    render(<AgentsView />)
+    fireEvent.click(screen.getByLabelText('New agent'))
+    fireEvent.change(document.getElementById('agent-id') as HTMLInputElement, { target: { value: 'coder' } })
+    fireEvent.change(document.getElementById('agent-group') as HTMLInputElement, { target: { value: 'core' } })
+    fireEvent.click(screen.getByLabelText('Create agent'))
+    await waitFor(() => expect(createAgentDef).toHaveBeenCalled())
+    const body = createAgentDef.mock.calls[0]![0] as { group?: string | null }
+    expect(body.group).toBe('core')
+  })
+
+  it('sends group: null when the group field is empty on create', async () => {
+    createAgentDef.mockResolvedValue(makeAgent({ id: 'coder', displayName: 'Coder' }))
+    agentDefsState = []
+    render(<AgentsView />)
+    fireEvent.click(screen.getByLabelText('New agent'))
+    fireEvent.change(document.getElementById('agent-id') as HTMLInputElement, { target: { value: 'coder' } })
+    fireEvent.click(screen.getByLabelText('Create agent'))
+    await waitFor(() => expect(createAgentDef).toHaveBeenCalled())
+    const body = createAgentDef.mock.calls[0]![0] as { group?: string | null }
+    expect(body.group).toBeNull()
+  })
+
+  it('seeds the group field from the existing def on edit', () => {
+    agentDefsState = [makeAgent({ id: 'planner', displayName: 'Planner', group: 'core' })]
+    render(<AgentsView />)
+    fireEvent.click(screen.getByTestId('agent-row-planner'))
+    const groupEl = document.getElementById('agent-group') as HTMLInputElement
+    expect(groupEl.value).toBe('core')
   })
 })

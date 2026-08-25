@@ -30,6 +30,7 @@ sampleDef = AgentDef
   , adModel = ModelId "llama3"
   , adSystem = Just "be polite"
   , adTools = AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])
+  , adGroup = Nothing
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = mkSystemSessionId "s1"
@@ -64,6 +65,10 @@ spec = describe "Seal.Agent.Def.Types" $ do
 
     it "AllowAll encodes as \"all\"" $ do
       let d = sampleDef { adTools = AllowAll }
+      (decode (encode d) :: Maybe AgentDef) `shouldBe` Just d
+
+    it "round-trips a def with a group" $ do
+      let d = sampleDef { adGroup = Just "core" }
       (decode (encode d) :: Maybe AgentDef) `shouldBe` Just d
 
 isLeft :: Either a b -> Bool

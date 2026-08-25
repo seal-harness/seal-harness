@@ -80,6 +80,29 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         Just d  -> adSystem d `shouldBe` Just "be nice"
         Nothing -> expectationFailure "def not stored"
 
+    it "accepts an optional group and records it" $ do
+      backend <- noneBackend
+      let op = agentDefWriteOp backend sampleSession
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text), "group" .= ("core" :: Text)]))
+      orIsError r `shouldBe` False
+      m <- adbRead backend sampleDefId
+      case m of
+        Just d  -> adGroup d `shouldBe` Just "core"
+        Nothing -> expectationFailure "def not stored"
+      let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+      T.isInfixOf "\"core\"" recorded `shouldBe` True
+
+    it "preserves the existing group on update when the field is omitted" $ do
+      backend <- noneBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text), "group" .= ("core" :: Text)]))
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g2" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      m <- adbRead backend sampleDefId
+      case m of
+        Just d  -> adGroup d `shouldBe` Just "core"
+        Nothing -> expectationFailure "def not found after update"
+
     it "updates an existing def and returns 'updated' with was_new=false (preserves provenance)" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend

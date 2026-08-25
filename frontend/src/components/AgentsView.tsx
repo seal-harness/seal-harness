@@ -81,7 +81,7 @@ function toolsToText(tools: ToolsAllowList): string {
 
 /** The empty-form defaults for "New agent". */
 function emptyInput(): AgentDefInput {
-  return { id: '', name: '', provider: '', model: '', system: '', tools: 'all' }
+  return { id: '', name: '', provider: '', model: '', system: '', tools: 'all', group: '' }
 }
 
 /** Build an AgentDefInput from an existing AgentDefInfo for editing. */
@@ -93,7 +93,132 @@ function defToInput(d: AgentDefInfo): AgentDefInput {
     model: d.model,
     system: d.system ?? '',
     tools: d.tools,
+    group: d.group ?? '',
   }
+}
+
+// ── Grouping ─────────────────────────────────────────────────────────────
+
+/** The display label for an agent's group.  Ungrouped agents (group === null
+ *  or empty string) fall under the default "Agents" heading, matching the
+ *  behaviour of the backend's available-agents catalog and the flat on-disk
+ *  layout (no subdirectory). Mirrors SkillsView.groupLabel. */
+function groupLabel(group: string | null): string {
+  const g = group?.trim()
+  if (!g) return 'Agents'
+  return g
+}
+
+/** Partition agents into groups in display order.  Ungrouped agents come
+ *  first (under "Agents"), then named groups in alphabetical order —
+ *  matching the sorting in the backend's prompt catalog. Mirrors
+ *  SkillsView.groupSkills. */
+interface AgentGroup {
+  label: string
+  agents: AgentDefInfo[]
+}
+
+function groupAgents(agents: AgentDefInfo[]): AgentGroup[] {
+  const sorted = [...agents].sort((a, b) => {
+    const ga = a.group?.trim() ?? ''
+    const gb = b.group?.trim() ?? ''
+    if (ga !== gb) return ga.localeCompare(gb)
+    return a.id.localeCompare(b.id)
+  })
+  const groups: AgentGroup[] = []
+  for (const a of sorted) {
+    const label = groupLabel(a.group)
+    const last = groups[groups.length - 1]
+    if (last && last.label === label) {
+      last.agents.push(a)
+    } else {
+      groups.push({ label, agents: [a] })
+    }
+  }
+  return groups
+}
+
+// ── Collapsible group section ────────────────────────────────────────────
+
+/** A collapsible group of agents in the list pane.  Starts expanded; the
+ *  header shows the group label + count and a ▾/▸ indicator.  Clicking the
+ *  header toggles expansion.  Auto-expands when the currently-edited agent
+ *  is inside this group so the selection is never hidden behind a
+ *  collapsed header. Mirrors SkillsView.SkillGroupSection. */
+function AgentGroupSection({
+  group,
+  editingId,
+  creating,
+  confirmingDelete,
+  defaultAgentId,
+  onSelectAgent,
+}: {
+  group: AgentGroup
+  editingId: string | null
+  creating: boolean
+  confirmingDelete: string | null
+  defaultAgentId: string | null
+  onSelectAgent: (id: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+
+  return (
+    <div data-testid={`agent-group-${group.label}`}>
+      <div
+        className="px-3 pt-2 pb-1 flex items-center justify-between cursor-pointer"
+        style={{ color: 'var(--text-faint)', letterSpacing: '0.06em' }}
+        data-testid={`agent-group-header-${group.label}`}
+        onClick={() => setExpanded((e) => !e)}
+      >
+        <span className="text-xs font-semibold uppercase">
+          {group.label} ({group.agents.length})
+        </span>
+        <span data-testid={`agent-group-collapse-${group.label}`} style={{ fontSize: 12 }}>
+          {expanded ? '▾' : '▸'}
+        </span>
+      </div>
+      {expanded && group.agents.map((a) => {
+        const isActive = (creating ? false : editingId === a.id) && !confirmingDelete
+        return (
+          <div
+            key={a.id}
+            data-testid={`agent-row-${a.id}`}
+            className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
+            onClick={() => onSelectAgent(a.id)}
+          >
+            <div className="flex items-center gap-2">
+              <span
+                className="text-sm truncate mr-auto"
+                style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
+              >
+                {a.displayName || a.id}
+              </span>
+              {defaultAgentId === a.id && (
+                <span
+                  className="pill"
+                  style={{
+                    background: 'var(--bg-elevated)',
+                    color: 'var(--text-faint)',
+                    padding: '0 0.4em',
+                    fontSize: '0.7em',
+                  }}
+                >
+                  default
+                </span>
+              )}
+            </div>
+            <div
+              className="text-xs mt-0.5 truncate"
+              style={{ color: 'var(--text-faint)' }}
+              title={`${a.provider || '—'} · ${a.model || '—'}`}
+            >
+              {a.id} · {a.provider || '—'} · {a.model || '—'}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 // ── Component ───────────────────────────────────────────────────────────
@@ -125,6 +250,7 @@ export function AgentsView() {
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<AgentDefInput>(emptyInput())
   const [toolsText, setToolsText] = useState('all')
+  const [groupField, setGroupField] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
@@ -145,6 +271,7 @@ export function AgentsView() {
     if (creating) {
       setForm(emptyInput())
       setToolsText('all')
+      setGroupField('')
       setFormError(null)
       return
     }
@@ -153,6 +280,7 @@ export function AgentsView() {
       if (d) {
         setForm(defToInput(d))
         setToolsText(toolsToText(d.tools))
+        setGroupField(d.group ?? '')
         setFormError(null)
       }
     }
@@ -162,6 +290,8 @@ export function AgentsView() {
     () => (editing ? agents.find((a) => a.id === editing) ?? null : null),
     [editing, agents],
   )
+
+  const grouped = useMemo(() => groupAgents(agents), [agents])
 
   const validateForm = (): string | null => {
     const id = (form.id ?? '').trim()
@@ -176,6 +306,8 @@ export function AgentsView() {
     setSubmitting(true)
     setFormError(null)
     const trimmedId = (form.id ?? '').trim()
+    const trimmedGroup = groupField.trim()
+    const groupPayload = trimmedGroup.length > 0 ? trimmedGroup : null
     if (creating) {
       const payload: AgentDefInput = {
         ...form,
@@ -185,6 +317,7 @@ export function AgentsView() {
         model: form.model ?? '',
         system: form.system && form.system.trim().length > 0 ? form.system : null,
         tools: parseToolsText(toolsText),
+        group: groupPayload,
       }
       const res = await createAgentDef(payload)
       setSubmitting(false)
@@ -208,6 +341,7 @@ export function AgentsView() {
         model: form.model ?? '',
         system: form.system && form.system.trim().length > 0 ? form.system : null,
         tools: parseToolsText(toolsText),
+        group: groupPayload,
       }
       const res = await updateAgentDef(editing, payload)
       setSubmitting(false)
@@ -238,6 +372,12 @@ export function AgentsView() {
     setCreating(false)
     setEditing(null)
     setFormError(null)
+  }
+
+  const handleSelectAgent = (id: string) => {
+    if (confirmingDelete === id) setConfirmingDelete(null)
+    setCreating(false)
+    setEditing(id)
   }
 
   // ── Render ──────────────────────────────────────────────────────────
@@ -284,50 +424,17 @@ export function AgentsView() {
               No agents yet. Click + to create one.
             </div>
           )}
-          {agents.map((a) => {
-            const isActive = (creating ? false : editing === a.id) && !confirmingDelete
-            return (
-              <div
-                key={a.id}
-                data-testid={`agent-row-${a.id}`}
-                className={`agent-row px-3 py-2 cursor-pointer${isActive ? ' selected' : ''}`}
-                onClick={() => {
-                  if (confirmingDelete === a.id) setConfirmingDelete(null)
-                  setCreating(false)
-                  setEditing(a.id)
-                }}
-              >
-                <div className="flex items-center gap-2">
-                  <span
-                    className="text-sm truncate mr-auto"
-                    style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tight)' }}
-                  >
-                    {a.displayName || a.id}
-                  </span>
-                  {defaultAgentId === a.id && (
-                    <span
-                      className="pill"
-                      style={{
-                        background: 'var(--bg-elevated)',
-                        color: 'var(--text-faint)',
-                        padding: '0 0.4em',
-                        fontSize: '0.7em',
-                      }}
-                    >
-                      default
-                    </span>
-                  )}
-                </div>
-                <div
-                  className="text-xs mt-0.5 truncate"
-                  style={{ color: 'var(--text-faint)' }}
-                  title={`${a.provider || '—'} · ${a.model || '—'}`}
-                >
-                  {a.id} · {a.provider || '—'} · {a.model || '—'}
-                </div>
-              </div>
-            )
-          })}
+          {grouped.map((grp) => (
+            <AgentGroupSection
+              key={grp.label}
+              group={grp}
+              editingId={editing}
+              creating={creating}
+              confirmingDelete={confirmingDelete}
+              defaultAgentId={defaultAgentId}
+              onSelectAgent={handleSelectAgent}
+            />
+          ))}
         </div>
       </div>
 
@@ -377,6 +484,18 @@ export function AgentsView() {
                 onChange={(e) => setForm((f) => ({ ...f, id: e.target.value }))}
                 style={inputStyle}
                 placeholder="e.g. coder"
+                autoComplete="off"
+              />
+            </Row>
+
+            <Row label="Group" htmlFor="agent-group" hint="Optional category for display grouping and on-disk layout (config/agents/<group>/<id>.md). Leave empty for ungrouped.">
+              <input
+                id="agent-group"
+                type="text"
+                value={groupField}
+                onChange={(e) => setGroupField(e.target.value)}
+                style={inputStyle}
+                placeholder="e.g. core"
                 autoComplete="off"
               />
             </Row>
