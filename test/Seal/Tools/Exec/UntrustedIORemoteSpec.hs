@@ -25,6 +25,8 @@
 module Seal.Tools.Exec.UntrustedIORemoteSpec (spec) where
 
 import Data.IORef
+import Data.List (isPrefixOf)
+import Data.Either (fromRight)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -32,7 +34,7 @@ import System.Directory (doesFileExist)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Tools.Args (mkSearchPattern, mkShellCommand)
+import Seal.Tools.Args (mkBinArg, mkBinName, mkSearchPattern, mkShellCommand)
 import Seal.Tools.Exec.Remote
   ( mkFakeRemoteRunner, mkFakeRemoteRunnerRecording
   )
@@ -206,6 +208,72 @@ spec = describe "Seal.Tools.Exec.UntrustedIO (remote arm)" $ do
       recorded `shouldBe` []
       res `shouldSatisfy` \case Left (UePath _) -> True; _ -> False
 
+  describe "uioShellExecEnv + uioBinExecEnv (credential-env execs)" $ do
+
+    it "uioShellExecEnv scopes the env to the command: 'cd <ws> && env K=V <cmd>'" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+      cmd <- either (const (error "fixture")) pure
+               (mkShellCommand "gh repo clone 'x' 'y'")
+      _ <- uioShellExecEnv uio [("GH_TOKEN", "tok")] cmd Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          case reverse argv of
+            (composed : _) -> do
+              -- THE BUG (pre-fix): the env prefix led the WHOLE command —
+              -- `env K=V cd '<ws>' && gh …` — which POSIX-scopes the vars
+              -- to the cd only. It must never lead.
+              "env " `isPrefixOf` composed `shouldBe` False
+              -- The credential env rides AFTER 'cd <ws> &&', adjacent to
+              -- the command it scopes.
+              composed `shouldBe`
+                "cd '/srv/agent-workspace' && env GH_TOKEN='tok' "
+                <> "gh repo clone 'x' 'y'"
+            [] -> expectationFailure "empty argv"
+        _ -> expectationFailure "expected exactly one call"
+
+    it "uioShellExecEnv with an explicit cwd anchors the cd at the workspace" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+          rp     = mkRemotePathOrDie "sub/dir"
+      cmd <- either (const (error "fixture")) pure (mkShellCommand "make")
+      _ <- uioShellExecEnv uio [("GIT_TERMINAL_PROMPT", "0")] cmd (Just rp)
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          case reverse argv of
+            (composed : _) -> do
+              "env " `isPrefixOf` composed `shouldBe` False
+              composed `shouldBe`
+                "cd '/srv/agent-workspace/sub/dir' && "
+                <> "env GIT_TERMINAL_PROMPT='0' make"
+            [] -> expectationFailure "empty argv"
+        _ -> expectationFailure "expected exactly one call"
+
+    it "uioBinExecEnv scopes the env to the binary: 'cd <ws> && env K=V bin args'" $ do
+      calls <- newIORef []
+      let runner = mkFakeRemoteRunnerRecording calls okRight
+          uio    = mkRemoteUntrustedIO sshCfg runner
+          bin    = fromRight (error "fixture") (mkBinName "gh")
+          bargs  = map (fromRight (error "fixture") . mkBinArg) ["pr", "create"]
+      _ <- uioBinExecEnv uio [("GH_TOKEN", "tok")] bin bargs Nothing
+      recorded <- readIORef calls
+      case recorded of
+        [(argv, _)] ->
+          case reverse argv of
+            (composed : _) -> do
+              "env " `isPrefixOf` composed `shouldBe` False
+              -- Each argv token is single-quoted (the arm's existing
+              -- quoting discipline); the env prefix scopes to the binary.
+              composed `shouldBe`
+                "cd '/srv/agent-workspace' && env GH_TOKEN='tok' "
+                <> "'gh' 'pr' 'create'"
+            [] -> expectationFailure "empty argv"
+        _ -> expectationFailure "expected exactly one call"
+
   describe "host-key mismatch (hard failure, never bypassed)" $ do
 
     it "uioShellExec surfaces 'UeExec ExecHostKeyMismatch'" $ do
@@ -324,9 +392,6 @@ checkAdjacentPair argv key value =
     let joined    = key <> "=" <> value
         adjacent  = [key, value]
         isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
-        isPrefixOf (p:ps) (q:qs) = p == q && isPrefixOf ps qs
-        isPrefixOf []      _      = True
-        isPrefixOf _       []     = False
         tails []                   = [[]]
         tails list@(_:rest)        = list : tails rest
     in joined `elem` argvList || adjacent `isInfixOf` argvList
