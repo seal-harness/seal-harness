@@ -23,6 +23,7 @@ module Seal.Config.Paths
   , workdirsRoot
   , sessionWorkdir
   , tabListPath
+  , cursorMapPath
   ) where
 
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
@@ -194,6 +195,17 @@ sessionLogPath paths sid = sessionDir paths sid </> "seal.log"
 -- 'loadTabList' so the tab list survives a @seal serve@ restart.
 tabListPath :: SealPaths -> FilePath
 tabListPath paths = spState paths </> "tabs.json"
+
+-- | The persisted cursor map: @\<state\>\/cursors.json@. Maps each
+-- conversation ('ConversationKey') to the 'TabRef' it's focused on.
+-- Written atomically (0600) by 'Seal.Channels.Cursor.Persist.saveCursorMap'
+-- on every cursor mutation; loaded at boot by 'loadCursorMap' so a
+-- conversation re-resolves to its prior session (carrying the user's
+-- @\/model use@ choice) after a @seal serve@ restart. Without this, the
+-- in-memory cursor store is lost on restart and the loop mints a fresh
+-- default-model session for every existing conversation.
+cursorMapPath :: SealPaths -> FilePath
+cursorMapPath paths = spState paths </> "cursors.json"
 
 -- | Directory for a sub-agent's transcript, nested under its parent session:
 -- @\<state\>\/sessions\/\<parent-id\>\/agents\/\<child-id\>@. Each forked agent

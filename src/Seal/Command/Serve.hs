@@ -8,6 +8,7 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO)
 import Control.Monad (filterM)
+import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isJust)
@@ -24,6 +25,9 @@ import qualified Seal.Channels.Telegram.Commands
 import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
 
 import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
+import Seal.Channels.Cursor
+  ( newPersistingCursorStore, seedCursorStore )
+import Seal.Channels.Cursor.Persist (loadCursorMap)
 import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Signal (withSignalChannel)
 import Seal.Channels.Signal.Transport (mkRealSignalTransport)
@@ -46,7 +50,7 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
@@ -153,6 +157,16 @@ runServeMain autonomy logger = do
     Just tl -> do
       kept <- filterM (sessionTabExists paths) (tlTabs tl)
       seedTabsHandle tabsH (renumberTabs kept)
+  -- Persisting cursor store: load + seed so existing Telegram/Signal
+  -- conversations re-resolve to their prior sessions (carrying the user's
+  -- /model use choice) after a seal serve restart. A cursor pointing at a
+  -- session whose session.json is missing degrades gracefully —
+  -- resolveTabSession returns Nothing and the loop mints a fresh session
+  -- on the next message (exactly as if the cursor were absent). No
+  -- boot-time stale sweep is needed.
+  cursorsH <- newPersistingCursorStore (cursorMapPath paths)
+  mCursors <- loadCursorMap (cursorMapPath paths)
+  for_ mCursors (seedCursorStore cursorsH)
   reg     <- newHarnessRegistry
   tmuxR   <- mkRealTmuxRunner
   uiState <- newUiStateHandle paths
@@ -177,7 +191,7 @@ runServeMain autonomy logger = do
         Nothing  -> False
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy (Just broker)
-        reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger
+        reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger cursorsH
   let sr = SessionRuntime
              { srPaths      = paths
              , srConfigPath = cfgPath

@@ -67,7 +67,7 @@ import Seal.Channel.Cli
   ( Backends (..), resolveSessionProvider )
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor
-  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll, newCursorStore )
+  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll )
 import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (CallDispatcher, callCommandSpec)
 import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
@@ -247,9 +247,16 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
       TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling (smChannel meta)
   }
 
--- | Build a 'ChannelDeps' with fresh cursor/reply/lock stores and the
--- given config loader. Used by 'Seal.Command.Serve' and the standalone
--- entry points. The 'tabsH' is the shared/unified handle (W4).
+-- | Build a 'ChannelDeps' with fresh reply/lock/abort stores and the given
+-- config loader. Used by 'Seal.Command.Serve' and the standalone entry
+-- points. The 'tabsH' is the shared/unified handle (W4). The 'cursors' is
+-- supplied by the caller: a persisting store
+-- ('Seal.Channels.Cursor.newPersistingCursorStore') under @seal serve@ /
+-- standalone @seal telegram@ / @seal signal@ so the conversation→tab
+-- bindings survive a restart, or a non-persisting 'newCursorStore' in
+-- tests. The caller is responsible for loading + seeding the cursor store
+-- at boot (see 'Seal.Channels.Cursor.Persist.loadCursorMap' +
+-- 'seedCursorStore'); this function does NOT touch disk for cursors.
 newChannelDeps
   :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
@@ -258,10 +265,10 @@ newChannelDeps
   -> Bool
   -> TabsHandle
   -> SealLogger
+  -> CursorStore
   -> IO ChannelDeps
 newChannelDeps paths vault repoReg provider backends autonomy broker
-               harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger = do
-  cursors <- newCursorStore
+               harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger cursors = do
   replies <- newReplyRegistry
   locks   <- newSessionLocks
   abortReg <- newSessionAbortRegistry
