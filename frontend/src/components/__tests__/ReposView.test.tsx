@@ -98,16 +98,19 @@ describe('ReposView', () => {
     fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
     fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@github.com:owner/repo.git' } })
     // vcs_kind defaults to github; leave as-is.
-    // credential kind defaults to deploy_key; vault_key is auto-generated.
+    // credential kind defaults to pat; vault_key is auto-generated.
+    // pat requires a token — enter one.
+    fireEvent.change(document.getElementById('repo-token') as HTMLInputElement, { target: { value: 'xyz' } })
     fireEvent.click(screen.getByLabelText('Create repo'))
     await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
-    const body = createRepo.mock.calls[0]![0] as { id?: string; url: string; vcs_kind: string; credential: { kind: string; vault_key: string } }
+    const body = createRepo.mock.calls[0]![0] as { id?: string; url: string; vcs_kind: string; token?: string; credential: { kind: string; vault_key: string } }
     expect(body.id).toBe('myrepo')
     expect(body.url).toBe('git@github.com:owner/repo.git')
     expect(body.vcs_kind).toBe('github')
-    expect(body.credential.kind).toBe('deploy_key')
+    expect(body.credential.kind).toBe('pat')
     // vault_key is auto-generated: seal-<kind>-<id>
-    expect(body.credential.vault_key).toBe('seal-deploy_key-myrepo')
+    expect(body.credential.vault_key).toBe('seal-pat-myrepo')
+    expect(body.token).toBe('xyz')
   })
 
   it('create surfaces the backend error when the save fails', async () => {
@@ -117,6 +120,7 @@ describe('ReposView', () => {
     fireEvent.click(screen.getByLabelText('New repo'))
     fireEvent.change(document.getElementById('repo-id') as HTMLInputElement, { target: { value: 'myrepo' } })
     fireEvent.change(document.getElementById('repo-url') as HTMLInputElement, { target: { value: 'git@evil.example/o.git' } })
+    fireEvent.change(document.getElementById('repo-token') as HTMLInputElement, { target: { value: 'xyz' } })
     fireEvent.click(screen.getByLabelText('Create repo'))
     await waitFor(() => expect(createRepo).toHaveBeenCalledTimes(1))
     expect(screen.getByTestId('repo-form-error')).toBeTruthy()
@@ -214,13 +218,13 @@ describe('ReposView', () => {
     reposState = []
     render(<ReposView />)
     fireEvent.click(screen.getByLabelText('New repo'))
-    // Default credential kind is deploy_key → no token field.
-    expect(document.getElementById('repo-token')).toBeNull()
-    // Select "Personal Access Token" (pat) → password field appears.
-    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    // Default credential kind is pat → password field is visible.
     const tokenEl = document.getElementById('repo-token') as HTMLInputElement
     expect(tokenEl).not.toBeNull()
     expect(tokenEl.type).toBe('password')
+    // Switch to deploy_key → password field disappears.
+    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'deploy_key' } })
+    expect(document.getElementById('repo-token')).toBeNull()
   })
 
   it('validation requires the token on create (submit with empty token + pat)', async () => {
@@ -257,8 +261,7 @@ describe('ReposView', () => {
     reposState = []
     render(<ReposView />)
     fireEvent.click(screen.getByLabelText('New repo'))
-    // Select pat, type a token.
-    fireEvent.change(document.getElementById('repo-cred-kind') as HTMLSelectElement, { target: { value: 'pat' } })
+    // pat is the default; type a token.
     fireEvent.change(document.getElementById('repo-token') as HTMLInputElement, { target: { value: 'xyz' } })
     expect((document.getElementById('repo-token') as HTMLInputElement).value).toBe('xyz')
     // Switch to deploy_key → token field disappears AND the token value
