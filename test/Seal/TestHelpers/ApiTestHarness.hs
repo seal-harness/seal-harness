@@ -26,6 +26,9 @@ module Seal.TestHelpers.ApiTestHarness
   , getTranscript
   , assertTranscriptContains
   , setScript
+  , uemLabel
+  , ghEnvMarkerName
+  , readGhEnvMarker
     -- * Dummy repo
   , DummyRepoConfig (..)
   , DummyRepo (..)
@@ -47,10 +50,10 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Builder qualified as BSB
-import Data.Char (isSpace)
+import Data.Char (isAsciiLower, isAsciiUpper, isSpace)
 import Data.Foldable (toList)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (maybeToList)
+import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -104,6 +107,8 @@ import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
+import Seal.Tools.Exec.Types (ExecError)
+import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -115,16 +120,25 @@ data ApiTestEnv = ApiTestEnv
   { ateApp         :: Application
   , ateDeps        :: ApiDeps
   , atePaths       :: SealPaths
-  , ateMode        :: Text          -- "local" | "remote"
+  , ateMode        :: UntrustedExecMode
+    -- ^ Which untrusted executor wiring this environment uses. The test
+    -- body must NOT branch on this for assertions — both modes must assert
+    -- the same contract. It exists so fixtures can observe the executor's
+    -- own boundary (local: process env; remote: composed ssh command) and
+    -- so diagnostics can label output.
   , ateProviderRef :: IORef [CompletionResponse]
   , ateDummyRepo   :: Maybe DummyRepo
   , ateCapturedSshArgv :: Maybe (IORef [([String], Maybe ByteString)])
-    -- ^ Only set when the fake remote runner is enabled ('atoFakeRemoteRunner'
-    -- + remote mode). Records every ssh argv (+ optional stdin payload) the
-    -- session exec attempted, oldest-last. The LAST element of each argv is
-    -- the fully-composed remote command string — the observable contract of
-    -- the remote arm's command composition.
+    -- ^ Only set in remote mode with the fake remote runner
+    -- ('atoFakeRemoteRunner'). Records every ssh argv (+ optional stdin
+    -- payload) the session exec attempted, oldest-last. Diagnostics only —
+    -- the contract itself is asserted via the shared gh-env marker file.
   }
+
+-- | Human-readable label for a mode (diagnostics output only).
+uemLabel :: UntrustedExecMode -> Text
+uemLabel UemLocal  = "local"
+uemLabel UemRemote = "remote"
 
 -- | The PAT token seeded into the fake vault for @CredPat@ dummy repos.
 -- Tests assert this exact value reaches the composed untrusted command's
@@ -274,7 +288,7 @@ runApiTestLocal
 runApiTestLocal mRepoCfg opts body = it "local" $ do
   withSystemTempDirectory "seal-api-test" $ \tmp -> do
     mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-    env <- buildTestEnv tmp "local" mRepo opts
+    env <- buildTestEnv tmp UemLocal mRepo opts
     body env
 
 -- | Run the test body in remote mode only. Guards with 'pendingWith' when
@@ -286,9 +300,9 @@ runApiTestRemote
   -> SpecWith ()
 runApiTestRemote mRepoCfg opts body = it "remote" $ do
   let runBody = withSystemTempDirectory "seal-api-test" $ \tmp -> do
-        mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-        env <- buildTestEnv tmp "remote" mRepo opts
-        body env
+          mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
+          env <- buildTestEnv tmp UemRemote mRepo opts
+          body env
   keygenExe <- findExecutable "ssh-keygen"
   case keygenExe of
     Nothing -> pendingWith "ssh-keygen not available"
@@ -322,7 +336,7 @@ runApiTestRemote mRepoCfg opts body = it "remote" $ do
 -- ---------------------------------------------------------------------------
 
 buildTestEnv
-  :: FilePath -> Text -> Maybe DummyRepo -> ApiTestOptions
+  :: FilePath -> UntrustedExecMode -> Maybe DummyRepo -> ApiTestOptions
   -> IO ApiTestEnv
 buildTestEnv tmp mode mRepo opts = do
   let stateRoot  = tmp </> "state"
@@ -394,25 +408,28 @@ buildTestEnv tmp mode mRepo opts = do
   -- Security config: remote mode needs untrusted_execution.remote.
   -- Write it to security.toml so runTurnBody picks it up (the turn
   -- engine loads SecurityConfig from disk, not from ApiDeps).
-  currentUser <- if mode == "remote" then whoami else pure ""
+  currentUser <- if mode == UemRemote then whoami else pure ""
   let mKeyfilePath = mRepo >>= drKeyfilePath
-      secCfg = if mode == "remote"
+      secCfg = if mode == UemRemote
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
   saveSecurityConfig (securityFilePath paths) secCfg
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
-  -- Fake remote runner (remote mode + atoFakeRemoteRunner): a content-routed
-  -- recording fake standing in for the real SSH runner. It answers the
-  -- SETUP_REPO call sequence (idempotency check → clone → verify → workdir
-  -- scans) so the test never needs live gh/git on the SSH target, while
-  -- capturing every ssh argv for command-composition assertions.
-  mCaptureRef <- if mode == "remote" && atoFakeRemoteRunner opts
+  -- Fake remote runner (remote mode + atoFakeRemoteRunner): enforces the
+  -- same observable contract the local-mode gh shim does — the clone only
+  -- succeeds if GH_TOKEN/GIT_TERMINAL_PROMPT are scoped to the trailing
+  -- gh command of the composed remote string. Both fixtures append what
+  -- the gh invocation actually saw to the same marker file, so the test
+  -- body asserts one contract with no mode branching.
+  mCaptureRef <- if mode == UemRemote && atoFakeRemoteRunner opts
     then Just <$> newIORef []
     else pure Nothing
-  let mRunner = mkSetupRepoFakeRunner <$> mCaptureRef
-      sendDeps = SendDeps
+  mRunner <- case mCaptureRef of
+    Just ref -> Just <$> mkSetupRepoFakeRunner (spHome paths </> ghEnvMarkerName) ref
+    Nothing  -> pure Nothing
+  let sendDeps = SendDeps
         { sdPaths = paths
         , sdVault = rt
         , sdRepoReg = repoRegH
@@ -435,7 +452,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdAbortReg = testAbortReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
-        , sdIsRemote = mode == "remote"
+        , sdIsRemote = mode == UemRemote
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
         }
@@ -472,35 +489,120 @@ buildTestEnv tmp mode mRepo opts = do
     , ateCapturedSshArgv = mCaptureRef
     }
 
--- | A content-routed recording fake 'RemoteRunner'. Each invocation is
--- recorded as @(argv, mStdin)@ (oldest-last) into the given ref; the canned
--- response is chosen by inspecting the composed command string (the last
--- argv element), so the fake is order-independent and tolerant of extra
--- calls (the remote @mkdir -p@ bootstrap, workdir discovery scans):
+-- | The marker file (relative to the test's @spHome@) that BOTH gh-observer
+-- fixtures append to: the local shim records the process env it was given;
+-- the remote fake runner records the effective env of the trailing command
+-- of the composed remote string. Lines are @KEY='value'@.
+ghEnvMarkerName :: FilePath
+ghEnvMarkerName = "gh-invocation.env"
+
+-- | Read + parse a gh-env marker file into @[(key, value)]@. Errors with a
+-- clear message if the file is absent — for the PAT suite that is itself a
+-- contract failure (the gh invocation was never observed).
+readGhEnvMarker :: FilePath -> IO [(Text, Text)]
+readGhEnvMarker path = do
+  exists <- doesFileExist path
+  if not exists
+    then error ("readGhEnvMarker: no gh invocation was observed (missing " <> path <> ")")
+    else do
+      content <- readFileStrict path
+      pure [ (T.pack k, T.dropAround (== '\'') (T.pack v))
+           | l <- lines content
+           , not (null l)
+           , let (k, rest) = break (== '=') l
+           , not (null rest)
+           , let v = drop 1 rest
+           ]
+
+-- | A content-routed recording fake 'RemoteRunner' that enforces the PAT
+-- delivery contract by construction. Each invocation is recorded as
+-- @(argv, mStdin)@ (oldest-last); the canned response is chosen by
+-- inspecting the composed command string (the last argv element):
 --
 --   * contains @remote.origin.url@ → idempotency check → @__NONE__@ (empty
 --     workspace: no existing clone)
---   * contains @__OK__@            → clone verify → @__OK__@
---   * contains @clone@             → the clone itself → git-style stdout
+--   * contains @__OK__@            → clone verify → @__OK__@ IFF the clone
+--     call carried correctly-scoped credentials, else @__MISSING__@
+--   * is the @gh repo clone …@ call → parse the effective env of the
+--     TRAILING command of the composed string (POSIX scoping: an @env@
+--     prefix before @cd &&@ binds only to @cd@) and append what gh would
+--     actually see to the marker file. Wrong/missing token ⇒ the verify
+--     call fails, so SETUP_REPO reports a clone failure — exactly as a
+--     real remote host would reject the unauthenticated clone.
 --   * anything else                → empty success (bootstrap/scans)
-mkSetupRepoFakeRunner :: IORef [([String], Maybe ByteString)] -> RemoteRunner
-mkSetupRepoFakeRunner ref = RemoteRunner
-  { runRemote      = (`record` Nothing)
-  , runRemoteStdin = \argv stdin -> record argv (Just stdin)
-  , runRemoteEnv   = \_env argv -> record argv Nothing
-  }
+mkSetupRepoFakeRunner
+  :: FilePath                                -- ^ marker file to append to
+  -> IORef [([String], Maybe ByteString)]    -- ^ captured argvs
+  -> IO RemoteRunner
+mkSetupRepoFakeRunner markerPath ref = do
+  cloneCredOkRef <- newIORef False
+  let record argv mStdin = case reverse argv of
+        (cmd : _) -> do
+          modifyIORef' ref (++ [(argv, mStdin)])
+          respondGhFake markerPath cloneCredOkRef cmd
+        [] -> pure (Right "")
+  pure RemoteRunner
+    { runRemote      = (`record` Nothing)
+    , runRemoteStdin = \argv stdin -> record argv (Just stdin)
+    , runRemoteEnv   = \_env argv -> record argv Nothing
+    }
+
+-- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').
+respondGhFake
+  :: FilePath -> IORef Bool -> String -> IO (Either ExecError Text)
+respondGhFake markerPath cloneCredOkRef cmdStr = do
+  let cmd = T.pack cmdStr
+  case () of
+    _ | "remote.origin.url" `T.isInfixOf` cmd -> pure (Right "__NONE__\n")
+      | "__OK__" `T.isInfixOf` cmd -> do
+          ok <- readIORef cloneCredOkRef
+          pure (Right (if ok then "__OK__\n" else "__MISSING__\n"))
+      | otherwise -> case parseGhCloneCmd cmd of
+          Nothing -> pure (Right "")  -- bootstrap / discovery scans
+          Just (url, effEnv) -> do
+            appendFile markerPath (ghMarkerLines url effEnv)
+            writeIORef cloneCredOkRef (ghCredsOk effEnv)
+            pure (Right "Cloning into 'seal-test'...\n")
+
+ghCredsOk :: [(Text, Text)] -> Bool
+ghCredsOk effEnv =
+  lookup "GH_TOKEN" effEnv == Just testPatToken
+  && lookup "GIT_TERMINAL_PROMPT" effEnv == Just "0"
+
+-- | Parse a composed remote command of the shape
+-- @cd '<ws>' && env K='V' … gh repo clone '<url>' '<dest>' -- --depth 1@
+-- (the POST-fix form) into the token-free URL and the env visible to the
+-- TRAILING command. Returns 'Nothing' when the trailing command is not an
+-- env-prefixed gh clone — including the BUGGY pre-fix form where the env
+-- prefix sits BEFORE the @cd@ and therefore binds nothing for gh.
+parseGhCloneCmd :: Text -> Maybe (Text, [(Text, Text)])
+parseGhCloneCmd cmd = case reverse (T.splitOn " && " cmd) of
+  [] -> Nothing
+  (final : _) -> do
+    afterEnv <- T.stripPrefix "env " final
+    let ws = T.words afterEnv
+        (assigns, rest) = span isAssign ws
+        effEnv = mapMaybe parseAssign assigns
+        trailing = T.unwords rest
+    url <- T.stripPrefix "gh repo clone '" trailing
+    pure (T.takeWhile (/= '\x27') url, effEnv)
   where
-    record argv mStdin = do
-      modifyIORef' ref (++ [(argv, mStdin)])
-      let cmd = case reverse argv of
-            (c : _) -> c
-            []      -> ""
-      pure (Right (T.pack (cannedFor cmd)))
-    cannedFor cmd
-      | "remote.origin.url" `isInfixOfStr` cmd = "__NONE__\n"
-      | "__OK__" `isInfixOfStr` cmd            = "__OK__\n"
-      | "clone" `isInfixOfStr` cmd             = "Cloning into 'test-repo'...\n"
-      | otherwise                              = ""
+    isAssign w = case T.uncons w of
+      Just (c, _) -> c /= '\x27' && T.any (== '=') w && "=" `T.isPrefixOf` T.dropWhile isNameChar w
+      Nothing     -> False
+    isNameChar c = isAsciiLower c || isAsciiUpper c || c == '_'
+    parseAssign w = case T.breakOn "=" w of
+      (k, v) | not (T.null k), "='" `T.isPrefixOf` v ->
+        Just (k, T.takeWhile (/= '\x27') (T.drop 2 v))
+      _ -> Nothing
+
+-- | The marker lines recording what the gh invocation saw.
+ghMarkerLines :: Text -> [(Text, Text)] -> String
+ghMarkerLines url effEnv = T.unpack (T.concat
+  [ "URL='" <> url <> "'\n"
+  , "GH_TOKEN='" <> fromMaybe "" (lookup "GH_TOKEN" effEnv) <> "'\n"
+  , "GIT_TERMINAL_PROMPT='" <> fromMaybe "" (lookup "GIT_TERMINAL_PROMPT" effEnv) <> "'\n"
+  ])
 
 -- | Build a SecurityConfig for remote mode (SSH to localhost).
 -- The identity (private key) must be set so sshExecArgv passes @-i <key>@.

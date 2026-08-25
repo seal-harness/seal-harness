@@ -6,22 +6,18 @@
 --
 -- Also hosts the PAT @SETUP_REPO@ integration suite: a repo registered with
 -- a @CredPat@ credential must clone via the web combo-box endpoint in BOTH
--- executors, with @GH_TOKEN@ delivered to the @gh@ process. The two arms
--- deliver env differently (local: 'System.Process' env field; remote: the
--- @env@ prefix baked into the composed ssh command), so each leg observes
--- the contract at its own boundary:
---
---   * __local__ — a @gh@ shim prepended to @PATH@ fails (exit 99) unless
---     @GH_TOKEN@ reaches the process env. Clone success proves delivery.
---   * __remote__ — the recording fake runner captures the fully-composed
---     ssh command; assertions pin @GH_TOKEN@/@GIT_TERMINAL_PROMPT@ into the
---     @env@ prefix positioned AFTER the @cd … &&@ (scoped to the @gh@
---     command, not to @cd@).
+-- executors, with @GH_TOKEN@ delivered to the @gh@ command itself. The two
+-- arms deliver env differently (local: 'System.Process' env field; remote:
+-- the @env@ prefix baked into the composed ssh command), but the test body
+-- is mode-agnostic: each arm's gh-observer fixture records what the
+-- invocation actually saw into a shared marker file, and identical
+-- assertions check it.
 --
 -- The remote leg needs no live SSH host, gh, or network — it pends only on
 -- missing tooling prerequisites, like the deploy-key suite.
 module Seal.Gateway.ApiIntegrationSpec (spec) where
 
+import Control.Exception (bracket)
 import Control.Monad (unless)
 import Data.Aeson (object, (.=))
 import Data.IORef (readIORef)
@@ -37,7 +33,6 @@ import System.FilePath (takeDirectory, (</>))
 import System.Process (readCreateProcessWithExitCode, proc)
 import Test.Hspec
 
-import Seal.ISA.Ops.Repo (sanitizeRepoName)
 import Seal.Providers.Class
   ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.Config.Paths (SealPaths (..))
@@ -75,7 +70,7 @@ deployKeySpec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
           -- ── Environment diagnostics ──
           putStrLn ""
           putStrLn "═══════════════════════════════════════════════════"
-          putStrLn ("MODE: " <> T.unpack (ateMode env))
+          putStrLn ("MODE: " <> T.unpack (uemLabel (ateMode env)))
           putStrLn ("BARE REPO: " <> drBareRepoPath dr)
           putStrLn ("KEYFILE: " <> fromMaybe "<none>" (drKeyfilePath dr))
           -- Check the keyfile exists.
@@ -172,10 +167,14 @@ deployKeySpec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
 -- combo-box endpoint (@POST /api/sessions/:id/setup-repo@ — the exact path
 -- that failed in session 20260824-173939-096) in both modes.
 --
--- The contract under test: the clone command the executor runs is
+-- The contract under test: the @gh@ invocation each executor runs is
 -- @gh repo clone '<url>' '<dest>' -- --depth 1@ carrying
 -- @GH_TOKEN=<testPatToken>@ and @GIT_TERMINAL_PROMPT=0@ scoped to the @gh@
--- process. Each arm observes it at its own boundary (see module header).
+-- command itself. The body is mode-agnostic: whichever executor is wired,
+-- its gh-observer fixture (local: the shim; remote: the fake runner)
+-- appends what the invocation actually saw to the shared marker file, and
+-- the same assertions check it. A lost or mis-scoped @GH_TOKEN@ fails the
+-- clone in BOTH modes.
 patSetupRepoSpec :: Spec
 patSetupRepoSpec =
   describe "Seal.Gateway.ApiIntegration (PAT SETUP_REPO)" $
@@ -192,107 +191,97 @@ patTestBody env = case ateDummyRepo env of
   Nothing -> expectationFailure "expected dummy repo"
   Just dr -> do
     let url = srUrl (drRepo dr)
-        dest = sanitizeRepoName url
-        mode = ateMode env
+        markerPath = spHome (atePaths env) </> ghEnvMarkerName
     putStrLn ""
-    putStrLn ("═══ PAT SETUP_REPO [" <> T.unpack mode <> "] url=" <> T.unpack url)
+    putStrLn (  "═══ PAT SETUP_REPO ["
+             <> T.unpack (uemLabel (ateMode env)) <> "] url=" <> T.unpack url)
 
     sid <- callApiNewTab env "ollama" "llama3.2"
 
-    -- Local arm only: shadow `gh` with a shim that fails unless GH_TOKEN
-    -- reaches the gh PROCESS env. This makes the local executor hermetic
-    -- (no real gh/network) while still proving token delivery end-to-end.
-    restorePath <- case mode of
-      "local" -> Just <$> installGhShim env
-      _       -> pure Nothing
+    -- The gh-observer fixture makes the executor hermetic AND observable:
+    -- locally the shim stands in for gh and records its process env;
+    -- remotely the fake runner parses the effective env of the composed
+    -- command. Installing the observer is mode-agnostic — in remote mode
+    -- no local gh ever spawns, so the shim simply sits unused.
+    withGhObserver env $ do
+      (st, body) <- callSetupRepoRaw env sid url
+      putStrLn ("SETUP-REPO STATUS: " <> show st)
+      putStrLn ("SETUP-REPO BODY: " <> show body)
 
-    (st, body) <- callSetupRepoRaw env sid url
-    putStrLn ("SETUP-REPO STATUS: " <> show st)
-    putStrLn ("SETUP-REPO BODY: " <> show body)
+      -- Diagnostics: dump the transcript + (remote only) the captured ssh
+      -- commands, mirroring the deploy-key suite's style.
+      entries <- getTranscript env sid
+      putStrLn ("TRANSCRIPT ENTRIES: " <> show (length entries))
+      mapM_ (\e -> putStrLn ("  ENTRY: " <> show e)) entries
+      case ateCapturedSshArgv env of
+        Nothing  -> pure ()
+        Just ref -> do
+          calls <- readIORef ref
+          putStrLn ("CAPTURED SSH CALLS: " <> show (length calls))
+          mapM_ (\(argv, _) ->
+                  unless (null argv) (putStrLn ("  CMD: " <> last argv)))
+                calls
 
-    case mode of
-      "remote" -> assertRemoteComposedCommand env url dest
-      _        -> pure ()
-    restorePathIfInstalled restorePath
+      -- ── The contract (identical in both modes) ────────────────────────
+      -- 1. The clone succeeded. Both fixtures fail the clone when the
+      --    credential env is missing or scoped to something other than the
+      --    gh command.
+      st `shouldBe` 200
+      assertTranscriptContains env sid "\"cloned\""
+      -- 2. What gh ACTUALLY saw: the right URL, and the credential env
+      --    bound to its own invocation — not to an earlier command.
+      observed <- readGhEnvMarker markerPath
+      lookup "URL" observed `shouldBe` Just url
+      lookup "GH_TOKEN" observed `shouldBe` Just testPatToken
+      lookup "GIT_TERMINAL_PROMPT" observed `shouldBe` Just "0"
 
-    -- Dump the transcript (mirrors the deploy-key suite's diagnostics).
-    entries <- getTranscript env sid
-    putStrLn ("TRANSCRIPT ENTRIES: " <> show (length entries))
-    mapM_ (\e -> putStrLn ("  ENTRY: " <> show e)) entries
-
-    -- Both modes: the clone must succeed (the shim/runner make failure the
-    -- signature of a lost or mis-scoped GH_TOKEN). The transcript API
-    -- surfaces SETUP_REPO as a harness entry whose payload carries
-    -- result.status = "cloned".
-    st `shouldBe` 200
-    assertTranscriptContains env sid "\"cloned\""
-
--- | Remote-leg assertions over the recorded ssh argvs. The composed command
--- for the clone call must carry the credential env AFTER the @cd … &&@ so it
--- scopes to the @gh@ command — not to @cd@.
-assertRemoteComposedCommand :: ApiTestEnv -> Text -> Text -> IO ()
-assertRemoteComposedCommand env url dest = case ateCapturedSshArgv env of
-  Nothing -> expectationFailure
-    "expected captured ssh argvs (the fake remote runner must be enabled)"
-  Just ref -> do
-    calls <- readIORef ref
-    let cmds = [ T.pack c | (argv, _) <- calls
-               , not (null argv)
-               , let c = last argv ]
-        cloneCmds = filter ("gh repo clone" `T.isInfixOf`) cmds
-    putStrLn ("CAPTURED SSH CALLS: " <> show (length calls))
-    mapM_ (\c -> putStrLn ("  CMD: " <> T.unpack c)) cmds
-    case cloneCmds of
-      [cmd] -> do
-        -- The full gh invocation skeleton, with the token-free https URL.
-        ("gh repo clone '" <> url <> "' '" <> dest <> "' -- --depth 1")
-          `T.isInfixOf` cmd `shouldBe` True
-        -- THE BUG: the env prefix used to lead the whole command
-        -- (`env K=V cd … && gh …`), scoping GH_TOKEN to cd. It must come
-        -- after the `cd <ws> &&` instead.
-        T.isPrefixOf "cd '" cmd `shouldBe` True
-        ("&& env GH_TOKEN='" <> testPatToken <> "'") `T.isInfixOf` cmd
-          `shouldBe` True
-        -- GIT_TERMINAL_PROMPT=0 rides the same prefix, adjacent to gh.
-        "GIT_TERMINAL_PROMPT='0' gh repo clone" `T.isInfixOf` cmd
-          `shouldBe` True
-      _ -> expectationFailure
-        ("expected exactly one gh clone call in captured argvs, got: "
-         <> show (length cloneCmds))
-
--- | Write a minimal @gh@ shim into the test's tmp dir and prepend its dir
--- to @PATH@. The shim succeeds ONLY when @GH_TOKEN@ matches 'testPatToken',
--- and materializes a bare @.git@ dir at the destination so 'verifyClone'
--- passes. Returns the previous @PATH@ (or 'Nothing' if unset) for
--- 'restorePathIfInstalled'.
-installGhShim :: ApiTestEnv -> IO (Maybe String)
-installGhShim env = do
-  let shimDir = spHome (atePaths env) </> "shim"
-      shimPath = shimDir </> "gh"
-  createDirectoryIfMissing True shimDir
-  writeFile shimPath (T.unpack (ghShimScript testPatToken))
-  setFileMode shimPath 0o755
-  origPath <- lookupEnv "PATH"
-  setEnv "PATH" (maybe shimDir (\p -> shimDir <> ":" <> p) origPath)
-  pure origPath
-
-restorePathIfInstalled :: Maybe (Maybe String) -> IO ()
-restorePathIfInstalled mRestore = case mRestore of
-  Nothing     -> pure ()
-  Just mOld   -> case mOld of
-    Just p  -> setEnv "PATH" p
-    Nothing -> setEnv "PATH" "/usr/bin:/bin"
+-- | Install the gh-observer fixture for the duration of the action and
+-- restore @PATH@ afterwards. Writes a minimal @gh@ shim into the test's
+-- tmp dir and prepends it to @PATH@; the shim records its invocation
+-- (URL + the GH_TOKEN / GIT_TERMINAL_PROMPT it received) into the shared
+-- marker file, then fails closed unless the credentials are correct and
+-- materializes a bare @.git@ dir so 'Seal.ISA.Ops.Repo.verifyClone' passes.
+withGhObserver :: ApiTestEnv -> IO a -> IO a
+withGhObserver env action = bracket install uninstall (const action)
+  where
+    shimDir   = spHome (atePaths env) </> "shim"
+    shimPath  = shimDir </> "gh"
+    markerPath = spHome (atePaths env) </> ghEnvMarkerName
+    install = do
+      createDirectoryIfMissing True shimDir
+      writeFile shimPath (T.unpack (ghShimScript testPatToken))
+      setFileMode shimPath 0o755
+      origPath <- lookupEnv "PATH"
+      setEnv "PATH" (maybe shimDir (\p -> shimDir <> ":" <> p) origPath)
+      setEnv "SEAL_TEST_GH_MARKER" markerPath
+      pure origPath
+    uninstall origPath = case origPath of
+      Just p  -> setEnv "PATH" p
+      Nothing -> setEnv "PATH" "/usr/bin:/bin"
 
 -- | The @gh@ stand-in. Usage shape it accepts:
--- @gh repo clone \<url\> \<dest\> [-- ...]@ — @$4@ is the destination.
+-- @gh repo clone \<url\> \<dest\> [-- ...]@ — @$3@ is the URL, @$4@ the
+-- destination. Fails closed (exit 99) when the credential env did not
+-- reach this process, and exit 98 on an unexpected argv shape.
 ghShimScript :: Text -> Text
 ghShimScript expectedToken = T.unlines
   [ "#!/bin/sh"
-  , "# seal-test gh shim: fail closed unless GH_TOKEN reaches this process."
-  , "if [ \"$GH_TOKEN\" != \"" <> expectedToken <> "\" ]; then"
-  , "  echo \"gh-shim: GH_TOKEN not delivered to process env\" >&2"
+  , "# seal-test gh shim: record what we were invoked with, then fail"
+  , "# closed unless the credential env reached this process."
+  , "{"
+  , "  echo \"URL='$3'\""
+  , "  echo \"GH_TOKEN='$GH_TOKEN'\""
+  , "  echo \"GIT_TERMINAL_PROMPT='$GIT_TERMINAL_PROMPT'\""
+  , "} >> \"$SEAL_TEST_GH_MARKER\""
+  , "if [ \"$GH_TOKEN\" != \"" <> expectedToken <> "\" ] ||"
+  , "   [ \"$GIT_TERMINAL_PROMPT\" != \"0\" ]; then"
+  , "  echo \"gh-shim: credential env not delivered to gh process\" >&2"
   , "  exit 99"
   , "fi"
+  , "[ \"$1\" = \"repo\" ] && [ \"$2\" = \"clone\" ] || {"
+  , "  echo \"gh-shim: unexpected argv shape\" >&2"
+  , "  exit 98"
+  , "}"
   , "# gh repo clone <url> <dest> [-- --depth 1] — $4 is <dest>."
   , "mkdir -p \"$4/.git/objects\" || exit 1"
   , "echo \"Cloning into '$4'...\""
