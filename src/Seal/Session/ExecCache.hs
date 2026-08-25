@@ -155,7 +155,7 @@ cachedWorkdirScan cache sid fs wsRoot mMetaEnv = do
           -- reads may switch lanes to local snapshots.
           fs' <- case mMetaEnv of
             Nothing   -> pure fs
-            Just env  -> buildRoutingWorkdirFs env fs (snapTopDirs snap)
+            Just env  -> buildRoutingWorkdirFs env fs rootText (snapTopDirs snap)
           defs <- listWorkdirAgentDefsSnap snap fs'
           skills <- listWorkdirSkillsSnap snap fs'
           modifyIORef' (sceScans cache)

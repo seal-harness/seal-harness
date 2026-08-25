@@ -328,7 +328,7 @@ wiringSpec = describe "Seal.Session.AgentMetaCache (discovery wiring)" $ do
               writeFile (dest </> "agents.md") "# local snapshot"
               pure (Right ())
             env = MetaCacheEnv runner sshCfg cacheRoot runTransfer
-        fs' <- buildRoutingWorkdirFs env remoteFs ["my-repo"]
+        fs' <- buildRoutingWorkdirFs env remoteFs "/srv/workspace" ["my-repo"]
         -- Under the prefix: served LOCALLY (snapshot bytes, not "REMOTE").
         rLocal <- wfsReadFile fs' =<< either (const (error "fixture")) pure
                     (mkRemotePath "my-repo/.agents/agents.md")

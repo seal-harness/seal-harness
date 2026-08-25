@@ -47,8 +47,8 @@ module Seal.Session.AgentMetaCache
   ) where
 
 import Control.Exception (IOException, try)
-import Control.Monad (forM)
 import Data.Either (fromRight)
+import Data.Maybe (isNothing)
 import Data.List (sortOn)
 import Data.Ord (Down (..))
 import Data.Text (Text)
@@ -73,6 +73,8 @@ import System.Process
 import Katip qualified as K
 
 import Seal.Config.Paths (SealPaths (..))
+import Control.Monad (forM, when)
+
 import Seal.Logging.Global (globalLogIO)
 import Seal.Security.Crypto (sha256Hash)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -86,6 +88,12 @@ import Seal.Tools.Exec.Types
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), WorkdirFsErr (..), mkLocalWorkdirFs
   )
+
+-- | Debug-level logging for the agent-metadata cache. Routed through the
+-- global logger so --log-level debug surfaces every gate: routing
+-- decisions, probe results, cache hits/misses, and fallback reasons.
+amcLog :: Text -> IO ()
+amcLog msg = globalLogIO K.DebugS (K.ls ("[agent-meta] " <> msg))
 
 -- | The fixed remote probe command for a repo dir's @.agents/@ content
 -- hash. Anchored with @cd@ (single-quoted — the path is SafePath-derived,
@@ -260,15 +268,23 @@ ensureAgentMetaSnapshot runner cfg cacheRoot normalizedUrl repoDir runTransfer =
         let entry = cacheRoot </> T.unpack (agentMetaCacheKey normalizedUrl contentHash)
         hit <- doesFileExist (entry </> metaFileName)
         if hit
-          then pure (MetaSnapshot entry)   -- content-addressed cache hit: no transfer
-          else transferAndPublish entry contentHash
+          then do
+            amcLog ("snapshot: cache HIT " <> T.pack entry)
+            pure (MetaSnapshot entry)   -- content-addressed cache hit: no transfer
+          else do
+            amcLog ("snapshot: cache MISS, transferring " <> T.pack entry)
+            transferAndPublish entry contentHash
   pure (fromRight MetaFallback r)
   where
     runProbe = case mkShellCommand (agentMetaProbeCmd repoDir) of
       Left _    -> pure Nothing   -- unreachable: internally-built, no NULs
       Right cmd -> do
         eRes <- runRemoteShell runner cfg cmd
-        pure $ either (const Nothing) parseProbeHash eRes
+        let mh = either (const Nothing) parseProbeHash eRes
+        when (isNothing mh) $
+          amcLog ("snapshot: content-hash probe failed for " <> T.pack repoDir
+                  <> " raw=" <> either (T.pack . show) id eRes)
+        pure mh
 
     transferAndPublish entry contentHash = do
       createDirectoryIfMissing True cacheRoot
@@ -279,6 +295,8 @@ ensureAgentMetaSnapshot runner cfg cacheRoot normalizedUrl repoDir runTransfer =
       xfer <- runTransfer (agentMetaTransferArgv cfg repoDir tmp) tmp
       case xfer of
         Left _ -> do
+          amcLog ("snapshot: rsync failed for " <> T.pack repoDir
+                  <> " — see [agent-meta rsync] line above if present")
           _ <- try @IOException (removeDirectoryRecursive tmp)
           pure MetaFallback
         Right () -> do
@@ -372,24 +390,40 @@ metaReadCeilingBytes = 131072
 buildRoutingWorkdirFs
   :: MetaCacheEnv          -- ^ probe/transfer deps
   -> WorkdirFs             -- ^ underlying (remote) fs
+  -> Text                  -- ^ the SESSION WORKDIR absolute path (the scan's
+                           -- own anchor — NOT the ssh workspace; sessions nest
+                           -- at <workspace>/workdirs/<sid>/)
   -> [Text]                -- ^ candidate repo top-dir names from wfsSnapshot
   -> IO WorkdirFs
-buildRoutingWorkdirFs env underlying topDirs = do
+buildRoutingWorkdirFs env underlying wsRootAbs topDirs = do
+  amcLog ("routing: session-workdir=" <> wsRootAbs
+          <> " candidates=" <> T.pack (show topDirs))
   routes <- concat <$> mapM routeOne topDirs
+  if null routes
+    then amcLog "routing: no routes established (all repos fell back)"
+    else amcLog ("routing: " <> T.pack (show (map fst routes)))
   pure (applyRoutes routes underlying)
   where
-    workspaceAbs = T.unpack (getRemotePath (scWorkspace (mceSshCfg env)))
     routeOne topDir = do
-      let repoDirAbs = workspaceAbs </> T.unpack topDir
+      let repoDirAbs = T.unpack wsRootAbs </> T.unpack topDir
       mUrl <- probeUrl repoDirAbs
       case mUrl of
-        Nothing -> pure []
+        Nothing -> do
+          amcLog ("routing: url probe failed for " <> topDir
+                  <> " — falling back to legacy reads")
+          pure []
         Just url -> do
+          amcLog ("routing: url=" <> url <> " repo=" <> T.pack repoDirAbs)
           outcome <- ensureAgentMetaSnapshot (mceRunner env) (mceSshCfg env)
                        (mceCacheRoot env) url repoDirAbs (mceRunTransfer env)
-          pure $ case outcome of
-            MetaSnapshot dir -> [(topDir <> "/.agents", dir)]
-            MetaFallback     -> []
+          case outcome of
+            MetaSnapshot dir -> do
+              amcLog ("routing: snapshot OK for " <> T.pack repoDirAbs)
+              pure [(topDir <> "/.agents", dir)]
+            MetaFallback -> do
+              amcLog ("routing: snapshot failed for " <> T.pack repoDirAbs
+                      <> " — falling back to legacy reads")
+              pure []
     probeUrl rd = case mkShellCommand (probeRepoUrlCmd rd) of
       Left _    -> pure Nothing   -- unreachable: internally built, no NULs
       Right cmd -> do

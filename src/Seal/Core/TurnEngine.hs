@@ -65,8 +65,10 @@ import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
    sessionDir,
    sessionLogPath, sessionRequestsPath, sshAgentsDir)
+import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Paging (defaultPageParams)
@@ -510,21 +512,39 @@ runSessionTurn td adapter meta mSrc t = do
 -- wiring can't support it (local mode, remote unconfigured, tests with no
 -- runner). Remote-only by design: in local mode the workdir IS local, so
 -- the per-file crawl has no SSH round trips to amortize.
+-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+-- wiring can't support it (local mode, remote unconfigured/incomplete,
+-- security-config load failure). Remote-only by design: in local mode the
+-- workdir IS local, so the per-file crawl has no SSH round trips to
+-- amortize. Logs its decision at debug so fallbacks are diagnosable.
 metaCacheEnvFor
-  :: TurnDeps -> SealPaths -> Either Text SecurityConfig -> Maybe MetaCacheEnv
-metaCacheEnvFor td paths eSecCfg =
-  case (tdIsRemote td, eSecCfg) of
-    (True, Right secCfg) ->
-      case untrustedExecConfigFromSecurity secCfg of
-        Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
-          Just MetaCacheEnv
-            { mceRunner    = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
-            , mceSshCfg    = sshCfg
-            , mceCacheRoot = agentMetaCacheDir paths
-            , mceRunTransfer = rsyncTransferIO sshCfg
-            }
+  :: TurnDeps -> SealPaths -> Either Text SecurityConfig
+  -> IO (Maybe MetaCacheEnv)
+metaCacheEnvFor td paths eSecCfg = do
+  let mEnv = case (tdIsRemote td, eSecCfg) of
+        (True, Right secCfg) ->
+          case untrustedExecConfigFromSecurity secCfg of
+            Just (UntrustedExecConfig UemRemote (Just sshCfg)) -> Just MetaCacheEnv
+              { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+              , mceSshCfg       = sshCfg
+              , mceCacheRoot    = agentMetaCacheDir paths
+              , mceRunTransfer  = rsyncTransferIO sshCfg
+              }
+            _ -> Nothing
         _ -> Nothing
-    _ -> Nothing
+      reason = case mEnv of
+        Just _  -> "Just (snapshot routing active)"
+        Nothing -> case (tdIsRemote td, eSecCfg) of
+          (False, _) -> "Nothing (local mode)"
+          (_, Left err) ->
+            "Nothing (security config load failed: " ++ T.unpack err ++ ")"
+          (_, Right secCfg) ->
+            case untrustedExecConfigFromSecurity secCfg of
+              Just uec | uecMode uec == UemRemote ->
+                "Nothing (mode=remote but ssh config missing/incomplete)"
+              _ -> "Nothing (mode is not remote)"
+  globalLogIO K2.DebugS (K2.ls (T.pack ("[agent-meta] env=" <> reason)))
+  pure mEnv
 
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
@@ -546,7 +566,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   -- [engine] One discovery scan per session (cache-backed): the result
   -- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn
   -- costs zero extra scans after the first (or after SETUP_REPO).
-  let metaEnv = metaCacheEnvFor td paths eSecCfg
+  metaEnv <- metaCacheEnvFor td paths eSecCfg
   (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
   workdirSkills <- Skill.staticSkillBackend workdirSkillsList
   workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
@@ -778,8 +798,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
-    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
-                         (metaCacheEnvFor td paths eSecCfg)
+    metaEnv <- metaCacheEnvFor td paths eSecCfg
+    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
     workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (tdBaseBackends td)
@@ -801,8 +821,9 @@ callDispatcher td caps sid channelLabel callOpName val = do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               invalidateWorkdirScan (tdExecCache td) sid
+              freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
-                cachedWorkdirScan (tdExecCache td) sid wfs wsRoot (metaCacheEnvFor td paths eSecCfg)
+                cachedWorkdirScan (tdExecCache td) sid wfs wsRoot freshMetaEnv
               autoBindRepoAgentWith freshDefs paths sid
               -- Record a preamble entry (System Prompt + Tools) now that
               -- the workdir is set up and the agent is bound. This makes
