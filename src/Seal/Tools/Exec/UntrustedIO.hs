@@ -549,9 +549,11 @@ logExecDebug tag argv mCwd extras =
       <> envPart
       <> cwdPart
       <> [ unwords (map shellQuoteArgv argv) ]
-    -- Debug logs show the real env values (including secrets like GH_TOKEN).
-    -- The harness machine is trusted and these logs are for debugging only.
-    envPart = case extras of
+    -- Secret values NEVER reach the log: 'redactEnv' replaces the values
+    -- of 'secretEnvKeys' with <redacted> before rendering. Non-secret
+    -- keys (SSH_AUTH_SOCK, GIT_TERMINAL_PROMPT, ...) pass through so
+    -- operators can still diagnose credential-injection plumbing.
+    envPart = case redactEnv extras of
       [] -> []
       xs -> [ unwords (map (\(k, v) -> k <> "=" <> v) xs) ]
     cwdPart = case mCwd of
