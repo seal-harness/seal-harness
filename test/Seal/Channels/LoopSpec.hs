@@ -210,6 +210,25 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           T.unlines bodies `shouldSatisfy` ("say hi warmly" `T.isInfixOf`)
 
   describe "buildChannelRegistry" $ do
+    -- A stub ProviderRuntime + SealPaths + sid IORef for the
+    -- buildChannelRegistry tests. The model spec is constructed but never
+    -- run here (these tests assert skill/call/bg shadowing + non-collision),
+    -- so the provider/paths can be stubs — only the spec *names* matter.
+    let stubPr :: ProviderRuntime
+        stubPr = ProviderRuntime
+          { prConfigPath = "/tmp/seal-buildChannelRegistry-test-config.toml"
+          , prVault = VaultRuntime
+              { vrPaths = error "stub"
+              , vrConfigPath = "/tmp/seal-buildChannelRegistry-test-config.toml"
+              , vrHandleRef = error "stub"
+              }
+          , prManager = error "stub"
+          , prCallCounter = error "stub"
+          }
+        stubPaths :: SealPaths
+        stubPaths = SealPaths
+          { spHome = "/tmp", spState = "/tmp", spConfig = "/tmp"
+          , spKeys = "/tmp", spCache = "/tmp" }
     -- Regression guard for the /skill load shadowing bug. Under @seal serve@,
     -- the web gateway's registry is passed to runChannelLoop, and it contains
     -- a skillCommandSpec + callCommandSpec bound to webCallDispatcher (which
@@ -238,12 +257,13 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
             pure (Right (OpResult [TrpText "channel"] False (object [])))
           bgRunner = BgRunner (\_prompt -> pure ())
       skillBackend <- noneBackend
+      sidRef <- newIORef (case mkSessionId "buildChannelRegistry-skill-shadow" of Right s -> s; Left _ -> error "bad sid")
       let baseRegistry :: Registry
           baseRegistry = mkRegistry
             [ skillCommandSpec skillBackend webDispatcher
             , stubSpec "ping"
             ]
-          channelReg = buildChannelRegistry skillBackend bgRunner chanDispatcher baseRegistry
+          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef baseRegistry
       -- The channel registry must have exactly one "skill" spec (the channel
       -- one), not two.
       let skillSpecs = [ s | s <- registrySpecs channelReg, csName s == CommandName "skill" ]
@@ -269,8 +289,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           chanDispatcher _opName _val = pure (Right (OpResult [] False (object [])))
           bgRunner = BgRunner (\_prompt -> pure ())
       skillBackend <- noneBackend
+      sidRef <- newIORef (case mkSessionId "buildChannelRegistry-preserve" of Right s -> s; Left _ -> error "bad sid")
       let baseRegistry = mkRegistry [ stubSpec "ping", stubSpec "vault" ]
-          channelReg = buildChannelRegistry skillBackend bgRunner chanDispatcher baseRegistry
+          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef baseRegistry
           names = [ n | CommandName n <- map csName (registrySpecs channelReg) ]
       -- ping + vault preserved, plus bg + call + skill appended.
       "ping" `elem` names `shouldBe` True

@@ -19,7 +19,7 @@ module Seal.Command.Registry
 
 import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Command.Agent (agentCommandSpec)
-import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Model (ModelTranscriptWriter, modelCommandSpec)
 import Seal.Command.Provider (ProviderRuntime, providerCommandSpec)
 import Seal.Command.Repo (RepoTestSeam, repoCommandSpec)
 import Seal.Command.Session (sessionCommandSpec)
@@ -69,6 +69,10 @@ data CoreCommandDeps = CoreCommandDeps
     -- ^ Writes the stop message to the session's transcript + broadcasts
     -- it so the stop appears cross-channel. Built at the wiring site from
     -- 'SealPaths' + the broker.
+  , ccdModelWriter :: ModelTranscriptWriter
+    -- ^ Writes the /model use confirmation to the session's transcript +
+    -- broadcasts it (twin of 'ccdStopWriter'). Built at the wiring site
+    -- from 'SealPaths' + the broker.
   , ccdRepoReg     :: RepoRegistryHandle
     -- ^ For @\/repo@ (list/add/remove/info/test).
   , ccdRepoSeam    :: Maybe RepoTestSeam
@@ -102,7 +106,7 @@ coreCommandSpecs d =
   [ vaultCommandSpec (ccdVault d)
   , providerCommandSpec (ccdProvider d)
   , sessionCommandSpec (ccdSession d)
-  , modelCommandSpec (ccdProvider d) (ccdSession d)
+  , modelCommandSpec (ccdProvider d) (ccdSession d) (ccdModelWriter d)
   , agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)
   , tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)
   , stopCommandSpec (ccdAbortReg d) (ccdSession d) (ccdStopWriter d)

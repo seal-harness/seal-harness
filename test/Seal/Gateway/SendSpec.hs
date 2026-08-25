@@ -20,6 +20,8 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import Options.Applicative qualified as Opt
+import Options.Applicative (ParserResult (..))
 import Test.Hspec
 
 import Seal.Agent.Def.Types (AgentDefId, mkAgentDefId)
@@ -45,7 +47,7 @@ import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
-import Seal.Command.Spec (mkRegistry)
+import Seal.Command.Spec (CommandSpec (..), mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
@@ -705,3 +707,26 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             (t : _) -> t `shouldSatisfy` ("stopped" `T.isInfixOf`)
             []      -> expectationFailure "last assistant message has no text"
           []      -> expectationFailure "no assistant message in the transcript — /stop did not write to the transcript"
+
+    it "/stop -h renders full help (regression: stopParserInfo must include helper)" $ do
+      -- On main, stopParserInfo omitted optparse's `helper`, so /stop -h
+      -- printed "Invalid option '--help'". With the fix, -h/--help renders
+      -- the full help (Usage + description + the -h,--help line).
+      let targetSid = mkSid "20260825-120000-stop-help"
+      let stopSpec = stopCommandSpecForSession undefined targetSid noStopTranscriptWriter
+          -- undefined SessionAbortRegistry is never forced: -h short-circuits
+          -- to help before the action runs.
+      case Opt.execParserPure Opt.defaultPrefs (csParserInfo stopSpec) ["-h"] of
+        Opt.Failure f -> do
+          let (msg, _) = Opt.renderFailure f "/stop"
+              out = T.pack msg
+          out `shouldSatisfy` ("Usage" `T.isInfixOf`)
+          out `shouldSatisfy` ("Abort the active session's in-flight tool call" `T.isInfixOf`)
+          out `shouldSatisfy` ("-h,--help" `T.isInfixOf`)
+          out `shouldNotSatisfy` ("Invalid option" `T.isInfixOf`)
+        other -> expectationFailure ("expected Failure (help), got: " <> show (isSuccess other))
+
+-- | Discriminate a ParserResult Success for informative failure messages.
+isSuccess :: ParserResult a -> Bool
+isSuccess (Success _) = True
+isSuccess _           = False

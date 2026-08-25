@@ -13,7 +13,7 @@ import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Help (renderHelpIndex)
-import Seal.Command.Model (modelCommandSpec)
+import Seal.Command.Model (modelCommandSpec, noModelTranscriptWriter)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Session (renderSessionInfo, renderSessionLine, sessionCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
@@ -109,7 +109,7 @@ spec = describe "Seal.Command.Session" $ do
       withSystemTempDirectory "seal-sess" $ \root -> do
         sr <- mkSR root (meta "20260701-120000-000")
         pr <- mkPR (root </> "config.toml")
-        let idx = renderHelpIndex (mkRegistry [sessionCommandSpec sr, modelCommandSpec pr sr])
+        let idx = renderHelpIndex (mkRegistry [sessionCommandSpec sr, modelCommandSpec pr sr noModelTranscriptWriter])
         idx `shouldSatisfy` ("Sessions" `T.isInfixOf`)
         idx `shouldSatisfy` ("/session" `T.isInfixOf`)
         idx `shouldSatisfy` ("Model" `T.isInfixOf`)
