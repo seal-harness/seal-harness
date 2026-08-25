@@ -57,7 +57,7 @@ import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps, getSent)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Channels.Cursor (cursorLookup)
+import Seal.Channels.Cursor (cursorLookup, newCursorStore)
 
 -- | A stub TmuxRunner that always succeeds with empty output.
 stubTmux :: TmuxRunner
@@ -130,9 +130,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    cursors <- newCursorStore
     logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "loop-test")
     sidRef <- newIORef sid
@@ -189,9 +190,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    cursors <- newCursorStore
     logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
     askReply <- newAskReplyStore 0
     let sid = either (error "sid") id (mkSessionId "skillload-test")
     sidRef <- newIORef sid
@@ -325,9 +327,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    cursors <- newCursorStore
     logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
     -- A tab inserted via the passed handle is visible through cdTabs —
     -- proving cdTabs IS the passed handle (unified, not a forked copy).
     -- (TabsHandle has no Eq instance, so we verify unification by behavior.)
@@ -365,9 +368,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           }
     approvals <- newApprovalCache
     tabsH <- newTabsHandle
+    cursors <- newCursorStore
     logger <- testSealLogger
     deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                    harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
     let sid = either (error "sid") id (mkSessionId "w3-autotab")
     -- Simulate the channel auto-tab call (production code: Loop.hs runTurnOnSession)
     ensureTabForSession (cdTabs deps) KindAi sid
@@ -478,9 +482,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
             }
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
+      cursors <- newCursorStore
       logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
       let key = ("telegram", "conv-headless-test")
       meta <- createConversationSessionHeadless deps key Telegram
       -- The conversation session is persisted (cursor can resolve it).
@@ -535,8 +540,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       fullSnap <- snapshotTabs tabsH
       length (tlTabs fullSnap) `shouldBe` 36
       logger <- testSealLogger
+      cursors <- newCursorStore
       deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
       let key = ("telegram", "conv-full-tabs-test")
       meta <- createConversationSession deps stubHandle key Telegram tabsH
       -- The tab insertion fails (list full) but the cursor MUST still bind
@@ -583,8 +589,9 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       eventsRef <- newIORef ([] :: [BrokerEvent])
       _ <- subscribe broker (either (error "sid") id (mkSessionId "any")) (\e -> modifyIORef' eventsRef (e :)) (pure ())
       logger <- testSealLogger
+      cursors <- newCursorStore
       deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised (Just broker)
-                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0
       let runner = mkBgRunner deps stubHandle askReply bgConvSid tabsH
@@ -622,9 +629,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
             }
       approvals <- newApprovalCache
       tabsH <- newTabsHandle
+      cursors <- newCursorStore
       logger <- testSealLogger
       deps <- newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
-                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger
+                        harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
       bgConvSid <- newIORef (either (error "sid") id (mkSessionId "conv-anchor"))
       askReply <- newAskReplyStore 0
       let runner = mkBgRunner deps stubHandle askReply bgConvSid tabsH

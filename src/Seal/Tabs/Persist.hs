@@ -13,9 +13,7 @@ module Seal.Tabs.Persist
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
-import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
-import System.FilePath (takeDirectory)
-import System.Posix.Files (setFileMode, unionFileModes, ownerReadMode, ownerWriteMode)
+import System.Directory (doesFileExist)
 import System.IO.Unsafe (unsafePerformIO)
 
 import Katip (Severity (..))
@@ -23,27 +21,32 @@ import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Harness.Id (parseHarnessId, harnessIdToText)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+import Seal.Util.AtomicJson (saveJsonAtomic)
 
 -- | Module-level write lock — serializes concurrent 'saveTabList' calls so
 -- two tab mutations cannot interleave file writes (a bare forkIO TVar
 -- listener would race; the explicit MVar guarantees atomicity). One lock
 -- per process, shared across all paths (a single @tabs.json@ per state dir).
+--
+-- NOTE: 'Seal.Util.AtomicJson.saveJsonAtomic' has its own module-level
+-- lock, so the MVar here is redundant for the write itself. It is retained
+-- because 'loadTabList' / 'filterValidTabs' are pure and do not take the
+-- lock; keeping the local lock documents the serialization invariant. A
+-- future cleanup can drop it once all callers route through
+-- 'saveJsonAtomic' (which they now do).
 writeLock :: MVar ()
 writeLock = unsafePerformIO (newMVar ())
 {-# NOINLINE writeLock #-}
 
--- | Save a 'TabList' to @path@ atomically: write @.tmp@, chmod 0600,
--- rename over the target. Serialized via 'writeLock'. Never throws (a write
--- failure logs to stderr and continues — the in-memory handle stays
--- authoritative within the session). Takes the 'TabList' directly (not a
--- 'TabsHandle') so this module does NOT import 'Seal.Tabs' (avoids a cycle).
+-- | Save a 'TabList' to @path@ atomically via 'saveJsonAtomic' (0600,
+-- MVar-serialized). A thrown IO error propagates to the caller
+-- ('Seal.Tabs.persistIf') which catches, logs a warning, and swallows —
+-- the in-memory handle stays authoritative within the session. Takes the
+-- 'TabList' directly (not a 'TabsHandle') so this module does NOT import
+-- 'Seal.Tabs' (avoids a cycle).
 saveTabList :: FilePath -> TabList -> IO ()
-saveTabList path tl = modifyMVar_ writeLock $ \_ -> do
-  createDirectoryIfMissing True (takeDirectory path)
-  let tmp = path <> ".tmp"
-  BL.writeFile tmp (A.encode tl)
-  setFileMode tmp (unionFileModes ownerReadMode ownerWriteMode)  -- 0600
-  renameFile tmp path
+saveTabList path tl = modifyMVar_ writeLock $ \_ ->
+  saveJsonAtomic path (A.encode tl)
 
 -- | Load the tab list from @path@. Missing file -> 'Nothing' (fresh empty
 -- list). Corrupt JSON -> 'Nothing' + a stderr warning (ids + error type

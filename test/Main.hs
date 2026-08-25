@@ -81,6 +81,7 @@ import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.ClassSpec
+import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
@@ -249,6 +250,7 @@ main = hspec $ do
   Seal.Channel.WiringSpec.spec
   Seal.Channels.ClassSpec.spec
   Seal.Channels.LoopSpec.spec
+  Seal.Channels.CursorSpec.spec
   Seal.Channels.SignalSpec.spec
   Seal.Channels.TelegramSpec.spec
   Seal.Channels.Telegram.ButtonsSpec.spec

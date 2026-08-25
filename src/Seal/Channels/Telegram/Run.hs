@@ -16,6 +16,7 @@ import Data.Char (isDigit)
 import Data.Either (fromRight)
 import Data.IORef (newIORef)
 import Data.Default (def)
+import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -53,7 +54,7 @@ import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeCo
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths
-  ( SealPaths (..), configFilePath, ensureSealDirs, getSealPaths
+  ( SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths
   , reposFilePath, securityFilePath, vaultFilePath )
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (UserId)
@@ -61,6 +62,9 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry qualified
 import Seal.Harness.Tmux qualified
 import Seal.Ingest (PreprocessChain, emptyChain)
+import Seal.Channels.Cursor
+  ( newPersistingCursorStore, seedCursorStore )
+import Seal.Channels.Cursor.Persist (loadCursorMap)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Security.Vault qualified as Vault
@@ -155,9 +159,12 @@ runTelegramMain autonomy logger = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  cursorsH <- newPersistingCursorStore (cursorMapPath paths)
+  mCursors <- loadCursorMap (cursorMapPath paths)
+  for_ mCursors (seedCursorStore cursorsH)
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
+        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger cursorsH
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt
         , ccdProvider    = pr

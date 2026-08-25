@@ -13,6 +13,7 @@ module Seal.Channels.Signal.Run
 
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe, isJust)
@@ -27,6 +28,9 @@ import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), newBackends )
 import Seal.Logging.Logger (SealLogger, logIO)
+import Seal.Channels.Cursor
+  ( newPersistingCursorStore, seedCursorStore )
+import Seal.Channels.Cursor.Persist (loadCursorMap)
 import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, runChannelLoop, mkTabCloseNotifier)
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Signal (withSignalChannel)
@@ -42,7 +46,7 @@ import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), configFilePath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Types (mkSessionId)
@@ -304,9 +308,12 @@ runSignalMain autonomy logger = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  cursorsH <- newPersistingCursorStore (cursorMapPath paths)
+  mCursors <- loadCursorMap (cursorMapPath paths)
+  for_ mCursors (seedCursorStore cursorsH)
   chanDeps <- newChannelDeps
         paths rt repoRegH pr backends autonomy Nothing
-        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger
+        harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger cursorsH
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt
         , ccdProvider    = pr

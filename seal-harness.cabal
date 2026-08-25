@@ -52,6 +52,7 @@ library
         Seal.Providers.Ollama
         Seal.Providers.Registry
         Seal.Util.AesonUtils
+        Seal.Util.AtomicJson
         Seal.Util.StrictIO
         Seal.Routing.Route
         Seal.Transcript.Types
@@ -84,6 +85,7 @@ library
         Seal.Channel.Cli
         Seal.Channels.Class
         Seal.Channels.Cursor
+        Seal.Channels.Cursor.Persist
         Seal.Channels.Loop
         Seal.Channels.Signal
         Seal.Channels.Signal.Run
@@ -346,6 +348,7 @@ test-suite tests
         Seal.TabsSpec
         Seal.Tabs.PartitionSpec
         Seal.Tabs.PersistSpec
+        Seal.Channels.CursorSpec
         Seal.Tabs.RelaySpec
         Seal.Tabs.WizardSpec
         Seal.Routing.RouteSpec
