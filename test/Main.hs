@@ -19,6 +19,7 @@ import qualified Seal.Gateway.StreamSpec
 import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.MetaSpec
+import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
 import qualified Seal.Session.StoreSpec
 import qualified Seal.Session.LogSpec
@@ -186,6 +187,7 @@ main = hspec $ do
   Seal.Gateway.TranscriptSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.MetaSpec.spec
+  Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec
   Seal.Session.StoreSpec.spec
   Seal.Session.LogSpec.spec
