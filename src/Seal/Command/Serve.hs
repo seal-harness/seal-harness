@@ -70,6 +70,8 @@ import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.SourceControl.Clone (lsRemoteRepo)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+import Seal.Session.AgentMetaCache
+  ( agentMetaCacheDir, gcAgentMetaCache, agentMetaCacheKeepN )
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
@@ -96,6 +98,9 @@ runServeMain autonomy logger = do
   -- (#88). Live agents are reused (the key is still loaded).
   startupAgentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   arProbeAndSweep startupAgentRegH
+  -- GC the content-addressed agent-metadata snapshot cache: keep the
+  -- newest N entries, drop the rest. Best-effort — failures are ignored.
+  gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN
   migrateSecurityConfig paths
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
@@ -267,6 +272,7 @@ runServeMain autonomy logger = do
         , sdLogger      = logger
         , sdIsRemote    = isRemoteExec
         , sdExecCache   = cdExecCache chanDeps
+        , sdRemoteRunner = Nothing
           -- ^ ONE shared instance: turns (web + channels), /call dispatches,
           -- and GET /api/sessions/:id/agents all hit the same cache.
         }

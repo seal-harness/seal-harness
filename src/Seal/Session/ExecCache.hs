@@ -47,6 +47,7 @@ import Seal.Config.Paths (SealPaths)
 import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Core.Types (SessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
+import Seal.Session.AgentMetaCache (MetaCacheEnv, buildRoutingWorkdirFs)
 import Seal.Session.Workdir
   ( SessionExec (..), isFailClosedSessionExec, mkSessionExec
   )
@@ -54,7 +55,7 @@ import Seal.Skills.Backend (listWorkdirSkillsSnap)
 import Seal.Skills.Types (Skill)
 import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Exec.Remote (RemoteRunner)
-import Seal.Tools.Exec.WorkdirFs (WorkdirFs, wfsSnapshot)
+import Seal.Tools.Exec.WorkdirFs (WorkdirFs, snapTopDirs, wfsSnapshot)
 
 -- | The shared cache handle. Create ONE per process (per gateway /
 -- channel loop / CLI invocation) via 'newSessionExecCache'.
@@ -130,8 +131,14 @@ invalidateExec cache sid =
 -- consumer retries).
 cachedWorkdirScan
   :: SessionExecCache -> SessionId -> WorkdirFs -> WorkspaceRoot
+  -> Maybe MetaCacheEnv
+  -- ^ When 'Just' (remote mode), @.agents/@ reads are served from the
+  -- content-addressed local snapshot cache ('Seal.Session.AgentMetaCache')
+  -- after a per-repo URL+content probe; repos that fail the snapshot path
+  -- keep flowing through the underlying (remote) fs. 'Nothing' is the
+  -- legacy all-remote crawl.
   -> IO ([AgentDef], [Skill])
-cachedWorkdirScan cache sid fs wsRoot = do
+cachedWorkdirScan cache sid fs wsRoot mMetaEnv = do
   now <- sceNow cache
   scans <- readIORef (sceScans cache)
   let rootText = rootTextOf wsRoot
@@ -144,8 +151,13 @@ cachedWorkdirScan cache sid fs wsRoot = do
         -- Fail-soft, uncached: don't freeze empty results for the TTL.
         Left _ -> pure ([], [])
         Right snap -> do
-          defs <- listWorkdirAgentDefsSnap snap fs
-          skills <- listWorkdirSkillsSnap snap fs
+          -- Structure comes from the live remote snapshot; only CONTENT
+          -- reads may switch lanes to local snapshots.
+          fs' <- case mMetaEnv of
+            Nothing   -> pure fs
+            Just env  -> buildRoutingWorkdirFs env fs rootText (snapTopDirs snap)
+          defs <- listWorkdirAgentDefsSnap snap fs'
+          skills <- listWorkdirSkillsSnap snap fs'
           modifyIORef' (sceScans cache)
             (Map.insert sid (CachedScan now rootText defs skills))
           pure (defs, skills)

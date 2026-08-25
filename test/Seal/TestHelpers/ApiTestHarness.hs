@@ -11,23 +11,31 @@
 module Seal.TestHelpers.ApiTestHarness
   ( -- * Entry point
     runApiTest
+  , runApiTestOpts
+  , ApiTestOptions (..)
+  , defaultApiTestOptions
   , runApiTestLocal
   , runApiTestRemote
     -- * Test environment
   , ApiTestEnv (..)
     -- * Helpers
   , callApiNewTab
+  , callSetupRepoRaw
   , sendMsgToSession
   , sendMsgToSessionRaw
   , getTranscript
   , assertTranscriptContains
   , setScript
+  , uemLabel
+  , ghEnvMarkerName
+  , readGhEnvMarker
     -- * Dummy repo
   , DummyRepoConfig (..)
   , DummyRepo (..)
   , setupDummyRepo
   , readFileStrict
   , isInfixOfStr
+  , testPatToken
   ) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -38,13 +46,14 @@ import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Builder qualified as BSB
-import Data.Char (isSpace)
+import Data.Char (isAsciiLower, isAsciiUpper, isSpace)
 import Data.Foldable (toList)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (maybeToList)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -97,6 +106,9 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
+import Seal.Tools.Exec.Remote (RemoteRunner (..))
+import Seal.Tools.Exec.Types (ExecError)
+import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 
@@ -108,10 +120,46 @@ data ApiTestEnv = ApiTestEnv
   { ateApp         :: Application
   , ateDeps        :: ApiDeps
   , atePaths       :: SealPaths
-  , ateMode        :: Text          -- "local" | "remote"
+  , ateMode        :: UntrustedExecMode
+    -- ^ Which untrusted executor wiring this environment uses. The test
+    -- body must NOT branch on this for assertions — both modes must assert
+    -- the same contract. It exists so fixtures can observe the executor's
+    -- own boundary (local: process env; remote: composed ssh command) and
+    -- so diagnostics can label output.
   , ateProviderRef :: IORef [CompletionResponse]
   , ateDummyRepo   :: Maybe DummyRepo
+  , ateCapturedSshArgv :: Maybe (IORef [([String], Maybe ByteString)])
+    -- ^ Only set in remote mode with the fake remote runner
+    -- ('atoFakeRemoteRunner'). Records every ssh argv (+ optional stdin
+    -- payload) the session exec attempted, oldest-last. Diagnostics only —
+    -- the contract itself is asserted via the shared gh-env marker file.
   }
+
+-- | Human-readable label for a mode (diagnostics output only).
+uemLabel :: UntrustedExecMode -> Text
+uemLabel UemLocal  = "local"
+uemLabel UemRemote = "remote"
+
+-- | The PAT token seeded into the fake vault for @CredPat@ dummy repos.
+-- Tests assert this exact value reaches the composed untrusted command's
+-- env (never disk, never a log).
+testPatToken :: Text
+testPatToken = "seal-test-pat-token-12345"
+
+-- | Options for 'runApiTestOpts'.
+newtype ApiTestOptions = ApiTestOptions
+  { atoFakeRemoteRunner :: Bool
+    -- ^ In remote mode, inject a content-routed recording fake as the SSH
+    -- runner (via 'sdRemoteRunner') instead of the real runner. The fake
+    -- answers the SETUP_REPO call sequence (idempotency check → clone →
+    -- verify) so the test is hermetic — no live gh/git/network on the SSH
+    -- target — while still capturing the fully-composed remote command for
+    -- assertion. Local mode is unaffected (the local executor has no runner
+    -- seam; it really executes).
+  }
+
+defaultApiTestOptions :: ApiTestOptions
+defaultApiTestOptions = ApiTestOptions { atoFakeRemoteRunner = False }
 
 -- ---------------------------------------------------------------------------
 -- Dummy repo
@@ -218,59 +266,79 @@ runApiTest
   :: Maybe DummyRepoConfig
   -> (ApiTestEnv -> IO ())
   -> Spec
-runApiTest mRepoCfg body = do
-  describe "local mode" $ runApiTestLocal mRepoCfg body
-  describe "remote mode" $ runApiTestRemote mRepoCfg body
+runApiTest mRepoCfg =
+  runApiTestOpts mRepoCfg defaultApiTestOptions
+
+-- | 'runApiTest' with options (fake remote runner, etc.).
+runApiTestOpts
+  :: Maybe DummyRepoConfig
+  -> ApiTestOptions
+  -> (ApiTestEnv -> IO ())
+  -> Spec
+runApiTestOpts mRepoCfg opts body = do
+  describe "local mode" $ runApiTestLocal mRepoCfg opts body
+  describe "remote mode" $ runApiTestRemote mRepoCfg opts body
 
 -- | Run the test body in local mode only.
 runApiTestLocal
   :: Maybe DummyRepoConfig
+  -> ApiTestOptions
   -> (ApiTestEnv -> IO ())
   -> SpecWith ()
-runApiTestLocal mRepoCfg body = it "local" $ do
+runApiTestLocal mRepoCfg opts body = it "local" $ do
   withSystemTempDirectory "seal-api-test" $ \tmp -> do
     mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-    env <- buildTestEnv tmp "local" mRepo
+    env <- buildTestEnv tmp UemLocal mRepo opts
     body env
 
 -- | Run the test body in remote mode only. Guards with 'pendingWith' when
 -- sshd / ssh-keygen / ssh-keyscan are unavailable.
 runApiTestRemote
   :: Maybe DummyRepoConfig
+  -> ApiTestOptions
   -> (ApiTestEnv -> IO ())
   -> SpecWith ()
-runApiTestRemote mRepoCfg body = it "remote" $ do
-  keygenExe <- findExecutable "ssh-keygen"
-  agentExe <- findExecutable "ssh-agent"
-  keyscanExe <- findExecutable "ssh-keyscan"
-  sshdExe <- findExecutable "sshd"
-  case (keygenExe, agentExe, keyscanExe, sshdExe) of
-    (Nothing, _, _, _) -> pendingWith "ssh-keygen not available"
-    (_, Nothing, _, _) -> pendingWith "ssh-agent not available"
-    (_, _, Nothing, _) -> pendingWith "ssh-keyscan not available"
-    (_, _, _, Nothing) -> pendingWith "sshd not available (cannot SSH to localhost)"
-    _ -> do
-      -- Verify sshd is actually running AND SSH auth works by attempting
-      -- a real SSH connection. Just checking port 22 isn't enough — the
-      -- CI runner may have sshd listening but not configured for pubkey
-      -- auth, or authorized_keys may not be set up. We test by generating
-      -- a throwaway key, adding it to authorized_keys, and SSHing.
-      sshWorks <- testSshToLocalhost
-      if not sshWorks
-        then pendingWith "SSH to localhost not working (sshd not running or pubkey auth not configured)"
-        else withSystemTempDirectory "seal-api-test" $ \tmp -> do
+runApiTestRemote mRepoCfg opts body = it "remote" $ do
+  let runBody = withSystemTempDirectory "seal-api-test" $ \tmp -> do
           mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-          env <- buildTestEnv tmp "remote" mRepo
+          env <- buildTestEnv tmp UemRemote mRepo opts
           body env
+  keygenExe <- findExecutable "ssh-keygen"
+  case keygenExe of
+    Nothing -> pendingWith "ssh-keygen not available"
+    Just _ ->
+      -- With the fake remote runner no live SSH host is needed — only
+      -- ssh-keygen (setupDummyRepo generates a keypair unconditionally).
+      -- The real-runner path additionally needs agent/keyscan/sshd AND a
+      -- verified live ssh-to-localhost, because CI runners may have sshd
+      -- listening without pubkey auth configured.
+      if atoFakeRemoteRunner opts
+        then runBody
+        else do
+          agentExe <- findExecutable "ssh-agent"
+          keyscanExe <- findExecutable "ssh-keyscan"
+          sshdExe <- findExecutable "sshd"
+          case (agentExe, keyscanExe, sshdExe) of
+            (Nothing, _, _) -> pendingWith "ssh-agent not available"
+            (_, Nothing, _) -> pendingWith "ssh-keyscan not available"
+            (_, _, Nothing) -> pendingWith "sshd not available (cannot SSH to localhost)"
+            _ -> do
+              -- Verify sshd is actually running AND SSH auth works by
+              -- attempting a real SSH connection. Just checking port 22
+              -- isn't enough.
+              sshWorks <- testSshToLocalhost
+              if not sshWorks
+                then pendingWith "SSH to localhost not working (sshd not running or pubkey auth not configured)"
+                else runBody
 
 -- ---------------------------------------------------------------------------
 -- Build the test environment
 -- ---------------------------------------------------------------------------
 
 buildTestEnv
-  :: FilePath -> Text -> Maybe DummyRepo
+  :: FilePath -> UntrustedExecMode -> Maybe DummyRepo -> ApiTestOptions
   -> IO ApiTestEnv
-buildTestEnv tmp mode mRepo = do
+buildTestEnv tmp mode mRepo opts = do
   let stateRoot  = tmp </> "state"
       configRoot = tmp </> "config"
       sessionRoot = stateRoot </> "sessions"
@@ -296,15 +364,17 @@ buildTestEnv tmp mode mRepo = do
         }
   providerRef <- newIORef []
 
-  -- Vault: fake unlocked, seeded with deploy-key passphrase if needed.
-  let vaultKey = case mRepo of
+  -- Vault: fake unlocked, seeded with the repo's secret if needed.
+  -- Deploy key: the keypair is passphrase-less, so the vault holds "".
+  -- PAT: the vault holds 'testPatToken' (the value tests assert reaches
+  -- the composed clone command's env).
+  let mVaultSeed = case mRepo of
         Just dr -> case srCredential (drRepo dr) of
-          CredDeployKey vk -> Just vk
-          _ -> Nothing
+          CredDeployKey vk -> Just (vk, "")
+          CredPat vk       -> Just (vk, TE.encodeUtf8 testPatToken)
+          _                -> Nothing
         Nothing -> Nothing
-  vaultRt <- case vaultKey of
-    Just vk -> makeFakeVaultRuntime [(vk, "")]  -- no passphrase (key is passphrase-less)
-    Nothing -> makeFakeVaultRuntime []
+  vaultRt <- makeFakeVaultRuntime (maybeToList mVaultSeed)
 
   -- Session runtime.
   let meta0 = SessionMeta
@@ -338,15 +408,27 @@ buildTestEnv tmp mode mRepo = do
   -- Security config: remote mode needs untrusted_execution.remote.
   -- Write it to security.toml so runTurnBody picks it up (the turn
   -- engine loads SecurityConfig from disk, not from ApiDeps).
-  currentUser <- if mode == "remote" then whoami else pure ""
+  currentUser <- if mode == UemRemote then whoami else pure ""
   let mKeyfilePath = mRepo >>= drKeyfilePath
-      secCfg = if mode == "remote"
+      secCfg = if mode == UemRemote
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
   saveSecurityConfig (securityFilePath paths) secCfg
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
+  -- Fake remote runner (remote mode + atoFakeRemoteRunner): enforces the
+  -- same observable contract the local-mode gh shim does — the clone only
+  -- succeeds if GH_TOKEN/GIT_TERMINAL_PROMPT are scoped to the trailing
+  -- gh command of the composed remote string. Both fixtures append what
+  -- the gh invocation actually saw to the same marker file, so the test
+  -- body asserts one contract with no mode branching.
+  mCaptureRef <- if mode == UemRemote && atoFakeRemoteRunner opts
+    then Just <$> newIORef []
+    else pure Nothing
+  mRunner <- case mCaptureRef of
+    Just ref -> Just <$> mkSetupRepoFakeRunner (spHome paths </> ghEnvMarkerName) ref
+    Nothing  -> pure Nothing
   let sendDeps = SendDeps
         { sdPaths = paths
         , sdVault = rt
@@ -370,8 +452,9 @@ buildTestEnv tmp mode mRepo = do
         , sdAbortReg = testAbortReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
-        , sdIsRemote = mode == "remote"
+        , sdIsRemote = mode == UemRemote
         , sdExecCache = execCache
+        , sdRemoteRunner = mRunner
         }
       deps = ApiDeps
         { adSessionRuntime = sr
@@ -403,7 +486,123 @@ buildTestEnv tmp mode mRepo = do
     , ateMode = mode
     , ateProviderRef = providerRef
     , ateDummyRepo = mRepo
+    , ateCapturedSshArgv = mCaptureRef
     }
+
+-- | The marker file (relative to the test's @spHome@) that BOTH gh-observer
+-- fixtures append to: the local shim records the process env it was given;
+-- the remote fake runner records the effective env of the trailing command
+-- of the composed remote string. Lines are @KEY='value'@.
+ghEnvMarkerName :: FilePath
+ghEnvMarkerName = "gh-invocation.env"
+
+-- | Read + parse a gh-env marker file into @[(key, value)]@. Errors with a
+-- clear message if the file is absent — for the PAT suite that is itself a
+-- contract failure (the gh invocation was never observed).
+readGhEnvMarker :: FilePath -> IO [(Text, Text)]
+readGhEnvMarker path = do
+  exists <- doesFileExist path
+  if not exists
+    then error ("readGhEnvMarker: no gh invocation was observed (missing " <> path <> ")")
+    else do
+      content <- readFileStrict path
+      pure [ (T.pack k, T.dropAround (== '\'') (T.pack v))
+           | l <- lines content
+           , not (null l)
+           , let (k, rest) = break (== '=') l
+           , not (null rest)
+           , let v = drop 1 rest
+           ]
+
+-- | A content-routed recording fake 'RemoteRunner' that enforces the PAT
+-- delivery contract by construction. Each invocation is recorded as
+-- @(argv, mStdin)@ (oldest-last); the canned response is chosen by
+-- inspecting the composed command string (the last argv element):
+--
+--   * contains @remote.origin.url@ → idempotency check → @__NONE__@ (empty
+--     workspace: no existing clone)
+--   * contains @__OK__@            → clone verify → @__OK__@ IFF the clone
+--     call carried correctly-scoped credentials, else @__MISSING__@
+--   * is the @gh repo clone …@ call → parse the effective env of the
+--     TRAILING command of the composed string (POSIX scoping: an @env@
+--     prefix before @cd &&@ binds only to @cd@) and append what gh would
+--     actually see to the marker file. Wrong/missing token ⇒ the verify
+--     call fails, so SETUP_REPO reports a clone failure — exactly as a
+--     real remote host would reject the unauthenticated clone.
+--   * anything else                → empty success (bootstrap/scans)
+mkSetupRepoFakeRunner
+  :: FilePath                                -- ^ marker file to append to
+  -> IORef [([String], Maybe ByteString)]    -- ^ captured argvs
+  -> IO RemoteRunner
+mkSetupRepoFakeRunner markerPath ref = do
+  cloneCredOkRef <- newIORef False
+  let record argv mStdin = case reverse argv of
+        (cmd : _) -> do
+          modifyIORef' ref (++ [(argv, mStdin)])
+          respondGhFake markerPath cloneCredOkRef cmd
+        [] -> pure (Right "")
+  pure RemoteRunner
+    { runRemote      = (`record` Nothing)
+    , runRemoteStdin = \argv stdin -> record argv (Just stdin)
+    , runRemoteEnv   = \_env argv -> record argv Nothing
+    }
+
+-- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').
+respondGhFake
+  :: FilePath -> IORef Bool -> String -> IO (Either ExecError Text)
+respondGhFake markerPath cloneCredOkRef cmdStr = do
+  let cmd = T.pack cmdStr
+  case () of
+    _ | "remote.origin.url" `T.isInfixOf` cmd -> pure (Right "__NONE__\n")
+      | "__OK__" `T.isInfixOf` cmd -> do
+          ok <- readIORef cloneCredOkRef
+          pure (Right (if ok then "__OK__\n" else "__MISSING__\n"))
+      | otherwise -> case parseGhCloneCmd cmd of
+          Nothing -> pure (Right "")  -- bootstrap / discovery scans
+          Just (url, effEnv) -> do
+            appendFile markerPath (ghMarkerLines url effEnv)
+            writeIORef cloneCredOkRef (ghCredsOk effEnv)
+            pure (Right "Cloning into 'seal-test'...\n")
+
+ghCredsOk :: [(Text, Text)] -> Bool
+ghCredsOk effEnv =
+  lookup "GH_TOKEN" effEnv == Just testPatToken
+  && lookup "GIT_TERMINAL_PROMPT" effEnv == Just "0"
+
+-- | Parse a composed remote command of the shape
+-- @cd '<ws>' && env K='V' … gh repo clone '<url>' '<dest>' -- --depth 1@
+-- (the POST-fix form) into the token-free URL and the env visible to the
+-- TRAILING command. Returns 'Nothing' when the trailing command is not an
+-- env-prefixed gh clone — including the BUGGY pre-fix form where the env
+-- prefix sits BEFORE the @cd@ and therefore binds nothing for gh.
+parseGhCloneCmd :: Text -> Maybe (Text, [(Text, Text)])
+parseGhCloneCmd cmd = case reverse (T.splitOn " && " cmd) of
+  [] -> Nothing
+  (final : _) -> do
+    afterEnv <- T.stripPrefix "env " final
+    let ws = T.words afterEnv
+        (assigns, rest) = span isAssign ws
+        effEnv = mapMaybe parseAssign assigns
+        trailing = T.unwords rest
+    url <- T.stripPrefix "gh repo clone '" trailing
+    pure (T.takeWhile (/= '\x27') url, effEnv)
+  where
+    isAssign w = case T.uncons w of
+      Just (c, _) -> c /= '\x27' && T.any (== '=') w && "=" `T.isPrefixOf` T.dropWhile isNameChar w
+      Nothing     -> False
+    isNameChar c = isAsciiLower c || isAsciiUpper c || c == '_'
+    parseAssign w = case T.breakOn "=" w of
+      (k, v) | not (T.null k), "='" `T.isPrefixOf` v ->
+        Just (k, T.takeWhile (/= '\x27') (T.drop 2 v))
+      _ -> Nothing
+
+-- | The marker lines recording what the gh invocation saw.
+ghMarkerLines :: Text -> [(Text, Text)] -> String
+ghMarkerLines url effEnv = T.unpack (T.concat
+  [ "URL='" <> url <> "'\n"
+  , "GH_TOKEN='" <> fromMaybe "" (lookup "GH_TOKEN" effEnv) <> "'\n"
+  , "GIT_TERMINAL_PROMPT='" <> fromMaybe "" (lookup "GIT_TERMINAL_PROMPT" effEnv) <> "'\n"
+  ])
 
 -- | Build a SecurityConfig for remote mode (SSH to localhost).
 -- The identity (private key) must be set so sshExecArgv passes @-i <key>@.
@@ -462,6 +661,15 @@ sendMsgToSessionRaw :: ApiTestEnv -> Text -> Text -> IO (Int, BL.ByteString)
 sendMsgToSessionRaw env sid msg = do
   req <- testPost ["api", "sessions", sid, "send"]
     (A.encode (A.object ["message" .= msg]))
+  runAppBody (ateApp env) req
+
+-- | Clone a repo into a session's workdir via
+-- @POST /api/sessions/:id/setup-repo@ — the endpoint the web combo box
+-- calls. Returns the (status, body) for inspection.
+callSetupRepoRaw :: ApiTestEnv -> Text -> Text -> IO (Int, BL.ByteString)
+callSetupRepoRaw env sid url = do
+  req <- testPost ["api", "sessions", sid, "setup-repo"]
+    (A.encode (A.object ["url" .= url]))
   runAppBody (ateApp env) req
 
 -- | Get the transcript as a JSON array.

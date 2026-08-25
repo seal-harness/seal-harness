@@ -118,6 +118,7 @@ library
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
+        Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
         Seal.Session.Meta
         Seal.Session.Store
@@ -430,6 +431,7 @@ test-suite tests
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
+        Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec

@@ -5,6 +5,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, waitCatch)
 import Data.Either (isRight)
 import Data.Text qualified as T
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import System.Directory (doesFileExist, removeFile)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -148,6 +149,34 @@ spec = describe "Seal.Tools.Exec.Local" $ do
         -- returns; if the child survived, the test would still pass but
         -- leave an orphan — the full kill verification lives in the
         -- manual verification (design §Verification).
+
+    it "cancel-path group kill returns promptly (polled grace, not blind sleep)" $ do
+      -- The grace period polls for the child's exit instead of sleeping
+      -- the full 5s: a child killed by SIGTERM lets cleanup return within
+      -- milliseconds. Under the old blind-sleep behavior this scenario
+      -- cost >= 5s per cancelled exec.
+      start <- getCurrentTime
+      cmd <- requireRight "fixture" (mkShellCommand "sleep 30")
+      let uio = mkLocalUntrustedIO (WorkspaceRoot "/tmp")
+      worker <- async (uioShellExec uio cmd Nothing)
+      threadDelay' 200_000  -- let the sleep start
+      cancel worker
+      _ <- waitCatch worker
+      end <- getCurrentTime
+      diffUTCTime end start `shouldSatisfy` (< 4)
+
+    it "success path pays no kill-grace tax (already-exited children skip the kill)" $ do
+      -- A completed command's cleanup must NOT signal its process group:
+      -- under the old unconditional kill this exec cost >= 5s (the full
+      -- grace), and on the remote arm it also killed the ssh ControlMaster,
+      -- forcing a fresh handshake per call (~5s each on some hosts).
+      start <- getCurrentTime
+      cmd <- requireRight "fixture" (mkShellCommand "true")
+      let uio = mkLocalUntrustedIO (WorkspaceRoot "/tmp")
+      res <- uioShellExec uio cmd Nothing
+      end <- getCurrentTime
+      res `shouldSatisfy` isRight
+      diffUTCTime end start `shouldSatisfy` (< 2)
 
     it "bounded output: truncates at 50KB with a marker (Task 4)" $
       withSystemTempDirectory "seal-bounded" $ \wd -> do

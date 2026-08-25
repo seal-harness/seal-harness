@@ -62,9 +62,13 @@ import Seal.Config.File
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
   , WebConfig (..) )
 import Seal.Config.Paths
-  (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir,
+  (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
+   sessionDir,
    sessionLogPath, sessionRequestsPath, sshAgentsDir)
-import Seal.Config.Security (loadSecurityConfig)
+import qualified Katip as K2 (Severity (..), ls)
+import Seal.Config.Security
+  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Paging (defaultPageParams)
@@ -130,7 +134,10 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
+import Seal.Session.AgentMetaCache
+  ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
+import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
@@ -378,6 +385,14 @@ data TurnDeps = TurnDeps
     -- ^ The per-process session-exec + workdir-discovery cache. Memoizes
     -- 'mkSessionExec' (the remote @mkdir -p@ bootstrap) and the agent-def +
     -- skill scans so each happens once per session, not once per turn.
+  , tdRemoteRunner :: Maybe RemoteRunner
+    -- ^ Test seam: when 'Just', replaces 'mkRealRemoteRunner' as the SSH
+    -- runner used to build the session exec in mode=remote. 'Nothing'
+    -- (production wiring) always uses the real runner. Integration tests
+    -- inject a recording fake so the composed ssh argv — the fully-rendered
+    -- remote command — is observable without a live SSH host. Never set in
+    -- production; the field exists solely so gateway API integration tests
+    -- can assert local/remote parity of the composed untrusted commands.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -493,6 +508,44 @@ runSessionTurn td adapter meta mSrc t = do
 -- + AgentEnv, run 'runTurn', broadcast new entries, return 'Just' on error.
 -- Extracted from 'runSessionTurn' to flatten the nesting (the bracket's
 -- third arg is a single function call, not a deeply-nested do-block).
+-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+-- wiring can't support it (local mode, remote unconfigured, tests with no
+-- runner). Remote-only by design: in local mode the workdir IS local, so
+-- the per-file crawl has no SSH round trips to amortize.
+-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+-- wiring can't support it (local mode, remote unconfigured/incomplete,
+-- security-config load failure). Remote-only by design: in local mode the
+-- workdir IS local, so the per-file crawl has no SSH round trips to
+-- amortize. Logs its decision at debug so fallbacks are diagnosable.
+metaCacheEnvFor
+  :: TurnDeps -> SealPaths -> Either Text SecurityConfig
+  -> IO (Maybe MetaCacheEnv)
+metaCacheEnvFor td paths eSecCfg = do
+  let mEnv = case (tdIsRemote td, eSecCfg) of
+        (True, Right secCfg) ->
+          case untrustedExecConfigFromSecurity secCfg of
+            Just (UntrustedExecConfig UemRemote (Just sshCfg)) -> Just MetaCacheEnv
+              { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+              , mceSshCfg       = sshCfg
+              , mceCacheRoot    = agentMetaCacheDir paths
+              , mceRunTransfer  = rsyncTransferIO sshCfg
+              }
+            _ -> Nothing
+        _ -> Nothing
+      reason = case mEnv of
+        Just _  -> "Just (snapshot routing active)"
+        Nothing -> case (tdIsRemote td, eSecCfg) of
+          (False, _) -> "Nothing (local mode)"
+          (_, Left err) ->
+            "Nothing (security config load failed: " ++ T.unpack err ++ ")"
+          (_, Right secCfg) ->
+            case untrustedExecConfigFromSecurity secCfg of
+              Just uec | uecMode uec == UemRemote ->
+                "Nothing (mode=remote but ssh config missing/incomplete)"
+              _ -> "Nothing (mode is not remote)"
+  globalLogIO K2.DebugS (K2.ls (T.pack ("[agent-meta] env=" <> reason)))
+  pure mEnv
+
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
   -> SessionId -> SealPaths
@@ -505,15 +558,16 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
   exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
-                 eSecCfg sid cloneDeps mkRealRemoteRunner
+                 (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
+                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
       uioEnv = seUIOEnv exec
   -- [engine] One discovery scan per session (cache-backed): the result
   -- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn
   -- costs zero extra scans after the first (or after SETUP_REPO).
-  (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+  metaEnv <- metaCacheEnvFor td paths eSecCfg
+  (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
   workdirSkills <- Skill.staticSkillBackend workdirSkillsList
   workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
   -- [engine] autoBindRepoAgent (design §5.2 step 3b — currently web-only;
@@ -739,12 +793,13 @@ callDispatcher td caps sid channelLabel callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
     exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps mkRealRemoteRunner)
-                   eSecCfg sid cloneDeps mkRealRemoteRunner
+                   (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
+                   eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
-    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+    metaEnv <- metaCacheEnvFor td paths eSecCfg
+    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
     workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (tdBaseBackends td)
@@ -766,7 +821,9 @@ callDispatcher td caps sid channelLabel callOpName val = do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               invalidateWorkdirScan (tdExecCache td) sid
-              (freshDefs, freshSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+              freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
+              (freshDefs, freshSkillsList) <-
+                cachedWorkdirScan (tdExecCache td) sid wfs wsRoot freshMetaEnv
               autoBindRepoAgentWith freshDefs paths sid
               -- Record a preamble entry (System Prompt + Tools) now that
               -- the workdir is set up and the agent is bound. This makes
@@ -857,8 +914,8 @@ buildWorker td parentSid appEnv eCfg operatorCeiling channel =
         childCloneDeps <- mkCloneDepsTurn td
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
         seUIOEnv <$> either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
-                            eSecCfg childSid childCloneDeps mkRealRemoteRunner
+                            (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
+                            eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
@@ -895,8 +952,8 @@ buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd _runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps mkRealRemoteRunner)
-                      eSecCfg childSid childCloneDeps mkRealRemoteRunner
+                      (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)
+                      eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
   pure (buildChildRegistry (tdVault td) childCloneDeps (tdBaseBackends td)

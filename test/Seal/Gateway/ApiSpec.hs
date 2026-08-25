@@ -3699,6 +3699,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLogger      = error "sdLogger: unused on the 404 path"
             , sdIsRemote    = False
             , sdExecCache   = execCache404
+            , sdRemoteRunner = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3797,6 +3798,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
             , sdExecCache   = execCache
+            , sdRemoteRunner = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3927,6 +3929,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
             , sdExecCache   = execCache
+            , sdRemoteRunner = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4042,6 +4045,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdLogger      = error "sdLogger: set below"
             , sdIsRemote    = False
             , sdExecCache   = execCache
+            , sdRemoteRunner = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
