@@ -32,6 +32,7 @@ module Seal.Session.AgentMetaCache
   , agentMetaCacheKeepN
   , agentMetaCacheKey
   , agentMetaMaxFileSize
+  , agentMetaTransferArgv
   , agentMetaProbeCmd
   , buildRoutingWorkdirFs
   , ensureAgentMetaSnapshot
@@ -197,9 +198,10 @@ rsyncRshString cfg =
       Nothing -> []
       Just f  -> ["-i", shq f]
 
--- | The fixed rsync argv pulling one remote directory into one local dir:
---
--- @rsync -r --max-size=\<cap\> -e \<pinned rsh\> user\\@host:\<src\> \<dest\>/@
+-- | The fixed rsync argv pulling a remote directory tree into one local
+-- dir. Element 0 is the PROGRAM NAME — 'rsyncTransferIO' splits it off
+-- before spawning (spawning @proc "rsync" argv@ verbatim would hand rsync
+-- a duplicated program name as a bogus source arg).
 --
 -- Deliberately NOT @-a@: no owner/group/perms/times preservation — every
 -- entry arrives with fresh default perms, then 'sanitizeSnapshot' sets the
@@ -214,6 +216,16 @@ rsyncArgv cfg srcAbs destDir =
       <> ":" <> srcAbs
   , destDir ++ "/"
   ]
+
+-- | The remote source for one repo's agent metadata: the CONTENTS of
+-- @.agents/@ (trailing slash), so the snapshot root mirrors what discovery
+-- reanchors at.
+agentsSrcPath :: FilePath -> FilePath
+agentsSrcPath repoDir = repoDir </> ".agents/"
+
+-- | Transfer argv for one repo's @.agents/@ tree into a temp dir.
+agentMetaTransferArgv :: SshConfig -> FilePath -> FilePath -> [String]
+agentMetaTransferArgv cfg repoDir = rsyncArgv cfg (agentsSrcPath repoDir)
 
 -- ---------------------------------------------------------------------------
 -- Integration: probe → key → hit? → rsync → sanitize → atomic publish
@@ -264,7 +276,7 @@ ensureAgentMetaSnapshot runner cfg cacheRoot normalizedUrl repoDir runTransfer =
       -- A stale .tmp from a crashed prior attempt must not survive.
       _ <- try @IOException (removeDirectoryRecursive tmp)
       createDirectoryIfMissing True tmp
-      xfer <- runTransfer (rsyncArgv cfg repoDir tmp) tmp
+      xfer <- runTransfer (agentMetaTransferArgv cfg repoDir tmp) tmp
       case xfer of
         Left _ -> do
           _ <- try @IOException (removeDirectoryRecursive tmp)
@@ -466,11 +478,19 @@ gcAgentMetaCache root keepN = do
 -- Non-zero exit → 'ExecError' (the caller falls back to the legacy crawl);
 -- stderr is logged at debug for diagnosability.
 rsyncTransferIO :: SshConfig -> [String] -> FilePath -> IO (Either ExecError ())
-rsyncTransferIO cfg argv _destTmp = do
-  let cp = (proc "rsync" argv)
-             { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
-             , create_group = True
-             }
+rsyncTransferIO cfg argv _destTmp = case argv of
+  -- argv carries the program name at its head; spawn splits it off. An
+  -- empty argv is unreachable (callers pass 'agentMetaTransferArgv' output).
+  []                -> pure (Left ExecRemoteUnreachable)
+  (prog : progArgs) ->
+    let cp = (proc prog progArgs)
+               { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
+               , create_group = True
+               }
+    in runManagedRsync cfg cp
+
+runManagedRsync :: SshConfig -> CreateProcess -> IO (Either ExecError ())
+runManagedRsync cfg cp = do
   res <- try @IOException $
     withManagedProcess cp $ \ph _mIn hOut hErr -> do
       out <- readBounded hOut agentMetaMaxFileSize

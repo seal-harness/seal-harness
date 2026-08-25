@@ -15,19 +15,20 @@ import Data.Text qualified as T
 import Data.Time
   ( NominalDiffTime, UTCTime (..), addUTCTime, getCurrentTime )
 import Data.Time.Calendar (fromGregorian)
+import System.FilePath ((</>))
 import System.Directory
   ( createDirectory, createDirectoryIfMissing, createFileLink, doesFileExist
   , getPermissions, executable, listDirectory, setModificationTime
   )
-import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Environment (lookupEnv)
 import System.Posix.Files
   ( FileStatus, fileMode, getFileStatus, setFileMode )
 import Test.Hspec
 
 import Seal.Security.Crypto ()
-import Seal.Tools.Exec.Remote (RemoteRunner (..), mkFakeRemoteRunner)
+import Seal.Tools.Exec.Remote (RemoteRunner (..), mkFakeRemoteRunner, mkRealRemoteRunner)
 import Seal.Tools.Exec.Types
   ( ExecError (..), SshConfig (..), getRemotePath, mkRemotePath
   , mkSshHost, mkSshUser
@@ -36,7 +37,7 @@ import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..))
 import Seal.Session.AgentMetaCache
 
 spec :: Spec
-spec = pureCoreSpec >> transferSpec >> wiringSpec
+spec = pureCoreSpec >> transferSpec >> wiringSpec >> liveSpec
 
 pureCoreSpec :: Spec
 pureCoreSpec = describe "Seal.Session.AgentMetaCache" $ do
@@ -360,3 +361,29 @@ seqFakeRunner canned = unsafePerformIO $ do
 
 unixEpoch :: UTCTime
 unixEpoch = UTCTime (fromGregorian 1970 1 1) 0
+
+-- TEMPORARY live diagnostic (run with SEAL_LIVE_AMC=1; delete before merge)
+liveSpec :: Spec
+liveSpec = describe "LIVE agent-meta probe" $
+  it "ensureAgentMetaSnapshot against the configured remote host" $ do
+    enabled <- lookupEnv "SEAL_LIVE_AMC"
+    case enabled of
+      Nothing -> pendingWith "set SEAL_LIVE_AMC=1"
+      Just _ -> do
+        let fixture :: Either T.Text a -> a
+            fixture = either (error . T.unpack) id
+            host = fixture (mkSshHost "192.168.80.201")
+            user = fixture (mkSshUser "zoe")
+            ws   = fixture (mkRemotePath "/Users/zoe/sandbox")
+            cfg = SshConfig
+              { scHost = host, scUser = user, scPort = 22
+              , scIdentity = Just "/Users/doug/.ssh/id_ed25519"
+              , scKnownHosts = "/Users/doug/.seal/exec-known-hosts"
+              , scWorkspace = ws
+              }
+            repoDir = "/Users/zoe/sandbox/workdirs/20260825-114413-797/seal-harness"
+        o <- ensureAgentMetaSnapshot mkRealRemoteRunner cfg "/tmp/amc-cache"
+               "https://github.com/seal-harness/seal-harness.git" repoDir
+               (rsyncTransferIO cfg)
+        putStrLn ("OUTCOME: " <> show o)
+        o `shouldSatisfy` \case MetaSnapshot _ -> True; _ -> False
