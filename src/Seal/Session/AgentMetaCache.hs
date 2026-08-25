@@ -27,18 +27,29 @@
 --     yields 'MetaFallback' and callers use the legacy per-file crawl.
 module Seal.Session.AgentMetaCache
   ( AgentMetaOutcome (..)
+  , MetaCacheEnv (..)
+  , agentMetaCacheDir
+  , agentMetaCacheKeepN
   , agentMetaCacheKey
   , agentMetaMaxFileSize
   , agentMetaProbeCmd
+  , buildRoutingWorkdirFs
   , ensureAgentMetaSnapshot
+  , gcAgentMetaCache
+  , parseGitConfigUrl
   , parseProbeHash
+  , probeRepoUrlCmd
   , rsyncArgv
   , rsyncRshString
+  , rsyncTransferIO
   , sanitizeSnapshot
   ) where
 
 import Control.Exception (IOException, try)
+import Control.Monad (forM)
 import Data.Either (fromRight)
+import Data.List (sortOn)
+import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -46,20 +57,33 @@ import Data.Time.Clock (getCurrentTime, UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 
 import System.Directory
-  ( createDirectoryIfMissing, doesFileExist, listDirectory
-  , removeDirectoryRecursive, removeFile, renameDirectory
+  ( createDirectoryIfMissing, doesFileExist, getModificationTime
+  , listDirectory, removeDirectoryRecursive, removeFile, renameDirectory
   )
 import System.FilePath ((</>))
 import System.Posix.Files
   ( getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink
   , setFileMode
   )
+import System.Exit (ExitCode (..))
+import System.Process
+  ( CreateProcess (..), StdStream (..), proc, waitForProcess )
 
+import Katip qualified as K
+
+import Seal.Config.Paths (SealPaths (..))
+import Seal.Logging.Global (globalLogIO)
 import Seal.Security.Crypto (sha256Hash)
+import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args (mkShellCommand)
+import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
 import Seal.Tools.Exec.Remote (RemoteRunner (..), runRemoteShell)
 import Seal.Tools.Exec.Types
-  ( ExecError (..), SshConfig (..), getSshHost, getSshUser
+  ( ExecError (..), RemotePath, SshConfig (..), getRemotePath, getSshHost
+  , getSshUser, mkRemotePath
+  )
+import Seal.Tools.Exec.WorkdirFs
+  ( WorkdirFs (..), WorkdirFsErr (..), mkLocalWorkdirFs
   )
 
 -- | The fixed remote probe command for a repo dir's @.agents/@ content
@@ -277,3 +301,187 @@ metaJson repoDir contentHash now =
   <> ",\"content_hash\":" <> show (T.unpack contentHash)
   <> ",\"synced_at\":" <> show (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
   <> "}"
+
+-- | Canonical cache-root location: @<state>/repos/agent-meta-cache@.
+agentMetaCacheDir :: SealPaths -> FilePath
+agentMetaCacheDir paths = spState paths </> "repos" </> "agent-meta-cache"
+
+-- | How many entries the startup GC keeps ('gcAgentMetaCache').
+agentMetaCacheKeepN :: Int
+agentMetaCacheKeepN = 20
+
+-- ---------------------------------------------------------------------------
+-- Discovery wiring: per-repo URL probe + snapshot-routed WorkdirFs
+-- ---------------------------------------------------------------------------
+
+-- | Everything the discovery flow needs to route @.agents/@ reads through
+-- content-addressed local snapshots. Built once per scan when the untrusted
+-- executor is remote; 'Nothing' (local mode, tests) keeps the legacy path.
+data MetaCacheEnv = MetaCacheEnv
+  { mceRunner       :: RemoteRunner   -- ^ probe transport (pinned ssh)
+  , mceSshCfg       :: SshConfig      -- ^ destination for rsync + probe anchor
+  , mceCacheRoot    :: FilePath       -- ^ <state>/repos/agent-meta-cache
+  , mceRunTransfer  :: [String] -> FilePath -> IO (Either ExecError ())
+    -- ^ Performs one rsync (production: 'rsyncTransferIO'; tests: a fake
+    -- that records the argv and materializes files).
+  }
+
+-- | The fixed remote command reading a repo clone's origin URL — the first
+-- half of the cache key. One round trip; failure (not a git repo, detached
+-- tree) simply excludes that repo from snapshot routing.
+probeRepoUrlCmd :: FilePath -> Text
+probeRepoUrlCmd repoDir =
+  "cd " <> shellQuoteDir (T.pack repoDir)
+  <> " && git config --get remote.origin.url"
+
+-- | Parse @git config@ output: a single non-empty line, trimmed. Rejects
+-- multi-line/garbage output (fail-closed to legacy routing).
+parseGitConfigUrl :: Text -> Maybe Text
+parseGitConfigUrl out =
+  case lines (T.unpack out) of
+    [l] -> let t = T.strip (T.pack l)
+           in if T.null t then Nothing else Just t
+    _   -> Nothing
+
+-- | Read ceiling served to parsers from snapshots. Matches the remote arm's
+-- bounded-read cap so consumers see identical truncation behavior.
+metaReadCeilingBytes :: Int
+metaReadCeilingBytes = 131072
+
+-- | Build a WorkdirFs that routes reads falling under any successfully
+-- snapshotted @<repo>/.agents@ subtree to the LOCAL sanitized snapshot,
+-- passing everything else through to the underlying (remote) fs.
+--
+-- Structure truth stays remote: 'wfsSnapshot' is always a passthrough, so
+-- SETUP_REPO invalidation and repo enumeration behave exactly as before —
+-- only file content reads change lanes. Local serving goes through
+-- 'mkLocalWorkdirFs', whose SafePath confinement keeps every read inside
+-- its snapshot root (and snapshots contain no symlinks to escape with).
+buildRoutingWorkdirFs
+  :: MetaCacheEnv          -- ^ probe/transfer deps
+  -> WorkdirFs             -- ^ underlying (remote) fs
+  -> [Text]                -- ^ candidate repo top-dir names from wfsSnapshot
+  -> IO WorkdirFs
+buildRoutingWorkdirFs env underlying topDirs = do
+  routes <- concat <$> mapM routeOne topDirs
+  pure (applyRoutes routes underlying)
+  where
+    workspaceAbs = T.unpack (getRemotePath (scWorkspace (mceSshCfg env)))
+    routeOne topDir = do
+      let repoDirAbs = workspaceAbs </> T.unpack topDir
+      mUrl <- probeUrl repoDirAbs
+      case mUrl of
+        Nothing -> pure []
+        Just url -> do
+          outcome <- ensureAgentMetaSnapshot (mceRunner env) (mceSshCfg env)
+                       (mceCacheRoot env) url repoDirAbs (mceRunTransfer env)
+          pure $ case outcome of
+            MetaSnapshot dir -> [(topDir <> "/.agents", dir)]
+            MetaFallback     -> []
+    probeUrl rd = case mkShellCommand (probeRepoUrlCmd rd) of
+      Left _    -> pure Nothing   -- unreachable: internally built, no NULs
+      Right cmd -> do
+        eRes <- runRemoteShell (mceRunner env) (mceSshCfg env) cmd
+        pure $ either (const Nothing) parseGitConfigUrl eRes
+
+-- | Apply prefix→localRoot routing over a WorkdirFs record. Matching reads
+-- are served by a SafePath-confined local arm rooted at the snapshot;
+-- everything else — including 'wfsSnapshot', the structure source of truth —
+-- passes through untouched. An empty route table returns the fs unchanged.
+applyRoutes :: [(Text, FilePath)] -> WorkdirFs -> WorkdirFs
+applyRoutes [] fs = fs
+applyRoutes routes fs = fs
+  { wfsReadFile           = \rp ->
+      route rp (wfsReadFile fs) serveRead
+  , wfsDoesFileExist      = \rp ->
+      route rp (wfsDoesFileExist fs) (existsIn wfsDoesFileExist)
+  , wfsDoesDirectoryExist = \rp ->
+      route rp (wfsDoesDirectoryExist fs) (existsIn wfsDoesDirectoryExist)
+  , wfsListDirectory      = \rp ->
+      route rp (wfsListDirectory fs) serveList
+  }
+  where
+    route
+      :: RemotePath
+      -> (RemotePath -> IO a)
+      -> (FilePath -> Text -> IO a)
+      -> IO a
+    route rp onRemote onLocal =
+      case matchRoute (getRemotePath rp) of
+        Nothing          -> onRemote rp
+        Just (root, rel) -> onLocal root rel
+    matchRoute t = foldr
+      (\(prefix, root) acc ->
+        if t == prefix
+          then Just (root, ".")
+          else if (prefix <> "/") `T.isPrefixOf` t
+            then Just (root, T.drop (T.length prefix + 1) t)
+            else acc)
+      Nothing routes
+    localFs root = mkLocalWorkdirFs (WorkspaceRoot root) metaReadCeilingBytes
+    -- The rel paths are internally generated (prefix-stripped snapshot
+    -- paths), so a parse failure here is unreachable; it maps to WfsNotFound
+    -- rather than inventing a PathError.
+    toRp :: Text -> Either WorkdirFsErr RemotePath
+    toRp rel = either (const (Left WfsNotFound)) Right (mkRemotePath rel)
+
+    serveRead root rel =
+      case toRp rel of
+        Left e    -> pure (Left e)
+        Right rp  -> wfsReadFile (localFs root) rp
+    existsIn
+      :: (WorkdirFs -> RemotePath -> IO Bool)
+      -> FilePath -> Text -> IO Bool
+    existsIn sel root rel =
+      case toRp rel of
+        Left _   -> pure False
+        Right rp -> sel (localFs root) rp
+    serveList root rel =
+      case toRp rel of
+        Left e    -> pure (Left e)
+        Right rp  -> wfsListDirectory (localFs root) rp
+
+-- ---------------------------------------------------------------------------
+-- GC + production transfer
+-- ---------------------------------------------------------------------------
+
+-- | Startup sweep: keep only the newest @keepN@ cache entries (by entry
+-- dir mtime). Best-effort — every error is swallowed; a full disk of stale
+-- entries is untidy, not unsafe.
+gcAgentMetaCache :: FilePath -> Int -> IO ()
+gcAgentMetaCache root keepN = do
+  _ <- try @IOException $ do
+    names <- listDirectory root
+    dated <- forM names $ \n -> do
+      let p = root </> n
+      mTime <- try @IOException (getModificationTime p)
+      pure (either (const []) (\t -> [(t, p)]) mTime)
+    let sorted = sortOn (Down . fst) (concat dated)
+        stale  = drop keepN sorted
+    mapM_ (removeDirectoryRecursive . snd) stale
+  pure ()
+
+-- | Production transfer runner: fixed-argv rsync via the managed-process
+-- seam (process-group spawn, bounded output, group kill on cancel).
+-- Non-zero exit → 'ExecError' (the caller falls back to the legacy crawl);
+-- stderr is logged at debug for diagnosability.
+rsyncTransferIO :: SshConfig -> [String] -> FilePath -> IO (Either ExecError ())
+rsyncTransferIO cfg argv _destTmp = do
+  let cp = (proc "rsync" argv)
+             { std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe
+             , create_group = True
+             }
+  res <- try @IOException $
+    withManagedProcess cp $ \ph _mIn hOut hErr -> do
+      out <- readBounded hOut agentMetaMaxFileSize
+      err <- readBounded hErr agentMetaMaxFileSize
+      ec  <- waitForProcess ph
+      pure (ec, out, err)
+  case res of
+    Left _ioErr -> pure (Left ExecRemoteUnreachable)
+    Right (ExitSuccess, _, _) -> pure (Right ())
+    Right (ExitFailure _n, _, err) -> do
+      globalLogIO K.DebugS (K.ls (T.pack
+        ("[agent-meta rsync] failed: " <> T.unpack (T.strip (T.takeEnd 400 err))
+         <> " host=" <> show (getSshHost (scHost cfg)))))
+      pure (Left ExecRemoteUnreachable)

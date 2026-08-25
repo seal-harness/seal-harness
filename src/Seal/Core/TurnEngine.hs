@@ -62,9 +62,11 @@ import Seal.Config.File
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
   , WebConfig (..) )
 import Seal.Config.Paths
-  (SealPaths, repoKeysDir, securityFilePath, sessionConversationPath, sessionDir,
+  (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
+   sessionDir,
    sessionLogPath, sessionRequestsPath, sshAgentsDir)
-import Seal.Config.Security (loadSecurityConfig)
+import Seal.Config.Security
+  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Paging (defaultPageParams)
@@ -130,7 +132,10 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+import Seal.Session.AgentMetaCache
+  ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
@@ -501,6 +506,26 @@ runSessionTurn td adapter meta mSrc t = do
 -- + AgentEnv, run 'runTurn', broadcast new entries, return 'Just' on error.
 -- Extracted from 'runSessionTurn' to flatten the nesting (the bracket's
 -- third arg is a single function call, not a deeply-nested do-block).
+-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+-- wiring can't support it (local mode, remote unconfigured, tests with no
+-- runner). Remote-only by design: in local mode the workdir IS local, so
+-- the per-file crawl has no SSH round trips to amortize.
+metaCacheEnvFor
+  :: TurnDeps -> SealPaths -> Either Text SecurityConfig -> Maybe MetaCacheEnv
+metaCacheEnvFor td paths eSecCfg =
+  case (tdIsRemote td, eSecCfg) of
+    (True, Right secCfg) ->
+      case untrustedExecConfigFromSecurity secCfg of
+        Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
+          Just MetaCacheEnv
+            { mceRunner    = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+            , mceSshCfg    = sshCfg
+            , mceCacheRoot = agentMetaCacheDir paths
+            , mceRunTransfer = rsyncTransferIO sshCfg
+            }
+        _ -> Nothing
+    _ -> Nothing
+
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
   -> SessionId -> SealPaths
@@ -521,7 +546,8 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   -- [engine] One discovery scan per session (cache-backed): the result
   -- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn
   -- costs zero extra scans after the first (or after SETUP_REPO).
-  (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+  let metaEnv = metaCacheEnvFor td paths eSecCfg
+  (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
   workdirSkills <- Skill.staticSkillBackend workdirSkillsList
   workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
   -- [engine] autoBindRepoAgent (design §5.2 step 3b — currently web-only;
@@ -753,6 +779,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
     (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+                         (metaCacheEnvFor td paths eSecCfg)
     workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
     let onDemand = either (const False) onDemandSchemas eCfg
         sessionBackends = (tdBaseBackends td)
@@ -774,7 +801,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               invalidateWorkdirScan (tdExecCache td) sid
-              (freshDefs, freshSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot
+              (freshDefs, freshSkillsList) <-
+                cachedWorkdirScan (tdExecCache td) sid wfs wsRoot (metaCacheEnvFor td paths eSecCfg)
               autoBindRepoAgentWith freshDefs paths sid
               -- Record a preamble entry (System Prompt + Tools) now that
               -- the workdir is set up and the agent is bound. This makes

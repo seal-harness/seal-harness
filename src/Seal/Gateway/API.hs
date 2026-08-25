@@ -54,7 +54,12 @@ import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sshAgentsDir)
-import Seal.Config.Security (SecurityConfig)
+import Seal.Config.Security
+  ( SecurityConfig, untrustedExecConfigFromSecurity )
+import Seal.Session.AgentMetaCache
+  ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
+import Seal.Tools.Exec.Untrusted
+  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
@@ -596,6 +601,24 @@ parseRepoUrl body =
       _ -> Nothing
     _ -> Nothing
 
+-- | Agent-metadata cache env for API-driven scans. Remote mode only —
+-- in local mode the workdir is local and the legacy crawl costs nothing.
+-- Prefers the SendDeps runner seam so remote-mode integration tests stay
+-- hermetic; production passes Nothing there and gets the real runner.
+metaCacheEnvForApi :: ApiDeps -> Maybe MetaCacheEnv
+metaCacheEnvForApi deps = case adSend deps of
+  Just sendDeps | sdIsRemote sendDeps ->
+    case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
+      Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
+        Just MetaCacheEnv
+          { mceRunner    = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
+          , mceSshCfg    = sshCfg
+          , mceCacheRoot = agentMetaCacheDir (adPaths deps)
+          , mceRunTransfer = rsyncTransferIO sshCfg
+          }
+      _ -> Nothing
+  _ -> Nothing
+
 -- | Handle @POST /api/sessions/:id/setup-repo@: build the response from the
 -- 'Either Text CloneResult' returned by 'handleSetupRepo'. 200 on
 -- cloned/no-op, 409 on conflict, 503 on clone failure, 400 on an invalid
@@ -847,10 +870,12 @@ handleSessionAgents deps sid = do
             e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner
             pure (e, Nothing)
       let wfs = seWorkdirFs exec
+          metaEnv = metaCacheEnvForApi deps
       workdirBackend <- case mCache of
         Just cache -> do
           -- One shared scan; serve the union from a static backend.
-          (workdirDefs, _) <- cachedWorkdirScan cache sid wfs (seWorkspaceRoot exec)
+          (workdirDefs, _) <-
+            cachedWorkdirScan cache sid wfs (seWorkspaceRoot exec) metaEnv
           staticAgentDefBackend workdirDefs
         Nothing -> workdirAgentDefBackend wfs
       let unionBackend = unionAgentDefBackend workdirBackend (adAgentDefs deps)

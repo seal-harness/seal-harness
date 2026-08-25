@@ -10,14 +10,18 @@ module Seal.Session.AgentMetaCacheSpec (spec) where
 
 import Data.Bits ((.&.))
 import Data.IORef
-import Data.List (isPrefixOf, tails)
+import Data.List (isPrefixOf, sort, tails)
 import Data.Text qualified as T
+import Data.Time
+  ( NominalDiffTime, UTCTime (..), addUTCTime, getCurrentTime )
+import Data.Time.Calendar (fromGregorian)
 import System.Directory
   ( createDirectory, createDirectoryIfMissing, createFileLink, doesFileExist
-  , getPermissions, executable, listDirectory
+  , getPermissions, executable, listDirectory, setModificationTime
   )
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Files
   ( FileStatus, fileMode, getFileStatus, setFileMode )
 import Test.Hspec
@@ -25,12 +29,14 @@ import Test.Hspec
 import Seal.Security.Crypto ()
 import Seal.Tools.Exec.Remote (RemoteRunner (..), mkFakeRemoteRunner)
 import Seal.Tools.Exec.Types
-  ( ExecError (..), SshConfig (..), mkRemotePath, mkSshHost, mkSshUser
+  ( ExecError (..), SshConfig (..), getRemotePath, mkRemotePath
+  , mkSshHost, mkSshUser
   )
+import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..))
 import Seal.Session.AgentMetaCache
 
 spec :: Spec
-spec = pureCoreSpec >> transferSpec
+spec = pureCoreSpec >> transferSpec >> wiringSpec
 
 pureCoreSpec :: Spec
 pureCoreSpec = describe "Seal.Session.AgentMetaCache" $ do
@@ -259,3 +265,98 @@ isPrefixOfS = isPrefixOf
 
 isInfixOfS :: String -> String -> Bool
 isInfixOfS needle haystack = any (isPrefixOf needle) (tails haystack)
+
+-- ---------------------------------------------------------------------------
+-- Discovery wiring (URL probe + routing + GC)
+-- ---------------------------------------------------------------------------
+
+wiringSpec :: Spec
+wiringSpec = describe "Seal.Session.AgentMetaCache (discovery wiring)" $ do
+
+  describe "probeRepoUrlCmd / parseGitConfigUrl" $ do
+    it "anchors the git-config probe at the repo dir" $ do
+      ("cd '/srv/ws/repo' && git config --get remote.origin.url"
+         `T.isInfixOf` probeRepoUrlCmd "/srv/ws/repo") `shouldBe` True
+
+    it "parses a single-line url; rejects empty and multi-line output" $ do
+      parseGitConfigUrl "git@github.com:a/b.git\n" `shouldBe`
+        Just "git@github.com:a/b.git"
+      parseGitConfigUrl "  https://github.com/a/b.git  \n"
+        `shouldBe` Just "https://github.com/a/b.git"
+      parseGitConfigUrl "" `shouldBe` Nothing
+      parseGitConfigUrl "\n" `shouldBe` Nothing
+      parseGitConfigUrl "line1\nline2\n" `shouldBe` Nothing
+
+  describe "gcAgentMetaCache" $
+    it "keeps the newest N entries and removes the rest" $
+      withSystemTempDirectory "seal-amc-gc" $ \root -> do
+        now <- getCurrentTime
+        let mkEntry i age =
+              let d = root </> ("e" <> show i)
+              in do createDirectory d
+                    setModificationTime d (addUTCTime (-age) now)
+        mapM_ (uncurry mkEntry)
+          [(1 :: Int, 300 :: NominalDiffTime), (2, 200), (3, 100)]  -- e3 newest, e1 oldest
+        gcAgentMetaCache root 2
+        kept <- listDirectory root
+        sort kept `shouldBe` ["e2", "e3"]
+
+  describe "buildRoutingWorkdirFs" $ do
+
+    it "serves <repo>/.agents reads from the snapshot; passes others through" $ do
+      withSystemTempDirectory "seal-amc-route" $ \root -> do
+        passed <- newIORef []
+        let remoteFs = WorkdirFs
+              { wfsReadFile = \rp -> do
+                  modifyIORef' passed (++ [getRemotePath rp])
+                  pure (Right "REMOTE")
+              , wfsDoesFileExist = \_ -> pure False
+              , wfsDoesDirectoryExist = \_ -> pure True
+              , wfsListDirectory = \_ -> pure (Right [])
+              , wfsFileSize = \_ -> pure (Right 0)
+              , wfsModificationTime = \_ -> pure (Right unixEpoch)
+              , wfsSnapshot = error "snapshot unused in routing test"
+              }
+            runner = seqFakeRunner
+              [ "git@github.com:a/b.git\n"                 -- url probe
+              , T.replicate 64 "a" <> "  -\n"              -- content hash
+              ]
+            cacheRoot = root </> "cache"
+            runTransfer _ dest = do
+              createDirectoryIfMissing True (dest </> "agents" </> "x")
+              writeFile (dest </> "agents.md") "# local snapshot"
+              pure (Right ())
+            env = MetaCacheEnv runner sshCfg cacheRoot runTransfer
+        fs' <- buildRoutingWorkdirFs env remoteFs ["my-repo"]
+        -- Under the prefix: served LOCALLY (snapshot bytes, not "REMOTE").
+        rLocal <- wfsReadFile fs' =<< either (const (error "fixture")) pure
+                    (mkRemotePath "my-repo/.agents/agents.md")
+        rLocal `shouldBe` Right "# local snapshot"
+        -- Outside the prefix: passthrough to the underlying fs (recorded).
+        rRemote <- wfsReadFile fs' =<< either (const (error "fixture")) pure
+                     (mkRemotePath "other-repo/file.txt")
+        rRemote `shouldBe` Right "REMOTE"
+        passedNow <- readIORef passed
+        passedNow `shouldBe` ["other-repo/file.txt"]
+        -- Cache entry landed where expected (content-addressed).
+        let key = agentMetaCacheKey "git@github.com:a/b.git" (T.replicate 64 "a")
+        doesFileExist (cacheRoot </> T.unpack key </> "seal-meta.json")
+          `shouldReturn` True
+
+-- | A fake RemoteRunner answering each call with the next canned Text
+-- (oldest-first), staying at the last one once exhausted.
+seqFakeRunner :: [T.Text] -> RemoteRunner
+seqFakeRunner canned = unsafePerformIO $ do
+  ref <- newIORef canned
+  pure RemoteRunner
+    { runRemote      = \_ -> pop ref
+    , runRemoteStdin = \_ _ -> pop ref
+    , runRemoteEnv   = \_ _ -> pop ref
+    }
+  where
+    pop ref = atomicModifyIORef' ref $ \case
+      (t : ts)  -> (ts, Right t)
+      []        -> ([], Left ExecRemoteUnreachable)
+
+unixEpoch :: UTCTime
+unixEpoch = UTCTime (fromGregorian 1970 1 1) 0
