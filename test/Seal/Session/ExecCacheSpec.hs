@@ -109,8 +109,8 @@ spec = describe "Seal.Session.ExecCache" $ do
       snaps <- newIORef (0 :: Int)
       cache <- newSessionExecCacheWith (pure fakeNow)
       let fs = countingFs snaps protocolSeed
-      r1@(defs1, skills1) <- cachedWorkdirScan cache sidA fs wsRoot
-      r2 <- cachedWorkdirScan cache sidA fs wsRoot
+      r1@(defs1, skills1) <- cachedWorkdirScan cache sidA fs wsRoot Nothing
+      r2 <- cachedWorkdirScan cache sidA fs wsRoot Nothing
       r1 `shouldBe` r2
       map defIdOf defs1 `shouldBe` ["my-repo--agents-md", "my-repo--foo-agent"]
       length skills1 `shouldBe` 0
@@ -121,34 +121,34 @@ spec = describe "Seal.Session.ExecCache" $ do
       snaps <- newIORef (0 :: Int)
       cache <- newSessionExecCacheWith (readIORef nowRef)
       let fs = countingFs snaps protocolSeed
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
       modifyIORef' nowRef (addUTCTime 3600)
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
       readIORef snaps `shouldReturn` 2
 
     it "re-scans when the workspace root changes (config-switch guard)" $ do
       snaps <- newIORef (0 :: Int)
       cache <- newSessionExecCacheWith (pure fakeNow)
       let fs = countingFs snaps protocolSeed
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
-      _ <- cachedWorkdirScan cache sidA fs (WorkspaceRoot "/other/workspace")
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
+      _ <- cachedWorkdirScan cache sidA fs (WorkspaceRoot "/other/workspace") Nothing
       readIORef snaps `shouldReturn` 2
 
     it "invalidates explicitly (the SETUP_REPO hook)" $ do
       snaps <- newIORef (0 :: Int)
       cache <- newSessionExecCacheWith (pure fakeNow)
       let fs = countingFs snaps protocolSeed
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
       invalidateWorkdirScan cache sidA
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
       readIORef snaps `shouldReturn` 2
 
     it "caches per session" $ do
       snaps <- newIORef (0 :: Int)
       cache <- newSessionExecCacheWith (pure fakeNow)
       let fs = countingFs snaps protocolSeed
-      _ <- cachedWorkdirScan cache sidA fs wsRoot
-      _ <- cachedWorkdirScan cache sidB fs wsRoot
+      _ <- cachedWorkdirScan cache sidA fs wsRoot Nothing
+      _ <- cachedWorkdirScan cache sidB fs wsRoot Nothing
       readIORef snaps `shouldReturn` 2
 
 -- ---------------------------------------------------------------------------

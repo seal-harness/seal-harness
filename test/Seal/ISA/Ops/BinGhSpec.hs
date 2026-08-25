@@ -820,8 +820,8 @@ spec = describe "Seal.ISA.Ops.Bin (gh credential injection — BinGhSpec)" $ do
   -- before any real SSH call; only the log path is exercised.
   --------------------------------------------------------------------
 
-  describe "cross-WU: debug log shows real GH_TOKEN (for harness debugging)" $ do
-    it "a PAT-injection gh call logs the real GH_TOKEN value (not redacted)" $ do
+  describe "cross-WU: debug log redacts GH_TOKEN" $ do
+    it "a PAT-injection gh call logs GH_TOKEN redacted (never the raw token)" $ do
       deps <- mkPatDeps [patRepo] True
       let runner = mkFakeRemoteRunner (Right registeredUrl)
           uio = mkRemoteUntrustedIO sshCfg runner
@@ -829,6 +829,7 @@ spec = describe "Seal.ISA.Ops.Bin (gh credential injection — BinGhSpec)" $ do
         runOp uio deps testOp ghPrCreateInput
       orIsError result `shouldBe` False
       let allText = T.unlines lines_
-      -- Debug logs on the harness machine show the real GH_TOKEN value
-      -- (the harness machine is trusted; these logs are for debugging).
-      ("GH_TOKEN=ghp_FAKE_TOKEN_12345" `T.isInfixOf` allText) `shouldBe` True
+      -- Secrets NEVER reach the log: the value renders as <redacted>
+      -- while the key stays visible for diagnosing injection plumbing.
+      ("GH_TOKEN=<redacted>" `T.isInfixOf` allText) `shouldBe` True
+      ("ghp_FAKE_TOKEN_12345" `T.isInfixOf` allText) `shouldBe` False

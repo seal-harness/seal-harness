@@ -62,36 +62,38 @@ withCaptureGlobalLogger action = do
   pure (result, lines_)
 
 spec :: Spec
-spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug (shows real values for debugging)" $ do
+spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug (redacts secret env values)" $ do
 
-  -- The harness machine is trusted and debug logs are for debugging only.
-  -- The real env values (including secrets like GH_TOKEN) are shown so
-  -- operators can diagnose credential-injection issues. The redaction
-  -- seam (secretEnvKeys/redactEnv) is kept available for future use cases
-  -- where logs might be shipped to an untrusted aggregator, but
-  -- logExecDebug itself does NOT redact.
+  -- Secrets NEVER reach the debug log. The harness machine being trusted
+  -- does not exempt it: logs are piped to consoles, files, and CI where
+  -- plaintext credentials are one scrollback-paste away from leaking.
+  -- Non-secret env keys pass through unchanged so operators can still
+  -- diagnose credential-injection plumbing.
 
-  it "shows the real GH_TOKEN value in the env extras (local arm shape)" $ do
+  it "redacts the GH_TOKEN value in the env extras (local arm shape)" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "gh pr create"] Nothing
         [("GH_TOKEN", "ghp_secret123"), ("GIT_TERMINAL_PROMPT", "0")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GH_TOKEN=ghp_secret123" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GH_TOKEN=<redacted>" `T.isInfixOf`)
+    allText `shouldNotSatisfy` ("ghp_secret123" `T.isInfixOf`)
     allText `shouldSatisfy` ("GIT_TERMINAL_PROMPT=0" `T.isInfixOf`)
 
-  it "shows the real GITHUB_TOKEN value in the env extras" $ do
+  it "redacts the GITHUB_TOKEN value in the env extras" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "gh pr create"] Nothing
         [("GITHUB_TOKEN", "ghp_secretABC")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GITHUB_TOKEN=ghp_secretABC" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GITHUB_TOKEN=<redacted>" `T.isInfixOf`)
+    allText `shouldNotSatisfy` ("ghp_secretABC" `T.isInfixOf`)
 
-  it "shows the real http.extraHeader value (defense-in-depth)" $ do
+  it "redacts the http.extraHeader value (defense-in-depth)" $ do
     (_, lines_) <- withCaptureGlobalLogger $
       logExecDebug "[local]" ["/bin/sh", "-c", "git fetch"] Nothing
         [("http.extraHeader", "Authorization: Basic c2VjcmV0")]
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("http.extraHeader=Authorization: Basic c2VjcmV0" `T.isInfixOf`)
+    allText `shouldSatisfy` ("http.extraHeader=<redacted>" `T.isInfixOf`)
+    allText `shouldNotSatisfy` ("c2VjcmV0" `T.isInfixOf`)
 
   it "preserves non-secret env keys unchanged" $ do
     (_, lines_) <- withCaptureGlobalLogger $
@@ -101,7 +103,7 @@ spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug (shows real values for
     allText `shouldSatisfy` ("GIT_TERMINAL_PROMPT=0" `T.isInfixOf`)
     allText `shouldSatisfy` ("SSH_AUTH_SOCK=/tmp/agent.sock" `T.isInfixOf`)
 
-  it "shows the real token in the remote arm's logged message (uioBinExecEnv)" $ do
+  it "redacts the token in the remote arm's logged message (uioBinExecEnv)" $ do
     let runner = mkFakeRemoteRunner (Right "")
         uio = mkRemoteUntrustedIO sshCfg runner
     bin <- either (const (error "fixture")) pure (mkBinName "gh")
@@ -109,7 +111,8 @@ spec = describe "Seal.Tools.Exec.UntrustedIO logExecDebug (shows real values for
     (_, lines_) <- withCaptureGlobalLogger $
       uioBinExecEnv uio [("GH_TOKEN", "ghp_secretXYZ")] bin [arg] Nothing
     let allText = T.unlines lines_
-    allText `shouldSatisfy` ("GH_TOKEN=ghp_secretXYZ" `T.isInfixOf`)
+    allText `shouldSatisfy` ("GH_TOKEN=<redacted>" `T.isInfixOf`)
+    allText `shouldNotSatisfy` ("ghp_secretXYZ" `T.isInfixOf`)
 
 -- | A placeholder SSH config for the remote-arm test (the fake runner
 -- ignores the connection details; only the workspace root matters for

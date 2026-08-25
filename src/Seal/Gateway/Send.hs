@@ -82,6 +82,7 @@ import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
   , SessionLocks )
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -168,6 +169,13 @@ data SendDeps = SendDeps
     -- ^ The per-process session-exec + workdir-discovery cache, shared with
     -- the gateway's 'ApiDeps' so a scan runs once per session across ALL
     -- surfaces (turns, /call dispatches, GET /api/sessions/:id/agents).
+  , sdRemoteRunner :: Maybe RemoteRunner
+    -- ^ Test seam (mirrors 'TurnDeps.tdRemoteRunner'): when 'Just', replaces
+    -- 'mkRealRemoteRunner' as the SSH runner used to build the session exec
+    -- in mode=remote. 'Nothing' (production) uses the real runner. Gateway
+    -- API integration tests inject a recording fake so the composed ssh
+    -- argv — the fully-rendered remote command — is observable without a
+    -- live SSH host.
   }
 
 -- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
@@ -209,6 +217,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdIsRemote     = sdIsRemote deps
   , tdBaseBackends = sdBackends deps
   , tdExecCache    = sdExecCache deps
+  , tdRemoteRunner = sdRemoteRunner deps
   }
 
 -- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:

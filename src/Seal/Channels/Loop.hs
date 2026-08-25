@@ -209,6 +209,7 @@ mkChannelTurnDeps deps = TurnDeps
   , tdIsRemote     = cdIsRemote deps
   , tdBaseBackends = cdBackends deps
   , tdExecCache    = cdExecCache deps
+  , tdRemoteRunner = Nothing
   }
 
 -- | Build the channel 'TurnAdapter' for a given 'ChannelHandle' +

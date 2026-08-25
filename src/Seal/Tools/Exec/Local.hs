@@ -205,10 +205,19 @@ withManagedProcess cp action = bracket create cleanup runAction
         (Just hOut, Just hErr) -> pure (ph, mIn, hOut, hErr, mPid)
         _                      -> error "withManagedProcess: pipe creation failed (unreachable)"
     cleanup (ph, mIn, hOut, hErr, mPid) = do
-      -- Kill the process group first (SIGTERM → grace → SIGKILL).
-      case mPid of
-        Nothing -> pure ()
-        Just pid -> killProcessGroup pid defaultKillGraceMicros
+      -- Fast path: if the child ALREADY exited (the common success path),
+      -- there is nothing to kill. Killing here would (a) tax every
+      -- successful exec with the full SIGTERM→SIGKILL grace wait and
+      -- (b) signal the backgrounded @ssh@ ControlMaster that shares the
+      -- child's process group on the remote arm — destroying connection
+      -- multiplexing (every subsequent remote op would pay a fresh
+      -- TCP+key-exchange+auth handshake).
+      mec <- getProcessExitCode ph
+      case mec of
+        Just _  -> pure ()
+        Nothing -> case mPid of
+          Nothing   -> pure ()
+          Just pid  -> killProcessGroup ph pid defaultKillGraceMicros
       -- Close the stdin (if open), stdout, stderr handles.
       case mIn of
         Nothing -> pure ()
@@ -238,23 +247,45 @@ reapBounded ph = go (100 :: Int)  -- 100 polls × 10ms = 1s deadline
           threadDelay 10_000  -- 10ms
           go (n - 1)
 
--- | Kill a process group: SIGTERM → grace period → SIGKILL.
+-- | Kill a process group: SIGTERM → bounded grace → SIGKILL.
 -- POSIX: 'signalProcessGroup' sends a signal to every process in the group.
 -- The @graceMicros@ is the SIGTERM→SIGKILL grace period. Because the child
 -- was spawned with @create_group = True@, its PGID equals its PID.
-killProcessGroup :: Int -> Int -> IO ()
-killProcessGroup pid graceMicros = do
+--
+-- The grace period POLLS for the child's exit (every 10ms) instead of
+-- sleeping the full duration: a child that dies on SIGTERM — the normal
+-- case — lets cleanup return within ~10ms, and only a stubborn child pays
+-- the full grace before SIGKILL. The trailing SIGKILL is unconditional
+-- (idempotent on already-dead processes) so no group member can outlive
+-- the kill on the cancel path.
+killProcessGroup :: ProcessHandle -> Int -> Int -> IO ()
+killProcessGroup ph pid graceMicros = do
   -- The child is in its own group (create_group=True), so its PGID == its PID.
   -- 'signalProcessGroup' takes a ProcessGroupID; a CPid and ProcessGroupID
   -- are both newtype'd Int, so we coerce via fromIntegral.
   let pgid = fromIntegral pid :: Posix.ProcessGroupID
   -- SIGTERM the whole group.
   _ <- try @IOException (Posix.signalProcessGroup Posix.sigTERM pgid)
-  -- Wait the grace period.
-  threadDelay graceMicros
+  -- Poll for exit within the grace budget (no blind sleep).
+  _ <- pollExitBounded ph graceMicros
   -- SIGKILL the whole group (idempotent on already-dead processes).
   _ <- try @IOException (Posix.signalProcessGroup Posix.sigKILL pgid)
   pure ()
+
+-- | Poll 'getProcessExitCode' every 10ms up to @budgetMicros@. Returns
+-- 'True' if the child exited within budget.
+pollExitBounded :: ProcessHandle -> Int -> IO Bool
+pollExitBounded ph budgetMicros = go (budgetMicros `div` 10_000)
+  where
+    go :: Int -> IO Bool
+    go 0 = pure False  -- out of budget; caller escalates to SIGKILL
+    go n = do
+      mec <- getProcessExitCode ph
+      case mec of
+        Just _  -> pure True
+        Nothing -> do
+          threadDelay 10_000
+          go (n - 1)
 
 -- | Read at most N bytes from a handle, returning the content. If the
 -- stream has more than N bytes remaining, a truncation marker is appended:
