@@ -21,6 +21,10 @@ import qualified Seal.Tui
 import qualified Seal.Channels.Signal.Run
 import qualified Seal.Channels.Telegram.Run
 import qualified Seal.Command.Serve
+import qualified Seal.Gateway.OpenApi
+
+import Data.ByteString.Lazy qualified as BL
+import System.IO (stdout)
 
 -- | Program information for 'runWithConfiguration'. Provides @--config-file@,
 -- @--print-config@, and @--help@ automatically.
@@ -43,6 +47,7 @@ dispatch cfg =
       CommandSignal autonomy -> liftIO (Seal.Channels.Signal.Run.runSignalMain autonomy logger)
       CommandTelegram autonomy -> liftIO (Seal.Channels.Telegram.Run.runTelegramMain autonomy logger)
       CommandServe autonomy -> liftIO (Seal.Command.Serve.runServeMain autonomy logger)
+      CommandGenOpenApi -> liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)
 
 -- | Map the process arguments so that an empty argument list behaves as if
 -- @--help@ was passed. Running @seal@ with no arguments should print usage
