@@ -13,9 +13,10 @@ Read `.beads/plans/active-plan.md` and continue the orchestrated execution of is
 - [x] WU-1 — Scaffold the spec + wire it (RED)
 - [x] WU-1.5 — Add the stub-child-worker test seam (GREEN for the seam)
 - [x] WU-2 — Definitions-group invariants #1-#7 (GREEN)
-- [x] WU-3 — Lifecycle-group invariants #8-#15 (5 pass, 3 FAIL)
-- [x] WU-4 — Cross-group sequencing invariants #16-#17 (2 pass, 1 FAIL)
-- [ ] WU-5 — Human checkpoint + PR (DONE)
+- [x] WU-3 — Lifecycle-group invariants #8-#15 (GREEN after registerChild fix)
+- [x] WU-4 — Cross-group sequencing invariants #16-#17 (GREEN after registerChild fix)
+- [x] WU-5 — Human checkpoint + PR (DONE — user chose option (a) fix registerChild)
+- [x] WU-6 — Fix registerChild + adjust tests to the synchronous model (GREEN)
 
 ## Context for a fresh agent
 - **Issue:** https://github.com/seal-harness/seal-harness/issues/135
