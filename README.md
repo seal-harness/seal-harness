@@ -10,6 +10,10 @@
 <p align="center">
   <a href="https://github.com/seal-harness/seal-harness/actions/workflows/ci.yml"><img src="https://github.com/seal-harness/seal-harness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue" alt="License"></a>
+  <br>
+  <a href="https://seal-harness.github.io/seal-harness/api/index.html">API Docs</a>
+  &nbsp;&bull;&nbsp;
+  <a href="https://seal-harness.github.io/seal-harness/coverage/main/hpc_index.html">Code Coverage</a>
 </p>
 
 ---
