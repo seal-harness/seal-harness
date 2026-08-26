@@ -275,6 +275,10 @@ runServeMain autonomy logger = do
         , sdRemoteRunner = Nothing
           -- ^ ONE shared instance: turns (web + channels), /call dispatches,
           -- and GET /api/sessions/:id/agents all hit the same cache.
+        , sdMkWorker    = Nothing
+          -- ^ Production: always use the real 'buildWorker' →
+          -- 'mkDelegateWorker' path. The 'sdMkWorker' seam is for gateway
+          -- API integration tests only.
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)

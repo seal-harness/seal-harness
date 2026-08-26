@@ -41,6 +41,7 @@ module Seal.ISA.Ops.Agent
   ) where
 
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad (zipWithM_)
 import Data.Aeson
   ( Value (..), object, withObject, (.:), (.:?), (.=) )
 import Data.Aeson.Key (fromText)
@@ -69,7 +70,7 @@ import Seal.Agent.Runtime.Delegation
   )
 import Seal.Agent.Runtime.Registry
   ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
-  , interruptAgent, listAgents, stopAgent )
+  , interruptAgent, listAgents, registerCompletedAgent, stopAgent )
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -421,14 +422,18 @@ agentStartOp wiring = TrustedOpcode
           case eResults of
             Left err -> pure (OpResult [TrpText err] True (object []))
             Right results -> do
-              -- Register each finished child (no-op in the synchronous
-              -- model; the 'ChildResult' payload IS the post-hoc record).
-              -- Kept for a future enhancement that registers before the run
-              -- (requires a fork-based model).
-              mapM_ (liftIO . registerChild (aswRuntime wiring)) results
+              -- Register each finished child in the runtime registry so
+              -- AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe
+              -- it after the synchronous run completes. The child is
+              -- recorded with status Stopped (the synchronous worker has
+              -- already finished by the time we reach here). Zipped with
+              -- the input tasks to recover the AgentDefId (the ChildResult
+              -- carries the SubagentId but not the def id).
+              let tasks = diTasks di
+              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) t r)) tasks results
               let rendered = encodeResultsJson results
               pure (OpResult [TrpText rendered] False (object ["results" .= results]))
-  }
+   }
 
 -- | Parse the model's input into a 'DelegateInput'. Single mode requires
 -- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
@@ -483,11 +488,26 @@ resolveTask defBackend _runtime mintSession _parentDepth worker task = do
           pure (Right (def, worker, sid))
 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
--- ran synchronously). No-op in the synchronous model — the 'ChildResult'
--- payload IS the post-hoc record. Kept for a future enhancement that
--- registers before the run (requires a fork-based model).
-registerChild :: AgentRuntime -> ChildResult -> IO ()
-registerChild _ _ = pure ()
+-- ran synchronously to completion). Records the instance with status
+-- 'Stopped' (the synchronous child has already finished by the time this is
+-- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
+-- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
+-- carries the 'SubagentId' but not the def id).
+registerChild :: AgentRuntime -> ChildTask -> ChildResult -> IO ()
+registerChild runtime task result =
+  case mkAgentDefId (ctDefId task) of
+    Left _ -> pure ()  -- malformed def id; skip registration
+    Right aid ->
+      case crChildSession result of
+        Nothing -> pure ()  -- no child session; skip (error/timeout case)
+        Just session -> do
+          let depth = 0  -- parent depth; the child's is depth+1 (not tracked here)
+          registerCompletedAgent runtime aid (crSubagentId result) session depth
+
+-- | Extract the task list from a 'DelegateInput' (in order).
+diTasks :: DelegateInput -> [ChildTask]
+diTasks (DiSingle t) = [t]
+diTasks (DiBatch ts) = ts
 
 -- ---------------------------------------------------------------------------
 -- AGENT_STATUS

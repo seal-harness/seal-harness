@@ -24,6 +24,7 @@ module Seal.Agent.Runtime.Registry
   , AgentRuntime
   , newAgentRuntime
   , startAgent
+  , registerCompletedAgent
   , stopAgent
   , interruptAgent
   , listAgents
@@ -31,7 +32,7 @@ module Seal.Agent.Runtime.Registry
   , agentInstanceBySubagentId
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Data.Map.Strict (Map)
@@ -99,6 +100,25 @@ startAgent (AgentRuntime tv) aid subagentId session depth worker = do
     Nothing   -> do
       killThread tid
       pure (Left "agent already running for this subagent id")
+
+-- | Register a synchronously-completed child in the runtime registry. The
+-- synchronous delegation model runs the worker to completion BEFORE this is
+-- called (the 'ChildResult' payload IS the post-hoc record), so the instance
+-- is recorded with status 'Stopped' (the child has already finished) and the
+-- @ThreadId@ of the registering thread (the parent's). This makes the child
+-- visible to 'AGENT_INSTANCES' / 'AGENT_STATUS' / 'AGENT_STOP' after the
+-- synchronous run completes. 'AGENT_STOP' removes it; 'AGENT_INTERRUPT'
+-- flips its status to 'Interrupted' (a no-op for an already-stopped child,
+-- but harmless). Idempotent: re-registering the same subagent id overwrites
+-- the prior entry (the second registration wins).
+registerCompletedAgent
+  :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> Int -> IO ()
+registerCompletedAgent (AgentRuntime tv) aid subagentId session depth = do
+  tid <- myThreadId
+  atomically $ do
+    insts <- readTVar tv
+    let inst = AgentInstance aid subagentId session Stopped tid depth
+    writeTVar tv (Map.insert subagentId inst insts)
 
 -- | Run the worker action, transitioning the instance to 'Crashed' on
 -- exception. A normal completion leaves the status as 'Running' until the

@@ -83,6 +83,7 @@ import Seal.Session.Lock
   , SessionLocks )
 import Seal.Tools.Exec.Abort (SessionAbortRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner)
+import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -176,6 +177,13 @@ data SendDeps = SendDeps
     -- API integration tests inject a recording fake so the composed ssh
     -- argv — the fully-rendered remote command — is observable without a
     -- live SSH host.
+  , sdMkWorker :: Maybe AgentWorkerBuilder
+    -- ^ Test seam (mirrors 'sdRemoteRunner' / 'TurnDeps.tdMkWorker'): when
+    -- 'Just', replaces 'buildWorker' as the 'AGENT_START' worker-builder.
+    -- 'Nothing' (production) uses the real 'buildWorker' →
+    -- 'mkDelegateWorker' path. Gateway API integration tests inject a stub
+    -- worker so 'AGENT_START' can run through the gateway without a real
+    -- provider call.
   }
 
 -- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
@@ -218,6 +226,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdBaseBackends = sdBackends deps
   , tdExecCache    = sdExecCache deps
   , tdRemoteRunner = sdRemoteRunner deps
+  , tdMkWorker    = sdMkWorker deps
   }
 
 -- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:
