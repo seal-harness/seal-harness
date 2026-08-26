@@ -4,9 +4,9 @@ module Seal.Gateway.ServerSpec (spec) where
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.IORef (newIORef)
 import Data.Time (UTCTime(..), fromGregorian)
-import Network.HTTP.Types (statusCode)
+import Network.HTTP.Types (methodGet, statusCode)
 import Network.Wai
-  ( Application, Request, defaultRequest, pathInfo, responseStatus )
+  ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -110,3 +110,15 @@ spec = describe "Seal.Gateway.Server" $ do
       let app = gatewayApp deps (Just dir)
       status <- runAppStatus app (defaultRequest { pathInfo = [] })
       status `shouldBe` 200
+
+  it "gatewayApp serves /api/openapi.json as JSON" $ do
+    deps <- mkDeps
+    let app = gatewayApp deps Nothing
+    status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi.json"], requestMethod = methodGet })
+    status `shouldBe` 200
+
+  it "gatewayApp serves /api/openapi as HTML (Swagger UI)" $ do
+    deps <- mkDeps
+    let app = gatewayApp deps Nothing
+    status <- runAppStatus app (defaultRequest { pathInfo = ["api", "openapi"], requestMethod = methodGet })
+    status `shouldBe` 200

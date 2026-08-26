@@ -20,6 +20,7 @@ data Command
   | CommandSignal AutonomyLevel
   | CommandTelegram AutonomyLevel
   | CommandServe AutonomyLevel
+  | CommandGenOpenApi
   deriving (Eq, Show)
 
 pCommand :: Parser Command
@@ -27,11 +28,13 @@ pCommand = hsubparser
   $  command "tui" (info (CommandTui <$> pAutonomy)
                          (progDesc "Start the interactive terminal UI (TUI)"))
   <> command "signal" (info (CommandSignal <$> pAutonomy)
-                            (progDesc "Run the agent over the Signal channel"))
+                             (progDesc "Run the agent over the Signal channel"))
   <> command "telegram" (info (CommandTelegram <$> pAutonomy)
-                              (progDesc "Run the agent over the Telegram channel"))
+                               (progDesc "Run the agent over the Telegram channel"))
   <> command "serve" (info (CommandServe <$> pAutonomy)
-                           (progDesc "Run the web gateway server"))
+                            (progDesc "Run the web gateway server"))
+  <> command "gen-openapi" (info (pure CommandGenOpenApi)
+                                  (progDesc "Print the OpenAPI 3.1 spec (JSON) to stdout"))
 
 -- | @--yolo@ sets 'Full' autonomy (bypass the untrusted-opcode approval
 -- gate); absent defaults to 'Supervised'.

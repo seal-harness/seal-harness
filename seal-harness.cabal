@@ -162,12 +162,13 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.API
-        Seal.Gateway.Route
-        Seal.Gateway.Send
-        Seal.Gateway.SessionJson
-        Seal.Gateway.ListsSnapshot
-        Seal.Gateway.Broadcast
-        Seal.Gateway.Server
+         Seal.Gateway.Route
+         Seal.Gateway.Send
+         Seal.Gateway.SessionJson
+         Seal.Gateway.ListsSnapshot
+         Seal.Gateway.Broadcast
+         Seal.Gateway.Server
+         Seal.Gateway.OpenApi
          Seal.Gateway.Stream
          Seal.Gateway.StreamBroker
          Seal.Gateway.Transcript
@@ -321,6 +322,8 @@ test-suite tests
       , tomland
       , validation-selective
       , unordered-containers
+      , lens
+      , openapi-hs
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -340,6 +343,7 @@ test-suite tests
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
         Seal.Gateway.TranscriptSpec
+        Seal.Gateway.OpenApiSpec
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
         Seal.Harness.ReconcileSpec

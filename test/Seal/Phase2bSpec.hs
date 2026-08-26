@@ -165,10 +165,19 @@ spec = describe "Seal.Phase2bSpec" $ do
           }
     sigLogger2 <- testSealLogger
     runSignalLoop testRegistry emptyChain (allow, 1998) acct transport tabsH askReply sr plainHandler sigLogger2
-    -- The plain turn is forked so the loop can keep receiving; give the
-    -- forked thread a moment to finish its runTurn + chSend before reading
-    -- the captured sends.
-    threadDelay 100000  -- 100ms
+    -- The plain turn is forked so the loop can keep receiving; poll for the
+    -- expected sends instead of a fixed sleep (the forked runTurn + chSend
+    -- can take >100ms on a loaded CI runner).
+    let waitFor p = do
+          let go n
+                | n >= 50 = pure ()  -- 50 × 20ms = 1s max
+                | otherwise = do
+                    done <- p
+                    if done then pure () else threadDelay 20000 >> go (n + 1)
+          go (0 :: Int)
+    waitFor $ do
+      cap <- getCaptured
+      pure ("pong" `elem` map snd cap && "reply from model" `elem` map snd cap)
     cap <- getCaptured
     -- /ping dispatched → pong sent via the handle
     map snd cap `shouldContain` ["pong"]
