@@ -769,3 +769,21 @@ body {
   color: var(--accent-primary);
 }
 .session-archive svg { display: block; }
+
+/* SHOW_HUMAN message formatting (lightweight markdown rendering inside
+   the ToolCallBlock). Inherits text color from the parent; only adds
+   spacing and minor structural styles. */
+.show-human-message h4,
+.show-human-message h5,
+.show-human-message h6 {
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+.show-human-message p:last-child,
+.show-human-message ul:last-child,
+.show-human-message ol:last-child,
+.show-human-message pre:last-child,
+.show-human-message blockquote:last-child,
+.show-human-message hr:last-child {
+  margin-bottom: 0;
+}

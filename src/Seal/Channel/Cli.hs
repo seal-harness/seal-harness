@@ -154,6 +154,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
       hlSettings     = innerSettings { historyFile = Just histFile }
       caps = def
         { ccSend         = putStrLn . T.unpack
+       , ccShowHuman    = putStrLn . T.unpack
         , ccPrompt       = \(AskPrompt prompt opts) ->
             runInputT innerSettings $ do
               mLine <- getInputLine (T.unpack (formatQuestionWithOptions prompt opts))
@@ -192,6 +193,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
         let bgSid = smId meta
             bgCaps = def
               { ccSend = ccSend caps
+              , ccShowHuman = ccShowHuman caps
               , ccPrompt = \(AskPrompt q opts) -> do
                   outcome <- askHumanWithOptions askReply bgSid q opts
                                (\_qid -> ccSend caps (formatQuestionWithOptions q opts))

@@ -1156,6 +1156,75 @@ describe('SessionSetup Agent dropdown', () => {
   })
 })
 
+// ── SHOW_HUMAN rendering ──────────────────────────────────────────────────
+
+describe('ShowHumanMessage', () => {
+  function makeShowHumanMessage(message: string, overrides: Partial<Message> = {}): Message {
+    return {
+      id: 'm1',
+      entryId: 'e1',
+      agentName: 'Seal',
+      agentStatus: 'completed',
+      timestamp: '2024-06-01 12:00:00',
+      blocks: [{
+        id: 'b1',
+        toolCall: {
+          id: 'tool-1',
+          name: 'SHOW_HUMAN',
+          input: { message },
+        },
+      }],
+      rawJson: '{}',
+      ...overrides,
+    }
+  }
+
+  it('renders the SHOW_HUMAN message text in the tool-call header', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[makeShowHumanMessage('Build completed successfully')]}
+      />,
+    )
+    // The message text appears in the header summary
+    // The message text should appear at least once (header + expanded body)
+    expect(screen.getAllByText('Build completed successfully').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('renders formatted markdown in the expanded SHOW_HUMAN box', () => {
+    const md = '# Build Report\n\nThe build **succeeded** with `0` errors.\n\n- Step 1\n- Step 2'
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[makeShowHumanMessage(md)]}
+      />,
+    )
+    // The heading text should be rendered (in an h4/h5/h6 element)
+    const heading = screen.getByText('Build Report')
+    expect(heading.tagName.toLowerCase()).toMatch(/^h[456]$/)
+    // Bold text should be in a <strong> element
+    expect(screen.getByText('succeeded').tagName).toBe('STRONG')
+    // Inline code should be in a <code> element
+    const codeEl = document.querySelector('.show-human-message code')
+    expect(codeEl).toBeTruthy()
+    expect(codeEl!.textContent).toBe('0')
+    // List items should be present
+    expect(screen.getByText('Step 1')).toBeTruthy()
+    expect(screen.getByText('Step 2')).toBeTruthy()
+  })
+
+  it('does not show raw JSON Input section for SHOW_HUMAN', () => {
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={[makeShowHumanMessage('hello world')]}
+      />,
+    )
+    // The "Input" label (shown for raw JSON in normal tool calls) should NOT appear
+    expect(screen.queryByText('Input')).toBeNull()
+  })
+})
+
 // ── AskHumanForm (W8) ─────────────────────────────────────────────────────
 
 describe('AskHumanForm', () => {

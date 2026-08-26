@@ -102,6 +102,7 @@ noOpSeam = RepoTestSeam
 capsFrom :: FakeCaps -> ChannelCaps
 capsFrom fc = ChannelCaps
   { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
+  , ccShowHuman    = \_ -> pure ()
   , ccPrompt       = \_ -> pure ""
   , ccPromptSecret = \_ -> pure ""
   , ccStreaming    = False

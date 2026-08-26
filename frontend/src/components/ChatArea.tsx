@@ -640,6 +640,187 @@ function toolCallSummary(input: unknown): string {
   return JSON.stringify(obj)
 }
 
+/** A lightweight markdown renderer for SHOW_HUMAN messages. Handles the
+ *  most common markdown features: headers (h1-h3), bold, italic, inline
+ *  code, code blocks (fenced), unordered lists, ordered lists, blockquotes,
+ *  and horizontal rules. Falls back gracefully — any unrecognized line is
+ *  rendered as a paragraph with whitespace preserved. No HTML is produced
+ *  directly; everything is React elements (XSS-safe by construction). */
+function ShowHumanMessage({ text }: { text: string }) {
+  const blocks = parseMarkdown(text)
+  return (
+    <div className="show-human-message" style={{ color: 'var(--text-primary)', lineHeight: 'var(--leading-relaxed)' }}>
+      {blocks.map((b, i) => renderBlock(b, i))}
+    </div>
+  )
+}
+
+type MdBlock =
+  | { kind: 'heading'; level: number; inline: MdInline[] }
+  | { kind: 'code'; lang: string; code: string }
+  | { kind: 'para'; inline: MdInline[] }
+  | { kind: 'ul'; items: MdInline[][] }
+  | { kind: 'ol'; items: MdInline[][] }
+  | { kind: 'quote'; inline: MdInline[] }
+  | { kind: 'hr' }
+
+type MdInline =
+  | { kind: 'text'; text: string }
+  | { kind: 'bold'; inline: MdInline[] }
+  | { kind: 'italic'; inline: MdInline[] }
+  | { kind: 'code'; code: string }
+
+function parseMarkdown(text: string): MdBlock[] {
+  const lines = text.split('\n')
+  const blocks: MdBlock[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]!
+    // Skip blank lines
+    if (line.trim() === '') { i++; continue }
+    // Fenced code block
+    const fence = line.match(/^```(\w*)/)
+    if (fence) {
+      const lang = fence[1] ?? ''
+      const codeLines: string[] = []
+      i++
+      while (i < lines.length && !lines[i]!.trim().startsWith('```')) {
+        codeLines.push(lines[i]!)
+        i++
+      }
+      i++ // skip closing ```
+      blocks.push({ kind: 'code', lang, code: codeLines.join('\n') })
+      continue
+    }
+    // Heading
+    const heading = line.match(/^(#{1,3})\s+(.*)/)
+    if (heading) {
+      blocks.push({ kind: 'heading', level: heading[1]!.length, inline: parseInline(heading[2]!) })
+      i++
+      continue
+    }
+    // Horizontal rule
+    if (/^---+\s*$/.test(line)) {
+      blocks.push({ kind: 'hr' })
+      i++
+      continue
+    }
+    // Blockquote
+    if (line.startsWith('> ')) {
+      const quoteLines: string[] = [line.slice(2)]
+      i++
+      while (i < lines.length && lines[i]!.startsWith('> ')) {
+        quoteLines.push(lines[i]!.slice(2))
+        i++
+      }
+      blocks.push({ kind: 'quote', inline: parseInline(quoteLines.join(' ')) })
+      continue
+    }
+    // Unordered list
+    if (/^[-*]\s+/.test(line)) {
+      const items: MdInline[][] = []
+      while (i < lines.length && /^[-*]\s+/.test(lines[i]!)) {
+        items.push(parseInline(lines[i]!.replace(/^[-*]\s+/, '')))
+        i++
+      }
+      blocks.push({ kind: 'ul', items })
+      continue
+    }
+    // Ordered list
+    if (/^\d+\.\s+/.test(line)) {
+      const items: MdInline[][] = []
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i]!)) {
+        items.push(parseInline(lines[i]!.replace(/^\d+\.\s+/, '')))
+        i++
+      }
+      blocks.push({ kind: 'ol', items })
+      continue
+    }
+    // Paragraph: collect consecutive non-blank, non-special lines
+    const paraLines: string[] = [line]
+    i++
+    while (i < lines.length && lines[i]!.trim() !== '' &&
+           !/^(#{1,3}\s|```|[-*]\s|\d+\.\s|>\s|---)/.test(lines[i]!)) {
+      paraLines.push(lines[i]!)
+      i++
+    }
+    blocks.push({ kind: 'para', inline: parseInline(paraLines.join(' ')) })
+  }
+  return blocks
+}
+
+function parseInline(text: string): MdInline[] {
+  const result: MdInline[] = []
+  let remaining = text
+  while (remaining.length > 0) {
+    // Bold: **text** or __text__
+    const bold = remaining.match(/\*\*(.+?)\*\*|__(.+?)__/)
+    // Italic: *text* or _text_ (but not ** or __)
+    const italic = remaining.match(/\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)/)
+    // Inline code: `text`
+    const code = remaining.match(/`([^`]+)`/)
+    // Find the earliest match
+    let bestIdx = Infinity
+    let bestMatch: RegExpMatchArray | null = null
+    let bestKind: 'bold' | 'italic' | 'code' | null = null
+    if (bold && bold.index! < bestIdx) { bestIdx = bold.index!; bestMatch = bold; bestKind = 'bold' }
+    if (italic && italic.index! < bestIdx) { bestIdx = italic.index!; bestMatch = italic; bestKind = 'italic' }
+    if (code && code.index! < bestIdx) { bestIdx = code.index!; bestMatch = code; bestKind = 'code' }
+    if (bestMatch === null || bestKind === null) {
+      result.push({ kind: 'text', text: remaining })
+      break
+    }
+    // Push any text before the match
+    if (bestIdx > 0) result.push({ kind: 'text', text: remaining.slice(0, bestIdx) })
+    // Push the matched element
+    if (bestKind === 'code') {
+      result.push({ kind: 'code', code: bestMatch[1]! })
+    } else if (bestKind === 'bold') {
+      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
+      result.push({ kind: 'bold', inline: parseInline(inner) })
+    } else if (bestKind === 'italic') {
+      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
+      result.push({ kind: 'italic', inline: parseInline(inner) })
+    }
+    remaining = remaining.slice(bestIdx + bestMatch[0].length)
+  }
+  return result
+}
+
+function renderInline(inline: MdInline, key: number): React.ReactNode {
+  switch (inline.kind) {
+    case 'text': return inline.text
+    case 'bold': return <strong key={key}>{inline.inline.map(renderInline)}</strong>
+    case 'italic': return <em key={key}>{inline.inline.map(renderInline)}</em>
+    case 'code': return <code key={key} className="inline-code">{inline.code}</code>
+  }
+}
+
+function renderBlock(block: MdBlock, key: number): React.ReactNode {
+  switch (block.kind) {
+    case 'heading': {
+      const Tag = (block.level <= 1 ? 'h4' : block.level === 2 ? 'h5' : 'h6') as React.ElementType
+      return <Tag key={key} style={{ margin: '0.5em 0 0.3em', fontWeight: 600 }}>{block.inline.map(renderInline)}</Tag>
+    }
+    case 'code':
+      return <pre key={key} className="code-block" style={{ margin: '0.5em 0', maxHeight: 400, overflow: 'auto' }}>{block.code}</pre>
+    case 'para':
+      return <p key={key} style={{ margin: '0.3em 0' }}>{block.inline.map(renderInline)}</p>
+    case 'ul':
+      return <ul key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'disc' }}>
+        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
+      </ul>
+    case 'ol':
+      return <ol key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'decimal' }}>
+        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
+      </ol>
+    case 'quote':
+      return <blockquote key={key} style={{ borderLeft: '3px solid var(--border)', margin: '0.3em 0', paddingLeft: '1em', color: 'var(--text-muted)' }}>{block.inline.map(renderInline)}</blockquote>
+    case 'hr':
+      return <hr key={key} style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.5em 0' }} />
+  }
+}
+
 const RESULT_PREVIEW_LINES = 4
 
 /** Renders a tool-call result. Short results (≤ RESULT_PREVIEW_LINES) inline.
@@ -824,14 +1005,18 @@ function ToolCallBlock({
   // ASK_HUMAN (no options), the form also renders outside, so stay collapsed.
   const hasOptions = (pendingQuestion?.options?.length ?? 0) > 0
   const isAskHuman = tc.name === 'ASK_HUMAN'
+  const isShowHuman = tc.name === 'SHOW_HUMAN'
+  const showHumanMsg = isShowHuman ? (tc.input as Record<string, unknown> | null)?.message : undefined
   const [expanded, setExpanded] = useState(targeted || (pendingQuestion !== undefined && !hasOptions && !isAskHuman))
 
-  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman])
+  useEffect(() => { if (targeted || (pendingQuestion && !hasOptions && !isAskHuman)) setExpanded(true) }, [targeted, pendingQuestion, hasOptions, isAskHuman, isShowHuman])
 
   const summary = toolCallSummary(tc.input)
   const inputJson = (() => {
     try { return JSON.stringify(tc.input, null, 2) } catch { return String(tc.input) }
   })()
+  const [showHumanExpanded, setShowHumanExpanded] = useState(true)
+  const effectivelyExpanded = isShowHuman ? showHumanExpanded : expanded
 
   const hasResult = tc.result !== undefined
   const failed = tc.exitCode !== undefined && tc.exitCode !== null
@@ -859,9 +1044,9 @@ function ToolCallBlock({
     >
       <div
         className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none"
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => isShowHuman ? setShowHumanExpanded(!showHumanExpanded) : setExpanded(!expanded)}
       >
-        <span style={{ fontSize: 10, opacity: 0.6 }}>{expanded ? '\u25BC' : '\u25B6'}</span>
+        <span style={{ fontSize: 10, opacity: 0.6 }}>{effectivelyExpanded ? '\u25BC' : '\u25B6'}</span>
         <span
           className="text-xs font-semibold"
           style={{ color: isPending ? 'var(--needs-input)' : failed ? 'var(--needs-input)' : 'var(--accent-secondary)' }}
@@ -872,7 +1057,7 @@ function ToolCallBlock({
           className="text-xs flex-1 truncate"
           style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}
         >
-          {summary}
+          {isShowHuman && typeof showHumanMsg === 'string' ? showHumanMsg : summary}
         </span>
         {isPending && (
           <span className="pill" style={{ background: 'rgba(255,193,7,0.12)', color: 'var(--needs-input)' }}>
@@ -890,8 +1075,12 @@ function ToolCallBlock({
           </span>
         )}
       </div>
-      {expanded && (
+      {effectivelyExpanded && (
         <div className="px-3 pb-3 pt-1 flex flex-col gap-2" style={{ borderTop: '1px solid var(--border)' }}>
+          {isShowHuman && typeof showHumanMsg === 'string' ? (
+            <ShowHumanMessage text={showHumanMsg} />
+          ) : (
+          <>
           <div>
             <div className="text-xs font-medium mb-1" style={{ color: 'var(--text-muted)' }}>Input</div>
             <pre className="code-block" style={{ maxHeight: 240, overflow: 'auto', margin: 0 }}>
@@ -926,6 +1115,8 @@ function ToolCallBlock({
             <div className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
               Awaiting result\u2026
             </div>
+          )}
+          </>
           )}
         </div>
       )}
