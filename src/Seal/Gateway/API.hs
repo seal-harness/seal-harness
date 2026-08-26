@@ -82,6 +82,7 @@ import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.StreamBroker (StreamBroker, thinkingSessions)
+import Seal.Gateway.OpenApi (encodeOpenApi)
 import Seal.Gateway.Transcript
   (readTranscriptEntriesTimed, renderServerTiming, setEncodeMs, showIso)
 import Seal.Handles.Tab (TabIndex, TabKind (..), mkTabIndex, tabIndexToInt)
@@ -555,9 +556,28 @@ apiApp deps req respond =
     (m', ["api", "adopt"]) | m' == methodPost -> do
       body <- collectBody req
       respond =<< handleAdopt deps body
+    (m', ["api", "openapi.json"]) | m' == methodGet ->
+      respond (jsonLBS status200 encodeOpenApi)
+    (m', ["api", "openapi"]) | m' == methodGet ->
+      respond (responseLBS status200 [("Content-Type", "text/html")] swaggerUiHtml)
     (m', _) | m' == methodOptions ->
       respond (responseLBS status200 corsHeaders "")
     _ -> respond (responseLBS status404 [("Content-Type", "application/json")] "{\"error\":\"not found\"}")
+
+-- | A static Swagger UI page that fetches @\/api\/openapi.json@ and renders
+-- the spec. Served at @GET \/api\/openapi@ (no external dependencies — the
+-- Swagger UI dist is loaded from @unpkg.com@).
+swaggerUiHtml :: BL.ByteString
+swaggerUiHtml = BL.fromChunks
+  [ "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+  , "<title>Seal Harness API Docs</title>"
+  , "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui.css\">"
+  , "</head><body><div id=\"swagger-ui\"></div>"
+  , "<script src=\"https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-bundle.js\"></script>"
+  , "<script src=\"https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-standalone-preset.js\"></script>"
+  , "<script>window.onload=function(){SwaggerUIBundle({url:'/api/openapi.json',dom_id:'#swagger-ui',deepLinking:true,presets:[SwaggerUIBundle.presets.apis,SwaggerUIStandalonePreset],layout:'StandaloneLayout'});};</script>"
+  , "</body></html>"
+  ]
 
 -- | Read the entire request body (collect chunks until empty).
 collectBody :: Request -> IO BL.ByteString
