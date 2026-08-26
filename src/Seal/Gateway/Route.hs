@@ -15,11 +15,35 @@ module Seal.Gateway.Route
   , routeMeta
   , allRoutes
   , sealRouter
+  , Resp
+  , Req
+  , AnswerReq (..)
+  , SessionIdOrErr (..)
+  , AgentDefIdOrErr (..)
+  , SkillIdOrErr (..)
+  , RepoIdOrErr (..)
+  , TabIndexOrErr (..)
+  , AskIdOrErr (..)
+  , sessionIdCapture
+  , agentDefIdCapture
+  , skillIdCapture
+  , repoIdCapture
+  , tabIndexCapture
+  , askIdCapture
+  , textCapture
+  , freeFormBodyCodec
   ) where
 
+import Control.Lens ((&), (?~))
+import Data.ByteString.Lazy qualified as BL
 import Data.Either (fromRight)
 import Data.Kind (Type)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.OpenApi
+  ( OpenApiType (..), OpenApiTypeValue (..), ToParamSchema (..), ToSchema (..)
+  , AdditionalProperties (..), NamedSchema (..), Schema, type_, additionalProperties )
 import Data.Text (Text)
+import Trasa.Codec (BodyCodec (..))
 import Trasa.Core
   ( Router, Meta (..), MetaCodec, CaptureCodec (..)
   , Bodiedness (..), Param
@@ -309,6 +333,28 @@ textCapture = CaptureCodec
   }
 
 -- ---------------------------------------------------------------------------
+-- ToParamSchema instances for the capture newtypes (OpenAPI generation)
+-- ---------------------------------------------------------------------------
+
+-- | All the validated-capture newtypes ('SessionIdOrErr', 'AgentDefIdOrErr',
+-- etc.) represent path segments serialized as strings. The 'ToParamSchema'
+-- instance renders a plain string schema so @trasa-openapi-hs@ can emit a
+-- 'OpenApiSchema' for each path parameter without needing the underlying
+-- validated type.
+instance ToParamSchema SessionIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema AgentDefIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema SkillIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema RepoIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema TabIndexOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema AskIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+
+-- ---------------------------------------------------------------------------
 -- Body + response codecs (TODO W6b — implement in Seal.Gateway.Route.Codec)
 -- ---------------------------------------------------------------------------
 
@@ -317,3 +363,39 @@ data AnswerReq = AnswerReq
   { arAnswer :: !Text
   , arScope :: !Text
   } deriving stock (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Free-form JSON schema + dummy JSON instances for the opaque body/response
+-- marker types (OpenAPI generation). The handlers build 'Value's directly, so
+-- these instances exist solely so 'Trasa.OpenApi.Codec.openApiJsonBody' can
+-- produce an 'OpenApiBodyCodec' for each route. The 'ToJSON'/'FromJSON'
+-- instances are never called by the OpenAPI generator (it only reads the
+-- schema + media types); they're total dummies that satisfy the class
+-- constraints. The 'ToSchema' instances render a free-form object schema
+-- (@{"type":"object","additionalProperties":true}@).
+-- ---------------------------------------------------------------------------
+
+freeFormObjectSchema :: Schema
+freeFormObjectSchema = mempty
+  & type_ ?~ OpenApiTypeSingle OpenApiObject
+  & additionalProperties ?~ AdditionalPropertiesAllowed True
+
+instance ToSchema Resp where
+  declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)
+instance ToSchema Req where
+  declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)
+instance ToSchema AnswerReq where
+  declareNamedSchema _ = pure (NamedSchema Nothing freeFormObjectSchema)
+
+-- | A dummy 'BodyCodec' for the opaque marker types ('Resp', 'Req',
+-- 'AnswerReq'). The OpenAPI generator only reads the media types from
+-- 'bodyCodecNames' (the encode/decode functions are never called — the
+-- generator builds a schema document, not a server). The functions are total
+-- bottoms ('Left "unused") so they can't accidentally produce a value of the
+-- uninhabited 'Resp'/'Req' types.
+freeFormBodyCodec :: BodyCodec a
+freeFormBodyCodec = BodyCodec
+  { bodyCodecNames = "application/json" :| []
+  , bodyCodecEncode = const BL.empty
+  , bodyCodecDecode = \_ -> Left "freeFormBodyCodec: unused (OpenAPI generation only)"
+  }

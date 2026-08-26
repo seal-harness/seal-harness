@@ -162,12 +162,13 @@ library
         Seal.Media.Tts
          Seal.Gateway.Config
           Seal.Gateway.API
-        Seal.Gateway.Route
-        Seal.Gateway.Send
-        Seal.Gateway.SessionJson
-        Seal.Gateway.ListsSnapshot
-        Seal.Gateway.Broadcast
-        Seal.Gateway.Server
+         Seal.Gateway.Route
+         Seal.Gateway.Send
+         Seal.Gateway.SessionJson
+         Seal.Gateway.ListsSnapshot
+         Seal.Gateway.Broadcast
+         Seal.Gateway.Server
+         Seal.Gateway.OpenApi
          Seal.Gateway.Stream
          Seal.Gateway.StreamBroker
          Seal.Gateway.Transcript
