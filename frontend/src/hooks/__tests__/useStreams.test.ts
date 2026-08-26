@@ -120,6 +120,30 @@ describe('reconcileEntries', () => {
   it('appends to an empty list', () => {
     expect(reconcileEntries([], e1)).toEqual([e1])
   })
+
+  it('evicts a streaming placeholder when a finalized entry arrives', () => {
+    const streaming = { ...makeEntry('streaming', '2026-01-01T00:00:02Z'), streaming: true }
+    const finalized = makeEntry('real-1', '2026-01-01T00:00:02Z')
+    // A streaming placeholder is in the list, then a finalized entry with a
+    // DIFFERENT id arrives. The streaming placeholder should be evicted (not
+    // left as a duplicate) and the finalized entry inserted.
+    const result = reconcileEntries([e1, streaming], finalized)
+    expect(result).toHaveLength(2)
+    expect(result[0]!.id).toBe('e1')
+    expect(result[1]!.id).toBe('real-1')
+    expect(result.find((e) => e.streaming)).toBeUndefined()
+  })
+
+  it('does not evict streaming entries when an entry-update arrives', () => {
+    const streaming = { ...makeEntry('streaming', '2026-01-01T00:00:02Z'), streaming: true }
+    const update = { ...makeEntry('streaming', '2026-01-01T00:00:02Z', 'growing text'), streaming: true }
+    // An entry-update (streaming: true) replaces the streaming placeholder in
+    // place by id — it should NOT evict it.
+    const result = reconcileEntries([e1, streaming], update)
+    expect(result).toHaveLength(2)
+    expect(result[1]!.streaming).toBe(true)
+    expect(result[1]!.payload).toBe('growing text')
+  })
 })
 
 describe('useTranscriptStream', () => {

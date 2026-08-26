@@ -42,6 +42,19 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     length a `shouldBe` 1  -- received (session a matches)
     length b `shouldBe` 0  -- filtered out (session b != a)
 
+  it "BeEntryUpdate is session-filtered like BeEntryRecorded" $ do
+    broker <- newStreamBroker 10
+    refA <- newIORef ([] :: [BrokerEvent])
+    refB <- newIORef ([] :: [BrokerEvent])
+    void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' refA (e :))
+    void $ subscribeTest broker (mkSid "b") (\e -> modifyIORef' refB (e :))
+    let entry = object ["id" .= ("streaming" :: T.Text)]
+    broadcast broker (BeEntryUpdate (mkSid "a") entry)
+    a <- readIORef refA
+    b <- readIORef refB
+    length a `shouldBe` 1  -- received (session a matches)
+    length b `shouldBe` 0  -- filtered out (session b != a)
+
   it "broadcastLists delivers to all subscribers" $ do
     broker <- newStreamBroker 10
     refA <- newIORef ([] :: [BrokerEvent])
