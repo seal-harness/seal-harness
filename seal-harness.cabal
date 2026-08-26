@@ -321,6 +321,8 @@ test-suite tests
       , tomland
       , validation-selective
       , unordered-containers
+      , lens
+      , openapi-hs
     hs-source-dirs: test
     other-modules:
         Seal.Core.ChannelKindSpec
@@ -339,6 +341,7 @@ test-suite tests
         Seal.Gateway.StreamBrokerSpec
         Seal.Gateway.StreamSpec
         Seal.Gateway.TranscriptSpec
+        Seal.Gateway.OpenApiSpec
         Seal.Harness.IdSpec
         Seal.Harness.RegistrySpec
         Seal.Harness.ReconcileSpec
