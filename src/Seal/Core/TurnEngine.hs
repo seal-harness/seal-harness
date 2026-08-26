@@ -393,6 +393,15 @@ data TurnDeps = TurnDeps
     -- remote command — is observable without a live SSH host. Never set in
     -- production; the field exists solely so gateway API integration tests
     -- can assert local/remote parity of the composed untrusted commands.
+  , tdMkWorker :: Maybe AgentWorkerBuilder
+    -- ^ Test seam (mirrors 'tdRemoteRunner'): when 'Just', replaces
+    -- 'buildWorker' as the 'AGENT_START' worker-builder used by
+    -- 'buildStartWiring'. 'Nothing' (production wiring) always uses the
+    -- real 'buildWorker' → 'mkDelegateWorker' path. Gateway API integration
+    -- tests inject a stub worker so 'AGENT_START' can run through the
+    -- gateway without a real provider call. Never set in production; the
+    -- field exists solely so gateway API integration tests can exercise
+    -- 'AGENT_START' end-to-end.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -883,7 +892,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswParentActivity = Just (bParentActivity (tdBaseBackends td))
     , aswMintSession = mintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = buildWorker td parentSid appEnv eCfg operatorCeiling channel
+    , aswWorker = fromMaybe (buildWorker td parentSid appEnv eCfg operatorCeiling channel) (tdMkWorker td)
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three

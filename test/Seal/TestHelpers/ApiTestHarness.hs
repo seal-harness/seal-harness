@@ -36,6 +36,8 @@ module Seal.TestHelpers.ApiTestHarness
   , readFileStrict
   , isInfixOfStr
   , testPatToken
+    -- * Stub child worker
+  , stubChildWorker
   ) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -105,6 +107,9 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
+import Seal.Agent.Runtime.Delegation
+  ( AgentWorkerBuilder, ChildWorkerOutcome (..)
+  , ChildExitReason (..) )
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError)
@@ -147,7 +152,7 @@ testPatToken :: Text
 testPatToken = "seal-test-pat-token-12345"
 
 -- | Options for 'runApiTestOpts'.
-newtype ApiTestOptions = ApiTestOptions
+data ApiTestOptions = ApiTestOptions
   { atoFakeRemoteRunner :: Bool
     -- ^ In remote mode, inject a content-routed recording fake as the SSH
     -- runner (via 'sdRemoteRunner') instead of the real runner. The fake
@@ -156,10 +161,21 @@ newtype ApiTestOptions = ApiTestOptions
     -- target — while still capturing the fully-composed remote command for
     -- assertion. Local mode is unaffected (the local executor has no runner
     -- seam; it really executes).
+  , atoChildWorker :: Maybe AgentWorkerBuilder
+    -- ^ When 'Just', inject a stub 'AgentWorkerBuilder' (via 'sdMkWorker' →
+    -- 'tdMkWorker') so 'AGENT_START' can run through the gateway without a
+    -- real provider call. 'Nothing' (the default — preserves existing
+    -- tests' behavior) uses the production 'buildWorker' →
+    -- 'mkDelegateWorker' path. Gateway API integration tests inject a stub
+    -- that returns a 'ChildWorkerOutcome' immediately so the start completes
+    -- synchronously.
   }
 
 defaultApiTestOptions :: ApiTestOptions
-defaultApiTestOptions = ApiTestOptions { atoFakeRemoteRunner = False }
+defaultApiTestOptions = ApiTestOptions
+  { atoFakeRemoteRunner = False
+  , atoChildWorker = Nothing
+  }
 
 -- ---------------------------------------------------------------------------
 -- Dummy repo
@@ -455,6 +471,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdIsRemote = mode == UemRemote
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
+        , sdMkWorker = atoChildWorker opts
         }
       deps = ApiDeps
         { adSessionRuntime = sr
@@ -804,3 +821,16 @@ testSshToLocalhost =
           writeFile authKeysPath filtered
         pure (sshEc == ExitSuccess))
     (\(_ :: SomeException) -> pure False)
+
+-- | A stub 'AgentWorkerBuilder' for gateway API integration tests that
+-- exercise 'AGENT_START'. Returns a 'ChildWorkerOutcome' immediately — no
+-- provider call, no real turn — so 'AGENT_START' completes synchronously
+-- through the gateway without a live LLM. The child "completes" with the
+-- 'SessionId' it was passed (the second argument), mirroring what the
+-- production 'mkDelegateWorker' reports via 'cwoChildSession'. The
+-- 'ChildRunHooks' are ignored (matching the production worker's discard of
+-- them at 'Seal.Agent.Runtime.Delegation.Worker' line 155) — surfacing the
+-- @_hooks@ no-op is the job of the integration tests, not this stub.
+stubChildWorker :: AgentWorkerBuilder
+stubChildWorker _def sid _task _hooks =
+  pure (ChildWorkerOutcome (Just "child done") CerCompleted 0 0 (Just sid))

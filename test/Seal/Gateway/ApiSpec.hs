@@ -3700,6 +3700,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdIsRemote    = False
             , sdExecCache   = execCache404
             , sdRemoteRunner = Nothing
+            , sdMkWorker    = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3799,6 +3800,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdIsRemote    = False
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
+            , sdMkWorker    = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3930,6 +3932,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdIsRemote    = False
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
+            , sdMkWorker    = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4046,6 +4049,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdIsRemote    = False
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
+            , sdMkWorker    = Nothing
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
