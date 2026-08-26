@@ -10,11 +10,11 @@
 Read `.beads/plans/active-plan.md` and continue the orchestrated execution of issue #135 (AGENT_ opcode invariant integration tests). The plan-review gate approved this plan (3 iterations, all 3 reviewers PASS on Rev 3). Work units WU-1 → WU-1.5 → WU-2 → WU-3 → WU-4 → WU-5 are sequential. Current progress is tracked in the "Execution state" section below — pick up at the next pending WU. The branch `test/agent-opcode-invariants` is already checked out. Follow the 4-phase loop per WU: IMPLEMENT → VALIDATE (`make check` or cabal test --match) → ADVERSARIAL REVIEW → COMMIT. The human checkpoint is WU-5: present the 4 failing tests to the user, who decides fix / pendingWith / defer.
 
 ## Execution state
-- [ ] WU-1 — Scaffold the spec + wire it (RED)
-- [ ] WU-1.5 — Add the stub-child-worker test seam (GREEN for the seam)
-- [ ] WU-2 — Definitions-group invariants #1-#7 (GREEN)
-- [ ] WU-3 — Lifecycle-group invariants #8-#15 (5 pass, 3 FAIL)
-- [ ] WU-4 — Cross-group sequencing invariants #16-#17 (2 pass, 1 FAIL)
+- [x] WU-1 — Scaffold the spec + wire it (RED)
+- [x] WU-1.5 — Add the stub-child-worker test seam (GREEN for the seam)
+- [x] WU-2 — Definitions-group invariants #1-#7 (GREEN)
+- [x] WU-3 — Lifecycle-group invariants #8-#15 (5 pass, 3 FAIL)
+- [x] WU-4 — Cross-group sequencing invariants #16-#17 (2 pass, 1 FAIL)
 - [ ] WU-5 — Human checkpoint + PR (DONE)
 
 ## Context for a fresh agent
