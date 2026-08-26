@@ -139,7 +139,10 @@ jobs:
       - name: Generate OpenAPI spec
         if: always()
         run: |
-          nix develop --command cabal run exe:seal -- gen-openapi > openapi.json 2>/dev/null
+          # Use the already-built binary from the 'Build' step (the ./result
+          # symlink created by `nix build`). cabal run would print build
+          # progress to stdout, contaminating the JSON output.
+          ./result/bin/seal gen-openapi > openapi.json
           if [ -s openapi.json ]; then
             echo "OpenAPI spec generated ($(wc -c < openapi.json) bytes)"
           else
