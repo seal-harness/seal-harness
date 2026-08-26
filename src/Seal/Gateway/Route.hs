@@ -32,6 +32,9 @@ module Seal.Gateway.Route
   , askIdCapture
   , textCapture
   , freeFormBodyCodec
+  , respCodec
+  , reqCodec
+  , answerReqCodec
   ) where
 
 import Control.Lens ((&), (?~))
@@ -43,7 +46,7 @@ import Data.OpenApi
   ( OpenApiType (..), OpenApiTypeValue (..), ToParamSchema (..), ToSchema (..)
   , AdditionalProperties (..), NamedSchema (..), Schema, type_, additionalProperties )
 import Data.Text (Text)
-import Trasa.Codec (BodyCodec (..))
+import Trasa.Codec (BodyCodec (..), jsonBodyCodec)
 import Trasa.Core
   ( Router, Meta (..), MetaCodec, CaptureCodec (..)
   , Bodiedness (..), Param
@@ -140,64 +143,69 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
--- All routes are queryless (@qend@). Body-bearing routes use @body (one
--- aesonBodyCodec)@; bodyless routes use @bodyless@.
+-- All routes are queryless (@qend@). Body-bearing routes use
+-- @body (one reqCodec)@ (a dummy 'BodyCodec' — the handler builds the
+-- 'Response' directly; trasa's response encoding is never invoked);
+-- bodyless routes use @bodyless@. Response codecs are @resp (one respCodec)@
+-- (also a dummy — see 'freeFormBodyCodec'). 'RouteHealth' uses
+-- 'jsonBodyCodec' since its response type is 'Text' (which has real
+-- 'ToJSON'/'FromJSON' instances).
 routeMeta :: SealRoute caps qrys req resp -> MetaCodec caps qrys req resp
 routeMeta = \case
-  RouteHealth -> Meta (match "health" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteTabsList -> Meta (match "tabs" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteTabsNew -> Meta (match "tabs" ./ match "new" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteTabsClose -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "close" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteTabsDismiss -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "dismiss" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteTabsAcknowledge -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "acknowledge" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteTabsRelease -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "release" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteTabsDestroy -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "destroy" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteLists -> Meta (match "lists" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionsList -> Meta (match "sessions" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionsArchived -> Meta (match "sessions" ./ match "archived" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionTranscript -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "transcript" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionSend -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "send" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionStop -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "stop" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionSetupRepo -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "setup-repo" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionAgents -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "agents" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionDescription -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "description" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteSessionArchived -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "archived" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteSessionPrompt -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "prompt" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteSessionAgent -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "agent" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteSessionQuestions -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSessionAnswer -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ capture askIdCapture ./ match "answer" ./ end) qend (body (one (error "answerReqCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionAskCancel -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ capture askIdCapture ./ match "cancel" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionNew -> Meta (match "sessions" ./ match "new" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteSessionNewFrom -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "new" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteHarnesses -> Meta (match "harnesses" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteHarnessDiscover -> Meta (match "harnesses" ./ match "discover" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteAgentsList -> Meta (match "agents" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteAgentDefaultGet -> Meta (match "agents" ./ match "default" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteAgentDefaultPut -> Meta (match "agents" ./ match "default" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteAgentGet -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteAgentCreate -> Meta (match "agents" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteAgentUpdate -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteAgentDelete -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.delete
-  RouteSkillsList -> Meta (match "skills" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSkillGet -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteSkillCreate -> Meta (match "skills" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteSkillUpdate -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteSkillDelete -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.delete
-  RouteReposList -> Meta (match "repos" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteRepoCreate -> Meta (match "repos" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteRepoGet -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteRepoUpdate -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteRepoDelete -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.delete
-  RouteRepoDeployKey -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteRepoDeployKeyGenerate -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ match "generate" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteProvidersList -> Meta (match "providers" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteProviderModels -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteProviderModelContext -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ capture textCapture ./ match "context" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one (error "respCodec: TODO"))) M.get
-  RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.put
-  RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
-  RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one (error "aesonBodyCodec: TODO"))) (resp (one (error "respCodec: TODO"))) M.post
+  RouteHealth -> Meta (match "health" ./ end) qend bodyless (resp (one jsonBodyCodec)) M.get
+  RouteTabsList -> Meta (match "tabs" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteTabsNew -> Meta (match "tabs" ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteTabsClose -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "close" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsDismiss -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "dismiss" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsAcknowledge -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "acknowledge" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsRelease -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "release" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteTabsDestroy -> Meta (match "tabs" ./ capture tabIndexCapture ./ match "destroy" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteLists -> Meta (match "lists" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionsList -> Meta (match "sessions" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionsArchived -> Meta (match "sessions" ./ match "archived" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionTranscript -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "transcript" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionSend -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "send" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSessionStop -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "stop" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteSessionSetupRepo -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "setup-repo" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSessionAgents -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "agents" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionDescription -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "description" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteSessionArchived -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "archived" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteSessionPrompt -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "prompt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteSessionAgent -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "agent" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteSessionQuestions -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSessionAnswer -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ capture askIdCapture ./ match "answer" ./ end) qend (body (one answerReqCodec)) (resp (one respCodec)) M.post
+  RouteSessionAskCancel -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "questions" ./ capture askIdCapture ./ match "cancel" ./ end) qend bodyless (resp (one respCodec)) M.post
+  RouteSessionNew -> Meta (match "sessions" ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSessionNewFrom -> Meta (match "sessions" ./ capture sessionIdCapture ./ match "new" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteHarnesses -> Meta (match "harnesses" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteHarnessDiscover -> Meta (match "harnesses" ./ match "discover" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteAgentsList -> Meta (match "agents" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteAgentDefaultGet -> Meta (match "agents" ./ match "default" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteAgentDefaultPut -> Meta (match "agents" ./ match "default" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteAgentGet -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteAgentCreate -> Meta (match "agents" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteAgentUpdate -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteAgentDelete -> Meta (match "agents" ./ capture agentDefIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
+  RouteSkillsList -> Meta (match "skills" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSkillGet -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSkillCreate -> Meta (match "skills" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSkillUpdate -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteSkillDelete -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
+  RouteReposList -> Meta (match "repos" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteRepoCreate -> Meta (match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteRepoGet -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteRepoUpdate -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteRepoDelete -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
+  RouteRepoDeployKey -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteRepoDeployKeyGenerate -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ match "generate" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteProvidersList -> Meta (match "providers" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteProviderModels -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteProviderModelContext -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ capture textCapture ./ match "context" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -399,3 +407,17 @@ freeFormBodyCodec = BodyCodec
   , bodyCodecEncode = const BL.empty
   , bodyCodecDecode = \_ -> Left "freeFormBodyCodec: unused (OpenAPI generation only)"
   }
+
+-- | The response codec for 'Resp' routes (dummy — the handler builds the
+-- 'Response' directly; trasa's response encoding is never invoked).
+respCodec :: BodyCodec Resp
+respCodec = freeFormBodyCodec
+
+-- | The request codec for 'Req'-body routes (dummy — the wrapper parses the
+-- body bytes itself and hands them to the handler).
+reqCodec :: BodyCodec Req
+reqCodec = freeFormBodyCodec
+
+-- | The request codec for 'AnswerReq'-body routes (dummy).
+answerReqCodec :: BodyCodec AnswerReq
+answerReqCodec = freeFormBodyCodec
