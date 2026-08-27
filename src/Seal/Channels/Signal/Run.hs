@@ -116,6 +116,7 @@ runSignalLoop registry chain (allow, chunkLimit) account transport tabsH askRepl
     let h = toHandle ch
         handleCaps = Data.Default.def
           { ccSend         = chSend h
+          , ccShowHuman    = chSend h
           , ccPrompt       = \(AskPrompt q opts) -> do
               -- Bind the pending question to the active session so the
               -- next inbound message from the peer (delivered via

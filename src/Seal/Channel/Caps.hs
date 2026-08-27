@@ -32,6 +32,15 @@ data ChannelCaps = ChannelCaps
   -- web). When 'False' (Telegram, Signal), the loop skips per-delta
   -- 'ccSend' and sends the accumulated text once at the end via the
   -- normal stop path — avoiding a flood of per-token messages.
+  , ccShowHuman    :: Text -> IO ()
+  -- ^ Display a message to the human operator, guaranteed to be shown
+  -- regardless of channel-specific verbosity settings or streaming
+  -- suppression. Unlike 'ccSend' (which may be subject to future
+  -- verbosity / intermediate-output suppression in chat channels), this
+  -- is the SHOW_HUMAN contract: the message WILL reach the user. Web
+  -- channels can leave this as a no-op (the message surfaces via the
+  -- transcript + ToolCallBlock rendering); chat channels wire it to
+  -- their 'chSend'.
   }
 
 -- | The default 'ChannelCaps': all IO actions are no-ops and streaming is
@@ -45,4 +54,5 @@ instance Default ChannelCaps where
     , ccPrompt       = \_ -> pure ""
     , ccPromptSecret = \_ -> pure ""
     , ccStreaming    = True
+    , ccShowHuman    = \_ -> pure ()
     }

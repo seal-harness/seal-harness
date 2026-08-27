@@ -30,6 +30,7 @@ makeFakeCaps inputs = do
       popSecret _prompt = popQueue inputRef
       caps = def
         { ccSend         = \t -> modifyIORef sentRef (t :)
+        , ccShowHuman    = \t -> modifyIORef sentRef (t :)
         , ccPrompt       = popPrompt
         , ccPromptSecret = popSecret
   , ccStreaming    = True  -- tests: streaming by default
