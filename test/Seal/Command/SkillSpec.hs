@@ -5,7 +5,7 @@ import Data.Aeson (object)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as AKey
 import Data.Aeson.KeyMap qualified as KM
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -15,7 +15,7 @@ import Test.Hspec
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Command.Call (CallDispatcher)
-import Seal.Command.Skill (renderSkillInfo, renderSkillLine, skillCommandSpec)
+import Seal.Command.Skill (PostLoadTurn, renderSkillInfo, renderSkillLine, skillCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Core.Types (OpName (..), mkSystemSessionId)
 import Seal.ISA.Dispatch (DispatchError (..))
@@ -79,9 +79,33 @@ runSkillWith skills dispatcher argv fc = do
         , ccPromptSecret = \_ -> pure ""
   , ccStreaming    = True  -- tests: streaming by default
         }
-  case execParserPure defaultPrefs (csParserInfo (skillCommandSpec backend dispatcher)) argv of
+  case execParserPure defaultPrefs (csParserInfo (skillCommandSpec backend dispatcher Nothing)) argv of
     Success act -> runCommandAction act caps
     _           -> expectationFailure ("parse failed: " <> show argv)
+
+-- | Run a /skill command with a PostLoadTurn callback. Used to test the
+-- auto-turn behavior after a successful skill load.
+runSkillWithPostLoad :: [Skill] -> CallDispatcher -> Maybe PostLoadTurn -> [String] -> FakeCaps -> IO ()
+runSkillWithPostLoad skills dispatcher mPostLoad argv fc = do
+  backend <- noneBackend
+  mapM_ (sbCreate backend) skills
+  let caps = def
+        { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
+        , ccPrompt       = \_ -> pure ""
+        , ccPromptSecret = \_ -> pure ""
+  , ccStreaming    = True
+        }
+  case execParserPure defaultPrefs (csParserInfo (skillCommandSpec backend dispatcher mPostLoad)) argv of
+    Success act -> runCommandAction act caps
+    _           -> expectationFailure ("parse failed: " <> show argv)
+
+-- | A recording PostLoadTurn that captures whether it was called and with
+-- what message text.
+recordingPostLoad :: IO (PostLoadTurn, IO (Maybe Text))
+recordingPostLoad = do
+  ref <- newIORef (Nothing :: Maybe Text)
+  let cb msg = writeIORef ref (Just msg)
+  pure (cb, readIORef ref)
 
 spec :: Spec
 spec = describe "Seal.Command.Skill" $ do
@@ -190,3 +214,52 @@ spec = describe "Seal.Command.Skill" $ do
       runSkillWith [] dispatcher ["load", "start", "do", "something", "now"] fc
       val <- getInput
       requireTextField val "message" `shouldReturn` "do something now"
+
+  describe "/skill load auto-turn" $ do
+    it "calls PostLoadTurn with the trailing message after a successful load" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, _getInput) <- recordingDispatcher
+      (postLoad, getPostLoad) <- recordingPostLoad
+      runSkillWithPostLoad [] dispatcher (Just postLoad) ["load", "start", "do", "something"] fc
+      mCalled <- getPostLoad
+      mCalled `shouldBe` Just "do something"
+
+    it "does NOT call PostLoadTurn when no trailing message is supplied" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, _getInput) <- recordingDispatcher
+      (postLoad, getPostLoad) <- recordingPostLoad
+      runSkillWithPostLoad [] dispatcher (Just postLoad) ["load", "greet"] fc
+      mCalled <- getPostLoad
+      mCalled `shouldBe` Nothing
+
+    it "does NOT call PostLoadTurn when the load fails (error result)" $ do
+      (fc, _) <- makeFakeCaps []
+      let dispatcher = fakeLoadDispatcher ["skill not found"] True
+      (postLoad, getPostLoad) <- recordingPostLoad
+      runSkillWithPostLoad [] dispatcher (Just postLoad) ["load", "nope", "do", "something"] fc
+      mCalled <- getPostLoad
+      mCalled `shouldBe` Nothing
+
+    it "does NOT call PostLoadTurn when the dispatch returns Left" $ do
+      (fc, _) <- makeFakeCaps []
+      let dispatcher = fakeErrorDispatcher (OpNotFound (OpName "SKILL_LOAD"))
+      (postLoad, getPostLoad) <- recordingPostLoad
+      runSkillWithPostLoad [] dispatcher (Just postLoad) ["load", "greet", "do", "something"] fc
+      mCalled <- getPostLoad
+      mCalled `shouldBe` Nothing
+
+    it "does NOT call PostLoadTurn when callback is Nothing" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, _getInput) <- recordingDispatcher
+      runSkillWithPostLoad [] dispatcher Nothing ["load", "start", "do", "something"] fc
+      -- No assertion needed — the test passes if it doesn't crash.
+      -- The behavior is: no turn is triggered (Nothing callback).
+      pure ()
+
+    it "does NOT call PostLoadTurn for whitespace-only trailing message" $ do
+      (fc, _) <- makeFakeCaps []
+      (dispatcher, _getInput) <- recordingDispatcher
+      (postLoad, getPostLoad) <- recordingPostLoad
+      runSkillWithPostLoad [] dispatcher (Just postLoad) ["load", "greet", "   "] fc
+      mCalled <- getPostLoad
+      mCalled `shouldBe` Nothing

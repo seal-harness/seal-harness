@@ -238,7 +238,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
           case toError outcome of
             Just err -> ccSend caps ("bg failed: " <> err)
             Nothing  -> pure ()))
-      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher])
+      registryWithBg = mkRegistry (registrySpecs registry <> [backgroundCommandSpec bgRunner, callCommandSpec callDispatcher, skillCommandSpec skillBackend callDispatcher (Just plainHandler)])
       -- The /call dispatcher: dispatch an opcode against the active
       -- session's ISA registry + transcript under Full autonomy (the
       -- operator is the approver by typing /call). Returns the

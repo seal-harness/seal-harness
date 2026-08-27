@@ -12,6 +12,7 @@
 -- pasting the body.
 module Seal.Command.Skill
   ( skillCommandSpec
+  , PostLoadTurn
   , renderSkillLine
   , renderSkillInfo
   ) where
@@ -32,38 +33,59 @@ import Seal.ISA.Opcode (OpResult (..))
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
 
+-- | An optional callback invoked after a successful @/skill load@ to trigger
+-- an LLM turn on the active session. The callback receives the trailing
+-- message text from the @/skill load@ invocation. When the message is
+-- non-empty and the callback is 'Just', 'loadCmd' calls it so the LLM
+-- processes the skill body + user message immediately (no need for the
+-- user to send another message). When the message is empty or the callback
+-- is 'Nothing', no turn is triggered (the skill body is in
+-- @conversation.jsonl@ and will be seen on the next user message).
+--
+-- The callback is channel-specific: the CLI wires it to its 'plainHandler',
+-- the web gateway to its 'plainTurn', and inbox channels to their
+-- 'runTurnOnSession'. This keeps the turn-triggering mechanism in the
+-- wiring layer (which has 'TurnDeps' + 'SessionMeta') rather than the
+-- command layer (which only has 'ChannelCaps' + 'CallDispatcher').
+type PostLoadTurn = Text -> IO ()
+
 -- | The @/skill@ command spec. Closes over the 'SkillBackend' (for
 -- @/skill list@ \/ @/skill info@, which read the materialized view of the
 -- Audited log directly) and the channel-supplied 'CallDispatcher' (for
 -- @/skill load@, which dispatches the 'SKILL_LOAD' opcode against the
 -- active session's ISA registry + transcript — the same dispatcher
 -- @/call@ uses, so the audit trail records both paths uniformly).
-skillCommandSpec :: SkillBackend -> CallDispatcher -> CommandSpec
-skillCommandSpec backend dispatcher = CommandSpec
+--
+-- The optional 'PostLoadTurn' callback (third argument) controls whether
+-- @/skill load <id> <msg>@ auto-runs the LLM after loading the skill. When
+-- 'Nothing', the behavior is unchanged (no auto-turn). Pass @Just cb@ to
+-- trigger a turn with the trailing message after a successful load.
+skillCommandSpec :: SkillBackend -> CallDispatcher -> Maybe PostLoadTurn -> CommandSpec
+skillCommandSpec backend dispatcher mPostLoad = CommandSpec
   { csName         = CommandName "skill"
   , csAliases      = []
   , csGroup        = GroupSkills
   , csSynopsis     = "List defined skills, show one skill's body, or load one into the session"
-  , csParserInfo   = skillParserInfo backend dispatcher
+  , csParserInfo   = skillParserInfo backend dispatcher mPostLoad
   , csAvailability = InteractiveOnly
   }
 
-skillParserInfo :: SkillBackend -> CallDispatcher -> ParserInfo CommandAction
-skillParserInfo backend dispatcher =
-  info (skillParser backend dispatcher <**> helper)
+skillParserInfo :: SkillBackend -> CallDispatcher -> Maybe PostLoadTurn -> ParserInfo CommandAction
+skillParserInfo backend dispatcher mPostLoad =
+  info (skillParser backend dispatcher mPostLoad <**> helper)
     (  progDesc "Inspect or load agent skills"
     <> header   "skill — list, show, or load a skill"
     )
 
-skillParser :: SkillBackend -> CallDispatcher -> Parser CommandAction
-skillParser backend dispatcher = hsubparser
+skillParser :: SkillBackend -> CallDispatcher -> Maybe PostLoadTurn -> Parser CommandAction
+skillParser backend dispatcher mPostLoad = hsubparser
   (  command "list"
        (info (pure (listCmd backend)) (progDesc "List all defined skills (id + description)"))
   <> command "info"
        (info (infoCmd backend <$> skillArg)
              (progDesc "Show one skill's full body"))
   <> command "load"
-       (info (loadCmd dispatcher <$> skillArg <*> messageArg)
+       (info (loadCmd dispatcher mPostLoad <$> skillArg <*> messageArg)
              (progDesc "Load one skill into the current session, with an optional trailing message"))
   <> metavar "COMMAND"
   )
@@ -108,6 +130,13 @@ infoCmd backend raw = CommandAction $ \caps ->
 -- @#123@ as the user's message). When no message is supplied, the input
 -- omits the @message@ key and the load behaves as before (skill body only).
 --
+-- When a 'PostLoadTurn' callback is supplied and the trailing message is
+-- non-empty, the callback is invoked after a successful load so the LLM
+-- immediately processes the skill body + user message. This avoids the need
+-- for the user to send another message after @/skill load@. When the message
+-- is empty or no callback is supplied, no turn is triggered (the skill body
+-- is in @conversation.jsonl@ and will be picked up on the next user message).
+--
 -- On success, the skill body is NOT rendered via 'ccSend' — the dispatcher
 -- records a second 'EKHarness' entry to the transcript carrying the
 -- @orRecorded@ value (which includes the body), and the frontend renders
@@ -119,8 +148,8 @@ infoCmd backend raw = CommandAction $ \caps ->
 -- text IS rendered via 'ccSend' so the user sees it in the slash bubble —
 -- error paths produce no transcript body entry, so the slash bubble is
 -- the only surface for the error message.
-loadCmd :: CallDispatcher -> Text -> Text -> CommandAction
-loadCmd dispatcher raw message = CommandAction $ \caps -> do
+loadCmd :: CallDispatcher -> Maybe PostLoadTurn -> Text -> Text -> CommandAction
+loadCmd dispatcher mPostLoad raw message = CommandAction $ \caps -> do
   ccSend caps ("$ /skill load " <> raw)
   case mkSkillId raw of
     Left err -> ccSend caps err
@@ -134,7 +163,9 @@ loadCmd dispatcher raw message = CommandAction $ \caps -> do
         Left e  -> ccSend caps (renderDispatchError e)
         Right r
           | orIsError r -> mapM_ (ccSend caps) (renderOpResult r)
-          | otherwise   -> pure ()
+          | otherwise   -> case mPostLoad of
+              Just postLoad | not (T.null (T.strip message)) -> postLoad message
+              _ -> pure ()
 
 -- | One line per skill for @/skill list@.
 renderSkillLine :: Skill -> Text

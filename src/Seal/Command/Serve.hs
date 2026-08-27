@@ -242,7 +242,7 @@ runServeMain autonomy logger = do
         }
       registry = mkRegistry
         ( coreCommandSpecs coreDeps
-          <> [ skillCommandSpec (bSkills backends) placeholderDispatcher
+          <> [ skillCommandSpec (bSkills backends) placeholderDispatcher Nothing
              , callCommandSpec placeholderDispatcher
              , newCommandSpec newDeps
              ]

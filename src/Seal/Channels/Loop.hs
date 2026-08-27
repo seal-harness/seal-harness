@@ -72,7 +72,7 @@ import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
 import Seal.Command.Call (CallDispatcher, callCommandSpec)
 import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Skill (skillCommandSpec)
+import Seal.Command.Skill (skillCommandSpec, PostLoadTurn)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
@@ -329,8 +329,8 @@ convKey ms = (channelKindToText (msChannelKind ms), conversationIdText (msConver
 buildChannelRegistry
   :: ProviderRuntime -> SealPaths -> Maybe StreamBroker
   -> SkillBackend -> BgRunner -> CallDispatcher
-  -> IORef SessionId -> Registry -> Registry
-buildChannelRegistry pr paths mBroker skillBackend bgRunner callDispatcher sidRef registry =
+  -> IORef SessionId -> Maybe PostLoadTurn -> Registry -> Registry
+buildChannelRegistry pr paths mBroker skillBackend bgRunner callDispatcher sidRef mPostLoad registry =
   mkRegistry (baseSpecs <> channelSpecs)
   where
     channelSpecNames = ["bg", "call", "skill", "model"] :: [Text]
@@ -340,7 +340,7 @@ buildChannelRegistry pr paths mBroker skillBackend bgRunner callDispatcher sidRe
     channelSpecs =
       [ backgroundCommandSpec bgRunner
       , callCommandSpec callDispatcher
-      , skillCommandSpec skillBackend callDispatcher
+      , skillCommandSpec skillBackend callDispatcher mPostLoad
       , modelCommandSpecForSession
           pr paths (readIORef sidRef)
           (mkModelTranscriptWriter paths mBroker)
@@ -386,9 +386,15 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
     let td = mkChannelTurnDeps deps
         bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
         callDispatcher = channelCallDispatcher deps td h askReply bgConvSid
+        postLoadTurn msg = do
+          sid <- readIORef bgConvSid
+          mMeta <- resolveTabSession deps (BoundSession sid)
+          case mMeta of
+            Just meta -> plainHandler h meta Nothing msg
+            Nothing   -> pure ()
         registryWithBg = buildChannelRegistry
           (cdProvider deps) (cdPaths deps) (cdBroker deps)
-          (bSkills (cdBackends deps)) bgRunner callDispatcher bgConvSid registry
+          (bSkills (cdBackends deps)) bgRunner callDispatcher bgConvSid (Just postLoadTurn) registry
     loop h registryWithBg bgConvSid
   where
     loop h reg bgConvSid = do

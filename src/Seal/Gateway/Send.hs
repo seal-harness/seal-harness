@@ -25,7 +25,7 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
-import Control.Monad (unless, when)
+import Control.Monad (unless, when, void)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
@@ -432,7 +432,7 @@ runSlash deps meta fullLine = do
       -- per-request versions; the rest of the specs are reused as-is.
       perRequestCallDispatcher = webCallDispatcher deps td sid
       perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
-        (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)
+        (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher (Just (void . plainTurnWithCaps deps meta caps)))
         (callCommandSpec perRequestCallDispatcher)
         (stopCommandSpecForSession (sdAbortReg deps) sid
            (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))

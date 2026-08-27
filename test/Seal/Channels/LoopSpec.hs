@@ -262,10 +262,10 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       sidRef <- newIORef (case mkSessionId "buildChannelRegistry-skill-shadow" of Right s -> s; Left _ -> error "bad sid")
       let baseRegistry :: Registry
           baseRegistry = mkRegistry
-            [ skillCommandSpec skillBackend webDispatcher
+            [ skillCommandSpec skillBackend webDispatcher Nothing
             , stubSpec "ping"
             ]
-          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef baseRegistry
+          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef Nothing baseRegistry
       -- The channel registry must have exactly one "skill" spec (the channel
       -- one), not two.
       let skillSpecs = [ s | s <- registrySpecs channelReg, csName s == CommandName "skill" ]
@@ -293,7 +293,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       skillBackend <- noneBackend
       sidRef <- newIORef (case mkSessionId "buildChannelRegistry-preserve" of Right s -> s; Left _ -> error "bad sid")
       let baseRegistry = mkRegistry [ stubSpec "ping", stubSpec "vault" ]
-          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef baseRegistry
+          channelReg = buildChannelRegistry stubPr stubPaths Nothing skillBackend bgRunner chanDispatcher sidRef Nothing baseRegistry
           names = [ n | CommandName n <- map csName (registrySpecs channelReg) ]
       -- ping + vault preserved, plus bg + call + skill appended.
       "ping" `elem` names `shouldBe` True
