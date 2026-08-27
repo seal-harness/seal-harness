@@ -137,6 +137,7 @@ instance Provider ScriptProvider where
 recordCaps :: IORef [Text] -> ChannelCaps
 recordCaps sent = def
   { ccSend        = \t -> modifyIORef' sent (++ [t])
+  , ccShowHuman   = \t -> modifyIORef' sent (++ [t])
   , ccPrompt      = \_ -> pure "yes"
   , ccPromptSecret = \_ -> pure ""
   , ccStreaming    = True  -- tests: streaming by default

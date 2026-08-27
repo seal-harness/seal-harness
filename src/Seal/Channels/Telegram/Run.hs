@@ -232,6 +232,7 @@ tryOpenVault paths cfg logger =
 mkTelegramHandleCaps :: TelegramTransport -> ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkTelegramHandleCaps transport h askReply sid = def
   { ccSend         = chSend h
+  , ccShowHuman    = chSend h
   , ccPrompt       = \ap -> do
       let AskPrompt q opts = ap
       mChat <- chLastChatId h

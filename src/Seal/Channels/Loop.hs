@@ -489,6 +489,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
 mkHandleCaps h askReply sid = def
   { ccSend         = chSend h
+  , ccShowHuman    = chSend h
   , ccPrompt       = \(AskPrompt q opts) -> do
       chSend h (formatQuestionWithOptions q opts)
       outcome <- askHumanWithOptions askReply sid q opts (const (pure ()))

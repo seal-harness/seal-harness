@@ -99,7 +99,7 @@ showHumanOp caps = TrustedOpcode
       maybe (Left "SHOW_HUMAN requires {message:string}") (const (Right ())) . strField "message"
   , toRun = \_ v -> do
       let msg = fromMaybe "" (strField "message" v)
-      liftIO (ccSend caps msg)
+      liftIO (ccShowHuman caps msg)
       pure (OpResult [] False Null)
   }
 
