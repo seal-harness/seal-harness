@@ -25,6 +25,7 @@ runTestApp act = do logger <- testSealLogger; env <- mkEnv logger defaultConfig;
 fakeCaps :: IORef [String] -> String -> ChannelCaps
 fakeCaps sent reply = def
   { ccSend = \t -> modifyIORef' sent (++ [show t])
+  , ccShowHuman = \t -> modifyIORef' sent (++ [show t])
   , ccPrompt = \_ -> pure (pack reply)
   , ccPromptSecret = \_ -> pure ""
   , ccStreaming    = True  -- tests: streaming by default
