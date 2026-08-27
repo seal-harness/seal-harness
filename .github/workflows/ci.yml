@@ -60,7 +60,19 @@ jobs:
         run: nix build --print-build-logs
 
       - name: Run tests with coverage
-        run: nix develop --command cabal test --enable-coverage
+        # cabal test --enable-coverage auto-runs `hpc markup` after the tests,
+        # printing "Writing: ...html" lines to stdout. Capture stdout to a
+        # file so the test logs are clean; if the tests fail, the captured
+        # output (including failures) is printed for debugging.
+        run: |
+          set +e
+          nix develop --command cabal test --enable-coverage --test-keep-tix-files > cabal-test-output.txt 2>&1
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            cat cabal-test-output.txt
+            exit $EXIT_CODE
+          fi
+          echo "Tests passed. HPC markup output suppressed (see Coverage & Docs job)."
 
       # Upload the HPC artifacts (the .tix file + mix/html dirs) so the
       # coverage job can generate reports without re-running the test suite.
@@ -351,57 +363,55 @@ jobs:
             fi
 
             # Swagger UI page (loads the spec from the same directory)
-            cat > deploy/api/index.html << 'SWAGGER'
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <meta charset="utf-8">
-              <title>Seal Harness API Docs</title>
-              <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui.css">
-            </head>
-            <body>
-              <div id="swagger-ui"></div>
-              <script src="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-bundle.js"></script>
-              <script src="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-standalone-preset.js"></script>
-              <script>
-                window.onload = function() {
-                  SwaggerUIBundle({
-                    url: 'openapi.json',
-                    dom_id: '#swagger-ui',
-                    deepLinking: true,
-                    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-                    layout: 'StandaloneLayout'
-                  });
-                };
-              </script>
-            </body>
-            </html>
-            SWAGGER
+            printf '%s\n' \
+              '<!DOCTYPE html>' \
+              '<html>' \
+              '<head>' \
+              '  <meta charset="utf-8">' \
+              '  <title>Seal Harness API Docs</title>' \
+              '  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui.css">' \
+              '</head>' \
+              '<body>' \
+              '  <div id="swagger-ui"></div>' \
+              '  <script src="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-bundle.js"></script>' \
+              '  <script src="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-standalone-preset.js"></script>' \
+              '  <script>' \
+              '    window.onload = function() {' \
+              '      SwaggerUIBundle({' \
+              "        url: 'openapi.json'," \
+              "        dom_id: '#swagger-ui'," \
+              '        deepLinking: true,' \
+              '        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],' \
+              "        layout: 'StandaloneLayout'" \
+              '      });' \
+              '    };' \
+              '  </script>' \
+              '</body>' \
+              '</html>' > deploy/api/index.html
 
             # Root index linking to coverage + API docs
-            cat > deploy/index.html << 'INDEX'
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <meta charset="utf-8">
-              <title>Seal Harness — Docs</title>
-              <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #24292f; }
-                h1 { border-bottom: 1px solid #d0d7de; padding-bottom: 8px; }
-                a { color: #0969da; text-decoration: none; font-size: 1.1em; display: block; padding: 12px 0; }
-                a:hover { text-decoration: underline; }
-                .desc { color: #656d76; font-size: 0.9em; }
-              </style>
-            </head>
-            <body>
-              <h1>Seal Harness</h1>
-              <a href="coverage/main/hpc_index.html">Code Coverage Report</a>
-              <p class="desc">HPC line/branch coverage for the current main build.</p>
-              <a href="api/index.html">API Docs (Swagger UI)</a>
-              <p class="desc">Interactive OpenAPI 3.1 documentation for the gateway REST API.</p>
-            </body>
-            </html>
-            INDEX
+            printf '%s\n' \
+              '<!DOCTYPE html>' \
+              '<html>' \
+              '<head>' \
+              '  <meta charset="utf-8">' \
+              '  <title>Seal Harness — Docs</title>' \
+              '  <style>' \
+              '    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #24292f; }' \
+              '    h1 { border-bottom: 1px solid #d0d7de; padding-bottom: 8px; }' \
+              '    a { color: #0969da; text-decoration: none; font-size: 1.1em; display: block; padding: 12px 0; }' \
+              '    a:hover { text-decoration: underline; }' \
+              '    .desc { color: #656d76; font-size: 0.9em; }' \
+              '  </style>' \
+              '</head>' \
+              '<body>' \
+              '  <h1>Seal Harness</h1>' \
+              '  <a href="coverage/main/hpc_index.html">Code Coverage Report</a>' \
+              '  <p class="desc">HPC line/branch coverage for the current main build.</p>' \
+              '  <a href="api/index.html">API Docs (Swagger UI)</a>' \
+              '  <p class="desc">Interactive OpenAPI 3.1 documentation for the gateway REST API.</p>' \
+              '</body>' \
+              '</html>' > deploy/index.html
           fi
 
       - name: Deploy to GitHub Pages
