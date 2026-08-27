@@ -339,12 +339,18 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
 
     it "creates a .codegraph directory when codegraph IS installed" $
       withSystemTempDirectory "seal-codegraph-install" $ \wd -> do
-        -- Check if codegraph is available; skip if not.
+        -- Check if codegraph is available; skip if not. uioShellExec
+        -- returns Right even on non-zero exit (it surfaces stderr as
+        -- Right text with an [exit code: N] annotation), so we check
+        -- the output for a non-zero exit code to detect absence.
         let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
-        checkRes <- UIORec.uioShellExec uio (case mkShellCommand "command -v codegraph" of Right c -> c; Left _ -> error "bad cmd") Nothing
+        let checkCmd = case mkShellCommand "command -v codegraph" of Right c -> c; Left _ -> error "bad cmd"
+        checkRes <- UIORec.uioShellExec uio checkCmd Nothing
         case checkRes of
           Left _ -> pendingWith "codegraph not installed — skipping"
-          Right _ -> do
+          Right out
+            | "[exit code: " `T.isInfixOf` out -> pendingWith "codegraph not installed — skipping"
+            | otherwise -> do
             -- Create a fake repo dir with a source file.
             createDirectoryIfMissing True (wd </> "test-repo")
             writeFile (wd </> "test-repo" </> "main.py") "def foo(): pass\n"
