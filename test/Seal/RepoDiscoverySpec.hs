@@ -211,7 +211,7 @@ spec = do
             }
           let unioned = tripleUnionSkillBackend workdirBackend userBackend
           skills <- sbList unioned
-          length skills `shouldBe` 3
+          length skills `shouldBe` 4
           let ids = map (skillIdText . skId) skills
           ids `shouldContain` ["my-repo--shared-skill"]
           ids `shouldContain` ["shared-skill"]

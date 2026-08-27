@@ -20,6 +20,14 @@ spec = describe "Seal.Skills.Builtins" $ do
         Just body -> T.unpack body `shouldContain` "workdir"
         Nothing  -> expectationFailure "seal-usage skill not found in builtins"
 
+    it "includes the codegraph skill shipped with the binary" $ do
+      let ids = map (skillIdText . skId) builtinSkills
+      ids `shouldContain` ["codegraph"]
+      case lookup ("codegraph" :: T.Text)
+                  [(skillIdText (skId s), skBody s) | s <- builtinSkills] of
+        Just body -> T.unpack body `shouldContain` "CodeGraph"
+        Nothing  -> expectationFailure "codegraph skill not found in builtins"
+
     it "every built-in decodes (no malformed embedded sources)" $ do
       length builtinSkills `shouldSatisfy` (> 0)
       mapM_ (\s -> skillIdText (skId s) `shouldSatisfy` (not . T.null)) builtinSkills

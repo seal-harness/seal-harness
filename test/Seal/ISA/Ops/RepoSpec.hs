@@ -13,7 +13,7 @@ import System.Process (callProcess)
 import Test.Hspec
 
 import Seal.ISA.Ops.Repo
-  ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, validateRepoUrl )
+  ( CloneResult (..), cloneRepoIO, isShellMetachar, normalizeRepoUrl, sanitizeRepoName, tryCodegraphInit, validateRepoUrl )
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Clone (CloneDeps (..))
@@ -21,6 +21,8 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.Tools.Exec.UntrustedIO (mkLocalUntrustedIO)
+import Seal.Tools.Exec.UntrustedIO qualified as UIORec
+import Seal.Tools.Args (mkShellCommand)
 import Seal.Tools.Ssh.Agent
   ( SshAgentEnv (..), mkFakeSshAgentHandle )
 
@@ -326,6 +328,28 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           other -> expectationFailure
             ("expected CloneFailed, got " <> show other
              <> " — cloneRepoIO must verify the clone landed, since uioShellExec returns Right on non-zero exit")
+
+  describe "tryCodegraphInit" $ do
+    it "is a no-op (does not throw) when codegraph is not installed" $
+      withSystemTempDirectory "seal-codegraph-noinstall" $ \wd -> do
+        let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
+        -- tryCodegraphInit should complete without throwing, whether or
+        -- not codegraph is installed. The function is best-effort.
+        tryCodegraphInit uio "some-repo" Nothing
+
+    it "creates a .codegraph directory when codegraph IS installed" $
+      withSystemTempDirectory "seal-codegraph-install" $ \wd -> do
+        -- Check if codegraph is available; skip if not.
+        let uio = mkLocalUntrustedIO (WorkspaceRoot wd)
+        checkRes <- UIORec.uioShellExec uio (case mkShellCommand "command -v codegraph" of Right c -> c; Left _ -> error "bad cmd") Nothing
+        case checkRes of
+          Left _ -> pendingWith "codegraph not installed — skipping"
+          Right _ -> do
+            -- Create a fake repo dir with a source file.
+            createDirectoryIfMissing True (wd </> "test-repo")
+            writeFile (wd </> "test-repo" </> "main.py") "def foo(): pass\n"
+            tryCodegraphInit uio "test-repo" Nothing
+            doesDirectoryExist (wd </> "test-repo" </> ".codegraph") `shouldReturn` True
 
 isLeft :: Either a b -> Bool
 isLeft (Left _)  = True

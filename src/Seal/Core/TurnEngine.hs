@@ -125,8 +125,9 @@ import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
   (AutonomyLevel, SecurityPolicy (..), AllowList (..))
-import Seal.Skills.Autoload (injectAutoloadSkill)
+import Seal.Skills.Autoload (injectAutoloadSkill, injectCodegraphSkill)
 import Seal.Skills.Backend qualified as Skill
+import Seal.Skills.Types qualified as SealSkillTypes
 import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
@@ -138,6 +139,8 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+import Seal.Tools.Exec.WorkdirFs
+  ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
 import Seal.Types.App (runApp)
@@ -190,10 +193,13 @@ resolveSystemPrompt
   -- ^ Whether to inject the tool-use enforcement guidance block.
   -> Bool
   -- ^ Whether to inject the task-completion guidance block.
+  -> Maybe Text
+  -- ^ The codegraph skill body to inject ('Nothing' when no repo with
+  -- @.codegraph/@ is in the workdir — skips codegraph injection).
   -> SessionMeta
   -> IO (Maybe Text)
 resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
-                   parallel toolUse taskCompletion meta = do
+                   parallel toolUse taskCompletion mCodegraphBody meta = do
   base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
@@ -201,9 +207,10 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
            Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
   let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
   withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
+  let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload
   if injectCatalog
-    then injectAvailableSkills skillBackend withAutoload
-    else pure withAutoload
+    then injectAvailableSkills skillBackend withCodegraph
+    else pure withCodegraph
 
 -- | Build the ISA registry for a session turn. This is the **single**
 -- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
@@ -597,9 +604,12 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
       parallel = either (const True) resolvedParallelToolGuidance eCfg
       toolUse = either (const True) resolvedToolUseEnforcement eCfg
       taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+  -- [engine] Check if any cloned repo has a .codegraph/ directory; if so,
+  -- inject the codegraph skill body into the system prompt.
+  mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
   -- [engine] System prompt (single resolver, honors smSystemOverride).
   mSystem <- resolveSystemPrompt agentDefBackend sessionSkills
-              autoloadId injectCatalog parallel toolUse taskCompletion meta'
+              autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
@@ -860,9 +870,10 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 let freshBackends = sessionBackends
                       { bAgentDefs = Def.unionAgentDefBackend freshAgentDefs (bAgentDefs (tdBaseBackends td)) }
                     sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
+                mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
                 mSystem <- resolveSystemPrompt
                   (bAgentDefs freshBackends) sessionSkills
-                  autoloadId injectCatalog parallel toolUse taskCompletion meta'
+                  autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
@@ -995,3 +1006,31 @@ childSystemPrompt td eCfg agentDef task = do
   if injectCatalog
     then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload
     else pure withAutoload
+
+-- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.
+-- If so, look up the codegraph skill body from the skill backend and return
+-- @Just body@ for injection into the system prompt. Returns @Nothing@ when
+-- no repo has @.codegraph/@ or the skill is missing from the backend.
+--
+-- This uses the workdir snapshot (ONE scan, shared with the discovery
+-- scanners) to check for @\<repo\>\/.codegraph\/@ under each top-level
+-- directory. The skill body is read from the union backend (user override
+-- shadows the built-in).
+codegraphSkillBodyFor
+  :: WorkdirFs
+  -> Skill.SkillBackend
+  -> IO (Maybe T.Text)
+codegraphSkillBodyFor wfs skillBackend = do
+  eSnap <- wfsSnapshot wfs
+  case eSnap of
+    Left _ -> pure Nothing   -- fail-soft: no snapshot → no injection
+    Right snap -> do
+      let repos = snapTopDirs snap
+          hasCodegraph repo = snapIsDirectoryAt snap (repo <> "/.codegraph")
+      if any hasCodegraph repos
+        then do
+          mSkill <- case SealSkillTypes.mkSkillId "codegraph" of
+            Right sid -> Skill.sbRead skillBackend sid
+            Left _    -> pure Nothing
+          pure (fmap SealSkillTypes.skBody mSkill)
+        else pure Nothing

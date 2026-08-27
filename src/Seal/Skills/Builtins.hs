@@ -66,6 +66,12 @@ builtinRaw =
           qAddDependentFile "config/skills/core/seal-usage.md"
           embedFile "config/skills/core/seal-usage.md")
     , "core"
+   )
+ , ( "codegraph"
+   , TE.decodeUtf8 $(do
+         qAddDependentFile "config/skills/core/codegraph.md"
+         embedFile "config/skills/core/codegraph.md")
+   , "core"
     )
   ]
 
