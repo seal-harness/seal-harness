@@ -142,11 +142,18 @@ runTurn env userText = do
     -- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows
     -- the session name immediately), record it with tfwRecordAndAck
     -- (synchronously fsync'd) and run the hook. Otherwise keep the async
-    -- write (no fsync latency at turn start).
+    -- write (no fsync latency at turn start). In the fsync path, also fire
+    -- the per-entry broadcast hook (aeOnEntry) so the web frontend sees the
+    -- user's message appear live — without this, the user message is
+    -- written but never broadcast, so the transcript area stays blank
+    -- until the first response entry lands (after the full LLM stream
+    -- completes). The async path skips aeOnEntry because the entry may
+    -- not be on disk yet (the read would return stale data).
     case aeOnUserMessage env of
       Just after -> do
         tfwRecordAndAck (aeTranscript env) (TwoFileWrite turn0 entry)
         liftIO after
+        liftIO (aeOnEntry env)
       Nothing ->
         tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)
   go (aeMaxTurns env) 0 turn0

@@ -10,10 +10,12 @@ import Control.Monad (void)
 import Data.Aeson qualified as A
 import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.Vector qualified as V
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (mapMaybe)
 import Data.Text.Encoding qualified as TE
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
@@ -482,10 +484,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
     it "ccPrompt with options registers a pending ask carrying the options" $ do
       store <- newAskReplyStore 0
       let sid = mkSid "ask-opts"
-          caps = webAskCaps Nothing store sid
           opts = [ QuestionOption "main" "the default branch"
                  , QuestionOption "develop" "the integration branch"
                  ]
+      caps <- webAskCaps Nothing store sid
       -- Fork the ccPrompt call (it blocks until the answer is delivered).
       done <- newEmptyMVar
       _ <- forkIO $ do
@@ -505,6 +507,33 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           pure ()
         _ -> expectationFailure "expected exactly one pending ask"
       takeMVar done
+
+  describe "webAskCaps ccSend streaming" $ do
+    it "ccSend broadcasts BeEntryUpdate with accumulated text via the broker" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribe broker (mkSid "stream-sid") (\e -> modifyIORef' ref (e :)) (pure ())
+      store <- newAskReplyStore 0
+      let sid = mkSid "stream-sid"
+      caps <- webAskCaps (Just broker) store sid
+      ccSend caps ("Hello" :: Text)
+      ccSend caps (" world" :: Text)
+      events <- readIORef ref
+      -- Two BeEntryUpdate events, each carrying the accumulated text so far.
+      -- Events are stored in reverse order (most recent first), so the head
+      -- is the second broadcast carrying the accumulated "Hello world".
+      length events `shouldBe` 2
+      case events of
+        [BeEntryUpdate _ v, _] ->
+          extractContentText v `shouldBe` Just ("Hello world" :: Text)
+        _ -> expectationFailure ("expected two BeEntryUpdate events, got " <> show events)
+
+    it "ccSend is a no-op when the broker is Nothing" $ do
+      store <- newAskReplyStore 0
+      let sid = mkSid "no-broker"
+      caps <- webAskCaps Nothing store sid
+      -- Should not throw; the ccSend is a no-op.
+      ccSend caps ("anything" :: Text)
 
   describe "parseAnswerBody" $ do
     it "accepts {scope: once} → Left (Left ScopeOnce)" $
@@ -732,3 +761,14 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
 isSuccess :: ParserResult a -> Bool
 isSuccess (Success _) = True
 isSuccess _           = False
+
+-- | Extract the first content block's text from a streaming entry-update JSON.
+-- Used by the ccSend streaming test to assert the accumulated text.
+extractContentText :: A.Value -> Maybe Text
+extractContentText v = do
+  A.Object o <- Just v
+  A.Object payload <- KeyMap.lookup (fromText "payload") o
+  A.Array arr <- KeyMap.lookup (fromText "content") payload
+  A.Object first_ <- case V.toList arr of (x : _) -> Just x; _ -> Nothing
+  A.String t <- KeyMap.lookup (fromText "text") first_
+  Just t

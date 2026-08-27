@@ -43,32 +43,46 @@ async function fetchTranscriptSeed(sessionId: string): Promise<TranscriptEntry[]
  * Pure reconciler: insert `incoming` into `existing`, dedup by id, sort by
  * timestamp ascending. Replaces the entry with a matching id (always returns
  * a new array), or inserts new entries at the sorted position by timestamp.
+ *
+ * When `incoming` is a finalized entry (no `streaming` flag), any prior
+ * `streaming: true` placeholder is evicted first — the streaming placeholder
+ * (id `"streaming"`) uses a sentinel id that won't match the final entry's
+ * positional id, so without eviction the streaming placeholder would linger
+ * as a duplicate row alongside the real entry.
  */
 export function reconcileEntries(
   existing: TranscriptEntry[],
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
   const done = perf.begin('reconcileEntries')
-  for (let i = 0; i < existing.length; i++) {
-    if (existing[i]!.id === incoming.id) {
+  // Evict any streaming placeholder when a finalized entry arrives.
+  let base = existing
+  if (!incoming.streaming) {
+    const streamingIdx = existing.findIndex((e) => e.streaming)
+    if (streamingIdx !== -1) {
+      base = existing.filter((_, i) => i !== streamingIdx)
+    }
+  }
+  for (let i = 0; i < base.length; i++) {
+    if (base[i]!.id === incoming.id) {
       // Replace in place (stable timestamp keeps sort order intact; streaming
       // entry-update entries carry their original timestamp throughout).
-      const next = existing.slice()
+      const next = base.slice()
       next[i] = incoming
       done({ count: existing.length, meta: { mode: 'replace' } })
       return next
     }
   }
   // Find insertion index that keeps the array sorted by timestamp ascending.
-  let insertAt = existing.length
-  for (let i = existing.length - 1; i >= 0; i--) {
-    if (existing[i]!.timestamp.localeCompare(incoming.timestamp) <= 0) {
+  let insertAt = base.length
+  for (let i = base.length - 1; i >= 0; i--) {
+    if (base[i]!.timestamp.localeCompare(incoming.timestamp) <= 0) {
       insertAt = i + 1
       break
     }
     insertAt = i
   }
-  const next = existing.slice()
+  const next = base.slice()
   next.splice(insertAt, 0, incoming)
   done({ count: existing.length, meta: { mode: 'insert' } })
   return next

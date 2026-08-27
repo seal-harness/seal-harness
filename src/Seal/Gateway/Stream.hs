@@ -95,6 +95,12 @@ streamApp guard broker pending = do
               , "sessionId" .= sessionIdText sid
               , "entry" .= v
               ]))
+          sendEvent (BeEntryUpdate sid v) =
+            sendTextData conn (A.encode (object
+              [ "type" .= ("entry-update" :: Text)
+              , "sessionId" .= sessionIdText sid
+              , "entry" .= v
+              ]))
           sendEvent (BeHarnessStatus v)    = sendTextData conn (A.encode v)
           sendEvent (BeListsSnapshot v)    = sendTextData conn (A.encode v)
           sendEvent (BeActivity sid v)     =

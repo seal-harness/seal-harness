@@ -31,7 +31,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -247,7 +247,7 @@ mkWebTurnAdapter deps td caps = TurnAdapter
   , taPreTurn       = \sid _meta t -> replyFanoutMessage (sdReplies deps) sid "web" t
   , taChannelLabel  = const "web"
   , taOnStop        = Just . replyFanout (sdReplies deps)
-  , taOnUserMessage = const Nothing
+  , taOnUserMessage = const (Just (pure ()))
   , taPostTurn      = \_ _ -> pure ()
   , taStartWiring   = \sessionBackends sid appEnv eCfg operatorCeiling _meta ->
       TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling "web"
@@ -401,7 +401,8 @@ loadSessionMeta paths sid = do
 plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
 plainTurn deps meta t = do
   let td = mkWebTurnDeps deps
-      adapter = mkWebTurnAdapter deps td (webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta))
+  caps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
+  let adapter = mkWebTurnAdapter deps td caps
   outcome <- runSessionTurn td adapter meta Nothing t
   pure (case toError outcome of
           Just err -> Left err
@@ -421,8 +422,8 @@ plainTurn deps meta t = do
 runSlash :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
 runSlash deps meta fullLine = do
   outVar <- newMVar ([] :: [Text])
-  let askCaps = webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
-      caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
+  askCaps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
+  let caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
       sid = smId meta
       td = mkWebTurnDeps deps
       -- W5: build a per-request call dispatcher that closes over the
@@ -507,36 +508,67 @@ plainTurnWithCaps deps meta caps t = do
 -- Delegates to the unified 'TurnEngine.callDispatcher'.
 webCallDispatcher :: SendDeps -> TurnDeps -> SessionId -> CallDispatcher
 webCallDispatcher deps td sid callOpName val = do
-  let caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid
+  caps <- webAskCaps (sdBroker deps) (sdAskReply deps) sid
   TurnEngine.callDispatcher td caps sid "web" callOpName val
 
--- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend' is a
--- no-op (web replies surface via the transcript poll); 'ccPrompt' drives the
+-- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend'
+-- accumulates streaming text deltas and broadcasts an @entry-update@ WS event
+-- so the web frontend sees the response grow live (token-by-token) instead of
+-- appearing only after the full LLM stream completes. 'ccPrompt' drives the
 -- full ask/reply primitive: it mints a pending question (carrying the opcode
 -- metadata when provided), broadcasts a 'BeAsk' event so the frontend renders
 -- it, and blocks on the store until the human answers via POST
 -- /api/sessions/:id/questions/:qid/answer (or the question is
 -- cancelled/timed out). The returned 'Text' is the approval scope's wire form
--- (e.g. @"once"@, @for_session@, @always@, @rejected@) for the confirmation
+-- (e.g. @"once"@, @"for_session"@, @"always"@, @"rejected"@) for the confirmation
 -- gate, or the human's typed reply for @ASK_HUMAN@. 'ccPromptSecret' is
 -- fail-closed.
 webAskCaps
-  :: Maybe StreamBroker -> AskReplyStore -> SessionId -> ChannelCaps
-webAskCaps mBroker store sid = def
-  { ccPrompt = \(AskPrompt q opts) -> do
-      outcome <- askHumanWithOptions store sid q opts (\qid ->
-        case mBroker of
-          Nothing -> pure ()
-          Just broker ->
-            broadcast broker (BeAsk sid (object
-              [ "id" .= askIdText qid
-              , "question" .= q
-              , "options" .= opts
-              ])))
-      pure (case outcome of
-        Left _  -> "rejected"
-        Right t -> t)
-  }
+  :: Maybe StreamBroker -> AskReplyStore -> SessionId -> IO ChannelCaps
+webAskCaps mBroker store sid = do
+  accRef <- newIORef ("" :: Text)
+  let caps = def
+        { ccSend = \delta -> case mBroker of
+            Nothing -> pure ()
+            Just broker -> do
+              acc <- atomicModifyIORef' accRef (\a -> (a <> delta, a <> delta))
+              broadcast broker (BeEntryUpdate sid (streamingEntryJson acc))
+        , ccPrompt = \(AskPrompt q opts) -> do
+            outcome <- askHumanWithOptions store sid q opts (\qid ->
+              case mBroker of
+                Nothing -> pure ()
+                Just broker ->
+                  broadcast broker (BeAsk sid (object
+                    [ "id" .= askIdText qid
+                    , "question" .= q
+                    , "options" .= opts
+                    ])))
+            pure (case outcome of
+              Left _  -> "rejected"
+              Right t -> t)
+        }
+  pure caps
+
+-- | Build a synthetic streaming @entry-update@ JSON envelope for the
+-- accumulated text so far. The entry id is the fixed sentinel @"streaming"@
+-- so the frontend's 'reconcileEntries' replaces the same placeholder in place
+-- as text grows. When the final @entry@ event arrives (after the response is
+-- recorded to the transcript), the frontend evicts the streaming placeholder
+-- and inserts the real entry. The payload mirrors a response entry's shape so
+-- the frontend's 'transcriptToMessages' renders it as an assistant message.
+streamingEntryJson :: Text -> Value
+streamingEntryJson text = object
+  [ "id"        .= ("streaming" :: Text)
+  , "timestamp" .= ("" :: Text)
+  , "direction" .= ("response" :: Text)
+  , "payload"   .= object
+      [ "content" .= [object ["type" .= ("text" :: Text), "text" .= text]]
+      ]
+  , "harness"   .= (Nothing :: Maybe Text)
+  , "model"     .= (Nothing :: Maybe Text)
+  , "channel"   .= (Nothing :: Maybe Text)
+  , "raw"       .= ("" :: Text)
+  ]
 
 -- | Notify the broker that a pending question was resolved (answered or
 -- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a

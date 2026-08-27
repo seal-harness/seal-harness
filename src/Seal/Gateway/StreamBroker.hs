@@ -30,6 +30,7 @@ import Seal.Core.Types (SessionId)
 -- | One event the broker fans out to subscribers.
 data BrokerEvent
   = BeEntryRecorded SessionId Value   -- ^ a transcript entry (the JSON the WS peer receives)
+  | BeEntryUpdate SessionId Value      -- ^ a streaming entry whose text is still growing (the WS peer renders as an @entry-update@ event, replacing the in-place entry by id)
   | BeHarnessStatus Value             -- ^ a harness liveness change
   | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
   | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
@@ -140,6 +141,7 @@ broadcast broker event = do
       BeSkillsChanged     -> pure True
       BeReposChanged      -> pure True
       BeEntryRecorded sid _ -> matchSession s sid
+      BeEntryUpdate sid _   -> matchSession s sid
       BeAsk sid _          -> matchSession s sid
       BeAskResolved sid _  -> matchSession s sid
     matchSession s sid = do
@@ -149,7 +151,6 @@ broadcast broker event = do
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()
 broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)
-
 -- | Push an @agent-defs-changed@ invalidation signal to every connection.
 -- All subscribers receive it (agent defs are not session-scoped).
 broadcastAgentDefsChanged :: StreamBroker -> IO ()
