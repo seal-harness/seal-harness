@@ -258,7 +258,7 @@ export function Sidebar({
     return formatAge(activity?.lastEntryAt ?? session.lastActive) || 'now'
   }
 
-  // Active Tabs sort: Idle Unread → Idle Read → Thinking, oldest
+  // Active Tabs sort: Idle Unread → Idle Read → Thinking, newest
   // last-user-message first within each bucket. The activity state comes
   // from the per-session stream; the sort key is the backing session's
   // lastUserMessageAt (falls back to lastActive/createdAt).

@@ -55,7 +55,7 @@ export interface SessionInfo {
   /** ISO timestamp of the most recent user (request-direction) message in
    *  the session's transcript, or null when the session has no transcript
    *  or no user message. Used by the sidebar to sort the Active Tabs list
-   *  (oldest last-user-message first within each status bucket). */
+   *  (newest last-user-message first within each status bucket). */
   lastUserMessageAt: string | null
 }
 

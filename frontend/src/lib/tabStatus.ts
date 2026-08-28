@@ -20,11 +20,11 @@
 // Read (no unread evidence) so a freshly-loaded sidebar never flashes every
 // tab as Unread before the first WS frame arrives.
 //
-// Sort order within the Active Tabs list (oldest first within each bucket):
+// Sort order within the Active Tabs list (newest first within each bucket):
 //   1. Idle Unread
 //   2. Idle Read
 //   3. Thinking
-// Within each bucket, tabs sort oldest → newest by the last USER message
+// Within each bucket, tabs sort newest → oldest by the last USER message
 // timestamp (session.lastUserMessageAt), falling back to session.lastActive
 // then session.createdAt so a tab always has a stable sort key.
 
@@ -77,8 +77,8 @@ export function deriveTabStatusKind(
 
 /** Resolve the last-user-message timestamp used to sort a tab within its
  *  bucket. Falls back to lastActive then createdAt so every tab has a
- *  stable key; `null` only when the session is missing entirely (treated
- *  as oldest). */
+ *  stable key; `null` only when the session is missing entirely (sorts
+ *  last, i.e. treated as oldest). */
 export function tabSortTimestamp(
   session: SessionInfo | null | undefined,
 ): number {
@@ -89,7 +89,7 @@ export function tabSortTimestamp(
 }
 
 /** Comparator implementing the Active Tabs sort: bucket order first
- *  (idle-unread → idle-read → thinking), then oldest last-user-message
+ *  (idle-unread → idle-read → thinking), then newest last-user-message
  *  first within each bucket. Stable on ties (preserves source order). */
 export function compareTabs(
   a: { tab: TabInfo; session: SessionInfo | null | undefined; activity: SessionActivityState | undefined },
@@ -98,7 +98,7 @@ export function compareTabs(
   const ba = BUCKET_ORDER[deriveTabStatusKind(a.activity)]
   const bb = BUCKET_ORDER[deriveTabStatusKind(b.activity)]
   if (ba !== bb) return ba - bb
-  return tabSortTimestamp(a.session) - tabSortTimestamp(b.session)
+  return tabSortTimestamp(b.session) - tabSortTimestamp(a.session)
 }
 
 /** Sort a list of tabs by the Active Tabs precedence. Each entry pairs the
