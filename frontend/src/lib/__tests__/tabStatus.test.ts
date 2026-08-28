@@ -125,7 +125,7 @@ describe('sortTabsForSidebar', () => {
     expect(result.map((t) => t.index)).toEqual([1, 2, 3])
   })
 
-  it('within a bucket, sorts oldest last-user-message first', () => {
+  it('within a bucket, sorts newest last-user-message first', () => {
     const oldTab = makeTab({ index: 1, session_id: 'old' })
     const midTab = makeTab({ index: 2, session_id: 'mid' })
     const newTab = makeTab({ index: 3, session_id: 'new' })
@@ -136,7 +136,7 @@ describe('sortTabsForSidebar', () => {
       { tab: oldTab, session: makeSession({ id: 'old', lastUserMessageAt: '2024-06-01T00:00:00.000Z' }), activity: readActivity },
       { tab: midTab, session: makeSession({ id: 'mid', lastUserMessageAt: '2024-06-03T00:00:00.000Z' }), activity: readActivity },
     ])
-    expect(result.map((t) => t.index)).toEqual([1, 2, 3])
+    expect(result.map((t) => t.index)).toEqual([3, 2, 1])
   })
 
   it('preserves source order on full ties (stable)', () => {
