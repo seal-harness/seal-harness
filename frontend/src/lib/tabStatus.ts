@@ -20,11 +20,11 @@
 // Read (no unread evidence) so a freshly-loaded sidebar never flashes every
 // tab as Unread before the first WS frame arrives.
 //
-// Sort order within the Active Tabs list (oldest first within each bucket):
+// Sort order within the Active Tabs list (newest first within each bucket):
 //   1. Idle Unread
 //   2. Idle Read
 //   3. Thinking
-// Within each bucket, tabs sort oldest → newest by the last USER message
+// Within each bucket, tabs sort newest → oldest by the last USER message
 // timestamp (session.lastUserMessageAt), falling back to session.lastActive
 // then session.createdAt so a tab always has a stable sort key.
 
@@ -98,7 +98,7 @@ export function compareTabs(
   const ba = BUCKET_ORDER[deriveTabStatusKind(a.activity)]
   const bb = BUCKET_ORDER[deriveTabStatusKind(b.activity)]
   if (ba !== bb) return ba - bb
-  return tabSortTimestamp(a.session) - tabSortTimestamp(b.session)
+  return tabSortTimestamp(b.session) - tabSortTimestamp(a.session)
 }
 
 /** Sort a list of tabs by the Active Tabs precedence. Each entry pairs the

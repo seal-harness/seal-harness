@@ -482,7 +482,7 @@ describe('Sidebar — tab status indicator', () => {
     expect(screen.getByTestId('tab-kind-idle-read')).toBeTruthy()
   })
 
-  it('sorts Active Tabs: Idle Unread → Idle Read → Thinking (oldest user msg first within bucket)', () => {
+  it('sorts Active Tabs: Idle Unread → Idle Read → Thinking (newest user msg first within bucket)', () => {
     // Indices deliberately out of expected order to prove sorting.
     const tabs = [
       makeTab({ index: 3, kind: 'session:anthropic', session_id: 'thinking', label: 'Thinking tab' }),
@@ -524,12 +524,12 @@ describe('Sidebar — tab status indicator', () => {
     // The status-label testids carry the tab index, so reading them in
     // document order yields the rendered sort.
     const labels = screen.getAllByTestId(/^tab-status-label-\d+$/).map((el) => el.textContent)
-    // Expected: Unread old, Unread new, Read, Thinking (with model suffix).
+    // Expected: Unread new, Unread old, Read, Thinking (with model suffix).
     expect(labels).toEqual(['Idle Unread·m', 'Idle Unread·m', 'Idle Read·m', 'Thinking·m'])
     // And the tab index badges (rendered first per row) follow the same order.
     const indexBadges = screen.getAllByText(/^([0-9]+)$/).map((el) => el.textContent)
     // The Active Tabs section renders tab.index badges; verify the sorted order.
-    // Unread old (1), Unread new (2), Read (0), Thinking (3).
+    // Unread new (2), Unread old (1), Read (0), Thinking (3).
     expect(indexBadges).toContain('1')
     expect(indexBadges).toContain('2')
     expect(indexBadges).toContain('0')
