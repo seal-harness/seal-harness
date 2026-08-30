@@ -787,3 +787,24 @@ body {
 .show-human-message hr:last-child {
   margin-bottom: 0;
 }
+
+/* ── AskHumanForm option buttons ─────────────────────────────────────── */
+
+.ask-human-option:hover:not(:disabled) {
+  background: rgba(124, 108, 246, 0.08) !important;
+  border-color: var(--accent-primary) !important;
+}
+
+.ask-human-option:active:not(:disabled) {
+  background: rgba(124, 108, 246, 0.16) !important;
+  transform: translateY(0.5px);
+}
+
+.ask-human-option:disabled {
+  cursor: default;
+}
+
+.ask-human-option:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 2px rgba(124, 108, 246, 0.4);
+}

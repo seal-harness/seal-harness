@@ -880,10 +880,27 @@ function AskHumanForm({
   const [otherText, setOtherText] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null)
   const opts = pendingQuestion.options ?? []
+
+  // Fallback: if the answer was accepted (promise resolved true) but the WS
+  // ask_resolved event never arrives (e.g. WS disconnected), reset the
+  // submitting state after a grace period so the user isn't permanently
+  // locked out. The WS path unmounts the form; this only fires if it
+  // doesn't.
+  useEffect(() => {
+    if (!submitting) return
+    const id = window.setTimeout(() => {
+      setSubmitting(false)
+      setError('No confirmation from server — try again')
+      setSelectedAnswer(null)
+    }, 15_000)
+    return () => window.clearTimeout(id)
+  }, [submitting])
 
   const submit = (answer: string) => {
     if (!onAnswerText || submitting) return
+    setSelectedAnswer(answer)
     setSubmitting(true)
     setError(null)
     const result = onAnswerText(pendingQuestion.id, answer)
@@ -918,21 +935,36 @@ function AskHumanForm({
     color: color,
   })
 
+  const optBtnStyle = (isSelected: boolean): React.CSSProperties => ({
+    background: isSelected ? 'rgba(124,108,246,0.12)' : 'var(--bg-sunken)',
+    border: `1px solid ${isSelected ? 'var(--accent-primary)' : 'var(--border)'}`,
+    color: isSelected ? 'var(--accent-primary)' : 'var(--text-primary)',
+    cursor: submitting ? 'default' : 'pointer',
+    transition: 'background var(--duration-fast) ease, border-color var(--duration-fast) ease, color var(--duration-fast) ease',
+    opacity: submitting && !isSelected ? 0.5 : 1,
+  })
+
   return (
     <div data-testid="ask-human-form" className="rounded-md p-3 flex flex-col gap-2" style={{ background: 'rgba(124,108,246,0.06)', border: '1px solid var(--accent-primary)' }}>
       <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
         {pendingQuestion.question}
       </div>
+      {submitting && (
+        <div data-testid="ask-human-submitting" className="flex items-center gap-2 text-xs" style={{ color: 'var(--accent-primary)' }}>
+          <span className="composer-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+          Submitting…
+        </div>
+      )}
       <div className="flex flex-col gap-2">
         {opts.map((opt, i) => (
           <button
             key={`${opt.label}-${i}`}
             type="button"
             role="radio"
-            aria-checked={false}
+            aria-checked={selectedAnswer === opt.label}
             disabled={submitting}
-            className="rounded-lg px-3 py-2 text-left"
-            style={{ ...btnStyle('var(--accent-primary)'), width: '100%' }}
+            className="rounded-lg px-3 py-2 text-left ask-human-option"
+            style={{ ...optBtnStyle(selectedAnswer === opt.label), width: '100%' }}
             onClick={() => submit(opt.label)}
           >
             <div className="text-sm font-semibold">{opt.label}</div>
@@ -945,7 +977,15 @@ function AskHumanForm({
       <div className="flex flex-col gap-1">
         <textarea
           className="rounded-lg px-3 py-2 text-sm resize-none"
-          style={{ background: 'var(--bg-sunken)', border: '1px solid var(--border)', color: 'var(--text-primary)', outline: 'none', minHeight: '40px', width: '100%' }}
+          style={{
+            background: 'var(--bg-sunken)',
+            border: `1px solid ${selectedAnswer && !opts.some((o) => o.label === selectedAnswer) ? 'var(--accent-primary)' : 'var(--border)'}`,
+            color: 'var(--text-primary)',
+            outline: 'none',
+            minHeight: '40px',
+            width: '100%',
+            cursor: submitting ? 'default' : 'text',
+          }}
           placeholder="Type your own answer…"
           value={otherText}
           disabled={submitting}
