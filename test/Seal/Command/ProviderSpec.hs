@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.ProviderSpec (spec) where
 
+import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.Either (isLeft)
 import Data.IORef (newIORef)
@@ -42,7 +43,7 @@ mkPR cfgPath mvh = do
 runProv :: ProviderRuntime -> [String] -> ChannelCaps -> IO ()
 runProv pr argv caps =
   case execParserPure defaultPrefs (csParserInfo (providerCommandSpec pr)) argv of
-    Success act         -> runCommandAction act caps
+    Success act         -> void (runCommandAction act caps)
     Failure _           -> expectationFailure ("parse failed: " <> show argv)
     CompletionInvoked _ -> expectationFailure "unexpected completion"
 

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.BackgroundSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -55,7 +56,7 @@ spec = describe "Seal.Command.Background" $ do
       case parseSlash reg "/bg tell me a joke" of
         ParsedAction act -> do
           (capsRef, caps) <- recordingCaps
-          runCommandAction act caps
+          void (runCommandAction act caps)
           sent <- readIORef ref
           sent `shouldBe` ["tell me a joke"]
           -- the caps were not used to send (the runner owns delivery)
@@ -69,7 +70,7 @@ spec = describe "Seal.Command.Background" $ do
       case parseSlash reg "/bg" of
         ParsedAction act -> do
           (ref, caps) <- recordingCaps
-          runCommandAction act caps
+          void (runCommandAction act caps)
           sent <- readIORef ref
           sent `shouldBe` ["usage: /bg <prompt>"]
         other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
@@ -92,7 +93,7 @@ spec = describe "Seal.Command.Background" $ do
     it "rejects a blank prompt with a usage line and never invokes the runner" $ do
       (runRef, runner) <- recordingRunner
       (ref, caps) <- recordingCaps
-      runCommandAction (runBackground runner "") caps
+      void (runCommandAction (runBackground runner "") caps)
       sent <- readIORef ref
       sent `shouldBe` ["usage: /bg <prompt>"]
       invoked <- readIORef runRef
@@ -101,7 +102,7 @@ spec = describe "Seal.Command.Background" $ do
     it "rejects a whitespace-only prompt as blank" $ do
       (_, runner) <- recordingRunner
       (ref, caps) <- recordingCaps
-      runCommandAction (runBackground runner "   ") caps
+      void (runCommandAction (runBackground runner "   ") caps)
       sent <- readIORef ref
       sent `shouldBe` ["usage: /bg <prompt>"]
 

@@ -473,7 +473,9 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                         runCommandAction a handleCaps
                       case eResult of
                         Left errMsg -> chSend h errMsg
-                        Right _     -> pure ()
+                        Right mFollowUp -> case mFollowUp of
+                          Just t  -> void (forkIO (plainHandler h meta (Just ms) t))
+                          Nothing -> pure ()
                       loop h reg bgConvSid
                     ShowText t       -> chSend h t >> loop h reg bgConvSid
                     PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid

@@ -7,8 +7,11 @@ module Seal.Command.Spec
   , Registry(..)
   , mkRegistry
   , lookupSpec
+  , runCommandActionMaybe
+  , commandAction
   ) where
 
+import Control.Monad (void)
 import Data.List (find)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -37,7 +40,27 @@ data Availability
   deriving stock (Eq, Show)
 
 -- | The runnable action a successfully-parsed command performs on its channel.
-newtype CommandAction = CommandAction { runCommandAction :: ChannelCaps -> IO () }
+-- Returns an optional follow-up turn text: 'Nothing' for commands that do not
+-- trigger a turn (the vast majority); @'Just' t@ when the command wants the
+-- agent loop to run a turn with text @t@ immediately after the command
+-- completes (e.g. @\/skill load@ after writing the skill body to
+-- @conversation.jsonl@). The follow-up turn is forked by each channel's
+-- dispatch site so the channel loop continues reading input while the LLM
+-- runs.
+newtype CommandAction = CommandAction { runCommandAction :: ChannelCaps -> IO (Maybe Text) }
+
+-- | Construct a 'CommandAction' from an @IO ()@ action that never triggers a
+-- follow-up turn. This is the common case — most commands produce output via
+-- 'ccSend' and return 'Nothing'. Commands that DO want to trigger a turn
+-- (e.g. @\/skill load@) construct 'CommandAction' directly and return
+-- @'Just' text@.
+commandAction :: (ChannelCaps -> IO ()) -> CommandAction
+commandAction act = CommandAction (\caps -> void (act caps) >> pure Nothing)
+
+-- | Run a 'CommandAction' and return the optional follow-up-turn signal.
+-- Convenience alias for 'runCommandAction'.
+runCommandActionMaybe :: CommandAction -> ChannelCaps -> IO (Maybe Text)
+runCommandActionMaybe = runCommandAction
 
 data CommandSpec = CommandSpec
   { csName :: CommandName

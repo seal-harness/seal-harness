@@ -14,7 +14,7 @@ import Options.Applicative
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Gateway.Transcript (firstUserMessageSnippet)
@@ -49,7 +49,7 @@ sessionParser sr = hsubparser
   )
 
 listCmd :: SessionRuntime -> CommandAction
-listCmd sr = CommandAction $ \caps -> do
+listCmd sr = commandAction $ \caps -> do
   active <- readIORef (srActive sr)
   metas  <- listSessions (srPaths sr)
   if null metas
@@ -60,7 +60,7 @@ listCmd sr = CommandAction $ \caps -> do
             (zip snippets metas)
 
 infoCmd :: SessionRuntime -> CommandAction
-infoCmd sr = CommandAction $ \caps -> do
+infoCmd sr = commandAction $ \caps -> do
   active <- readIORef (srActive sr)
   mapM_ (ccSend caps) (renderSessionInfo active)
 

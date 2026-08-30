@@ -16,7 +16,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Skill (renderSkillInfo, renderSkillLine, skillCommandSpec)
-import Seal.Command.Spec (CommandSpec (..), runCommandAction)
+import Seal.Command.Spec (CommandSpec (..), runCommandActionMaybe)
 import Seal.Core.Types (OpName (..), mkSystemSessionId)
 import Seal.ISA.Dispatch (DispatchError (..))
 import Seal.ISA.Opcode (OpResult (..))
@@ -68,8 +68,9 @@ requireTextField v key =
     _ -> expectationFailure ("expected object input, got " <> show v) >> pure ""
 
 -- | Run a /skill command against a backend preloaded with the given skills,
--- using a supplied CallDispatcher for /skill load.
-runSkillWith :: [Skill] -> CallDispatcher -> [String] -> FakeCaps -> IO ()
+-- using a supplied CallDispatcher for /skill load. Returns the optional
+-- follow-up turn text ('Nothing' for non-load commands).
+runSkillWith :: [Skill] -> CallDispatcher -> [String] -> FakeCaps -> IO (Maybe Text)
 runSkillWith skills dispatcher argv fc = do
   backend <- noneBackend
   mapM_ (sbCreate backend) skills
@@ -77,11 +78,11 @@ runSkillWith skills dispatcher argv fc = do
         { ccSend         = \t -> modifyIORef' (fcSent fc) (t :)
         , ccPrompt       = \_ -> pure ""
         , ccPromptSecret = \_ -> pure ""
-  , ccStreaming    = True  -- tests: streaming by default
+        , ccStreaming    = True  -- tests: streaming by default
         }
   case execParserPure defaultPrefs (csParserInfo (skillCommandSpec backend dispatcher)) argv of
-    Success act -> runCommandAction act caps
-    _           -> expectationFailure ("parse failed: " <> show argv)
+    Success act -> runCommandActionMaybe act caps
+    _           -> expectationFailure ("parse failed: " <> show argv) >> pure Nothing
 
 spec :: Spec
 spec = describe "Seal.Command.Skill" $ do
@@ -105,33 +106,33 @@ spec = describe "Seal.Command.Skill" $ do
       (fc, _) <- makeFakeCaps []
       s1 <- mkSkill "greet" "greeting skill" "say hi"
       s2 <- mkSkill "farewell" "farewell skill" "bye"
-      runSkillWith [s1, s2] noLoad ["list"] fc
+      _ <- runSkillWith [s1, s2] noLoad ["list"] fc
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("greet" `T.isInfixOf`)
       T.unlines sent `shouldSatisfy` ("farewell" `T.isInfixOf`)
 
     it "list reports none when empty" $ do
       (fc, _) <- makeFakeCaps []
-      runSkillWith [] noLoad ["list"] fc
+      _ <- runSkillWith [] noLoad ["list"] fc
       sent <- getSent fc
       sent `shouldBe` ["no skills defined"]
 
     it "info shows the full body of a skill" $ do
       (fc, _) <- makeFakeCaps []
       s <- mkSkill "greet" "greeting skill" "say hello warmly"
-      runSkillWith [s] noLoad ["info", "greet"] fc
+      _ <- runSkillWith [s] noLoad ["info", "greet"] fc
       sent <- getSent fc
       T.unlines sent `shouldSatisfy` ("say hello warmly" `T.isInfixOf`)
 
     it "info reports not found for a missing skill" $ do
       (fc, _) <- makeFakeCaps []
-      runSkillWith [] noLoad ["info", "nope"] fc
+      _ <- runSkillWith [] noLoad ["info", "nope"] fc
       sent <- getSent fc
       sent `shouldBe` ["skill not found: nope"]
 
     it "info rejects an invalid id" $ do
       (fc, _) <- makeFakeCaps []
-      runSkillWith [] noLoad ["info", "bad/id"] fc
+      _ <- runSkillWith [] noLoad ["info", "bad/id"] fc
       sent <- getSent fc
       sent `shouldBe` ["invalid skill id: \"bad/id\""]
 
@@ -139,31 +140,34 @@ spec = describe "Seal.Command.Skill" $ do
     it "echoes only the header line on a successful load (body goes to transcript)" $ do
       (fc, _) <- makeFakeCaps []
       let dispatcher = fakeLoadDispatcher ["# greet\n\ngreeting skill\n\n---\n\nsay hi"] False
-      runSkillWith [] dispatcher ["load", "greet"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "greet"] fc
       sent <- getSent fc
       sent `shouldBe` ["$ /skill load greet"]
+      mTurn `shouldBe` Just "Skill loaded. Follow the instructions in the skill above."
 
     it "reports skill not found when the dispatcher returns an error result" $ do
       (fc, _) <- makeFakeCaps []
       let dispatcher = fakeLoadDispatcher ["skill not found"] True
-      runSkillWith [] dispatcher ["load", "nope"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "nope"] fc
       sent <- getSent fc
       case sent of
         (echo : rest) -> do
           echo `shouldBe` "$ /skill load nope"
           T.unlines rest `shouldSatisfy` ("skill not found" `T.isInfixOf`)
         _ -> expectationFailure "expected at least the echo line"
+      mTurn `shouldBe` Nothing
 
     it "renders a dispatcher Left (OpNotFound) gracefully" $ do
       (fc, _) <- makeFakeCaps []
       let dispatcher = fakeErrorDispatcher (OpNotFound (OpName "SKILL_LOAD"))
-      runSkillWith [] dispatcher ["load", "greet"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "greet"] fc
       sent <- getSent fc
       case sent of
         (echo : rest) -> do
           echo `shouldBe` "$ /skill load greet"
           T.unlines rest `shouldSatisfy` ("opcode not found" `T.isInfixOf`)
         _ -> expectationFailure "expected at least the echo line"
+      mTurn `shouldBe` Nothing
 
     it "forwards the trailing message in the opcode input" $ do
       -- /skill load start #123 should dispatch SKILL_LOAD with
@@ -171,22 +175,25 @@ spec = describe "Seal.Command.Skill" $ do
       -- conversation.jsonl after the skill body.
       (fc, _) <- makeFakeCaps []
       (dispatcher, getInput) <- recordingDispatcher
-      runSkillWith [] dispatcher ["load", "start", "#123"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "start", "#123"] fc
       val <- getInput
       requireTextField val "id" `shouldReturn` "start"
       requireTextField val "message" `shouldReturn` "#123"
+      mTurn `shouldBe` Just "#123"
 
     it "omits the message (empty string) when no trailing text is supplied" $ do
       (fc, _) <- makeFakeCaps []
       (dispatcher, getInput) <- recordingDispatcher
-      runSkillWith [] dispatcher ["load", "greet"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "greet"] fc
       val <- getInput
       requireTextField val "id" `shouldReturn` "greet"
       requireTextField val "message" `shouldReturn` ""
+      mTurn `shouldBe` Just "Skill loaded. Follow the instructions in the skill above."
 
     it "joins multiple trailing words with spaces" $ do
       (fc, _) <- makeFakeCaps []
       (dispatcher, getInput) <- recordingDispatcher
-      runSkillWith [] dispatcher ["load", "start", "do", "something", "now"] fc
+      mTurn <- runSkillWith [] dispatcher ["load", "start", "do", "something", "now"] fc
       val <- getInput
       requireTextField val "message" `shouldReturn` "do something now"
+      mTurn `shouldBe` Just "do something now"

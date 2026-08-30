@@ -7,6 +7,7 @@
 -- 'ConversationId' through 'chReceive'.
 module Seal.Phase2aSpec (spec) where
 
+import Control.Monad (void)
 import Data.Either (fromRight)
 import Options.Applicative (info, progDesc)
 import Test.Hspec
@@ -16,7 +17,7 @@ import Data.Default (def)
 import Seal.Channels.Class (Channel (..))
 import Seal.Command.Spec
   ( Availability (..)
-  , CommandAction (..)
+  , CommandAction (..), commandAction
   , CommandGroup (..)
   , CommandName (..)
   , CommandSpec (..)
@@ -36,7 +37,7 @@ import Seal.TestHelpers.FakeChannel
 -- ---------------------------------------------------------------------------
 
 pingAction :: CommandAction
-pingAction = CommandAction $ \caps -> ccSend caps "pong"
+pingAction = commandAction $ \caps -> ccSend caps "pong"
 
 pingSpec :: CommandSpec
 pingSpec = CommandSpec
@@ -116,7 +117,7 @@ spec = describe "Seal.Phase2aSpec" $ do
     (_, t1) <- chReceive h
     d1      <- ingest testRegistry emptyChain (RawInbound t1)
     case d1 of
-      DispatchAction a -> runCommandAction a caps
+      DispatchAction a -> void (runCommandAction a caps)
       other            -> expectationFailure
                             ("expected DispatchAction, got: " <> showShape other)
     -- Pull hello

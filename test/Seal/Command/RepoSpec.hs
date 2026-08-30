@@ -9,6 +9,7 @@
 -- or vault is touched.
 module Seal.Command.RepoSpec (spec) where
 
+import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
@@ -113,7 +114,7 @@ runRepo
   :: RepoRegistryHandle -> RepoTestSeam -> [String] -> FakeCaps -> IO ()
 runRepo h seam argv fc =
   case execParserPure defaultPrefs (csParserInfo (repoCommandSpec h seam)) argv of
-    Success act -> runCommandAction act (capsFrom fc)
+    Success act -> void (runCommandAction act (capsFrom fc))
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 -- | Parse argv against the /repo command and run the resulting action with
@@ -123,7 +124,7 @@ runRepoWithCaps
   :: RepoRegistryHandle -> RepoTestSeam -> [String] -> ChannelCaps -> IO ()
 runRepoWithCaps h seam argv caps =
   case execParserPure defaultPrefs (csParserInfo (repoCommandSpec h seam)) argv of
-    Success act -> runCommandAction act caps
+    Success act -> void (runCommandAction act caps)
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 ----------------------------------------------------------------------------

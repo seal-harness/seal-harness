@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Vault.CommandsSpec (spec) where
 
-import Data.Functor (($>))
+import Control.Monad (void)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -72,7 +72,7 @@ runVaultCmd rt caps args =
       result  = execParserPure defaultPrefs (csParserInfo cmdSpec) args
   in case result of
     Success action ->
-      runCommandAction action caps $> Right ()
+      void (runCommandAction action caps) >> pure (Right ())
     Failure failure ->
       let (msg, _) = renderFailure failure "vault"
       in pure (Left msg)

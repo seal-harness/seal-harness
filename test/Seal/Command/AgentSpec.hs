@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.AgentSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (modifyIORef')
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -46,7 +47,7 @@ runAgentWith defs argv fc cfgPath = do
   , ccStreaming    = True  -- tests: streaming by default
         }
   case execParserPure defaultPrefs (csParserInfo (agentCommandSpec backend cfgPath)) argv of
-    Success act -> runCommandAction act caps
+    Success act -> void (runCommandAction act caps)
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 spec :: Spec

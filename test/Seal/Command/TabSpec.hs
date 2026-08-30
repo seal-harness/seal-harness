@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.TabSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -165,7 +166,7 @@ mkSid :: Text -> SessionId
 mkSid t = case mkSessionId t of Right s -> s; Left _ -> error "bad sid"
 
 runCommand :: CommandAction -> ChannelCaps -> IO ()
-runCommand = runCommandAction
+runCommand act caps = void (runCommandAction act caps)
 
 -- | Render a ParseOutcome for error messages (it has no Show instance).
 showPO :: ParseOutcome -> String

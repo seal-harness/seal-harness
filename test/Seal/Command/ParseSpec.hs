@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.ParseSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -36,7 +37,7 @@ pingSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
   where
-    toPingAction (PingOpts loud) = CommandAction $ \caps ->
+    toPingAction (PingOpts loud) = commandAction $ \caps ->
       ccSend caps (if loud then "PONG!" else "pong")
 
 -- A command WITH subcommands (via hsubparser), mirroring the real /vault,
@@ -54,7 +55,7 @@ grpSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
   where
-    noop      = CommandAction (\_ -> pure ())
+    noop      = commandAction (\_ -> pure ())
     grpParser = hsubparser
       (  command "add"
            (info (pure noop) (progDesc "Add an item to the group"))
@@ -198,7 +199,7 @@ spec = describe "Seal.Command.Parse" $ do
             }
       case parseSlash testRegistry "/ping" of
         ParsedAction cmd -> do
-          runCommandAction cmd caps
+          void (runCommandAction cmd caps)
           readIORef ref `shouldReturn` "pong"
         other -> expectationFailure ("expected ParsedAction, got: " <> show (isHelp other))
 
@@ -212,7 +213,7 @@ spec = describe "Seal.Command.Parse" $ do
             }
       case parseSlash testRegistry "/ping --loud" of
         ParsedAction cmd -> do
-          runCommandAction cmd caps
+          void (runCommandAction cmd caps)
           readIORef ref `shouldReturn` "PONG!"
         other -> expectationFailure ("expected ParsedAction, got: " <> show (isHelp other))
 

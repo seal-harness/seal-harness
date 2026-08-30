@@ -31,7 +31,7 @@ import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Security.Vault.Age (VaultError (..))
 import Seal.SourceControl.Clone (CloneError (..))
@@ -172,7 +172,7 @@ usernameOpt = optional (T.pack <$> strOption
 ----------------------------------------------------------------------------
 
 listCmd :: RepoRegistryHandle -> CommandAction
-listCmd regH = CommandAction $ \caps -> do
+listCmd regH = commandAction $ \caps -> do
   eRepos <- rrhList regH
   case eRepos of
     Left err      -> ccSend caps err
@@ -198,7 +198,7 @@ addCmd
   -> Maybe Text  -- ^ optional username (machine_user only)
   -> CommandAction
 addCmd regH seam rawId url rawVcs rawCred vaultKey mUsername =
-  CommandAction $ \caps -> do
+  commandAction $ \caps -> do
     case validateAdd rawId url rawVcs rawCred vaultKey mUsername of
       Left err -> ccSend caps err
       Right repo -> case srCredential repo of
@@ -253,7 +253,7 @@ validateAdd rawId url rawVcs rawCred vaultKey mUsername = do
 -- | @/repo remove <id>@. Idempotent (204 semantics mirror the REST API): a
 -- missing id is still reported as @removed@.
 removeCmd :: RepoRegistryHandle -> Text -> CommandAction
-removeCmd regH raw = CommandAction $ \caps ->
+removeCmd regH raw = commandAction $ \caps ->
   case mkRepoId raw of
     Left err -> ccSend caps err
     Right rid -> do
@@ -275,7 +275,7 @@ removeCmd regH raw = CommandAction $ \caps ->
 -- vault's key list). A locked vault surfaces @vault locked — run /vault
 -- unlock to check@; any other vault error skips the advisory silently.
 infoCmd :: RepoRegistryHandle -> RepoTestSeam -> Text -> CommandAction
-infoCmd regH seam raw = CommandAction $ \caps ->
+infoCmd regH seam raw = commandAction $ \caps ->
   case mkRepoId raw of
     Left err -> ccSend caps err
     Right rid -> do
@@ -322,7 +322,7 @@ vaultKeyAdvisory seam cred = do
 -- becomes @git ls-remote failed (exit n)@ (NOT W3's @git failed (exit n)@),
 -- since the only git invocation /repo test performs is @git ls-remote@.
 testCmd :: RepoRegistryHandle -> RepoTestSeam -> Text -> CommandAction
-testCmd regH seam raw = CommandAction $ \caps ->
+testCmd regH seam raw = commandAction $ \caps ->
   case mkRepoId raw of
     Left err -> ccSend caps err
     Right rid -> do

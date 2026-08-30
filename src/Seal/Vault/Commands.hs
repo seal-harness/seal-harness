@@ -20,7 +20,7 @@ import System.Directory (doesFileExist)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Command.Spec
   ( Availability (..)
-  , CommandAction (..)
+  , CommandAction (..), commandAction
   , CommandGroup (..)
   , CommandName (..)
   , CommandSpec (..)
@@ -142,7 +142,7 @@ handleResult _    (Right a) k = k a
 -- ---------------------------------------------------------------------------
 
 setupCmd :: VaultRuntime -> CommandAction
-setupCmd rt = CommandAction $ \caps -> do
+setupCmd rt = commandAction $ \caps -> do
   -- Snapshot old security config BEFORE any modifications so rekeyExisting can use it.
   let secPath = securityFilePath (vrPaths rt)
   oldCfg <- loadSecurityConfig secPath
@@ -307,7 +307,7 @@ rekeyExisting rt caps newEnc rk eCfg = do
                   ccSend caps (vaultErrMsg e)
 
 addCmd :: VaultRuntime -> Text -> CommandAction
-addCmd rt name = CommandAction $ \caps ->
+addCmd rt name = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     val <- ccPromptSecret caps ("Value for " <> name <> ": ")
     result <- vhPut h name (TE.encodeUtf8 val)
@@ -315,39 +315,39 @@ addCmd rt name = CommandAction $ \caps ->
       ccSend caps ("Secret '" <> name <> "' stored.")
 
 getCmd :: VaultRuntime -> Text -> CommandAction
-getCmd rt name = CommandAction $ \caps ->
+getCmd rt name = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     result <- vhGet h name
     handleResult caps result (ccSend caps . TE.decodeUtf8Lenient)
 
 listCmd :: VaultRuntime -> CommandAction
-listCmd rt = CommandAction $ \caps ->
+listCmd rt = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     result <- vhList h
     handleResult caps result (mapM_ (ccSend caps))
 
 deleteCmd :: VaultRuntime -> Text -> CommandAction
-deleteCmd rt name = CommandAction $ \caps ->
+deleteCmd rt name = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     result <- vhDelete h name
     handleResult caps result $ \() ->
       ccSend caps ("Secret '" <> name <> "' deleted.")
 
 lockCmd :: VaultRuntime -> CommandAction
-lockCmd rt = CommandAction $ \caps ->
+lockCmd rt = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     vhLock h
     ccSend caps "Vault locked."
 
 unlockCmd :: VaultRuntime -> CommandAction
-unlockCmd rt = CommandAction $ \caps ->
+unlockCmd rt = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     result <- vhUnlock h
     handleResult caps result $ \() ->
       ccSend caps "Vault unlocked."
 
 statusCmd :: VaultRuntime -> CommandAction
-statusCmd rt = CommandAction $ \caps ->
+statusCmd rt = commandAction $ \caps ->
   withHandle rt caps $ \h -> do
     st <- vhStatus h
     ccSend caps $ T.unlines

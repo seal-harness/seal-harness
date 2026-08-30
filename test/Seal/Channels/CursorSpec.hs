@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Channels.CursorSpec (spec) where
 
+import Control.Monad (void)
 import Control.Concurrent.Async (replicateConcurrently_)
 import Data.IORef
 import Data.Map.Strict qualified as Map
@@ -260,7 +261,7 @@ spec = describe "Seal.Channels.Cursor (persistence)" $ do
         (fc, caps) <- makeFakeCaps []
         case Opt.execParserPure Opt.defaultPrefs (csParserInfo cmdSpec)
                ["use","ollama","qwen3.8"] of
-          Opt.Success act -> runCommandAction act caps
+          Opt.Success act -> void (runCommandAction act caps)
           _ -> expectationFailure "/model use parse failed"
         _ <- getSent fc
         -- Confirm session.json carries qwen3.8.

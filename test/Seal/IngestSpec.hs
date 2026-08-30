@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.IngestSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -12,7 +13,7 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Command.Spec
   ( Availability (..)
-  , CommandAction (..)
+  , CommandAction (..), commandAction
   , CommandGroup (..)
   , CommandName (..)
   , CommandSpec (..)
@@ -36,7 +37,7 @@ recordingCaps ref = def
 
 -- | The fake "ping" command: sends "pong" via 'ccSend'.
 pingAction :: CommandAction
-pingAction = CommandAction $ \caps -> ccSend caps "pong"
+pingAction = commandAction $ \caps -> ccSend caps "pong"
 
 pingSpec :: CommandSpec
 pingSpec = CommandSpec
@@ -111,7 +112,7 @@ spec = do
       d   <- ingest testRegistry emptyChain (RawInbound "/ping")
       case d of
         DispatchAction a -> do
-          runCommandAction a (recordingCaps ref)
+          void (runCommandAction a (recordingCaps ref))
           sent <- readIORef ref
           sent `shouldBe` ["pong"]
         other -> expectationFailure $

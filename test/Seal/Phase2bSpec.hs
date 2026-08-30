@@ -30,7 +30,7 @@ import Seal.Config.Paths (SealPaths (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Channels.Signal.Transport (mkMockSignalTransport)
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..), Registry, mkRegistry )
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.MessageSource (mkUserId)
@@ -78,7 +78,7 @@ signalEnvelope source mUuid body =
     uuidField Nothing  = []
 
 pingAction :: CommandAction
-pingAction = CommandAction $ \caps -> ccSend caps "pong"
+pingAction = commandAction $ \caps -> ccSend caps "pong"
 
 pingSpec :: CommandSpec
 pingSpec = CommandSpec

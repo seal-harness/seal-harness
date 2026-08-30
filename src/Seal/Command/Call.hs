@@ -28,7 +28,7 @@ import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Dispatch (DispatchError (..))
@@ -75,7 +75,7 @@ callParser dispatcher = callCmd dispatcher
 -- line of the output so the "Command output" bubble is self-contained
 -- (the web channel clears the optimistic "You" bubble on slash responses).
 callCmd :: CallDispatcher -> Text -> Maybe Text -> CommandAction
-callCmd dispatcher opNameText mJson = CommandAction $ \caps -> do
+callCmd dispatcher opNameText mJson = commandAction $ \caps -> do
   ccSend caps (echoLine opNameText mJson)
   case mkOpNameText opNameText of
     Left err -> ccSend caps ("invalid opcode name: " <> err)

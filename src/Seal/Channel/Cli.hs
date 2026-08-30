@@ -17,9 +17,9 @@ module Seal.Channel.Cli
 
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (fromRight)
-import Data.Foldable (for_)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
@@ -95,11 +95,13 @@ import Seal.Harness.Tmux (TmuxRunner)
 -- text through an injected handler keeps this function testable without a live
 -- provider.
 interpretDisposition :: ChannelCaps -> (Text -> IO ()) -> Disposition -> IO ()
-interpretDisposition caps plainHandler = \case
-  DispatchAction a -> runCommandAction a caps
-  ShowText t       -> ccSend caps t
-  PlainMessage t   -> plainHandler t
-  Rejected msg     -> ccSend caps msg
+interpretDisposition caps plainHandler d = do
+  mFollowUp <- case d of
+    DispatchAction a -> runCommandAction a caps
+    ShowText t       -> ccSend caps t >> pure Nothing
+    PlainMessage t   -> plainHandler t >> pure Nothing
+    Rejected msg     -> ccSend caps msg >> pure Nothing
+  for_ mFollowUp plainHandler
 
 -- | Drive one plain-text turn through the agent loop. The seam the wiring test
 -- asserts against: a 'PlainMessage' becomes @runApp env (runTurn agentEnv t)@.

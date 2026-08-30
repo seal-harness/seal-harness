@@ -44,7 +44,7 @@ pingSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
   where
-    toPingAction (PingOpts loud _n) = CommandAction $ \caps ->
+    toPingAction (PingOpts loud _n) = commandAction $ \caps ->
       ccSend caps (if loud then "PONG!" else "pong")
 
 -- A minimal vault stub (no real vault; proves multi-group layout).
@@ -57,7 +57,7 @@ vaultStubSpec = CommandSpec
   , csParserInfo   = info
       (subparser
         (command "status"
-          (info (pure (CommandAction $ \caps -> ccSend caps "vault status"))
+          (info (pure (commandAction $ \caps -> ccSend caps "vault status"))
                 (progDesc "Show vault status"))))
       (progDesc "Encrypt and manage secrets")
   , csAvailability = AlwaysAvailable

@@ -86,7 +86,7 @@ import Seal.Web.UiState (newUiStateHandle)
 
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
 import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
-import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
+import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe, testSealLogger)
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
 testAbortReg :: SessionAbortRegistry
@@ -4000,6 +4000,9 @@ spec = describe "Seal.Gateway.API" $ do
       tmuxR <- mkRealTmuxRunner
       askReply <- newAskReplyStore 0
       approvals <- newApprovalCache
+      testReplies <- newReplyRegistry
+      testLocks <- newSessionLocks
+      testLog <- testSealLogger
       let paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           activeSidTxt = "20260720-214230-238"
@@ -4041,11 +4044,11 @@ spec = describe "Seal.Gateway.API" $ do
             , sdHttpManager = Nothing
             , sdAskReply    = askReply
             , sdApprovals   = approvals
-            , sdReplies     = error "sdReplies: unused on the slash path"
-            , sdLocks       = error "sdLocks: unused on the slash path"
+            , sdReplies     = testReplies
+            , sdLocks       = testLocks
             , sdAbortReg    = testAbortReg
             , sdTabsHandle  = tabsH
-            , sdLogger      = error "sdLogger: set below"
+            , sdLogger      = testLog
             , sdIsRemote    = False
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing

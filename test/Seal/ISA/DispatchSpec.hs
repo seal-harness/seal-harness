@@ -215,11 +215,11 @@ spec = describe "Seal.ISA.Dispatch" $ do
         [e] -> Map.notMember "channel" (erMeta e) `shouldBe` True
         _ -> expectationFailure ("expected exactly one entry, got " <> show (length entries))
 
-    it "appends the trailing message to conversation.jsonl after the skill body" $ do
+    it "writes only the skill body (the trailing message is NOT written — the follow-up turn handles it)" $ do
       -- /skill load start #123 → the skill body lands in conversation.jsonl
-      -- as a User message, then the trailing message "#123" is appended as
-      -- a SECOND User message so the model sees the skill followed by the
-      -- user's request on the next turn.
+      -- as an Assistant message. The trailing message "#123" is NOT written
+      -- here — the command's follow-up turn writes it as a User message via
+      -- runTurn, so the model sees the skill followed by the user's request.
       (h, readState) <- fakeTwoFileTranscript
       let bodyText :: Text
           bodyText = "# start\n\nstart skill\n\n---\n\nbody"
@@ -234,10 +234,9 @@ spec = describe "Seal.ISA.Dispatch" $ do
             ]
       recordSkillLoadResult h (OpName "SKILL_LOAD") input result Nothing
       (conv, _entries) <- readState
-      -- Two User messages: the skill body, then the trailing message.
+      -- Only the skill body is written (the trailing message is NOT).
       let texts = [ t | Message _ bs <- conv, CbText t <- bs ]
-      length texts `shouldBe` 2
-      texts `shouldBe` [bodyText, "#123"]
+      texts `shouldBe` [bodyText]
 
     it "writes only the skill body when the message is blank" $ do
       (h, readState) <- fakeTwoFileTranscript
@@ -287,7 +286,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
         [m] -> msgRole m `shouldBe` Assistant
         _   -> expectationFailure ("expected exactly one message, got " <> show (length conv))
 
-    it "writes the trailing message as a User message (actual user input)" $ do
+    it "does NOT write the trailing message (the follow-up turn handles it)" $ do
       (h, readState) <- fakeTwoFileTranscript
       let bodyText :: Text
           bodyText = "# start\n\nstart skill\n\n---\n\nbody"
@@ -302,11 +301,12 @@ spec = describe "Seal.ISA.Dispatch" $ do
             ]
       recordSkillLoadResult h (OpName "SKILL_LOAD") input result Nothing
       (conv, _entries) <- readState
+      -- Only the skill body (Assistant) is written. The trailing message
+      -- is NOT written by recordSkillLoadResult — the follow-up turn
+      -- triggered by loadCmd writes it as a User message via runTurn.
       case conv of
-        [skillMsg, userMsg] -> do
-          msgRole skillMsg `shouldBe` Assistant
-          msgRole userMsg  `shouldBe` User
-        _ -> expectationFailure ("expected two messages, got " <> show (length conv))
+        [skillMsg] -> msgRole skillMsg `shouldBe` Assistant
+        _ -> expectationFailure ("expected exactly one message, got " <> show (length conv))
 
   describe "recordSetupRepoResult" $ do
     it "writes the clone result as an Assistant message (harness output, not user input)" $ do

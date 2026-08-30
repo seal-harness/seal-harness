@@ -44,7 +44,7 @@ import Options.Applicative
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli (Backends (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig)
 import Seal.Config.Paths (SealPaths)
@@ -183,7 +183,7 @@ repoOpt = strOption
 -- the given args (or config defaults when not specified), insert a new
 -- tab, optionally clone a repo, and send the confirmation line.
 newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
-newCmd deps mProvider mModel mRepo = CommandAction $ \caps -> do
+newCmd deps mProvider mModel mRepo = commandAction $ \caps -> do
   oldMeta <- ndOldMeta deps
   let args = NewArgs { naProvider = mProvider, naModel = mModel, naRepo = mRepo }
   meta <- mintNewSessionWith args oldMeta deps

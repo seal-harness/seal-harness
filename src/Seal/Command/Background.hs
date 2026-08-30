@@ -33,7 +33,7 @@ import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 
 -- | A channel-supplied runner for a @/bg@ prompt. The channel builds this
@@ -90,7 +90,7 @@ bgParser runner =
 -- channel's 'BgRunner'. The runner owns session creation, forking,
 -- confirmation routing, and reply delivery.
 runBackground :: BgRunner -> Text -> CommandAction
-runBackground runner prompt = CommandAction $ \caps ->
+runBackground runner prompt = commandAction $ \caps ->
   if T.null (T.strip prompt)
     then ccSend caps "usage: /bg <prompt>"
     else runBg runner prompt
