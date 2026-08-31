@@ -89,7 +89,7 @@ spec = describe "Seal.Command.Skill" $ do
   describe "pure renderers" $ do
     it "renderSkillLine shows id + description" $ do
       s <- mkSkill "greet" "greeting skill" "say hi"
-      renderSkillLine s `shouldBe` "greet  greeting skill"
+      renderSkillLine s `shouldBe` "[greet] greeting skill"
 
     it "renderSkillInfo includes id, description, and body" $ do
       s <- mkSkill "greet" "greeting skill" "say hello warmly"

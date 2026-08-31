@@ -166,7 +166,7 @@ loadCmd dispatcher raw message = CommandAction $ \caps -> do
 
 -- | One line per skill for @/skill list@.
 renderSkillLine :: Skill -> Text
-renderSkillLine s = skillIdText (skId s) <> "  " <> skDescription s
+renderSkillLine s = "[" <> skillIdText (skId s) <> "] " <> skDescription s
 
 -- | Multi-line detail for @/skill info@.
 renderSkillInfo :: Skill -> [Text]
