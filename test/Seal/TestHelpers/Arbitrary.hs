@@ -134,12 +134,22 @@ instance Arbitrary MemoryEntry where
     <*> arbitrary
     <*> genSessionId
 
--- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_-]+, non-empty).
+-- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_\/-]+, non-empty,
+-- no leading dot, no double\/trailing slash). May include a single forward
+-- slash separator for a group-qualified id.
 instance Arbitrary SkillId where
   arbitrary = do
-    c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
-    cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
-    pure (fromRight (SkillId "x") (mkSkillId (pack (c : cs))))
+    bare <- genBareId
+    oneof
+      [ pure (fromRight (SkillId "x") (mkSkillId (pack bare)))
+      , do g <- genBareId
+           pure (fromRight (SkillId "x") (mkSkillId (pack (g <> "/" <> bare))))
+      ]
+    where
+      genBareId = do
+        c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+        cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+        pure (c : cs)
 
 instance Arbitrary Skill where
   arbitrary = Skill

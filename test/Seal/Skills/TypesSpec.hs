@@ -43,8 +43,17 @@ spec = describe "Seal.Skills.Types" $ do
     it "rejects a leading-dot id" $
       mkSkillId ".hidden" `shouldSatisfy` isLeft
 
+    it "accepts an id with a group separator (forward slash)" $
+      mkSkillId "core/dummy-test" `shouldBe` Right (SkillId "core/dummy-test")
+
+    it "rejects an id with double slashes" $
+      mkSkillId "core//bad" `shouldSatisfy` isLeft
+
+    it "rejects an id with a trailing slash" $
+      mkSkillId "core/" `shouldSatisfy` isLeft
+
     it "rejects an id with disallowed chars" $
-      mkSkillId "bad/id" `shouldSatisfy` isLeft
+      mkSkillId "bad id" `shouldSatisfy` isLeft
 
     it "round-trips valid ids through the predicate (property)" $
       property $ \case

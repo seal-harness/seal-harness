@@ -25,6 +25,8 @@ import Data.Aeson
 import Data.Aeson.Key (fromText)
 import Data.Aeson.Types (parseMaybe)
 import Data.Maybe (fromMaybe)
+import Data.List (sortBy)
+import Data.Ord (comparing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -240,7 +242,7 @@ skillListOp backend = TrustedOpcode
                     [ skillIdText (skId s)
                         <> maybe "" (\g -> " [" <> g <> "]") (skGroup s)
                         <> ": " <> skDescription s
-                    | s <- allSkills ]
+                    | s <- sortBy (comparing (\s' -> (fromMaybe "" (skGroup s'), skillIdText (skId s')))) allSkills ]
           recorded = object
             [ "count" .= length allSkills
             , "ids" .= fmap (skillIdText . skId) allSkills
