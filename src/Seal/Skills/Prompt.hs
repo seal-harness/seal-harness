@@ -22,7 +22,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 
 import Seal.Skills.Backend (SkillBackend (..))
-import Seal.Skills.Types (Skill (..), skillIdText)
+import Seal.Skills.Types (Skill (..), skillIdText, bareSkillIdText)
 
 -- | A soft character budget for the whole @\<available_skills\>@ block.
 -- Keeps the catalog token-safe even when a deployment has many skills;
@@ -69,12 +69,17 @@ fullBlock skills =
 renderGroup :: [Skill] -> Text
 renderGroup [] = ""
 renderGroup group@(s:_) =
-  header <> "\n" <> T.intercalate "\n" [ "- " <> skillIdText (skId x) <> ": " <> desc x | x <- group ]
+  header <> "\n" <> T.intercalate "\n" [ "- " <> entryId x <> ": " <> desc x | x <- group ]
   where
     header = case skGroup s of
       Just g  -> "## " <> g
       Nothing -> "## Skills"
     desc x = let d = skDescription x in if T.null d then "(no description)" else d
+    -- Within a grouped section, show the bare id (the group is already
+    -- the header). For ungrouped skills, show the full id.
+    entryId x = case skGroup x of
+      Just _  -> bareSkillIdText (skId x)
+      Nothing -> skillIdText (skId x)
 
 -- | Truncate @block@ to @budget@ characters, appending a tail notice with
 -- the number of characters elided when truncation occurs. Strings at or

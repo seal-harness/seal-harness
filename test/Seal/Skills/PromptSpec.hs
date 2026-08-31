@@ -54,6 +54,20 @@ spec = describe "Seal.Skills.Prompt" $ do
       T.isInfixOf "- gamma: g desc" block `shouldBe` True
       T.isInfixOf "- beta: b desc" block `shouldBe` True
 
+    it "shows bare id within grouped sections (not the full group/id)" $ do
+      let block = availableSkillsBlock
+            [ mkSkill "core/dummy-test" "core dummy" "b" (Just "core")
+            , mkSkill "design/dummy-test" "design dummy" "b" (Just "design")
+            ]
+      T.isInfixOf "## core" block `shouldBe` True
+      T.isInfixOf "## design" block `shouldBe` True
+      T.isInfixOf "- dummy-test: core dummy" block `shouldBe` True
+      T.isInfixOf "- dummy-test: design dummy" block `shouldBe` True
+      -- The FQ id (core/dummy-test) should NOT appear in the entry line —
+      -- the group is already the header.
+      T.isInfixOf "- core/dummy-test:" block `shouldBe` False
+      T.isInfixOf "- design/dummy-test:" block `shouldBe` False
+
     it "renders ungrouped skills under a default '## Skills' header" $ do
       let block = availableSkillsBlock [ mkSkill "solo" "no group" "b" Nothing ]
       T.isInfixOf "## Skills" block `shouldBe` True

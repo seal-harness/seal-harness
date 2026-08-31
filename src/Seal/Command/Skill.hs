@@ -18,6 +18,9 @@ module Seal.Command.Skill
   ) where
 
 import Data.Aeson (object, (.=))
+import Data.Maybe (fromMaybe)
+import Data.List (sortBy)
+import Data.Ord (comparing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -97,8 +100,13 @@ listCmd backend = CommandAction $ \caps -> do
   skills <- sbList backend
   if null skills
     then ccSend caps "no skills defined"
-    else mapM_ (ccSend caps . renderSkillLine) skills
+    else mapM_ (ccSend caps . renderSkillLine) (sortSkills skills)
   pure Nothing
+
+-- | Sort skills alphabetically by group name then by skill id, for
+-- deterministic @/skill list@ output.
+sortSkills :: [Skill] -> [Skill]
+sortSkills = sortBy (comparing (\s -> (fromMaybe "" (skGroup s), skillIdText (skId s))))
 
 infoCmd :: SkillBackend -> Text -> CommandAction
 infoCmd backend raw = CommandAction $ \caps ->
@@ -166,7 +174,8 @@ loadCmd dispatcher raw message = CommandAction $ \caps -> do
 
 -- | One line per skill for @/skill list@.
 renderSkillLine :: Skill -> Text
-renderSkillLine s = "[" <> skillIdText (skId s) <> "] " <> skDescription s
+renderSkillLine s =
+  "[" <> skillIdText (skId s) <> "] " <> skDescription s
 
 -- | Multi-line detail for @/skill info@.
 renderSkillInfo :: Skill -> [Text]
