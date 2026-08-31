@@ -5,6 +5,8 @@
 module Seal.Agent.Loop
   ( runTurn
   , defaultMaxTokens
+  , aggregateStreamEvents
+  , stripToolCallXml
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -582,14 +584,207 @@ msDiff start end = round (realToFrac (diffUTCTime end start) * 1000 :: Double)
 
 -- | Aggregate a list of 'StreamEvent's (collected during streaming) into a
 -- 'CompletionResponse' for the transcript. Text chunks are concatenated into
--- a single 'CbText' block; tool-call start/end pairs become 'CbToolUse'
+-- a single 'CbText' block (with stray tool-call XML stripped — see
+-- 'stripToolCallXml'); tool-call start/end pairs become 'CbToolUse'
 -- blocks. The stop reason + usage come from the 'StreamOutcome'.
 aggregateStreamEvents :: [StreamEvent] -> StreamOutcome -> CompletionResponse
 aggregateStreamEvents events outcome =
   CompletionResponse blocks (soStop outcome) (soUsage outcome)
   where
     textChunks = [t | StreamTextChunk t <- events]
-    textBlocks = [CbText (T.intercalate "" textChunks) | not (null textChunks)]
+    textBlocks = [CbText (stripToolCallXml (T.intercalate "" textChunks))
+                 | not (null textChunks)]
     toolBlocks = [CbToolUse tcid name args
                 | StreamToolEnd tcid name args <- events]
     blocks = textBlocks <> toolBlocks
+
+-- | Upper bound on how far back a truncation-tail scan looks (chars). The
+-- tail of a StopMaxTokens response can contain a partial tool-call XML
+-- opening tag (e.g. @\<invoke name="FILE_RE@); if the continuation prepends
+-- the last chunk of the prior text (which carries that partial tag) to the
+-- new stream's first chunk, the strip below would otherwise have to rescan
+-- the entire continuation text. Cap the re-scan window so stripping stays
+-- O(1) amortized per continuation.
+maxPartialTagScan :: Int
+maxPartialTagScan = 512
+
+-- | Strip leaked tool-call XML from streamed assistant text.
+--
+-- Some provider stacks (observed with GLM via Ollama's cloud endpoint, in
+-- sessions 20260831-162314-870 / 20260831-162806-923) occasionally emit a
+-- tool call as XML in the text stream instead of a structured tool_calls
+-- chunk — e.g. @\<invoke name="FILE_READ">\<^arg_key>path\<^\/arg_key>...\<\/invoke>@.
+-- If that text lands in the transcript as @CbText@ it (a) confuses the
+-- model on subsequent turns (it reads its own half-parsed tool call as
+-- prose) and (b) renders as garbage in the frontend. When the provider
+-- ALSO surfaces the structured @tool_calls@ for the same call (the normal
+-- case), the XML is redundant; when it does not, the call is unactionable
+-- markup either way. Strip it, but leave normal prose (including literal
+-- XML in fenced code contexts that doesn't match the tool-call shape) alone.
+--
+-- Stripped shapes (case-insensitive, allow whitespace around tags):
+--
+--   * a complete @\<invoke name="..."\>...\<\/invoke>@ block
+--   * orphan @\<\/invoke>@ / @\<function_calls>@ / @\<\/function_calls>@ /
+--     @\<tool_call>@ / @\<\/tool_call>@ tags
+stripToolCallXml :: Text -> Text
+stripToolCallXml t0 =
+  let -- 0. Remove complete blocks FIRST: an intact closer at the tail
+      -- must not be mistaken for a truncation cut by the partial-tail
+      -- scan below (which would otherwise eat real content).
+      t2 = dropBlocks "<invoke" "</invoke>"
+                  (dropToolCallBlock t0)
+      -- 1. Drop a trailing partial opening tag (a StopMaxTokens cut can
+      --    leave e.g. an unfinished '<invoke na' at the end of the text).
+      t1b = dropTrailingPartialTag t2
+      -- 2. Remove orphan tags (unterminated blocks whose opener was cut,
+      --    or a stray close tag the provider emitted).
+      t3 = T.replace oInvokeClose "" t1b
+      t4 = T.replace oFcOpen "" t3
+      t5 = T.replace oFcClose "" t4
+      t6 = T.replace oToolOpen "" t5
+      t7 = T.replace oToolClose "" t6
+      -- 3. Remove orphan param tags (leaked args wrap key/value in
+      --    \<arg_key\>/\<arg_value\> tags; when the surrounding
+      --    \<invoke\> block was already removed these are strays).
+      t8 = T.replace paramKeyOpen "" t7
+      t9 = T.replace paramKeyClose "" t8
+      t10 = T.replace paramValOpen "" t9
+      t11 = T.replace paramValClose "" t10
+      -- 5. Remove a trailing unterminated opener (its closer was never
+      --    emitted, e.g. a truncation cut mid-block): if an opener
+      --    appears in the last maxPartialTagScan chars and no closer
+      --    follows it, drop from the opener to the end of the text.
+      t12 = dropTrailingUnterminated t11
+  in t12
+  where
+    oInvokeClose = "</invoke>"
+    oFcOpen      = "<function_calls>"
+    oFcClose     = "</function_calls>"
+    oToolOpen    = "<tool_call>"
+    oToolClose   = "</tool_call>"
+    paramKeyOpen  = "<arg_key>"
+    paramKeyClose = "</arg_key>"
+    paramValOpen  = "<arg_value>"
+    paramValClose = "</arg_value>"
+
+-- | Remove a complete @\<tool_call>...\<tool_call>\/tool_call\>@ span. The opener
+-- carries no attributes, so this is a plain two-marker scan (unlike
+-- 'dropBlocks', whose attribute handling misfires on JSON bodies that
+-- contain no '@<@' but do contain a close tag later in the text).
+dropToolCallBlock :: Text -> Text
+dropToolCallBlock = go
+  where
+    open = "<tool_call>"
+    close = "</tool_call>"
+    go acc = case T.breakOn open acc of
+      (before, rest)
+        | T.null rest -> acc
+        | otherwise   ->
+            let afterOpen = T.drop (T.length open) rest
+            in case T.breakOn close afterOpen of
+                 (_, afterCloseRest)
+                   | T.null afterCloseRest -> acc  -- no close: leave
+                 (_, afterClose)           -> go (before <> T.drop (T.length close) afterClose)
+
+-- | Remove every complete @open ... close@ span (non-greedy: up to the
+-- FIRST closing tag), including the tags themselves. Unterminated blocks
+-- are left alone (the orphan-tag pass handles their remnants).
+dropBlocks :: Text -> Text -> Text -> Text
+dropBlocks open close = go
+  where
+    go acc = case breakOnTag acc of
+      Nothing -> acc
+      Just (before, afterOpenTag) ->
+        case T.breakOn close afterOpenTag of
+          (_, afterCloseRest)
+            | T.null afterCloseRest -> acc  -- no close: leave as-is
+          (_, afterClose)           -> go (before <> T.drop (T.length close) afterClose)
+    -- Find the open tag (with any attributes up to its closing '>') and
+    -- return (text before it, text after the tag's '>').
+    breakOnTag acc = case T.breakOn open acc of
+      (before, rest)
+        | T.null rest -> Nothing
+        | otherwise   ->
+            let afterName = T.drop (T.length open) rest
+            in case T.breakOn ">" afterName of
+                 (attrs, gtRest)
+                   -- attrs is everything up to the first '>' — treat it
+                   -- as the tag's attribute list only when it contains
+                   -- no other '<' (a nested '<' means this '>' closes a
+                   -- LATER tag, not this opener; the match was a false
+                   -- positive on e.g. '<tool_call>{...json...}'.
+                   | T.isInfixOf "<" attrs -> Nothing
+                   | T.null gtRest          -> Nothing  -- no '>' at all
+                   | otherwise              -> Just (before, T.drop 1 gtRest)
+
+-- | If a tool-call opener (@<invoke@, @<function_calls@, @<tool_call@)
+-- appears within the last 'maxPartialTagScan' chars and NO closer follows
+-- it, the tail is an unterminated leaked tool call — drop from the opener
+-- to the end of the text. Catches blocks the provider broke across a
+-- truncation boundary (opener present, close never emitted).
+dropTrailingUnterminated :: Text -> Text
+dropTrailingUnterminated t =
+  case openIdx of
+    Nothing -> t
+    Just i ->
+      let afterOpen = T.drop i t
+      in if any (`T.isInfixOf` afterOpen) closers then t else T.take i t
+  where
+    closers = ["</invoke>", "</function_calls>", "</tool_call>"]
+    openers = ["invoke", "function_calls", "tool_call"]
+    -- the LAST opener occurrence inside the trailing window (global
+    -- index, with a tag-ish boundary after the name — prose like
+    -- "<invoke-ish" must not match)
+    openIdx =
+      let window = T.takeEnd maxPartialTagScan t
+          base   = T.length t - T.length window
+          hits   = [ (base + i, o)
+                   | o <- openers
+                   , i <- reverse [0 .. T.length window - (T.length o + 1)]
+                   , T.index window i == '<'
+                   , Just rest <- [T.stripPrefix o (T.drop (i + 1) window)]
+                   , tagBoundary rest ]
+      in case hits of
+           []           -> Nothing
+           ((i, _) : _) -> Just i
+    tagBoundary rest = case T.uncons rest of
+      Nothing     -> True
+      Just (c, _) -> c == ' ' || c == '>' || c == '/' || c == '\t' || c == '\n' || c == '\r'
+
+-- | Drop a truncated tool-call XML tag at the very end of the text (a
+-- StopMaxTokens cut can leave an unfinished tag as the final characters).
+-- Only the last 'maxPartialTagScan' chars are scanned: a final unmatched
+-- '<' that would begin one of the known tool-call tag names (case-
+-- insensitive) is cut, along with everything after it. A '<' in prose
+-- ("5 < 6") never matches a known tag-name prefix, so ordinary text is
+-- untouched.
+dropTrailingPartialTag :: Text -> Text
+dropTrailingPartialTag t =
+  case ltIdx of
+    Nothing -> t
+    Just i ->
+      let afterLt = T.toLower (T.drop (i + 1) t)
+      in if any (tagStart afterLt) tagPrefixes
+           then T.take i t
+           else t
+  where
+    tagPrefixes = ["invoke", "function_calls", "tool_call", "/invoke",
+                   "/function_calls", "/tool_call"]
+    -- The text right after '<' begins a known tag name AND the name is
+    -- followed by a tag-ish boundary (whitespace, '>', '/', or end of
+    -- text). A hyphen (as in prose like "<invoke-ish>") disqualifies it —
+    -- that's an ordinary word, not a tag.
+    tagStart after tag =
+      case T.stripPrefix tag after of
+        Nothing   -> False
+        Just rest -> case T.uncons rest of
+          Nothing     -> True  -- cut exactly after the tag name
+          Just (c, _) -> c == ' ' || c == '>' || c == '/' || c == '\t' || c == '\n' || c == '\r'
+    -- the last '<' within the trailing scan window (global index), if any
+    ltIdx =
+      let window = T.takeEnd maxPartialTagScan t
+          base   = T.length t - T.length window
+      in case [base + i | i <- reverse [0 .. T.length window - 1], T.index window i == '<'] of
+           (i : _) -> Just i
+           []      -> Nothing
