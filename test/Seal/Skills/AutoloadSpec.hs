@@ -9,7 +9,7 @@ import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 
 import Seal.Core.Types (mkSystemSessionId)
-import Seal.Skills.Autoload (injectAutoloadSkill, renderSkillForPrompt)
+import Seal.Skills.Autoload (injectAutoloadSkill, injectCodegraphSkill, renderSkillForPrompt)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 
@@ -102,3 +102,27 @@ spec = describe "Seal.Skills.Autoload" $ do
           out = renderSkillForPrompt Nothing skill
       T.unpack out `shouldContain` "the body"
       T.unpack out `shouldNotContain` "\n\n\n"
+
+  describe "injectCodegraphSkill" $ do
+    it "appends the codegraph skill body to an existing system prompt" $ do
+      let result = injectCodegraphSkill (Just "Use codegraph for code analysis") (Just "base prompt")
+      case result of
+        Just t -> do
+          T.unpack t `shouldContain` "base prompt"
+          T.unpack t `shouldContain` "Use codegraph for code analysis"
+          T.unpack t `shouldContain` "Auto-loaded skill: codegraph"
+        Nothing -> expectationFailure "expected a system prompt"
+
+    it "uses the skill body as the whole prompt when base is Nothing" $ do
+      let result = injectCodegraphSkill (Just "codegraph body") Nothing
+      case result of
+        Just t -> do
+          T.unpack t `shouldContain` "codegraph body"
+          T.unpack t `shouldContain` "Auto-loaded skill: codegraph"
+        Nothing -> expectationFailure "expected a system prompt"
+
+    it "returns the prompt unchanged when codegraph body is Nothing (no .codegraph/)" $ do
+      injectCodegraphSkill Nothing (Just "base prompt") `shouldBe` Just "base prompt"
+
+    it "returns Nothing when body is Nothing and base is Nothing" $ do
+      injectCodegraphSkill Nothing Nothing `shouldBe` (Nothing :: Maybe Text)

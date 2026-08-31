@@ -7,9 +7,12 @@
 -- The injected skill is /teaching/, not enforcement: it tells the model the
 -- workdir contract so it cooperates. The operator can disable auto-injection
 -- by setting @[skills] autoload = ""@ in @config.toml@, or override the
--- injected skill id with any other value.
+-- injected skill id with any other value. The codegraph skill body (when
+-- a repo with @.codegraph/@ is in the workdir) is injected the same way,
+-- after the autoload skill, by 'injectCodegraphSkill'.
 module Seal.Skills.Autoload
   ( injectAutoloadSkill
+  , injectCodegraphSkill
   , renderSkillForPrompt
   ) where
 
@@ -17,6 +20,11 @@ import Data.Text (Text)
 
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+
+-- | The skill id for the codegraph built-in. Used by the caller to
+-- look up the skill body before calling 'injectCodegraphSkill'.
+codegraphSkillId :: Text
+codegraphSkillId = "codegraph"
 
 -- | Append the auto-loaded skill body to the resolved system prompt.
 --
@@ -61,3 +69,28 @@ renderSkillForPrompt mPrompt skill =
     rendered =
       "# Auto-loaded skill: " <> skillIdText (skId skill) <> "\n\n"
       <> skBody skill
+
+-- | Conditionally inject the codegraph skill body into the system prompt.
+-- Called by the turn engine after the autoload skill is injected, but
+-- only when a @.codegraph/@ directory exists in one of the repos cloned
+-- into the workdir. The caller (TurnEngine) checks for @.codegraph/@ and,
+-- if present, looks up the codegraph skill body from the backend and
+-- passes @Just body@ here. When @Nothing@, the prompt is returned unchanged.
+--
+-- The skill body is appended under the same @## Auto-loaded skill: <id>@
+-- header as the autoload skill, so the model sees it as orientation, not
+-- as part of the agent's identity prompt.
+injectCodegraphSkill
+  :: Maybe Text
+  -- ^ The codegraph skill body ('Nothing' when no @.codegraph/@ is
+  -- present; the prompt is unchanged in that case).
+  -> Maybe Text
+  -- ^ The resolved system prompt so far (base + autoload body, or
+  -- 'Nothing' when no agent is bound and no autoload skill injected).
+  -> Maybe Text
+injectCodegraphSkill Nothing prompt = prompt
+injectCodegraphSkill (Just body) prompt =
+  let rendered = "# Auto-loaded skill: " <> codegraphSkillId <> "\n\n" <> body
+  in case prompt of
+       Nothing   -> Just rendered
+       Just base -> Just (base <> "\n\n" <> rendered)

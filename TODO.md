@@ -57,6 +57,7 @@
 - [x] Ask-human: stock answers (#92), Telegram buttons (#94), open-ended questions
 - [x] Git opcodes + SSH agent forwarding (#82)
 - [x] .agents Protocol + skills discovery from cloned repos (#87, #99)
+- [x] CodeGraph integration: auto-run `codegraph init` on SETUP_REPO + conditional skill injection
 - [x] FILE_READ: Hermes-like pagination
 - [x] FILE_PATCH: content-based apply, not position-based
 - [x] Consolidated Tools row into System row (#101)

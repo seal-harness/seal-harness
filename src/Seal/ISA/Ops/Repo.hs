@@ -46,6 +46,7 @@ module Seal.ISA.Ops.Repo
   , isShellMetachar
   , CloneResult (..)
   , cloneRepoIO
+  , tryCodegraphInit
   ) where
 
 import Data.Aeson (Value, object, withObject, (.:), (.=))
@@ -299,7 +300,9 @@ verifyClone uio repoName cloneOut mCwdPath = do
   case vRes of
     Left err -> pure (CloneFailed ("clone verify failed: " <> renderUntrustedErr err))
     Right vOut
-      | "__OK__" `T.isInfixOf` vOut -> pure (CloneCloned repoName)
+      | "__OK__" `T.isInfixOf` vOut -> do
+          _ <- tryCodegraphInit uio repoName mCwdPath
+          pure (CloneCloned repoName)
       | otherwise -> pure (CloneFailed
                             ("clone did not land — git output: "
                              <> T.strip (T.filter (/= '\n') cloneOut)))
@@ -342,3 +345,33 @@ recordWith _ target status =
 -- but quoting is defense-in-depth.
 shellQ :: Text -> Text
 shellQ t = "'" <> T.concatMap (\c -> if c == '\'' then "'\\''" else T.singleton c) t <> "'"
+
+-- | Best-effort: run @codegraph init@ in the freshly cloned repo directory
+-- so the agent has a pre-built knowledge graph on the next turn. This is
+-- a soft-failure operation — if @codegraph@ is not installed (exit 127) or
+-- fails for any reason (unsupported language, large repo, etc.), the
+-- clone result is unaffected. The @codegraph@ binary is looked up via
+-- @command -v@ first so we don't spawn a process we know will fail; if
+-- not found, we skip silently.
+--
+-- Security: this runs on the untrusted plane via 'uioShellExec', which is
+-- correct — @codegraph init@ parses untrusted repo content (tree-sitter on
+-- upstream code). No new attack surface is introduced.
+tryCodegraphInit :: UntrustedIO -> Text -> Maybe RemotePath -> IO ()
+tryCodegraphInit uio repoName mCwdPath = do
+  -- Check if codegraph is installed (command -v returns 0 if found).
+  let checkCmd = "command -v codegraph >/dev/null 2>&1"
+  checkRes <- UIORec.uioShellExec uio (shellCmd checkCmd) mCwdPath
+  case checkRes of
+    Left _ -> pure ()   -- uioShellExec failed entirely — skip
+    Right _ -> do
+      -- codegraph exists; run init with the repo directory as cwd.
+      -- @codegraph init@ (no path arg) initializes the project in the
+      -- current directory. The @|| true@ ensures best-effort: any failure
+      -- (unsupported language, etc.) is swallowed.
+      let repoPath = case mkRemotePath repoName of
+            Right rp -> Just rp
+            Left _   -> Nothing
+      let initCmd = "codegraph init 2>&1 || true"
+      _ <- UIORec.uioShellExec uio (shellCmd initCmd) repoPath
+      pure ()
