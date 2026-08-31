@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.SpecSpec (spec) where
 
+import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Test.Hspec
 import Options.Applicative
@@ -31,7 +32,7 @@ pingSpec = CommandSpec
   , csAvailability = AlwaysAvailable
   }
   where
-    toPingAction (PingOpts loud) = CommandAction $ \caps ->
+    toPingAction (PingOpts loud) = commandAction $ \caps ->
       ccSend caps (if loud then "PONG!" else "pong")
 
 echoSpec :: CommandSpec
@@ -40,7 +41,7 @@ echoSpec = CommandSpec
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "Echo text back"
-  , csParserInfo   = info (pure (CommandAction $ \caps -> ccSend caps "..."))
+  , csParserInfo   = info (pure (commandAction $ \caps -> ccSend caps "..."))
                           (progDesc "Echo the input back")
   , csAvailability = AlwaysAvailable
   }
@@ -98,6 +99,6 @@ spec = describe "Seal.Command.Spec" $ do
             , ccPromptSecret = \_ -> pure ""
   , ccStreaming    = True  -- tests: streaming by default
             }
-          act = CommandAction (`ccSend` "hello")
-      runCommandAction act caps
+          act = commandAction (`ccSend` "hello")
+      void (runCommandAction act caps)
       readIORef ref `shouldReturn` "\"hello\""

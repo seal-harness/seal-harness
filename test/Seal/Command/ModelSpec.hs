@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.ModelSpec (spec) where
 
+import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef)
 import Data.Maybe (fromMaybe)
@@ -57,7 +58,7 @@ mkPR cfgPath mvh = do
 runModel :: ProviderRuntime -> SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runModel pr sr argv caps =
   case execParserPure defaultPrefs (csParserInfo (modelCommandSpec pr sr noModelTranscriptWriter)) argv of
-    Success act -> runCommandAction act caps
+    Success act -> void (runCommandAction act caps)
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 -- | Run /model against a per-sid spec (the web-gateway / channel-loop shape),
@@ -69,7 +70,7 @@ runModelForSession pr paths resolveSid mWriter argv caps =
   let writer = fromMaybe noModelTranscriptWriter mWriter
       cmdSpec = modelCommandSpecForSession pr paths resolveSid writer
   in case execParserPure defaultPrefs (csParserInfo cmdSpec) argv of
-       Success act -> runCommandAction act caps
+       Success act -> void (runCommandAction act caps)
        _           -> expectationFailure ("parse failed: " <> show argv)
 
 -- | Run a mock ollama @/api/tags@ server on an ephemeral port for the

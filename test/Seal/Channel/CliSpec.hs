@@ -21,7 +21,7 @@ import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Command.Spec (CommandAction (..))
+import Seal.Command.Spec (commandAction)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Handles.AskReply (newApprovalCache)
@@ -96,7 +96,7 @@ spec = do
     it "DispatchAction runs the action through caps" $ do
       ref <- newIORef []
       let caps   = recordingCaps ref
-          action = CommandAction $ \c -> ccSend c "from action"
+          action = commandAction $ \c -> ccSend c "from action"
       interpretDisposition caps ignoredHandler (DispatchAction action)
       sent <- readIORef ref
       sent `shouldBe` ["from action"]

@@ -56,7 +56,7 @@ import System.Process
 
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig,
                          saveRuntimeConfig)
@@ -220,7 +220,7 @@ channelParser rt = hsubparser
 -- through 'ChannelCaps' (sends + prompts) so the wizard works on the CLI
 -- TUI and any interactive channel.
 signalSetupCmd :: ChannelRuntime -> CommandAction
-signalSetupCmd rt = CommandAction $ \caps -> do
+signalSetupCmd rt = commandAction $ \caps -> do
   let cli = crSignalCli rt
   -- Step 1: Check signal-cli is installed.
   eVer <- scCheckInstalled cli
@@ -447,7 +447,7 @@ lockDownAllowFrom rt caps account = lockAttempt (3 :: Int)
 -- goes through 'ChannelCaps' (sends + prompts) so the wizard works on the
 -- CLI TUI and any interactive channel.
 telegramSetupCmd :: ChannelRuntime -> CommandAction
-telegramSetupCmd rt = CommandAction $ \caps -> do
+telegramSetupCmd rt = commandAction $ \caps -> do
   ccSend caps $ T.intercalate "\n"
     [ "Setting up the Telegram channel."
     , ""

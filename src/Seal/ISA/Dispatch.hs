@@ -27,9 +27,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask)
 import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as A
-import Data.Aeson.Types (parseMaybe)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -222,14 +220,8 @@ recordSkillLoadResult h (OpName nm) input result mChannel
                  ] <> channelMeta)
             }
           bodyText = T.intercalate "\n" [ t | TrpText t <- orParts result ]
-          -- The optional trailing message from the /skill load <id> <message>
-          -- invocation. Extracted from the input's @message@ field; blank or
-          -- absent yields no second conversation message.
-          messageText = fromMaybe "" (parseMaybe (A.withObject "input" (A..: "message")) input)
-          trimmedMessage = T.strip messageText
           convMsgs =
             [ Message Assistant [CbText bodyText] | not (T.null bodyText) ]
-            <> [ Message User [CbText trimmedMessage] | not (T.null trimmedMessage) ]
       tfwRecordAndAck h (TwoFileWrite convMsgs entry)
   | otherwise = pure ()
 

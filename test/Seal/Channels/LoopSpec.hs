@@ -8,6 +8,7 @@
 -- registry and return the structured result.
 module Seal.Channels.LoopSpec (spec) where
 
+import Control.Monad (void)
 import Data.Aeson (object, (.=))
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
@@ -28,7 +29,7 @@ import Seal.Command.Call (CallDispatcher)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec
-  ( CommandAction (..), CommandName (..), CommandSpec (..), Registry
+  ( CommandAction (..), commandAction, CommandName (..), CommandSpec (..), Registry
   , Availability (..), CommandGroup (..)
   , lookupSpec, mkRegistry, registrySpecs, runCommandAction )
 import Seal.Core.ChannelKind (ChannelKind (..))
@@ -92,7 +93,7 @@ stubSpec name = CommandSpec
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = "stub"
-  , csParserInfo   = Opt.info (pure (CommandAction (\_ -> pure ())))
+  , csParserInfo   = Opt.info (pure (commandAction (\_ -> pure ())))
                           (Opt.progDesc "stub")
   , csAvailability = AlwaysAvailable
   }
@@ -278,7 +279,7 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
           (fc, caps) <- makeFakeCaps []
           case Opt.execParserPure Opt.defaultPrefs (csParserInfo skillSpec) ["load", "greet"] of
             Opt.Success act -> do
-              runCommandAction act caps
+              void (runCommandAction act caps)
               _ <- getSent fc  -- drain (echo line); not asserted
               chan <- readIORef chanCalls
               web <- readIORef webCalls

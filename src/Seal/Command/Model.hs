@@ -39,7 +39,7 @@ import Options.Applicative
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig
@@ -180,7 +180,7 @@ modelArg = T.pack <$> strArgument (metavar "MODEL" <> help "Model id")
 
 listCmd
   :: ProviderRuntime -> IO (Maybe SessionMeta) -> Maybe Text -> CommandAction
-listCmd pr resolveMeta Nothing = CommandAction $ \caps -> do
+listCmd pr resolveMeta Nothing = commandAction $ \caps -> do
   eCfg <- loadRuntimeConfig (prConfigPath pr)
   let cfg = fromRight defaultRuntimeConfig eCfg
   mh <- readIORef (vrHandleRef (prVault pr))
@@ -193,7 +193,7 @@ listCmd pr resolveMeta Nothing = CommandAction $ \caps -> do
         Just a  -> "active: " <> smProvider a <> "/" <> smModel a
         Nothing -> "active: (no session)"
   ccSend caps activeLine
-listCmd pr _ (Just provLbl) = CommandAction $ \caps ->
+listCmd pr _ (Just provLbl) = commandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
@@ -254,7 +254,7 @@ useCmd
   -> Text
   -> Maybe Text
   -> CommandAction
-useCmd pr resolveMeta save mWriter provLbl mModel = CommandAction $ \caps ->
+useCmd pr resolveMeta save mWriter provLbl mModel = commandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do
@@ -279,7 +279,7 @@ useCmd pr resolveMeta save mWriter provLbl mModel = CommandAction $ \caps ->
           ccSend caps confirm
 
 defaultCmd :: ProviderRuntime -> Text -> Text -> CommandAction
-defaultCmd pr provLbl model = CommandAction $ \caps ->
+defaultCmd pr provLbl model = commandAction $ \caps ->
   case parseProvider provLbl of
     Nothing -> ccSend caps (unknownProviderMsg provLbl)
     Just kp -> do

@@ -26,7 +26,7 @@ import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId, agentDefIdText)
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Core.Types (ModelId (..), OpName (..))
@@ -70,14 +70,14 @@ agentArg :: Parser Text
 agentArg = T.pack <$> strArgument (metavar "AGENT" <> help "Agent def id (e.g. worker)")
 
 listCmd :: AgentDefBackend -> CommandAction
-listCmd backend = CommandAction $ \caps -> do
+listCmd backend = commandAction $ \caps -> do
   defs <- adbList backend
   if null defs
     then ccSend caps "no agent defs defined"
     else mapM_ (ccSend caps . renderAgentLine) (sortOn adName defs)
 
 infoCmd :: AgentDefBackend -> Text -> CommandAction
-infoCmd backend raw = CommandAction $ \caps ->
+infoCmd backend raw = commandAction $ \caps ->
   case mkAgentDefId raw of
     Left err -> ccSend caps err
     Right aid -> do
@@ -88,7 +88,7 @@ infoCmd backend raw = CommandAction $ \caps ->
 
 -- | @/agent default@ with no arg views; with an arg validates-then-persists.
 defaultCmd :: AgentDefBackend -> FilePath -> Maybe Text -> CommandAction
-defaultCmd backend cfgPath mArg = CommandAction $ \caps ->
+defaultCmd backend cfgPath mArg = commandAction $ \caps ->
   case mArg of
     Nothing -> do
       eCfg <- loadRuntimeConfig cfgPath

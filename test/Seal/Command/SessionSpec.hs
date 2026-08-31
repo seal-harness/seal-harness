@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.SessionSpec (spec) where
 
+import Control.Monad (void)
 import Data.Either (fromRight)
 import Data.IORef (newIORef)
 import Data.Text qualified as T
@@ -52,7 +53,7 @@ mkPR cfgPath = do
 runSess :: SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runSess sr argv caps =
   case execParserPure defaultPrefs (csParserInfo (sessionCommandSpec sr)) argv of
-    Success act -> runCommandAction act caps
+    Success act -> void (runCommandAction act caps)
     _           -> expectationFailure ("parse failed: " <> show argv)
 
 spec :: Spec

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.ChannelSpec (spec) where
 
+import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, modifyIORef', writeIORef)
 import Data.Maybe (isJust)
@@ -136,7 +137,7 @@ runChannel cli tgApi vault argv inputs cfgPath = do
                           , crTelegramBotApi = tgApi
                           , crVaultStore = vault }
   case execParserPure defaultPrefs (csParserInfo (channelCommandSpec rt)) argv of
-    Success act -> runCommandAction act caps
+    Success act -> void (runCommandAction act caps)
     _           -> expectationFailure ("parse failed: " <> show argv)
   getSent fc
 

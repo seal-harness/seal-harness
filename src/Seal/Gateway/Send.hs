@@ -453,12 +453,20 @@ runSlash deps meta fullLine = do
   d <- ingest perRequestRegistry (sdPreprocess deps) (RawInbound fullLine)
   case d of
     DispatchAction (CommandAction act) -> do
-      act caps
+      mFollowUp <- act caps
       chunks <- readMVar outVar
       -- If the action swapped the active session (e.g. /new), thread the
       -- new sid into the outcome so the frontend navigates to it.
       mNewSid <- newSessionIdIfChangedFrom deps (smId activeBefore)
-      pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
+      -- When the command signals a follow-up turn (e.g. /skill load),
+      -- run the turn so the LLM runs immediately. The follow-up text
+      -- becomes the user message 'runTurn' writes to conversation.jsonl;
+      -- the skill body is already there from 'recordSkillLoadResult'.
+      case mFollowUp of
+        Just t -> do
+          _ <- plainTurnWithCaps deps meta caps t
+          pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
+        Nothing -> pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
     ShowText t -> pure (SendSlash t Nothing)
     Rejected t -> pure (SendError 400 t)
     PlainMessage t -> do

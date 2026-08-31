@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Command.CallSpec (spec) where
 
+import Control.Monad (void)
 import Data.Aeson (Value, object)
 import Data.Aeson qualified as Aeson
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -47,7 +48,7 @@ fakeErrorDispatcher :: DispatchError -> CallDispatcher
 fakeErrorDispatcher e _opName _val = pure (Left e)
 
 runCommand :: CommandAction -> ChannelCaps -> IO ()
-runCommand = runCommandAction
+runCommand act caps = void (runCommandAction act caps)
 
 showPO :: ParseOutcome -> String
 showPO (ParsedAction _)  = "ParsedAction"

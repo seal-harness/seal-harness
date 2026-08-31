@@ -37,7 +37,7 @@ import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), commandAction, CommandGroup (..)
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.Paths (SealPaths, sessionDir)
 import Seal.Core.Types (SessionId, sessionIdText)
@@ -125,7 +125,7 @@ stopParserInfo abortReg resolveSid writer =
     )
 
 stopAction :: SessionAbortRegistry -> IO SessionId -> StopTranscriptWriter -> CommandAction
-stopAction abortReg resolveSid (StopTranscriptWriter mWriter) = CommandAction $ \caps -> do
+stopAction abortReg resolveSid (StopTranscriptWriter mWriter) = commandAction $ \caps -> do
   sid <- resolveSid
   setSessionAbort abortReg sid
   let stopMsg = "(stopped)"

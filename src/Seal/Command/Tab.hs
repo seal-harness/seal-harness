@@ -16,7 +16,7 @@ import System.Directory (doesFileExist)
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (mkSessionId, sessionIdText)
@@ -61,7 +61,7 @@ terseGrammarSpec = CommandSpec
   , csAliases      = []
   , csGroup        = GroupGeneral
   , csSynopsis     = terseSynopsis
-  , csParserInfo   = info (pure (CommandAction (const (pure ())))) (progDesc "Terse tab switching")
+  , csParserInfo   = info (pure (commandAction (const (pure ())))) (progDesc "Terse tab switching")
   , csAvailability = AlwaysAvailable
   }
 
@@ -92,7 +92,7 @@ tabParser paths h closeNotifier = hsubparser
 -- the web frontend's 'sessionDisplayTitle' cascade) for session-backed
 -- tabs with no label.
 listCmd :: SealPaths -> TabsHandle -> CommandAction
-listCmd paths h = CommandAction $ \caps -> do
+listCmd paths h = commandAction $ \caps -> do
   tl <- snapshotTabs h
   if tabCount tl == 0
     then ccSend caps "no tabs"
@@ -116,7 +116,7 @@ resolveTabName paths t
 -- | The /tab new subcommand. (For 6b the kind is informational; a session
 -- tab is the default. A harness tab needs the wizard — deferred.)
 newCmd :: TabsHandle -> Maybe Text -> CommandAction
-newCmd h _mKind = CommandAction $ \caps -> do
+newCmd h _mKind = commandAction $ \caps -> do
   let ref = BoundSession placeholder
   r <- insertTabH h ref KindAi Nothing
   case r of
@@ -130,7 +130,7 @@ newCmd h _mKind = CommandAction $ \caps -> do
 -- | The /tab close subcommand. Snapshots the tab's 'TabRef' before removing
 -- it so the close notifier can tell attached channels which tab was closed.
 closeCmd :: TabsHandle -> TabCloseNotifier -> Int -> Bool -> CommandAction
-closeCmd h closeNotifier idx force = CommandAction $ \caps -> do
+closeCmd h closeNotifier idx force = commandAction $ \caps -> do
   case mkTabIndex idx of
     Left e  -> ccSend caps ("invalid index: " <> e)
     Right i -> do
@@ -156,7 +156,7 @@ tabRefAtIndex h i = do
 
 -- | The /tab focus subcommand.
 focusCmd :: TabsHandle -> Int -> CommandAction
-focusCmd h idx = CommandAction $ \caps -> do
+focusCmd h idx = commandAction $ \caps -> do
   case mkTabIndex idx of
     Left e  -> ccSend caps ("invalid index: " <> e)
     Right i -> do
@@ -167,7 +167,7 @@ focusCmd h idx = CommandAction $ \caps -> do
 
 -- | The /tab resume subcommand.
 resumeCmd :: TabsHandle -> Text -> CommandAction
-resumeCmd h sidText = CommandAction $ \caps -> do
+resumeCmd h sidText = commandAction $ \caps -> do
   case mkSessionId sidText of
     Left e  -> ccSend caps ("invalid session id: " <> e)
     Right s -> do
@@ -178,7 +178,7 @@ resumeCmd h sidText = CommandAction $ \caps -> do
 
 -- | The /tab rename subcommand.
 renameCmd :: TabsHandle -> Int -> Text -> CommandAction
-renameCmd h idx name = CommandAction $ \caps -> do
+renameCmd h idx name = commandAction $ \caps -> do
   case mkTabIndex idx of
     Left e  -> ccSend caps ("invalid index: " <> e)
     Right i -> do

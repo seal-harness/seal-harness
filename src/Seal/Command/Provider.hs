@@ -28,7 +28,7 @@ import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Providers.Anthropic.OAuth
   ( buildAuthorizeUrl, exchangeCode, newPkce, parsePastedCode, serializeTokens )
 import Seal.Command.Spec
-  ( Availability (..), CommandAction (..), CommandGroup (..)
+  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File
   ( RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig
@@ -159,7 +159,7 @@ seedProviderDefaults kp fc0 =
        else upsertProvider lbl (\p -> p { pcDefaultModel = Just (modelText (defaultModelFor kp)) }) fc1
 
 addCmd :: ProviderRuntime -> Text -> CommandAction
-addCmd pr lbl = CommandAction $ \caps ->
+addCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh ->
       if providerLabel kp == "ollama"
@@ -205,7 +205,7 @@ addOllama pr caps vh kp = do
 -- default. The confirmation echoes the provider's resolved default model so it
 -- is clear what new sessions will start with.
 defaultCmd :: ProviderRuntime -> Text -> CommandAction
-defaultCmd pr lbl = CommandAction $ \caps ->
+defaultCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp -> do
     let plabel = providerLabel kp
     res <- updateRuntimeConfig (prConfigPath pr)
@@ -221,7 +221,7 @@ defaultCmd pr lbl = CommandAction $ \caps ->
           ("default provider set to " <> plabel <> " (model: " <> m <> ")")
 
 listCmd :: ProviderRuntime -> CommandAction
-listCmd pr = CommandAction $ \caps ->
+listCmd pr = commandAction $ \caps ->
   withVaultHandle pr caps $ \vh -> do
     eCfg <- loadRuntimeConfig (prConfigPath pr)
     let cfg = fromRight defaultRuntimeConfig eCfg
@@ -255,7 +255,7 @@ listCmd pr = CommandAction $ \caps ->
 -- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges
 -- it for tokens, and stores them in the vault. Tokens are never echoed.
 loginCmd :: ProviderRuntime -> Text -> CommandAction
-loginCmd pr lbl = CommandAction $ \caps ->
+loginCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     if providerLabel kp /= "anthropic"
       then ccSend caps
@@ -287,7 +287,7 @@ openBrowser url = do
   pure ()
 
 testCmd :: ProviderRuntime -> Text -> CommandAction
-testCmd pr lbl = CommandAction $ \caps ->
+testCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
       eCfg <- loadRuntimeConfig (prConfigPath pr)
@@ -305,7 +305,7 @@ testCmd pr lbl = CommandAction $ \caps ->
           ccSend caps (formatTestResult (providerLabel kp) r)
 
 removeCmd :: ProviderRuntime -> Text -> CommandAction
-removeCmd pr lbl = CommandAction $ \caps ->
+removeCmd pr lbl = commandAction $ \caps ->
   withProvider caps lbl $ \kp ->
     withVaultHandle pr caps $ \vh -> do
       r1 <- deleteIfPresent vh (vaultKeyName kp)

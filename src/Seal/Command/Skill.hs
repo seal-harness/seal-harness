@@ -14,6 +14,7 @@ module Seal.Command.Skill
   ( skillCommandSpec
   , renderSkillLine
   , renderSkillInfo
+  , skillLoadFollowUpText
   ) where
 
 import Data.Aeson (object, (.=))
@@ -31,6 +32,19 @@ import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode (OpResult (..))
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+
+-- | The synthetic user message used as the follow-up turn text when
+-- @/skill load@ is invoked WITHOUT a trailing message (e.g.
+-- @/skill load greet@). The skill body has already been written to
+-- @conversation.jsonl@ as an 'Assistant' message by
+-- 'Seal.ISA.Dispatch.recordSkillLoadResult'; this text becomes the 'User'
+-- message that triggers the LLM turn, so the model sees the skill
+-- immediately followed by a prompt to act on it. When the user supplies a
+-- trailing message (e.g. @/skill load start #123@), THAT text is used
+-- instead — the user's intent takes precedence over the synthetic prompt.
+skillLoadFollowUpText :: Text
+skillLoadFollowUpText =
+  "Skill loaded. Follow the instructions in the skill above."
 
 -- | The @/skill@ command spec. Closes over the 'SkillBackend' (for
 -- @/skill list@ \/ @/skill info@, which read the materialized view of the
@@ -84,16 +98,17 @@ listCmd backend = CommandAction $ \caps -> do
   if null skills
     then ccSend caps "no skills defined"
     else mapM_ (ccSend caps . renderSkillLine) skills
+  pure Nothing
 
 infoCmd :: SkillBackend -> Text -> CommandAction
 infoCmd backend raw = CommandAction $ \caps ->
   case mkSkillId raw of
-    Left err -> ccSend caps err
+    Left err -> ccSend caps err >> pure Nothing
     Right sid -> do
       mSkill <- sbRead backend sid
       case mSkill of
-        Nothing -> ccSend caps ("skill not found: " <> skillIdText sid)
-        Just s  -> mapM_ (ccSend caps) (renderSkillInfo s)
+        Nothing -> ccSend caps ("skill not found: " <> skillIdText sid) >> pure Nothing
+        Just s  -> mapM_ (ccSend caps) (renderSkillInfo s) >> pure Nothing
 
 -- | @/skill load <id> [message...]@ — dispatch the 'SKILL_LOAD' opcode with
 -- @{"id": <id>, "message": <message>}@ via the channel-supplied
@@ -101,12 +116,14 @@ infoCmd backend raw = CommandAction $ \caps ->
 -- the "Command output" bubble is self-contained).
 --
 -- The optional trailing @message@ is forwarded to the dispatcher as a
--- @message@ field in the opcode input. 'recordSkillLoadResult' appends it to
--- @conversation.jsonl@ as a separate 'User' message AFTER the skill body, so
--- the model sees the skill followed by the user's request on the next turn
--- (e.g. @/skill load start #123@ loads the @start@ skill then sends
--- @#123@ as the user's message). When no message is supplied, the input
--- omits the @message@ key and the load behaves as before (skill body only).
+-- @message@ field in the opcode input. 'recordSkillLoadResult' writes the
+-- skill body to @conversation.jsonl@ as an 'Assistant' message. This
+-- command returns a follow-up turn text ('Just' text) so the channel
+-- dispatch site forks an LLM turn immediately — the model sees the skill
+-- body (from the transcript) followed by the turn text (as the 'User'
+-- message 'runTurn' writes). When a trailing message was supplied, it
+-- becomes the turn text (the user's intent); when no message was supplied,
+-- a synthetic prompt ('skillLoadFollowUpText') is used instead.
 --
 -- On success, the skill body is NOT rendered via 'ccSend' — the dispatcher
 -- records a second 'EKHarness' entry to the transcript carrying the
@@ -118,12 +135,13 @@ infoCmd backend raw = CommandAction $ \caps ->
 -- On error (dispatch 'Left' or 'Right' with the error flag set), the error
 -- text IS rendered via 'ccSend' so the user sees it in the slash bubble —
 -- error paths produce no transcript body entry, so the slash bubble is
--- the only surface for the error message.
+-- the only surface for the error message. Error paths return 'Nothing'
+-- (no follow-up turn).
 loadCmd :: CallDispatcher -> Text -> Text -> CommandAction
 loadCmd dispatcher raw message = CommandAction $ \caps -> do
   ccSend caps ("$ /skill load " <> raw)
   case mkSkillId raw of
-    Left err -> ccSend caps err
+    Left err -> ccSend caps err >> pure Nothing
     Right sid -> do
       let input = object
             [ "id" .= skillIdText sid
@@ -131,10 +149,20 @@ loadCmd dispatcher raw message = CommandAction $ \caps -> do
             ]
       res <- dispatcher (OpName "SKILL_LOAD") input
       case res of
-        Left e  -> ccSend caps (renderDispatchError e)
+        Left e  -> do
+          ccSend caps (renderDispatchError e)
+          pure Nothing
         Right r
-          | orIsError r -> mapM_ (ccSend caps) (renderOpResult r)
-          | otherwise   -> pure ()
+          | orIsError r -> do
+              mapM_ (ccSend caps) (renderOpResult r)
+              pure Nothing
+          | otherwise   ->
+              -- Success: signal a follow-up turn. Use the user's trailing
+              -- message when non-empty; otherwise the synthetic prompt.
+              let turnText = if T.null (T.strip message)
+                               then skillLoadFollowUpText
+                               else message
+              in pure (Just turnText)
 
 -- | One line per skill for @/skill list@.
 renderSkillLine :: Skill -> Text
