@@ -1,0 +1,1059 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The unified turn engine — the single implementation of the ISA registry
+<span class="lineno">    3 </span>-- builder, the child registry builder, the system-prompt resolver, and the
+<span class="lineno">    4 </span>-- turn body ('runSessionTurn').
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- This module replaces the three duplicated implementations that lived in
+<span class="lineno">    7 </span>-- 'Seal.Gateway.Send.buildWebRegistry' + 'plainTurn',
+<span class="lineno">    8 </span>-- 'Seal.Channels.Loop.buildIsaRegistry' + 'runTurnOnSession', and
+<span class="lineno">    9 </span>-- 'Seal.Channel.Cli.cliIsaReg' + 'withCliTurn'. The structural guarantee: a
+<span class="lineno">   10 </span>-- new opcode added to 'buildSessionRegistry' is available on all four
+<span class="lineno">   11 </span>-- surfaces (Web, TUI, Telegram, Signal) with zero additional wiring per
+<span class="lineno">   12 </span>-- surface, and a turn behaves identically regardless of which surface
+<span class="lineno">   13 </span>-- originates it.
+<span class="lineno">   14 </span>module Seal.Core.TurnEngine
+<span class="lineno">   15 </span>  ( buildSessionRegistry
+<span class="lineno">   16 </span>  , buildChildRegistry
+<span class="lineno">   17 </span>  , resolveSystemPrompt
+<span class="lineno">   18 </span>  , TurnDeps (..)
+<span class="lineno">   19 </span>  , TurnAdapter (..)
+<span class="lineno">   20 </span>  , TurnOutcome (..)
+<span class="lineno">   21 </span>  , runSessionTurn
+<span class="lineno">   22 </span>  , shouldAutoTab
+<span class="lineno">   23 </span>  , callDispatcher
+<span class="lineno">   24 </span>  , buildStartWiring
+<span class="lineno">   25 </span>  , buildWorker
+<span class="lineno">   26 </span>  , loadChannelLabel
+<span class="lineno">   27 </span>  , broadcastNewEntries
+<span class="lineno">   28 </span>  , loadSessionMeta
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Control.Exception (bracket)
+<span class="lineno">   32 </span>import Control.Monad (unless, when)
+<span class="lineno">   33 </span>import Data.Aeson (Value)
+<span class="lineno">   34 </span>import Data.Aeson qualified as A
+<span class="lineno">   35 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   36 </span>import Data.Foldable (for_)
+<span class="lineno">   37 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   38 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   39 </span>import Data.Text (Text)
+<span class="lineno">   40 </span>import Data.Text qualified as T
+<span class="lineno">   41 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   42 </span>import Data.Time (UTCTime, getCurrentTime)
+<span class="lineno">   43 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   44 </span>import System.Directory (createDirectoryIfMissing, doesFileExist)
+<span class="lineno">   45 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>import Seal.Agent.Def.Backend qualified as Def
+<span class="lineno">   48 </span>import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
+<span class="lineno">   49 </span>import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
+<span class="lineno">   50 </span>import Seal.Agent.Loop (runTurn, defaultMaxTokens)
+<span class="lineno">   51 </span>import Seal.Agent.PromptParts (injectStaticGuidance)
+<span class="lineno">   52 </span>import Seal.Agent.Runtime.Delegation
+<span class="lineno">   53 </span>  (ChildTask (..), ctContext, fromFileConfig)
+<span class="lineno">   54 </span>import Seal.Agent.Runtime.Delegation.Worker
+<span class="lineno">   55 </span>  (mkDelegateWorker, DelegationWorkerDeps (..))
+<span class="lineno">   56 </span>import Seal.Channel.Caps (ChannelCaps)
+<span class="lineno">   57 </span>import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
+<span class="lineno">   58 </span>import Seal.Config.File
+<span class="lineno">   59 </span>  ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
+<span class="lineno">   60 </span>  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript
+<span class="lineno">   61 </span>  , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance
+<span class="lineno">   62 </span>  , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
+<span class="lineno">   63 </span>  , WebConfig (..) )
+<span class="lineno">   64 </span>import Seal.Config.Paths
+<span class="lineno">   65 </span>  (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
+<span class="lineno">   66 </span>   sessionDir,
+<span class="lineno">   67 </span>   sessionLogPath, sessionRequestsPath, sshAgentsDir)
+<span class="lineno">   68 </span>import qualified Katip as K2 (Severity (..), ls)
+<span class="lineno">   69 </span>import Seal.Config.Security
+<span class="lineno">   70 </span>  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+<span class="lineno">   71 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   72 </span>import Seal.Core.Backends (Backends (..))
+<span class="lineno">   73 </span>import Seal.Core.MessageSource (MessageSource)
+<span class="lineno">   74 </span>import Seal.Core.Paging (defaultPageParams)
+<span class="lineno">   75 </span>import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
+<span class="lineno">   76 </span>import Seal.Gateway.Broadcast
+<span class="lineno">   77 </span>  (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered)
+<span class="lineno">   78 </span>import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
+<span class="lineno">   79 </span>import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+<span class="lineno">   80 </span>import Seal.Handles.AskReply (ApprovalCache)
+<span class="lineno">   81 </span>import Seal.Handles.Tab (TabKind (KindAi))
+<span class="lineno">   82 </span>import Seal.Handles.Transcript
+<span class="lineno">   83 </span>  ( TwoFileHandle, withTwoFileTranscript, tfwSetSecretOps, tfwReadEntries
+<span class="lineno">   84 </span>  , tfwRecordAndAck, TwoFileWrite (..) )
+<span class="lineno">   85 </span>import Seal.Harness.Id (newHarnessId)
+<span class="lineno">   86 </span>import Seal.Harness.Registry (HarnessRegistry)
+<span class="lineno">   87 </span>import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
+<span class="lineno">   88 </span>import Seal.ISA.Dispatch
+<span class="lineno">   89 </span>  (DispatchError (..), dispatch, recordSetupRepoResult,
+<span class="lineno">   90 </span>   recordSkillLoadResult)
+<span class="lineno">   91 </span>import Seal.ISA.Ops.Agent
+<span class="lineno">   92 </span>import Seal.ISA.Ops.Bin (binExecOp)
+<span class="lineno">   93 </span>import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
+<span class="lineno">   94 </span>import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
+<span class="lineno">   95 </span>import Seal.ISA.Ops.Human (askHumanOp, showHumanOp)
+<span class="lineno">   96 </span>import Seal.ISA.Ops.Memory
+<span class="lineno">   97 </span>import Seal.ISA.Ops.Process (processManageOp)
+<span class="lineno">   98 </span>import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
+<span class="lineno">   99 </span>import Seal.ISA.Ops.Repo (setupRepoOp)
+<span class="lineno">  100 </span>import Seal.ISA.Ops.Search (searchFilesOp)
+<span class="lineno">  101 </span>import Seal.ISA.Ops.Secret (secretGetOp)
+<span class="lineno">  102 </span>import Seal.ISA.Ops.Shell (shellExecOp)
+<span class="lineno">  103 </span>import Seal.ISA.Ops.Skills
+<span class="lineno">  104 </span>import Seal.ISA.Opcode (OpResult (..), localBackend, opName, orIsError)
+<span class="lineno">  105 </span>import qualified Seal.ISA.Registry as ISA
+<span class="lineno">  106 </span>import Seal.Logging.Exceptions (withExceptionLogging)
+<span class="lineno">  107 </span>import Seal.Logging.Logger (SealLogger)
+<span class="lineno">  108 </span>import Seal.Providers.Class
+<span class="lineno">  109 </span>  (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
+<span class="lineno">  110 </span>import Seal.Transcript.Entries
+<span class="lineno">  111 </span>  ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
+<span class="lineno">  112 </span>import Seal.Session.ExecCache
+<span class="lineno">  113 </span>  ( SessionExecCache, cachedSessionExec, cachedWorkdirScan
+<span class="lineno">  114 </span>  , invalidateWorkdirScan
+<span class="lineno">  115 </span>  )
+<span class="lineno">  116 </span>import Seal.Session.Kind (HarnessFlavour (..))
+<span class="lineno">  117 </span>import Seal.Session.Lock
+<span class="lineno">  118 </span>  (ReplyRegistry, replyFanout, replySubscriberCount,
+<span class="lineno">  119 </span>   SessionLocks, withSessionLock)
+<span class="lineno">  120 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">  121 </span>import Seal.Session.Store
+<span class="lineno">  122 </span>  ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
+<span class="lineno">  123 </span>  )
+<span class="lineno">  124 </span>import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
+<span class="lineno">  125 </span>import Seal.Security.Path (WorkspaceRoot)
+<span class="lineno">  126 </span>import qualified Seal.Security.Policy as Policy
+<span class="lineno">  127 </span>  (AutonomyLevel, SecurityPolicy (..), AllowList (..))
+<span class="lineno">  128 </span>import Seal.Skills.Autoload (injectAutoloadSkill, injectCodegraphSkill)
+<span class="lineno">  129 </span>import Seal.Skills.Backend qualified as Skill
+<span class="lineno">  130 </span>import Seal.Skills.Types qualified as SealSkillTypes
+<span class="lineno">  131 </span>import Seal.Skills.Prompt (injectAvailableSkills)
+<span class="lineno">  132 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">  133 </span>import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+<span class="lineno">  134 </span>import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
+<span class="lineno">  135 </span>import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+<span class="lineno">  136 </span>import qualified Seal.SourceControl.Clone as Clone
+<span class="lineno">  137 </span>import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
+<span class="lineno">  138 </span>import Seal.Session.AgentMetaCache
+<span class="lineno">  139 </span>  ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
+<span class="lineno">  140 </span>import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
+<span class="lineno">  141 </span>import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+<span class="lineno">  142 </span>import Seal.Tools.Exec.WorkdirFs
+<span class="lineno">  143 </span>  ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
+<span class="lineno">  144 </span>import Seal.Tools.Timeout (defaultToolTimeoutConfig)
+<span class="lineno">  145 </span>import Seal.Tabs (TabsHandle, ensureTabForSession)
+<span class="lineno">  146 </span>import Seal.Types.App (runApp)
+<span class="lineno">  147 </span>import Seal.Types.Config (defaultConfig)
+<span class="lineno">  148 </span>import Seal.Types.Env (Env, mkEnv)
+<span class="lineno">  149 </span>import Seal.Util.StrictIO (decodeFileStrict, readFileTextStrict)
+<span class="lineno">  150 </span>import Seal.Vault.Commands (VaultRuntime)
+<span class="lineno">  151 </span>import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
+<span class="lineno">  152 </span>import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
+<span class="lineno">  153 </span>
+<span class="lineno">  154 </span>import qualified Seal.Agent.Runtime.Delegation.Worker as Worker
+<span class="lineno">  155 </span>  (filterBlocklisted)
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>-- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
+<span class="lineno">  158 </span>-- the default when the @[web]@ section is absent or the field is 'Nothing'.
+<span class="lineno">  159 </span>unwrapOpt :: (WebConfig -&gt; Maybe a) -&gt; Maybe WebConfig -&gt; a -&gt; a
+<span class="lineno">  160 </span><span class="decl"><span class="nottickedoff">unwrapOpt field webCfg deflt =</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">maybe deflt (fromMaybe deflt . field) webCfg</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Like 'unwrapOpt' but for fields that are already 'Maybe a'. The
+<span class="lineno">  164 </span>-- default is 'Nothing'.
+<span class="lineno">  165 </span>unwrapOptMaybe :: (WebConfig -&gt; Maybe a) -&gt; Maybe WebConfig -&gt; Maybe a
+<span class="lineno">  166 </span><span class="decl"><span class="nottickedoff">unwrapOptMaybe = maybe Nothing</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | Resolve the system prompt for a session turn. This is the **single**
+<span class="lineno">  169 </span>-- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
+<span class="lineno">  170 </span>--
+<span class="lineno">  171 </span>-- The resolution pipeline:
+<span class="lineno">  172 </span>-- 1. If @smSystemOverride@ is set (non-empty), use it as the base.
+<span class="lineno">  173 </span>-- 2. Otherwise, read the bound agent's @adSystem@ from the workdir-aware
+<span class="lineno">  174 </span>--    agent-def backend.
+<span class="lineno">  175 </span>-- 3. Inject static guidance (parallel / tool-use / task-completion).
+<span class="lineno">  176 </span>-- 4. Inject the autoload skill body.
+<span class="lineno">  177 </span>-- 5. Inject the available-skills catalog (if enabled).
+<span class="lineno">  178 </span>--
+<span class="lineno">  179 </span>-- The flags ('autoloadId', 'injectCatalog', 'parallel', 'toolUse',
+<span class="lineno">  180 </span>-- 'taskCompletion') are passed as explicit args — the caller computes
+<span class="lineno">  181 </span>-- them from the loaded 'RuntimeConfig'. This matches the web path's
+<span class="lineno">  182 </span>-- existing convention and avoids re-reading config inside the resolver.
+<span class="lineno">  183 </span>resolveSystemPrompt
+<span class="lineno">  184 </span>  :: Def.AgentDefBackend
+<span class="lineno">  185 </span>  -&gt; Skill.SkillBackend
+<span class="lineno">  186 </span>  -&gt; Maybe Text
+<span class="lineno">  187 </span>  -- ^ The resolved auto-load skill id ('Nothing' disables injection).
+<span class="lineno">  188 </span>  -&gt; Bool
+<span class="lineno">  189 </span>  -- ^ Whether to inject the @\&lt;available_skills\&gt;@ catalog.
+<span class="lineno">  190 </span>  -&gt; Bool
+<span class="lineno">  191 </span>  -- ^ Whether to inject the parallel tool-call guidance block.
+<span class="lineno">  192 </span>  -&gt; Bool
+<span class="lineno">  193 </span>  -- ^ Whether to inject the tool-use enforcement guidance block.
+<span class="lineno">  194 </span>  -&gt; Bool
+<span class="lineno">  195 </span>  -- ^ Whether to inject the task-completion guidance block.
+<span class="lineno">  196 </span>  -&gt; Maybe Text
+<span class="lineno">  197 </span>  -- ^ The codegraph skill body to inject ('Nothing' when no repo with
+<span class="lineno">  198 </span>  -- @.codegraph/@ is in the workdir — skips codegraph injection).
+<span class="lineno">  199 </span>  -&gt; SessionMeta
+<span class="lineno">  200 </span>  -&gt; IO (Maybe Text)
+<span class="lineno">  201 </span><span class="decl"><span class="istickedoff">resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog</span>
+<span class="lineno">  202 </span><span class="spaces">                   </span><span class="istickedoff">parallel toolUse taskCompletion mCodegraphBody meta = do</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">base &lt;- case smSystemOverride meta of</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="istickedoff">Just t | <span class="nottickedoff">not (T.null (T.strip t))</span> -&gt; <span class="nottickedoff">pure (Just t)</span></span>
+<span class="lineno">  205 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; case smAgent meta of</span>
+<span class="lineno">  206 </span><span class="spaces">           </span><span class="istickedoff">Nothing  -&gt; pure Nothing</span>
+<span class="lineno">  207 </span><span class="spaces">           </span><span class="istickedoff">Just aid -&gt; maybe <span class="nottickedoff">Nothing</span> adSystem &lt;$&gt; Def.adbRead agentDefBackend aid</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">withAutoload &lt;- injectAutoloadSkill skillBackend autoloadId withGuidance</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlytrue">injectCatalog</span></span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">then injectAvailableSkills skillBackend withCodegraph</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">else <span class="nottickedoff">pure withCodegraph</span></span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | Build the ISA registry for a session turn. This is the **single**
+<span class="lineno">  216 </span>-- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
+<span class="lineno">  217 </span>-- Replaces 'Seal.Gateway.Send.buildWebRegistry',
+<span class="lineno">  218 </span>-- 'Seal.Channels.Loop.buildIsaRegistry', and
+<span class="lineno">  219 </span>-- 'Seal.Channel.Cli.cliIsaReg'.
+<span class="lineno">  220 </span>buildSessionRegistry
+<span class="lineno">  221 </span>  :: VaultRuntime
+<span class="lineno">  222 </span>  -&gt; Clone.CloneDeps
+<span class="lineno">  223 </span>  -&gt; Backends
+<span class="lineno">  224 </span>  -&gt; WorkspaceRoot
+<span class="lineno">  225 </span>  -&gt; SessionId
+<span class="lineno">  226 </span>  -&gt; Int
+<span class="lineno">  227 </span>  -&gt; Policy.AutonomyLevel
+<span class="lineno">  228 </span>  -&gt; Maybe WebConfig
+<span class="lineno">  229 </span>  -&gt; AgentStartWiring
+<span class="lineno">  230 </span>  -&gt; HarnessRegistry
+<span class="lineno">  231 </span>  -&gt; TmuxRunner
+<span class="lineno">  232 </span>  -&gt; Maybe Manager
+<span class="lineno">  233 </span>  -&gt; ChannelCaps
+<span class="lineno">  234 </span>  -&gt; Bool
+<span class="lineno">  235 </span>  -&gt; ISA.Registry
+<span class="lineno">  236 </span><span class="decl"><span class="istickedoff">buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg</span>
+<span class="lineno">  237 </span><span class="spaces">                     </span><span class="istickedoff">startWiring harnessReg tmuxRunner httpManager caps onDemand =</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">reg</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">baseOps =</span>
+<span class="lineno">  241 </span><span class="spaces">      </span><span class="istickedoff">[ showHumanOp <span class="nottickedoff">caps</span></span>
+<span class="lineno">  242 </span><span class="spaces">      </span><span class="istickedoff">, askHumanOp <span class="nottickedoff">caps</span></span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">, secretGetOp <span class="nottickedoff">rt</span></span>
+<span class="lineno">  244 </span><span class="spaces">      </span><span class="istickedoff">, memoryWriteOp <span class="nottickedoff">(bMemory backends)</span> <span class="nottickedoff">sid</span></span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="istickedoff">, memoryRecallOp <span class="nottickedoff">defaultPageParams</span> <span class="nottickedoff">(bMemory backends)</span></span>
+<span class="lineno">  246 </span><span class="spaces">      </span><span class="istickedoff">, memoryDeleteOp <span class="nottickedoff">(bMemory backends)</span></span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">, skillWriteOp <span class="nottickedoff">(bSkills backends)</span> <span class="nottickedoff">sid</span></span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff">, skillLoadOp (bSkills backends)</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="istickedoff">, skillListOp <span class="nottickedoff">(bSkills backends)</span></span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="istickedoff">, skillDeleteOp <span class="nottickedoff">(bSkills backends)</span></span>
+<span class="lineno">  251 </span><span class="spaces">      </span><span class="istickedoff">, agentDefWriteOp (bAgentDefs backends) sid</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">, agentDefReadOp (bAgentDefs backends)</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">, agentDefListOp (bAgentDefs backends)</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">, agentDefDeleteOp (bAgentDefs backends)</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">, agentInstancesOp (bRuntime backends)</span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">, agentStartOp startWiring</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">, agentStatusOp <span class="nottickedoff">(bRuntime backends)</span></span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="istickedoff">, agentStopOp (bRuntime backends)</span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">, agentInterruptOp (bRuntime backends)</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">, searchFilesOp <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">securityPolicy</span> <span class="nottickedoff">operatorCeiling</span></span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">, fileReadOp <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">operatorCeiling</span></span>
+<span class="lineno">  262 </span><span class="spaces">      </span><span class="istickedoff">, fileWriteOp <span class="nottickedoff">wsRoot</span> operatorCeiling</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">, filePatchOp <span class="nottickedoff">wsRoot</span></span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">, shellExecOp <span class="nottickedoff">wsRoot</span> securityPolicy</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">, setupRepoOp <span class="nottickedoff">cloneDeps</span> <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">autonomy</span></span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">, setupRepoOp cloneDeps <span class="nottickedoff">wsRoot</span> autonomy</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">, binExecOp <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">securityPolicy</span> <span class="nottickedoff">binAllowList</span></span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">, processManageOp <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">securityPolicy</span></span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">, webFetchOp <span class="nottickedoff">webFetchCfg</span></span>
+<span class="lineno">  270 </span><span class="spaces">      </span><span class="istickedoff">, webSearchOp <span class="nottickedoff">webSearchCfg</span></span>
+<span class="lineno">  271 </span><span class="spaces">      </span><span class="istickedoff">, harnessListOp <span class="nottickedoff">harnessReg</span></span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">, harnessStartOp <span class="nottickedoff">harnessReg</span> <span class="nottickedoff">tmuxRunner</span> <span class="nottickedoff">harnessSession</span> <span class="nottickedoff">harnessWindow</span></span>
+<span class="lineno">  273 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">HfGeneric</span> <span class="nottickedoff">newHarnessId</span></span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">, harnessStopOp <span class="nottickedoff">harnessReg</span> <span class="nottickedoff">tmuxRunner</span></span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">introspectionOps = [ opcodeDescribeOp reg, opcodeListOp reg ]</span></span>
+<span class="lineno">  277 </span><span class="spaces">    </span><span class="istickedoff">reg = ISA.mkRegistry (baseOps ++ if <span class="tickonlyfalse">onDemand</span> then <span class="nottickedoff">introspectionOps</span> else [])</span>
+<span class="lineno">  278 </span><span class="spaces">    </span><span class="istickedoff">securityPolicy = Policy.SecurityPolicy <span class="nottickedoff">Policy.AllowAll</span> autonomy</span>
+<span class="lineno">  279 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">binAllowList = Nothing</span></span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">webSearchCfg = WebSearchConfig</span></span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">{ wscManager     = httpManager</span></span>
+<span class="lineno">  282 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscProvider    = parseProvider (unwrapOpt wcSearchProvider webCfg &quot;parallel&quot;)</span></span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscEndpoint    = unwrapOpt wcSearchEndpoint webCfg &quot;&quot;</span></span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscAllowList   = unwrapOpt wcSearchAllowList webCfg []</span></span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg</span></span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10</span></span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscVault       = Just rt</span></span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg</span></span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">webFetchCfg = WebFetchConfig</span></span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">{ wfcManager   = httpManager</span></span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wfcAllowList = unwrapOpt wcFetchAllowList webCfg []</span></span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wfcMaxBytes  = unwrapOpt wcMaxFetchBytes webCfg operatorCeiling</span></span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, wfcAuthKey   = Nothing</span></span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">harnessSession = either (error &quot;unreachable: seal is a valid TmuxIdent&quot;) id (mkTmuxIdent &quot;seal&quot;)</span></span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">harnessWindow  = either (error &quot;unreachable: harness is a valid TmuxIdent&quot;) id (mkTmuxIdent &quot;harness&quot;)</span></span></span>
+<span class="lineno">  298 </span>
+<span class="lineno">  299 </span>-- | Build the narrowed ISA registry for a delegated child agent. Blocklists
+<span class="lineno">  300 </span>-- the management opcodes (AGENT_DEF_WRITE/DELETE, AGENT_INSTANCES,
+<span class="lineno">  301 </span>-- AGENT_START/STATUS/STOP/INTERRUPT). Includes web/harness ops — the CLI
+<span class="lineno">  302 </span>-- child previously lacked these; the unified child includes them.
+<span class="lineno">  303 </span>buildChildRegistry
+<span class="lineno">  304 </span>  :: VaultRuntime
+<span class="lineno">  305 </span>  -&gt; Clone.CloneDeps
+<span class="lineno">  306 </span>  -&gt; Backends
+<span class="lineno">  307 </span>  -&gt; WorkspaceRoot
+<span class="lineno">  308 </span>  -&gt; SessionId
+<span class="lineno">  309 </span>  -&gt; Int
+<span class="lineno">  310 </span>  -&gt; Policy.AutonomyLevel
+<span class="lineno">  311 </span>  -&gt; Maybe WebConfig
+<span class="lineno">  312 </span>  -&gt; Maybe Manager
+<span class="lineno">  313 </span>  -&gt; ChannelCaps
+<span class="lineno">  314 </span>  -&gt; ISA.Registry
+<span class="lineno">  315 </span><span class="decl"><span class="nottickedoff">buildChildRegistry rt cloneDeps backends childWsRoot childSid operatorCeiling</span>
+<span class="lineno">  316 </span><span class="spaces">                   </span><span class="nottickedoff">autonomy webCfg httpManager childCaps =</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="nottickedoff">ISA.mkRegistry (Worker.filterBlocklisted childBaseOps opName)</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  319 </span><span class="spaces">    </span><span class="nottickedoff">childBaseOps =</span>
+<span class="lineno">  320 </span><span class="spaces">      </span><span class="nottickedoff">[ showHumanOp childCaps</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="nottickedoff">, askHumanOp childCaps</span>
+<span class="lineno">  322 </span><span class="spaces">      </span><span class="nottickedoff">, secretGetOp rt</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="nottickedoff">, memoryWriteOp (bMemory backends) childSid</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="nottickedoff">, memoryRecallOp defaultPageParams (bMemory backends)</span>
+<span class="lineno">  325 </span><span class="spaces">      </span><span class="nottickedoff">, memoryDeleteOp (bMemory backends)</span>
+<span class="lineno">  326 </span><span class="spaces">      </span><span class="nottickedoff">, skillWriteOp (bSkills backends) childSid</span>
+<span class="lineno">  327 </span><span class="spaces">      </span><span class="nottickedoff">, skillLoadOp (bSkills backends)</span>
+<span class="lineno">  328 </span><span class="spaces">      </span><span class="nottickedoff">, skillListOp (bSkills backends)</span>
+<span class="lineno">  329 </span><span class="spaces">      </span><span class="nottickedoff">, skillDeleteOp (bSkills backends)</span>
+<span class="lineno">  330 </span><span class="spaces">      </span><span class="nottickedoff">, agentDefReadOp (bAgentDefs backends)</span>
+<span class="lineno">  331 </span><span class="spaces">      </span><span class="nottickedoff">, agentDefListOp (bAgentDefs backends)</span>
+<span class="lineno">  332 </span><span class="spaces">      </span><span class="nottickedoff">, searchFilesOp childWsRoot securityPolicy operatorCeiling</span>
+<span class="lineno">  333 </span><span class="spaces">      </span><span class="nottickedoff">, fileReadOp childWsRoot operatorCeiling</span>
+<span class="lineno">  334 </span><span class="spaces">      </span><span class="nottickedoff">, fileWriteOp childWsRoot operatorCeiling</span>
+<span class="lineno">  335 </span><span class="spaces">      </span><span class="nottickedoff">, filePatchOp childWsRoot</span>
+<span class="lineno">  336 </span><span class="spaces">      </span><span class="nottickedoff">, shellExecOp childWsRoot securityPolicy</span>
+<span class="lineno">  337 </span><span class="spaces">      </span><span class="nottickedoff">, setupRepoOp cloneDeps childWsRoot autonomy</span>
+<span class="lineno">  338 </span><span class="spaces">      </span><span class="nottickedoff">, binExecOp childWsRoot securityPolicy binAllowList</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="nottickedoff">, processManageOp childWsRoot securityPolicy</span>
+<span class="lineno">  340 </span><span class="spaces">      </span><span class="nottickedoff">, webFetchOp webFetchCfg</span>
+<span class="lineno">  341 </span><span class="spaces">      </span><span class="nottickedoff">, webSearchOp webSearchCfg</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="nottickedoff">]</span>
+<span class="lineno">  343 </span><span class="spaces">    </span><span class="nottickedoff">securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy</span>
+<span class="lineno">  344 </span><span class="spaces">    </span><span class="nottickedoff">binAllowList = Nothing</span>
+<span class="lineno">  345 </span><span class="spaces">    </span><span class="nottickedoff">webFetchCfg = WebFetchConfig</span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="nottickedoff">{ wfcManager = httpManager, wfcAllowList = []</span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="nottickedoff">, wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }</span>
+<span class="lineno">  348 </span><span class="spaces">    </span><span class="nottickedoff">webSearchCfg = WebSearchConfig</span>
+<span class="lineno">  349 </span><span class="spaces">      </span><span class="nottickedoff">{ wscManager = httpManager</span>
+<span class="lineno">  350 </span><span class="spaces">      </span><span class="nottickedoff">, wscProvider = parseProvider (unwrapOpt wcSearchProvider webCfg &quot;parallel&quot;)</span>
+<span class="lineno">  351 </span><span class="spaces">      </span><span class="nottickedoff">, wscEndpoint = unwrapOpt wcSearchEndpoint webCfg &quot;&quot;</span>
+<span class="lineno">  352 </span><span class="spaces">      </span><span class="nottickedoff">, wscAllowList = unwrapOpt wcSearchAllowList webCfg []</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="nottickedoff">, wscAuthKey = unwrapOptMaybe wcSearchAuthKey webCfg</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="nottickedoff">, wscMaxResults = unwrapOpt wcSearchMaxResults webCfg 10</span>
+<span class="lineno">  355 </span><span class="spaces">      </span><span class="nottickedoff">, wscVault = Just rt</span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="nottickedoff">, wscSearXngUrl = unwrapOptMaybe wcSearXngUrl webCfg</span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  358 </span>
+<span class="lineno">  359 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  360 </span>-- TurnDeps — the unified wiring record (design §5.1)
+<span class="lineno">  361 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  362 </span>
+<span class="lineno">  363 </span>-- | The unified wiring record — everything the turn body needs, constructed
+<span class="lineno">  364 </span>-- once at startup and threaded into every turn. Replaces @SendDeps@ +
+<span class="lineno">  365 </span>-- @ChannelDeps@ + the CLI's @where@-block closures.
+<span class="lineno">  366 </span>--
+<span class="lineno">  367 </span>-- @tdResolve@ is the injection seam for provider resolution: production
+<span class="lineno">  368 </span>-- defaults to 'Seal.Channel.Cli.resolveSessionProvider'; tests inject a
+<span class="lineno">  369 </span>-- fake. @tdSecurityConfig@ and @tdConfig@ are not fields here — the engine
+<span class="lineno">  370 </span>-- re-reads them per turn via 'loadSecurityConfig' / 'loadRuntimeConfig'
+<span class="lineno">  371 </span>-- (matching the three original paths' live-config-reload behaviour).
+<span class="lineno">  372 </span>data TurnDeps = TurnDeps
+<span class="lineno">  373 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tdPaths</span></span></span>        :: SealPaths
+<span class="lineno">  374 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdVault</span></span></span>        :: VaultRuntime
+<span class="lineno">  375 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdProvider</span></span></span>     :: ProviderRuntime
+<span class="lineno">  376 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdResolve</span></span></span>      :: SessionMeta -&gt; IO (Either Text (SomeProvider, ModelId))
+<span class="lineno">  377 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdRepoReg</span></span></span>      :: RepoRegistryHandle
+<span class="lineno">  378 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdAutonomy</span></span></span>     :: Policy.AutonomyLevel
+<span class="lineno">  379 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdBroker</span></span></span>       :: Maybe StreamBroker
+<span class="lineno">  380 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tdHarnessReg</span></span></span>   :: HarnessRegistry
+<span class="lineno">  381 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tdTmuxRunner</span></span></span>   :: TmuxRunner
+<span class="lineno">  382 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tdHttpManager</span></span></span>  :: Maybe Manager
+<span class="lineno">  383 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tdApprovals</span></span></span>    :: ApprovalCache
+<span class="lineno">  384 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdReplies</span></span></span>      :: ReplyRegistry
+<span class="lineno">  385 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdLocks</span></span></span>        :: SessionLocks
+<span class="lineno">  386 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdAbortReg</span></span></span>     :: SessionAbortRegistry
+<span class="lineno">  387 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdTabsHandle</span></span></span>   :: TabsHandle
+<span class="lineno">  388 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdLogger</span></span></span>       :: SealLogger
+<span class="lineno">  389 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdIsRemote</span></span></span>     :: Bool
+<span class="lineno">  390 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdBaseBackends</span></span></span> :: Backends
+<span class="lineno">  391 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdExecCache</span></span></span>    :: SessionExecCache
+<span class="lineno">  392 </span>    -- ^ The per-process session-exec + workdir-discovery cache. Memoizes
+<span class="lineno">  393 </span>    -- 'mkSessionExec' (the remote @mkdir -p@ bootstrap) and the agent-def +
+<span class="lineno">  394 </span>    -- skill scans so each happens once per session, not once per turn.
+<span class="lineno">  395 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdRemoteRunner</span></span></span> :: Maybe RemoteRunner
+<span class="lineno">  396 </span>    -- ^ Test seam: when 'Just', replaces 'mkRealRemoteRunner' as the SSH
+<span class="lineno">  397 </span>    -- runner used to build the session exec in mode=remote. 'Nothing'
+<span class="lineno">  398 </span>    -- (production wiring) always uses the real runner. Integration tests
+<span class="lineno">  399 </span>    -- inject a recording fake so the composed ssh argv — the fully-rendered
+<span class="lineno">  400 </span>    -- remote command — is observable without a live SSH host. Never set in
+<span class="lineno">  401 </span>    -- production; the field exists solely so gateway API integration tests
+<span class="lineno">  402 </span>    -- can assert local/remote parity of the composed untrusted commands.
+<span class="lineno">  403 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tdMkWorker</span></span></span> :: Maybe AgentWorkerBuilder
+<span class="lineno">  404 </span>    -- ^ Test seam (mirrors 'tdRemoteRunner'): when 'Just', replaces
+<span class="lineno">  405 </span>    -- 'buildWorker' as the 'AGENT_START' worker-builder used by
+<span class="lineno">  406 </span>    -- 'buildStartWiring'. 'Nothing' (production wiring) always uses the
+<span class="lineno">  407 </span>    -- real 'buildWorker' → 'mkDelegateWorker' path. Gateway API integration
+<span class="lineno">  408 </span>    -- tests inject a stub worker so 'AGENT_START' can run through the
+<span class="lineno">  409 </span>    -- gateway without a real provider call. Never set in production; the
+<span class="lineno">  410 </span>    -- field exists solely so gateway API integration tests can exercise
+<span class="lineno">  411 </span>    -- 'AGENT_START' end-to-end.
+<span class="lineno">  412 </span>  }
+<span class="lineno">  413 </span>
+<span class="lineno">  414 </span>-- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
+<span class="lineno">  415 </span>-- ONLY medium-specific pieces the engine calls back into — the adapter
+<span class="lineno">  416 </span>-- constructs them, the engine runs them at the right points.
+<span class="lineno">  417 </span>--
+<span class="lineno">  418 </span>-- * @taCaps@ — the 'ChannelCaps' for this turn (the only medium-specific
+<span class="lineno">  419 </span>--   I/O seam).
+<span class="lineno">  420 </span>-- * @taPreTurn@ — runs BEFORE the engine broadcasts &quot;thinking&quot; + acquires
+<span class="lineno">  421 </span>--   the lock. Used by inbox-driven channels to 'replySubscribe' the channel
+<span class="lineno">  422 </span>--   handle and 'replyFanoutMessage' the inbound text to other subscribed
+<span class="lineno">  423 </span>--   channels (cross-channel mirroring). Web/CLI pass @pure ()@ (no
+<span class="lineno">  424 </span>--   subscription, no mirror — the web frontend sees the message directly,
+<span class="lineno">  425 </span>--   the CLI is the only surface).
+<span class="lineno">  426 </span>-- * @taChannelLabel@ — the label stamped into the transcript's @channel@
+<span class="lineno">  427 </span>--   field (e.g. @&quot;web&quot;@, @&quot;cli&quot;@, @smChannel@ for inbox-driven channels).
+<span class="lineno">  428 </span>-- * @taOnStop@ — builds the 'aeOnStop' fan-out hook for a given 'SessionId'.
+<span class="lineno">  429 </span>--   'Just' for surfaces that want cross-channel reply fan-out after the turn
+<span class="lineno">  430 </span>--   (web + channels); 'Nothing' for the CLI (no chat channels subscribe to a
+<span class="lineno">  431 </span>--   CLI session).
+<span class="lineno">  432 </span>-- * @taOnUserMessage@ — builds the 'aeOnUserMessage' hook for a given
+<span class="lineno">  433 </span>--   'SessionMeta' (e.g. the /bg 'broadcastTabs' refresh when
+<span class="lineno">  434 </span>--   'shouldAutoTab' is false). 'Nothing' for normal turns.
+<span class="lineno">  435 </span>-- * @taPostTurn@ — runs AFTER the engine's own post-turn broadcast +
+<span class="lineno">  436 </span>--   auto-tab. Used by channels to refresh the @lists@ snapshot
+<span class="lineno">  437 </span>--   ('broadcastTabs') when 'shouldAutoTab' is false (the /bg path). Web/CLI
+<span class="lineno">  438 </span>--   pass @pure ()@.
+<span class="lineno">  439 </span>-- * @taStartWiring@ — builds the 'AgentStartWiring' for this turn, given
+<span class="lineno">  440 </span>--   the per-turn 'SessionMeta' (after 'autoBindRepoAgent' may have rebound
+<span class="lineno">  441 </span>--   it). The per-surface builders (@webStartWiring@,
+<span class="lineno">  442 </span>--   @channelStartWiring@, @cliStartWiring@) are passed in here; W4
+<span class="lineno">  443 </span>--   collapses them into a single engine-owned @buildStartWiring@.
+<span class="lineno">  444 </span>data TurnAdapter = TurnAdapter
+<span class="lineno">  445 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">taCaps</span></span></span>          :: ChannelCaps
+<span class="lineno">  446 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taPreTurn</span></span></span>       :: SessionId -&gt; SessionMeta -&gt; Text -&gt; IO ()
+<span class="lineno">  447 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taChannelLabel</span></span></span>  :: SessionMeta -&gt; Text
+<span class="lineno">  448 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taOnStop</span></span></span>        :: SessionId -&gt; Maybe (Text -&gt; IO ())
+<span class="lineno">  449 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taOnUserMessage</span></span></span> :: SessionMeta -&gt; Maybe (IO ())
+<span class="lineno">  450 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taPostTurn</span></span></span>      :: SessionId -&gt; SessionMeta -&gt; IO ()
+<span class="lineno">  451 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">taStartWiring</span></span></span>   :: forall a. Backends -&gt; SessionId -&gt; Env
+<span class="lineno">  452 </span>                    -&gt; Either a RuntimeConfig -&gt; Int -&gt; SessionMeta -&gt; AgentStartWiring
+<span class="lineno">  453 </span>  }
+<span class="lineno">  454 </span>
+<span class="lineno">  455 </span>-- | The outcome of a unified turn. 'toError' is 'Just' when the provider
+<span class="lineno">  456 </span>-- could not be resolved or the turn threw a synchronous exception;
+<span class="lineno">  457 </span>-- 'Nothing' on a clean run.
+<span class="lineno">  458 </span>newtype TurnOutcome = TurnOutcome { <span class="istickedoff"><span class="decl"><span class="istickedoff">toError</span></span></span> :: Maybe Text }
+<span class="lineno">  459 </span>
+<span class="lineno">  460 </span>-- | The single turn body (design §5.2). Replaces @plainTurn@ (Send.hs),
+<span class="lineno">  461 </span>-- @runTurnOnSession@ (Loop.hs), and @withCliTurn@ (Cli.hs).
+<span class="lineno">  462 </span>--
+<span class="lineno">  463 </span>-- The engine owns (per the §5.2 step table): load meta, resolve provider,
+<span class="lineno">  464 </span>-- broadcast &quot;thinking&quot;, the per-session lock (OUTSIDE the transcript
+<span class="lineno">  465 </span>-- bracket — serializes the entire turn), the transcript bracket,
+<span class="lineno">  466 </span>-- mkSessionExec, workdir-aware backends, the system prompt, the ISA
+<span class="lineno">  467 </span>-- registry, AgentEnv construction, runTurn, broadcast &quot;idle&quot; + new entries,
+<span class="lineno">  468 </span>-- reply fan-out, and auto-tab. The adapter owns: 'replySubscribe' +
+<span class="lineno">  469 </span>-- 'replyFanoutMessage' (@taPreTurn@, runs before the lock), the channel
+<span class="lineno">  470 </span>-- label, the on-stop/on-user-message hooks, the start-wiring builder, and
+<span class="lineno">  471 </span>-- the post-turn @lists@ refresh (@taPostTurn@).
+<span class="lineno">  472 </span>--
+<span class="lineno">  473 </span>-- Broadcast timing + exception safety: the &quot;thinking&quot; signal fires before
+<span class="lineno">  474 </span>-- the lock; the &quot;idle&quot; signal + 'fanoutLastReply' run in a 'bracket' cleanup
+<span class="lineno">  475 </span>-- so a turn killed mid-way (success, sync exception, async 'ThreadKilled')
+<span class="lineno">  476 </span>-- cannot leave the tab stuck in &quot;thinking&quot;. This matches the existing web +
+<span class="lineno">  477 </span>-- channel paths; the CLI converges to the same guarantee.
+<span class="lineno">  478 </span>runSessionTurn
+<span class="lineno">  479 </span>  :: TurnDeps -&gt; TurnAdapter -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text -&gt; IO TurnOutcome
+<span class="lineno">  480 </span><span class="decl"><span class="istickedoff">runSessionTurn td adapter meta mSrc t = do</span>
+<span class="lineno">  481 </span><span class="spaces">  </span><span class="istickedoff">let paths = tdPaths td</span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="istickedoff">sid   = smId meta</span>
+<span class="lineno">  483 </span><span class="spaces">      </span><span class="istickedoff">sessionDirPath = sessionDir paths sid</span>
+<span class="lineno">  484 </span><span class="spaces">  </span><span class="istickedoff">eprov &lt;- tdResolve td meta</span>
+<span class="lineno">  485 </span><span class="spaces">  </span><span class="istickedoff">case eprov of</span>
+<span class="lineno">  486 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; do</span>
+<span class="lineno">  487 </span><span class="spaces">      </span><span class="istickedoff">-- Provider resolution failed: still run the adapter's pre-turn hook so</span>
+<span class="lineno">  488 </span><span class="spaces">      </span><span class="istickedoff">-- the adapter isn't left in an inconsistent state (e.g. a channel</span>
+<span class="lineno">  489 </span><span class="spaces">      </span><span class="istickedoff">-- handle that subscribed but never sees the turn complete). The</span>
+<span class="lineno">  490 </span><span class="spaces">      </span><span class="istickedoff">-- engine's bracket is NOT entered (no &quot;thinking&quot; signal was sent).</span>
+<span class="lineno">  491 </span><span class="spaces">      </span><span class="istickedoff">taPreTurn adapter sid <span class="nottickedoff">meta</span> <span class="nottickedoff">t</span></span>
+<span class="lineno">  492 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">(TurnOutcome (Just err))</span></span>
+<span class="lineno">  493 </span><span class="spaces">    </span><span class="istickedoff">Right (prov, model) -&gt; do</span>
+<span class="lineno">  494 </span><span class="spaces">      </span><span class="istickedoff">createDirectoryIfMissing True sessionDirPath</span>
+<span class="lineno">  495 </span><span class="spaces">      </span><span class="istickedoff">saveSessionMeta paths meta</span>
+<span class="lineno">  496 </span><span class="spaces">      </span><span class="istickedoff">-- [adapter] Pre-turn: subscribe + cross-channel mirror (inbox-driven</span>
+<span class="lineno">  497 </span><span class="spaces">      </span><span class="istickedoff">-- channels); no-op for web/CLI.</span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="istickedoff">taPreTurn adapter sid <span class="nottickedoff">meta</span> <span class="nottickedoff">t</span></span>
+<span class="lineno">  499 </span><span class="spaces">      </span><span class="istickedoff">-- [engine] Broadcast &quot;thinking&quot; (before the lock, matches the existing</span>
+<span class="lineno">  500 </span><span class="spaces">      </span><span class="istickedoff">-- web + channel paths).</span>
+<span class="lineno">  501 </span><span class="spaces">      </span><span class="istickedoff">broadcastHarnessStatus (tdBroker td) sid &quot;thinking&quot;</span>
+<span class="lineno">  502 </span><span class="spaces">      </span><span class="istickedoff">mErr &lt;- bracket</span>
+<span class="lineno">  503 </span><span class="spaces">        </span><span class="istickedoff">(pure <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  504 </span><span class="spaces">        </span><span class="istickedoff">(\_ -&gt; do</span>
+<span class="lineno">  505 </span><span class="spaces">          </span><span class="istickedoff">-- [engine] Guaranteed cleanup: signal idle + fan out the last</span>
+<span class="lineno">  506 </span><span class="spaces">          </span><span class="istickedoff">-- assistant reply to subscribed chat channels (so a turn that</span>
+<span class="lineno">  507 </span><span class="spaces">          </span><span class="istickedoff">-- dies mid-way still releases the tab + delivers any partial</span>
+<span class="lineno">  508 </span><span class="spaces">          </span><span class="istickedoff">-- reply).</span>
+<span class="lineno">  509 </span><span class="spaces">          </span><span class="istickedoff">broadcastHarnessStatus (tdBroker td) sid &quot;idle&quot;</span>
+<span class="lineno">  510 </span><span class="spaces">          </span><span class="istickedoff">fanoutLastReply (tdReplies td) <span class="nottickedoff">(tdBroker td)</span> paths sid</span>
+<span class="lineno">  511 </span><span class="spaces">          </span><span class="istickedoff">broadcastReplyDelivered (tdBroker td) <span class="nottickedoff">sid</span>)</span>
+<span class="lineno">  512 </span><span class="spaces">        </span><span class="istickedoff">(\_ -&gt; withSessionLock (tdLocks td) sid $</span>
+<span class="lineno">  513 </span><span class="spaces">          </span><span class="istickedoff">withTwoFileTranscript sessionDirPath $ \tHandle -&gt;</span>
+<span class="lineno">  514 </span><span class="spaces">            </span><span class="istickedoff">runTurnBody td adapter <span class="nottickedoff">meta</span> mSrc t sid paths prov model tHandle)</span>
+<span class="lineno">  515 </span><span class="spaces">      </span><span class="istickedoff">-- [engine] Auto-tab the session (idempotent; no-op if a tab already</span>
+<span class="lineno">  516 </span><span class="spaces">      </span><span class="istickedoff">-- binds sid). Gated on shouldAutoTab so /bg sessions stay headless.</span>
+<span class="lineno">  517 </span><span class="spaces">      </span><span class="istickedoff">when (shouldAutoTab meta) $</span>
+<span class="lineno">  518 </span><span class="spaces">        </span><span class="istickedoff">ensureTabForSession (tdTabsHandle td) <span class="nottickedoff">KindAi</span> sid</span>
+<span class="lineno">  519 </span><span class="spaces">      </span><span class="istickedoff">-- [adapter] Post-turn (e.g. /bg lists refresh).</span>
+<span class="lineno">  520 </span><span class="spaces">      </span><span class="istickedoff">taPostTurn adapter <span class="nottickedoff">sid</span> <span class="nottickedoff">meta</span></span>
+<span class="lineno">  521 </span><span class="spaces">      </span><span class="istickedoff">pure (TurnOutcome mErr)</span></span>
+<span class="lineno">  522 </span>
+<span class="lineno">  523 </span>-- | The transcript-bracket body: build the per-turn execution environment
+<span class="lineno">  524 </span>-- + AgentEnv, run 'runTurn', broadcast new entries, return 'Just' on error.
+<span class="lineno">  525 </span>-- Extracted from 'runSessionTurn' to flatten the nesting (the bracket's
+<span class="lineno">  526 </span>-- third arg is a single function call, not a deeply-nested do-block).
+<span class="lineno">  527 </span>-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+<span class="lineno">  528 </span>-- wiring can't support it (local mode, remote unconfigured, tests with no
+<span class="lineno">  529 </span>-- runner). Remote-only by design: in local mode the workdir IS local, so
+<span class="lineno">  530 </span>-- the per-file crawl has no SSH round trips to amortize.
+<span class="lineno">  531 </span>-- | Build the agent-metadata cache env for a scan, or 'Nothing' when the
+<span class="lineno">  532 </span>-- wiring can't support it (local mode, remote unconfigured/incomplete,
+<span class="lineno">  533 </span>-- security-config load failure). Remote-only by design: in local mode the
+<span class="lineno">  534 </span>-- workdir IS local, so the per-file crawl has no SSH round trips to
+<span class="lineno">  535 </span>-- amortize. Logs its decision at debug so fallbacks are diagnosable.
+<span class="lineno">  536 </span>metaCacheEnvFor
+<span class="lineno">  537 </span>  :: TurnDeps -&gt; SealPaths -&gt; Either Text SecurityConfig
+<span class="lineno">  538 </span>  -&gt; IO (Maybe MetaCacheEnv)
+<span class="lineno">  539 </span><span class="decl"><span class="istickedoff">metaCacheEnvFor td paths eSecCfg = do</span>
+<span class="lineno">  540 </span><span class="spaces">  </span><span class="istickedoff">let mEnv = case (tdIsRemote td, eSecCfg) of</span>
+<span class="lineno">  541 </span><span class="spaces">        </span><span class="istickedoff">(True, Right secCfg) -&gt;</span>
+<span class="lineno">  542 </span><span class="spaces">          </span><span class="istickedoff">case untrustedExecConfigFromSecurity secCfg of</span>
+<span class="lineno">  543 </span><span class="spaces">            </span><span class="istickedoff">Just (UntrustedExecConfig UemRemote (Just sshCfg)) -&gt; Just <span class="nottickedoff">MetaCacheEnv</span></span>
+<span class="lineno">  544 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">{ mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)</span></span>
+<span class="lineno">  545 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, mceSshCfg       = sshCfg</span></span>
+<span class="lineno">  546 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, mceCacheRoot    = agentMetaCacheDir paths</span></span>
+<span class="lineno">  547 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, mceRunTransfer  = rsyncTransferIO sshCfg</span></span>
+<span class="lineno">  548 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  549 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  550 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  551 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">reason = case mEnv of</span></span>
+<span class="lineno">  552 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just _  -&gt; &quot;Just (snapshot routing active)&quot;</span></span>
+<span class="lineno">  553 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; case (tdIsRemote td, eSecCfg) of</span></span>
+<span class="lineno">  554 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(False, _) -&gt; &quot;Nothing (local mode)&quot;</span></span>
+<span class="lineno">  555 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(_, Left err) -&gt;</span></span>
+<span class="lineno">  556 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">&quot;Nothing (security config load failed: &quot; ++ T.unpack err ++ &quot;)&quot;</span></span>
+<span class="lineno">  557 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(_, Right secCfg) -&gt;</span></span>
+<span class="lineno">  558 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">case untrustedExecConfigFromSecurity secCfg of</span></span>
+<span class="lineno">  559 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Just uec | uecMode uec == UemRemote -&gt;</span></span>
+<span class="lineno">  560 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">&quot;Nothing (mode=remote but ssh config missing/incomplete)&quot;</span></span>
+<span class="lineno">  561 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; &quot;Nothing (mode is not remote)&quot;</span></span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="istickedoff">globalLogIO <span class="nottickedoff">K2.DebugS</span> <span class="nottickedoff">(K2.ls (T.pack (&quot;[agent-meta] env=&quot; &lt;&gt; reason)))</span></span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="istickedoff">pure mEnv</span></span>
+<span class="lineno">  564 </span>
+<span class="lineno">  565 </span>runTurnBody
+<span class="lineno">  566 </span>  :: TurnDeps -&gt; TurnAdapter -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text
+<span class="lineno">  567 </span>  -&gt; SessionId -&gt; SealPaths
+<span class="lineno">  568 </span>  -&gt; SomeProvider -&gt; ModelId -&gt; TwoFileHandle
+<span class="lineno">  569 </span>  -&gt; IO (Maybe Text)
+<span class="lineno">  570 </span><span class="decl"><span class="istickedoff">runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do</span>
+<span class="lineno">  571 </span><span class="spaces">  </span><span class="istickedoff">appEnv &lt;- mkEnv <span class="nottickedoff">(tdLogger td)</span> <span class="nottickedoff">defaultConfig</span></span>
+<span class="lineno">  572 </span><span class="spaces">  </span><span class="istickedoff">eCfg &lt;- loadRuntimeConfig (prConfigPath (tdProvider td))</span>
+<span class="lineno">  573 </span><span class="spaces">  </span><span class="istickedoff">eSecCfg &lt;- loadSecurityConfig (securityFilePath paths)</span>
+<span class="lineno">  574 </span><span class="spaces">  </span><span class="istickedoff">let operatorCeiling = either <span class="nottickedoff">(const defaultRetrievalMaxScanBytes)</span> retrievalMaxScanBytes eCfg</span>
+<span class="lineno">  575 </span><span class="spaces">  </span><span class="istickedoff">cloneDeps &lt;- mkCloneDepsTurn <span class="nottickedoff">td</span></span>
+<span class="lineno">  576 </span><span class="spaces">  </span><span class="istickedoff">exec &lt;- either <span class="nottickedoff">(\_ _ _ _ -&gt; pure (failClosedSessionExec cloneDeps))</span></span>
+<span class="lineno">  577 </span><span class="spaces">                 </span><span class="istickedoff">(\sc _sid _cd runner -&gt; cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)</span>
+<span class="lineno">  578 </span><span class="spaces">                 </span><span class="istickedoff">eSecCfg <span class="nottickedoff">sid</span> <span class="nottickedoff">cloneDeps</span> (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))</span>
+<span class="lineno">  579 </span><span class="spaces">  </span><span class="istickedoff">let wfs    = seWorkdirFs exec</span>
+<span class="lineno">  580 </span><span class="spaces">      </span><span class="istickedoff">wsRoot = seWorkspaceRoot exec</span>
+<span class="lineno">  581 </span><span class="spaces">      </span><span class="istickedoff">uioEnv = seUIOEnv exec</span>
+<span class="lineno">  582 </span><span class="spaces">  </span><span class="istickedoff">-- [engine] One discovery scan per session (cache-backed): the result</span>
+<span class="lineno">  583 </span><span class="spaces">  </span><span class="istickedoff">-- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn</span>
+<span class="lineno">  584 </span><span class="spaces">  </span><span class="istickedoff">-- costs zero extra scans after the first (or after SETUP_REPO).</span>
+<span class="lineno">  585 </span><span class="spaces">  </span><span class="istickedoff">metaEnv &lt;- metaCacheEnvFor td <span class="nottickedoff">paths</span> eSecCfg</span>
+<span class="lineno">  586 </span><span class="spaces">  </span><span class="istickedoff">(workdirDefs, workdirSkillsList) &lt;- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv</span>
+<span class="lineno">  587 </span><span class="spaces">  </span><span class="istickedoff">workdirSkills &lt;- Skill.staticSkillBackend workdirSkillsList</span>
+<span class="lineno">  588 </span><span class="spaces">  </span><span class="istickedoff">workdirAgentDefs &lt;- Def.staticAgentDefBackend workdirDefs</span>
+<span class="lineno">  589 </span><span class="spaces">  </span><span class="istickedoff">-- [engine] autoBindRepoAgent (design §5.2 step 3b — currently web-only;</span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">-- unifying means channels/CLI gain it, the desired behavioural</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">-- convergence). Runs over the SAME cached defs — no extra scan.</span>
+<span class="lineno">  592 </span><span class="spaces">  </span><span class="istickedoff">autoBindRepoAgentWith workdirDefs paths sid</span>
+<span class="lineno">  593 </span><span class="spaces">  </span><span class="istickedoff">mMetaAfterBind &lt;- loadSessionMeta paths sid</span>
+<span class="lineno">  594 </span><span class="spaces">  </span><span class="istickedoff">let meta' = fromMaybe <span class="nottickedoff">meta</span> mMetaAfterBind</span>
+<span class="lineno">  595 </span><span class="spaces">  </span><span class="istickedoff">-- [engine] Workdir-aware backends (per-turn merge; tdBaseBackends is the</span>
+<span class="lineno">  596 </span><span class="spaces">  </span><span class="istickedoff">-- base, never mutated). The workdir halves are static backends over the</span>
+<span class="lineno">  597 </span><span class="spaces">  </span><span class="istickedoff">-- cache's scan result (see above).</span>
+<span class="lineno">  598 </span><span class="spaces">  </span><span class="istickedoff">let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td))</span>
+<span class="lineno">  599 </span><span class="spaces">      </span><span class="istickedoff">sessionBackends = (tdBaseBackends td)</span>
+<span class="lineno">  600 </span><span class="spaces">        </span><span class="istickedoff">{ bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td)) }</span>
+<span class="lineno">  601 </span><span class="spaces">      </span><span class="istickedoff">agentDefBackend = bAgentDefs sessionBackends</span>
+<span class="lineno">  602 </span><span class="spaces">      </span><span class="istickedoff">autoloadId = either <span class="nottickedoff">(const Nothing)</span> resolvedAutoloadSkill eCfg</span>
+<span class="lineno">  603 </span><span class="spaces">      </span><span class="istickedoff">injectCatalog = either <span class="nottickedoff">(const True)</span> resolvedAvailableSkills eCfg</span>
+<span class="lineno">  604 </span><span class="spaces">      </span><span class="istickedoff">parallel = either <span class="nottickedoff">(const True)</span> resolvedParallelToolGuidance eCfg</span>
+<span class="lineno">  605 </span><span class="spaces">      </span><span class="istickedoff">toolUse = either <span class="nottickedoff">(const True)</span> resolvedToolUseEnforcement eCfg</span>
+<span class="lineno">  606 </span><span class="spaces">      </span><span class="istickedoff">taskCompletion = either <span class="nottickedoff">(const True)</span> resolvedTaskCompletionGuidance eCfg</span>
+<span class="lineno">  607 </span><span class="spaces">  </span><span class="istickedoff">-- [engine] Check if any cloned repo has a .codegraph/ directory; if so,</span>
+<span class="lineno">  608 </span><span class="spaces">  </span><span class="istickedoff">-- inject the codegraph skill body into the system prompt.</span>
+<span class="lineno">  609 </span><span class="spaces">  </span><span class="istickedoff">mCodegraphBody &lt;- codegraphSkillBodyFor wfs <span class="nottickedoff">sessionSkills</span></span>
+<span class="lineno">  610 </span><span class="spaces">  </span><span class="istickedoff">-- [engine] System prompt (single resolver, honors smSystemOverride).</span>
+<span class="lineno">  611 </span><span class="spaces">  </span><span class="istickedoff">mSystem &lt;- resolveSystemPrompt agentDefBackend sessionSkills</span>
+<span class="lineno">  612 </span><span class="spaces">              </span><span class="istickedoff">autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'</span>
+<span class="lineno">  613 </span><span class="spaces">  </span><span class="istickedoff">turnAbortFlag &lt;- lookupOrCreateAbortFlag (tdAbortReg td) sid</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="istickedoff">let onDemand = either <span class="nottickedoff">(const False)</span> onDemandSchemas eCfg</span>
+<span class="lineno">  615 </span><span class="spaces">      </span><span class="istickedoff">startWiring = taStartWiring adapter sessionBackends <span class="nottickedoff">sid</span> <span class="nottickedoff">appEnv</span> <span class="nottickedoff">eCfg</span> <span class="nottickedoff">operatorCeiling</span> <span class="nottickedoff">meta'</span></span>
+<span class="lineno">  616 </span><span class="spaces">      </span><span class="istickedoff">isaReg = buildSessionRegistry <span class="nottickedoff">(tdVault td)</span> <span class="nottickedoff">cloneDeps</span> sessionBackends <span class="nottickedoff">wsRoot</span> sid operatorCeiling</span>
+<span class="lineno">  617 </span><span class="spaces">                 </span><span class="istickedoff">(tdAutonomy td) <span class="nottickedoff">(either (const Nothing) rcWeb eCfg)</span> startWiring</span>
+<span class="lineno">  618 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">(tdHarnessReg td)</span> <span class="nottickedoff">(tdTmuxRunner td)</span> <span class="nottickedoff">(tdHttpManager td)</span> <span class="nottickedoff">(taCaps adapter)</span> onDemand</span>
+<span class="lineno">  619 </span><span class="spaces">  </span><span class="istickedoff">tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)</span>
+<span class="lineno">  620 </span><span class="spaces">  </span><span class="istickedoff">let onEntry = broadcastNewEntries (tdBroker td) paths sid <span class="nottickedoff">(modelText model)</span> <span class="nottickedoff">(smCreatedAt meta')</span></span>
+<span class="lineno">  621 </span><span class="spaces">      </span><span class="istickedoff">env = (mkSessionAgentEnv TurnEnv</span>
+<span class="lineno">  622 </span><span class="spaces">              </span><span class="istickedoff">{ teCaps          = taCaps adapter</span>
+<span class="lineno">  623 </span><span class="spaces">              </span><span class="istickedoff">, teProvider      = prov</span>
+<span class="lineno">  624 </span><span class="spaces">              </span><span class="istickedoff">, teProviderLabel = <span class="nottickedoff">smProvider meta'</span></span>
+<span class="lineno">  625 </span><span class="spaces">              </span><span class="istickedoff">, teModel         = model</span>
+<span class="lineno">  626 </span><span class="spaces">              </span><span class="istickedoff">, teSession       = <span class="nottickedoff">sid</span></span>
+<span class="lineno">  627 </span><span class="spaces">              </span><span class="istickedoff">, teSystem        = mSystem</span>
+<span class="lineno">  628 </span><span class="spaces">              </span><span class="istickedoff">, teRegistry      = isaReg</span>
+<span class="lineno">  629 </span><span class="spaces">              </span><span class="istickedoff">, teTranscript    = tHandle</span>
+<span class="lineno">  630 </span><span class="spaces">              </span><span class="istickedoff">, teUioEnv        = uioEnv</span>
+<span class="lineno">  631 </span><span class="spaces">              </span><span class="istickedoff">, teDebugReqPath  = debugRequestsPath <span class="nottickedoff">paths</span> <span class="nottickedoff">sid</span> eCfg</span>
+<span class="lineno">  632 </span><span class="spaces">              </span><span class="istickedoff">, teAutonomy      = tdAutonomy td</span>
+<span class="lineno">  633 </span><span class="spaces">              </span><span class="istickedoff">, teApprovals     = <span class="nottickedoff">tdApprovals td</span></span>
+<span class="lineno">  634 </span><span class="spaces">              </span><span class="istickedoff">, teOnEntry       = onEntry</span>
+<span class="lineno">  635 </span><span class="spaces">              </span><span class="istickedoff">, teOnDemand      = onDemand</span>
+<span class="lineno">  636 </span><span class="spaces">              </span><span class="istickedoff">, teLogPath       = Just (sessionLogPath paths sid)</span>
+<span class="lineno">  637 </span><span class="spaces">              </span><span class="istickedoff">, teMaxTurns      = either <span class="nottickedoff">(const defaultMaxTurns)</span> maxTurnsConfig eCfg</span>
+<span class="lineno">  638 </span><span class="spaces">              </span><span class="istickedoff">, teOnUserMessage = taOnUserMessage adapter <span class="nottickedoff">meta'</span></span>
+<span class="lineno">  639 </span><span class="spaces">              </span><span class="istickedoff">, teChannel       = taChannelLabel adapter <span class="nottickedoff">meta'</span></span>
+<span class="lineno">  640 </span><span class="spaces">              </span><span class="istickedoff">, teOnStop        = taOnStop adapter sid</span>
+<span class="lineno">  641 </span><span class="spaces">              </span><span class="istickedoff">, teAbortFlag     = turnAbortFlag</span>
+<span class="lineno">  642 </span><span class="spaces">              </span><span class="istickedoff">, teToolTimeout   = either <span class="nottickedoff">(const defaultToolTimeoutConfig)</span> toolTimeoutConfig eCfg</span>
+<span class="lineno">  643 </span><span class="spaces">              </span><span class="istickedoff">})</span>
+<span class="lineno">  644 </span><span class="spaces">            </span><span class="istickedoff">{ aeMessageSource = mSrc }</span>
+<span class="lineno">  645 </span><span class="spaces">  </span><span class="istickedoff">eResult &lt;- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) &quot;turn&quot; $</span>
+<span class="lineno">  646 </span><span class="spaces">    </span><span class="istickedoff">runApp <span class="nottickedoff">appEnv</span> (runTurn env t)</span>
+<span class="lineno">  647 </span><span class="spaces">  </span><span class="istickedoff">case eResult of</span>
+<span class="lineno">  648 </span><span class="spaces">    </span><span class="istickedoff">Left errMsg -&gt; pure (Just <span class="nottickedoff">errMsg</span>)</span>
+<span class="lineno">  649 </span><span class="spaces">    </span><span class="istickedoff">Right _     -&gt; do</span>
+<span class="lineno">  650 </span><span class="spaces">      </span><span class="istickedoff">-- [engine] Broadcast new transcript entries (one canonical post-turn</span>
+<span class="lineno">  651 </span><span class="spaces">      </span><span class="istickedoff">-- sequence; the per-entry live broadcast already fired via aeOnEntry).</span>
+<span class="lineno">  652 </span><span class="spaces">      </span><span class="istickedoff">broadcastNewEntries (tdBroker td) <span class="nottickedoff">paths</span> <span class="nottickedoff">sid</span> <span class="nottickedoff">(modelText model)</span> <span class="nottickedoff">(smCreatedAt meta')</span></span>
+<span class="lineno">  653 </span><span class="spaces">      </span><span class="istickedoff">pure Nothing</span></span>
+<span class="lineno">  654 </span>
+<span class="lineno">  655 </span>-- | Record a synthetic 'EKRequest' preamble entry (convLen=0, full envelope,
+<span class="lineno">  656 </span>-- no messages) before the first user message so the frontend's System Prompt
+<span class="lineno">  657 </span>-- + Tools rows appear above the first message, not interleaved with it. The
+<span class="lineno">  658 </span>-- entry carries the resolved system prompt + the ISA registry's tool defs so
+<span class="lineno">  659 </span>-- the frontend can render both rows from this single entry. The preamble is
+<span class="lineno">  660 </span>-- recorded ONCE per session (the caller checks for prior EKRequest entries).
+<span class="lineno">  661 </span>-- Broadcasts the entry so a live-connected frontend sees it immediately.
+<span class="lineno">  662 </span>recordPreamble :: TwoFileHandle -&gt; ModelId -&gt; Maybe Text -&gt; ISA.Registry -&gt; IO ()
+<span class="lineno">  663 </span><span class="decl"><span class="istickedoff">recordPreamble tHandle model mSystem isaReg = do</span>
+<span class="lineno">  664 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  665 </span><span class="spaces">  </span><span class="istickedoff">let env0 = EnvelopeDelta</span>
+<span class="lineno">  666 </span><span class="spaces">        </span><span class="istickedoff">{ edModel = Just model</span>
+<span class="lineno">  667 </span><span class="spaces">        </span><span class="istickedoff">, edSystem = Just mSystem</span>
+<span class="lineno">  668 </span><span class="spaces">        </span><span class="istickedoff">, edTools = Just (ISA.registryToolDefs isaReg)</span>
+<span class="lineno">  669 </span><span class="spaces">        </span><span class="istickedoff">, edToolChoice = Just ToolAuto</span>
+<span class="lineno">  670 </span><span class="spaces">        </span><span class="istickedoff">, edMaxTokens = Just defaultMaxTokens</span>
+<span class="lineno">  671 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  672 </span><span class="spaces">      </span><span class="istickedoff">entry = EntryRecord</span>
+<span class="lineno">  673 </span><span class="spaces">        </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  674 </span><span class="spaces">        </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  675 </span><span class="spaces">        </span><span class="istickedoff">, erKind = EKRequest</span>
+<span class="lineno">  676 </span><span class="spaces">        </span><span class="istickedoff">, erConvLen = 0</span>
+<span class="lineno">  677 </span><span class="spaces">        </span><span class="istickedoff">, erEnvelope = Just env0</span>
+<span class="lineno">  678 </span><span class="spaces">        </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  679 </span><span class="spaces">        </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  680 </span><span class="spaces">        </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  681 </span><span class="spaces">        </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  682 </span><span class="spaces">        </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  683 </span><span class="spaces">        </span><span class="istickedoff">, erMeta = Map.empty</span>
+<span class="lineno">  684 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  685 </span><span class="spaces">  </span><span class="istickedoff">tfwRecordAndAck tHandle (TwoFileWrite [] entry)</span></span>
+<span class="lineno">  686 </span>
+<span class="lineno">  687 </span>-- | Build 'Clone.CloneDeps' from a 'TurnDeps' (the in-scope vault runtime +
+<span class="lineno">  688 </span>-- repo registry handle + paths). The ssh-agent is real (production:
+<span class="lineno">  689 </span>-- 'mkRealSshAgentHandle'); the pinned host keys are compile-time-embedded.
+<span class="lineno">  690 </span>mkCloneDepsTurn :: TurnDeps -&gt; IO Clone.CloneDeps
+<span class="lineno">  691 </span><span class="decl"><span class="istickedoff">mkCloneDepsTurn td = do</span>
+<span class="lineno">  692 </span><span class="spaces">  </span><span class="istickedoff">agentRegH &lt;- mkAgentRegistryHandle <span class="nottickedoff">(sshAgentsDir (tdPaths td))</span></span>
+<span class="lineno">  693 </span><span class="spaces">  </span><span class="istickedoff">pure Clone.CloneDeps</span>
+<span class="lineno">  694 </span><span class="spaces">    </span><span class="istickedoff">{ Clone.cdVault = tdVault td</span>
+<span class="lineno">  695 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdRepoReg = tdRepoReg td</span>
+<span class="lineno">  696 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdSshAgent = <span class="nottickedoff">mkRealSshAgentHandle</span></span>
+<span class="lineno">  697 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdAgentRegistry = <span class="nottickedoff">agentRegH</span></span>
+<span class="lineno">  698 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdPinnedKnownHosts = <span class="nottickedoff">pinnedGithubKnownHosts</span></span>
+<span class="lineno">  699 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdKeyfilesDir = <span class="nottickedoff">repoKeysDir (tdPaths td)</span></span>
+<span class="lineno">  700 </span><span class="spaces">    </span><span class="istickedoff">, Clone.cdIsRemote = <span class="nottickedoff">tdIsRemote td</span></span>
+<span class="lineno">  701 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  702 </span>
+<span class="lineno">  703 </span>-- | Load a session's 'SessionMeta' by id from disk. Returns 'Nothing' when
+<span class="lineno">  704 </span>-- the session directory or @session.json@ is missing or undecodable. The
+<span class="lineno">  705 </span>-- engine uses this to re-read meta after 'autoBindRepoAgent' may have
+<span class="lineno">  706 </span>-- rebound 'smAgent'.
+<span class="lineno">  707 </span>loadSessionMeta :: SealPaths -&gt; SessionId -&gt; IO (Maybe SessionMeta)
+<span class="lineno">  708 </span><span class="decl"><span class="istickedoff">loadSessionMeta paths sid = do</span>
+<span class="lineno">  709 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionDir paths sid System.FilePath.&lt;/&gt; &quot;session.json&quot;</span>
+<span class="lineno">  710 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- System.Directory.doesFileExist mp</span>
+<span class="lineno">  711 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  712 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  713 </span><span class="spaces">    </span><span class="istickedoff">else decodeFileStrict mp</span></span>
+<span class="lineno">  714 </span>
+<span class="lineno">  715 </span>-- | Should 'runSessionTurn' auto-tab the session after a turn? 'True' for
+<span class="lineno">  716 </span>-- normal turns (every channel-originated session is visible in the sidebar).
+<span class="lineno">  717 </span>-- 'False' for @/bg@ sessions, whose 'smChannel' is @&quot;bg&quot;@: a /bg turn runs
+<span class="lineno">  718 </span>-- headless on a fresh session that must NOT surface in the web sidebar.
+<span class="lineno">  719 </span>shouldAutoTab :: SessionMeta -&gt; Bool
+<span class="lineno">  720 </span><span class="decl"><span class="istickedoff">shouldAutoTab meta = smChannel meta /= &quot;bg&quot;</span></span>
+<span class="lineno">  721 </span>
+<span class="lineno">  722 </span>-- | Broadcast new transcript entries over the WS broker so the frontend
+<span class="lineno">  723 </span>-- updates live without a page refresh. Reads the full transcript from disk
+<span class="lineno">  724 </span>-- and broadcasts every entry — the frontend dedupes by id. 'Nothing' broker
+<span class="lineno">  725 </span>-- (tests) is a no-op.
+<span class="lineno">  726 </span>broadcastNewEntries
+<span class="lineno">  727 </span>  :: Maybe StreamBroker -&gt; SealPaths -&gt; SessionId -&gt; Text -&gt; UTCTime -&gt; IO ()
+<span class="lineno">  728 </span><span class="decl"><span class="istickedoff">broadcastNewEntries mBroker paths sid model createdAt =</span>
+<span class="lineno">  729 </span><span class="spaces">  </span><span class="istickedoff">case mBroker of</span>
+<span class="lineno">  730 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  731 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt; do</span>
+<span class="lineno">  732 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- readTranscriptEntries paths <span class="nottickedoff">model</span> <span class="nottickedoff">(showIso createdAt)</span> sid</span>
+<span class="lineno">  733 </span><span class="spaces">      </span><span class="istickedoff">mapM_ (broadcast broker . BeEntryRecorded sid) entries</span></span>
+<span class="lineno">  734 </span>
+<span class="lineno">  735 </span>-- | Fan out the last assistant reply to subscribed chat channels, and emit
+<span class="lineno">  736 </span>-- a @reply-delivered@ signal when ≥1 chat channel received it (so the web
+<span class="lineno">  737 </span>-- sidebar marks the tab Idle Read). No-op when the session has no
+<span class="lineno">  738 </span>-- @conversation.json@ (CLI/tests).
+<span class="lineno">  739 </span>fanoutLastReply :: ReplyRegistry -&gt; Maybe StreamBroker -&gt; SealPaths -&gt; SessionId -&gt; IO ()
+<span class="lineno">  740 </span><span class="decl"><span class="istickedoff">fanoutLastReply replies mBroker paths sid = do</span>
+<span class="lineno">  741 </span><span class="spaces">  </span><span class="istickedoff">let convPath = sessionConversationPath paths sid</span>
+<span class="lineno">  742 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist convPath</span>
+<span class="lineno">  743 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  744 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  745 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  746 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- readFileTextStrict convPath</span>
+<span class="lineno">  747 </span><span class="spaces">      </span><span class="istickedoff">let lines' = filter (not . T.null) (T.lines raw)</span>
+<span class="lineno">  748 </span><span class="spaces">          </span><span class="istickedoff">msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8) lines' :: [Message]</span>
+<span class="lineno">  749 </span><span class="spaces">      </span><span class="istickedoff">for_ (lastAssistantText msgs) $ \reply -&gt; do</span>
+<span class="lineno">  750 </span><span class="spaces">        </span><span class="istickedoff">replyFanout replies sid <span class="nottickedoff">reply</span></span>
+<span class="lineno">  751 </span><span class="spaces">        </span><span class="istickedoff">count &lt;- replySubscriberCount replies sid</span>
+<span class="lineno">  752 </span><span class="spaces">        </span><span class="istickedoff">when (count &gt; 0) <span class="nottickedoff">(broadcastReplyDelivered mBroker sid)</span></span></span>
+<span class="lineno">  753 </span>
+<span class="lineno">  754 </span>-- | Extract the concatenated text content of the last 'Assistant' message.
+<span class="lineno">  755 </span>lastAssistantText :: [Message] -&gt; Maybe Text
+<span class="lineno">  756 </span><span class="decl"><span class="istickedoff">lastAssistantText msgs =</span>
+<span class="lineno">  757 </span><span class="spaces">  </span><span class="istickedoff">case reverse (filter (\m -&gt; msgRole m == Assistant) msgs) of</span>
+<span class="lineno">  758 </span><span class="spaces">    </span><span class="istickedoff">(m : _) -&gt; case [<span class="nottickedoff">t</span> | CbText t &lt;- msgContent m] of</span>
+<span class="lineno">  759 </span><span class="spaces">      </span><span class="istickedoff">(t : _) -&gt; Just <span class="nottickedoff">t</span></span>
+<span class="lineno">  760 </span><span class="spaces">      </span><span class="istickedoff">[]      -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  761 </span><span class="spaces">    </span><span class="istickedoff">[]      -&gt; Nothing</span></span>
+<span class="lineno">  762 </span>
+<span class="lineno">  763 </span>-- | Extract the 'Text' from a 'ModelId'.
+<span class="lineno">  764 </span>modelText :: ModelId -&gt; Text
+<span class="lineno">  765 </span><span class="decl"><span class="nottickedoff">modelText (ModelId t) = t</span></span>
+<span class="lineno">  766 </span>
+<span class="lineno">  767 </span>-- | Resolve the optional debug-requests path from the loaded config. When
+<span class="lineno">  768 </span>-- @debug_session_transcript@ is @true@, returns @Just (sessionRequestsPath paths sid)@;
+<span class="lineno">  769 </span>-- otherwise @Nothing@. The debug file (@requests.jsonl@) records each
+<span class="lineno">  770 </span>-- 'CompletionRequest' in full exactly as sent to the LLM.
+<span class="lineno">  771 </span>debugRequestsPath :: SealPaths -&gt; SessionId -&gt; Either a RuntimeConfig -&gt; Maybe FilePath
+<span class="lineno">  772 </span><span class="decl"><span class="istickedoff">debugRequestsPath paths sid eCfg =</span>
+<span class="lineno">  773 </span><span class="spaces">  </span><span class="istickedoff">case eCfg of</span>
+<span class="lineno">  774 </span><span class="spaces">    </span><span class="istickedoff">Right cfg | Just True &lt;- rcDebugSessionTranscript cfg -&gt;</span>
+<span class="lineno">  775 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Just (sessionRequestsPath paths sid)</span></span>
+<span class="lineno">  776 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  777 </span>
+<span class="lineno">  778 </span>-- | Load a session's channel label (e.g. @&quot;telegram&quot;@, @&quot;web&quot;@, @&quot;cli&quot;@)
+<span class="lineno">  779 </span>-- from its @session.json@. Returns 'Nothing' when the session directory or
+<span class="lineno">  780 </span>-- file is missing or undecodable. Used by 'callDispatcher' to stamp
+<span class="lineno">  781 </span>-- channel origin into the SKILL_LOAD transcript entry.
+<span class="lineno">  782 </span>loadChannelLabel :: SealPaths -&gt; SessionId -&gt; IO (Maybe Text)
+<span class="lineno">  783 </span><span class="decl"><span class="istickedoff">loadChannelLabel paths sid = do</span>
+<span class="lineno">  784 </span><span class="spaces">  </span><span class="istickedoff">mMeta &lt;- loadSessionMeta paths sid</span>
+<span class="lineno">  785 </span><span class="spaces">  </span><span class="istickedoff">pure (<span class="nottickedoff">smChannel</span> &lt;$&gt; mMeta)</span></span>
+<span class="lineno">  786 </span>
+<span class="lineno">  787 </span>-- | The unified call dispatcher (design §5.3 — replaces @webCallDispatcher@,
+<span class="lineno">  788 </span>-- @channelCallDispatcher@, and the CLI's inline @callDispatcher@). Takes
+<span class="lineno">  789 </span>-- explicit 'TurnDeps' + 'SessionId' + 'ChannelCaps' + the channel label (for
+<span class="lineno">  790 </span>-- the transcript entry's @erMeta.channel@). Opens the transcript, builds the
+<span class="lineno">  791 </span>-- session's ISA registry, dispatches the opcode via
+<span class="lineno">  792 </span>-- 'Seal.ISA.Dispatch.dispatch' under 'Full' autonomy semantics (the operator
+<span class="lineno">  793 </span>-- is the approver by typing @/call@), records the result, and broadcasts new
+<span class="lineno">  794 </span>-- entries.
+<span class="lineno">  795 </span>--
+<span class="lineno">  796 </span>-- SETUP_REPO convergence (W4): the unified dispatcher runs
+<span class="lineno">  797 </span>-- 'recordSetupRepoResult' + 'autoBindRepoAgent' + 'broadcastAgentDefsChanged'
+<span class="lineno">  798 </span>-- for ALL surfaces (was web-only). This matches W3's autoBindRepoAgent
+<span class="lineno">  799 </span>-- convergence — channels/CLI gain the auto-bind behavior.
+<span class="lineno">  800 </span>callDispatcher
+<span class="lineno">  801 </span>  :: TurnDeps -&gt; ChannelCaps -&gt; SessionId -&gt; Text
+<span class="lineno">  802 </span>  -&gt; OpName -&gt; Value -&gt; IO (Either DispatchError OpResult)
+<span class="lineno">  803 </span><span class="decl"><span class="istickedoff">callDispatcher td caps sid channelLabel callOpName val = do</span>
+<span class="lineno">  804 </span><span class="spaces">  </span><span class="istickedoff">let paths = tdPaths td</span>
+<span class="lineno">  805 </span><span class="spaces">      </span><span class="istickedoff">sessionDirPath = sessionDir paths sid</span>
+<span class="lineno">  806 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True sessionDirPath</span>
+<span class="lineno">  807 </span><span class="spaces">  </span><span class="istickedoff">mMeta &lt;- loadSessionMeta paths sid</span>
+<span class="lineno">  808 </span><span class="spaces">  </span><span class="istickedoff">withTwoFileTranscript sessionDirPath $ \tHandle -&gt; do</span>
+<span class="lineno">  809 </span><span class="spaces">    </span><span class="istickedoff">appEnv &lt;- mkEnv <span class="nottickedoff">(tdLogger td)</span> <span class="nottickedoff">defaultConfig</span></span>
+<span class="lineno">  810 </span><span class="spaces">    </span><span class="istickedoff">eCfg &lt;- loadRuntimeConfig (prConfigPath (tdProvider td))</span>
+<span class="lineno">  811 </span><span class="spaces">    </span><span class="istickedoff">eSecCfg &lt;- loadSecurityConfig (securityFilePath paths)</span>
+<span class="lineno">  812 </span><span class="spaces">    </span><span class="istickedoff">let <span class="nottickedoff">operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg</span></span>
+<span class="lineno">  813 </span><span class="spaces">    </span><span class="istickedoff">cloneDeps &lt;- mkCloneDepsTurn td</span>
+<span class="lineno">  814 </span><span class="spaces">    </span><span class="istickedoff">exec &lt;- either <span class="nottickedoff">(\_ _ _ _ -&gt; pure (failClosedSessionExec cloneDeps))</span></span>
+<span class="lineno">  815 </span><span class="spaces">                   </span><span class="istickedoff">(\sc _sid _cd runner -&gt; cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)</span>
+<span class="lineno">  816 </span><span class="spaces">                   </span><span class="istickedoff">eSecCfg <span class="nottickedoff">sid</span> <span class="nottickedoff">cloneDeps</span> (fromMaybe <span class="nottickedoff">mkRealRemoteRunner</span> (tdRemoteRunner td))</span>
+<span class="lineno">  817 </span><span class="spaces">    </span><span class="istickedoff">let wfs = seWorkdirFs exec</span>
+<span class="lineno">  818 </span><span class="spaces">        </span><span class="istickedoff">wsRoot = seWorkspaceRoot exec</span>
+<span class="lineno">  819 </span><span class="spaces">        </span><span class="istickedoff">uioEnv = seUIOEnv exec</span>
+<span class="lineno">  820 </span><span class="spaces">    </span><span class="istickedoff">metaEnv &lt;- metaCacheEnvFor td <span class="nottickedoff">paths</span> <span class="nottickedoff">eSecCfg</span></span>
+<span class="lineno">  821 </span><span class="spaces">    </span><span class="istickedoff">(workdirDefs, _) &lt;- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv</span>
+<span class="lineno">  822 </span><span class="spaces">    </span><span class="istickedoff">workdirAgentDefs &lt;- Def.staticAgentDefBackend <span class="nottickedoff">workdirDefs</span></span>
+<span class="lineno">  823 </span><span class="spaces">    </span><span class="istickedoff">let onDemand = either <span class="nottickedoff">(const False)</span> onDemandSchemas eCfg</span>
+<span class="lineno">  824 </span><span class="spaces">        </span><span class="istickedoff">sessionBackends = (tdBaseBackends td)</span>
+<span class="lineno">  825 </span><span class="spaces">          </span><span class="istickedoff">{ bAgentDefs = <span class="nottickedoff">Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))</span> }</span>
+<span class="lineno">  826 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel</span></span>
+<span class="lineno">  827 </span><span class="spaces">        </span><span class="istickedoff">isaReg = buildSessionRegistry <span class="nottickedoff">(tdVault td)</span> cloneDeps sessionBackends <span class="nottickedoff">wsRoot</span> <span class="nottickedoff">sid</span> <span class="nottickedoff">operatorCeiling</span></span>
+<span class="lineno">  828 </span><span class="spaces">                   </span><span class="istickedoff">(tdAutonomy td) <span class="nottickedoff">(either (const Nothing) rcWeb eCfg)</span> <span class="nottickedoff">startWiring</span></span>
+<span class="lineno">  829 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">(tdHarnessReg td)</span> <span class="nottickedoff">(tdTmuxRunner td)</span> <span class="nottickedoff">(tdHttpManager td)</span> <span class="nottickedoff">caps</span> onDemand</span>
+<span class="lineno">  830 </span><span class="spaces">    </span><span class="istickedoff">tfwSetSecretOps tHandle <span class="nottickedoff">(ISA.secretOpNames isaReg)</span></span>
+<span class="lineno">  831 </span><span class="spaces">    </span><span class="istickedoff">callAbortFlag &lt;- lookupOrCreateAbortFlag (tdAbortReg td) sid</span>
+<span class="lineno">  832 </span><span class="spaces">    </span><span class="istickedoff">res &lt;- runApp <span class="nottickedoff">appEnv</span> (dispatch isaReg tHandle <span class="nottickedoff">localBackend</span> uioEnv (either <span class="nottickedoff">(const defaultToolTimeoutConfig)</span> toolTimeoutConfig eCfg) callAbortFlag callOpName val)</span>
+<span class="lineno">  833 </span><span class="spaces">    </span><span class="istickedoff">case res of</span>
+<span class="lineno">  834 </span><span class="spaces">      </span><span class="istickedoff">Right r -&gt; do</span>
+<span class="lineno">  835 </span><span class="spaces">        </span><span class="istickedoff">let opNm = case callOpName of OpName n -&gt; n</span>
+<span class="lineno">  836 </span><span class="spaces">        </span><span class="istickedoff">if opNm == &quot;SETUP_REPO&quot;</span>
+<span class="lineno">  837 </span><span class="spaces">          </span><span class="istickedoff">then do</span>
+<span class="lineno">  838 </span><span class="spaces">            </span><span class="istickedoff">recordSetupRepoResult tHandle callOpName val r (Just channelLabel)</span>
+<span class="lineno">  839 </span><span class="spaces">            </span><span class="istickedoff">unless (orIsError r) $ do</span>
+<span class="lineno">  840 </span><span class="spaces">              </span><span class="istickedoff">-- The clone changed the workdir's structure: drop the cached</span>
+<span class="lineno">  841 </span><span class="spaces">              </span><span class="istickedoff">-- discovery scan, re-scan fresh, and bind from the fresh defs.</span>
+<span class="lineno">  842 </span><span class="spaces">              </span><span class="istickedoff">invalidateWorkdirScan (tdExecCache td) sid</span>
+<span class="lineno">  843 </span><span class="spaces">              </span><span class="istickedoff">freshMetaEnv &lt;- metaCacheEnvFor td <span class="nottickedoff">paths</span> <span class="nottickedoff">eSecCfg</span></span>
+<span class="lineno">  844 </span><span class="spaces">              </span><span class="istickedoff">(freshDefs, freshSkillsList) &lt;-</span>
+<span class="lineno">  845 </span><span class="spaces">                </span><span class="istickedoff">cachedWorkdirScan (tdExecCache td) sid wfs wsRoot freshMetaEnv</span>
+<span class="lineno">  846 </span><span class="spaces">              </span><span class="istickedoff">autoBindRepoAgentWith freshDefs <span class="nottickedoff">paths</span> <span class="nottickedoff">sid</span></span>
+<span class="lineno">  847 </span><span class="spaces">              </span><span class="istickedoff">-- Record a preamble entry (System Prompt + Tools) now that</span>
+<span class="lineno">  848 </span><span class="spaces">              </span><span class="istickedoff">-- the workdir is set up and the agent is bound. This makes</span>
+<span class="lineno">  849 </span><span class="spaces">              </span><span class="istickedoff">-- the System Prompt + Tools rows appear in the frontend</span>
+<span class="lineno">  850 </span><span class="spaces">              </span><span class="istickedoff">-- BEFORE the first user message, not after it. Only recorded</span>
+<span class="lineno">  851 </span><span class="spaces">              </span><span class="istickedoff">-- when no prior EKRequest entry exists (first time only).</span>
+<span class="lineno">  852 </span><span class="spaces">              </span><span class="istickedoff">priorEntries &lt;- tfwReadEntries tHandle</span>
+<span class="lineno">  853 </span><span class="spaces">              </span><span class="istickedoff">unless (any (\e -&gt; erKind e == EKRequest) priorEntries) $ do</span>
+<span class="lineno">  854 </span><span class="spaces">                </span><span class="istickedoff">mMetaAfterBind &lt;- loadSessionMeta paths sid</span>
+<span class="lineno">  855 </span><span class="spaces">                </span><span class="istickedoff">let meta' = fromMaybe <span class="nottickedoff">metaFallback</span> mMetaAfterBind</span>
+<span class="lineno">  856 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">metaFallback = fromMaybe (error &quot;callDispatcher: SETUP_REPO without session meta&quot;) mMeta</span></span>
+<span class="lineno">  857 </span><span class="spaces">                    </span><span class="istickedoff">autoloadId = either <span class="nottickedoff">(const Nothing)</span> resolvedAutoloadSkill eCfg</span>
+<span class="lineno">  858 </span><span class="spaces">                    </span><span class="istickedoff">injectCatalog = either <span class="nottickedoff">(const True)</span> resolvedAvailableSkills eCfg</span>
+<span class="lineno">  859 </span><span class="spaces">                    </span><span class="istickedoff">parallel = either <span class="nottickedoff">(const True)</span> resolvedParallelToolGuidance eCfg</span>
+<span class="lineno">  860 </span><span class="spaces">                    </span><span class="istickedoff">toolUse = either <span class="nottickedoff">(const True)</span> resolvedToolUseEnforcement eCfg</span>
+<span class="lineno">  861 </span><span class="spaces">                    </span><span class="istickedoff">taskCompletion = either <span class="nottickedoff">(const True)</span> resolvedTaskCompletionGuidance eCfg</span>
+<span class="lineno">  862 </span><span class="spaces">                </span><span class="istickedoff">freshSkills &lt;- Skill.staticSkillBackend freshSkillsList</span>
+<span class="lineno">  863 </span><span class="spaces">                </span><span class="istickedoff">-- Rebuild sessionBackends with the FRESH agent defs (after</span>
+<span class="lineno">  864 </span><span class="spaces">                </span><span class="istickedoff">-- autoBindRepoAgent re-bound the agent to the repo's</span>
+<span class="lineno">  865 </span><span class="spaces">                </span><span class="istickedoff">-- .agents/agents.md). The original sessionBackends was built</span>
+<span class="lineno">  866 </span><span class="spaces">                </span><span class="istickedoff">-- BEFORE the fresh scan, so it doesn't include the repo's</span>
+<span class="lineno">  867 </span><span class="spaces">                </span><span class="istickedoff">-- agent definition — using it would produce a preamble with</span>
+<span class="lineno">  868 </span><span class="spaces">                </span><span class="istickedoff">-- a stale (or missing) system prompt.</span>
+<span class="lineno">  869 </span><span class="spaces">                </span><span class="istickedoff">freshAgentDefs &lt;- Def.staticAgentDefBackend <span class="nottickedoff">freshDefs</span></span>
+<span class="lineno">  870 </span><span class="spaces">                </span><span class="istickedoff">let <span class="nottickedoff">freshBackends = sessionBackends</span></span>
+<span class="lineno">  871 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">{ bAgentDefs = Def.unionAgentDefBackend freshAgentDefs (bAgentDefs (tdBaseBackends td)) }</span></span>
+<span class="lineno">  872 </span><span class="spaces">                    </span><span class="istickedoff">sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))</span>
+<span class="lineno">  873 </span><span class="spaces">                </span><span class="istickedoff">mCodegraphBody &lt;- codegraphSkillBodyFor wfs <span class="nottickedoff">sessionSkills</span></span>
+<span class="lineno">  874 </span><span class="spaces">                </span><span class="istickedoff">mSystem &lt;- resolveSystemPrompt</span>
+<span class="lineno">  875 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">(bAgentDefs freshBackends)</span> sessionSkills</span>
+<span class="lineno">  876 </span><span class="spaces">                  </span><span class="istickedoff">autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'</span>
+<span class="lineno">  877 </span><span class="spaces">                </span><span class="istickedoff">let model = maybe <span class="nottickedoff">(ModelId &quot;&quot;)</span> (ModelId . smModel) mMetaAfterBind</span>
+<span class="lineno">  878 </span><span class="spaces">                </span><span class="istickedoff">recordPreamble tHandle model mSystem isaReg</span>
+<span class="lineno">  879 </span><span class="spaces">            </span><span class="istickedoff">broadcastAgentDefsChanged (tdBroker td)</span>
+<span class="lineno">  880 </span><span class="spaces">          </span><span class="istickedoff">else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)</span>
+<span class="lineno">  881 </span><span class="spaces">        </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  882 </span><span class="spaces">          </span><span class="istickedoff">Just meta -&gt; broadcastNewEntries (tdBroker td) <span class="nottickedoff">paths</span> <span class="nottickedoff">sid</span> <span class="nottickedoff">(smModel meta)</span> <span class="nottickedoff">(smCreatedAt meta)</span></span>
+<span class="lineno">  883 </span><span class="spaces">          </span><span class="istickedoff">Nothing   -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  884 </span><span class="spaces">      </span><span class="istickedoff">Left _  -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  885 </span><span class="spaces">    </span><span class="istickedoff">pure res</span></span>
+<span class="lineno">  886 </span>
+<span class="lineno">  887 </span>-- | Build the 'AgentStartWiring' for a unified turn (design §5.3 — replaces
+<span class="lineno">  888 </span>-- @webStartWiring@, @channelStartWiring@, @cliStartWiring@). The
+<span class="lineno">  889 </span>-- worker-builder is 'buildWorker' (the single implementation). The child
+<span class="lineno">  890 </span>-- registry is the unified 'buildChildRegistry'.
+<span class="lineno">  891 </span>buildStartWiring
+<span class="lineno">  892 </span>  :: TurnDeps -&gt; Backends -&gt; SessionId
+<span class="lineno">  893 </span>  -&gt; Env -&gt; Either a RuntimeConfig -&gt; Int -&gt; Text
+<span class="lineno">  894 </span>  -&gt; AgentStartWiring
+<span class="lineno">  895 </span><span class="decl"><span class="istickedoff">buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channel =</span>
+<span class="lineno">  896 </span><span class="spaces">  </span><span class="istickedoff">AgentStartWiring</span>
+<span class="lineno">  897 </span><span class="spaces">    </span><span class="istickedoff">{ aswDefBackend = bAgentDefs sessionBackends</span>
+<span class="lineno">  898 </span><span class="spaces">    </span><span class="istickedoff">, aswRuntime = bRuntime (tdBaseBackends td)</span>
+<span class="lineno">  899 </span><span class="spaces">    </span><span class="istickedoff">, aswConfig = do</span>
+<span class="lineno">  900 </span><span class="spaces">        </span><span class="istickedoff">eCfg' &lt;- loadRuntimeConfig (prConfigPath (tdProvider td))</span>
+<span class="lineno">  901 </span><span class="spaces">        </span><span class="istickedoff">pure (fromFileConfig (either <span class="nottickedoff">(const Nothing)</span> rcDelegation eCfg'))</span>
+<span class="lineno">  902 </span><span class="spaces">    </span><span class="istickedoff">, aswPauseFlag = bSpawnPauseFlag (tdBaseBackends td)</span>
+<span class="lineno">  903 </span><span class="spaces">    </span><span class="istickedoff">, aswParentActivity = <span class="nottickedoff">Just (bParentActivity (tdBaseBackends td))</span></span>
+<span class="lineno">  904 </span><span class="spaces">    </span><span class="istickedoff">, aswMintSession = mintSession <span class="nottickedoff">parentSid</span></span>
+<span class="lineno">  905 </span><span class="spaces">    </span><span class="istickedoff">, aswParentDepth = 0</span>
+<span class="lineno">  906 </span><span class="spaces">    </span><span class="istickedoff">, aswWorker = fromMaybe <span class="nottickedoff">(buildWorker td parentSid appEnv eCfg operatorCeiling channel)</span> (tdMkWorker td)</span>
+<span class="lineno">  907 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  908 </span>
+<span class="lineno">  909 </span>-- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
+<span class="lineno">  910 </span>-- @*MintSession@ helpers). Each start gets its own timestamped id.
+<span class="lineno">  911 </span>mintSession :: SessionId -&gt; IO SessionId
+<span class="lineno">  912 </span><span class="decl"><span class="istickedoff">mintSession fallback = do</span>
+<span class="lineno">  913 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  914 </span><span class="spaces">  </span><span class="istickedoff">case mkSessionId (formatSessionId now) of</span>
+<span class="lineno">  915 </span><span class="spaces">    </span><span class="istickedoff">Right s  -&gt; pure <span class="nottickedoff">s</span></span>
+<span class="lineno">  916 </span><span class="spaces">    </span><span class="istickedoff">Left _e  -&gt; <span class="nottickedoff">pure fallback</span></span></span>
+<span class="lineno">  917 </span>
+<span class="lineno">  918 </span>-- | The unified AGENT_START worker-builder (design §5.3 — replaces
+<span class="lineno">  919 </span>-- @webMkWorker@, @channelMkWorker@, @cliMkWorker@). Resolves the def's
+<span class="lineno">  920 </span>-- provider+model (falling back to the parent session meta when the def
+<span class="lineno">  921 </span>-- fields are empty), opens a fresh two-file transcript under the parent
+<span class="lineno">  922 </span>-- session's agents dir, builds a narrowed child ISA registry (the unified
+<span class="lineno">  923 </span>-- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
+<span class="lineno">  924 </span>-- message.
+<span class="lineno">  925 </span>buildWorker
+<span class="lineno">  926 </span>  :: TurnDeps -&gt; SessionId -&gt; Env -&gt; Either a RuntimeConfig -&gt; Int -&gt; Text
+<span class="lineno">  927 </span>  -&gt; AgentWorkerBuilder
+<span class="lineno">  928 </span><span class="decl"><span class="nottickedoff">buildWorker td parentSid appEnv eCfg operatorCeiling channel =</span>
+<span class="lineno">  929 </span><span class="spaces">  </span><span class="nottickedoff">mkDelegateWorker DelegationWorkerDeps</span>
+<span class="lineno">  930 </span><span class="spaces">    </span><span class="nottickedoff">{ dwdPaths = tdPaths td</span>
+<span class="lineno">  931 </span><span class="spaces">    </span><span class="nottickedoff">, dwdParentSid = parentSid</span>
+<span class="lineno">  932 </span><span class="spaces">    </span><span class="nottickedoff">, dwdAppEnv = appEnv</span>
+<span class="lineno">  933 </span><span class="spaces">    </span><span class="nottickedoff">, dwdMkUIOEnv = \childSid -&gt; do</span>
+<span class="lineno">  934 </span><span class="spaces">        </span><span class="nottickedoff">childCloneDeps &lt;- mkCloneDepsTurn td</span>
+<span class="lineno">  935 </span><span class="spaces">        </span><span class="nottickedoff">eSecCfg &lt;- loadSecurityConfig (securityFilePath (tdPaths td))</span>
+<span class="lineno">  936 </span><span class="spaces">        </span><span class="nottickedoff">seUIOEnv &lt;$&gt; either (\_ _ _ _ -&gt; pure (failClosedSessionExec childCloneDeps))</span>
+<span class="lineno">  937 </span><span class="spaces">                            </span><span class="nottickedoff">(\sc _sid _cd runner -&gt; cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)</span>
+<span class="lineno">  938 </span><span class="spaces">                            </span><span class="nottickedoff">eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))</span>
+<span class="lineno">  939 </span><span class="spaces">    </span><span class="nottickedoff">, dwdAutonomy = tdAutonomy td</span>
+<span class="lineno">  940 </span><span class="spaces">    </span><span class="nottickedoff">, dwdApprovals = tdApprovals td</span>
+<span class="lineno">  941 </span><span class="spaces">    </span><span class="nottickedoff">, dwdOnDemand = either (const False) onDemandSchemas eCfg</span>
+<span class="lineno">  942 </span><span class="spaces">    </span><span class="nottickedoff">, dwdParentDepth = 0</span>
+<span class="lineno">  943 </span><span class="spaces">    </span><span class="nottickedoff">, dwdResolveProvider = resolveChild</span>
+<span class="lineno">  944 </span><span class="spaces">    </span><span class="nottickedoff">, dwdChildRegistry = buildChildRegistryAdapter td eCfg operatorCeiling</span>
+<span class="lineno">  945 </span><span class="spaces">    </span><span class="nottickedoff">, dwdChildSystemPrompt = childSystemPrompt td eCfg</span>
+<span class="lineno">  946 </span><span class="spaces">    </span><span class="nottickedoff">, dwdOnEntry = pure ()</span>
+<span class="lineno">  947 </span><span class="spaces">    </span><span class="nottickedoff">, dwdChannel = channel</span>
+<span class="lineno">  948 </span><span class="spaces">    </span><span class="nottickedoff">, dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)</span>
+<span class="lineno">  949 </span><span class="spaces">    </span><span class="nottickedoff">, dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg</span>
+<span class="lineno">  950 </span><span class="spaces">    </span><span class="nottickedoff">}</span>
+<span class="lineno">  951 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  952 </span><span class="spaces">    </span><span class="nottickedoff">resolveChild agentDef = do</span>
+<span class="lineno">  953 </span><span class="spaces">      </span><span class="nottickedoff">mParentMeta &lt;- loadSessionMeta (tdPaths td) parentSid</span>
+<span class="lineno">  954 </span><span class="spaces">      </span><span class="nottickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  955 </span><span class="spaces">      </span><span class="nottickedoff">let parent = fromMaybe (fallbackMeta now) mParentMeta</span>
+<span class="lineno">  956 </span><span class="spaces">          </span><span class="nottickedoff">fallBackProvider = if T.null (adProvider agentDef) then smProvider parent else adProvider agentDef</span>
+<span class="lineno">  957 </span><span class="spaces">          </span><span class="nottickedoff">fallBackModel = case adModel agentDef of</span>
+<span class="lineno">  958 </span><span class="spaces">            </span><span class="nottickedoff">ModelId m | T.null m -&gt; smModel parent</span>
+<span class="lineno">  959 </span><span class="spaces">                      </span><span class="nottickedoff">| otherwise -&gt; m</span>
+<span class="lineno">  960 </span><span class="spaces">      </span><span class="nottickedoff">resolveDefProvider (tdProvider td) fallBackProvider (ModelId fallBackModel)</span>
+<span class="lineno">  961 </span><span class="spaces">    </span><span class="nottickedoff">fallbackMeta tnow = SessionMeta</span>
+<span class="lineno">  962 </span><span class="spaces">      </span><span class="nottickedoff">{ smId = parentSid, smProvider = &quot;ollama&quot;, smModel = &quot;glm-5.2:cloud&quot;</span>
+<span class="lineno">  963 </span><span class="spaces">      </span><span class="nottickedoff">, smChannel = &quot;cli&quot;, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing</span>
+<span class="lineno">  964 </span><span class="spaces">      </span><span class="nottickedoff">, smDescription = Nothing</span>
+<span class="lineno">  965 </span><span class="spaces">      </span><span class="nottickedoff">, smCreatedAt = tnow, smLastActive = tnow }</span></span>
+<span class="lineno">  966 </span>
+<span class="lineno">  967 </span>-- | Build a narrowed child registry via the unified 'buildChildRegistry'.
+<span class="lineno">  968 </span>buildChildRegistryAdapter
+<span class="lineno">  969 </span>  :: TurnDeps -&gt; Either a RuntimeConfig -&gt; Int
+<span class="lineno">  970 </span>  -&gt; AgentDef -&gt; SessionId -&gt; ChannelCaps -&gt; IO ISA.Registry
+<span class="lineno">  971 </span><span class="decl"><span class="nottickedoff">buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do</span>
+<span class="lineno">  972 </span><span class="spaces">  </span><span class="nottickedoff">childCloneDeps &lt;- mkCloneDepsTurn td</span>
+<span class="lineno">  973 </span><span class="spaces">  </span><span class="nottickedoff">eSecCfg &lt;- loadSecurityConfig (securityFilePath (tdPaths td))</span>
+<span class="lineno">  974 </span><span class="spaces">  </span><span class="nottickedoff">childExec &lt;- either (\_ _ _ _ -&gt; pure (failClosedSessionExec childCloneDeps))</span>
+<span class="lineno">  975 </span><span class="spaces">                      </span><span class="nottickedoff">(\sc _sid _cd runner -&gt; cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner)</span>
+<span class="lineno">  976 </span><span class="spaces">                      </span><span class="nottickedoff">eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))</span>
+<span class="lineno">  977 </span><span class="spaces">  </span><span class="nottickedoff">let childWsRoot = seWorkspaceRoot childExec</span>
+<span class="lineno">  978 </span><span class="spaces">      </span><span class="nottickedoff">childWebCfg = either (const Nothing) rcWeb eCfg</span>
+<span class="lineno">  979 </span><span class="spaces">  </span><span class="nottickedoff">pure (buildChildRegistry (tdVault td) childCloneDeps (tdBaseBackends td)</span>
+<span class="lineno">  980 </span><span class="spaces">          </span><span class="nottickedoff">childWsRoot childSid operatorCeiling (tdAutonomy td)</span>
+<span class="lineno">  981 </span><span class="spaces">          </span><span class="nottickedoff">childWebCfg (tdHttpManager td) childCaps)</span></span>
+<span class="lineno">  982 </span>
+<span class="lineno">  983 </span>-- | Resolve the child agent's system prompt. Mirrors the three original
+<span class="lineno">  984 </span>-- @*ChildSystemPrompt@ helpers: the def's 'adSystem' (with the task context
+<span class="lineno">  985 </span>-- appended) + the static guidance + autoload skill + available-skills
+<span class="lineno">  986 </span>-- catalog. Uses 'tdBaseBackends' (the child registry doesn't get
+<span class="lineno">  987 </span>-- workdir-aware skills — matching the original implementations).
+<span class="lineno">  988 </span>childSystemPrompt
+<span class="lineno">  989 </span>  :: TurnDeps -&gt; Either a RuntimeConfig
+<span class="lineno">  990 </span>  -&gt; AgentDef -&gt; ChildTask -&gt; IO (Maybe Text)
+<span class="lineno">  991 </span><span class="decl"><span class="nottickedoff">childSystemPrompt td eCfg agentDef task = do</span>
+<span class="lineno">  992 </span><span class="spaces">  </span><span class="nottickedoff">let base = adSystem agentDef</span>
+<span class="lineno">  993 </span><span class="spaces">      </span><span class="nottickedoff">ctx  = ctContext task</span>
+<span class="lineno">  994 </span><span class="spaces">      </span><span class="nottickedoff">basePrompt = case (base, ctx) of</span>
+<span class="lineno">  995 </span><span class="spaces">        </span><span class="nottickedoff">(Just b, Just c) | not (T.null c) -&gt; Just (b &lt;&gt; &quot;\n\nCONTEXT:\n&quot; &lt;&gt; c)</span>
+<span class="lineno">  996 </span><span class="spaces">        </span><span class="nottickedoff">(Just b, _)                       -&gt; Just b</span>
+<span class="lineno">  997 </span><span class="spaces">        </span><span class="nottickedoff">(Nothing, Just c)                 -&gt; Just (&quot;CONTEXT:\n&quot; &lt;&gt; c)</span>
+<span class="lineno">  998 </span><span class="spaces">        </span><span class="nottickedoff">(Nothing, Nothing)                -&gt; Nothing</span>
+<span class="lineno">  999 </span><span class="spaces">      </span><span class="nottickedoff">autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg</span>
+<span class="lineno"> 1000 </span><span class="spaces">      </span><span class="nottickedoff">injectCatalog = either (const True) resolvedAvailableSkills eCfg</span>
+<span class="lineno"> 1001 </span><span class="spaces">      </span><span class="nottickedoff">parallel = either (const True) resolvedParallelToolGuidance eCfg</span>
+<span class="lineno"> 1002 </span><span class="spaces">      </span><span class="nottickedoff">toolUse = either (const True) resolvedToolUseEnforcement eCfg</span>
+<span class="lineno"> 1003 </span><span class="spaces">      </span><span class="nottickedoff">taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg</span>
+<span class="lineno"> 1004 </span><span class="spaces">      </span><span class="nottickedoff">withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt</span>
+<span class="lineno"> 1005 </span><span class="spaces">  </span><span class="nottickedoff">withAutoload &lt;- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance</span>
+<span class="lineno"> 1006 </span><span class="spaces">  </span><span class="nottickedoff">if injectCatalog</span>
+<span class="lineno"> 1007 </span><span class="spaces">    </span><span class="nottickedoff">then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload</span>
+<span class="lineno"> 1008 </span><span class="spaces">    </span><span class="nottickedoff">else pure withAutoload</span></span>
+<span class="lineno"> 1009 </span>
+<span class="lineno"> 1010 </span>-- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.
+<span class="lineno"> 1011 </span>-- If so, look up the codegraph skill body from the skill backend and return
+<span class="lineno"> 1012 </span>-- @Just body@ for injection into the system prompt. Returns @Nothing@ when
+<span class="lineno"> 1013 </span>-- no repo has @.codegraph/@ or the skill is missing from the backend.
+<span class="lineno"> 1014 </span>--
+<span class="lineno"> 1015 </span>-- This uses the workdir snapshot (ONE scan, shared with the discovery
+<span class="lineno"> 1016 </span>-- scanners) to check for @\&lt;repo\&gt;\/.codegraph\/@ under each top-level
+<span class="lineno"> 1017 </span>-- directory. The skill body is read from the union backend (user override
+<span class="lineno"> 1018 </span>-- shadows the built-in).
+<span class="lineno"> 1019 </span>codegraphSkillBodyFor
+<span class="lineno"> 1020 </span>  :: WorkdirFs
+<span class="lineno"> 1021 </span>  -&gt; Skill.SkillBackend
+<span class="lineno"> 1022 </span>  -&gt; IO (Maybe T.Text)
+<span class="lineno"> 1023 </span><span class="decl"><span class="istickedoff">codegraphSkillBodyFor wfs skillBackend = do</span>
+<span class="lineno"> 1024 </span><span class="spaces">  </span><span class="istickedoff">eSnap &lt;- wfsSnapshot wfs</span>
+<span class="lineno"> 1025 </span><span class="spaces">  </span><span class="istickedoff">case eSnap of</span>
+<span class="lineno"> 1026 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; pure Nothing   -- fail-soft: no snapshot → no injection</span>
+<span class="lineno"> 1027 </span><span class="spaces">    </span><span class="istickedoff">Right snap -&gt; do</span>
+<span class="lineno"> 1028 </span><span class="spaces">      </span><span class="istickedoff">let repos = snapTopDirs snap</span>
+<span class="lineno"> 1029 </span><span class="spaces">          </span><span class="istickedoff">hasCodegraph repo = snapIsDirectoryAt snap (repo &lt;&gt; &quot;/.codegraph&quot;)</span>
+<span class="lineno"> 1030 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">any hasCodegraph repos</span></span>
+<span class="lineno"> 1031 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">do</span></span>
+<span class="lineno"> 1032 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">mSkill &lt;- case SealSkillTypes.mkSkillId &quot;codegraph&quot; of</span></span>
+<span class="lineno"> 1033 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right sid -&gt; Skill.sbRead skillBackend sid</span></span>
+<span class="lineno"> 1034 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left _    -&gt; pure Nothing</span></span>
+<span class="lineno"> 1035 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure (fmap SealSkillTypes.skBody mSkill)</span></span>
+<span class="lineno"> 1036 </span><span class="spaces">        </span><span class="istickedoff">else pure Nothing</span></span>
+
+</pre>
+</body>
+</html>

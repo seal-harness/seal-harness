@@ -1,0 +1,235 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The shared worker-builder for AGENT_START delegation. Each channel
+<span class="lineno">    3 </span>-- (CLI, Signal, Telegram, web) has its own per-turn 'AgentEnv' closure but
+<span class="lineno">    4 </span>-- the delegation-specific logic — open the child transcript under
+<span class="lineno">    5 </span>-- @\&lt;parent\&gt;\/agents\/\&lt;child-id\&gt;@, build a narrowed child ISA registry with
+<span class="lineno">    6 </span>-- the delegation blocklist applied, resolve the child provider (honoring
+<span class="lineno">    7 </span>-- @delegation.provider/model/base_url@ overrides), run 'runTurn' with the
+<span class="lineno">    8 </span>-- goal as the first user message, and capture the final text response as the
+<span class="lineno">    9 </span>-- summary — is identical across channels. This module exposes one
+<span class="lineno">   10 </span>-- 'mkDelegateWorker' that the wiring layers call.
+<span class="lineno">   11 </span>module Seal.Agent.Runtime.Delegation.Worker
+<span class="lineno">   12 </span>  ( mkDelegateWorker
+<span class="lineno">   13 </span>  , delegationBlocklist
+<span class="lineno">   14 </span>  , filterBlocklisted
+<span class="lineno">   15 </span>  , narrowAllowList
+<span class="lineno">   16 </span>  , DelegationWorkerDeps (..)
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   20 </span>import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+<span class="lineno">   21 </span>import Data.Set qualified as Set
+<span class="lineno">   22 </span>import Data.Text (Text)
+<span class="lineno">   23 </span>import Data.Text qualified as T
+<span class="lineno">   24 </span>import System.Directory (createDirectoryIfMissing)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Seal.Agent.Def.Types (AgentDef (..))
+<span class="lineno">   27 </span>import Seal.Agent.Env (AgentEnv (..))
+<span class="lineno">   28 </span>import Seal.Agent.Loop (runTurn)
+<span class="lineno">   29 </span>import Seal.Agent.Runtime.Delegation
+<span class="lineno">   30 </span>  ( AgentWorkerBuilder
+<span class="lineno">   31 </span>  , ChildExitReason (..)
+<span class="lineno">   32 </span>  , ChildTask (..)
+<span class="lineno">   33 </span>  , ChildWorkerOutcome (..)
+<span class="lineno">   34 </span>  )
+<span class="lineno">   35 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   36 </span>import Data.Default (def)
+<span class="lineno">   37 </span>import Seal.Config.Paths (SealPaths, agentSessionDir)
+<span class="lineno">   38 </span>import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
+<span class="lineno">   39 </span>import Seal.Handles.AskReply (ApprovalCache)
+<span class="lineno">   40 </span>import Seal.Handles.Transcript (withTwoFileTranscript)
+<span class="lineno">   41 </span>import Seal.ISA.Opcode (localBackend)
+<span class="lineno">   42 </span>import Seal.ISA.Registry (Registry)
+<span class="lineno">   43 </span>import Seal.Providers.Class (SomeProvider)
+<span class="lineno">   44 </span>import Seal.Security.Policy (AllowList (..), AutonomyLevel)
+<span class="lineno">   45 </span>import Seal.Tools.Exec.Abort (AbortFlag)
+<span class="lineno">   46 </span>import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+<span class="lineno">   47 </span>import Seal.Tools.Timeout (ToolTimeoutConfig)
+<span class="lineno">   48 </span>import Seal.Types.App (runApp)
+<span class="lineno">   49 </span>import Seal.Types.Env (Env)
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Opcodes that a child agent must NEVER have access to. Mirrors Hermes'
+<span class="lineno">   52 </span>-- @DELEGATE_BLOCKED_TOOLS@. Stripping these means a child cannot:
+<span class="lineno">   53 </span>--
+<span class="lineno">   54 </span>--   * recursively spawn its own subagents (@AGENT_START@) — that would
+<span class="lineno">   55 </span>--     bypass the depth cap;
+<span class="lineno">   56 </span>--   * mutate agent definitions (@AGENT_DEF_WRITE@ / @AGENT_DEF_DELETE@) —
+<span class="lineno">   57 </span>--     only the parent should evolve the def store;
+<span class="lineno">   58 </span>--   * introspect or control live instances (@AGENT_INSTANCES@ /
+<span class="lineno">   59 </span>--     @AGENT_STATUS@ / @AGENT_STOP@ / @AGENT_INTERRUPT@) — those are
+<span class="lineno">   60 </span>--     parent/operator controls, not child tools.
+<span class="lineno">   61 </span>delegationBlocklist :: Set.Set OpName
+<span class="lineno">   62 </span><span class="decl"><span class="nottickedoff">delegationBlocklist = Set.fromList</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="nottickedoff">[ OpName &quot;AGENT_START&quot;</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_DEF_WRITE&quot;</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_DEF_DELETE&quot;</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_INSTANCES&quot;</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_STATUS&quot;</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_STOP&quot;</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="nottickedoff">, OpName &quot;AGENT_INTERRUPT&quot;</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="nottickedoff">]</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>-- | Apply the 'delegationBlocklist' to a child's tool allow-list. Only
+<span class="lineno">   73 </span>-- narrows 'AllowOnly' (set-difference with the blocklist); 'AllowAll' is
+<span class="lineno">   74 </span>-- returned unchanged because the blocklist is enforced at registry-build
+<span class="lineno">   75 </span>-- time by omitting blocklisted opcodes from the ops list (we can't enumerate
+<span class="lineno">   76 </span>-- the universe of opcode names to form a complement here).
+<span class="lineno">   77 </span>narrowAllowList :: AllowList OpName -&gt; AllowList OpName
+<span class="lineno">   78 </span><span class="decl"><span class="nottickedoff">narrowAllowList AllowAll       = AllowAll</span>
+<span class="lineno">   79 </span><span class="spaces"></span><span class="nottickedoff">narrowAllowList (AllowOnly xs) = AllowOnly (Set.difference xs delegationBlocklist)</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Filter a list of opcodes to remove any whose name is in the
+<span class="lineno">   82 </span>-- 'delegationBlocklist'. The wiring layer calls this on its base ops list
+<span class="lineno">   83 </span>-- before passing to 'Seal.ISA.Registry.mkRegistry' to build the child's
+<span class="lineno">   84 </span>-- narrowed registry. This is the primary blocklist enforcement — it works
+<span class="lineno">   85 </span>-- regardless of whether the def's @adTools@ is 'AllowAll' or 'AllowOnly'.
+<span class="lineno">   86 </span>filterBlocklisted :: [opcode] -&gt; (opcode -&gt; OpName) -&gt; [opcode]
+<span class="lineno">   87 </span><span class="decl"><span class="nottickedoff">filterBlocklisted ops getName =</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="nottickedoff">[ o | o &lt;- ops, not (getName o `Set.member` delegationBlocklist) ]</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | The per-channel deps the worker-builder closes over. The wiring layer
+<span class="lineno">   91 </span>-- (Cli.hs, Channels.Loop.hs, Gateway.Send.hs) builds this from its own
+<span class="lineno">   92 </span>-- per-turn closure and passes it to 'mkDelegateWorker'.
+<span class="lineno">   93 </span>data DelegationWorkerDeps = DelegationWorkerDeps
+<span class="lineno">   94 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdPaths</span></span></span>        :: SealPaths
+<span class="lineno">   95 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdParentSid</span></span></span>    :: SessionId
+<span class="lineno">   96 </span>    -- ^ The parent's session id — the child's transcript nests under it.
+<span class="lineno">   97 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdAppEnv</span></span></span>       :: Env
+<span class="lineno">   98 </span>    -- ^ The top-level app env (katip logging, config) — re-used for the
+<span class="lineno">   99 </span>    -- child's 'runApp'.
+<span class="lineno">  100 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdMkUIOEnv</span></span></span> :: SessionId -&gt; IO UIOEnv
+<span class="lineno">  101 </span>    -- ^ Construct the child's 'UIOEnv' (carrying the 'UntrustedIO'
+<span class="lineno">  102 </span>    -- capability handle + Git 'CloneDeps') from the child's session id.
+<span class="lineno">  103 </span>    -- The wiring layer creates the child's workdir (per-session isolation)
+<span class="lineno">  104 </span>    -- and resolves the security config into the env. Called at child-start
+<span class="lineno">  105 </span>    -- time (after the child's sid is minted).
+<span class="lineno">  106 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdAutonomy</span></span></span>     :: AutonomyLevel
+<span class="lineno">  107 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdApprovals</span></span></span>    :: ApprovalCache
+<span class="lineno">  108 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdOnDemand</span></span></span>     :: Bool
+<span class="lineno">  109 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdParentDepth</span></span></span>  :: Int
+<span class="lineno">  110 </span>    -- ^ The parent's delegation depth; the child's depth is this + 1.
+<span class="lineno">  111 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdResolveProvider</span></span></span> :: AgentDef -&gt; IO (Either Text (SomeProvider, ModelId))
+<span class="lineno">  112 </span>    -- ^ Resolve the child's provider+model from the def, applying any
+<span class="lineno">  113 </span>    -- delegation.provider/model/base_url override (the wiring layer reads
+<span class="lineno">  114 </span>    -- the override from the RuntimeConfig and threads it here).
+<span class="lineno">  115 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdChildRegistry</span></span></span>
+<span class="lineno">  116 </span>      :: AgentDef -&gt; SessionId -&gt; ChannelCaps -&gt; IO Registry
+<span class="lineno">  117 </span>    -- ^ Build the child's narrowed ISA registry. The wiring layer is
+<span class="lineno">  118 </span>    -- responsible for applying 'delegationBlocklist' to the def's
+<span class="lineno">  119 </span>    -- @adTools@ allow-list and constructing the registry. The caps + sid
+<span class="lineno">  120 </span>    -- are passed in so the registry can close over them (ASK_HUMAN etc.).
+<span class="lineno">  121 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdChildSystemPrompt</span></span></span> :: AgentDef -&gt; ChildTask -&gt; IO (Maybe Text)
+<span class="lineno">  122 </span>    -- ^ Build the child's system prompt from the def's @adSystem@ + the
+<span class="lineno">  123 </span>    -- task's @ctContext@. Runs in 'IO' so the wiring layer can load the
+<span class="lineno">  124 </span>    -- auto-injected skill (default @seal-usage@) from the skill backend and
+<span class="lineno">  125 </span>    -- append it. 'Nothing' means no system prompt.
+<span class="lineno">  126 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdOnEntry</span></span></span> :: IO ()
+<span class="lineno">  127 </span>    -- ^ The on-entry hook for the child's transcript (live broadcast).
+<span class="lineno">  128 </span>    -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
+<span class="lineno">  129 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdChannel</span></span></span> :: Text
+<span class="lineno">  130 </span>    -- ^ The parent session's channel label (e.g. @\&quot;telegram\&quot;@, @\&quot;web\&quot;@,
+<span class="lineno">  131 </span>    -- @\&quot;cli\&quot;@), inherited by the child so the child's request entries are
+<span class="lineno">  132 </span>    -- attributed to the same channel the parent turn ran on. Stamped into
+<span class="lineno">  133 </span>    -- the child's 'aeChannel' so 'runTurn' attributes the child's user
+<span class="lineno">  134 </span>    -- messages (the task goals) to the originating channel.
+<span class="lineno">  135 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdAbortFlag</span></span></span> :: SessionId -&gt; IO AbortFlag
+<span class="lineno">  136 </span>    -- ^ Construct the child's abort flag from the child's session id
+<span class="lineno">  137 </span>    -- (looked up from the 'Seal.Tools.Exec.Abort.SessionAbortRegistry').
+<span class="lineno">  138 </span>    -- The child's abort is independent of the parent's in v1 (a parent
+<span class="lineno">  139 </span>    -- abort doesn't auto-abort the child, and vice versa).
+<span class="lineno">  140 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwdToolTimeout</span></span></span> :: ToolTimeoutConfig
+<span class="lineno">  141 </span>    -- ^ The per-call timeout/retry config, inherited from the parent
+<span class="lineno">  142 </span>    -- (loaded once from @config.toml@ @[tool_timeout]@ at startup).
+<span class="lineno">  143 </span>  }
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | Build the 'AgentWorkerBuilder' the AGENT_START opcode closes over. This
+<span class="lineno">  146 </span>-- is the shared delegation worker: open the child transcript, build the
+<span class="lineno">  147 </span>-- child env, run 'runTurn' with the goal as the first user message, capture
+<span class="lineno">  148 </span>-- the final text response as the summary, and report the outcome.
+<span class="lineno">  149 </span>--
+<span class="lineno">  150 </span>-- The summary is captured via a 'ChannelCaps' whose 'ccSend' writes to an
+<span class="lineno">  151 </span>-- IORef; 'runTurn' calls 'ccSend' with the final text response, so we read
+<span class="lineno">  152 </span>-- the IORef after the run. The child's @ccPrompt@ is a no-op (children don't
+<span class="lineno">  153 </span>-- prompt the human — that would deadlock the parent).
+<span class="lineno">  154 </span>mkDelegateWorker :: DelegationWorkerDeps -&gt; AgentWorkerBuilder
+<span class="lineno">  155 </span><span class="decl"><span class="nottickedoff">mkDelegateWorker deps agentDef childSid task _hooks = do</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="nottickedoff">let childDir = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="nottickedoff">createDirectoryIfMissing True childDir</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">eProv &lt;- dwdResolveProvider deps agentDef</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">case eProv of</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; pure (ChildWorkerOutcome</span>
+<span class="lineno">  161 </span><span class="spaces">                       </span><span class="nottickedoff">(Just (&quot;agent start failed: &quot; &lt;&gt; err))</span>
+<span class="lineno">  162 </span><span class="spaces">                       </span><span class="nottickedoff">CerError 0 0 (Just childSid))</span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="nottickedoff">Right (prov, model) -&gt;</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="nottickedoff">withTwoFileTranscript childDir $ \childTHandle -&gt; do</span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="nottickedoff">summaryRef &lt;- newIORef (Nothing :: Maybe Text)</span>
+<span class="lineno">  166 </span><span class="spaces">        </span><span class="nottickedoff">let capturingCaps = def</span>
+<span class="lineno">  167 </span><span class="spaces">              </span><span class="nottickedoff">{ ccSend = \t -&gt; atomicModifyIORef' summaryRef (const (Just t, ()))</span>
+<span class="lineno">  168 </span><span class="spaces">              </span><span class="nottickedoff">, ccStreaming    = False  -- children: capture final summary, no per-delta sends</span>
+<span class="lineno">  169 </span><span class="spaces">              </span><span class="nottickedoff">}</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="nottickedoff">childReg &lt;- dwdChildRegistry deps agentDef childSid capturingCaps</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="nottickedoff">childUioEnv &lt;- dwdMkUIOEnv deps childSid</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="nottickedoff">childSystem &lt;- dwdChildSystemPrompt deps agentDef task</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="nottickedoff">childAbortFlag &lt;- dwdAbortFlag deps childSid</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="nottickedoff">let env = AgentEnv</span>
+<span class="lineno">  175 </span><span class="spaces">              </span><span class="nottickedoff">{ aeProvider   = prov</span>
+<span class="lineno">  176 </span><span class="spaces">              </span><span class="nottickedoff">, aeProviderLabel = providerLabel agentDef</span>
+<span class="lineno">  177 </span><span class="spaces">              </span><span class="nottickedoff">, aeModel      = model</span>
+<span class="lineno">  178 </span><span class="spaces">              </span><span class="nottickedoff">, aeSystem     = childSystem</span>
+<span class="lineno">  179 </span><span class="spaces">              </span><span class="nottickedoff">, aeRegistry   = childReg</span>
+<span class="lineno">  180 </span><span class="spaces">              </span><span class="nottickedoff">, aeTranscript = childTHandle</span>
+<span class="lineno">  181 </span><span class="spaces">              </span><span class="nottickedoff">, aeBackend    = localBackend</span>
+<span class="lineno">  182 </span><span class="spaces">              </span><span class="nottickedoff">, aeUIOEnv     = childUioEnv</span>
+<span class="lineno">  183 </span><span class="spaces">              </span><span class="nottickedoff">, aeCaps       = capturingCaps</span>
+<span class="lineno">  184 </span><span class="spaces">              </span><span class="nottickedoff">, aeSession    = childSid</span>
+<span class="lineno">  185 </span><span class="spaces">              </span><span class="nottickedoff">, aeMaxTurns   = 90</span>
+<span class="lineno">  186 </span><span class="spaces">              </span><span class="nottickedoff">, aeChannel    = dwdChannel deps</span>
+<span class="lineno">  187 </span><span class="spaces">              </span><span class="nottickedoff">, aeMessageSource = Nothing</span>
+<span class="lineno">  188 </span><span class="spaces">              </span><span class="nottickedoff">, aeAutonomy   = dwdAutonomy deps</span>
+<span class="lineno">  189 </span><span class="spaces">              </span><span class="nottickedoff">, aeApprovals  = dwdApprovals deps</span>
+<span class="lineno">  190 </span><span class="spaces">              </span><span class="nottickedoff">, aeDebugRequestsPath = Nothing</span>
+<span class="lineno">  191 </span><span class="spaces">              </span><span class="nottickedoff">, aeOnEntry    = dwdOnEntry deps</span>
+<span class="lineno">  192 </span><span class="spaces">              </span><span class="nottickedoff">, aeOnUserMessage = Nothing</span>
+<span class="lineno">  193 </span><span class="spaces">              </span><span class="nottickedoff">, aeOnStop     = Nothing</span>
+<span class="lineno">  194 </span><span class="spaces">              </span><span class="nottickedoff">, aeOnDemandSchemas = dwdOnDemand deps</span>
+<span class="lineno">  195 </span><span class="spaces">              </span><span class="nottickedoff">, aeLogPath    = Nothing</span>
+<span class="lineno">  196 </span><span class="spaces">              </span><span class="nottickedoff">, aeAbortFlag  = childAbortFlag</span>
+<span class="lineno">  197 </span><span class="spaces">              </span><span class="nottickedoff">, aeToolTimeout = dwdToolTimeout deps</span>
+<span class="lineno">  198 </span><span class="spaces">              </span><span class="nottickedoff">}</span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="nottickedoff">runApp (dwdAppEnv deps) (runTurn env (ctGoal task))</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="nottickedoff">`catch` \e -&gt; writeIORef summaryRef</span>
+<span class="lineno">  201 </span><span class="spaces">                       </span><span class="nottickedoff">(Just (&quot;child runTurn raised: &quot; &lt;&gt; T.pack (show (e :: SomeException))))</span>
+<span class="lineno">  202 </span><span class="spaces">        </span><span class="nottickedoff">summary &lt;- readIORef summaryRef</span>
+<span class="lineno">  203 </span><span class="spaces">        </span><span class="nottickedoff">let exitReason = case summary of</span>
+<span class="lineno">  204 </span><span class="spaces">              </span><span class="nottickedoff">Just _  -&gt; CerCompleted</span>
+<span class="lineno">  205 </span><span class="spaces">              </span><span class="nottickedoff">Nothing -&gt; CerMaxIterations</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="nottickedoff">-- Token counts: the child's per-turn usage is recorded in the</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="nottickedoff">-- transcript entries; we don't aggregate them here (would require</span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="nottickedoff">-- reading entries.jsonl). Report 0 for now — a follow-up can sum</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="nottickedoff">-- the child's EKResponse entries.</span>
+<span class="lineno">  210 </span><span class="spaces">        </span><span class="nottickedoff">pure (ChildWorkerOutcome summary exitReason 0 0 (Just childSid))</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="nottickedoff">providerLabel d = if T.null (adProvider d) then &quot;ollama&quot; else adProvider d</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | Process-global logger ref for library modules that don't have a
+<span class="lineno">    2 </span>-- 'SealLogger' threaded through their dependencies (e.g. 'Seal.Tabs',
+<span class="lineno">    3 </span>-- 'Seal.Handles.Transcript', 'Seal.Web.UiState'). Set once at startup via
+<span class="lineno">    4 </span>-- 'setGlobalLogger'; read via 'globalLogIO'. This avoids threading the
+<span class="lineno">    5 </span>-- logger through dozens of function signatures in deep library code.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The primary logging path is the threaded 'SealLogger' (via 'ChannelDeps',
+<span class="lineno">    8 </span>-- 'SendDeps', 'Env'). This global ref is a fallback for modules that are
+<span class="lineno">    9 </span>-- called from many call sites and can't easily receive the logger as a
+<span class="lineno">   10 </span>-- parameter. If 'setGlobalLogger' has not been called, 'globalLogIO' is a
+<span class="lineno">   11 </span>-- no-op (best-effort — the logger must never crash the caller).
+<span class="lineno">   12 </span>module Seal.Logging.Global
+<span class="lineno">   13 </span>  ( setGlobalLogger
+<span class="lineno">   14 </span>  , unsetGlobalLogger
+<span class="lineno">   15 </span>  , globalLogIO
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Control.Exception (catch, SomeException)
+<span class="lineno">   19 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   20 </span>import System.IO.Unsafe (unsafePerformIO)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Katip (Severity (..), LogStr)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | The process-global logger ref. Initialized to 'Nothing' (no-op).
+<span class="lineno">   27 </span>-- Set once at startup via 'setGlobalLogger'.
+<span class="lineno">   28 </span>globalLoggerRef :: IORef (Maybe SealLogger)
+<span class="lineno">   29 </span><span class="decl"><span class="istickedoff">globalLoggerRef = unsafePerformIO (newIORef <span class="nottickedoff">Nothing</span>)</span></span>
+<span class="lineno">   30 </span>{-# NOINLINE globalLoggerRef #-}
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>-- | Set the process-global logger. Called once at startup (in
+<span class="lineno">   33 </span>-- 'Seal.AppMain.dispatch', inside the 'withSealLogger' bracket).
+<span class="lineno">   34 </span>setGlobalLogger :: SealLogger -&gt; IO ()
+<span class="lineno">   35 </span><span class="decl"><span class="istickedoff">setGlobalLogger = writeIORef globalLoggerRef . Just</span></span>
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>-- | Unset the process-global logger (set the ref to 'Nothing'). Used by
+<span class="lineno">   38 </span>-- tests that install a capture logger via 'setGlobalLogger' and want to
+<span class="lineno">   39 </span>-- restore the no-op default after the test so subsequent tests are
+<span class="lineno">   40 </span>-- unaffected. Not called in production (the logger lives for the process
+<span class="lineno">   41 </span>-- lifetime).
+<span class="lineno">   42 </span>unsetGlobalLogger :: IO ()
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">unsetGlobalLogger = writeIORef globalLoggerRef Nothing</span></span>
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- | Emit a log line via the process-global logger. If no logger has been
+<span class="lineno">   46 </span>-- set (e.g. in tests that don't call 'setGlobalLogger'), this is a no-op.
+<span class="lineno">   47 </span>-- Best-effort: if the logger throws, the error is silently swallowed.
+<span class="lineno">   48 </span>globalLogIO :: Severity -&gt; LogStr -&gt; IO ()
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">globalLogIO sev msg = do</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">mLogger &lt;- readIORef globalLoggerRef</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">case mLogger of</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">Nothing    -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">Just logger -&gt; logIO logger sev msg</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="istickedoff">`catch` <span class="nottickedoff">\(_ :: SomeException) -&gt; pure ()</span></span></span>
+
+</pre>
+</body>
+</html>

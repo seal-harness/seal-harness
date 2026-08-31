@@ -1,0 +1,143 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | 'UntrustedExecBackend' — a smart-constructed type that can ONLY be
+<span class="lineno">    3 </span>-- built from an 'Ssh' backend (spec §4). A local container/VM shares the
+<span class="lineno">    4 </span>-- harness kernel and does NOT count as remote (spec §2 sharpening), so
+<span class="lineno">    5 </span>-- 'Container' cannot produce this type either.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- This is the type the remote-only arm of 'selectUntrustedBackend' returns;
+<span class="lineno">    8 </span>-- the dispatcher's full-sum selection is 'selectExecBackend' (4a-T2), which
+<span class="lineno">    9 </span>-- also yields the 'EbLocal' arm. 'UntrustedExecBackend' is the
+<span class="lineno">   10 </span>-- type-guaranteed &quot;this came from SSH&quot; proof.
+<span class="lineno">   11 </span>module Seal.Tools.Exec.Untrusted
+<span class="lineno">   12 </span>  ( UntrustedExecBackend
+<span class="lineno">   13 </span>  , mkUntrustedExecBackend
+<span class="lineno">   14 </span>  , untrustedBackendSshConfig
+<span class="lineno">   15 </span>  , UntrustedExecMode (..)
+<span class="lineno">   16 </span>  , UntrustedExecConfig (..)
+<span class="lineno">   17 </span>  , selectUntrustedBackend
+<span class="lineno">   18 </span>  , selectExecBackend
+<span class="lineno">   19 </span>  , enforceRemoteOnly
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Data.Text (Text)
+<span class="lineno">   23 </span>import Seal.Tools.Exec.Types
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>-- | A backend that untrusted dispatch is allowed to run through. Smart-
+<span class="lineno">   26 </span>-- constructed so it can ONLY come from an 'Ssh' backend (spec §4). A local
+<span class="lineno">   27 </span>-- container/VM shares the harness kernel and does NOT count as remote
+<span class="lineno">   28 </span>-- (spec §2 sharpening), so 'Container' cannot produce this type either.
+<span class="lineno">   29 </span>newtype UntrustedExecBackend = UntrustedExecBackend SshConfig
+<span class="lineno">   30 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>-- | The only way to obtain an 'UntrustedExecBackend' is to hand in an
+<span class="lineno">   33 </span>-- 'Ssh' 'TerminalBackend'. Local/Tmux/Container all fail with the
+<span class="lineno">   34 </span>-- appropriate 'ExecError'.
+<span class="lineno">   35 </span>mkUntrustedExecBackend :: TerminalBackend -&gt; Either ExecError UntrustedExecBackend
+<span class="lineno">   36 </span><span class="decl"><span class="istickedoff">mkUntrustedExecBackend = \case</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">TbSsh cfg       -&gt; Right <span class="nottickedoff">(UntrustedExecBackend cfg)</span></span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">TbLocal         -&gt; Left ExecLocalNotPermittedForUntrusted</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">TbTmux _       -&gt; Left ExecNotImplemented</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">TbContainer _  -&gt; Left ExecNotImplemented</span></span>
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | The startup check for the @remote-only-untrusted@ Cabal flag (spec §3
+<span class="lineno">   43 </span>-- Layer B). When the flag is on (compiled in via CPP — see
+<span class="lineno">   44 </span>-- 'Seal.Tools.Exec.Local'\'s absence), a @mode=local@ value in the config
+<span class="lineno">   45 </span>-- is a startup configuration error: the local untrusted executor is
+<span class="lineno">   46 </span>-- absent from the binary, so @mode=local@ is unexecutable. Returns
+<span class="lineno">   47 </span>-- @Right ()@ when @mode=remote@; @Left err@ when @mode=local@.
+<span class="lineno">   48 </span>--
+<span class="lineno">   49 </span>-- This is a pure function so the startup check is testable without boot.
+<span class="lineno">   50 </span>enforceRemoteOnly :: UntrustedExecConfig -&gt; Either Text ()
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">enforceRemoteOnly cfg =</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">case uecMode cfg of</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">UemRemote -&gt; Right ()</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">UemLocal  -&gt; Left <span class="nottickedoff">&quot;remote-only-untrusted build: untrusted_execution.mode=local is rejected (the local executor is absent from this binary)&quot;</span></span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | Recover the 'SshConfig' from an 'UntrustedExecBackend' (the remote
+<span class="lineno">   57 </span>-- executor in 4g consumes this).
+<span class="lineno">   58 </span>untrustedBackendSshConfig :: UntrustedExecBackend -&gt; SshConfig
+<span class="lineno">   59 </span><span class="decl"><span class="nottickedoff">untrustedBackendSshConfig (UntrustedExecBackend cfg) = cfg</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   62 </span>-- UntrustedExecConfig + the two pure select functions (4a-T2)
+<span class="lineno">   63 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | The runtime mode (spec §3 Layer A): @local@ (default) or @remote@
+<span class="lineno">   66 </span>-- (fail-closed). Forced @remote@ under the @-f remote-only-untrusted@
+<span class="lineno">   67 </span>-- Cabal flag (4g-T2).
+<span class="lineno">   68 </span>data UntrustedExecMode = UemLocal | UemRemote
+<span class="lineno">   69 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | The untrusted-execution configuration the pure select functions
+<span class="lineno">   72 </span>-- consume. Carries the 'mode' and the remote 'SshConfig' (if configured).
+<span class="lineno">   73 </span>-- The full TOML parsing lands in 4b-T2; 4a-T2 only needs the type.
+<span class="lineno">   74 </span>data UntrustedExecConfig = UntrustedExecConfig
+<span class="lineno">   75 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uecMode</span></span></span>   :: UntrustedExecMode
+<span class="lineno">   76 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uecRemote</span></span></span> :: Maybe SshConfig
+<span class="lineno">   77 </span>  }
+<span class="lineno">   78 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>-- | The spec's @selectUntrustedBackend@, narrowed to the remote arm.
+<span class="lineno">   81 </span>-- Returns 'Right' ONLY when the backend is 'Ssh' AND a remote 'SshConfig'
+<span class="lineno">   82 </span>-- is configured AND the mode permits it. NEVER yields a local-capable
+<span class="lineno">   83 </span>-- backend (the 'UntrustedExecBackend' type is Ssh-only by construction).
+<span class="lineno">   84 </span>--
+<span class="lineno">   85 </span>-- @mode=local@ always returns 'Left ExecLocalNotPermittedForUntrusted'
+<span class="lineno">   86 </span>-- (this function is the remote-only selector; the full-sum selector is
+<span class="lineno">   87 </span>-- 'selectExecBackend').
+<span class="lineno">   88 </span>selectUntrustedBackend
+<span class="lineno">   89 </span>  :: UntrustedExecConfig -&gt; TerminalBackend -&gt; Either ExecError UntrustedExecBackend
+<span class="lineno">   90 </span><span class="decl"><span class="istickedoff">selectUntrustedBackend cfg = \case</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">TbSsh _        -&gt; case uecRemote cfg of</span>
+<span class="lineno">   92 </span><span class="spaces">                      </span><span class="istickedoff">Just _  -&gt; case uecMode cfg of</span>
+<span class="lineno">   93 </span><span class="spaces">                                   </span><span class="istickedoff">UemRemote -&gt; mkUntrustedExecBackend (TbSsh <span class="nottickedoff">(sshFromCfg cfg)</span>)</span>
+<span class="lineno">   94 </span><span class="spaces">                                   </span><span class="istickedoff">UemLocal -&gt; Left <span class="nottickedoff">ExecLocalNotPermittedForUntrusted</span></span>
+<span class="lineno">   95 </span><span class="spaces">                      </span><span class="istickedoff">Nothing -&gt; Left ExecRemoteRequired</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">TbLocal        -&gt; Left ExecLocalNotPermittedForUntrusted</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">TbTmux _       -&gt; Left <span class="nottickedoff">ExecNotImplemented</span></span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">TbContainer _  -&gt; Left <span class="nottickedoff">ExecNotImplemented</span></span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">-- Recover the configured SshConfig. (Only reached when uecRemote is Just.)</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">sshFromCfg c = case uecRemote c of</span></span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Just s  -&gt; s</span></span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; error &quot;selectUntrustedBackend: unreachable (guarded by uecRemote check)&quot;</span></span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | The full-sum selector the dispatcher wires. Returns 'EbLocal' when
+<span class="lineno">  106 </span>-- @mode=local@ + 'TbLocal'; 'EbRemote' when @mode=remote@ + 'TbSsh'
+<span class="lineno">  107 </span>-- configured; 'Left' otherwise (fail-closed, no local fallback under
+<span class="lineno">  108 </span>-- @mode=remote@).
+<span class="lineno">  109 </span>selectExecBackend
+<span class="lineno">  110 </span>  :: UntrustedExecConfig -&gt; TerminalBackend -&gt; Either ExecError ExecBackend
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">selectExecBackend cfg = \case</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">TbLocal        -&gt; case uecMode cfg of</span>
+<span class="lineno">  113 </span><span class="spaces">                      </span><span class="istickedoff">UemLocal  -&gt; Right <span class="nottickedoff">(EbLocal mkLocalExecHandlePlaceholder)</span></span>
+<span class="lineno">  114 </span><span class="spaces">                      </span><span class="istickedoff">UemRemote -&gt; Left ExecLocalNotPermittedForUntrusted</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">TbSsh _        -&gt; case (uecMode cfg, uecRemote cfg) of</span>
+<span class="lineno">  116 </span><span class="spaces">                      </span><span class="istickedoff">(UemLocal, _)       -&gt; <span class="nottickedoff">Left ExecLocalNotPermittedForUntrusted</span></span>
+<span class="lineno">  117 </span><span class="spaces">                      </span><span class="istickedoff">(UemRemote, Just s) -&gt; Right (EbRemote s)</span>
+<span class="lineno">  118 </span><span class="spaces">                      </span><span class="istickedoff">(UemRemote, Nothing) -&gt; Left ExecRemoteRequired</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">TbTmux _       -&gt; Left <span class="nottickedoff">ExecNotImplemented</span></span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">TbContainer _  -&gt; Left <span class="nottickedoff">ExecNotImplemented</span></span></span>
+
+</pre>
+</body>
+</html>

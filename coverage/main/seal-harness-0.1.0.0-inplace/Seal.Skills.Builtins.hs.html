@@ -1,0 +1,136 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TemplateHaskell #-}
+<span class="lineno">    3 </span>-- | Built-in skills shipped with the Seal Harness binary. The markdown
+<span class="lineno">    4 </span>-- sources live under @config/skills/\&lt;group\&gt;/@ in the repo and are embedded
+<span class="lineno">    5 </span>-- into the binary at compile time via 'file-embed' so the harness is
+<span class="lineno">    6 </span>-- self-contained: no first-run materialization, no install-layout
+<span class="lineno">    7 </span>-- dependency, no staleness across upgrades (the embedded copy is always the
+<span class="lineno">    8 </span>-- version the binary shipped with).
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- A user can override any built-in by dropping a same-id markdown file at
+<span class="lineno">   11 </span>-- @~/.seal/config/skills/&lt;group&gt;/&lt;id&gt;.md@ (or the flat
+<span class="lineno">   12 </span>-- @~/.seal/config/skills/&lt;id&gt;.md@); the union backend
+<span class="lineno">   13 </span>-- ('Seal.Skills.Backend.unionSkillBackend') checks the user layer first
+<span class="lineno">   14 </span>-- and falls back to the embedded built-in. To bring in upstream changes
+<span class="lineno">   15 </span>-- after an upgrade, the user diffs their override against the new
+<span class="lineno">   16 </span>-- built-in (visible via @SKILL_LIST@ or @\/skill list@ — both surface
+<span class="lineno">   17 </span>-- built-ins) and does the desired merge manually.
+<span class="lineno">   18 </span>module Seal.Skills.Builtins
+<span class="lineno">   19 </span>  ( builtinSkills
+<span class="lineno">   20 </span>  , builtinSkillMap
+<span class="lineno">   21 </span>  , lookupBuiltinSkill
+<span class="lineno">   22 </span>  , builtinSkillIds
+<span class="lineno">   23 </span>  ) where
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Data.FileEmbed (embedFile)
+<span class="lineno">   26 </span>import Data.Map.Strict (Map)
+<span class="lineno">   27 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   28 </span>import Data.Maybe (mapMaybe)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   31 </span>import Data.Time (UTCTime (..))
+<span class="lineno">   32 </span>import Data.Time.Calendar (fromGregorian)
+<span class="lineno">   33 </span>import Data.Time.Clock (secondsToDiffTime)
+<span class="lineno">   34 </span>import Language.Haskell.TH.Syntax (qAddDependentFile)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import Seal.Skills.Codec (decodeSkill)
+<span class="lineno">   37 </span>import Seal.Skills.Types (Skill (..), SkillId, qualifiedSkillId)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | The compiled-in provenance stamp for built-in skills. A fixed epoch
+<span class="lineno">   40 </span>-- instant so the embedded data is deterministic (no per-build timestamp
+<span class="lineno">   41 </span>-- churn in the binary). A user override's @updated_at@ will always be
+<span class="lineno">   42 </span>-- later, which is the right signal for &quot;this is a user-modified copy.&quot;
+<span class="lineno">   43 </span>builtinStamp :: UTCTime
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">builtinStamp = UTCTime (fromGregorian 2026 7 24) (secondsToDiffTime 0)</span></span>
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | The raw markdown bytes of each built-in skill source, embedded at
+<span class="lineno">   47 </span>-- compile time. Add a tuple here to ship another built-in skill. The first
+<span class="lineno">   48 </span>-- element is the skill id (must match the @id:@ frontmatter inside the
+<span class="lineno">   49 </span>-- file); the second is the embedded file content (via 'embedFile'); the
+<span class="lineno">   50 </span>-- third is the group the built-in belongs to (stamped into 'skGroup' so
+<span class="lineno">   51 </span>-- the @\&lt;available_skills\&gt;@ catalog groups built-ins consistently with
+<span class="lineno">   52 </span>-- their on-disk location).
+<span class="lineno">   53 </span>--
+<span class="lineno">   54 </span>-- Each 'embedFile' splice is paired with a 'qAddDependentFile' call so
+<span class="lineno">   55 </span>-- GHC recompiles this module when an embedded source changes (plain
+<span class="lineno">   56 </span>-- 'embedFile' alone does not register the file as a build dependency, so
+<span class="lineno">   57 </span>-- editing the markdown would not trigger a rebuild — a subtle footgun
+<span class="lineno">   58 </span>-- we close here). The splice must use a literal path (GHC stage
+<span class="lineno">   59 </span>-- restriction: a top-level splice cannot reference a locally-bound
+<span class="lineno">   60 </span>-- variable), so each entry inlines its own splice rather than sharing a
+<span class="lineno">   61 </span>-- single one parameterized by @path@.
+<span class="lineno">   62 </span>builtinRaw :: [(Text, Text, Text)]
+<span class="lineno">   63 </span><span class="decl"><span class="istickedoff">builtinRaw =</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">[ ( <span class="nottickedoff">&quot;seal-usage&quot;</span></span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">, TE.decodeUtf8 $(do</span>
+<span class="lineno">   66 </span><span class="spaces">          </span><span class="istickedoff">qAddDependentFile &quot;config/skills/core/seal-usage.md&quot;</span>
+<span class="lineno">   67 </span><span class="spaces">          </span><span class="istickedoff">embedFile &quot;config/skills/core/seal-usage.md&quot;)</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">, &quot;core&quot;</span>
+<span class="lineno">   69 </span><span class="spaces">   </span><span class="istickedoff">)</span>
+<span class="lineno">   70 </span><span class="spaces"> </span><span class="istickedoff">, ( <span class="nottickedoff">&quot;codegraph&quot;</span></span>
+<span class="lineno">   71 </span><span class="spaces">   </span><span class="istickedoff">, TE.decodeUtf8 $(do</span>
+<span class="lineno">   72 </span><span class="spaces">         </span><span class="istickedoff">qAddDependentFile &quot;config/skills/core/codegraph.md&quot;</span>
+<span class="lineno">   73 </span><span class="spaces">         </span><span class="istickedoff">embedFile &quot;config/skills/core/codegraph.md&quot;)</span>
+<span class="lineno">   74 </span><span class="spaces">   </span><span class="istickedoff">, &quot;core&quot;</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | The decoded built-in skills, with provenance stamped to 'builtinStamp'
+<span class="lineno">   79 </span>-- (the decoded @session@ defaults to @&quot;unknown&quot;@ per 'decodeSkill'; we
+<span class="lineno">   80 </span>-- leave it — built-ins are not user-authored, so the originating-session
+<span class="lineno">   81 </span>-- field is conventional, not meaningful) and 'skGroup' stamped to the
+<span class="lineno">   82 </span>-- group declared in 'builtinRaw' (so built-ins are always grouped
+<span class="lineno">   83 </span>-- consistently, regardless of any @group:@ frontmatter in the file).
+<span class="lineno">   84 </span>-- Malformed sources are skipped (a malformed built-in is an authoring
+<span class="lineno">   85 </span>-- error caught at the first test run, not a runtime condition the binary
+<span class="lineno">   86 </span>-- should paper over).
+<span class="lineno">   87 </span>builtinSkills :: [Skill]
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">builtinSkills = mapMaybe decodeAndStamp builtinRaw</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">decodeAndStamp (_expectedId, raw, group) =</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff">case decodeSkill raw of</span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">Nothing    -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">   93 </span><span class="spaces">        </span><span class="istickedoff">Just skill -&gt;</span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="istickedoff">let stamped = skill</span>
+<span class="lineno">   95 </span><span class="spaces">                </span><span class="istickedoff">{ skCreatedAt = <span class="nottickedoff">builtinStamp</span></span>
+<span class="lineno">   96 </span><span class="spaces">                </span><span class="istickedoff">, skUpdatedAt = builtinStamp</span>
+<span class="lineno">   97 </span><span class="spaces">                </span><span class="istickedoff">, skGroup     = Just group</span>
+<span class="lineno">   98 </span><span class="spaces">                </span><span class="istickedoff">}</span>
+<span class="lineno">   99 </span><span class="spaces">          </span><span class="istickedoff">in Just stamped</span>
+<span class="lineno">  100 </span><span class="spaces">                </span><span class="istickedoff">{ skId = qualifiedSkillId (skGroup stamped) (skId stamped)</span>
+<span class="lineno">  101 </span><span class="spaces">                </span><span class="istickedoff">}</span></span>
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>-- | 'builtinSkills' keyed by id for O(log n) lookups.
+<span class="lineno">  104 </span>builtinSkillMap :: Map SkillId Skill
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">builtinSkillMap = Map.fromList [(skId s, s) | s &lt;- builtinSkills]</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | The ids of all built-in skills (for listing / override detection).
+<span class="lineno">  108 </span>builtinSkillIds :: [SkillId]
+<span class="lineno">  109 </span><span class="decl"><span class="nottickedoff">builtinSkillIds = map skId builtinSkills</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | Look up a built-in skill by id. 'Nothing' if no built-in has that id.
+<span class="lineno">  112 </span>lookupBuiltinSkill :: SkillId -&gt; Maybe Skill
+<span class="lineno">  113 </span><span class="decl"><span class="nottickedoff">lookupBuiltinSkill sid = Map.lookup sid builtinSkillMap</span></span>
+
+</pre>
+</body>
+</html>

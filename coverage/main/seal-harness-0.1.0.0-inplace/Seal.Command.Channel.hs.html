@@ -1,0 +1,812 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @\/channel@ command: interactive setup for chat channels. Currently
+<span class="lineno">    3 </span>-- Signal and Telegram are supported. The Signal wizard checks for
+<span class="lineno">    4 </span>-- @signal-cli@, offers a @link@ (secondary device) or @register@ (primary
+<span class="lineno">    5 </span>-- device) flow, walks the user through it via 'ChannelCaps' prompts, and
+<span class="lineno">    6 </span>-- writes the resolved account into the @[signal]@ section of @config.toml@.
+<span class="lineno">    7 </span>-- The Telegram wizard prompts for a BotFather token, validates it via the
+<span class="lineno">    8 </span>-- Bot API @getMe@ endpoint, and writes the @[telegram]@ section. Mirrors
+<span class="lineno">    9 </span>-- PureClaw's @\/channel signal@ wizard; adapted to Seal's 'ChannelCaps' +
+<span class="lineno">   10 </span>-- 'RuntimeConfig' + 'SealPaths' shape.
+<span class="lineno">   11 </span>module Seal.Command.Channel
+<span class="lineno">   12 </span>  ( channelCommandSpec
+<span class="lineno">   13 </span>  , ChannelRuntime (..)
+<span class="lineno">   14 </span>  , SignalCli (..)
+<span class="lineno">   15 </span>  , mkRealSignalCli
+<span class="lineno">   16 </span>  , TelegramBotApi (..)
+<span class="lineno">   17 </span>  , mkRealTelegramBotApi
+<span class="lineno">   18 </span>  , VaultStore (..)
+<span class="lineno">   19 </span>  , mkRealVaultStore
+<span class="lineno">   20 </span>  , noVaultStore
+<span class="lineno">   21 </span>  , GetMeOutcome (..)
+<span class="lineno">   22 </span>  , LinkOutcome (..)
+<span class="lineno">   23 </span>  , RegisterOutcome (..)
+<span class="lineno">   24 </span>  , VerifyOutcome (..)
+<span class="lineno">   25 </span>  , AccountsOutcome (..)
+<span class="lineno">   26 </span>  , ReceiveOutcome (..)
+<span class="lineno">   27 </span>  ) where
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import Control.Exception (IOException, SomeException, try)
+<span class="lineno">   30 </span>import Data.Aeson qualified as A
+<span class="lineno">   31 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   32 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   33 </span>import Data.ByteString (ByteString)
+<span class="lineno">   34 </span>import Data.ByteString qualified as BS
+<span class="lineno">   35 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   36 </span>import Data.Either (fromRight)
+<span class="lineno">   37 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   38 </span>import Data.Set qualified as Set
+<span class="lineno">   39 </span>import Data.Text (Text)
+<span class="lineno">   40 </span>import Data.Text qualified as T
+<span class="lineno">   41 </span>import Data.Text.Encoding (decodeUtf8With)
+<span class="lineno">   42 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   43 </span>import Data.Text.Encoding.Error (lenientDecode)
+<span class="lineno">   44 </span>import Network.HTTP.Client (Manager, httpLbs, parseRequest, responseBody,
+<span class="lineno">   45 </span>                            responseStatus)
+<span class="lineno">   46 </span>import Network.HTTP.Client.TLS (newTlsManager)
+<span class="lineno">   47 </span>import Network.HTTP.Types (statusCode)
+<span class="lineno">   48 </span>import Options.Applicative
+<span class="lineno">   49 </span>import System.Directory (createDirectoryIfMissing)
+<span class="lineno">   50 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   51 </span>import System.FilePath (takeDirectory)
+<span class="lineno">   52 </span>import System.IO (BufferMode (..), Handle, hGetLine, hSetBuffering)
+<span class="lineno">   53 </span>import System.Process
+<span class="lineno">   54 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess,
+<span class="lineno">   55 </span>    withCreateProcess )
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   58 </span>import Seal.Command.Spec
+<span class="lineno">   59 </span>  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
+<span class="lineno">   60 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   61 </span>import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig,
+<span class="lineno">   62 </span>                         saveRuntimeConfig)
+<span class="lineno">   63 </span>import Seal.Core.AllowList (AllowList (..))
+<span class="lineno">   64 </span>import Seal.Security.Vault qualified as Vault
+<span class="lineno">   65 </span>import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
+<span class="lineno">   66 </span>import Seal.Telegram.Config
+<span class="lineno">   67 </span>  ( TelegramConfig (..), defaultTelegramChunkLimit, mkTelegramToken
+<span class="lineno">   68 </span>  , telegramTokenText, telegramVaultKey )
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   71 </span>-- Runtime + testability seam
+<span class="lineno">   72 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | The runtime the @\/channel@ command closes over: where to find the
+<span class="lineno">   75 </span>-- config file (so the wizard can read-modify-write @config.toml@), a
+<span class="lineno">   76 </span>-- 'SignalCli' seam for shelling out to @signal-cli@, a 'TelegramBotApi'
+<span class="lineno">   77 </span>-- seam for the Telegram Bot API, and a 'VaultStore' seam for storing
+<span class="lineno">   78 </span>-- channel secrets in the vault. Tests inject mock seams so @cabal test@
+<span class="lineno">   79 </span>-- never needs the binary, network, or vault.
+<span class="lineno">   80 </span>data ChannelRuntime = ChannelRuntime
+<span class="lineno">   81 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">crConfigPath</span></span></span>    :: FilePath
+<span class="lineno">   82 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crSignalCli</span></span></span>     :: SignalCli
+<span class="lineno">   83 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crTelegramBotApi</span></span></span> :: TelegramBotApi
+<span class="lineno">   84 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crVaultStore</span></span></span>    :: VaultStore
+<span class="lineno">   85 </span>  }
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | A seam over the vault for storing channel secrets (like the Telegram
+<span class="lineno">   88 </span>-- bot token). The wizard writes the token to the vault (not @config.toml@)
+<span class="lineno">   89 </span>-- so it is never stored in cleartext. 'vsStore' stores a key+value;
+<span class="lineno">   90 </span>-- 'vsAvailable' checks whether the vault is open and ready.
+<span class="lineno">   91 </span>data VaultStore = VaultStore
+<span class="lineno">   92 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">vsStore</span></span></span>     :: Text -&gt; ByteString -&gt; IO (Either Text ())
+<span class="lineno">   93 </span>    -- ^ Store a secret under a key. 'Right ()' on success; 'Left' diagnostic.
+<span class="lineno">   94 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">vsAvailable</span></span></span> :: IO Bool
+<span class="lineno">   95 </span>    -- ^ Is the vault open and ready to accept writes?
+<span class="lineno">   96 </span>  }
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | A small seam over the @signal-cli@ binary. Each field is one subprocess
+<span class="lineno">   99 </span>-- operation the wizard needs. 'mkRealSignalCli' shells out; tests supply an
+<span class="lineno">  100 </span>-- in-memory 'SignalCli'. The seam keeps the wizard logic pure with respect
+<span class="lineno">  101 </span>-- to the binary and makes the interactive flow unit-testable.
+<span class="lineno">  102 </span>data SignalCli = SignalCli
+<span class="lineno">  103 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scCheckInstalled</span></span></span> :: IO (Either Text Text)
+<span class="lineno">  104 </span>    -- ^ @signal-cli --version@. Right version-string on success; Left
+<span class="lineno">  105 </span>    -- diagnostic if absent or failing.
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scLink</span></span></span>           :: (Text -&gt; IO ()) -&gt; IO LinkOutcome
+<span class="lineno">  107 </span>    -- ^ @signal-cli link -n Seal@. The callback is invoked with the
+<span class="lineno">  108 </span>    -- @sgnl:\/\/@ URI the instant it appears (before the scan completes),
+<span class="lineno">  109 </span>    -- so the wizard can show it immediately. 'scLink' then blocks until
+<span class="lineno">  110 </span>    -- the user scans it (or signal-cli times out). See 'LinkOutcome'.
+<span class="lineno">  111 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scRegister</span></span></span>       :: Text -&gt; Maybe Text -&gt; IO RegisterOutcome
+<span class="lineno">  112 </span>    -- ^ @signal-cli -u &lt;phone&gt; register [--captcha &lt;token&gt;]@.
+<span class="lineno">  113 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVerify</span></span></span>         :: Text -&gt; Text -&gt; IO VerifyOutcome
+<span class="lineno">  114 </span>    -- ^ @signal-cli -u &lt;phone&gt; verify &lt;code&gt;@.
+<span class="lineno">  115 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scListAccounts</span></span></span>   :: IO AccountsOutcome
+<span class="lineno">  116 </span>    -- ^ @signal-cli listAccounts@. Used to detect the linked account.
+<span class="lineno">  117 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scReceiveSender</span></span></span>  :: Text -&gt; Int -&gt; IO ReceiveOutcome
+<span class="lineno">  118 </span>    -- ^ @signal-cli -u &lt;account&gt; receive --max-messages 1 -t &lt;timeout&gt;@.
+<span class="lineno">  119 </span>    -- Blocks until one message arrives or the timeout elapses. Used by the
+<span class="lineno">  120 </span>    -- wizard to capture the sender's user id and lock down @allow_from@.
+<span class="lineno">  121 </span>  }
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | Outcome of @signal-cli link@: the @sgnl:\/\/@ URI to show the user (or a
+<span class="lineno">  124 </span>-- failure), then the exit status after the user scans. The URI is emitted
+<span class="lineno">  125 </span>-- before blocking, so the wizard can show it immediately.
+<span class="lineno">  126 </span>data LinkOutcome
+<span class="lineno">  127 </span>  = LinkFailed Text
+<span class="lineno">  128 </span>  | LinkTimedOut
+<span class="lineno">  129 </span>    -- ^ signal-cli's provisioning WebSocket closed before the scan completed
+<span class="lineno">  130 </span>    -- (60s idle timeout). The wizard may retry to give the user a fresh window.
+<span class="lineno">  131 </span>  | LinkSucceeded Text
+<span class="lineno">  132 </span>    -- ^ The @sgnl:\/\/@ URI; the scan completed with @ExitSuccess@.
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | Outcome of @signal-cli -u &lt;phone&gt; register@.
+<span class="lineno">  135 </span>data RegisterOutcome
+<span class="lineno">  136 </span>  = RegisterOk
+<span class="lineno">  137 </span>  | RegisterCaptchaRequired
+<span class="lineno">  138 </span>  | RegisterFailed Text
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | Outcome of @signal-cli -u &lt;phone&gt; verify &lt;code&gt;@.
+<span class="lineno">  141 </span>data VerifyOutcome
+<span class="lineno">  142 </span>  = VerifyOk
+<span class="lineno">  143 </span>  | VerifyFailed Text
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | Outcome of @signal-cli listAccounts@.
+<span class="lineno">  146 </span>data AccountsOutcome
+<span class="lineno">  147 </span>  = AccountsFailed Text
+<span class="lineno">  148 </span>  | AccountsFound [Text]
+<span class="lineno">  149 </span>    -- ^ The detected @+…@ phone numbers (E.164).
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>-- | Outcome of @signal-cli receive@ (one message, with a timeout). The
+<span class="lineno">  152 </span>-- sender's user id is the phone number signal-cli reports in the envelope's
+<span class="lineno">  153 </span>-- @source@ field (used to populate @allow_from@).
+<span class="lineno">  154 </span>data ReceiveOutcome
+<span class="lineno">  155 </span>  = ReceiveFailed Text
+<span class="lineno">  156 </span>  | ReceiveTimedOut
+<span class="lineno">  157 </span>  | ReceiveSender Text
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  160 </span>-- TelegramBotApi — seam over the Telegram Bot API
+<span class="lineno">  161 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | A small seam over the Telegram Bot API. The wizard needs only one
+<span class="lineno">  164 </span>-- operation: validate a bot token via @getMe@. 'mkRealTelegramBotApi'
+<span class="lineno">  165 </span>-- performs an HTTPS request to the Bot API; tests supply an in-memory
+<span class="lineno">  166 </span>-- 'TelegramBotApi'. The seam keeps the wizard logic pure with respect to
+<span class="lineno">  167 </span>-- the network and makes the interactive flow unit-testable.
+<span class="lineno">  168 </span>newtype TelegramBotApi = TelegramBotApi
+<span class="lineno">  169 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tbaGetMe</span></span></span> :: Text -&gt; IO GetMeOutcome
+<span class="lineno">  170 </span>    -- ^ Call @GET \/bot&lt;token&gt;\/getMe@. 'Right' username on success; 'Left'
+<span class="lineno">  171 </span>    -- diagnostic if the token is invalid or the request fails.
+<span class="lineno">  172 </span>  }
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | Outcome of the Bot API @getMe@ call.
+<span class="lineno">  175 </span>data GetMeOutcome
+<span class="lineno">  176 </span>  = GetMeOk Text
+<span class="lineno">  177 </span>    -- ^ The bot's username (without the leading @).
+<span class="lineno">  178 </span>  | GetMeFailed Text
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  181 </span>-- CommandSpec
+<span class="lineno">  182 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | The @\/channel@ command spec. Subcommands: @signal@, @telegram@.
+<span class="lineno">  185 </span>-- Interactive only (the wizard prompts the user; non-interactive channels
+<span class="lineno">  186 </span>-- defer prompts, so the wizard is meaningful on the CLI TUI and equivalent
+<span class="lineno">  187 </span>-- interactive surfaces). The 'ChannelRuntime' carries the config path +
+<span class="lineno">  188 </span>-- 'SignalCli' + 'TelegramBotApi' seams.
+<span class="lineno">  189 </span>channelCommandSpec :: ChannelRuntime -&gt; CommandSpec
+<span class="lineno">  190 </span><span class="decl"><span class="istickedoff">channelCommandSpec rt = CommandSpec</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = CommandName &quot;channel&quot;</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = <span class="nottickedoff">GroupGeneral</span></span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = &quot;Set up a chat channel (signal, telegram)&quot;</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = channelParserInfo rt</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = InteractiveOnly</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  198 </span>
+<span class="lineno">  199 </span>channelParserInfo :: ChannelRuntime -&gt; ParserInfo CommandAction
+<span class="lineno">  200 </span><span class="decl"><span class="istickedoff">channelParserInfo rt =</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">info (channelParser rt &lt;**&gt; helper)</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Set up a chat channel&quot;</span></span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;channel — interactive channel setup (signal, telegram)&quot;</span></span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">  205 </span>
+<span class="lineno">  206 </span>channelParser :: ChannelRuntime -&gt; Parser CommandAction
+<span class="lineno">  207 </span><span class="decl"><span class="istickedoff">channelParser rt = hsubparser</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">$  command &quot;signal&quot;</span>
+<span class="lineno">  209 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (signalSetupCmd rt)) (progDesc <span class="nottickedoff">&quot;Set up the Signal channel&quot;</span>))</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;telegram&quot;</span>
+<span class="lineno">  211 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (telegramSetupCmd rt)) (progDesc <span class="nottickedoff">&quot;Set up the Telegram channel&quot;</span>))</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;CHANNEL&quot;</span></span></span>
+<span class="lineno">  213 </span>
+<span class="lineno">  214 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  215 </span>-- Wizard
+<span class="lineno">  216 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>-- | Run the Signal setup wizard. Checks @signal-cli@, offers link or
+<span class="lineno">  219 </span>-- register, walks the chosen flow, writes config. All interaction goes
+<span class="lineno">  220 </span>-- through 'ChannelCaps' (sends + prompts) so the wizard works on the CLI
+<span class="lineno">  221 </span>-- TUI and any interactive channel.
+<span class="lineno">  222 </span>signalSetupCmd :: ChannelRuntime -&gt; CommandAction
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">signalSetupCmd rt = commandAction $ \caps -&gt; do</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">let cli = crSignalCli rt</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">-- Step 1: Check signal-cli is installed.</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">eVer &lt;- scCheckInstalled cli</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">case eVer of</span>
+<span class="lineno">  228 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  229 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;signal-cli is not installed.&quot;</span>
+<span class="lineno">  230 </span><span class="spaces">      </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">, &quot;Install it first:&quot;</span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">, &quot;  macOS:  brew install signal-cli&quot;</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">, &quot;  Nix:    nix-env -i signal-cli&quot;</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">, &quot;  Other:  https://github.com/AsamK/signal-cli&quot;</span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">, &quot;Then run /channel signal again.&quot;</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  238 </span><span class="spaces">    </span><span class="istickedoff">Right version -&gt; do</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps (&quot;Found signal-cli &quot; &lt;&gt; version)</span>
+<span class="lineno">  240 </span><span class="spaces">      </span><span class="istickedoff">-- Step 2: Offer link or register.</span>
+<span class="lineno">  241 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  242 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  243 </span><span class="spaces">        </span><span class="istickedoff">, &quot;How would you like to connect?&quot;</span>
+<span class="lineno">  244 </span><span class="spaces">        </span><span class="istickedoff">, &quot;  [1] Link to an existing Signal account (adds Seal as secondary device)&quot;</span>
+<span class="lineno">  245 </span><span class="spaces">        </span><span class="istickedoff">, &quot;  [2] Register with a phone number (becomes primary device for that number)&quot;</span>
+<span class="lineno">  246 </span><span class="spaces">        </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  247 </span><span class="spaces">        </span><span class="istickedoff">, &quot;Note: Option 2 will take over the number from any existing Signal registration.&quot;</span>
+<span class="lineno">  248 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="istickedoff">choice &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Choice [1]: &quot; [])</span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="istickedoff">let effectiveChoice = if T.null choice then &quot;1&quot; else choice</span>
+<span class="lineno">  251 </span><span class="spaces">      </span><span class="istickedoff">case effectiveChoice of</span>
+<span class="lineno">  252 </span><span class="spaces">        </span><span class="istickedoff">&quot;1&quot; -&gt; signalLinkFlow rt caps</span>
+<span class="lineno">  253 </span><span class="spaces">        </span><span class="istickedoff">&quot;2&quot; -&gt; signalRegisterFlow rt caps</span>
+<span class="lineno">  254 </span><span class="spaces">        </span><span class="istickedoff">_   -&gt; ccSend caps &quot;Invalid choice. Setup cancelled.&quot;</span></span>
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>-- | Link to an existing Signal account by scanning a @sgnl:\/\/@ URI.
+<span class="lineno">  257 </span>-- Retries up to 3 times on timeout (signal-cli's provisioning WebSocket has a
+<span class="lineno">  258 </span>-- fixed 60s idle timeout); each retry mints a fresh URI + QR so the user
+<span class="lineno">  259 </span>-- gets a new window. A real failure exits immediately.
+<span class="lineno">  260 </span>signalLinkFlow :: ChannelRuntime -&gt; ChannelCaps -&gt; IO ()
+<span class="lineno">  261 </span><span class="decl"><span class="istickedoff">signalLinkFlow rt caps = linkAttempt (3 :: Int)</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">linkAttempt 0 = <span class="nottickedoff">ccSend caps &quot;Link timed out. Run /channel signal again to retry.&quot;</span></span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">linkAttempt triesLeft = do</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps &quot;Generating link... (this may take a moment)&quot;</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">let onUri uri = do</span>
+<span class="lineno">  267 </span><span class="spaces">            </span><span class="istickedoff">mQr &lt;- renderQR uri</span>
+<span class="lineno">  268 </span><span class="spaces">            </span><span class="istickedoff">let qrBlock = case mQr of</span>
+<span class="lineno">  269 </span><span class="spaces">                  </span><span class="istickedoff">Just qr -&gt; <span class="nottickedoff">[ &quot;Scan this QR code with Signal on your phone:&quot;</span></span>
+<span class="lineno">  270 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">, &quot;&quot;</span></span>
+<span class="lineno">  271 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">, qr</span></span>
+<span class="lineno">  272 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">, &quot;&quot;</span></span>
+<span class="lineno">  273 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">, &quot;Or paste this link into a QR code generator:&quot;</span></span>
+<span class="lineno">  274 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  275 </span><span class="spaces">                  </span><span class="istickedoff">Nothing -&gt; [ &quot;Scan this link (or paste into a QR code generator):&quot; ]</span>
+<span class="lineno">  276 </span><span class="spaces">            </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  277 </span><span class="spaces">              </span><span class="istickedoff">( [ &quot;Open Signal on your phone:&quot;</span>
+<span class="lineno">  278 </span><span class="spaces">                </span><span class="istickedoff">, &quot;  Settings \x2192 Linked Devices \x2192 Link New Device&quot;</span>
+<span class="lineno">  279 </span><span class="spaces">                </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  280 </span><span class="spaces">                </span><span class="istickedoff">] &lt;&gt; qrBlock &lt;&gt; [ &quot;&quot;</span>
+<span class="lineno">  281 </span><span class="spaces">                </span><span class="istickedoff">, &quot;  &quot; &lt;&gt; uri</span>
+<span class="lineno">  282 </span><span class="spaces">                </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  283 </span><span class="spaces">                </span><span class="istickedoff">, &quot;Waiting for you to scan... (this will complete automatically)&quot;</span>
+<span class="lineno">  284 </span><span class="spaces">                </span><span class="istickedoff">] )</span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="istickedoff">outcome &lt;- scLink (crSignalCli rt) onUri</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">case outcome of</span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="istickedoff">LinkFailed err -&gt; ccSend caps (&quot;Link failed or was cancelled.\n&quot; &lt;&gt; err)</span>
+<span class="lineno">  288 </span><span class="spaces">        </span><span class="istickedoff">LinkTimedOut -&gt; do</span>
+<span class="lineno">  289 </span><span class="spaces">          </span><span class="istickedoff">ccSend caps &quot;Link timed out after 60s. Generating a fresh link...&quot;</span>
+<span class="lineno">  290 </span><span class="spaces">          </span><span class="istickedoff">linkAttempt (triesLeft - 1)</span>
+<span class="lineno">  291 </span><span class="spaces">        </span><span class="istickedoff">LinkSucceeded _uri -&gt; do</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">ccSend caps &quot;Linked successfully!&quot;</span>
+<span class="lineno">  293 </span><span class="spaces">          </span><span class="istickedoff">detectAndWriteSignalConfig rt caps</span></span>
+<span class="lineno">  294 </span>
+<span class="lineno">  295 </span>-- | Register a new phone number (primary device). Prompts for the E.164
+<span class="lineno">  296 </span>-- number, calls @signal-cli register@ (handling a captcha challenge if
+<span class="lineno">  297 </span>-- required), then @verify@.
+<span class="lineno">  298 </span>signalRegisterFlow :: ChannelRuntime -&gt; ChannelCaps -&gt; IO ()
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">signalRegisterFlow rt caps = do</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">phoneNumber &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Phone number (E.164 format, e.g. +15555550123): &quot; [])</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">if T.null phoneNumber || not (&quot;+&quot; `T.isPrefixOf` phoneNumber)</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">then ccSend caps &quot;Invalid phone number. Must start with + (E.164 format).&quot;</span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">else signalRegister rt caps phoneNumber Nothing</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- | Attempt @signal-cli -u &lt;phone&gt; register@, handling the captcha loop.
+<span class="lineno">  306 </span>signalRegister :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">signalRegister rt caps phoneNumber mCaptcha = do</span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">let cli = crSignalCli rt</span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps (&quot;Sending verification SMS to &quot; &lt;&gt; phoneNumber &lt;&gt; &quot;...&quot;)</span>
+<span class="lineno">  310 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- scRegister cli phoneNumber mCaptcha</span>
+<span class="lineno">  311 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  312 </span><span class="spaces">    </span><span class="istickedoff">RegisterOk -&gt; signalVerify rt caps phoneNumber</span>
+<span class="lineno">  313 </span><span class="spaces">    </span><span class="istickedoff">RegisterCaptchaRequired -&gt; do</span>
+<span class="lineno">  314 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  315 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;Signal requires a captcha before sending the SMS.&quot;</span>
+<span class="lineno">  316 </span><span class="spaces">        </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  317 </span><span class="spaces">        </span><span class="istickedoff">, &quot;1. Open this URL in a browser:&quot;</span>
+<span class="lineno">  318 </span><span class="spaces">        </span><span class="istickedoff">, &quot;   https://signalcaptchas.org/registration/generate.html&quot;</span>
+<span class="lineno">  319 </span><span class="spaces">        </span><span class="istickedoff">, &quot;2. Solve the captcha&quot;</span>
+<span class="lineno">  320 </span><span class="spaces">        </span><span class="istickedoff">, &quot;3. Open DevTools (F12), go to Network tab&quot;</span>
+<span class="lineno">  321 </span><span class="spaces">        </span><span class="istickedoff">, &quot;4. Click \&quot;Open Signal\&quot; \x2014 find the signalcaptcha:// URL in the Network tab&quot;</span>
+<span class="lineno">  322 </span><span class="spaces">        </span><span class="istickedoff">, &quot;5. Copy and paste the full URL here (starts with signalcaptcha://)&quot;</span>
+<span class="lineno">  323 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">captchaInput &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Captcha token: &quot; [])</span>
+<span class="lineno">  325 </span><span class="spaces">      </span><span class="istickedoff">let token = T.strip (T.replace &quot;signalcaptcha://&quot; &quot;&quot; captchaInput)</span>
+<span class="lineno">  326 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">T.null token</span></span>
+<span class="lineno">  327 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">ccSend caps &quot;No captcha provided. Setup cancelled.&quot;</span></span>
+<span class="lineno">  328 </span><span class="spaces">        </span><span class="istickedoff">else signalRegister rt caps phoneNumber (Just token)</span>
+<span class="lineno">  329 </span><span class="spaces">    </span><span class="istickedoff">RegisterFailed err -&gt; <span class="nottickedoff">ccSend caps (&quot;Registration failed: &quot; &lt;&gt; err)</span></span></span>
+<span class="lineno">  330 </span>
+<span class="lineno">  331 </span>-- | Verify a phone number after the registration SMS was sent.
+<span class="lineno">  332 </span>signalVerify :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; IO ()
+<span class="lineno">  333 </span><span class="decl"><span class="istickedoff">signalVerify rt caps phoneNumber = do</span>
+<span class="lineno">  334 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps &quot;Verification code sent! Check your SMS.&quot;</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="istickedoff">code &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Verification code: &quot; [])</span>
+<span class="lineno">  336 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- scVerify (crSignalCli rt) phoneNumber code</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  338 </span><span class="spaces">    </span><span class="istickedoff">VerifyOk -&gt; do</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps &quot;Phone number verified!&quot;</span>
+<span class="lineno">  340 </span><span class="spaces">      </span><span class="istickedoff">writeSignalConfig rt caps phoneNumber</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="istickedoff">VerifyFailed err -&gt; <span class="nottickedoff">ccSend caps (&quot;Verification failed: &quot; &lt;&gt; err)</span></span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>-- | Detect the linked account number via @signal-cli listAccounts@, then
+<span class="lineno">  344 </span>-- write config. Falls back to prompting if detection fails.
+<span class="lineno">  345 </span>detectAndWriteSignalConfig :: ChannelRuntime -&gt; ChannelCaps -&gt; IO ()
+<span class="lineno">  346 </span><span class="decl"><span class="istickedoff">detectAndWriteSignalConfig rt caps = do</span>
+<span class="lineno">  347 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- scListAccounts (crSignalCli rt)</span>
+<span class="lineno">  348 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="istickedoff">AccountsFailed _ -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  350 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">phoneNumber &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;What phone number was linked? (E.164 format): &quot; [])</span></span>
+<span class="lineno">  351 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">writeSignalConfig rt caps phoneNumber</span></span>
+<span class="lineno">  352 </span><span class="spaces">    </span><span class="istickedoff">AccountsFound (phone : _) -&gt; do</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps (&quot;Detected account: &quot; &lt;&gt; phone)</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="istickedoff">writeSignalConfig rt caps phone</span>
+<span class="lineno">  355 </span><span class="spaces">    </span><span class="istickedoff">AccountsFound [] -&gt; do</span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff">phoneNumber &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Could not detect account. Phone number (E.164 format): &quot; [])</span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="istickedoff">writeSignalConfig rt caps phoneNumber</span></span>
+<span class="lineno">  358 </span>
+<span class="lineno">  359 </span>-- | Write the @[signal]@ section into @config.toml@ and confirm. Preserves
+<span class="lineno">  360 </span>-- all other config; sets the account and a permissive initial DM policy
+<span class="lineno">  361 </span>-- (@AllowAll@), then immediately prompts the user to send a message and
+<span class="lineno">  362 </span>-- locks down @allow_from@ to the captured sender (see 'lockDownAllowFrom').
+<span class="lineno">  363 </span>writeSignalConfig :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; IO ()
+<span class="lineno">  364 </span><span class="decl"><span class="istickedoff">writeSignalConfig rt caps phoneNumber = do</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">let cfgPath = crConfigPath rt</span>
+<span class="lineno">  366 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory cfgPath)</span>
+<span class="lineno">  367 </span><span class="spaces">  </span><span class="istickedoff">existing &lt;- loadRuntimeConfig cfgPath</span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">let baseCfg = fromRight <span class="nottickedoff">defaultRuntimeConfig</span> existing</span>
+<span class="lineno">  369 </span><span class="spaces">      </span><span class="istickedoff">updated = baseCfg</span>
+<span class="lineno">  370 </span><span class="spaces">        </span><span class="istickedoff">{ rcSignal = Just SignalConfig</span>
+<span class="lineno">  371 </span><span class="spaces">            </span><span class="istickedoff">{ scAccount        = Just phoneNumber</span>
+<span class="lineno">  372 </span><span class="spaces">            </span><span class="istickedoff">, scTextChunkLimit = Just defaultSignalChunkLimit</span>
+<span class="lineno">  373 </span><span class="spaces">            </span><span class="istickedoff">, scAllowFrom      = AllowAll</span>
+<span class="lineno">  374 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  375 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  376 </span><span class="spaces">  </span><span class="istickedoff">saveRuntimeConfig cfgPath updated</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  378 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  379 </span><span class="spaces">    </span><span class="istickedoff">, &quot;Signal configured!&quot;</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  Account: &quot; &lt;&gt; phoneNumber</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  Default channel: signal&quot;</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  383 </span><span class="spaces">    </span><span class="istickedoff">, &quot;One more step to secure your setup:&quot;</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  Send any message from Signal to &quot; &lt;&gt; phoneNumber</span>
+<span class="lineno">  385 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  and I'll lock down access to just that sender.&quot;</span>
+<span class="lineno">  386 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">  387 </span><span class="spaces">  </span><span class="istickedoff">lockDownAllowFrom rt caps phoneNumber</span></span>
+<span class="lineno">  388 </span>
+<span class="lineno">  389 </span>-- | Prompt the user to send a Signal message, capture the sender's user id
+<span class="lineno">  390 </span>-- via @signal-cli receive@, and rewrite the @[signal].allow_from@ to
+<span class="lineno">  391 </span>-- 'AllowOnly' that sender. Retries up to 3 times on timeout (120s each). On
+<span class="lineno">  392 </span>-- failure, leaves the config at 'AllowAll' with a warning to lock down
+<span class="lineno">  393 </span>-- manually. Idempotent: only writes when a sender is captured.
+<span class="lineno">  394 </span>lockDownAllowFrom :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; IO ()
+<span class="lineno">  395 </span><span class="decl"><span class="istickedoff">lockDownAllowFrom rt caps account = lockAttempt (3 :: Int)</span>
+<span class="lineno">  396 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  397 </span><span class="spaces">    </span><span class="istickedoff">lockAttempt 0 = ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  398 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="istickedoff">, &quot;No message received. Your config currently accepts messages from&quot;</span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="istickedoff">, &quot;anyone. To lock it down later, edit the [signal] section of your&quot;</span>
+<span class="lineno">  401 </span><span class="spaces">      </span><span class="istickedoff">, &quot;config and set allow_from = [\&quot;&lt;your-phone-or-uuid&gt;\&quot;].&quot;</span>
+<span class="lineno">  402 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="istickedoff">lockAttempt triesLeft = do</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps &quot;Waiting for your message... (this may take a moment)&quot;</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- scReceiveSender (crSignalCli rt) <span class="nottickedoff">account</span> <span class="nottickedoff">120</span></span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  407 </span><span class="spaces">        </span><span class="istickedoff">ReceiveFailed err -&gt; <span class="nottickedoff">ccSend caps (&quot;Receiving failed: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  408 </span><span class="spaces">        </span><span class="istickedoff">ReceiveTimedOut -&gt; do</span>
+<span class="lineno">  409 </span><span class="spaces">          </span><span class="istickedoff">ccSend caps &quot;No message received in time. Let's try again.&quot;</span>
+<span class="lineno">  410 </span><span class="spaces">          </span><span class="istickedoff">lockAttempt (triesLeft - 1)</span>
+<span class="lineno">  411 </span><span class="spaces">        </span><span class="istickedoff">ReceiveSender sender -&gt; do</span>
+<span class="lineno">  412 </span><span class="spaces">          </span><span class="istickedoff">let cfgPath = crConfigPath rt</span>
+<span class="lineno">  413 </span><span class="spaces">          </span><span class="istickedoff">existing &lt;- loadRuntimeConfig cfgPath</span>
+<span class="lineno">  414 </span><span class="spaces">          </span><span class="istickedoff">let baseCfg = fromRight <span class="nottickedoff">defaultRuntimeConfig</span> existing</span>
+<span class="lineno">  415 </span><span class="spaces">              </span><span class="istickedoff">mSig = rcSignal baseCfg</span>
+<span class="lineno">  416 </span><span class="spaces">              </span><span class="istickedoff">sigCfg = fromMaybe <span class="nottickedoff">SignalConfig</span></span>
+<span class="lineno">  417 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">{ scAccount = Just account</span></span>
+<span class="lineno">  418 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">, scTextChunkLimit = Just defaultSignalChunkLimit</span></span>
+<span class="lineno">  419 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">, scAllowFrom = AllowAll</span></span>
+<span class="lineno">  420 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">}</span> mSig</span>
+<span class="lineno">  421 </span><span class="spaces">              </span><span class="istickedoff">updated = baseCfg</span>
+<span class="lineno">  422 </span><span class="spaces">                </span><span class="istickedoff">{ rcSignal = Just sigCfg { scAllowFrom = AllowOnly (Set.singleton sender) }</span>
+<span class="lineno">  423 </span><span class="spaces">                </span><span class="istickedoff">}</span>
+<span class="lineno">  424 </span><span class="spaces">          </span><span class="istickedoff">saveRuntimeConfig cfgPath updated</span>
+<span class="lineno">  425 </span><span class="spaces">          </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  426 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  427 </span><span class="spaces">            </span><span class="istickedoff">, &quot;Locked down! Access is now restricted to: &quot; &lt;&gt; sender</span>
+<span class="lineno">  428 </span><span class="spaces">            </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  429 </span><span class="spaces">            </span><span class="istickedoff">, &quot;To start chatting:&quot;</span>
+<span class="lineno">  430 </span><span class="spaces">            </span><span class="istickedoff">, &quot;  1. Restart Seal (or run: seal signal)&quot;</span>
+<span class="lineno">  431 </span><span class="spaces">            </span><span class="istickedoff">, &quot;  2. Open Signal on your phone&quot;</span>
+<span class="lineno">  432 </span><span class="spaces">            </span><span class="istickedoff">, &quot;  3. Send a message to &quot; &lt;&gt; account</span>
+<span class="lineno">  433 </span><span class="spaces">            </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  434 </span><span class="spaces">            </span><span class="istickedoff">, &quot;To allow more senders later, edit &quot; &lt;&gt; T.pack cfgPath &lt;&gt; &quot;:&quot;</span>
+<span class="lineno">  435 </span><span class="spaces">            </span><span class="istickedoff">, &quot;  [signal]&quot;</span>
+<span class="lineno">  436 </span><span class="spaces">            </span><span class="istickedoff">, &quot;  allow_from = [\&quot;&quot; &lt;&gt; sender &lt;&gt; &quot;\&quot;, \&quot;&lt;other-sender&gt;\&quot;]&quot;</span>
+<span class="lineno">  437 </span><span class="spaces">            </span><span class="istickedoff">]</span></span>
+<span class="lineno">  438 </span>
+<span class="lineno">  439 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  440 </span>-- Telegram wizard
+<span class="lineno">  441 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  442 </span>
+<span class="lineno">  443 </span>-- | Run the Telegram setup wizard. Prompts for a BotFather token, validates
+<span class="lineno">  444 </span>-- it via the Bot API @getMe@ (so a typo is caught here, not at runtime),
+<span class="lineno">  445 </span>-- stores the token in the vault (NOT in @config.toml@), and writes the
+<span class="lineno">  446 </span>-- @[telegram]@ config section with the non-secret fields. All interaction
+<span class="lineno">  447 </span>-- goes through 'ChannelCaps' (sends + prompts) so the wizard works on the
+<span class="lineno">  448 </span>-- CLI TUI and any interactive channel.
+<span class="lineno">  449 </span>telegramSetupCmd :: ChannelRuntime -&gt; CommandAction
+<span class="lineno">  450 </span><span class="decl"><span class="istickedoff">telegramSetupCmd rt = commandAction $ \caps -&gt; do</span>
+<span class="lineno">  451 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  452 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;Setting up the Telegram channel.&quot;</span>
+<span class="lineno">  453 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  454 </span><span class="spaces">    </span><span class="istickedoff">, &quot;You need a bot token from BotFather (@BotFather on Telegram):&quot;</span>
+<span class="lineno">  455 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  1. Open a chat with @BotFather&quot;</span>
+<span class="lineno">  456 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  2. Send /newbot and follow the prompts&quot;</span>
+<span class="lineno">  457 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  3. Copy the token it gives you (looks like 123456:ABC-DEF...)&quot;</span>
+<span class="lineno">  458 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">  459 </span><span class="spaces">  </span><span class="istickedoff">tokenInput &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Bot token: &quot; [])</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">case mkTelegramToken tokenInput of</span>
+<span class="lineno">  461 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; ccSend caps (&quot;Invalid token: &quot; &lt;&gt; err)</span>
+<span class="lineno">  462 </span><span class="spaces">    </span><span class="istickedoff">Right token -&gt; do</span>
+<span class="lineno">  463 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps &quot;Validating token with Telegram...&quot;</span>
+<span class="lineno">  464 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- tbaGetMe (crTelegramBotApi rt) <span class="nottickedoff">(telegramTokenText token)</span></span>
+<span class="lineno">  465 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  466 </span><span class="spaces">        </span><span class="istickedoff">GetMeFailed err -&gt; ccSend caps (&quot;Token validation failed: &quot; &lt;&gt; err)</span>
+<span class="lineno">  467 </span><span class="spaces">        </span><span class="istickedoff">GetMeOk username -&gt; do</span>
+<span class="lineno">  468 </span><span class="spaces">          </span><span class="istickedoff">ccSend caps (&quot;Connected! Bot username: @&quot; &lt;&gt; username)</span>
+<span class="lineno">  469 </span><span class="spaces">          </span><span class="istickedoff">storeTelegramToken rt caps <span class="nottickedoff">(telegramTokenText token)</span> username</span></span>
+<span class="lineno">  470 </span>
+<span class="lineno">  471 </span>-- | Store the token in the vault and write the @[telegram]@ config section
+<span class="lineno">  472 </span>-- (without the token — only non-secret fields). If the vault is not
+<span class="lineno">  473 </span>-- available, warns the user to set up the vault first.
+<span class="lineno">  474 </span>storeTelegramToken :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">  475 </span><span class="decl"><span class="istickedoff">storeTelegramToken rt caps token username = do</span>
+<span class="lineno">  476 </span><span class="spaces">  </span><span class="istickedoff">let store = crVaultStore rt</span>
+<span class="lineno">  477 </span><span class="spaces">  </span><span class="istickedoff">available &lt;- vsAvailable store</span>
+<span class="lineno">  478 </span><span class="spaces">  </span><span class="istickedoff">if not available</span>
+<span class="lineno">  479 </span><span class="spaces">    </span><span class="istickedoff">then ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  480 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  481 </span><span class="spaces">      </span><span class="istickedoff">, &quot;Vault is not set up or not unlocked.&quot;</span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="istickedoff">, &quot;The Telegram bot token is a secret and must be stored in the vault.&quot;</span>
+<span class="lineno">  483 </span><span class="spaces">      </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  484 </span><span class="spaces">      </span><span class="istickedoff">, &quot;Run /vault setup first, then /channel telegram again.&quot;</span>
+<span class="lineno">  485 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  486 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  487 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- vsStore store telegramVaultKey <span class="nottickedoff">(TE.encodeUtf8 token)</span></span>
+<span class="lineno">  488 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  489 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps (&quot;Failed to store token in vault: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  490 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; writeTelegramConfig rt caps username</span></span>
+<span class="lineno">  491 </span>
+<span class="lineno">  492 </span>-- | Write the @[telegram]@ section into @config.toml@ (without the token)
+<span class="lineno">  493 </span>-- and confirm. The token is stored in the vault, not the config file.
+<span class="lineno">  494 </span>-- Preserves all other config; sets a permissive default DM policy
+<span class="lineno">  495 </span>-- (@AllowAll@), which the user can tighten later by editing @allow_from@.
+<span class="lineno">  496 </span>writeTelegramConfig :: ChannelRuntime -&gt; ChannelCaps -&gt; Text -&gt; IO ()
+<span class="lineno">  497 </span><span class="decl"><span class="istickedoff">writeTelegramConfig rt caps username = do</span>
+<span class="lineno">  498 </span><span class="spaces">  </span><span class="istickedoff">let cfgPath = crConfigPath rt</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory cfgPath)</span>
+<span class="lineno">  500 </span><span class="spaces">  </span><span class="istickedoff">existing &lt;- loadRuntimeConfig cfgPath</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="istickedoff">let baseCfg = fromRight <span class="nottickedoff">defaultRuntimeConfig</span> existing</span>
+<span class="lineno">  502 </span><span class="spaces">      </span><span class="istickedoff">updated = baseCfg</span>
+<span class="lineno">  503 </span><span class="spaces">        </span><span class="istickedoff">{ rcTelegram = Just TelegramConfig</span>
+<span class="lineno">  504 </span><span class="spaces">            </span><span class="istickedoff">{ tcToken         = Nothing  -- token lives in the vault, not config</span>
+<span class="lineno">  505 </span><span class="spaces">            </span><span class="istickedoff">, tcTextChunkLimit = Just defaultTelegramChunkLimit</span>
+<span class="lineno">  506 </span><span class="spaces">            </span><span class="istickedoff">, tcAllowFrom      = AllowAll</span>
+<span class="lineno">  507 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  508 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  509 </span><span class="spaces">  </span><span class="istickedoff">saveRuntimeConfig cfgPath updated</span>
+<span class="lineno">  510 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps $ T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  511 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;&quot;</span>
+<span class="lineno">  512 </span><span class="spaces">    </span><span class="istickedoff">, &quot;Telegram configured!&quot;</span>
+<span class="lineno">  513 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  Bot: @&quot; &lt;&gt; username</span>
+<span class="lineno">  514 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  Token: stored in vault (key: &quot; &lt;&gt; telegramVaultKey &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  515 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  DM policy: open (accepts messages from anyone)&quot;</span>
+<span class="lineno">  516 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  517 </span><span class="spaces">    </span><span class="istickedoff">, &quot;To start chatting:&quot;</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  1. Restart Seal (or run: seal telegram)&quot;</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  2. Open Telegram and DM @&quot; &lt;&gt; username</span>
+<span class="lineno">  520 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  521 </span><span class="spaces">    </span><span class="istickedoff">, &quot;To restrict access later, edit &quot; &lt;&gt; T.pack cfgPath &lt;&gt; &quot;:&quot;</span>
+<span class="lineno">  522 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  [telegram]&quot;</span>
+<span class="lineno">  523 </span><span class="spaces">    </span><span class="istickedoff">, &quot;  allow_from = [\&quot;&lt;your-telegram-user-id&gt;\&quot;]&quot;</span>
+<span class="lineno">  524 </span><span class="spaces">    </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  525 </span><span class="spaces">    </span><span class="istickedoff">, &quot;Your Telegram user id will appear in the logs on first message.&quot;</span>
+<span class="lineno">  526 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  527 </span>
+<span class="lineno">  528 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  529 </span>-- Real SignalCli — shells out to signal-cli
+<span class="lineno">  530 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  531 </span>
+<span class="lineno">  532 </span>-- | The real 'SignalCli': every field shells out to the @signal-cli@ binary
+<span class="lineno">  533 </span>-- via &quot;System.Process&quot;. Returned by 'mkRealSignalCli'. If @signal-cli@ is
+<span class="lineno">  534 </span>-- absent the fields surface a clear 'Left' (the wizard shows an install
+<span class="lineno">  535 </span>-- hint and bails).
+<span class="lineno">  536 </span>mkRealSignalCli :: IO SignalCli
+<span class="lineno">  537 </span><span class="decl"><span class="nottickedoff">mkRealSignalCli = pure SignalCli</span>
+<span class="lineno">  538 </span><span class="spaces">  </span><span class="nottickedoff">{ scCheckInstalled = do</span>
+<span class="lineno">  539 </span><span class="spaces">      </span><span class="nottickedoff">(ec, out, _err) &lt;- readProcessNoInput &quot;signal-cli&quot; [&quot;--version&quot;]</span>
+<span class="lineno">  540 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  541 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess -&gt;</span>
+<span class="lineno">  542 </span><span class="spaces">          </span><span class="nottickedoff">Right (T.strip (decodeUtf8 out))</span>
+<span class="lineno">  543 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; Left &quot;signal-cli not installed or not on PATH&quot;</span>
+<span class="lineno">  544 </span><span class="spaces">  </span><span class="nottickedoff">, scLink = runLink</span>
+<span class="lineno">  545 </span><span class="spaces">  </span><span class="nottickedoff">, scRegister = \phone mCaptcha -&gt;</span>
+<span class="lineno">  546 </span><span class="spaces">      </span><span class="nottickedoff">let captchaArgs = maybe [] (\c -&gt; [&quot;--captcha&quot;, T.unpack c]) mCaptcha</span>
+<span class="lineno">  547 </span><span class="spaces">          </span><span class="nottickedoff">args = [&quot;-u&quot;, T.unpack phone, &quot;register&quot;] &lt;&gt; captchaArgs</span>
+<span class="lineno">  548 </span><span class="spaces">      </span><span class="nottickedoff">in do</span>
+<span class="lineno">  549 </span><span class="spaces">        </span><span class="nottickedoff">(ec, _out, err) &lt;- readProcessNoInput &quot;signal-cli&quot; args</span>
+<span class="lineno">  550 </span><span class="spaces">        </span><span class="nottickedoff">let errText = T.strip (decodeUtf8 err)</span>
+<span class="lineno">  551 </span><span class="spaces">        </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  552 </span><span class="spaces">          </span><span class="nottickedoff">ExitSuccess -&gt; RegisterOk</span>
+<span class="lineno">  553 </span><span class="spaces">          </span><span class="nottickedoff">_ | &quot;captcha&quot; `T.isInfixOf` T.toLower errText -&gt; RegisterCaptchaRequired</span>
+<span class="lineno">  554 </span><span class="spaces">            </span><span class="nottickedoff">| otherwise -&gt; RegisterFailed errText</span>
+<span class="lineno">  555 </span><span class="spaces">  </span><span class="nottickedoff">, scVerify = \phone code -&gt; do</span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="nottickedoff">(ec, _out, err) &lt;- readProcessNoInput &quot;signal-cli&quot;</span>
+<span class="lineno">  557 </span><span class="spaces">        </span><span class="nottickedoff">[&quot;-u&quot;, T.unpack phone, &quot;verify&quot;, T.unpack code]</span>
+<span class="lineno">  558 </span><span class="spaces">      </span><span class="nottickedoff">let errText = T.strip (decodeUtf8 err)</span>
+<span class="lineno">  559 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  560 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess -&gt; VerifyOk</span>
+<span class="lineno">  561 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; VerifyFailed errText</span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="nottickedoff">, scListAccounts = do</span>
+<span class="lineno">  563 </span><span class="spaces">      </span><span class="nottickedoff">(ec, out, _err) &lt;- readProcessNoInput &quot;signal-cli&quot; [&quot;listAccounts&quot;]</span>
+<span class="lineno">  564 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  565 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess -&gt;</span>
+<span class="lineno">  566 </span><span class="spaces">          </span><span class="nottickedoff">let phones = filter (&quot;+&quot; `T.isPrefixOf`)</span>
+<span class="lineno">  567 </span><span class="spaces">                         </span><span class="nottickedoff">(map T.strip (T.lines (decodeUtf8 out)))</span>
+<span class="lineno">  568 </span><span class="spaces">          </span><span class="nottickedoff">in AccountsFound phones</span>
+<span class="lineno">  569 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; AccountsFailed &quot;signal-cli listAccounts failed&quot;</span>
+<span class="lineno">  570 </span><span class="spaces">  </span><span class="nottickedoff">, scReceiveSender = \account timeoutSecs -&gt; do</span>
+<span class="lineno">  571 </span><span class="spaces">      </span><span class="nottickedoff">(ec, out, err) &lt;- readProcessNoInput &quot;signal-cli&quot;</span>
+<span class="lineno">  572 </span><span class="spaces">        </span><span class="nottickedoff">[ &quot;--output=json&quot;</span>
+<span class="lineno">  573 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;-u&quot;, T.unpack account</span>
+<span class="lineno">  574 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;receive&quot;</span>
+<span class="lineno">  575 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;--max-messages&quot;, &quot;1&quot;</span>
+<span class="lineno">  576 </span><span class="spaces">        </span><span class="nottickedoff">, &quot;-t&quot;, show timeoutSecs</span>
+<span class="lineno">  577 </span><span class="spaces">        </span><span class="nottickedoff">]</span>
+<span class="lineno">  578 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  579 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess</span>
+<span class="lineno">  580 </span><span class="spaces">          </span><span class="nottickedoff">| T.null (T.strip (decodeUtf8 out)) -&gt; ReceiveTimedOut</span>
+<span class="lineno">  581 </span><span class="spaces">          </span><span class="nottickedoff">| otherwise -&gt; case parseReceiveSender (decodeUtf8 out) of</span>
+<span class="lineno">  582 </span><span class="spaces">              </span><span class="nottickedoff">Just src -&gt; ReceiveSender src</span>
+<span class="lineno">  583 </span><span class="spaces">              </span><span class="nottickedoff">Nothing  -&gt; ReceiveFailed &quot;could not parse sender from signal-cli receive output&quot;</span>
+<span class="lineno">  584 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; ReceiveFailed (T.strip (decodeUtf8 err))</span>
+<span class="lineno">  585 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  586 </span>
+<span class="lineno">  587 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  588 </span>-- Real TelegramBotApi — calls the Telegram Bot API over HTTPS
+<span class="lineno">  589 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  590 </span>
+<span class="lineno">  591 </span>-- | The real 'TelegramBotApi': validates a bot token via a GET request to
+<span class="lineno">  592 </span>-- @https:\/\/api.telegram.org\/bot&lt;token&gt;\/getMe@. Uses a shared TLS manager.
+<span class="lineno">  593 </span>-- On a non-200 response or a network error the wizard surfaces a clear
+<span class="lineno">  594 </span>-- 'GetMeFailed'. The bot's username is extracted from the JSON response body
+<span class="lineno">  595 </span>-- (the @\&quot;result\&quot;: {\&quot;username\&quot;: \&quot;...\&quot;}@ field). We avoid pulling in a
+<span class="lineno">  596 </span>-- full JSON parser dependency by extracting the username via a lightweight
+<span class="lineno">  597 </span>-- text scan — the Bot API response shape for getMe is stable.
+<span class="lineno">  598 </span>mkRealTelegramBotApi :: IO TelegramBotApi
+<span class="lineno">  599 </span><span class="decl"><span class="nottickedoff">mkRealTelegramBotApi = do</span>
+<span class="lineno">  600 </span><span class="spaces">  </span><span class="nottickedoff">mgr &lt;- newTlsManager</span>
+<span class="lineno">  601 </span><span class="spaces">  </span><span class="nottickedoff">pure TelegramBotApi</span>
+<span class="lineno">  602 </span><span class="spaces">    </span><span class="nottickedoff">{ tbaGetMe = validateToken mgr</span>
+<span class="lineno">  603 </span><span class="spaces">    </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  604 </span>
+<span class="lineno">  605 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  606 </span>-- VaultStore — seam over the vault for storing channel secrets
+<span class="lineno">  607 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  608 </span>
+<span class="lineno">  609 </span>-- | Build a 'VaultStore' from a 'VaultHandle'. 'vsStore' encodes the text
+<span class="lineno">  610 </span>-- to a ByteString and calls 'vhPut'; 'vsAvailable' checks that the vault
+<span class="lineno">  611 </span>-- is open (not locked) by calling 'vhStatus'.
+<span class="lineno">  612 </span>mkRealVaultStore :: Maybe Vault.VaultHandle -&gt; IO VaultStore
+<span class="lineno">  613 </span><span class="decl"><span class="nottickedoff">mkRealVaultStore mVh = pure $ case mVh of</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="nottickedoff">Nothing -&gt; noVaultStore</span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="nottickedoff">Just vh -&gt; VaultStore</span>
+<span class="lineno">  616 </span><span class="spaces">    </span><span class="nottickedoff">{ vsStore = \key val -&gt; do</span>
+<span class="lineno">  617 </span><span class="spaces">        </span><span class="nottickedoff">r &lt;- Vault.vhPut vh key val</span>
+<span class="lineno">  618 </span><span class="spaces">        </span><span class="nottickedoff">pure $ case r of</span>
+<span class="lineno">  619 </span><span class="spaces">          </span><span class="nottickedoff">Right () -&gt; Right ()</span>
+<span class="lineno">  620 </span><span class="spaces">          </span><span class="nottickedoff">Left err -&gt; Left (T.pack (show err))</span>
+<span class="lineno">  621 </span><span class="spaces">    </span><span class="nottickedoff">, vsAvailable = do</span>
+<span class="lineno">  622 </span><span class="spaces">        </span><span class="nottickedoff">st &lt;- Vault.vhStatus vh</span>
+<span class="lineno">  623 </span><span class="spaces">        </span><span class="nottickedoff">pure (not (Vault.vsLocked st))</span>
+<span class="lineno">  624 </span><span class="spaces">    </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  625 </span>
+<span class="lineno">  626 </span>-- | A 'VaultStore' that is never available (no vault configured). The
+<span class="lineno">  627 </span>-- wizard shows a &quot;set up the vault first&quot; message when this is used.
+<span class="lineno">  628 </span>noVaultStore :: VaultStore
+<span class="lineno">  629 </span><span class="decl"><span class="nottickedoff">noVaultStore = VaultStore</span>
+<span class="lineno">  630 </span><span class="spaces">  </span><span class="nottickedoff">{ vsStore = \_ _ -&gt; pure (Left &quot;vault not configured&quot;)</span>
+<span class="lineno">  631 </span><span class="spaces">  </span><span class="nottickedoff">, vsAvailable = pure False</span>
+<span class="lineno">  632 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  633 </span>
+<span class="lineno">  634 </span>-- | Perform the @getMe@ request and extract the bot username. Returns
+<span class="lineno">  635 </span>-- 'GetMeOk' with the username (without the leading @) on success,
+<span class="lineno">  636 </span>-- 'GetMeFailed' with a diagnostic otherwise.
+<span class="lineno">  637 </span>validateToken :: Manager -&gt; Text -&gt; IO GetMeOutcome
+<span class="lineno">  638 </span><span class="decl"><span class="nottickedoff">validateToken mgr token = do</span>
+<span class="lineno">  639 </span><span class="spaces">  </span><span class="nottickedoff">let url = &quot;https://api.telegram.org/bot&quot; &lt;&gt; T.unpack token &lt;&gt; &quot;/getMe&quot;</span>
+<span class="lineno">  640 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException (parseRequest url)</span>
+<span class="lineno">  641 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  642 </span><span class="spaces">    </span><span class="nottickedoff">Left ex -&gt; pure (GetMeFailed (&quot;request error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  643 </span><span class="spaces">    </span><span class="nottickedoff">Right req -&gt; do</span>
+<span class="lineno">  644 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  645 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  646 </span><span class="spaces">        </span><span class="nottickedoff">Left ex -&gt; pure (GetMeFailed (&quot;network error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  647 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt;</span>
+<span class="lineno">  648 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  649 </span><span class="spaces">              </span><span class="nottickedoff">body = decodeUtf8 (BL.toStrict (responseBody resp))</span>
+<span class="lineno">  650 </span><span class="spaces">          </span><span class="nottickedoff">in if code == 200</span>
+<span class="lineno">  651 </span><span class="spaces">               </span><span class="nottickedoff">then case extractUsername body of</span>
+<span class="lineno">  652 </span><span class="spaces">                 </span><span class="nottickedoff">Just u  -&gt; pure (GetMeOk u)</span>
+<span class="lineno">  653 </span><span class="spaces">                 </span><span class="nottickedoff">Nothing -&gt; pure (GetMeFailed &quot;could not parse username from getMe response&quot;)</span>
+<span class="lineno">  654 </span><span class="spaces">               </span><span class="nottickedoff">else pure (GetMeFailed (&quot;getMe returned HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; body))</span></span>
+<span class="lineno">  655 </span>
+<span class="lineno">  656 </span>-- | Extract the @\&quot;username\&quot;@ field value from a getMe JSON response body
+<span class="lineno">  657 </span>-- via a lightweight text scan: find @\&quot;username\&quot;@ then the next quoted
+<span class="lineno">  658 </span>-- string. The Bot API response shape is stable: @{&quot;ok&quot;:true,&quot;result&quot;:{&quot;id&quot;:...,&quot;is_bot&quot;:true,&quot;first_name&quot;:&quot;...&quot;,&quot;username&quot;:&quot;...&quot;}}@.
+<span class="lineno">  659 </span>-- Returns the username without the leading @.
+<span class="lineno">  660 </span>extractUsername :: Text -&gt; Maybe Text
+<span class="lineno">  661 </span><span class="decl"><span class="nottickedoff">extractUsername body = do</span>
+<span class="lineno">  662 </span><span class="spaces">  </span><span class="nottickedoff">let key = &quot;\&quot;username\&quot;&quot;</span>
+<span class="lineno">  663 </span><span class="spaces">      </span><span class="nottickedoff">afterKey = T.dropWhile (`notElem` (&quot;\&quot;&quot; :: String))</span>
+<span class="lineno">  664 </span><span class="spaces">                   </span><span class="nottickedoff">(T.drop (T.length key)</span>
+<span class="lineno">  665 </span><span class="spaces">                           </span><span class="nottickedoff">(snd (T.breakOn key body)))</span>
+<span class="lineno">  666 </span><span class="spaces">  </span><span class="nottickedoff">-- afterKey starts with &quot;username-value&quot;..., drop the leading quote</span>
+<span class="lineno">  667 </span><span class="spaces">  </span><span class="nottickedoff">case T.uncons (T.drop 1 afterKey) of</span>
+<span class="lineno">  668 </span><span class="spaces">    </span><span class="nottickedoff">Just (_, rest) -&gt;</span>
+<span class="lineno">  669 </span><span class="spaces">      </span><span class="nottickedoff">let val = T.takeWhile (/= '&quot;') rest</span>
+<span class="lineno">  670 </span><span class="spaces">      </span><span class="nottickedoff">in if T.null val then Nothing else Just val</span>
+<span class="lineno">  671 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; Nothing</span></span>
+<span class="lineno">  672 </span>
+<span class="lineno">  673 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  674 </span>-- runLink — signal-cli link subprocess
+<span class="lineno">  675 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  676 </span>runLink :: (Text -&gt; IO ()) -&gt; IO LinkOutcome
+<span class="lineno">  677 </span><span class="decl"><span class="nottickedoff">runLink onUri =</span>
+<span class="lineno">  678 </span><span class="spaces">  </span><span class="nottickedoff">withCreateProcess</span>
+<span class="lineno">  679 </span><span class="spaces">    </span><span class="nottickedoff">( (proc &quot;signal-cli&quot; [&quot;link&quot;, &quot;-n&quot;, &quot;Seal&quot;])</span>
+<span class="lineno">  680 </span><span class="spaces">        </span><span class="nottickedoff">{ std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">  681 </span><span class="spaces">    </span><span class="nottickedoff">) $ \_ mOut mErr ph -&gt; do</span>
+<span class="lineno">  682 </span><span class="spaces">      </span><span class="nottickedoff">let stderrH = fromMaybe (error &quot;runLink: no stderr handle&quot;) mErr</span>
+<span class="lineno">  683 </span><span class="spaces">          </span><span class="nottickedoff">stdoutH = fromMaybe (error &quot;runLink: no stdout handle&quot;) mOut</span>
+<span class="lineno">  684 </span><span class="spaces">      </span><span class="nottickedoff">hSetBuffering stderrH LineBuffering</span>
+<span class="lineno">  685 </span><span class="spaces">      </span><span class="nottickedoff">hSetBuffering stdoutH LineBuffering</span>
+<span class="lineno">  686 </span><span class="spaces">      </span><span class="nottickedoff">mUri &lt;- readUntilLink stdoutH stderrH</span>
+<span class="lineno">  687 </span><span class="spaces">      </span><span class="nottickedoff">case mUri of</span>
+<span class="lineno">  688 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; do</span>
+<span class="lineno">  689 </span><span class="spaces">          </span><span class="nottickedoff">_ &lt;- waitForProcess ph</span>
+<span class="lineno">  690 </span><span class="spaces">          </span><span class="nottickedoff">pure (LinkFailed &quot;no sgnl:// URI found in signal-cli link output&quot;)</span>
+<span class="lineno">  691 </span><span class="spaces">        </span><span class="nottickedoff">Just uri -&gt; do</span>
+<span class="lineno">  692 </span><span class="spaces">          </span><span class="nottickedoff">onUri uri</span>
+<span class="lineno">  693 </span><span class="spaces">          </span><span class="nottickedoff">ec &lt;- waitForProcess ph</span>
+<span class="lineno">  694 </span><span class="spaces">          </span><span class="nottickedoff">case ec of</span>
+<span class="lineno">  695 </span><span class="spaces">            </span><span class="nottickedoff">ExitSuccess -&gt; pure (LinkSucceeded uri)</span>
+<span class="lineno">  696 </span><span class="spaces">            </span><span class="nottickedoff">_ -&gt; do</span>
+<span class="lineno">  697 </span><span class="spaces">              </span><span class="nottickedoff">-- Read all remaining stderr (signal-cli emits many debug log</span>
+<span class="lineno">  698 </span><span class="spaces">              </span><span class="nottickedoff">-- lines before the &quot;Connection closed!&quot; error; a single</span>
+<span class="lineno">  699 </span><span class="spaces">              </span><span class="nottickedoff">-- hGetLine would miss it). Process has exited so the handle</span>
+<span class="lineno">  700 </span><span class="spaces">              </span><span class="nottickedoff">-- is at EOF — hGetContents returns immediately.</span>
+<span class="lineno">  701 </span><span class="spaces">              </span><span class="nottickedoff">errRest &lt;- BS.hGetContents stderrH</span>
+<span class="lineno">  702 </span><span class="spaces">              </span><span class="nottickedoff">let errText = decodeUtf8 errRest</span>
+<span class="lineno">  703 </span><span class="spaces">              </span><span class="nottickedoff">if &quot;Connection closed&quot; `T.isInfixOf` errText</span>
+<span class="lineno">  704 </span><span class="spaces">                </span><span class="nottickedoff">then pure LinkTimedOut</span>
+<span class="lineno">  705 </span><span class="spaces">                </span><span class="nottickedoff">else pure (LinkFailed (T.strip errText))</span></span>
+<span class="lineno">  706 </span>
+<span class="lineno">  707 </span>-- | Read lines from stdout then stderr looking for a @sgnl:\/\/@ URI. Max
+<span class="lineno">  708 </span>-- 50 lines to prevent an infinite loop on a misbehaving signal-cli.
+<span class="lineno">  709 </span>readUntilLink :: Handle -&gt; Handle -&gt; IO (Maybe Text)
+<span class="lineno">  710 </span><span class="decl"><span class="nottickedoff">readUntilLink stdoutH stderrH = go (50 :: Int)</span>
+<span class="lineno">  711 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  712 </span><span class="spaces">    </span><span class="nottickedoff">go 0 = pure Nothing</span>
+<span class="lineno">  713 </span><span class="spaces">    </span><span class="nottickedoff">go n = do</span>
+<span class="lineno">  714 </span><span class="spaces">      </span><span class="nottickedoff">lineResult &lt;- try @IOException (hGetLine stdoutH)</span>
+<span class="lineno">  715 </span><span class="spaces">      </span><span class="nottickedoff">case lineResult of</span>
+<span class="lineno">  716 </span><span class="spaces">        </span><span class="nottickedoff">Right line -&gt;</span>
+<span class="lineno">  717 </span><span class="spaces">          </span><span class="nottickedoff">let t = T.pack line</span>
+<span class="lineno">  718 </span><span class="spaces">          </span><span class="nottickedoff">in if &quot;sgnl://&quot; `T.isInfixOf` t</span>
+<span class="lineno">  719 </span><span class="spaces">             </span><span class="nottickedoff">then pure (Just (T.strip t))</span>
+<span class="lineno">  720 </span><span class="spaces">             </span><span class="nottickedoff">else go (n - 1)</span>
+<span class="lineno">  721 </span><span class="spaces">        </span><span class="nottickedoff">Left _ -&gt; do</span>
+<span class="lineno">  722 </span><span class="spaces">          </span><span class="nottickedoff">errResult &lt;- try @IOException (hGetLine stderrH)</span>
+<span class="lineno">  723 </span><span class="spaces">          </span><span class="nottickedoff">case errResult of</span>
+<span class="lineno">  724 </span><span class="spaces">            </span><span class="nottickedoff">Right line -&gt;</span>
+<span class="lineno">  725 </span><span class="spaces">              </span><span class="nottickedoff">let t = T.pack line</span>
+<span class="lineno">  726 </span><span class="spaces">              </span><span class="nottickedoff">in if &quot;sgnl://&quot; `T.isInfixOf` t</span>
+<span class="lineno">  727 </span><span class="spaces">                 </span><span class="nottickedoff">then pure (Just (T.strip t))</span>
+<span class="lineno">  728 </span><span class="spaces">                 </span><span class="nottickedoff">else go (n - 1)</span>
+<span class="lineno">  729 </span><span class="spaces">            </span><span class="nottickedoff">Left _ -&gt; pure Nothing</span></span>
+<span class="lineno">  730 </span>
+<span class="lineno">  731 </span>-- | Read a process's stdout/stderr as 'ByteString' and wait for it. Mirrors
+<span class="lineno">  732 </span>-- 'Seal.Vault.Backend.readProcessNoInput' (kept local to avoid a cross-
+<span class="lineno">  733 </span>-- module dependency for one helper).
+<span class="lineno">  734 </span>readProcessNoInput :: FilePath -&gt; [String] -&gt; IO (ExitCode, ByteString, ByteString)
+<span class="lineno">  735 </span><span class="decl"><span class="istickedoff">readProcessNoInput cmdPath args =</span>
+<span class="lineno">  736 </span><span class="spaces">  </span><span class="istickedoff">withCreateProcess</span>
+<span class="lineno">  737 </span><span class="spaces">    </span><span class="istickedoff">( (proc cmdPath args)</span>
+<span class="lineno">  738 </span><span class="spaces">        </span><span class="istickedoff">{ std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">  739 </span><span class="spaces">    </span><span class="istickedoff">) $ <span class="nottickedoff">\_ mOut mErr ph -&gt; do</span></span>
+<span class="lineno">  740 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(hOut, hErr) &lt;- case (mOut, mErr) of</span></span>
+<span class="lineno">  741 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(Just a, Just b) -&gt; pure (a, b)</span></span>
+<span class="lineno">  742 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; error &quot;readProcessNoInput: pipe creation failed (unreachable)&quot;</span></span>
+<span class="lineno">  743 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">out &lt;- BS.hGetContents hOut</span></span>
+<span class="lineno">  744 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">err &lt;- BS.hGetContents hErr</span></span>
+<span class="lineno">  745 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">ec  &lt;- waitForProcess ph</span></span>
+<span class="lineno">  746 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let !_ = BS.length out</span></span>
+<span class="lineno">  747 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">!_ = BS.length err</span></span>
+<span class="lineno">  748 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (ec, out, err)</span></span></span>
+<span class="lineno">  749 </span>
+<span class="lineno">  750 </span>decodeUtf8 :: ByteString -&gt; Text
+<span class="lineno">  751 </span><span class="decl"><span class="nottickedoff">decodeUtf8 = decodeUtf8With lenientDecode</span></span>
+<span class="lineno">  752 </span>
+<span class="lineno">  753 </span>-- | Render a @sgnl:\/\/@ URI (or any text) as an ANSI QR code by shelling out
+<span class="lineno">  754 </span>-- to @qrencode -t ANSIUTF8@. Returns 'Nothing' if @qrencode@ is not installed
+<span class="lineno">  755 </span>-- or exits non-zero, so the wizard can fall back to showing the raw URI. The
+<span class="lineno">  756 </span>-- QR is emitted immediately (before the 60s scan window opens) so the user
+<span class="lineno">  757 </span>-- has the full window to scan it.
+<span class="lineno">  758 </span>renderQR :: Text -&gt; IO (Maybe Text)
+<span class="lineno">  759 </span><span class="decl"><span class="istickedoff">renderQR uri = do</span>
+<span class="lineno">  760 </span><span class="spaces">  </span><span class="istickedoff">eResult &lt;- try @IOException $</span>
+<span class="lineno">  761 </span><span class="spaces">    </span><span class="istickedoff">readProcessNoInput &quot;qrencode&quot; [&quot;-t&quot;, &quot;ANSIUTF8&quot;, &quot;-o&quot;, &quot;-&quot;, T.unpack uri]</span>
+<span class="lineno">  762 </span><span class="spaces">  </span><span class="istickedoff">pure $ case eResult of</span>
+<span class="lineno">  763 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; Nothing</span>
+<span class="lineno">  764 </span><span class="spaces">    </span><span class="istickedoff">Right (ExitSuccess, out, _)</span>
+<span class="lineno">  765 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">not (BS.null out)</span> -&gt; <span class="nottickedoff">Just (T.strip (decodeUtf8 out))</span></span>
+<span class="lineno">  766 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  767 </span>
+<span class="lineno">  768 </span>-- | Extract the @source@ (sender phone number) from one
+<span class="lineno">  769 </span>-- @signal-cli receive --output=json@ envelope. The output is a JSON array of
+<span class="lineno">  770 </span>-- envelope objects (or a single object); each has @envelope.source@. Returns
+<span class="lineno">  771 </span>-- the first sender found, or 'Nothing' if the shape doesn't match.
+<span class="lineno">  772 </span>parseReceiveSender :: Text -&gt; Maybe Text
+<span class="lineno">  773 </span><span class="decl"><span class="nottickedoff">parseReceiveSender body =</span>
+<span class="lineno">  774 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode (BL.fromStrict (TE.encodeUtf8 body)) of</span>
+<span class="lineno">  775 </span><span class="spaces">    </span><span class="nottickedoff">Just (vals :: [A.Value]) -&gt; firstSource vals</span>
+<span class="lineno">  776 </span><span class="spaces">    </span><span class="nottickedoff">Nothing                  -&gt;</span>
+<span class="lineno">  777 </span><span class="spaces">      </span><span class="nottickedoff">case A.decode (BL.fromStrict (TE.encodeUtf8 body)) of</span>
+<span class="lineno">  778 </span><span class="spaces">        </span><span class="nottickedoff">Just (val :: A.Value) -&gt; sourceOf val</span>
+<span class="lineno">  779 </span><span class="spaces">        </span><span class="nottickedoff">Nothing              -&gt; Nothing</span>
+<span class="lineno">  780 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  781 </span><span class="spaces">    </span><span class="nottickedoff">sourceOf v = do</span>
+<span class="lineno">  782 </span><span class="spaces">      </span><span class="nottickedoff">o &lt;- asObject v</span>
+<span class="lineno">  783 </span><span class="spaces">      </span><span class="nottickedoff">env &lt;- KeyMap.lookup (Key.fromString &quot;envelope&quot;) o</span>
+<span class="lineno">  784 </span><span class="spaces">      </span><span class="nottickedoff">envO &lt;- asObject env</span>
+<span class="lineno">  785 </span><span class="spaces">      </span><span class="nottickedoff">A.String src &lt;- KeyMap.lookup (Key.fromString &quot;source&quot;) envO</span>
+<span class="lineno">  786 </span><span class="spaces">      </span><span class="nottickedoff">Just src</span>
+<span class="lineno">  787 </span><span class="spaces">    </span><span class="nottickedoff">firstSource = foldr (\v acc -&gt; sourceOf v &lt;|&gt; acc) Nothing</span>
+<span class="lineno">  788 </span><span class="spaces">    </span><span class="nottickedoff">asObject (A.Object o) = Just o</span>
+<span class="lineno">  789 </span><span class="spaces">    </span><span class="nottickedoff">asObject _            = Nothing</span></span>
+
+</pre>
+</body>
+</html>

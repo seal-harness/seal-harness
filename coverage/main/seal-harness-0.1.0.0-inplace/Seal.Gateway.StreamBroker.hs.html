@@ -1,0 +1,208 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The in-process broker that fans 'BrokerEvent's to every subscribed WS
+<span class="lineno">    2 </span>-- connection, filtering by each connection's focused session. STM-backed:
+<span class="lineno">    3 </span>-- a 'TVar' of subscribers + a global cap.
+<span class="lineno">    4 </span>module Seal.Gateway.StreamBroker
+<span class="lineno">    5 </span>  ( BrokerEvent (..)
+<span class="lineno">    6 </span>  , Subscriber (..)
+<span class="lineno">    7 </span>  , StreamBroker (..)
+<span class="lineno">    8 </span>  , newStreamBroker
+<span class="lineno">    9 </span>  , subscribe
+<span class="lineno">   10 </span>  , updateSubscriberSession
+<span class="lineno">   11 </span>  , broadcast
+<span class="lineno">   12 </span>  , broadcastLists
+<span class="lineno">   13 </span>  , broadcastAgentDefsChanged
+<span class="lineno">   14 </span>  , broadcastSkillsChanged
+<span class="lineno">   15 </span>  , broadcastReposChanged
+<span class="lineno">   16 </span>  , subscriberCount
+<span class="lineno">   17 </span>  , thinkingSessions
+<span class="lineno">   18 </span>  , setThinking
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+<span class="lineno">   22 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   23 </span>import Control.Monad (when, filterM, forM_)
+<span class="lineno">   24 </span>import Data.Aeson (Value)
+<span class="lineno">   25 </span>import Data.Set (Set)
+<span class="lineno">   26 </span>import Data.Set qualified as Set
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | One event the broker fans out to subscribers.
+<span class="lineno">   31 </span>data BrokerEvent
+<span class="lineno">   32 </span>  = BeEntryRecorded SessionId Value   -- ^ a transcript entry (the JSON the WS peer receives)
+<span class="lineno">   33 </span>  | BeEntryUpdate SessionId Value      -- ^ a streaming entry whose text is still growing (the WS peer renders as an @entry-update@ event, replacing the in-place entry by id)
+<span class="lineno">   34 </span>  | BeHarnessStatus Value             -- ^ a harness liveness change
+<span class="lineno">   35 </span>  | BeListsSnapshot Value             -- ^ a refreshed tab/session snapshot
+<span class="lineno">   36 </span>  | BeAsk SessionId Value             -- ^ a pending human-question from ASK_HUMAN (the JSON the WS peer renders)
+<span class="lineno">   37 </span>  | BeAskResolved SessionId Value      -- ^ a pending question was answered/cancelled (the JSON carries the ask id)
+<span class="lineno">   38 </span>  | BeActivity SessionId Value          -- ^ a per-session activity signal (harness-status / reply-delivered) the WS peer renders as an @activity@ envelope
+<span class="lineno">   39 </span>  | BeAgentDefsChanged                 -- ^ agent defs were created/updated/deleted; clients should re-fetch
+<span class="lineno">   40 </span>  | BeSkillsChanged                    -- ^ skills were created/updated/deleted; clients should re-fetch
+<span class="lineno">   41 </span>  | BeReposChanged                     -- ^ the source-control repo registry was mutated; clients should re-fetch /api/repos
+<span class="lineno">   42 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | The per-subscriber state: the focused session (via an 'TVar' so the
+<span class="lineno">   45 </span>-- connection thread can update it on focus without re-subscribing), a
+<span class="lineno">   46 </span>-- send action, and an optional close action. The close action is called
+<span class="lineno">   47 </span>-- when 'subSend' throws (dead connection) so the WS socket is actively
+<span class="lineno">   48 </span>-- closed — this triggers the client's @onclose@ handler and reconnect
+<span class="lineno">   49 </span>-- rather than leaving a zombie connection that never receives another
+<span class="lineno">   50 </span>-- event but also never detects the failure.
+<span class="lineno">   51 </span>data Subscriber = Subscriber
+<span class="lineno">   52 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">subSessionRef</span></span></span> :: TVar SessionId
+<span class="lineno">   53 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">subSend</span></span></span>       :: BrokerEvent -&gt; IO ()
+<span class="lineno">   54 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">subClose</span></span></span>      :: IO ()
+<span class="lineno">   55 </span>  }
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | The in-process broker. STM-backed: a 'TVar' of subscribers + a global
+<span class="lineno">   58 </span>-- cap. Also tracks the set of sessions currently in a @thinking@ turn so
+<span class="lineno">   59 </span>-- a freshly-connected web client can hydrate its sidebar without waiting
+<span class="lineno">   60 </span>-- for the next harness-status event (which would only arrive at the next
+<span class="lineno">   61 </span>-- turn boundary — leaving a mid-turn refresh stuck on Idle).
+<span class="lineno">   62 </span>data StreamBroker = StreamBroker
+<span class="lineno">   63 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">sbSubs</span></span></span> :: TVar [Subscriber]
+<span class="lineno">   64 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sbCap</span></span></span> :: Int
+<span class="lineno">   65 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sbThinking</span></span></span> :: TVar (Set SessionId)
+<span class="lineno">   66 </span>  }
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Build a new broker with the given subscriber cap.
+<span class="lineno">   69 </span>newStreamBroker :: Int -&gt; IO StreamBroker
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">newStreamBroker cap =</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">StreamBroker &lt;$&gt; newTVarIO [] &lt;*&gt; pure cap &lt;*&gt; newTVarIO Set.empty</span></span>
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | Subscribe a new connection. If the global cap is exceeded, the subscribe
+<span class="lineno">   74 </span>-- is a no-op (the over-cap subscriber is never added — it should close).
+<span class="lineno">   75 </span>-- Returns the session 'TVar' so the caller can update the focused session
+<span class="lineno">   76 </span>-- via 'updateSubscriberSession' when the client sends a @focus@ op.
+<span class="lineno">   77 </span>--
+<span class="lineno">   78 </span>-- The @close@ action is called when the broker detects this subscriber's
+<span class="lineno">   79 </span>-- send has thrown (dead connection), so the WS socket is actively closed
+<span class="lineno">   80 </span>-- and the client reconnects. Pass @pure ()@ when no cleanup is needed
+<span class="lineno">   81 </span>-- (tests).
+<span class="lineno">   82 </span>subscribe :: StreamBroker -&gt; SessionId -&gt; (BrokerEvent -&gt; IO ()) -&gt; IO () -&gt; IO (TVar SessionId)
+<span class="lineno">   83 </span><span class="decl"><span class="istickedoff">subscribe broker session sendfn closefn = do</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">ref &lt;- newTVarIO session</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">subs &lt;- readTVar (sbSubs broker)</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">when (length subs &lt; sbCap broker) $</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">writeTVar (sbSubs broker) (subs &lt;&gt; [Subscriber ref sendfn closefn])</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">ref</span></span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | Update a subscriber's focused session. Called when the client sends a
+<span class="lineno">   92 </span>-- @focus@ op so subsequent 'BeEntryRecorded' events for the new session are
+<span class="lineno">   93 </span>-- delivered.
+<span class="lineno">   94 </span>updateSubscriberSession :: TVar SessionId -&gt; SessionId -&gt; IO ()
+<span class="lineno">   95 </span><span class="decl"><span class="nottickedoff">updateSubscriberSession ref sid = atomically (writeTVar ref sid)</span></span>
+<span class="lineno">   96 </span>
+<span class="lineno">   97 </span>-- | Fan one event to every subscriber whose focused session matches. For
+<span class="lineno">   98 </span>-- 'BeListsSnapshot' (a broadcast to all), every subscriber receives it
+<span class="lineno">   99 </span>-- regardless of focus.
+<span class="lineno">  100 </span>--
+<span class="lineno">  101 </span>-- A subscriber whose 'subSend' throws (e.g. a closed WebSocket connection
+<span class="lineno">  102 </span>-- raising 'Network.WebSockets.ConnectionClosed') is pruned from the
+<span class="lineno">  103 </span>-- subscriber list and its 'subClose' action is invoked. Closing the
+<span class="lineno">  104 </span>-- connection actively (rather than just silently removing it from the
+<span class="lineno">  105 </span>-- list) ensures the client's @onclose@ fires and it reconnects — without
+<span class="lineno">  106 </span>-- this, a dead connection would linger as a zombie: the reader loop is
+<span class="lineno">  107 </span>-- still alive, the client thinks it's connected, but no events arrive.
+<span class="lineno">  108 </span>-- The close action is best-effort (swallowed if it throws) so a failure
+<span class="lineno">  109 </span>-- during cleanup never propagates to the caller (e.g. a @seal serve@
+<span class="lineno">  110 </span>-- request thread running 'triggerBroadcast' after a slash command).
+<span class="lineno">  111 </span>broadcast :: StreamBroker -&gt; BrokerEvent -&gt; IO ()
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">broadcast broker event = do</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">subs &lt;- readTVarIO (sbSubs broker)</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">live &lt;- filterM (deliverTo event) subs</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">-- Drop any subscribers whose send threw (dead connections). Call their</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">-- close actions so the WS socket is actively closed and the client</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">-- reconnects. The length check avoids a needless STM write when everyone</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">-- survived.</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">when (length live &lt; length subs) $ do</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">let dead = filter (\s -&gt; subSessionRef s `notElem` map subSessionRef live) subs</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">forM_ dead $ \s -&gt; subClose s `catch` <span class="nottickedoff">\(_ :: SomeException) -&gt; pure ()</span></span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">atomically $ writeTVar (sbSubs broker) live</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">deliverTo ev s =</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">(do</span>
+<span class="lineno">  126 </span><span class="spaces">         </span><span class="istickedoff">ok &lt;- shouldSend ev s</span>
+<span class="lineno">  127 </span><span class="spaces">         </span><span class="istickedoff">if ok then subSend s ev &gt;&gt; pure True else pure True)</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">`catch` \(_e :: SomeException) -&gt; pure False</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">-- All-subscriber events vs session-filtered events.</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">-- BeActivity is ALL-subscriber: the sidebar renders tab status for</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">-- EVERY open tab, so a turn on a channel-originated session (e.g.</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">-- Telegram) must surface to a web client focused on a different</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">-- session. The activity envelope carries its own sessionId, so the</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">-- frontend's useSessionActivityStream keys it per-session without</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">-- relying on the broker's focus filter.</span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="istickedoff">shouldSend ev s = case ev of</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">BeListsSnapshot _  -&gt; pure True</span>
+<span class="lineno">  138 </span><span class="spaces">      </span><span class="istickedoff">BeHarnessStatus _  -&gt; <span class="nottickedoff">pure True</span></span>
+<span class="lineno">  139 </span><span class="spaces">      </span><span class="istickedoff">BeActivity _ _      -&gt; pure True</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">BeAgentDefsChanged  -&gt; <span class="nottickedoff">pure True</span></span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">BeSkillsChanged     -&gt; <span class="nottickedoff">pure True</span></span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">BeReposChanged      -&gt; <span class="nottickedoff">pure True</span></span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">BeEntryRecorded sid _ -&gt; matchSession s sid</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">BeEntryUpdate sid _   -&gt; matchSession s sid</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">BeAsk sid _          -&gt; <span class="nottickedoff">matchSession s sid</span></span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">BeAskResolved sid _  -&gt; <span class="nottickedoff">matchSession s sid</span></span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">matchSession s sid = do</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">subSid &lt;- readTVarIO (subSessionRef s)</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">pure (subSid == sid)</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>-- | Push a refreshed tab/session snapshot to every connection.
+<span class="lineno">  152 </span>broadcastLists :: StreamBroker -&gt; Value -&gt; IO ()
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">broadcastLists broker snap = broadcast broker (BeListsSnapshot snap)</span></span>
+<span class="lineno">  154 </span>-- | Push an @agent-defs-changed@ invalidation signal to every connection.
+<span class="lineno">  155 </span>-- All subscribers receive it (agent defs are not session-scoped).
+<span class="lineno">  156 </span>broadcastAgentDefsChanged :: StreamBroker -&gt; IO ()
+<span class="lineno">  157 </span><span class="decl"><span class="nottickedoff">broadcastAgentDefsChanged broker = broadcast broker BeAgentDefsChanged</span></span>
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- | Push a @skills-changed@ invalidation signal to every connection.
+<span class="lineno">  160 </span>-- All subscribers receive it (skills are not session-scoped).
+<span class="lineno">  161 </span>broadcastSkillsChanged :: StreamBroker -&gt; IO ()
+<span class="lineno">  162 </span><span class="decl"><span class="nottickedoff">broadcastSkillsChanged broker = broadcast broker BeSkillsChanged</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | Push a @repos-changed@ invalidation signal to every connection.
+<span class="lineno">  165 </span>-- All subscribers receive it (the repo registry is not session-scoped).
+<span class="lineno">  166 </span>broadcastReposChanged :: StreamBroker -&gt; IO ()
+<span class="lineno">  167 </span><span class="decl"><span class="nottickedoff">broadcastReposChanged broker = broadcast broker BeReposChanged</span></span>
+<span class="lineno">  168 </span>
+<span class="lineno">  169 </span>-- | The current subscriber count (for diagnostics / the global cap check).
+<span class="lineno">  170 </span>subscriberCount :: StreamBroker -&gt; IO Int
+<span class="lineno">  171 </span><span class="decl"><span class="istickedoff">subscriberCount broker = length &lt;$&gt; readTVarIO (sbSubs broker)</span></span>
+<span class="lineno">  172 </span>
+<span class="lineno">  173 </span>-- | Read the set of sessions currently in a @thinking@ turn. Used by the
+<span class="lineno">  174 </span>-- lists-snapshot builders to hydrate a freshly-connected web client's
+<span class="lineno">  175 </span>-- sidebar (so a mid-turn refresh does not blank the thinking indicator).
+<span class="lineno">  176 </span>thinkingSessions :: StreamBroker -&gt; IO (Set SessionId)
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">thinkingSessions broker = readTVarIO (sbThinking broker)</span></span>
+<span class="lineno">  178 </span>
+<span class="lineno">  179 </span>-- | Add ('True') or remove ('False') a session from the thinking set.
+<span class="lineno">  180 </span>-- Idempotent. Called by 'broadcastHarnessStatus' so the broker's
+<span class="lineno">  181 </span>-- in-memory state mirrors the events it fans out.
+<span class="lineno">  182 </span>setThinking :: StreamBroker -&gt; SessionId -&gt; Bool -&gt; IO ()
+<span class="lineno">  183 </span><span class="decl"><span class="istickedoff">setThinking broker sid thinking =</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">atomically $ modifyTVar' (sbThinking broker)</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">(\s -&gt; if thinking then Set.insert sid s else Set.delete sid s)</span></span>
+
+</pre>
+</body>
+</html>

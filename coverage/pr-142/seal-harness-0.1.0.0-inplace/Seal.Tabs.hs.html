@@ -1,0 +1,188 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The thin TVar-backed handle that mutates a 'TabList' — the live state a
+<span class="lineno">    3 </span>-- tab command reads/writes. House style: a record of IO actions so the type
+<span class="lineno">    4 </span>-- is uniform between real and fake variants.
+<span class="lineno">    5 </span>module Seal.Tabs
+<span class="lineno">    6 </span>  ( TabsHandle (..)
+<span class="lineno">    7 </span>  , newTabsHandle
+<span class="lineno">    8 </span>  , newPersistingTabsHandle
+<span class="lineno">    9 </span>  , seedTabsHandle
+<span class="lineno">   10 </span>  , snapshotTabs
+<span class="lineno">   11 </span>  , insertTabH
+<span class="lineno">   12 </span>  , removeTabH
+<span class="lineno">   13 </span>  , renameTabH
+<span class="lineno">   14 </span>  , rebindTabH
+<span class="lineno">   15 </span>  , focusTabH
+<span class="lineno">   16 </span>  , ensureTabForSession
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+<span class="lineno">   20 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Katip (Severity (..), ls)
+<span class="lineno">   25 </span>import Seal.Core.Types (SessionId, sessionIdText)
+<span class="lineno">   26 </span>import Seal.Handles.Tab (TabIndex, TabKind)
+<span class="lineno">   27 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   28 </span>import Seal.Tabs.Persist (saveTabList)
+<span class="lineno">   29 </span>import Seal.Tabs.Types
+<span class="lineno">   30 </span>  ( Tab (..), TabList (..), TabRef (..), emptyTabList, insertTab
+<span class="lineno">   31 </span>  , removeTab, renameTab, rebindTab, tabCount )
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>-- | The live tab-list handle. Backed by a 'TVar' so concurrent tab commands
+<span class="lineno">   34 </span>-- are race-safe (each operation is one STM transaction). The optional
+<span class="lineno">   35 </span>-- @thSave@ action is invoked after a successful mutation so the tab list
+<span class="lineno">   36 </span>-- persists to disk (W5); it's 'Nothing' for a plain 'newTabsHandle' and
+<span class="lineno">   37 </span>-- @Just (saveTabList path h)@ for 'newPersistingTabsHandle'.
+<span class="lineno">   38 </span>data TabsHandle = TabsHandle
+<span class="lineno">   39 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">thVar</span></span></span>  :: TVar TabList
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">thSave</span></span></span> :: Maybe (IO ())
+<span class="lineno">   41 </span>  }
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>newTabsHandle :: IO TabsHandle
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">newTabsHandle = TabsHandle &lt;$&gt; newTVarIO emptyTabList &lt;*&gt; pure Nothing</span></span>
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | Create a 'TabsHandle' that persists every mutation to @path@ (atomic
+<span class="lineno">   47 </span>-- write, 0600, MVar-serialized — see 'Seal.Tabs.Persist.saveTabList'). Used
+<span class="lineno">   48 </span>-- by 'Seal.Command.Serve.runServeMain' so the tab list survives a restart.
+<span class="lineno">   49 </span>newPersistingTabsHandle :: FilePath -&gt; IO TabsHandle
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">newPersistingTabsHandle path = do</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">tv &lt;- newTVarIO emptyTabList</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">let h = TabsHandle { thVar = tv, thSave = Just (snapshotTabs h &gt;&gt;= saveTabList path) }</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">pure h</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>snapshotTabs :: TabsHandle -&gt; IO TabList
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">snapshotTabs h = readTVarIO (thVar h)</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Replace the handle's 'TabList' in one STM transaction. Used at boot to
+<span class="lineno">   59 </span>-- seed the in-memory handle from the persisted @tabs.json@ (after the
+<span class="lineno">   60 </span>-- caller has dropped stale tabs + renumbered). Does NOT persist (the caller
+<span class="lineno">   61 </span>-- is loading FROM disk — writing back would be a redundant no-op).
+<span class="lineno">   62 </span>seedTabsHandle :: TabsHandle -&gt; TabList -&gt; IO ()
+<span class="lineno">   63 </span><span class="decl"><span class="nottickedoff">seedTabsHandle h tl = atomically (writeTVar (thVar h) tl)</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Insert a tab at the lowest free slot. 'Right' the new index; 'Left' on
+<span class="lineno">   66 </span>-- I2 (duplicate ref) or full. Persists via 'thSave' after a successful STM
+<span class="lineno">   67 </span>-- commit (W5).
+<span class="lineno">   68 </span>insertTabH :: TabsHandle -&gt; TabRef -&gt; TabKind -&gt; Maybe Text -&gt; IO (Either Text TabIndex)
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">insertTabH h ref kind label = do</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- atomically $ do</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">let tv = thVar h</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">tl &lt;- readTVar tv</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">case insertTab ref kind label tl of</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">Left e        -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">Right tl' -&gt; do</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">writeTVar tv tl'</span>
+<span class="lineno">   77 </span><span class="spaces">        </span><span class="istickedoff">case tlTabs tl' of</span>
+<span class="lineno">   78 </span><span class="spaces">          </span><span class="istickedoff">[]     -&gt; <span class="nottickedoff">pure (Left &quot;insert succeeded but list is empty (unreachable)&quot;)</span></span>
+<span class="lineno">   79 </span><span class="spaces">          </span><span class="istickedoff">(t:_)  -&gt; pure (Right (tIndex t))</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">persistIf h r</span></span>
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>-- | Remove a tab (compacts; I1). 'Left' if out of range. Persists on success.
+<span class="lineno">   83 </span>removeTabH :: TabsHandle -&gt; TabIndex -&gt; IO (Either Text ())
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">removeTabH h idx = do</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- atomically $ do</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">let tv = thVar h</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">tl &lt;- readTVar tv</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">case removeTab tl idx of</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">Left e       -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff">Right tl' -&gt; writeTVar tv tl' &gt;&gt; pure (Right <span class="nottickedoff">()</span>)</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">persistIf h r</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Rename a tab. 'Left' if the index is out of range. Persists on success.
+<span class="lineno">   94 </span>renameTabH :: TabsHandle -&gt; TabIndex -&gt; Text -&gt; IO (Either Text ())
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">renameTabH h idx name = do</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- atomically $ do</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">let tv = thVar h</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">tl &lt;- readTVar tv</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">case renameTab tl idx name of</span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">Left e       -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff">Right tl' -&gt; writeTVar tv tl' &gt;&gt; pure (Right <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">persistIf h r</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Rebind a tab's 'TabRef' in place (preserves index/kind/label/status;
+<span class="lineno">  105 </span>-- used by @\/new@). 'Left' on out-of-range index or I2 violation (the new
+<span class="lineno">  106 </span>-- ref is already bound to a different tab). Rebind-to-same-ref is a no-op
+<span class="lineno">  107 </span>-- 'Right'. Single STM transaction — race-safe vs concurrent tab ops.
+<span class="lineno">  108 </span>-- Persists on success (W5).
+<span class="lineno">  109 </span>rebindTabH :: TabsHandle -&gt; TabIndex -&gt; TabRef -&gt; IO (Either Text ())
+<span class="lineno">  110 </span><span class="decl"><span class="istickedoff">rebindTabH h idx newRef = do</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- atomically $ do</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">let tv = thVar h</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">tl &lt;- readTVar tv</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">case rebindTab idx newRef tl of</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">Left e       -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">Right tl' -&gt; writeTVar tv tl' &gt;&gt; pure (Right <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">persistIf h r</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Focus a tab: validates the index is in range. 'Right ()' on success;
+<span class="lineno">  120 </span>-- 'Left' if out of range. (The actual cursor state is per-conversation and
+<span class="lineno">  121 </span>-- tracked by the relay/wiring; this just validates the index.) No persist
+<span class="lineno">  122 </span>-- (focus is a pure validation — no state change).
+<span class="lineno">  123 </span>focusTabH :: TabsHandle -&gt; TabIndex -&gt; IO (Either Text ())
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">focusTabH h idx = atomically $ do</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">let tv = thVar h</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">tl &lt;- readTVar tv</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">if tabCount tl &gt; 0 &amp;&amp; idx `elem` map tIndex (tlTabs tl)</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right <span class="nottickedoff">()</span>)</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">else pure (Left <span class="nottickedoff">&quot;tab index out of range&quot;</span>)</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Run the persist action (if any) after a successful mutation, returning
+<span class="lineno">  132 </span>-- the original result. A 'Left' outcome (mutation rejected) is a no-op for
+<span class="lineno">  133 </span>-- the save. A save failure is logged to stderr (ids + error only — no
+<span class="lineno">  134 </span>-- session content) and swallowed — the in-memory handle stays authoritative
+<span class="lineno">  135 </span>-- within the session; the next successful mutation will retry the save
+<span class="lineno">  136 </span>-- (writing the full current list, so a missed save self-heals).
+<span class="lineno">  137 </span>persistIf :: TabsHandle -&gt; Either a b -&gt; IO (Either a b)
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">persistIf h r = do</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">case r of</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">Left _  -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; case thSave h of</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">Nothing  -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">Just act -&gt; act `catch` <span class="nottickedoff">\e -&gt; globalLogIO WarningS (&quot;[persist] tabs.json save failed: &quot; &lt;&gt; ls (T.pack (show (e :: SomeException))))</span></span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">pure r</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- | Idempotent: if no tab binds @sid@, insert a @'BoundSession' sid@ tab of
+<span class="lineno">  147 </span>-- the given kind at the lowest free slot. Sources the 'SessionId' only from
+<span class="lineno">  148 </span>-- server-validated contexts (the caller passes @smId meta@ from a
+<span class="lineno">  149 </span>-- 'SessionMeta' loaded by 'loadSessionMeta' / minted by 'newSession' — never
+<span class="lineno">  150 </span>-- a raw client string). Failure (@Left &quot;tab list full (36 slots)&quot;@ or
+<span class="lineno">  151 </span>-- @Left &quot;tab ref already bound&quot;@ from a concurrent insert) is logged to
+<span class="lineno">  152 </span>-- stderr (ids + error only — no session content) and does NOT propagate;
+<span class="lineno">  153 </span>-- the tab is a UI affordance, not a correctness requirement. Shared by the
+<span class="lineno">  154 </span>-- web 'handleSend' (W2) and the channel/CLI 'plainTurn' paths (W3).
+<span class="lineno">  155 </span>ensureTabForSession :: TabsHandle -&gt; TabKind -&gt; SessionId -&gt; IO ()
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">ensureTabForSession tabsH kind sid = do</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">tl &lt;- snapshotTabs tabsH</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">let alreadyBound = any (\t -&gt; tRef t == BoundSession sid) (tlTabs tl)</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">if alreadyBound</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">then pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">r &lt;- insertTabH tabsH (BoundSession sid) <span class="nottickedoff">kind</span> <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">case r of</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">globalLogIO WarningS (&quot;[auto-tab] could not insert tab for &quot; &lt;&gt; ls (sessionIdText sid) &lt;&gt; &quot;: &quot; &lt;&gt; ls e)</span></span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; pure <span class="nottickedoff">()</span></span></span>
+
+</pre>
+</body>
+</html>

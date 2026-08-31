@@ -1,0 +1,348 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @seal telegram@ startup wiring: spawn the Telegram channel + run
+<span class="lineno">    3 </span>-- the agent loop against it, parallel to @seal signal@. Reuses the shared
+<span class="lineno">    4 </span>-- 'Seal.Channels.Loop.runChannelLoop' + 'plainTurn' so the agent loop is
+<span class="lineno">    5 </span>-- identical; the difference is the channel is Telegram (Bot API long-poll)
+<span class="lineno">    6 </span>-- instead of Signal (signal-cli subprocess). 'aeMessageSource' is
+<span class="lineno">    7 </span>-- @Just ms@ so the transcript records the channel + conversation id.
+<span class="lineno">    8 </span>module Seal.Channels.Telegram.Run
+<span class="lineno">    9 </span>  ( runTelegram
+<span class="lineno">   10 </span>  , runTelegramMain
+<span class="lineno">   11 </span>  , mkTelegramHandleCaps
+<span class="lineno">   12 </span>  , onTelegramCallback
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Data.Char (isDigit)
+<span class="lineno">   16 </span>import Data.Either (fromRight)
+<span class="lineno">   17 </span>import Data.IORef (newIORef)
+<span class="lineno">   18 </span>import Data.Default (def)
+<span class="lineno">   19 </span>import Data.Foldable (for_)
+<span class="lineno">   20 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   24 </span>import Data.Text.Read qualified as TR (decimal)
+<span class="lineno">   25 </span>import Data.Vector qualified as V
+<span class="lineno">   26 </span>import Network.HTTP.Client.TLS (newTlsManager)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Katip (Severity (..), ls)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   31 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   32 </span>import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
+<span class="lineno">   33 </span>import Seal.Handles.AskReply
+<span class="lineno">   34 </span>  ( AskId, AskReplyStore, newApprovalCache, newAskReplyStore
+<span class="lineno">   35 </span>  , deliverAnswer, AskReply (..), ApprovalScope (..), findByAskIdPrefix
+<span class="lineno">   36 </span>  , askHumanWithOptions, askIdText, pendingForSession, pqiId, pqiOptions
+<span class="lineno">   37 </span>  , QuestionOption (..), formatQuestionWithOptions )
+<span class="lineno">   38 </span>import Seal.Handles.Channel (ChannelHandle (..))
+<span class="lineno">   39 </span>import Seal.Channels.Telegram.Transport
+<span class="lineno">   40 </span>  ( TelegramTransport (..), TelegramButton (..), mkRealTelegramTransport, tgSetCommands )
+<span class="lineno">   41 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   42 </span>import Seal.Channels.Telegram (withTelegramChannel)
+<span class="lineno">   43 </span>import Seal.Channels.Telegram.Commands (telegramBotCommands)
+<span class="lineno">   44 </span>import Seal.Channel.Cli (Backends (..), newBackends)
+<span class="lineno">   45 </span>import Seal.Command.Channel
+<span class="lineno">   46 </span>  ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
+<span class="lineno">   47 </span>  , mkRealTelegramBotApi, mkRealVaultStore )
+<span class="lineno">   48 </span>import Seal.Command.Provider (ProviderRuntime (..))
+<span class="lineno">   49 </span>import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
+<span class="lineno">   50 </span>import Seal.Command.Spec (Registry, mkRegistry)
+<span class="lineno">   51 </span>import Seal.Command.Model (mkModelTranscriptWriter)
+<span class="lineno">   52 </span>import Seal.Command.Stop (mkStopTranscriptWriter)
+<span class="lineno">   53 </span>import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+<span class="lineno">   54 </span>import Seal.Config.Migrate (migrateSecurityConfig)
+<span class="lineno">   55 </span>import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+<span class="lineno">   56 </span>import Seal.Config.Paths
+<span class="lineno">   57 </span>  ( SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths
+<span class="lineno">   58 </span>  , reposFilePath, securityFilePath, vaultFilePath )
+<span class="lineno">   59 </span>import Seal.Core.AllowList (AllowList)
+<span class="lineno">   60 </span>import Seal.Core.MessageSource (UserId)
+<span class="lineno">   61 </span>import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+<span class="lineno">   62 </span>import Seal.Harness.Registry qualified
+<span class="lineno">   63 </span>import Seal.Harness.Tmux qualified
+<span class="lineno">   64 </span>import Seal.Ingest (PreprocessChain, emptyChain)
+<span class="lineno">   65 </span>import Seal.Channels.Cursor
+<span class="lineno">   66 </span>  ( newPersistingCursorStore, seedCursorStore )
+<span class="lineno">   67 </span>import Seal.Channels.Cursor.Persist (loadCursorMap)
+<span class="lineno">   68 </span>import Seal.Security.Policy (AutonomyLevel)
+<span class="lineno">   69 </span>import Seal.SourceControl.Registry (mkRepoRegistryHandle)
+<span class="lineno">   70 </span>import Seal.Security.Vault qualified as Vault
+<span class="lineno">   71 </span>import Seal.Session.Store (SessionRuntime (..), initSession)
+<span class="lineno">   72 </span>import Seal.Tabs (newTabsHandle)
+<span class="lineno">   73 </span>import Seal.Telegram.Config
+<span class="lineno">   74 </span>  ( TelegramToken (..), resolveTelegramConfig, telegramTokenText
+<span class="lineno">   75 </span>  , telegramVaultKey )
+<span class="lineno">   76 </span>import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+<span class="lineno">   77 </span>import Seal.Vault.Commands (VaultRuntime (..))
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Spawn the real Telegram transport, resolve the token + chunk limit +
+<span class="lineno">   80 </span>-- allow-list, and run the agent loop against the Telegram channel. Fails
+<span class="lineno">   81 </span>-- fast with a stderr diagnostic if the token is unresolved or the Bot API
+<span class="lineno">   82 </span>-- is unreachable.
+<span class="lineno">   83 </span>runTelegram
+<span class="lineno">   84 </span>  :: ChannelDeps -&gt; Registry -&gt; PreprocessChain
+<span class="lineno">   85 </span>  -&gt; (TelegramToken, Int, AllowList UserId)
+<span class="lineno">   86 </span>  -&gt; AskReplyStore
+<span class="lineno">   87 </span>  -&gt; IO ()
+<span class="lineno">   88 </span><span class="decl"><span class="nottickedoff">runTelegram deps registry chain (token, chunkLimit, allow) askReply = do</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="nottickedoff">let mgr = prManager (cdProvider deps)</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="nottickedoff">transport &lt;- mkRealTelegramTransport (telegramTokenText token) mgr</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="nottickedoff">-- Register the bot's slash-command menu with BotFather for auto-completion.</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="nottickedoff">tgSetCommands transport (telegramBotCommands registry)</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="nottickedoff">let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="nottickedoff">plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="nottickedoff">tabsH &lt;- newTabsHandle</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="nottickedoff">runChannelLoop deps withCh plainHandler registry chain askReply tabsH</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="nottickedoff">(Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply))</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Full @seal telegram@ startup wiring: paths -&gt; config -&gt; vault -&gt; session
+<span class="lineno">  100 </span>-- -&gt; backends -&gt; registry -&gt; spawn the Telegram channel -&gt; run the loop.
+<span class="lineno">  101 </span>-- Mirrors 'Seal.Channels.Signal.Run.runSignalMain' but drives the Telegram
+<span class="lineno">  102 </span>-- channel instead. Resolves the @[telegram]@ config section + an optional
+<span class="lineno">  103 </span>-- vault-supplied token; fails fast with a stderr diagnostic if the token is
+<span class="lineno">  104 </span>-- unresolved.
+<span class="lineno">  105 </span>runTelegramMain :: AutonomyLevel -&gt; SealLogger -&gt; IO ()
+<span class="lineno">  106 </span><span class="decl"><span class="nottickedoff">runTelegramMain autonomy logger = do</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="nottickedoff">paths &lt;- getSealPaths</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="nottickedoff">ensureSealDirs paths</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="nottickedoff">migrateSecurityConfig paths</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="nottickedoff">let cfgPath = configFilePath paths</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="nottickedoff">cfg &lt;- loadRuntimeConfig cfgPath &gt;&gt;= \case</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="nottickedoff">logIO logger WarningS (&quot;could not load config: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultRuntimeConfig</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="nottickedoff">secCfg &lt;- loadSecurityConfig (securityFilePath paths) &gt;&gt;= \case</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="nottickedoff">logIO logger WarningS (&quot;could not load security config: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultSecurityConfig</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="nottickedoff">mHandle &lt;- tryOpenVault paths secCfg logger</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="nottickedoff">ref     &lt;- newIORef mHandle</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="nottickedoff">let rt = VaultRuntime</span>
+<span class="lineno">  124 </span><span class="spaces">            </span><span class="nottickedoff">{ vrPaths      = paths</span>
+<span class="lineno">  125 </span><span class="spaces">            </span><span class="nottickedoff">, vrConfigPath = cfgPath</span>
+<span class="lineno">  126 </span><span class="spaces">            </span><span class="nottickedoff">, vrHandleRef  = ref</span>
+<span class="lineno">  127 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="nottickedoff">mgr &lt;- newTlsManager</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="nottickedoff">callCounter &lt;- newIORef 0</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="nottickedoff">let pr = ProviderRuntime</span>
+<span class="lineno">  131 </span><span class="spaces">            </span><span class="nottickedoff">{ prConfigPath  = cfgPath</span>
+<span class="lineno">  132 </span><span class="spaces">            </span><span class="nottickedoff">, prVault       = rt</span>
+<span class="lineno">  133 </span><span class="spaces">            </span><span class="nottickedoff">, prManager     = mgr</span>
+<span class="lineno">  134 </span><span class="spaces">            </span><span class="nottickedoff">, prCallCounter = callCounter</span>
+<span class="lineno">  135 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="nottickedoff">let cfgRoot = spConfig paths</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="nottickedoff">ensureConfigRepo cfgRoot</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="nottickedoff">let repo = openConfigRepo cfgRoot</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="nottickedoff">backends &lt;- newBackends cfgRoot repo</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="nottickedoff">sessionMeta &lt;- initSession paths cfg (bAgentDefs backends)</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="nottickedoff">activeRef   &lt;- newIORef sessionMeta</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="nottickedoff">let sr = SessionRuntime</span>
+<span class="lineno">  143 </span><span class="spaces">             </span><span class="nottickedoff">{ srPaths      = paths</span>
+<span class="lineno">  144 </span><span class="spaces">             </span><span class="nottickedoff">, srConfigPath = cfgPath</span>
+<span class="lineno">  145 </span><span class="spaces">             </span><span class="nottickedoff">, srActive     = activeRef</span>
+<span class="lineno">  146 </span><span class="spaces">             </span><span class="nottickedoff">}</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="nottickedoff">tabsH &lt;- newTabsHandle</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="nottickedoff">cli &lt;- mkRealSignalCli</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="nottickedoff">tgApi &lt;- mkRealTelegramBotApi</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="nottickedoff">vaultStore &lt;- mkRealVaultStore mHandle</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="nottickedoff">let channelRt = ChannelRuntime { crConfigPath = cfgPath, crSignalCli = cli</span>
+<span class="lineno">  152 </span><span class="spaces">                                 </span><span class="nottickedoff">, crTelegramBotApi = tgApi</span>
+<span class="lineno">  153 </span><span class="spaces">                                 </span><span class="nottickedoff">, crVaultStore = vaultStore }</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="nottickedoff">askReply &lt;- newAskReplyStore 0</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="nottickedoff">approvals &lt;- newApprovalCache</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="nottickedoff">harnessReg &lt;- Seal.Harness.Registry.newHarnessRegistry</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="nottickedoff">tmuxR &lt;- Seal.Harness.Tmux.mkRealTmuxRunner</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">let loadCfg = do</span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="nottickedoff">lc &lt;- loadRuntimeConfig cfgPath</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="nottickedoff">pure (fromRight defaultRuntimeConfig lc)</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">repoRegH &lt;- mkRepoRegistryHandle (reposFilePath paths)</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="nottickedoff">cursorsH &lt;- newPersistingCursorStore (cursorMapPath paths)</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="nottickedoff">mCursors &lt;- loadCursorMap (cursorMapPath paths)</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="nottickedoff">for_ mCursors (seedCursorStore cursorsH)</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">chanDeps &lt;- newChannelDeps</span>
+<span class="lineno">  166 </span><span class="spaces">        </span><span class="nottickedoff">paths rt repoRegH pr backends autonomy Nothing</span>
+<span class="lineno">  167 </span><span class="spaces">        </span><span class="nottickedoff">harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger cursorsH</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">let coreDeps = CoreCommandDeps</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="nottickedoff">{ ccdVault       = rt</span>
+<span class="lineno">  170 </span><span class="spaces">        </span><span class="nottickedoff">, ccdProvider    = pr</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="nottickedoff">, ccdSession     = sr</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAgentDefs   = bAgentDefs backends</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="nottickedoff">, ccdCfgPath     = cfgPath</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="nottickedoff">, ccdPaths       = paths</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabs        = tabsH</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAbortReg    = cdAbortReg chanDeps</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="nottickedoff">, ccdStopWriter  = mkStopTranscriptWriter paths (cdBroker chanDeps)</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="nottickedoff">, ccdModelWriter = mkModelTranscriptWriter paths (cdBroker chanDeps)</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoReg     = repoRegH</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoSeam    = Nothing</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="nottickedoff">registry = mkRegistry</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="nottickedoff">( coreCommandSpecs coreDeps</span>
+<span class="lineno">  185 </span><span class="spaces">          </span><span class="nottickedoff">&lt;&gt; [ channelCommandSpec channelRt</span>
+<span class="lineno">  186 </span><span class="spaces">             </span><span class="nottickedoff">]</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="nottickedoff">)</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">-- Read the bot token from the vault (the wizard stores it there, not in</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="nottickedoff">-- config.toml). Falls back to the config token if present (for backward</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">-- compat), but the vault token takes precedence.</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">mVaultToken &lt;- case mHandle of</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="nottickedoff">Just vh -&gt; do</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="nottickedoff">r &lt;- Vault.vhGet vh telegramVaultKey</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case r of</span>
+<span class="lineno">  196 </span><span class="spaces">        </span><span class="nottickedoff">Right bs -&gt; Just (TE.decodeUtf8 bs)</span>
+<span class="lineno">  197 </span><span class="spaces">        </span><span class="nottickedoff">Left _   -&gt; Nothing</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="nottickedoff">case resolveTelegramConfig (rcTelegram cfg) mVaultToken of</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; logIO logger ErrorS (&quot;seal telegram: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="nottickedoff">Right resolved -&gt; runTelegram chanDeps registry emptyChain resolved askReply</span></span>
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- | Open the vault if both recipient and identity are configured. Mirrors
+<span class="lineno">  203 </span>-- 'Seal.Tui.tryOpenVault'; duplicated here to keep this module standalone.
+<span class="lineno">  204 </span>tryOpenVault :: SealPaths -&gt; SecurityConfig -&gt; SealLogger -&gt; IO (Maybe Vault.VaultHandle)
+<span class="lineno">  205 </span><span class="decl"><span class="nottickedoff">tryOpenVault paths cfg logger =</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="nottickedoff">case (scVaultRecipient cfg, scVaultIdentity cfg) of</span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="nottickedoff">(Just _, Just _) -&gt;</span>
+<span class="lineno">  208 </span><span class="spaces">      </span><span class="nottickedoff">resolveEncryptor cfg &gt;&gt;= \case</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  210 </span><span class="spaces">          </span><span class="nottickedoff">logIO logger WarningS (&quot;vault not available: &quot; &lt;&gt; ls (T.pack (show err)))</span>
+<span class="lineno">  211 </span><span class="spaces">          </span><span class="nottickedoff">pure Nothing</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="nottickedoff">Right enc -&gt; do</span>
+<span class="lineno">  213 </span><span class="spaces">          </span><span class="nottickedoff">let vcfg = Vault.VaultConfig</span>
+<span class="lineno">  214 </span><span class="spaces">                </span><span class="nottickedoff">{ Vault.vcPath    = maybe (vaultFilePath paths) T.unpack (scVaultPath cfg)</span>
+<span class="lineno">  215 </span><span class="spaces">                </span><span class="nottickedoff">, Vault.vcKeyType = fromMaybe &quot;x25519&quot; (scVaultKeyType cfg)</span>
+<span class="lineno">  216 </span><span class="spaces">                </span><span class="nottickedoff">, Vault.vcUnlock  = parseUnlockMode (scVaultUnlock cfg)</span>
+<span class="lineno">  217 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  218 </span><span class="spaces">          </span><span class="nottickedoff">Just &lt;$&gt; Vault.openVault vcfg enc</span>
+<span class="lineno">  219 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; pure Nothing</span></span>
+<span class="lineno">  220 </span>
+<span class="lineno">  221 </span>-- | Build a 'ChannelCaps' for the Telegram channel. When the 'AskPrompt'
+<span class="lineno">  222 </span>-- has non-empty options AND the handle has a last chat id, 'ccPrompt' sends
+<span class="lineno">  223 </span>-- the question + a numbered list of options (with descriptions) as the
+<span class="lineno">  224 </span>-- message body, with an inline keyboard (one button per option + an
+<span class="lineno">  225 </span>-- &quot;Other&quot; free-text button) attached. The message body carries the full
+<span class="lineno">  226 </span>-- option text + descriptions (Telegram button labels are too short for
+<span class="lineno">  227 </span>-- descriptions); the buttons carry just the short labels for tap
+<span class="lineno">  228 </span>-- convenience. 'answerCallbackQuery' shows a toast on tap; the loop also
+<span class="lineno">  229 </span>-- sends a persistent &quot;✓ &lt;label&gt;&quot; confirmation after delivery. When the
+<span class="lineno">  230 </span>-- options are empty OR no chat id is known, it falls back to the generic
+<span class="lineno">  231 </span>-- numbered-list rendering via 'chSend' + 'formatQuestionWithOptions'.
+<span class="lineno">  232 </span>mkTelegramHandleCaps :: TelegramTransport -&gt; ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps
+<span class="lineno">  233 </span><span class="decl"><span class="istickedoff">mkTelegramHandleCaps transport h askReply sid = def</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">{ ccSend         = <span class="nottickedoff">chSend h</span></span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">, ccPrompt       = \ap -&gt; do</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">let AskPrompt q opts = ap</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">mChat &lt;- chLastChatId h</span>
+<span class="lineno">  238 </span><span class="spaces">      </span><span class="istickedoff">case (mChat, opts) of</span>
+<span class="lineno">  239 </span><span class="spaces">        </span><span class="istickedoff">(Just chatId, _ : _) -&gt; do</span>
+<span class="lineno">  240 </span><span class="spaces">          </span><span class="istickedoff">outcome &lt;- askHumanWithOptions askReply sid q opts (sendKeyboard <span class="nottickedoff">chatId</span> q opts)</span>
+<span class="lineno">  241 </span><span class="spaces">          </span><span class="istickedoff">pure <span class="nottickedoff">(fromRight &quot;&quot; outcome)</span></span>
+<span class="lineno">  242 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  243 </span><span class="spaces">          </span><span class="istickedoff">-- Empty options OR no chat id: fall back to the numbered list.</span>
+<span class="lineno">  244 </span><span class="spaces">          </span><span class="istickedoff">chSend h (formatQuestionWithOptions q opts)</span>
+<span class="lineno">  245 </span><span class="spaces">          </span><span class="istickedoff">outcome &lt;- askHumanWithOptions askReply sid q opts (const (pure <span class="nottickedoff">()</span>))</span>
+<span class="lineno">  246 </span><span class="spaces">          </span><span class="istickedoff">pure <span class="nottickedoff">(fromRight &quot;&quot; outcome)</span></span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">, ccPromptSecret = <span class="nottickedoff">fmap (fromRight &quot;&quot;) . chPromptSecret h</span></span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">, ccStreaming    = <span class="nottickedoff">chStreaming h</span></span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">-- | The notify callback: sends the question + option descriptions as</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">-- the message body, with the inline keyboard (short labels only)</span>
+<span class="lineno">  253 </span><span class="spaces">    </span><span class="istickedoff">-- attached. The 8-hex prefix of the 'AskId' ties the buttons to this</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">-- specific pending ask.</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">sendKeyboard :: Text -&gt; Text -&gt; [QuestionOption] -&gt; AskId -&gt; IO ()</span>
+<span class="lineno">  256 </span><span class="spaces">    </span><span class="istickedoff">sendKeyboard chatId q opts qid =</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">let prefix = T.take 8 (askIdText qid)</span>
+<span class="lineno">  258 </span><span class="spaces">          </span><span class="istickedoff">body = formatQuestionWithOptions q opts</span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">in tgSendWithKeyboard transport <span class="nottickedoff">chatId</span> body (buildKeyboard prefix opts)</span></span>
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | Build the inline keyboard: one row per option (button label = the
+<span class="lineno">  262 </span>-- option's 'qoLabel', callback_data = @\&quot;&lt;prefix&gt;:&lt;idx&gt;\&quot;@). No &quot;Other&quot;
+<span class="lineno">  263 </span>-- free-text button (Telegram has no inline free-text input; the user can
+<span class="lineno">  264 </span>-- still type a free-text answer as a regular message, which the loop
+<span class="lineno">  265 </span>-- routes via 'deliverNextAnswerResolved' when no pending callback match
+<span class="lineno">  266 </span>-- is found). Pure. The callback_data is always ≤ 64 bytes (8 hex + 1
+<span class="lineno">  267 </span>-- colon + ≤ 1 char for the index = ≤ 10 bytes).
+<span class="lineno">  268 </span>buildKeyboard :: Text -&gt; [QuestionOption] -&gt; [[TelegramButton]]
+<span class="lineno">  269 </span><span class="decl"><span class="istickedoff">buildKeyboard prefix opts =</span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">[ [TelegramButton (qoLabel o) (prefix &lt;&gt; &quot;:&quot; &lt;&gt; T.pack (show i))]</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">| (i, o) &lt;- zip [0 :: Int ..] opts</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  273 </span>
+<span class="lineno">  274 </span>-- | The callback handler for Telegram: parses the @callback_data@
+<span class="lineno">  275 </span>-- (@\&quot;&lt;8hex&gt;:&lt;token&gt;\&quot;@), where @token@ is either a decimal index (the
+<span class="lineno">  276 </span>-- tapped option button) or @other@ (the Other free-text button). For an
+<span class="lineno">  277 </span>-- index, finds the pending ask by the 8-hex prefix, resolves the index to
+<span class="lineno">  278 </span>-- the option's label via the pending ask's 'pqiOptions', and delivers it
+<span class="lineno">  279 </span>-- by-id via 'deliverAnswer'. Sends a persistent &quot;✓ &lt;label&gt;&quot; confirmation
+<span class="lineno">  280 </span>-- to the chat via 'chSend' so the user sees their tap was registered (the
+<span class="lineno">  281 </span>-- LLM may take time to respond). A stale @:other@ token (from a legacy
+<span class="lineno">  282 </span>-- keyboard that had an &quot;Other&quot; button) falls through to 'False'. Returns
+<span class="lineno">  283 </span>-- 'True' if a callback was delivered; 'False' if not (fall through).
+<span class="lineno">  284 </span>--
+<span class="lineno">  285 </span>-- The 'AskReplyStore' is the first arg so the caller can partially apply
+<span class="lineno">  286 </span>-- it; the 'runChannelLoop' 'onCallback' hook supplies the 'ChannelHandle'.
+<span class="lineno">  287 </span>onTelegramCallback :: AskReplyStore -&gt; ChannelHandle -&gt; SessionId -&gt; Text -&gt; IO Bool
+<span class="lineno">  288 </span><span class="decl"><span class="istickedoff">onTelegramCallback store h sid body =</span>
+<span class="lineno">  289 </span><span class="spaces">  </span><span class="istickedoff">case T.splitOn &quot;:&quot; body of</span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff">[prefix, token]</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">| T.length prefix == 8 &amp;&amp; T.all isHexChar prefix -&gt;</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">case parseIndex token of</span>
+<span class="lineno">  293 </span><span class="spaces">            </span><span class="istickedoff">Just idx -&gt; resolveIndex h store sid prefix idx</span>
+<span class="lineno">  294 </span><span class="spaces">            </span><span class="istickedoff">Nothing  -&gt; pure False  -- non-numeric (e.g. legacy &quot;other&quot;): fall through</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; pure False</span>
+<span class="lineno">  296 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">isHexChar c = isDigit c || (c &gt;= 'a' &amp;&amp; c &lt;= 'f') || (c &gt;= 'A' &amp;&amp; c &lt;= 'F')</span></span>
+<span class="lineno">  298 </span>
+<span class="lineno">  299 </span>-- | Parse a non-negative decimal index from the callback token. 'Nothing'
+<span class="lineno">  300 </span>-- if the token is not a clean decimal (e.g. empty, negative, or has
+<span class="lineno">  301 </span>-- trailing chars).
+<span class="lineno">  302 </span>parseIndex :: Text -&gt; Maybe Int
+<span class="lineno">  303 </span><span class="decl"><span class="istickedoff">parseIndex t =</span>
+<span class="lineno">  304 </span><span class="spaces">  </span><span class="istickedoff">case TR.decimal (T.strip t) of</span>
+<span class="lineno">  305 </span><span class="spaces">    </span><span class="istickedoff">Right (n, rest) | <span class="tickonlytrue">T.null rest &amp;&amp; n &gt;= 0</span> -&gt; Just n</span>
+<span class="lineno">  306 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  307 </span>
+<span class="lineno">  308 </span>-- | Resolve a callback index to the option's label + deliver it by-id,
+<span class="lineno">  309 </span>-- then send a &quot;✓ &lt;label&gt;&quot; confirmation to the chat.
+<span class="lineno">  310 </span>resolveIndex :: ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; Text -&gt; Int -&gt; IO Bool
+<span class="lineno">  311 </span><span class="decl"><span class="istickedoff">resolveIndex h store sid prefix idx = do</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">mQid &lt;- findByAskIdPrefix store sid prefix</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">case mQid of</span>
+<span class="lineno">  314 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure False</span>
+<span class="lineno">  315 </span><span class="spaces">    </span><span class="istickedoff">Just qid -&gt; do</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">ps &lt;- pendingForSession store sid</span>
+<span class="lineno">  317 </span><span class="spaces">      </span><span class="istickedoff">case filter (\p -&gt; pqiId p == qid) ps of</span>
+<span class="lineno">  318 </span><span class="spaces">        </span><span class="istickedoff">(p : _) -&gt;</span>
+<span class="lineno">  319 </span><span class="spaces">          </span><span class="istickedoff">case V.fromList (pqiOptions p) V.!? idx of</span>
+<span class="lineno">  320 </span><span class="spaces">            </span><span class="istickedoff">Just o  -&gt; do</span>
+<span class="lineno">  321 </span><span class="spaces">              </span><span class="istickedoff">_accepted &lt;- deliverAnswer store qid <span class="nottickedoff">(AskReply ScopeOnce (qoLabel o))</span></span>
+<span class="lineno">  322 </span><span class="spaces">              </span><span class="istickedoff">chSend h (&quot;✓ &quot; &lt;&gt; qoLabel o)</span>
+<span class="lineno">  323 </span><span class="spaces">              </span><span class="istickedoff">pure True</span>
+<span class="lineno">  324 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure False  -- out of bounds</span>
+<span class="lineno">  325 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">pure False</span></span></span>  -- stale (ask vanished between the two lookups)
+
+</pre>
+</body>
+</html>

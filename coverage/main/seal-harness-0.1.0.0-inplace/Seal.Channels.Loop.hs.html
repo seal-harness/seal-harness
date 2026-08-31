@@ -1,0 +1,849 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The shared inbox-driven channel loop, used by both Signal and Telegram
+<span class="lineno">    3 </span>-- channels (and any future inbox-driven channel). The loop pulls
+<span class="lineno">    4 </span>-- @(MessageSource, body)@ from 'chReceive', classifies via
+<span class="lineno">    5 </span>-- 'Seal.Routing.Route' (Layer-1 terse grammar + /tab commands BEFORE the
+<span class="lineno">    6 </span>-- /-command registry), dispatches slash commands via a 'ChannelCaps'
+<span class="lineno">    7 </span>-- adapter over the 'ChannelHandle', and routes plain messages to the
+<span class="lineno">    8 </span>-- supplied 'plainHandler' (which runs 'runTurn' with 'aeMessageSource' =
+<span class="lineno">    9 </span>-- @Just ms@). Terminates when 'chReceive' returns EOF.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- The 'ChannelDeps' record bundles everything a channel turn needs to have
+<span class="lineno">   12 </span>-- parity with the web and CLI paths: the full ISA registry (including
+<span class="lineno">   13 </span>-- Untrusted execution opcodes, web fetch/search, harness ops, and
+<span class="lineno">   14 </span>-- AGENT_START), the WS broker for live transcript updates, and the harness
+<span class="lineno">   15 </span>-- + tmux + HTTP manager deps. This ensures every channel gets identical
+<span class="lineno">   16 </span>-- transcript logging and tool-call infrastructure.
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- == Tab-centric session model
+<span class="lineno">   19 </span>--
+<span class="lineno">   20 </span>-- Each conversation (a Telegram chat, a Signal conversation) has its own
+<span class="lineno">   21 </span>-- cursor into the shared tab list ('CursorStore'). On first message from
+<span class="lineno">   22 </span>-- a conversation, a new tab + session is created and the cursor is set.
+<span class="lineno">   23 </span>-- Subsequent messages resolve the session via the cursor → tab → SessionId
+<span class="lineno">   24 </span>-- path, NOT via a shared active-session ref. This means @/tab focus N@
+<span class="lineno">   25 </span>-- on one Telegram conversation only affects that conversation — other
+<span class="lineno">   26 </span>-- conversations keep their own cursor. The web frontend has no cursor; it
+<span class="lineno">   27 </span>-- sends to a specific session by id (the tab the user clicked).
+<span class="lineno">   28 </span>--
+<span class="lineno">   29 </span>-- Replies fan out to all channels focused on the session via the
+<span class="lineno">   30 </span>-- 'ReplyRegistry' — so a web-originated turn on a Telegram-session tab
+<span class="lineno">   31 </span>-- also delivers the reply to Telegram. A per-session write lock
+<span class="lineno">   32 </span>-- ('SessionLocks') serializes concurrent turns on the same session to
+<span class="lineno">   33 </span>-- prevent transcript corruption.
+<span class="lineno">   34 </span>module Seal.Channels.Loop
+<span class="lineno">   35 </span>  ( ChannelDeps (..)
+<span class="lineno">   36 </span>  , newChannelDeps
+<span class="lineno">   37 </span>  , runChannelLoop
+<span class="lineno">   38 </span>  , mkHandleCaps
+<span class="lineno">   39 </span>  , handleTabCommand
+<span class="lineno">   40 </span>  , plainTurn
+<span class="lineno">   41 </span>  , plainTurnWithCaps
+<span class="lineno">   42 </span>  , buildChannelRegistry
+<span class="lineno">   43 </span>  , mkBgRunner
+<span class="lineno">   44 </span>  , channelCallDispatcher
+<span class="lineno">   45 </span>  , mkChannelTurnDeps
+<span class="lineno">   46 </span>  , mkTabCloseNotifier
+<span class="lineno">   47 </span>  , shouldAutoTab
+<span class="lineno">   48 </span>  , isBgSlash
+<span class="lineno">   49 </span>  , createConversationSession
+<span class="lineno">   50 </span>  , createConversationSessionHeadless
+<span class="lineno">   51 </span>  ) where
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>import Control.Concurrent (forkIO)
+<span class="lineno">   54 </span>import Control.Monad (void)
+<span class="lineno">   55 </span>import Data.Either (fromRight)
+<span class="lineno">   56 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   57 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   58 </span>import Data.Text (Text)
+<span class="lineno">   59 </span>import Data.Text qualified as T
+<span class="lineno">   60 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   61 </span>import System.Directory (doesFileExist)
+<span class="lineno">   62 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   65 </span>import Data.Default (def)
+<span class="lineno">   66 </span>import Seal.Channel.Cli
+<span class="lineno">   67 </span>  ( Backends (..), resolveSessionProvider )
+<span class="lineno">   68 </span>import Seal.Channels.Class (Channel (..))
+<span class="lineno">   69 </span>import Seal.Channels.Cursor
+<span class="lineno">   70 </span>  ( CursorStore, cursorLookup, cursorSet, cursorMigrateAll, cursorClearAll )
+<span class="lineno">   71 </span>import Seal.Command.Background (BgRunner (..), backgroundCommandSpec)
+<span class="lineno">   72 </span>import Seal.Command.Call (CallDispatcher, callCommandSpec)
+<span class="lineno">   73 </span>import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
+<span class="lineno">   74 </span>import Seal.Command.Provider (ProviderRuntime (..))
+<span class="lineno">   75 </span>import Seal.Command.Skill (skillCommandSpec)
+<span class="lineno">   76 </span>import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
+<span class="lineno">   77 </span>import Seal.Command.Tab (TabCloseNotifier)
+<span class="lineno">   78 </span>import Seal.Config.File
+<span class="lineno">   79 </span>  ( RuntimeConfig )
+<span class="lineno">   80 </span>import Seal.Config.Paths (SealPaths (..), sessionDir)
+<span class="lineno">   81 </span>import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
+<span class="lineno">   82 </span>import Seal.Core.MessageSource
+<span class="lineno">   83 </span>  ( MessageSource, conversationIdText, msChannelKind, msConversationId )
+<span class="lineno">   84 </span>import Seal.Core.TurnEngine
+<span class="lineno">   85 </span>  (TurnDeps (..), TurnAdapter (..),
+<span class="lineno">   86 </span>   runSessionTurn, shouldAutoTab)
+<span class="lineno">   87 </span>import qualified Seal.Core.TurnEngine as TurnEngine
+<span class="lineno">   88 </span>import Seal.Core.Types (SessionId, mkSessionId, sessionIdText)
+<span class="lineno">   89 </span>import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+<span class="lineno">   90 </span>import Seal.Gateway.StreamBroker (StreamBroker)
+<span class="lineno">   91 </span>import Seal.Handles.AskReply
+<span class="lineno">   92 </span>  ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
+<span class="lineno">   93 </span>  , formatQuestionWithOptions )
+<span class="lineno">   94 </span>import Seal.Handles.Channel (ChannelHandle (..))
+<span class="lineno">   95 </span>import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
+<span class="lineno">   96 </span>import Seal.Harness.Registry (HarnessRegistry)
+<span class="lineno">   97 </span>import Seal.Harness.Tmux (TmuxRunner)
+<span class="lineno">   98 </span>import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
+<span class="lineno">   99 </span>import Seal.Routing.Route qualified as Route
+<span class="lineno">  100 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">  101 </span>import Seal.Skills.Backend (SkillBackend)
+<span class="lineno">  102 </span>import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
+<span class="lineno">  103 </span>import Seal.Session.ExecCache (SessionExecCache, newSessionExecCache)
+<span class="lineno">  104 </span>import Seal.Session.Lock
+<span class="lineno">  105 </span>  ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
+<span class="lineno">  106 </span>  , replyFanoutMessage, replyMigrateAll
+<span class="lineno">  107 </span>  , SessionLocks, newSessionLocks )
+<span class="lineno">  108 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">  109 </span>import Seal.Session.Store
+<span class="lineno">  110 </span>  ( defaultSessionSelection, newSessionMeta
+<span class="lineno">  111 </span>  , resolveDefaultAgent, saveSessionMeta )
+<span class="lineno">  112 </span>import Seal.Tabs
+<span class="lineno">  113 </span>  ( TabsHandle, focusTabH, insertTabH, removeTabH
+<span class="lineno">  114 </span>  , renameTabH, rebindTabH, snapshotTabs )
+<span class="lineno">  115 </span>import Seal.Tabs.Types
+<span class="lineno">  116 </span>  ( Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..)
+<span class="lineno">  117 </span>  , tabCount, tlTabs, lookupByRef )
+<span class="lineno">  118 </span>import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+<span class="lineno">  119 </span>import Seal.Logging.Logger (SealLogger)
+<span class="lineno">  120 </span>import Seal.Logging.Exceptions (withExceptionLogging)
+<span class="lineno">  121 </span>import Seal.Vault.Commands (VaultRuntime (..))
+<span class="lineno">  122 </span>import Seal.Util.StrictIO (decodeFileStrict)
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | The dependencies a channel turn needs to have full parity with the web
+<span class="lineno">  125 </span>-- and CLI paths. Built once at startup (in 'Seal.Command.Serve' or the
+<span class="lineno">  126 </span>-- standalone @seal signal@ / @seal telegram@ entry points) and shared
+<span class="lineno">  127 </span>-- across all turns on that channel. Mirrors 'Seal.Gateway.Send.SendDeps'
+<span class="lineno">  128 </span>-- but for inbox-driven channels.
+<span class="lineno">  129 </span>data ChannelDeps = ChannelDeps
+<span class="lineno">  130 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cdPaths</span></span></span>      :: SealPaths
+<span class="lineno">  131 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdVault</span></span></span>      :: VaultRuntime
+<span class="lineno">  132 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdRepoReg</span></span></span>    :: RepoRegistryHandle
+<span class="lineno">  133 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdProvider</span></span></span>   :: ProviderRuntime
+<span class="lineno">  134 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdBackends</span></span></span>   :: Backends
+<span class="lineno">  135 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdAutonomy</span></span></span>   :: Policy.AutonomyLevel
+<span class="lineno">  136 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdBroker</span></span></span>     :: Maybe StreamBroker
+<span class="lineno">  137 </span>    -- ^ The WS broker for pushing live transcript entries to the frontend.
+<span class="lineno">  138 </span>    -- 'Nothing' in standalone modes (no web frontend); 'Just' under
+<span class="lineno">  139 </span>    -- @seal serve@ so channel turns surface in the web UI in real time.
+<span class="lineno">  140 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdHarnessRegistry</span></span></span> :: HarnessRegistry
+<span class="lineno">  141 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdTmuxRunner</span></span></span>  :: TmuxRunner
+<span class="lineno">  142 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdHttpManager</span></span></span> :: Maybe Manager
+<span class="lineno">  143 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdApprovals</span></span></span>   :: ApprovalCache
+<span class="lineno">  144 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdCursors</span></span></span>     :: CursorStore
+<span class="lineno">  145 </span>    -- ^ Per-conversation tab cursors. Each conversation (Telegram chat,
+<span class="lineno">  146 </span>    -- Signal conversation) has its own cursor into the shared tab list.
+<span class="lineno">  147 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdReplies</span></span></span>     :: ReplyRegistry
+<span class="lineno">  148 </span>    -- ^ Per-session reply fan-out registry. Channels subscribe their
+<span class="lineno">  149 </span>    -- 'ChannelHandle' when they focus a tab; replies are fanned out to
+<span class="lineno">  150 </span>    -- all subscribed handles after each turn.
+<span class="lineno">  151 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdLocks</span></span></span>       :: SessionLocks
+<span class="lineno">  152 </span>    -- ^ Per-session write locks. Serializes concurrent turns on the same
+<span class="lineno">  153 </span>    -- session to prevent transcript corruption.
+<span class="lineno">  154 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdAbortReg</span></span></span>     :: SessionAbortRegistry
+<span class="lineno">  155 </span>    -- ^ Per-session abort registry (design Blocker Resolution #2). The
+<span class="lineno">  156 </span>    -- channel @\/stop@ command calls 'setSessionAbort' on this; the turn
+<span class="lineno">  157 </span>    -- path looks up the per-session 'AbortFlag' via
+<span class="lineno">  158 </span>    -- 'lookupOrCreateAbortFlag' and passes it into 'mkSessionAgentEnv' as
+<span class="lineno">  159 </span>    -- 'aeAbortFlag'. Mirrors 'cdLocks'.
+<span class="lineno">  160 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdTabs</span></span></span>        :: TabsHandle
+<span class="lineno">  161 </span>    -- ^ The shared, unified tab handle. Under @seal serve@, this is the SAME
+<span class="lineno">  162 </span>    -- handle as the web gateway's 'adTabsHandle', so a tab inserted by any
+<span class="lineno">  163 </span>    -- channel (Signal, Telegram) is visible in the web sidebar (W4
+<span class="lineno">  164 </span>    -- invariant 3). The standalone @seal signal@ / @seal telegram@ entry
+<span class="lineno">  165 </span>    -- points pass their own 'newTabsHandle' (no web surface to unify with).
+<span class="lineno">  166 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdConfig</span></span></span>      :: IO RuntimeConfig
+<span class="lineno">  167 </span>    -- ^ Load the current config (re-read per turn so config changes take
+<span class="lineno">  168 </span>    -- effect without a restart). Used for default provider/model/agent
+<span class="lineno">  169 </span>    -- when creating a new session for a conversation.
+<span class="lineno">  170 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdIsRemote</span></span></span>    :: Bool
+<span class="lineno">  171 </span>    -- ^ Whether the untrusted executor runs commands over SSH (remote
+<span class="lineno">  172 </span>    -- mode from the security config). Set once at startup from
+<span class="lineno">  173 </span>    -- @isJust (untrustedExecConfigFromSecurity secCfg)@. Threaded into
+<span class="lineno">  174 </span>    -- 'CloneDeps' so the deploy-key clone path knows to use agent
+<span class="lineno">  175 </span>    -- forwarding (@ssh -A@) + a remote @known_hosts@ temp file.
+<span class="lineno">  176 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cdLogger</span></span></span>      :: SealLogger
+<span class="lineno">  177 </span>    -- ^ The shared logger for structured katip logging. Built once at
+<span class="lineno">  178 </span>    -- startup via 'withSealLogger', threaded through all channel turns.
+<span class="lineno">  179 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdExecCache</span></span></span>   :: SessionExecCache
+<span class="lineno">  180 </span>    -- ^ The per-process session-exec + workdir-discovery cache (created by
+<span class="lineno">  181 </span>    -- 'newChannelDeps'). Under @seal serve@ the SAME instance backs the
+<span class="lineno">  182 </span>    -- web 'SendDeps'/'ApiDeps' so a scan runs once per session across all
+<span class="lineno">  183 </span>    -- surfaces.
+<span class="lineno">  184 </span>  }
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- | Build a 'TurnDeps' from a 'ChannelDeps'. The unified turn engine takes a
+<span class="lineno">  187 </span>-- 'TurnDeps'; this adapter builder is the only place the channel's
+<span class="lineno">  188 </span>-- 'ChannelDeps' shape meets the engine's 'TurnDeps' shape. After W4
+<span class="lineno">  189 </span>-- collapses 'SendDeps' + 'ChannelDeps' + the CLI closures into one
+<span class="lineno">  190 </span>-- 'TurnDeps', this builder is dropped.
+<span class="lineno">  191 </span>mkChannelTurnDeps :: ChannelDeps -&gt; TurnDeps
+<span class="lineno">  192 </span><span class="decl"><span class="istickedoff">mkChannelTurnDeps deps = TurnDeps</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">{ tdPaths        = cdPaths deps</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">, tdVault        = <span class="nottickedoff">cdVault deps</span></span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">, tdProvider     = cdProvider deps</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">, tdResolve      = resolveSessionProvider (cdProvider deps)</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">, tdRepoReg      = <span class="nottickedoff">cdRepoReg deps</span></span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">, tdAutonomy     = <span class="nottickedoff">cdAutonomy deps</span></span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">, tdBroker       = <span class="nottickedoff">cdBroker deps</span></span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">, tdHarnessReg   = <span class="nottickedoff">cdHarnessRegistry deps</span></span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">, tdTmuxRunner   = <span class="nottickedoff">cdTmuxRunner deps</span></span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">, tdHttpManager  = <span class="nottickedoff">cdHttpManager deps</span></span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">, tdApprovals    = <span class="nottickedoff">cdApprovals deps</span></span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">, tdReplies      = <span class="nottickedoff">cdReplies deps</span></span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">, tdLocks        = <span class="nottickedoff">cdLocks deps</span></span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">, tdAbortReg     = cdAbortReg deps</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">, tdTabsHandle   = <span class="nottickedoff">cdTabs deps</span></span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">, tdLogger       = <span class="nottickedoff">cdLogger deps</span></span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">, tdIsRemote     = cdIsRemote deps</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">, tdBaseBackends = cdBackends deps</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">, tdExecCache    = cdExecCache deps</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">, tdRemoteRunner = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">, tdMkWorker    = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>-- | Build the channel 'TurnAdapter' for a given 'ChannelHandle' +
+<span class="lineno">  217 </span>-- 'ChannelCaps'. The channel adapter:
+<span class="lineno">  218 </span>-- * @taPreTurn@ — 'replySubscribe's the channel handle to the session's
+<span class="lineno">  219 </span>--   replies (so the post-turn fan-out delivers the assistant response to
+<span class="lineno">  220 </span>--   this channel) + 'replyFanoutMessage' mirrors the user's message to
+<span class="lineno">  221 </span>--   every OTHER subscribed channel (cross-channel mirroring, the handle's
+<span class="lineno">  222 </span>--   label).
+<span class="lineno">  223 </span>-- * @taChannelLabel@ — the session's 'smChannel' (an inbox session is
+<span class="lineno">  224 </span>--   always created on the channel its messages arrive on).
+<span class="lineno">  225 </span>-- * @taOnStop@ — 'Just' the reply fan-out so subscribed channels receive
+<span class="lineno">  226 </span>--   the final reply.
+<span class="lineno">  227 </span>-- * @taOnUserMessage@ — for /bg turns, 'Just' a 'broadcastTabs' refresh so
+<span class="lineno">  228 </span>--   the sidebar shows the session name as soon as the user message is
+<span class="lineno">  229 </span>--   durable; 'Nothing' for normal turns (the post-turn 'taPostTurn'
+<span class="lineno">  230 </span>--   refresh covers them).
+<span class="lineno">  231 </span>-- * @taPostTurn@ — 'broadcastTabs' so the sidebar reflects the new tab +
+<span class="lineno">  232 </span>--   the first-message snippet. Runs for both auto-tab and /bg paths.
+<span class="lineno">  233 </span>-- * @taStartWiring@ — the engine-owned 'TurnEngine.buildStartWiring' (W4
+<span class="lineno">  234 </span>--   collapsed the per-surface builders into this single one).
+<span class="lineno">  235 </span>mkChannelTurnAdapter :: ChannelDeps -&gt; TurnDeps -&gt; ChannelHandle -&gt; ChannelCaps -&gt; TurnAdapter
+<span class="lineno">  236 </span><span class="decl"><span class="nottickedoff">mkChannelTurnAdapter deps td h caps = TurnAdapter</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="nottickedoff">{ taCaps          = caps</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="nottickedoff">, taPreTurn       = \sid _meta t -&gt; do</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- replySubscribe (cdReplies deps) h sid</span>
+<span class="lineno">  240 </span><span class="spaces">      </span><span class="nottickedoff">replyFanoutMessage (cdReplies deps) sid (chLabel h) t</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="nottickedoff">, taChannelLabel  = smChannel</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="nottickedoff">, taOnStop        = Just . replyFanout (cdReplies deps)</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="nottickedoff">, taOnUserMessage = \meta -&gt; if shouldAutoTab meta</span>
+<span class="lineno">  244 </span><span class="spaces">                                 </span><span class="nottickedoff">then Nothing</span>
+<span class="lineno">  245 </span><span class="spaces">                                 </span><span class="nottickedoff">else Just (broadcastTabs deps (cdTabs deps))</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="nottickedoff">, taPostTurn      = \_ _ -&gt; broadcastTabs deps (cdTabs deps)</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="nottickedoff">, taStartWiring   = \sessionBackends sid appEnv eCfg operatorCeiling meta -&gt;</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="nottickedoff">TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling (smChannel meta)</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  250 </span>
+<span class="lineno">  251 </span>-- | Build a 'ChannelDeps' with fresh reply/lock/abort stores and the given
+<span class="lineno">  252 </span>-- config loader. Used by 'Seal.Command.Serve' and the standalone entry
+<span class="lineno">  253 </span>-- points. The 'tabsH' is the shared/unified handle (W4). The 'cursors' is
+<span class="lineno">  254 </span>-- supplied by the caller: a persisting store
+<span class="lineno">  255 </span>-- ('Seal.Channels.Cursor.newPersistingCursorStore') under @seal serve@ /
+<span class="lineno">  256 </span>-- standalone @seal telegram@ / @seal signal@ so the conversation→tab
+<span class="lineno">  257 </span>-- bindings survive a restart, or a non-persisting 'newCursorStore' in
+<span class="lineno">  258 </span>-- tests. The caller is responsible for loading + seeding the cursor store
+<span class="lineno">  259 </span>-- at boot (see 'Seal.Channels.Cursor.Persist.loadCursorMap' +
+<span class="lineno">  260 </span>-- 'seedCursorStore'); this function does NOT touch disk for cursors.
+<span class="lineno">  261 </span>newChannelDeps
+<span class="lineno">  262 </span>  :: SealPaths -&gt; VaultRuntime -&gt; RepoRegistryHandle -&gt; ProviderRuntime -&gt; Backends
+<span class="lineno">  263 </span>  -&gt; Policy.AutonomyLevel -&gt; Maybe StreamBroker
+<span class="lineno">  264 </span>  -&gt; HarnessRegistry -&gt; TmuxRunner -&gt; Maybe Manager
+<span class="lineno">  265 </span>  -&gt; ApprovalCache -&gt; IO RuntimeConfig
+<span class="lineno">  266 </span>  -&gt; Bool
+<span class="lineno">  267 </span>  -&gt; TabsHandle
+<span class="lineno">  268 </span>  -&gt; SealLogger
+<span class="lineno">  269 </span>  -&gt; CursorStore
+<span class="lineno">  270 </span>  -&gt; IO ChannelDeps
+<span class="lineno">  271 </span><span class="decl"><span class="istickedoff">newChannelDeps paths vault repoReg provider backends autonomy broker</span>
+<span class="lineno">  272 </span><span class="spaces">               </span><span class="istickedoff">harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger cursors = do</span>
+<span class="lineno">  273 </span><span class="spaces">  </span><span class="istickedoff">replies &lt;- newReplyRegistry</span>
+<span class="lineno">  274 </span><span class="spaces">  </span><span class="istickedoff">locks   &lt;- newSessionLocks</span>
+<span class="lineno">  275 </span><span class="spaces">  </span><span class="istickedoff">abortReg &lt;- newSessionAbortRegistry</span>
+<span class="lineno">  276 </span><span class="spaces">  </span><span class="istickedoff">execCache &lt;- newSessionExecCache</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">pure ChannelDeps</span>
+<span class="lineno">  278 </span><span class="spaces">    </span><span class="istickedoff">{ cdPaths      = paths</span>
+<span class="lineno">  279 </span><span class="spaces">    </span><span class="istickedoff">, cdVault      = <span class="nottickedoff">vault</span></span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="istickedoff">, cdRepoReg    = <span class="nottickedoff">repoReg</span></span>
+<span class="lineno">  281 </span><span class="spaces">    </span><span class="istickedoff">, cdProvider   = provider</span>
+<span class="lineno">  282 </span><span class="spaces">    </span><span class="istickedoff">, cdBackends   = backends</span>
+<span class="lineno">  283 </span><span class="spaces">    </span><span class="istickedoff">, cdAutonomy   = <span class="nottickedoff">autonomy</span></span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="istickedoff">, cdBroker     = broker</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">, cdHarnessRegistry = <span class="nottickedoff">harnessReg</span></span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">, cdTmuxRunner  = <span class="nottickedoff">tmux</span></span>
+<span class="lineno">  287 </span><span class="spaces">    </span><span class="istickedoff">, cdHttpManager = <span class="nottickedoff">httpMgr</span></span>
+<span class="lineno">  288 </span><span class="spaces">    </span><span class="istickedoff">, cdApprovals   = <span class="nottickedoff">approvals</span></span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">, cdCursors     = cursors</span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff">, cdReplies     = <span class="nottickedoff">replies</span></span>
+<span class="lineno">  291 </span><span class="spaces">    </span><span class="istickedoff">, cdLocks       = <span class="nottickedoff">locks</span></span>
+<span class="lineno">  292 </span><span class="spaces">    </span><span class="istickedoff">, cdAbortReg    = abortReg</span>
+<span class="lineno">  293 </span><span class="spaces">    </span><span class="istickedoff">, cdTabs        = tabsH</span>
+<span class="lineno">  294 </span><span class="spaces">    </span><span class="istickedoff">, cdConfig      = loadCfg</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">, cdIsRemote    = isRemote</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">, cdLogger      = <span class="nottickedoff">logger</span></span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">, cdExecCache   = execCache</span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  299 </span>
+<span class="lineno">  300 </span>-- | The conversation key for the cursor store: (channel-kind-text,
+<span class="lineno">  301 </span>-- conversation-id-text). Derived from the 'MessageSource' (both fields
+<span class="lineno">  302 </span>-- are server-derived, never user-supplied, so a sender cannot forge a
+<span class="lineno">  303 </span>-- cursor key).
+<span class="lineno">  304 </span>convKey :: MessageSource -&gt; (Text, Text)
+<span class="lineno">  305 </span><span class="decl"><span class="nottickedoff">convKey ms = (channelKindToText (msChannelKind ms), conversationIdText (msConversationId ms))</span></span>
+<span class="lineno">  306 </span>
+<span class="lineno">  307 </span>-- | Build the channel's slash-command registry from a supplied base
+<span class="lineno">  308 </span>-- 'Registry' plus the channel-specific @bg@, @call@, @skill@, and @model@
+<span class="lineno">  309 </span>-- specs.
+<span class="lineno">  310 </span>--
+<span class="lineno">  311 </span>-- The channel-appended specs bind to the channel's per-session
+<span class="lineno">  312 </span>-- 'channelCallDispatcher' (which reads the conversation's cursor-resolved
+<span class="lineno">  313 </span>-- sid). Under @seal serve@, the supplied @registry@ is the WEB gateway's
+<span class="lineno">  314 </span>-- registry, whose @skill@ and @call@ specs bind to 'webCallDispatcher'
+<span class="lineno">  315 </span>-- (which reads the process-global @srActive@ ref). Without shadowing those
+<span class="lineno">  316 </span>-- out, a @/skill load@ issued from Telegram dispatches via the FIRST
+<span class="lineno">  317 </span>-- matching spec — the web one — and records the SKILL_LOAD entry on
+<span class="lineno">  318 </span>-- whatever session @srActive@ points at, NOT the Telegram conversation's
+<span class="lineno">  319 </span>-- session. The same hazard applies to @/model use@ (the core spec writes
+<span class="lineno">  320 </span>-- @srActive@'s session.json, not the conversation's). The channel-dispatcher
+<span class="lineno">  321 </span>--   versions must win, so drop any incoming spec whose primary name collides
+<span class="lineno">  322 </span>--   with a channel-appended spec before appending them. 'lookupSpec' returns
+<span class="lineno">  323 </span>--   the first match, so the appended channel specs then resolve correctly.
+<span class="lineno">  324 </span>--
+<span class="lineno">  325 </span>-- The @model@ spec is built from the channel's 'ProviderRuntime' + 'SealPaths'
+<span class="lineno">  326 </span>-- + broker (passed explicitly rather than reading the whole 'ChannelDeps' so
+<span class="lineno">  327 </span>-- the registry builder stays decoupled from the full deps record — the
+<span class="lineno">  328 </span>-- pure-registry tests don't need to construct a full 'ChannelDeps').
+<span class="lineno">  329 </span>buildChannelRegistry
+<span class="lineno">  330 </span>  :: ProviderRuntime -&gt; SealPaths -&gt; Maybe StreamBroker
+<span class="lineno">  331 </span>  -&gt; SkillBackend -&gt; BgRunner -&gt; CallDispatcher
+<span class="lineno">  332 </span>  -&gt; IORef SessionId -&gt; Registry -&gt; Registry
+<span class="lineno">  333 </span><span class="decl"><span class="istickedoff">buildChannelRegistry pr paths mBroker skillBackend bgRunner callDispatcher sidRef registry =</span>
+<span class="lineno">  334 </span><span class="spaces">  </span><span class="istickedoff">mkRegistry (baseSpecs &lt;&gt; channelSpecs)</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  336 </span><span class="spaces">    </span><span class="istickedoff">channelSpecNames = [&quot;bg&quot;, &quot;call&quot;, &quot;skill&quot;, &quot;model&quot;] :: [Text]</span>
+<span class="lineno">  337 </span><span class="spaces">    </span><span class="istickedoff">baseSpecs = filter</span>
+<span class="lineno">  338 </span><span class="spaces">      </span><span class="istickedoff">(\s -&gt; let CommandName n = csName s in n `notElem` channelSpecNames)</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">(registrySpecs registry)</span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="istickedoff">channelSpecs =</span>
+<span class="lineno">  341 </span><span class="spaces">      </span><span class="istickedoff">[ backgroundCommandSpec <span class="nottickedoff">bgRunner</span></span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">, callCommandSpec <span class="nottickedoff">callDispatcher</span></span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">, skillCommandSpec <span class="nottickedoff">skillBackend</span> callDispatcher</span>
+<span class="lineno">  344 </span><span class="spaces">      </span><span class="istickedoff">, modelCommandSpecForSession</span>
+<span class="lineno">  345 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pr</span> <span class="nottickedoff">paths</span> <span class="nottickedoff">(readIORef sidRef)</span></span>
+<span class="lineno">  346 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(mkModelTranscriptWriter paths mBroker)</span></span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">  348 </span>
+<span class="lineno">  349 </span>-- | The inbox-driven loop. Spawns the channel via the supplied bracket,
+<span class="lineno">  350 </span>-- pulls @(MessageSource, body)@ from 'chReceive', classifies via
+<span class="lineno">  351 </span>-- 'Seal.Routing.Route', and dispatches. Each conversation resolves its
+<span class="lineno">  352 </span>-- session via the cursor store (not a shared active-session ref). On
+<span class="lineno">  353 </span>-- first message from a conversation, a new tab + session is created.
+<span class="lineno">  354 </span>--
+<span class="lineno">  355 </span>-- The optional 'mkCaps' factory overrides the default 'mkHandleCaps'
+<span class="lineno">  356 </span>-- (e.g. Telegram's inline-keyboard 'ccPrompt'). 'Nothing' = use
+<span class="lineno">  357 </span>-- 'mkHandleCaps' (Signal + the generic numbered list).
+<span class="lineno">  358 </span>--
+<span class="lineno">  359 </span>-- The optional 'onCallback' hook is called before
+<span class="lineno">  360 </span>-- 'deliverNextAnswerResolved' — Telegram uses it to route callback_query
+<span class="lineno">  361 </span>-- button taps by 'AskId' (by-id delivery, NOT FIFO). 'Nothing' = no
+<span class="lineno">  362 </span>-- callback support (the body goes straight to 'deliverNextAnswerResolved').
+<span class="lineno">  363 </span>runChannelLoop
+<span class="lineno">  364 </span>  :: (Channel c)
+<span class="lineno">  365 </span>  =&gt; ChannelDeps
+<span class="lineno">  366 </span>  -&gt; ((c -&gt; IO ()) -&gt; IO ())
+<span class="lineno">  367 </span>  -&gt; (ChannelHandle -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text -&gt; IO ())
+<span class="lineno">  368 </span>  -&gt; Registry
+<span class="lineno">  369 </span>  -&gt; PreprocessChain
+<span class="lineno">  370 </span>  -&gt; AskReplyStore
+<span class="lineno">  371 </span>  -&gt; TabsHandle
+<span class="lineno">  372 </span>  -&gt; Maybe (ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps)
+<span class="lineno">  373 </span>  -&gt; Maybe (ChannelHandle -&gt; SessionId -&gt; Text -&gt; IO Bool)
+<span class="lineno">  374 </span>  -&gt; IO ()
+<span class="lineno">  375 </span><span class="decl"><span class="nottickedoff">runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCaps onCallback =</span>
+<span class="lineno">  376 </span><span class="spaces">  </span><span class="nottickedoff">withChannel $ \ch -&gt; do</span>
+<span class="lineno">  377 </span><span class="spaces">    </span><span class="nottickedoff">let h = toHandle ch</span>
+<span class="lineno">  378 </span><span class="spaces">    </span><span class="nottickedoff">-- A mutable cell holding the originating conversation's active session</span>
+<span class="lineno">  379 </span><span class="spaces">    </span><span class="nottickedoff">-- id, updated each turn before any slash command is dispatched. The</span>
+<span class="lineno">  380 </span><span class="spaces">    </span><span class="nottickedoff">-- /bg runner reads it to key the confirmation ask to the conversation</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="nottickedoff">-- (not the fresh bg session), so the loop's deliverNextAnswer</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="nottickedoff">-- short-circuit consumes the next inbound message as the answer. The</span>
+<span class="lineno">  383 </span><span class="spaces">    </span><span class="nottickedoff">-- initial bottom is never read: the loop writes the real sid before</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="nottickedoff">-- any /bg dispatch.</span>
+<span class="lineno">  385 </span><span class="spaces">    </span><span class="nottickedoff">bgConvSid &lt;- newIORef (error &quot;bgConvSid: set before first dispatch&quot; :: SessionId)</span>
+<span class="lineno">  386 </span><span class="spaces">    </span><span class="nottickedoff">let td = mkChannelTurnDeps deps</span>
+<span class="lineno">  387 </span><span class="spaces">        </span><span class="nottickedoff">bgRunner = mkBgRunner deps h askReply bgConvSid tabsH</span>
+<span class="lineno">  388 </span><span class="spaces">        </span><span class="nottickedoff">callDispatcher = channelCallDispatcher deps td h askReply bgConvSid</span>
+<span class="lineno">  389 </span><span class="spaces">        </span><span class="nottickedoff">registryWithBg = buildChannelRegistry</span>
+<span class="lineno">  390 </span><span class="spaces">          </span><span class="nottickedoff">(cdProvider deps) (cdPaths deps) (cdBroker deps)</span>
+<span class="lineno">  391 </span><span class="spaces">          </span><span class="nottickedoff">(bSkills (cdBackends deps)) bgRunner callDispatcher bgConvSid registry</span>
+<span class="lineno">  392 </span><span class="spaces">    </span><span class="nottickedoff">loop h registryWithBg bgConvSid</span>
+<span class="lineno">  393 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  394 </span><span class="spaces">    </span><span class="nottickedoff">loop h reg bgConvSid = do</span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="nottickedoff">(mSrc, body) &lt;- chReceive h</span>
+<span class="lineno">  396 </span><span class="spaces">      </span><span class="nottickedoff">case mSrc of</span>
+<span class="lineno">  397 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; pure ()  -- EOF</span>
+<span class="lineno">  398 </span><span class="spaces">        </span><span class="nottickedoff">Just ms -&gt; do</span>
+<span class="lineno">  399 </span><span class="spaces">          </span><span class="nottickedoff">let key = convKey ms</span>
+<span class="lineno">  400 </span><span class="spaces">              </span><span class="nottickedoff">bgRoute = isBgSlash body</span>
+<span class="lineno">  401 </span><span class="spaces">          </span><span class="nottickedoff">-- Resolve the conversation's session (create if first message).</span>
+<span class="lineno">  402 </span><span class="spaces">          </span><span class="nottickedoff">-- For a /bg command, take the headless path: the conversation needs</span>
+<span class="lineno">  403 </span><span class="spaces">          </span><span class="nottickedoff">-- an anchor session (its sid keys the bg runner's confirmation ask</span>
+<span class="lineno">  404 </span><span class="spaces">          </span><span class="nottickedoff">-- via bgConvSid below) but must NOT get a tab, since no turn ever</span>
+<span class="lineno">  405 </span><span class="spaces">          </span><span class="nottickedoff">-- runs on this session — a tab would surface as an empty</span>
+<span class="lineno">  406 </span><span class="spaces">          </span><span class="nottickedoff">-- conversation in the web sidebar. The bg turn itself runs on a</span>
+<span class="lineno">  407 </span><span class="spaces">          </span><span class="nottickedoff">-- separate, fresh bg session minted by mkBgRunner.</span>
+<span class="lineno">  408 </span><span class="spaces">          </span><span class="nottickedoff">mCursor &lt;- cursorLookup (cdCursors deps) key</span>
+<span class="lineno">  409 </span><span class="spaces">          </span><span class="nottickedoff">meta &lt;- case mCursor of</span>
+<span class="lineno">  410 </span><span class="spaces">            </span><span class="nottickedoff">Just tabRef -&gt; do</span>
+<span class="lineno">  411 </span><span class="spaces">              </span><span class="nottickedoff">mMeta &lt;- resolveTabSession deps tabRef</span>
+<span class="lineno">  412 </span><span class="spaces">              </span><span class="nottickedoff">case mMeta of</span>
+<span class="lineno">  413 </span><span class="spaces">                </span><span class="nottickedoff">Just m  -&gt; pure m</span>
+<span class="lineno">  414 </span><span class="spaces">                </span><span class="nottickedoff">Nothing</span>
+<span class="lineno">  415 </span><span class="spaces">                  </span><span class="nottickedoff">| bgRoute  -&gt; createConversationSessionHeadless deps key (msChannelKind ms)</span>
+<span class="lineno">  416 </span><span class="spaces">                  </span><span class="nottickedoff">| otherwise -&gt; createConversationSession deps h key (msChannelKind ms) tabsH</span>
+<span class="lineno">  417 </span><span class="spaces">            </span><span class="nottickedoff">Nothing</span>
+<span class="lineno">  418 </span><span class="spaces">              </span><span class="nottickedoff">| bgRoute  -&gt; createConversationSessionHeadless deps key (msChannelKind ms)</span>
+<span class="lineno">  419 </span><span class="spaces">              </span><span class="nottickedoff">| otherwise -&gt; createConversationSession deps h key (msChannelKind ms) tabsH</span>
+<span class="lineno">  420 </span><span class="spaces">          </span><span class="nottickedoff">let sid = smId meta</span>
+<span class="lineno">  421 </span><span class="spaces">          </span><span class="nottickedoff">-- Record the conversation's active session so the /bg runner</span>
+<span class="lineno">  422 </span><span class="spaces">          </span><span class="nottickedoff">-- (dispatched below if this turn is a /bg) keys its confirmation</span>
+<span class="lineno">  423 </span><span class="spaces">          </span><span class="nottickedoff">-- ask to this sid. Updated every turn, before any slash-command</span>
+<span class="lineno">  424 </span><span class="spaces">          </span><span class="nottickedoff">-- dispatch.</span>
+<span class="lineno">  425 </span><span class="spaces">          </span><span class="nottickedoff">writeIORef bgConvSid sid</span>
+<span class="lineno">  426 </span><span class="spaces">          </span><span class="nottickedoff">-- For channels with callback support (Telegram), try the</span>
+<span class="lineno">  427 </span><span class="spaces">          </span><span class="nottickedoff">-- onCallback hook first (by-id delivery for button taps). If it</span>
+<span class="lineno">  428 </span><span class="spaces">          </span><span class="nottickedoff">-- returns True, the body was a callback + delivered; continue</span>
+<span class="lineno">  429 </span><span class="spaces">          </span><span class="nottickedoff">-- the loop. Otherwise, fall through to deliverNextAnswerResolved.</span>
+<span class="lineno">  430 </span><span class="spaces">          </span><span class="nottickedoff">mCallbackHandled &lt;- case onCallback of</span>
+<span class="lineno">  431 </span><span class="spaces">            </span><span class="nottickedoff">Nothing -&gt; pure False</span>
+<span class="lineno">  432 </span><span class="spaces">            </span><span class="nottickedoff">Just cb -&gt; cb h sid body</span>
+<span class="lineno">  433 </span><span class="spaces">          </span><span class="nottickedoff">delivered &lt;-</span>
+<span class="lineno">  434 </span><span class="spaces">            </span><span class="nottickedoff">if mCallbackHandled</span>
+<span class="lineno">  435 </span><span class="spaces">              </span><span class="nottickedoff">then pure True</span>
+<span class="lineno">  436 </span><span class="spaces">              </span><span class="nottickedoff">else snd &lt;$&gt; deliverNextAnswerResolved askReply sid body</span>
+<span class="lineno">  437 </span><span class="spaces">          </span><span class="nottickedoff">if delivered</span>
+<span class="lineno">  438 </span><span class="spaces">            </span><span class="nottickedoff">then loop h reg bgConvSid</span>
+<span class="lineno">  439 </span><span class="spaces">            </span><span class="nottickedoff">else do</span>
+<span class="lineno">  440 </span><span class="spaces">              </span><span class="nottickedoff">let handleCaps = case mkCaps of</span>
+<span class="lineno">  441 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; mkHandleCaps h askReply sid</span>
+<span class="lineno">  442 </span><span class="spaces">                    </span><span class="nottickedoff">Just f  -&gt; f h askReply sid</span>
+<span class="lineno">  443 </span><span class="spaces">              </span><span class="nottickedoff">case Route.route body of</span>
+<span class="lineno">  444 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.Focus idx) -&gt; do</span>
+<span class="lineno">  445 </span><span class="spaces">                  </span><span class="nottickedoff">_ &lt;- focusTabH tabsH idx</span>
+<span class="lineno">  446 </span><span class="spaces">                  </span><span class="nottickedoff">tl &lt;- snapshotTabs tabsH</span>
+<span class="lineno">  447 </span><span class="spaces">                  </span><span class="nottickedoff">case lookupTabByIndex tl idx of</span>
+<span class="lineno">  448 </span><span class="spaces">                    </span><span class="nottickedoff">Just tab -&gt; cursorSet (cdCursors deps) key (tRef tab)</span>
+<span class="lineno">  449 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  450 </span><span class="spaces">                  </span><span class="nottickedoff">chSend h (&quot;focused tab &quot; &lt;&gt; T.singleton (tabIndexToChar idx))</span>
+<span class="lineno">  451 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  452 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.Inject idx payload) -&gt; do</span>
+<span class="lineno">  453 </span><span class="spaces">                  </span><span class="nottickedoff">_ &lt;- focusTabH tabsH idx</span>
+<span class="lineno">  454 </span><span class="spaces">                  </span><span class="nottickedoff">void (forkIO (plainHandler h meta (Just ms) payload))</span>
+<span class="lineno">  455 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  456 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.TabCommand tsc) -&gt; do</span>
+<span class="lineno">  457 </span><span class="spaces">                  </span><span class="nottickedoff">_ &lt;- handleTabCommand h tabsH tsc</span>
+<span class="lineno">  458 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  459 </span><span class="spaces">                </span><span class="nottickedoff">Right Route.CurrentTab -&gt; do</span>
+<span class="lineno">  460 </span><span class="spaces">                  </span><span class="nottickedoff">tl &lt;- snapshotTabs tabsH</span>
+<span class="lineno">  461 </span><span class="spaces">                  </span><span class="nottickedoff">case mCursor &gt;&gt;= lookupByRef tl of</span>
+<span class="lineno">  462 </span><span class="spaces">                    </span><span class="nottickedoff">Just t  -&gt; chSend h (renderCurrentTab t)</span>
+<span class="lineno">  463 </span><span class="spaces">                    </span><span class="nottickedoff">Nothing -&gt; chSend h &quot;no current tab&quot;</span>
+<span class="lineno">  464 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  465 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.NewSession _args) -&gt; do</span>
+<span class="lineno">  466 </span><span class="spaces">                  </span><span class="nottickedoff">_ &lt;- handleNewSession deps h tabsH (msChannelKind ms) meta</span>
+<span class="lineno">  467 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  468 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.SlashCommand _) -&gt; do</span>
+<span class="lineno">  469 </span><span class="spaces">                  </span><span class="nottickedoff">d &lt;- ingest reg chain (RawInbound body)</span>
+<span class="lineno">  470 </span><span class="spaces">                  </span><span class="nottickedoff">case d of</span>
+<span class="lineno">  471 </span><span class="spaces">                    </span><span class="nottickedoff">DispatchAction a -&gt; do</span>
+<span class="lineno">  472 </span><span class="spaces">                      </span><span class="nottickedoff">eResult &lt;- withExceptionLogging (cdLogger deps) Nothing &quot;slash command&quot; $</span>
+<span class="lineno">  473 </span><span class="spaces">                        </span><span class="nottickedoff">runCommandAction a handleCaps</span>
+<span class="lineno">  474 </span><span class="spaces">                      </span><span class="nottickedoff">case eResult of</span>
+<span class="lineno">  475 </span><span class="spaces">                        </span><span class="nottickedoff">Left errMsg -&gt; chSend h errMsg</span>
+<span class="lineno">  476 </span><span class="spaces">                        </span><span class="nottickedoff">Right mFollowUp -&gt; case mFollowUp of</span>
+<span class="lineno">  477 </span><span class="spaces">                          </span><span class="nottickedoff">Just t  -&gt; void (forkIO (plainHandler h meta (Just ms) t))</span>
+<span class="lineno">  478 </span><span class="spaces">                          </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  479 </span><span class="spaces">                      </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  480 </span><span class="spaces">                    </span><span class="nottickedoff">ShowText t       -&gt; chSend h t &gt;&gt; loop h reg bgConvSid</span>
+<span class="lineno">  481 </span><span class="spaces">                    </span><span class="nottickedoff">PlainMessage t   -&gt; void (forkIO (plainHandler h meta (Just ms) t)) &gt;&gt; loop h reg bgConvSid</span>
+<span class="lineno">  482 </span><span class="spaces">                    </span><span class="nottickedoff">Rejected msg     -&gt; chSend h msg &gt;&gt; loop h reg bgConvSid</span>
+<span class="lineno">  483 </span><span class="spaces">                </span><span class="nottickedoff">Right (Route.Plain t) -&gt; do</span>
+<span class="lineno">  484 </span><span class="spaces">                  </span><span class="nottickedoff">void (forkIO (plainHandler h meta (Just ms) t))</span>
+<span class="lineno">  485 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span>
+<span class="lineno">  486 </span><span class="spaces">                </span><span class="nottickedoff">Left (Route.ParseError e) -&gt; do</span>
+<span class="lineno">  487 </span><span class="spaces">                  </span><span class="nottickedoff">chSend h e</span>
+<span class="lineno">  488 </span><span class="spaces">                  </span><span class="nottickedoff">loop h reg bgConvSid</span></span>
+<span class="lineno">  489 </span>
+<span class="lineno">  490 </span>-- | Build the per-turn 'ChannelCaps' for a channel handle.
+<span class="lineno">  491 </span>mkHandleCaps :: ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps
+<span class="lineno">  492 </span><span class="decl"><span class="nottickedoff">mkHandleCaps h askReply sid = def</span>
+<span class="lineno">  493 </span><span class="spaces">  </span><span class="nottickedoff">{ ccSend         = chSend h</span>
+<span class="lineno">  494 </span><span class="spaces">  </span><span class="nottickedoff">, ccShowHuman    = chSend h</span>
+<span class="lineno">  495 </span><span class="spaces">  </span><span class="nottickedoff">, ccPrompt       = \(AskPrompt q opts) -&gt; do</span>
+<span class="lineno">  496 </span><span class="spaces">      </span><span class="nottickedoff">chSend h (formatQuestionWithOptions q opts)</span>
+<span class="lineno">  497 </span><span class="spaces">      </span><span class="nottickedoff">outcome &lt;- askHumanWithOptions askReply sid q opts (const (pure ()))</span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="nottickedoff">pure (fromRight &quot;&quot; outcome)</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="nottickedoff">, ccPromptSecret = fmap (fromRight &quot;&quot;) . chPromptSecret h</span>
+<span class="lineno">  500 </span><span class="spaces">  </span><span class="nottickedoff">, ccStreaming    = chStreaming h</span>
+<span class="lineno">  501 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  502 </span>
+<span class="lineno">  503 </span>-- | Look up a tab by index in a 'TabList'.
+<span class="lineno">  504 </span>lookupTabByIndex :: TabList -&gt; Seal.Handles.Tab.TabIndex -&gt; Maybe Tab
+<span class="lineno">  505 </span><span class="decl"><span class="nottickedoff">lookupTabByIndex tl idx = go (tlTabs tl)</span>
+<span class="lineno">  506 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  507 </span><span class="spaces">    </span><span class="nottickedoff">go [] = Nothing</span>
+<span class="lineno">  508 </span><span class="spaces">    </span><span class="nottickedoff">go (t:rest) | tIndex t == idx = Just t</span>
+<span class="lineno">  509 </span><span class="spaces">                </span><span class="nottickedoff">| otherwise       = go rest</span></span>
+<span class="lineno">  510 </span>
+<span class="lineno">  511 </span>-- | Resolve a 'TabRef' to its session meta by loading from disk.
+<span class="lineno">  512 </span>-- 'Nothing' if the tab was closed or the session.json is missing.
+<span class="lineno">  513 </span>resolveTabSession :: ChannelDeps -&gt; TabRef -&gt; IO (Maybe SessionMeta)
+<span class="lineno">  514 </span><span class="decl"><span class="nottickedoff">resolveTabSession deps ref = case ref of</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="nottickedoff">BoundSession sid -&gt; do</span>
+<span class="lineno">  516 </span><span class="spaces">    </span><span class="nottickedoff">let mp = sessionDir (cdPaths deps) sid &lt;/&gt; &quot;session.json&quot;</span>
+<span class="lineno">  517 </span><span class="spaces">    </span><span class="nottickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="nottickedoff">if not exists</span>
+<span class="lineno">  519 </span><span class="spaces">      </span><span class="nottickedoff">then pure Nothing</span>
+<span class="lineno">  520 </span><span class="spaces">      </span><span class="nottickedoff">else decodeFileStrict mp :: IO (Maybe SessionMeta)</span>
+<span class="lineno">  521 </span><span class="spaces">  </span><span class="nottickedoff">BoundHarness _   -&gt; pure Nothing</span></span>
+<span class="lineno">  522 </span>
+<span class="lineno">  523 </span>-- | Handle @\/new@ on an inbox channel: mint a fresh session from config
+<span class="lineno">  524 </span>-- defaults, rebind the conversation's current tab (if any) to the new sid,
+<span class="lineno">  525 </span>-- migrate every OTHER conversation cursor pointing at the old ref to the
+<span class="lineno">  526 </span>-- new ref (per the user's &quot;a tab has one session at a time; all channels
+<span class="lineno">  527 </span>-- focused on the tab follow the rebind&quot; model), and send the confirmation
+<span class="lineno">  528 </span>-- line. The old session is kept on disk (still in @/session list@).
+<span class="lineno">  529 </span>--
+<span class="lineno">  530 </span>-- Mirrors the CLI's @\/new@ path but lives at the loop level because the
+<span class="lineno">  531 </span>-- conversation key + cursor aren't available to a registry CommandAction
+<span class="lineno">  532 </span>-- (architect review issue C). The fresh @meta@ is NOT used to run a turn —
+<span class="lineno">  533 </span>-- the next inbound message's cursor lookup resolves to the new session
+<span class="lineno">  534 </span>-- automatically (the cursor migrate ensures that).
+<span class="lineno">  535 </span>handleNewSession
+<span class="lineno">  536 </span>  :: ChannelDeps -&gt; ChannelHandle -&gt; TabsHandle
+<span class="lineno">  537 </span>  -&gt; ChannelKind -&gt; SessionMeta -&gt; IO ()
+<span class="lineno">  538 </span><span class="decl"><span class="nottickedoff">handleNewSession deps h tabsH kind oldMeta = do</span>
+<span class="lineno">  539 </span><span class="spaces">  </span><span class="nottickedoff">-- Preserve the old session's provider/model/agent (so mid-session</span>
+<span class="lineno">  540 </span><span class="spaces">  </span><span class="nottickedoff">-- /model use changes survive /new). The new session gets a fresh id +</span>
+<span class="lineno">  541 </span><span class="spaces">  </span><span class="nottickedoff">-- timestamps; everything else is copied from the old meta.</span>
+<span class="lineno">  542 </span><span class="spaces">  </span><span class="nottickedoff">let channelLabel = channelKindToText kind</span>
+<span class="lineno">  543 </span><span class="spaces">      </span><span class="nottickedoff">oldSid = smId oldMeta</span>
+<span class="lineno">  544 </span><span class="spaces">      </span><span class="nottickedoff">oldRef = BoundSession oldSid</span>
+<span class="lineno">  545 </span><span class="spaces">  </span><span class="nottickedoff">newMeta &lt;- newSessionMeta (cdPaths deps) (smProvider oldMeta) (smModel oldMeta)</span>
+<span class="lineno">  546 </span><span class="spaces">                            </span><span class="nottickedoff">channelLabel (smAgent oldMeta)</span>
+<span class="lineno">  547 </span><span class="spaces">  </span><span class="nottickedoff">saveSessionMeta (cdPaths deps) newMeta</span>
+<span class="lineno">  548 </span><span class="spaces">  </span><span class="nottickedoff">-- Rebind the tab (if any) bound to the old sid to the new sid.</span>
+<span class="lineno">  549 </span><span class="spaces">  </span><span class="nottickedoff">snap &lt;- snapshotTabs tabsH</span>
+<span class="lineno">  550 </span><span class="spaces">  </span><span class="nottickedoff">case [ t | t &lt;- tlTabs snap, tRef t == oldRef ] of</span>
+<span class="lineno">  551 </span><span class="spaces">    </span><span class="nottickedoff">[]       -&gt; pure ()  -- no tab bound to old sid; cursor-only swap below</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="nottickedoff">(tab : _) -&gt; rebindTabH tabsH (tIndex tab) (BoundSession (smId newMeta)) &gt;&gt;= \case</span>
+<span class="lineno">  553 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (&quot;warning: /new tab rebind failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  554 </span><span class="spaces">      </span><span class="nottickedoff">Right _ -&gt; broadcastTabs deps tabsH</span>
+<span class="lineno">  555 </span><span class="spaces">  </span><span class="nottickedoff">-- Migrate every conversation cursor pointing at the old ref to the new</span>
+<span class="lineno">  556 </span><span class="spaces">  </span><span class="nottickedoff">-- ref (includes THIS conversation's cursor). Per the user's model: a tab</span>
+<span class="lineno">  557 </span><span class="spaces">  </span><span class="nottickedoff">-- has one session at a time; all channels focused on it follow the</span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="nottickedoff">-- rebind to the new session.</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="nottickedoff">_count &lt;- cursorMigrateAll (cdCursors deps) oldRef (BoundSession (smId newMeta))</span>
+<span class="lineno">  560 </span><span class="spaces">  </span><span class="nottickedoff">-- Migrate reply subscriptions from the old session to the new one so</span>
+<span class="lineno">  561 </span><span class="spaces">  </span><span class="nottickedoff">-- future fan-outs (including tab-close notifications) reach attached</span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="nottickedoff">-- channels under the new session id.</span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="nottickedoff">_n &lt;- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)</span>
+<span class="lineno">  564 </span><span class="spaces">  </span><span class="nottickedoff">chSend h</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="nottickedoff">(&quot;new session &quot; &lt;&gt; sessionIdText (smId newMeta)</span>
+<span class="lineno">  566 </span><span class="spaces">       </span><span class="nottickedoff">&lt;&gt; &quot; (&quot; &lt;&gt; smProvider newMeta &lt;&gt; &quot;/&quot; &lt;&gt; smModel newMeta &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  567 </span><span class="spaces">       </span><span class="nottickedoff">&lt;&gt; &quot; — prior session &quot; &lt;&gt; sessionIdText oldSid &lt;&gt; &quot; kept in /session list&quot;)</span></span>
+<span class="lineno">  568 </span>
+<span class="lineno">  569 </span>-- | Create a new session + tab for a conversation that has no cursor yet.
+<span class="lineno">  570 </span>-- Mints a 'SessionMeta' from config defaults, persists it, inserts a tab
+<span class="lineno">  571 </span>-- into the shared 'TabsHandle', and sets the conversation's cursor.
+<span class="lineno">  572 </span>createConversationSession
+<span class="lineno">  573 </span>  :: ChannelDeps -&gt; ChannelHandle -&gt; (Text, Text) -&gt; ChannelKind
+<span class="lineno">  574 </span>  -&gt; TabsHandle -&gt; IO SessionMeta
+<span class="lineno">  575 </span><span class="decl"><span class="istickedoff">createConversationSession deps _h key kind tabsH = do</span>
+<span class="lineno">  576 </span><span class="spaces">  </span><span class="istickedoff">cfg &lt;- cdConfig deps</span>
+<span class="lineno">  577 </span><span class="spaces">  </span><span class="istickedoff">(mAgent, mProv, mModel) &lt;- resolveDefaultAgent <span class="nottickedoff">(bAgentDefs (cdBackends deps))</span> cfg</span>
+<span class="lineno">  578 </span><span class="spaces">  </span><span class="istickedoff">let (cfgProv, cfgModel) = defaultSessionSelection cfg</span>
+<span class="lineno">  579 </span><span class="spaces">      </span><span class="istickedoff">provider = fromMaybe cfgProv mProv</span>
+<span class="lineno">  580 </span><span class="spaces">      </span><span class="istickedoff">model    = fromMaybe cfgModel mModel</span>
+<span class="lineno">  581 </span><span class="spaces">      </span><span class="istickedoff">channelLabel = channelKindToText kind</span>
+<span class="lineno">  582 </span><span class="spaces">  </span><span class="istickedoff">meta &lt;- newSessionMeta <span class="nottickedoff">(cdPaths deps)</span> provider model channelLabel mAgent</span>
+<span class="lineno">  583 </span><span class="spaces">  </span><span class="istickedoff">saveSessionMeta (cdPaths deps) meta</span>
+<span class="lineno">  584 </span><span class="spaces">  </span><span class="istickedoff">-- Bind the conversation's cursor to this session unconditionally. The</span>
+<span class="lineno">  585 </span><span class="spaces">  </span><span class="istickedoff">-- cursor is what the loop's next-turn lookup (Loop.hs:278) uses to</span>
+<span class="lineno">  586 </span><span class="spaces">  </span><span class="istickedoff">-- resolve the conversation's session; if it isn't set, the next message</span>
+<span class="lineno">  587 </span><span class="spaces">  </span><span class="istickedoff">-- mints a brand-new session and orphans this one. Earlier this lived</span>
+<span class="lineno">  588 </span><span class="spaces">  </span><span class="istickedoff">-- inside the 'Right _' branch below, so a full tab list (Left _) silently</span>
+<span class="lineno">  589 </span><span class="spaces">  </span><span class="istickedoff">-- skipped cursor-binding — every subsequent turn from the conversation</span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">-- would mint a fresh session, never reusing this one.</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">cursorSet (cdCursors deps) key (BoundSession (smId meta))</span>
+<span class="lineno">  592 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- insertTabH tabsH (BoundSession (smId meta)) <span class="nottickedoff">KindAi</span> <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  593 </span><span class="spaces">  </span><span class="istickedoff">case r of</span>
+<span class="lineno">  594 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; pure <span class="nottickedoff">()</span>  -- tab list full; session still works without a tab</span>
+<span class="lineno">  595 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt;</span>
+<span class="lineno">  596 </span><span class="spaces">      </span><span class="istickedoff">-- Push the new tab to any WS subscribers (the web frontend sidebar)</span>
+<span class="lineno">  597 </span><span class="spaces">      </span><span class="istickedoff">-- so a channel-created tab surfaces immediately. No-op when cdBroker</span>
+<span class="lineno">  598 </span><span class="spaces">      </span><span class="istickedoff">-- is Nothing (standalone signal/telegram without serve).</span>
+<span class="lineno">  599 </span><span class="spaces">      </span><span class="istickedoff">broadcastTabs deps <span class="nottickedoff">tabsH</span></span>
+<span class="lineno">  600 </span><span class="spaces">  </span><span class="istickedoff">pure meta</span></span>
+<span class="lineno">  601 </span>
+<span class="lineno">  602 </span>-- | Create a new session for a conversation WITHOUT inserting a tab or
+<span class="lineno">  603 </span>-- broadcasting to the sidebar. Used by the @/bg@ path (see 'isBgSlash')
+<span class="lineno">  604 </span>-- where the conversation needs an anchor session (its sid keys the bg
+<span class="lineno">  605 </span>-- runner's confirmation ask via 'bgConvSid') but must NOT surface an empty
+<span class="lineno">  606 </span>-- tab in the web sidebar — the @/bg@ turn runs headless on a fresh bg
+<span class="lineno">  607 </span>-- session, so a tab bound to this conversation session would never receive
+<span class="lineno">  608 </span>-- a turn and would appear dead. The cursor is always set (unlike
+<span class="lineno">  609 </span>-- 'createConversationSession', there is no tab-list-full failure mode to
+<span class="lineno">  610 </span>-- skip it on), so subsequent non-bg messages resolve to this session.
+<span class="lineno">  611 </span>createConversationSessionHeadless
+<span class="lineno">  612 </span>  :: ChannelDeps -&gt; (Text, Text) -&gt; ChannelKind -&gt; IO SessionMeta
+<span class="lineno">  613 </span><span class="decl"><span class="istickedoff">createConversationSessionHeadless deps key kind = do</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="istickedoff">cfg &lt;- cdConfig deps</span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="istickedoff">(mAgent, mProv, mModel) &lt;- resolveDefaultAgent <span class="nottickedoff">(bAgentDefs (cdBackends deps))</span> cfg</span>
+<span class="lineno">  616 </span><span class="spaces">  </span><span class="istickedoff">let (cfgProv, cfgModel) = defaultSessionSelection cfg</span>
+<span class="lineno">  617 </span><span class="spaces">      </span><span class="istickedoff">provider = fromMaybe cfgProv mProv</span>
+<span class="lineno">  618 </span><span class="spaces">      </span><span class="istickedoff">model    = fromMaybe cfgModel mModel</span>
+<span class="lineno">  619 </span><span class="spaces">      </span><span class="istickedoff">channelLabel = channelKindToText kind</span>
+<span class="lineno">  620 </span><span class="spaces">  </span><span class="istickedoff">meta &lt;- newSessionMeta <span class="nottickedoff">(cdPaths deps)</span> provider model channelLabel mAgent</span>
+<span class="lineno">  621 </span><span class="spaces">  </span><span class="istickedoff">saveSessionMeta (cdPaths deps) meta</span>
+<span class="lineno">  622 </span><span class="spaces">  </span><span class="istickedoff">cursorSet (cdCursors deps) key (BoundSession (smId meta))</span>
+<span class="lineno">  623 </span><span class="spaces">  </span><span class="istickedoff">pure meta</span></span>
+<span class="lineno">  624 </span>
+<span class="lineno">  625 </span>-- | Does an inbound body route to a @/bg@ slash command? Layer-1 routing
+<span class="lineno">  626 </span>-- ('Seal.Routing.Route.route') sends any @\/&lt;other&gt;…@ to 'SlashCommand'; this
+<span class="lineno">  627 </span>-- checks the command name is @&quot;bg&quot;@ (case-insensitive, matching the terse
+<span class="lineno">  628 </span>-- grammar's single-token form @\/bg@ or @\/bg &lt;prompt&gt;@). Used by the loop to
+<span class="lineno">  629 </span>-- pick the headless session-creation path, so @/bg@ does not mint a spurious
+<span class="lineno">  630 </span>-- empty tab for the conversation while still anchoring the bg runner's
+<span class="lineno">  631 </span>-- confirmation-ask key on the conversation's sid.
+<span class="lineno">  632 </span>isBgSlash :: Text -&gt; Bool
+<span class="lineno">  633 </span><span class="decl"><span class="istickedoff">isBgSlash body =</span>
+<span class="lineno">  634 </span><span class="spaces">  </span><span class="istickedoff">case Route.route body of</span>
+<span class="lineno">  635 </span><span class="spaces">    </span><span class="istickedoff">Right (Route.SlashCommand rest) -&gt;</span>
+<span class="lineno">  636 </span><span class="spaces">      </span><span class="istickedoff">let cmd = T.toCaseFold (T.takeWhile (/= ' ') rest)</span>
+<span class="lineno">  637 </span><span class="spaces">      </span><span class="istickedoff">in cmd == &quot;bg&quot;</span>
+<span class="lineno">  638 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; False</span></span>
+<span class="lineno">  639 </span>
+<span class="lineno">  640 </span>-- | Push the current tab-list snapshot to WS subscribers (the web frontend
+<span class="lineno">  641 </span>-- sidebar). No-op when 'cdBroker' is 'Nothing' (standalone channels without
+<span class="lineno">  642 </span>-- @seal serve@). Call after any channel-side tab mutation so the frontend
+<span class="lineno">  643 </span>-- reflects the change without waiting for a web-originated turn.
+<span class="lineno">  644 </span>broadcastTabs :: ChannelDeps -&gt; TabsHandle -&gt; IO ()
+<span class="lineno">  645 </span><span class="decl"><span class="istickedoff">broadcastTabs deps tabsH =</span>
+<span class="lineno">  646 </span><span class="spaces">  </span><span class="istickedoff">case cdBroker deps of</span>
+<span class="lineno">  647 </span><span class="spaces">    </span><span class="istickedoff">Nothing     -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  648 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt; broadcastListsSnapshot broker tabsH (cdPaths deps)</span></span>
+<span class="lineno">  649 </span>
+<span class="lineno">  650 </span>-- | Build a 'TabCloseNotifier' from the shared cursor store + reply
+<span class="lineno">  651 </span>-- registry. When a tab is closed, every conversation whose cursor points
+<span class="lineno">  652 </span>-- at the closed tab's 'TabRef' is notified via the reply fan-out (so the
+<span class="lineno">  653 </span>-- message lands on the channel handle the conversation last used), and the
+<span class="lineno">  654 </span>-- cursor is cleared so the next message creates a fresh tab. For
+<span class="lineno">  655 </span>-- 'BoundHarness' tabs there are no channel subscriptions, so this is a
+<span class="lineno">  656 </span>-- no-op. Used by the slash-command registry's @\/tab close@ and the REST
+<span class="lineno">  657 </span>-- @POST \/api\/tabs\/:index\/close@ path.
+<span class="lineno">  658 </span>mkTabCloseNotifier :: CursorStore -&gt; ReplyRegistry -&gt; TabCloseNotifier
+<span class="lineno">  659 </span><span class="decl"><span class="nottickedoff">mkTabCloseNotifier cursors replies ref = case ref of</span>
+<span class="lineno">  660 </span><span class="spaces">  </span><span class="nottickedoff">BoundSession sid -&gt; do</span>
+<span class="lineno">  661 </span><span class="spaces">    </span><span class="nottickedoff">replyFanout replies sid (msg sid)</span>
+<span class="lineno">  662 </span><span class="spaces">    </span><span class="nottickedoff">cursorClearAll cursors ref</span>
+<span class="lineno">  663 </span><span class="spaces">  </span><span class="nottickedoff">BoundHarness _ -&gt; pure ()</span>
+<span class="lineno">  664 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  665 </span><span class="spaces">    </span><span class="nottickedoff">msg sid = &quot;tab closed (session &quot; &lt;&gt; sessionIdText sid &lt;&gt; &quot;); a new tab will be created on your next message&quot;</span></span>
+<span class="lineno">  666 </span>
+<span class="lineno">  667 </span>-- | Handle a parsed 'TabSlashCommand' over a channel (mutates the
+<span class="lineno">  668 </span>-- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.
+<span class="lineno">  669 </span>handleTabCommand :: ChannelHandle -&gt; TabsHandle -&gt; TabSlashCommand -&gt; IO ()
+<span class="lineno">  670 </span><span class="decl"><span class="nottickedoff">handleTabCommand h tabsH = \case</span>
+<span class="lineno">  671 </span><span class="spaces">  </span><span class="nottickedoff">TabListCmd -&gt; do</span>
+<span class="lineno">  672 </span><span class="spaces">    </span><span class="nottickedoff">tl &lt;- snapshotTabs tabsH</span>
+<span class="lineno">  673 </span><span class="spaces">    </span><span class="nottickedoff">if tabCount tl == 0</span>
+<span class="lineno">  674 </span><span class="spaces">      </span><span class="nottickedoff">then chSend h &quot;no tabs&quot;</span>
+<span class="lineno">  675 </span><span class="spaces">      </span><span class="nottickedoff">else mapM_ (chSend h . renderCurrentTab) (tlTabs tl)</span>
+<span class="lineno">  676 </span><span class="spaces">  </span><span class="nottickedoff">TabNewCmd _mKind -&gt; do</span>
+<span class="lineno">  677 </span><span class="spaces">    </span><span class="nottickedoff">r &lt;- insertTabH tabsH (BoundSession placeholderSid) KindAi Nothing</span>
+<span class="lineno">  678 </span><span class="spaces">    </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  679 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (&quot;tab new failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  680 </span><span class="spaces">      </span><span class="nottickedoff">Right i -&gt; chSend h (&quot;tab &quot; &lt;&gt; T.singleton (tabIndexToChar i) &lt;&gt; &quot; created&quot;)</span>
+<span class="lineno">  681 </span><span class="spaces">  </span><span class="nottickedoff">TabCloseCmd idx force -&gt; do</span>
+<span class="lineno">  682 </span><span class="spaces">    </span><span class="nottickedoff">r &lt;- removeTabH tabsH idx</span>
+<span class="lineno">  683 </span><span class="spaces">    </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  684 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (if force == Force then &quot;force close: &quot; &lt;&gt; e else &quot;close failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  685 </span><span class="spaces">      </span><span class="nottickedoff">Right _ -&gt; chSend h (&quot;tab &quot; &lt;&gt; T.singleton (tabIndexToChar idx) &lt;&gt; &quot; closed&quot;)</span>
+<span class="lineno">  686 </span><span class="spaces">  </span><span class="nottickedoff">TabFocusCmd idx -&gt; do</span>
+<span class="lineno">  687 </span><span class="spaces">    </span><span class="nottickedoff">r &lt;- focusTabH tabsH idx</span>
+<span class="lineno">  688 </span><span class="spaces">    </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  689 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (&quot;focus failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  690 </span><span class="spaces">      </span><span class="nottickedoff">Right _ -&gt; chSend h (&quot;focused tab &quot; &lt;&gt; T.singleton (tabIndexToChar idx))</span>
+<span class="lineno">  691 </span><span class="spaces">  </span><span class="nottickedoff">TabResumeCmd sid -&gt; do</span>
+<span class="lineno">  692 </span><span class="spaces">    </span><span class="nottickedoff">r &lt;- insertTabH tabsH (BoundSession sid) KindAi Nothing</span>
+<span class="lineno">  693 </span><span class="spaces">    </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  694 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (&quot;resume failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  695 </span><span class="spaces">      </span><span class="nottickedoff">Right i -&gt; chSend h (&quot;tab &quot; &lt;&gt; T.singleton (tabIndexToChar i) &lt;&gt; &quot; resumed&quot;)</span>
+<span class="lineno">  696 </span><span class="spaces">  </span><span class="nottickedoff">TabRenameCmd idx name -&gt; do</span>
+<span class="lineno">  697 </span><span class="spaces">    </span><span class="nottickedoff">r &lt;- renameTabH tabsH idx name</span>
+<span class="lineno">  698 </span><span class="spaces">    </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  699 </span><span class="spaces">      </span><span class="nottickedoff">Left e  -&gt; chSend h (&quot;rename failed: &quot; &lt;&gt; e)</span>
+<span class="lineno">  700 </span><span class="spaces">      </span><span class="nottickedoff">Right _ -&gt; chSend h (&quot;tab &quot; &lt;&gt; T.singleton (tabIndexToChar idx) &lt;&gt; &quot; renamed to &quot; &lt;&gt; name)</span>
+<span class="lineno">  701 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  702 </span><span class="spaces">    </span><span class="nottickedoff">placeholderSid = case mkSessionId &quot;tab-session&quot; of</span>
+<span class="lineno">  703 </span><span class="spaces">      </span><span class="nottickedoff">Right s -&gt; s</span>
+<span class="lineno">  704 </span><span class="spaces">      </span><span class="nottickedoff">Left _  -&gt; error &quot;placeholder session id&quot;</span></span>
+<span class="lineno">  705 </span>
+<span class="lineno">  706 </span>-- | Render one tab as a single line: @&lt;index&gt;  &lt;kind&gt;  [label]@.
+<span class="lineno">  707 </span>renderCurrentTab :: Tab -&gt; Text
+<span class="lineno">  708 </span><span class="decl"><span class="nottickedoff">renderCurrentTab t =</span>
+<span class="lineno">  709 </span><span class="spaces">  </span><span class="nottickedoff">T.singleton (tabIndexToChar (tIndex t)) &lt;&gt; &quot;  &quot; &lt;&gt; T.pack (show (tKind t))</span>
+<span class="lineno">  710 </span><span class="spaces">    </span><span class="nottickedoff">&lt;&gt; maybe &quot;&quot; (&quot;  &quot; &lt;&gt;) (tLabel t)</span></span>
+<span class="lineno">  711 </span>
+<span class="lineno">  712 </span>-- | Run one plain-text turn through the agent loop with the
+<span class="lineno">  713 </span>-- 'MessageSource' threaded into 'aeMessageSource'. Takes the resolved
+<span class="lineno">  714 </span>-- 'SessionMeta' (from the cursor → tab → SessionId path) rather than
+<span class="lineno">  715 </span>-- reading a shared active-session ref. Acquires the per-session write
+<span class="lineno">  716 </span>-- lock to prevent concurrent transcript corruption. After the turn, the
+<span class="lineno">  717 </span>-- reply is fanned out to all channels subscribed to this session.
+<span class="lineno">  718 </span>plainTurn
+<span class="lineno">  719 </span>  :: ChannelDeps -&gt; ChannelHandle -&gt; AskReplyStore
+<span class="lineno">  720 </span>  -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text -&gt; IO ()
+<span class="lineno">  721 </span><span class="decl"><span class="nottickedoff">plainTurn deps h askReply meta =</span>
+<span class="lineno">  722 </span><span class="spaces">  </span><span class="nottickedoff">runTurnOnSession deps h askReply Nothing (smId meta) meta</span></span>
+<span class="lineno">  723 </span>
+<span class="lineno">  724 </span>-- | Like 'plainTurn' but with an optional 'ChannelCaps' factory override
+<span class="lineno">  725 </span>-- (e.g. Telegram's 'mkTelegramHandleCaps' for inline-keyboard @ASK_HUMAN@).
+<span class="lineno">  726 </span>-- 'Nothing' uses the generic 'mkHandleCaps' (numbered-list rendering).
+<span class="lineno">  727 </span>plainTurnWithCaps
+<span class="lineno">  728 </span>  :: ChannelDeps -&gt; ChannelHandle -&gt; AskReplyStore
+<span class="lineno">  729 </span>  -&gt; Maybe (ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps)
+<span class="lineno">  730 </span>  -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text -&gt; IO ()
+<span class="lineno">  731 </span><span class="decl"><span class="nottickedoff">plainTurnWithCaps deps h askReply mkCaps meta =</span>
+<span class="lineno">  732 </span><span class="spaces">  </span><span class="nottickedoff">runTurnOnSession deps h askReply mkCaps (smId meta) meta</span></span>
+<span class="lineno">  733 </span>
+<span class="lineno">  734 </span>-- | The shared turn body. 'askSid' is the 'SessionId' used to key the
+<span class="lineno">  735 </span>-- 'ccPrompt' ask/reply slot: for a normal turn it is the session's own sid
+<span class="lineno">  736 </span>-- (the conversation's active session); for a @/bg@ turn it is the
+<span class="lineno">  737 </span>-- /originating conversation's/ sid (NOT the fresh bg session's) so the
+<span class="lineno">  738 </span>-- channel loop's per-session 'deliverNextAnswer' short-circuit consumes the
+<span class="lineno">  739 </span>-- next inbound message as the confirmation answer — producing a modal
+<span class="lineno">  740 </span>-- &quot;answer the pending question before resuming normal turns&quot; state scoped
+<span class="lineno">  741 </span>-- to that conversation. The turn itself still runs on 'smId meta' (the bg
+<span class="lineno">  742 </span>-- session): transcript, 'aeSession', and the approval cache stay scoped to
+<span class="lineno">  743 </span>-- the bg session; only the ask-delivery key moves to the conversation.
+<span class="lineno">  744 </span>runTurnOnSession
+<span class="lineno">  745 </span>  :: ChannelDeps -&gt; ChannelHandle -&gt; AskReplyStore
+<span class="lineno">  746 </span>  -&gt; Maybe (ChannelHandle -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps)
+<span class="lineno">  747 </span>  -&gt; SessionId -&gt; SessionMeta -&gt; Maybe MessageSource -&gt; Text -&gt; IO ()
+<span class="lineno">  748 </span><span class="decl"><span class="istickedoff">runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do</span>
+<span class="lineno">  749 </span><span class="spaces">  </span><span class="istickedoff">let td = mkChannelTurnDeps deps</span>
+<span class="lineno">  750 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">handleCaps = case mkCaps of</span></span>
+<span class="lineno">  751 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Nothing  -&gt; mkHandleCaps h askReply askSid</span></span>
+<span class="lineno">  752 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Just f   -&gt; f h askReply askSid</span></span>
+<span class="lineno">  753 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">adapter = mkChannelTurnAdapter deps td h handleCaps</span></span>
+<span class="lineno">  754 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- runSessionTurn td <span class="nottickedoff">adapter</span> meta <span class="nottickedoff">mSrc</span> <span class="nottickedoff">t</span></span>
+<span class="lineno">  755 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">pure ()</span></span></span>
+<span class="lineno">  756 </span>
+<span class="lineno">  757 </span>-- | Build the @/bg@ 'BgRunner' for an inbox-driven channel. The runner mints
+<span class="lineno">  758 </span>-- a fresh persisted session from the config defaults (channel label
+<span class="lineno">  759 </span>-- @&quot;bg&quot;@), then forks a turn against the invoking 'ChannelHandle'. The
+<span class="lineno">  760 </span>-- confirmation ask is keyed to the /originating conversation's/ active
+<span class="lineno">  761 </span>-- session id (read from 'bgConvSid', which the loop updates each turn) —
+<span class="lineno">  762 </span>-- NOT the fresh bg session's sid — so the channel loop's per-session
+<span class="lineno">  763 </span>-- 'deliverNextAnswer' short-circuit consumes the next inbound message as
+<span class="lineno">  764 </span>-- the confirmation answer (a modal &quot;answer the pending question before
+<span class="lineno">  765 </span>-- resuming normal turns&quot; state scoped to that conversation). The turn
+<span class="lineno">  766 </span>-- itself runs on the fresh bg session (transcript + 'aeSession' + approval
+<span class="lineno">  767 </span>-- cache stay scoped to it); only the ask-delivery key moves to the
+<span class="lineno">  768 </span>-- conversation. The assistant reply is delivered via the handle's
+<span class="lineno">  769 </span>-- @chSend@. No tab or cursor state is mutated.
+<span class="lineno">  770 </span>--
+<span class="lineno">  771 </span>-- After persisting the session, a @lists@ snapshot is broadcast (via
+<span class="lineno">  772 </span>-- 'broadcastTabs') so the web frontend's 'useListsStream' learns about the
+<span class="lineno">  773 </span>-- new session immediately — it surfaces in @recentSessions@ (it's a real,
+<span class="lineno">  774 </span>-- persisted, one-shot session, just not tabbed). At this point the
+<span class="lineno">  775 </span>-- transcript is empty so the row shows the agent name as a placeholder;
+<span class="lineno">  776 </span>-- the @runTurnOnSession@ path's @aeOnUserMessage@ hook (wired in
+<span class="lineno">  777 </span>-- 'runTurnOnSession' when @shouldAutoTab@ is False) re-broadcasts a
+<span class="lineno">  778 </span>-- @lists@ snapshot as soon as the user message is durable on disk, so
+<span class="lineno">  779 </span>-- the snippet (the first user message) populates the session name
+<span class="lineno">  780 </span>-- before the LLM responds. Without the pre-turn push the frontend only
+<span class="lineno">  781 </span>-- discovers the session on a hard refresh. No-op when 'cdBroker' is
+<span class="lineno">  782 </span>-- 'Nothing' (standalone Telegram/Signal without @seal serve@).
+<span class="lineno">  783 </span>mkBgRunner :: ChannelDeps -&gt; ChannelHandle -&gt; AskReplyStore -&gt; IORef SessionId -&gt; TabsHandle -&gt; BgRunner
+<span class="lineno">  784 </span><span class="decl"><span class="istickedoff">mkBgRunner deps h askReply bgConvSid tabsH = BgRunner $ \prompt -&gt; do</span>
+<span class="lineno">  785 </span><span class="spaces">  </span><span class="istickedoff">convSid &lt;- readIORef bgConvSid</span>
+<span class="lineno">  786 </span><span class="spaces">  </span><span class="istickedoff">cfg &lt;- cdConfig deps</span>
+<span class="lineno">  787 </span><span class="spaces">  </span><span class="istickedoff">(mAgent, mProv, mModel) &lt;- resolveDefaultAgent <span class="nottickedoff">(bAgentDefs (cdBackends deps))</span> cfg</span>
+<span class="lineno">  788 </span><span class="spaces">  </span><span class="istickedoff">let (cfgProv, cfgModel) = defaultSessionSelection cfg</span>
+<span class="lineno">  789 </span><span class="spaces">      </span><span class="istickedoff">provider = fromMaybe cfgProv mProv</span>
+<span class="lineno">  790 </span><span class="spaces">      </span><span class="istickedoff">model    = fromMaybe cfgModel mModel</span>
+<span class="lineno">  791 </span><span class="spaces">  </span><span class="istickedoff">meta &lt;- newSessionMeta <span class="nottickedoff">(cdPaths deps)</span> provider model &quot;bg&quot; mAgent</span>
+<span class="lineno">  792 </span><span class="spaces">  </span><span class="istickedoff">saveSessionMeta (cdPaths deps) meta</span>
+<span class="lineno">  793 </span><span class="spaces">  </span><span class="istickedoff">broadcastTabs deps tabsH</span>
+<span class="lineno">  794 </span><span class="spaces">  </span><span class="istickedoff">void (forkIO (runTurnOnSession deps <span class="nottickedoff">h</span> <span class="nottickedoff">askReply</span> <span class="nottickedoff">Nothing</span> <span class="nottickedoff">convSid</span> meta <span class="nottickedoff">Nothing</span> <span class="nottickedoff">prompt</span>))</span></span>
+<span class="lineno">  795 </span>
+<span class="lineno">  796 </span>-- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.
+<span class="lineno">  797 </span>-- Dispatches an opcode against the active session's ISA registry + transcript
+<span class="lineno">  798 </span>-- under 'Full' autonomy semantics (the operator is the approver by typing the
+<span class="lineno">  799 </span>-- command). Reads the session id from the supplied 'IORef' fresh on each
+<span class="lineno">  800 </span>-- invocation — the 'runChannelLoop' body writes the cursor-resolved 'sid' to
+<span class="lineno">  801 </span>-- this IORef every turn at Loop.hs:266, so the dispatcher always sees the
+<span class="lineno">  802 </span>-- active session.
+<span class="lineno">  803 </span>--
+<span class="lineno">  804 </span>-- Constructed inside 'runChannelLoop' at Loop.hs:243 in the @let@-block
+<span class="lineno">  805 </span>-- where 'bgConvSid' (the IORef) and 'askReply' (the 'AskReplyStore' param)
+<span class="lineno">  806 </span>-- are in scope, and baked into 'registryWithBg' alongside
+<span class="lineno">  807 </span>-- 'backgroundCommandSpec', 'callCommandSpec', and 'skillCommandSpec' so
+<span class="lineno">  808 </span>-- @/call@ and @/skill load@ dispatch against the same per-session registry
+<span class="lineno">  809 </span>-- + transcript. Mirrors 'webCallDispatcher' at
+<span class="lineno">  810 </span>-- 'Seal.Gateway.Send.hs:516-541'.
+<span class="lineno">  811 </span>-- | The inbox-channel analogue of 'Seal.Gateway.Send.webCallDispatcher'.
+<span class="lineno">  812 </span>-- Delegates to the unified 'TurnEngine.callDispatcher'. Reads the session
+<span class="lineno">  813 </span>-- id from the supplied 'IORef' fresh on each invocation — the
+<span class="lineno">  814 </span>-- 'runChannelLoop' body writes the cursor-resolved 'sid' to this IORef
+<span class="lineno">  815 </span>-- every turn, so the dispatcher always sees the active session.
+<span class="lineno">  816 </span>channelCallDispatcher
+<span class="lineno">  817 </span>  :: ChannelDeps -&gt; TurnDeps -&gt; ChannelHandle -&gt; AskReplyStore -&gt; IORef SessionId -&gt; CallDispatcher
+<span class="lineno">  818 </span><span class="decl"><span class="istickedoff">channelCallDispatcher deps td h askReply sidRef callOpName val = do</span>
+<span class="lineno">  819 </span><span class="spaces">  </span><span class="istickedoff">sid &lt;- readIORef sidRef</span>
+<span class="lineno">  820 </span><span class="spaces">  </span><span class="istickedoff">mChannel &lt;- TurnEngine.loadChannelLabel (cdPaths deps) sid</span>
+<span class="lineno">  821 </span><span class="spaces">  </span><span class="istickedoff">let channelLabel = fromMaybe &quot;cli&quot; mChannel</span>
+<span class="lineno">  822 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">caps = mkHandleCaps h askReply sid</span></span>
+<span class="lineno">  823 </span><span class="spaces">  </span><span class="istickedoff">TurnEngine.callDispatcher td <span class="nottickedoff">caps</span> sid channelLabel callOpName val</span></span>
+<span class="lineno">  824 </span>
+<span class="lineno">  825 </span>-- | Mint a fresh 'SessionId' for a forked agent instance.
+<span class="lineno">  826 </span>-- IORef; the worker reads it after the run and returns it as the summary.
+
+</pre>
+</body>
+</html>

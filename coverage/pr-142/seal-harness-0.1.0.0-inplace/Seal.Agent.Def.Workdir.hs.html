@@ -1,0 +1,839 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The workdir-scoped agent-definition discovery backend.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- This module scans a session workdir (the workspace root, via the
+<span class="lineno">    5 </span>-- 'WorkdirFs' handle) for agent definitions shipped by cloned
+<span class="lineno">    6 </span>-- repositories. It is the single home for ALL workspace-derived agent-def
+<span class="lineno">    7 </span>-- discovery; the user store lives in &quot;Seal.Agent.Def.Backend&quot; (§3.9).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- **No direct filesystem access.** This module deliberately does NOT
+<span class="lineno">   10 </span>-- import @System.Directory@ or @Data.Text.IO@ — every workspace read goes
+<span class="lineno">   11 </span>-- through the 'WorkdirFs' handle (single SafePath-confined chokepoint,
+<span class="lineno">   12 </span>-- §3.6). The compile-fail fixture
+<span class="lineno">   13 </span>-- @Seal.Agent.Def.BackendNoDirectFsFailSpec@ asserts this invariant by
+<span class="lineno">   14 </span>-- grepping this module's source for those import lines.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- Two on-disk schemes are discovered (mirroring the user store):
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- 1. **FlatScheme** — one Markdown file per def at @agents\/\&lt;id\&gt;.md@,
+<span class="lineno">   19 </span>--    frontmatter + body = system prompt.
+<span class="lineno">   20 </span>-- 2. **DirScheme** (PureClaw-compatible) — a subdirectory per agent at
+<span class="lineno">   21 </span>--    @agents\/\&lt;id\&gt;\/@, with optional TOML frontmatter on @AGENTS.md@
+<span class="lineno">   22 </span>--    and the system prompt composed by reading bootstrap files
+<span class="lineno">   23 </span>--    (@SOUL.md@, @USER.md@, @AGENTS.md@ body, @MEMORY.md@,
+<span class="lineno">   24 </span>--    @IDENTITY.md@, @TOOLS.md@, @BOOTSTRAP.md@) in fixed order with
+<span class="lineno">   25 </span>--    @--- SOUL ---@-style section markers.
+<span class="lineno">   26 </span>--
+<span class="lineno">   27 </span>-- For @.agents\/@, the [.agents Protocol](https://dotagentsprotocol.com) is
+<span class="lineno">   28 </span>-- recognized: when @.agents\/@ contains @agents.md@ OR an @agents\/@
+<span class="lineno">   29 </span>-- subdirectory, it is treated as a **protocol root** — the project-level
+<span class="lineno">   30 </span>-- @.agents\/agents.md@ is loaded as an agent def (id @agents-md@), and each
+<span class="lineno">   31 </span>-- @.agents\/agents\/\&lt;id\&gt;\/agent.md@ sub-agent is loaded. Otherwise
+<span class="lineno">   32 </span>-- @.agents\/@ falls back to the legacy hybrid flat + DirScheme discovery.
+<span class="lineno">   33 </span>--
+<span class="lineno">   34 </span>-- @.seal\/agents@ and @agents@ always use the legacy discovery.
+<span class="lineno">   35 </span>--
+<span class="lineno">   36 </span>-- The re-exports from &quot;Seal.Agent.Def.Backend&quot; keep the public API
+<span class="lineno">   37 </span>-- stable ('workdirAgentDefBackend', 'composeDirSystemPrompt',
+<span class="lineno">   38 </span>-- 'encodeAgentDef', 'decodeAgentDef', etc.).
+<span class="lineno">   39 </span>module Seal.Agent.Def.Workdir
+<span class="lineno">   40 </span>  ( -- * Backend record
+<span class="lineno">   41 </span>    AgentDefBackend (..)
+<span class="lineno">   42 </span>    -- * Workdir backend
+<span class="lineno">   43 </span>  , workdirAgentDefBackend
+<span class="lineno">   44 </span>  , listWorkdirAgentDefs
+<span class="lineno">   45 </span>  , listWorkdirAgentDefsSnap
+<span class="lineno">   46 </span>  , staticAgentDefBackend
+<span class="lineno">   47 </span>    -- * DirScheme composition (WorkdirFs-anchored)
+<span class="lineno">   48 </span>  , composeDirSystemPrompt
+<span class="lineno">   49 </span>  , readSection
+<span class="lineno">   50 </span>  , loadDirAgentDef
+<span class="lineno">   51 </span>  , loadDirAgentConfig
+<span class="lineno">   52 </span>  , dirMTime
+<span class="lineno">   53 </span>    -- * Protocol discovery (WorkdirFs-anchored)
+<span class="lineno">   54 </span>  , listAgentsDotAgents
+<span class="lineno">   55 </span>  , listProtocolAgentDefs
+<span class="lineno">   56 </span>  , isProtocolRoot
+<span class="lineno">   57 </span>  , loadProjectAgentDef
+<span class="lineno">   58 </span>  , loadProtocolSubAgent
+<span class="lineno">   59 </span>    -- * Flat codecs (shared with the user store)
+<span class="lineno">   60 </span>  , encodeAgentDef
+<span class="lineno">   61 </span>  , decodeAgentDef
+<span class="lineno">   62 </span>    -- * DirScheme types + helpers
+<span class="lineno">   63 </span>  , DirAgentConfig (..)
+<span class="lineno">   64 </span>  , defaultDirAgentConfig
+<span class="lineno">   65 </span>  , dirAgentConfigCodec
+<span class="lineno">   66 </span>  , parseDirAgentConfig
+<span class="lineno">   67 </span>  , SectionKind (..)
+<span class="lineno">   68 </span>  , sectionFileName
+<span class="lineno">   69 </span>  , sectionMarker
+<span class="lineno">   70 </span>  , truncateSection
+<span class="lineno">   71 </span>  , defaultSectionCharLimit
+<span class="lineno">   72 </span>  , maxBootstrapFileBytes
+<span class="lineno">   73 </span>  , decodeDirTools
+<span class="lineno">   74 </span>  , decodeTools
+<span class="lineno">   75 </span>  , renderTools
+<span class="lineno">   76 </span>  , isoTime
+<span class="lineno">   77 </span>  , parseTime
+<span class="lineno">   78 </span>  , epochZero
+<span class="lineno">   79 </span>  , deriveAgentsMdId
+<span class="lineno">   80 </span>  ) where
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>import Control.Monad (forM, (&lt;=&lt;))
+<span class="lineno">   83 </span>import Data.Aeson (Value (..), encode)
+<span class="lineno">   84 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   85 </span>import Data.Char qualified as Char
+<span class="lineno">   86 </span>import Data.Either (fromRight)
+<span class="lineno">   87 </span>import Data.List (sortOn)
+<span class="lineno">   88 </span>import Data.Map.Strict (Map)
+<span class="lineno">   89 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   90 </span>import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+<span class="lineno">   91 </span>import Data.Set qualified as Set
+<span class="lineno">   92 </span>import Data.Text (Text)
+<span class="lineno">   93 </span>import Data.Text qualified as T
+<span class="lineno">   94 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   95 </span>import Data.Time (UTCTime (..))
+<span class="lineno">   96 </span>import Data.Time.Calendar (fromGregorian)
+<span class="lineno">   97 </span>import Data.Time.Clock (secondsToDiffTime)
+<span class="lineno">   98 </span>import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+<span class="lineno">   99 </span>import Data.Vector qualified as V
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>import Toml ((.=))
+<span class="lineno">  102 </span>import Toml qualified
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>import Seal.Agent.Def.Types
+<span class="lineno">  105 </span>  ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
+<span class="lineno">  106 </span>  , isValidAgentDefId
+<span class="lineno">  107 </span>  )
+<span class="lineno">  108 </span>import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
+<span class="lineno">  109 </span>import Seal.Security.Policy (AllowList (..))
+<span class="lineno">  110 </span>import Seal.Store.Markdown
+<span class="lineno">  111 </span>  ( decodeDoc, encodeDoc, fmLookup, fmLookupList, splitFrontmatterRaw
+<span class="lineno">  112 </span>  )
+<span class="lineno">  113 </span>import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
+<span class="lineno">  114 </span>import Seal.Tools.Exec.WorkdirFs
+<span class="lineno">  115 </span>  ( WorkdirFs (..)
+<span class="lineno">  116 </span>  , WorkspaceSnapshot
+<span class="lineno">  117 </span>  , snapChildDirsAt, snapChildFilesAt, snapIsDirectoryAt, snapIsFileAt
+<span class="lineno">  118 </span>  , snapTopDirs
+<span class="lineno">  119 </span>  , wfsSnapshot
+<span class="lineno">  120 </span>  )
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  123 </span>-- Backend record (lives here so the workdir backend can construct one
+<span class="lineno">  124 </span>-- without an import cycle with &quot;Seal.Agent.Def.Backend&quot;, which re-exports
+<span class="lineno">  125 </span>-- this module's workdir API and builds the user store on top of it).
+<span class="lineno">  126 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | The agent-definition store capability. Each operation is IO; 'adbList'
+<span class="lineno">  129 </span>-- returns all defs sorted by id.
+<span class="lineno">  130 </span>data AgentDefBackend = AgentDefBackend
+<span class="lineno">  131 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">adbRead</span></span></span>   :: AgentDefId -&gt; IO (Maybe AgentDef)
+<span class="lineno">  132 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adbUpdate</span></span></span> :: AgentDef -&gt; IO ()
+<span class="lineno">  133 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adbList</span></span></span>   :: IO [AgentDef]
+<span class="lineno">  134 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adbDelete</span></span></span> :: AgentDefId -&gt; IO ()
+<span class="lineno">  135 </span>  -- ^ Remove a def by id (delete the file + auto-commit; idempotent).
+<span class="lineno">  136 </span>  }
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  139 </span>-- Conventions + protocol identifiers
+<span class="lineno">  140 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | The conventional agent-def directories a cloned repo may carry.
+<span class="lineno">  143 </span>-- @.agents@ is the primary convention (mirrors @.skills@ for the
+<span class="lineno">  144 </span>-- agentskills.io format). The others are back-compat.
+<span class="lineno">  145 </span>workdirAgentDefConventions :: [FilePath]
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">workdirAgentDefConventions = [ &quot;.agents&quot;, &quot;.seal/agents&quot;, &quot;agents&quot; ]</span></span>
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | The synthetic 'AgentDefId' text for the project-level @.agents/agents.md@
+<span class="lineno">  149 </span>-- (the @.agents Protocol@ project instructions file). The @-md@ suffix makes
+<span class="lineno">  150 </span>-- accidental collision with a subdir name unlikely; the existing
+<span class="lineno">  151 </span>-- flat-wins-on-conflict rule is the real guard. The suffix is the invariant
+<span class="lineno">  152 </span>-- pinned by the QuickCheck property (§3.1).
+<span class="lineno">  153 </span>deriveAgentsMdId :: Text
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">deriveAgentsMdId = &quot;agents-md&quot;</span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- | The friendly display name for the project-level @agents.md@ when its
+<span class="lineno">  157 </span>-- frontmatter has no @name@ field (so the synthetic id never leaks to the
+<span class="lineno">  158 </span>-- UI — §3.1).
+<span class="lineno">  159 </span>projectAgentsMdDisplayName :: Text
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">projectAgentsMdDisplayName = &quot;Project (agents.md)&quot;</span></span>
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  163 </span>-- DirScheme types + pure helpers
+<span class="lineno">  164 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>-- | Optional TOML frontmatter on @AGENTS.md@ inside an agent directory.
+<span class="lineno">  167 </span>-- All fields are optional; unknown fields are ignored by the codec. A
+<span class="lineno">  168 </span>-- missing @AGENTS.md@ or unparseable frontmatter yields
+<span class="lineno">  169 </span>-- 'defaultDirAgentConfig'.
+<span class="lineno">  170 </span>data DirAgentConfig = DirAgentConfig
+<span class="lineno">  171 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">dacModel</span></span></span>    :: Maybe Text
+<span class="lineno">  172 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dacProvider</span></span></span> :: Maybe Text
+<span class="lineno">  173 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dacTools</span></span></span>    :: Maybe [Text]   -- ^ TOML array of opcode names; absent -&gt; 'AllowAll'
+<span class="lineno">  174 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>-- | 'DirAgentConfig' with every field unset (the permissive fallback).
+<span class="lineno">  177 </span>defaultDirAgentConfig :: DirAgentConfig
+<span class="lineno">  178 </span><span class="decl"><span class="istickedoff">defaultDirAgentConfig = DirAgentConfig Nothing Nothing Nothing</span></span>
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>-- | Bidirectional tomland codec for 'DirAgentConfig'. Mirrors the
+<span class="lineno">  181 </span>-- @Toml.dioptional (Toml.text ...)@ pattern used in 'Seal.Config.File'.
+<span class="lineno">  182 </span>-- @tools@ uses @Toml.arrayOf Toml._Text@ to decode a TOML array of
+<span class="lineno">  183 </span>-- strings (e.g. @tools = [&quot;FILE_READ&quot;, &quot;ASK_HUMAN&quot;]@).
+<span class="lineno">  184 </span>dirAgentConfigCodec :: Toml.TomlCodec DirAgentConfig
+<span class="lineno">  185 </span><span class="decl"><span class="istickedoff">dirAgentConfigCodec = DirAgentConfig</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;model&quot;)              .= <span class="nottickedoff">dacModel</span></span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;provider&quot;)           .= <span class="nottickedoff">dacProvider</span></span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.arrayOf Toml._Text &quot;tools&quot;) .= <span class="nottickedoff">dacTools</span></span></span>
+<span class="lineno">  189 </span>
+<span class="lineno">  190 </span>-- | Parse the TOML frontmatter off an @AGENTS.md@ document. A document
+<span class="lineno">  191 </span>-- with no frontmatter yields 'defaultDirAgentConfig'. Parse failures also
+<span class="lineno">  192 </span>-- yield 'defaultDirAgentConfig' (permissive — matches PureClaw's
+<span class="lineno">  193 </span>-- 'loadAgentConfig' fallback).
+<span class="lineno">  194 </span>parseDirAgentConfig :: Text -&gt; DirAgentConfig
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">parseDirAgentConfig input =</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">case splitFrontmatterRaw input of</span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="istickedoff">(Nothing, _)   -&gt; defaultDirAgentConfig</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="istickedoff">(Just &quot;&quot;, _)   -&gt; <span class="nottickedoff">defaultDirAgentConfig</span></span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">(Just toml, _) -&gt;</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="istickedoff">case Toml.decode dirAgentConfigCodec toml of</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">defaultDirAgentConfig</span></span>
+<span class="lineno">  202 </span><span class="spaces">        </span><span class="istickedoff">Right cfg -&gt; cfg</span></span>
+<span class="lineno">  203 </span>
+<span class="lineno">  204 </span>-- | Bootstrap file types, in the fixed injection order (mirrors PureClaw's
+<span class="lineno">  205 </span>-- 'SectionKind' list).
+<span class="lineno">  206 </span>data SectionKind = SoulK | UserK | AgentsK | MemoryK | IdentityK | ToolsK | BootstrapK
+<span class="lineno">  207 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>sectionFileName :: SectionKind -&gt; FilePath
+<span class="lineno">  210 </span><span class="decl"><span class="istickedoff">sectionFileName SoulK      = &quot;SOUL.md&quot;</span>
+<span class="lineno">  211 </span><span class="spaces"></span><span class="istickedoff">sectionFileName UserK      = &quot;USER.md&quot;</span>
+<span class="lineno">  212 </span><span class="spaces"></span><span class="istickedoff">sectionFileName AgentsK    = &quot;AGENTS.md&quot;</span>
+<span class="lineno">  213 </span><span class="spaces"></span><span class="istickedoff">sectionFileName MemoryK    = &quot;MEMORY.md&quot;</span>
+<span class="lineno">  214 </span><span class="spaces"></span><span class="istickedoff">sectionFileName IdentityK  = &quot;IDENTITY.md&quot;</span>
+<span class="lineno">  215 </span><span class="spaces"></span><span class="istickedoff">sectionFileName ToolsK     = &quot;TOOLS.md&quot;</span>
+<span class="lineno">  216 </span><span class="spaces"></span><span class="istickedoff">sectionFileName BootstrapK = &quot;BOOTSTRAP.md&quot;</span></span>
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>sectionMarker :: SectionKind -&gt; Text
+<span class="lineno">  219 </span><span class="decl"><span class="istickedoff">sectionMarker SoulK      = &quot;--- SOUL ---&quot;</span>
+<span class="lineno">  220 </span><span class="spaces"></span><span class="istickedoff">sectionMarker UserK      = <span class="nottickedoff">&quot;--- USER ---&quot;</span></span>
+<span class="lineno">  221 </span><span class="spaces"></span><span class="istickedoff">sectionMarker AgentsK    = &quot;--- AGENTS ---&quot;</span>
+<span class="lineno">  222 </span><span class="spaces"></span><span class="istickedoff">sectionMarker MemoryK    = <span class="nottickedoff">&quot;--- MEMORY ---&quot;</span></span>
+<span class="lineno">  223 </span><span class="spaces"></span><span class="istickedoff">sectionMarker IdentityK  = <span class="nottickedoff">&quot;--- IDENTITY ---&quot;</span></span>
+<span class="lineno">  224 </span><span class="spaces"></span><span class="istickedoff">sectionMarker ToolsK     = <span class="nottickedoff">&quot;--- TOOLS ---&quot;</span></span>
+<span class="lineno">  225 </span><span class="spaces"></span><span class="istickedoff">sectionMarker BootstrapK = <span class="nottickedoff">&quot;--- BOOTSTRAP ---&quot;</span></span></span>
+<span class="lineno">  226 </span>
+<span class="lineno">  227 </span>-- | Maximum raw file size we will read. Anything larger is skipped. (The
+<span class="lineno">  228 </span>-- 'WorkdirFs' byte ceiling is the live bound; this constant is retained as
+<span class="lineno">  229 </span>-- the documented per-file cap and for the oversize test.)
+<span class="lineno">  230 </span>maxBootstrapFileBytes :: Integer
+<span class="lineno">  231 </span><span class="decl"><span class="nottickedoff">maxBootstrapFileBytes = 1024 * 1024</span></span>
+<span class="lineno">  232 </span>
+<span class="lineno">  233 </span>-- | Default per-file character limit for 'composeDirSystemPrompt'. Large
+<span class="lineno">  234 </span>-- enough that typical SOUL/USER/AGENTS files fit intact; sections beyond
+<span class="lineno">  235 </span>-- this are truncated with the PureClaw-style marker.
+<span class="lineno">  236 </span>defaultSectionCharLimit :: Int
+<span class="lineno">  237 </span><span class="decl"><span class="istickedoff">defaultSectionCharLimit = 65536</span></span>
+<span class="lineno">  238 </span>
+<span class="lineno">  239 </span>-- | Truncate a section body to @limit@ characters, appending the exact
+<span class="lineno">  240 </span>-- truncation marker. Strings at or under the limit are returned as-is.
+<span class="lineno">  241 </span>truncateSection :: Int -&gt; Text -&gt; Text
+<span class="lineno">  242 </span><span class="decl"><span class="istickedoff">truncateSection limit txt</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">| T.length txt &lt;= limit = txt</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="istickedoff">T.take limit txt</span>
+<span class="lineno">  246 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;\n[...truncated at &quot; &lt;&gt; T.pack (show limit) &lt;&gt; &quot; chars...]&quot;</span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  249 </span>-- Flat codecs (shared with the user store in Seal.Agent.Def.Backend)
+<span class="lineno">  250 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | Encode an 'AgentDef' as a Markdown document (frontmatter + body, where
+<span class="lineno">  253 </span>-- the body is the system prompt).
+<span class="lineno">  254 </span>encodeAgentDef :: AgentDef -&gt; Text
+<span class="lineno">  255 </span><span class="decl"><span class="istickedoff">encodeAgentDef d = encodeDoc fm body</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  257 </span><span class="spaces">    </span><span class="istickedoff">ModelId modelName = adModel d</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">body = fromMaybe &quot;&quot; (adSystem d)</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">fm = Map.fromList $</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">[ (&quot;id&quot;, agentDefIdText (adId d))</span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;name&quot;, adName d)</span>
+<span class="lineno">  262 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;provider&quot;, adProvider d)</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;model&quot;, modelName)</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;tools&quot;, renderTools (adTools d))</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;created_at&quot;, isoTime (adCreatedAt d))</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;updated_at&quot;, isoTime (adUpdatedAt d))</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;session&quot;, sessionIdText (adSession d))</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">] ++ maybe [] (\g -&gt; [(&quot;group&quot;, g)]) (adGroup d)</span></span>
+<span class="lineno">  269 </span>
+<span class="lineno">  270 </span>-- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
+<span class="lineno">  271 </span>-- field is missing or fails 'mkAgentDefId'.
+<span class="lineno">  272 </span>decodeAgentDef :: Text -&gt; Maybe AgentDef
+<span class="lineno">  273 </span><span class="decl"><span class="istickedoff">decodeAgentDef content =</span>
+<span class="lineno">  274 </span><span class="spaces">  </span><span class="istickedoff">case decodeDoc content of</span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">(fm, body) -&gt; do</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">aidT &lt;- fmLookup &quot;id&quot; fm</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">aid  &lt;- either <span class="nottickedoff">(const Nothing)</span> Just (mkAgentDefId aidT)</span>
+<span class="lineno">  278 </span><span class="spaces">      </span><span class="istickedoff">Just AgentDef</span>
+<span class="lineno">  279 </span><span class="spaces">        </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  280 </span><span class="spaces">        </span><span class="istickedoff">, adName = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (fmLookup &quot;name&quot; fm)</span>
+<span class="lineno">  281 </span><span class="spaces">        </span><span class="istickedoff">, adProvider = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (fmLookup &quot;provider&quot; fm)</span>
+<span class="lineno">  282 </span><span class="spaces">        </span><span class="istickedoff">, adModel = ModelId (fromMaybe <span class="nottickedoff">&quot;&quot;</span> (fmLookup &quot;model&quot; fm))</span>
+<span class="lineno">  283 </span><span class="spaces">        </span><span class="istickedoff">, adSystem = if T.null body then Nothing else Just body</span>
+<span class="lineno">  284 </span><span class="spaces">        </span><span class="istickedoff">, adTools = decodeTools fm</span>
+<span class="lineno">  285 </span><span class="spaces">        </span><span class="istickedoff">, adGroup = fmLookup &quot;group&quot; fm</span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="istickedoff">, adCreatedAt = parseTime (fmLookup &quot;created_at&quot; fm)</span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="istickedoff">, adUpdatedAt = parseTime (fmLookup &quot;updated_at&quot; fm)</span>
+<span class="lineno">  288 </span><span class="spaces">        </span><span class="istickedoff">, adSession = fromRight <span class="nottickedoff">(mkSystemSessionId &quot;unknown&quot;)</span> (mkSessionId (fromMaybe <span class="nottickedoff">&quot;unknown&quot;</span> (fmLookup &quot;session&quot; fm)))</span>
+<span class="lineno">  289 </span><span class="spaces">        </span><span class="istickedoff">}</span></span>
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  292 </span>-- Shared pure helpers (flat + dir)
+<span class="lineno">  293 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  294 </span>
+<span class="lineno">  295 </span>-- | Decode the @tools@ frontmatter value (a 'Maybe [Text]' from the TOML
+<span class="lineno">  296 </span>-- codec): @Nothing@ -&gt; 'AllowAll'; a list of opcode-name strings -&gt;
+<span class="lineno">  297 </span>-- 'AllowOnly'. The string @&quot;all&quot;@ is not special here (the TOML codec
+<span class="lineno">  298 </span>-- produces a list, not a scalar); callers wanting @AllowAll@ simply omit
+<span class="lineno">  299 </span>-- the @tools@ key.
+<span class="lineno">  300 </span>decodeDirTools :: Maybe [Text] -&gt; AllowList OpName
+<span class="lineno">  301 </span><span class="decl"><span class="istickedoff">decodeDirTools Nothing     = AllowAll</span>
+<span class="lineno">  302 </span><span class="spaces"></span><span class="istickedoff">decodeDirTools (Just [])   = <span class="nottickedoff">AllowAll</span></span>
+<span class="lineno">  303 </span><span class="spaces"></span><span class="istickedoff">decodeDirTools (Just ts)   = AllowOnly (Set.fromList (map OpName ts))</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- | Render an 'AllowList OpName' as @&quot;all&quot;@ or a JSON array string.
+<span class="lineno">  306 </span>renderTools :: AllowList OpName -&gt; Text
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">renderTools AllowAll       = &quot;all&quot;</span>
+<span class="lineno">  308 </span><span class="spaces"></span><span class="istickedoff">renderTools (AllowOnly xs) =</span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">TE.decodeUtf8 (BL.toStrict (encode (V.fromList [ String t | OpName t &lt;- Set.toList xs ])))</span></span>
+<span class="lineno">  310 </span>
+<span class="lineno">  311 </span>-- | Decode the @tools@ frontmatter field (flat scheme): @&quot;all&quot;@ -&gt;
+<span class="lineno">  312 </span>-- 'AllowAll'; a JSON array of opcode-name strings -&gt; 'AllowOnly';
+<span class="lineno">  313 </span>-- absent/other -&gt; 'AllowAll'.
+<span class="lineno">  314 </span>decodeTools :: Map Text Text -&gt; AllowList OpName
+<span class="lineno">  315 </span><span class="decl"><span class="istickedoff">decodeTools fm = case Map.lookup &quot;tools&quot; fm of</span>
+<span class="lineno">  316 </span><span class="spaces">  </span><span class="istickedoff">Nothing    -&gt; AllowAll</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">Just &quot;all&quot; -&gt; AllowAll</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="istickedoff">Just _     -&gt; case fmLookupList &quot;tools&quot; fm of</span>
+<span class="lineno">  319 </span><span class="spaces">    </span><span class="istickedoff">Just ts -&gt; AllowOnly (Set.fromList (map OpName ts))</span>
+<span class="lineno">  320 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">AllowAll</span></span></span>
+<span class="lineno">  321 </span>
+<span class="lineno">  322 </span>-- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
+<span class="lineno">  323 </span>isoTime :: UTCTime -&gt; Text
+<span class="lineno">  324 </span><span class="decl"><span class="istickedoff">isoTime = T.pack . formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot;</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
+<span class="lineno">  327 </span>-- when absent or unparseable.
+<span class="lineno">  328 </span>parseTime :: Maybe Text -&gt; UTCTime
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">parseTime Nothing    = <span class="nottickedoff">epochZero</span></span>
+<span class="lineno">  330 </span><span class="spaces"></span><span class="istickedoff">parseTime (Just raw) = fromMaybe <span class="nottickedoff">epochZero</span> (parseTimeM True <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot; (T.unpack raw))</span></span>
+<span class="lineno">  331 </span>
+<span class="lineno">  332 </span>-- | The epoch fallback for missing/unparseable timestamps.
+<span class="lineno">  333 </span>epochZero :: UTCTime
+<span class="lineno">  334 </span><span class="decl"><span class="istickedoff">epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)</span></span>
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  337 </span>-- DirScheme composition (WorkdirFs-anchored)
+<span class="lineno">  338 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  339 </span>
+<span class="lineno">  340 </span>-- | Read a single bootstrap section file, applying size/empty/truncation
+<span class="lineno">  341 </span>-- rules. Returns 'Nothing' when the file is missing, empty
+<span class="lineno">  342 </span>-- (including whitespace-only), or rejected as oversized. For @AGENTS.md@,
+<span class="lineno">  343 </span>-- only the body after the TOML frontmatter fence is injected (the
+<span class="lineno">  344 </span>-- frontmatter itself lives in 'DirAgentConfig').
+<span class="lineno">  345 </span>--
+<span class="lineno">  346 </span>-- Reads through the 'WorkdirFs' handle (single confinement chokepoint,
+<span class="lineno">  347 </span>-- §3.6); the section file is looked up as @\&lt;sectionFileName\&gt;@ directly
+<span class="lineno">  348 </span>-- under the anchor. The @limit@ is the per-section character cap; the
+<span class="lineno">  349 </span>-- byte-level size cap is applied inside 'wfsReadFile'.
+<span class="lineno">  350 </span>readSection :: WorkdirFs -&gt; SectionKind -&gt; Int -&gt; IO (Maybe Text)
+<span class="lineno">  351 </span><span class="decl"><span class="istickedoff">readSection fs kind limit = do</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="istickedoff">let rel = T.pack (sectionFileName kind)</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="istickedoff">eTxt &lt;- wfsReadFile fs =&lt;&lt; rpOrDie rel</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">case eTxt of</span>
+<span class="lineno">  355 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; pure Nothing</span>
+<span class="lineno">  356 </span><span class="spaces">    </span><span class="istickedoff">Right txt -&gt;</span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="istickedoff">let contents = case kind of</span>
+<span class="lineno">  358 </span><span class="spaces">            </span><span class="istickedoff">AgentsK -&gt; case splitFrontmatterRaw txt of</span>
+<span class="lineno">  359 </span><span class="spaces">              </span><span class="istickedoff">(_, body) -&gt; body</span>
+<span class="lineno">  360 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; txt</span>
+<span class="lineno">  361 </span><span class="spaces">          </span><span class="istickedoff">trimmed = T.dropWhileEnd Char.isSpace contents</span>
+<span class="lineno">  362 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null (T.strip trimmed)</span></span>
+<span class="lineno">  363 </span><span class="spaces">           </span><span class="istickedoff">then <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  364 </span><span class="spaces">           </span><span class="istickedoff">else pure (Just (truncateSection limit trimmed))</span></span>
+<span class="lineno">  365 </span>
+<span class="lineno">  366 </span>-- | Compose a system prompt from an agent directory's bootstrap files.
+<span class="lineno">  367 </span>-- Files are read in the fixed injection order (SOUL, USER, AGENTS,
+<span class="lineno">  368 </span>-- MEMORY, IDENTITY, TOOLS, BOOTSTRAP), missing/empty/oversized files are
+<span class="lineno">  369 </span>-- skipped, and any section exceeding @limit@ characters is truncated with
+<span class="lineno">  370 </span>-- the exact marker @&quot;\\n[...truncated at \&lt;limit\&gt; chars...]&quot;@. Returns
+<span class="lineno">  371 </span>-- the empty string if every section is missing/empty.
+<span class="lineno">  372 </span>--
+<span class="lineno">  373 </span>-- The 'WorkdirFs' is anchored at the agent directory (the section files
+<span class="lineno">  374 </span>-- are looked up as @SOUL.md@\/@AGENTS.md@\/… directly under the anchor).
+<span class="lineno">  375 </span>composeDirSystemPrompt :: WorkdirFs -&gt; Int -&gt; IO Text
+<span class="lineno">  376 </span><span class="decl"><span class="istickedoff">composeDirSystemPrompt fs limit = do</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">let kinds = [SoulK, UserK, AgentsK, MemoryK, IdentityK, ToolsK, BootstrapK]</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">sections &lt;- mapM (\k -&gt; readSection fs k limit) kinds</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">let rendered = [ sectionMarker k &lt;&gt; &quot;\n&quot; &lt;&gt; body</span>
+<span class="lineno">  380 </span><span class="spaces">                 </span><span class="istickedoff">| (k, Just body) &lt;- zip kinds sections</span>
+<span class="lineno">  381 </span><span class="spaces">                 </span><span class="istickedoff">]</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="istickedoff">pure (T.intercalate &quot;\n\n&quot; rendered)</span></span>
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>-- | Load a DirScheme agent def from @agents\/\&lt;id\&gt;\/@. Composes the
+<span class="lineno">  385 </span>-- system prompt eagerly from the bootstrap files. Returns 'Nothing' if
+<span class="lineno">  386 </span>-- the directory does not exist or the dirname fails 'isValidAgentDefId'.
+<span class="lineno">  387 </span>--
+<span class="lineno">  388 </span>-- The 'WorkdirFs' is anchored at the agents directory (the per-agent
+<span class="lineno">  389 </span>-- subdirectory is @\&lt;id\&gt;@ under the anchor).
+<span class="lineno">  390 </span>loadDirAgentDef :: WorkdirFs -&gt; AgentDefId -&gt; IO (Maybe AgentDef)
+<span class="lineno">  391 </span><span class="decl"><span class="istickedoff">loadDirAgentDef fs aid = do</span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="istickedoff">let dirRp = agentDefIdText aid</span>
+<span class="lineno">  393 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- wfsDoesDirectoryExist fs =&lt;&lt; rpOrDie dirRp</span>
+<span class="lineno">  394 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  395 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  396 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  397 </span><span class="spaces">      </span><span class="istickedoff">let subFs = reanchorFs fs dirRp</span>
+<span class="lineno">  398 </span><span class="spaces">      </span><span class="istickedoff">cfg  &lt;- loadDirAgentConfig subFs</span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="istickedoff">body &lt;- composeDirSystemPrompt subFs defaultSectionCharLimit</span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="istickedoff">mtime &lt;- dirMTime subFs</span>
+<span class="lineno">  401 </span><span class="spaces">      </span><span class="istickedoff">pure (Just AgentDef</span>
+<span class="lineno">  402 </span><span class="spaces">        </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  403 </span><span class="spaces">        </span><span class="istickedoff">, adName = agentDefIdText aid</span>
+<span class="lineno">  404 </span><span class="spaces">        </span><span class="istickedoff">, adProvider = fromMaybe &quot;&quot; (dacProvider cfg)</span>
+<span class="lineno">  405 </span><span class="spaces">        </span><span class="istickedoff">, adModel = ModelId (fromMaybe &quot;&quot; (dacModel cfg))</span>
+<span class="lineno">  406 </span><span class="spaces">        </span><span class="istickedoff">, adSystem = if T.null body then Nothing else Just body</span>
+<span class="lineno">  407 </span><span class="spaces">        </span><span class="istickedoff">, adTools = decodeDirTools (dacTools cfg)</span>
+<span class="lineno">  408 </span><span class="spaces">        </span><span class="istickedoff">, adGroup = Nothing</span>
+<span class="lineno">  409 </span><span class="spaces">        </span><span class="istickedoff">, adCreatedAt = mtime</span>
+<span class="lineno">  410 </span><span class="spaces">        </span><span class="istickedoff">, adUpdatedAt = mtime</span>
+<span class="lineno">  411 </span><span class="spaces">        </span><span class="istickedoff">, adSession = mkSystemSessionId &quot;manual&quot;</span>
+<span class="lineno">  412 </span><span class="spaces">        </span><span class="istickedoff">})</span></span>
+<span class="lineno">  413 </span>
+<span class="lineno">  414 </span>-- | Read and parse the @AGENTS.md@ frontmatter inside an agent directory.
+<span class="lineno">  415 </span>-- Missing file or parse failure yields 'defaultDirAgentConfig'. The
+<span class="lineno">  416 </span>-- 'WorkdirFs' is anchored at the agent directory.
+<span class="lineno">  417 </span>loadDirAgentConfig :: WorkdirFs -&gt; IO DirAgentConfig
+<span class="lineno">  418 </span><span class="decl"><span class="istickedoff">loadDirAgentConfig fs = do</span>
+<span class="lineno">  419 </span><span class="spaces">  </span><span class="istickedoff">eTxt &lt;- wfsReadFile fs =&lt;&lt; rpOrDie &quot;AGENTS.md&quot;</span>
+<span class="lineno">  420 </span><span class="spaces">  </span><span class="istickedoff">case eTxt of</span>
+<span class="lineno">  421 </span><span class="spaces">    </span><span class="istickedoff">Left _   -&gt; pure defaultDirAgentConfig</span>
+<span class="lineno">  422 </span><span class="spaces">    </span><span class="istickedoff">Right txt -&gt; pure (parseDirAgentConfig txt)</span></span>
+<span class="lineno">  423 </span>
+<span class="lineno">  424 </span>-- | Best-effort mtime for an agent directory: the mtime of @AGENTS.md@ if
+<span class="lineno">  425 </span>-- present, else the mtime of @SOUL.md@, else epoch zero. (Unstable across
+<span class="lineno">  426 </span>-- @git pull@ — see the design doc §3.2 timestamp note.) The 'WorkdirFs'
+<span class="lineno">  427 </span>-- is anchored at the agent directory.
+<span class="lineno">  428 </span>dirMTime :: WorkdirFs -&gt; IO UTCTime
+<span class="lineno">  429 </span><span class="decl"><span class="istickedoff">dirMTime fs = go [&quot;AGENTS.md&quot;, &quot;SOUL.md&quot;]</span>
+<span class="lineno">  430 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  431 </span><span class="spaces">    </span><span class="istickedoff">go [] = pure <span class="nottickedoff">epochZero</span></span>
+<span class="lineno">  432 </span><span class="spaces">    </span><span class="istickedoff">go (p:ps) = do</span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="istickedoff">eMt &lt;- wfsModificationTime fs =&lt;&lt; rpOrDie (T.pack p)</span>
+<span class="lineno">  434 </span><span class="spaces">      </span><span class="istickedoff">case eMt of</span>
+<span class="lineno">  435 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; go ps</span>
+<span class="lineno">  436 </span><span class="spaces">        </span><span class="istickedoff">Right t -&gt; pure t</span></span>
+<span class="lineno">  437 </span>
+<span class="lineno">  438 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  439 </span>-- Protocol discovery (WorkdirFs-anchored)
+<span class="lineno">  440 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  441 </span>
+<span class="lineno">  442 </span>-- | Decode the project-level @agents.md@ frontmatter + body into an
+<span class="lineno">  443 </span>-- 'AgentDef' (id @agents-md@). Frontmatter @kind@/@name@/@provider@/@model@
+<span class="lineno">  444 </span>-- honored; @kind@ is not required (its presence doesn't gate discovery —
+<span class="lineno">  445 </span>-- @agents.md@ is the canonical project instructions file regardless).
+<span class="lineno">  446 </span>decodeProjectAgentsMd :: Text -&gt; Maybe AgentDef
+<span class="lineno">  447 </span><span class="decl"><span class="istickedoff">decodeProjectAgentsMd content =</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">case decodeDoc content of</span>
+<span class="lineno">  449 </span><span class="spaces">    </span><span class="istickedoff">(fm, body) -&gt;</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">case mkAgentDefId deriveAgentsMdId of</span>
+<span class="lineno">  451 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  452 </span><span class="spaces">        </span><span class="istickedoff">Right aid -&gt; Just AgentDef</span>
+<span class="lineno">  453 </span><span class="spaces">          </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  454 </span><span class="spaces">          </span><span class="istickedoff">, adName = fromMaybe projectAgentsMdDisplayName (fmLookup &quot;name&quot; fm)</span>
+<span class="lineno">  455 </span><span class="spaces">          </span><span class="istickedoff">, adProvider = fromMaybe &quot;&quot; (fmLookup &quot;provider&quot; fm)</span>
+<span class="lineno">  456 </span><span class="spaces">          </span><span class="istickedoff">, adModel = ModelId (fromMaybe &quot;&quot; (fmLookup &quot;model&quot; fm))</span>
+<span class="lineno">  457 </span><span class="spaces">          </span><span class="istickedoff">, adSystem = if <span class="tickonlyfalse">T.null body</span> then <span class="nottickedoff">Nothing</span> else Just body</span>
+<span class="lineno">  458 </span><span class="spaces">          </span><span class="istickedoff">, adTools = decodeTools fm</span>
+<span class="lineno">  459 </span><span class="spaces">          </span><span class="istickedoff">, adGroup = Nothing</span>
+<span class="lineno">  460 </span><span class="spaces">          </span><span class="istickedoff">, adCreatedAt = epochZero</span>
+<span class="lineno">  461 </span><span class="spaces">          </span><span class="istickedoff">, adUpdatedAt = epochZero</span>
+<span class="lineno">  462 </span><span class="spaces">          </span><span class="istickedoff">, adSession = mkSystemSessionId &quot;manual&quot;</span>
+<span class="lineno">  463 </span><span class="spaces">          </span><span class="istickedoff">}</span></span>
+<span class="lineno">  464 </span>
+<span class="lineno">  465 </span>-- | Decode a protocol @agent.md@ frontmatter + body into an 'AgentDef'.
+<span class="lineno">  466 </span>-- The id is the subdir name, unless frontmatter @id@ is present and valid
+<span class="lineno">  467 </span>-- (then frontmatter wins). @enabled@ absent → enabled (appears); explicit
+<span class="lineno">  468 </span>-- @enabled: false@ → 'Nothing' (skipped per §3.3). Frontmatter
+<span class="lineno">  469 </span>-- @name@/@provider@/@model@ honored when present.
+<span class="lineno">  470 </span>decodeProtocolAgentMd :: Text -&gt; Text -&gt; Maybe AgentDef
+<span class="lineno">  471 </span><span class="decl"><span class="istickedoff">decodeProtocolAgentMd subDirName content =</span>
+<span class="lineno">  472 </span><span class="spaces">  </span><span class="istickedoff">case decodeDoc content of</span>
+<span class="lineno">  473 </span><span class="spaces">    </span><span class="istickedoff">(fm, body) -&gt;</span>
+<span class="lineno">  474 </span><span class="spaces">      </span><span class="istickedoff">case fmLookup &quot;enabled&quot; fm of</span>
+<span class="lineno">  475 </span><span class="spaces">        </span><span class="istickedoff">Just v | T.strip v == &quot;false&quot; -&gt; Nothing  -- disabled → skip</span>
+<span class="lineno">  476 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt;</span>
+<span class="lineno">  477 </span><span class="spaces">          </span><span class="istickedoff">let idText = fromMaybe subDirName (fmLookup &quot;id&quot; fm &gt;&gt;= validId)</span>
+<span class="lineno">  478 </span><span class="spaces">          </span><span class="istickedoff">in case mkAgentDefId idText of</span>
+<span class="lineno">  479 </span><span class="spaces">               </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  480 </span><span class="spaces">               </span><span class="istickedoff">Right aid -&gt; Just AgentDef</span>
+<span class="lineno">  481 </span><span class="spaces">                 </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  482 </span><span class="spaces">                 </span><span class="istickedoff">, adName = fromMaybe <span class="nottickedoff">idText</span> (fmLookup &quot;name&quot; fm)</span>
+<span class="lineno">  483 </span><span class="spaces">                 </span><span class="istickedoff">, adProvider = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (fmLookup &quot;provider&quot; fm)</span>
+<span class="lineno">  484 </span><span class="spaces">                 </span><span class="istickedoff">, adModel = ModelId (fromMaybe &quot;&quot; (fmLookup &quot;model&quot; fm))</span>
+<span class="lineno">  485 </span><span class="spaces">                 </span><span class="istickedoff">, adSystem = if <span class="tickonlyfalse">T.null body</span> then <span class="nottickedoff">Nothing</span> else Just body</span>
+<span class="lineno">  486 </span><span class="spaces">                 </span><span class="istickedoff">, adTools = decodeTools fm</span>
+<span class="lineno">  487 </span><span class="spaces">                 </span><span class="istickedoff">, adGroup = Nothing</span>
+<span class="lineno">  488 </span><span class="spaces">                 </span><span class="istickedoff">, adCreatedAt = epochZero</span>
+<span class="lineno">  489 </span><span class="spaces">                 </span><span class="istickedoff">, adUpdatedAt = epochZero</span>
+<span class="lineno">  490 </span><span class="spaces">                 </span><span class="istickedoff">, adSession = mkSystemSessionId &quot;manual&quot;</span>
+<span class="lineno">  491 </span><span class="spaces">                 </span><span class="istickedoff">}</span>
+<span class="lineno">  492 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  493 </span><span class="spaces">    </span><span class="istickedoff">validId t = if <span class="tickonlytrue">isValidAgentDefId t</span> then Just t else <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  494 </span>
+<span class="lineno">  495 </span>-- | Load the project-level @.agents\/agents.md@ as an 'AgentDef' with id
+<span class="lineno">  496 </span>-- @agents-md@ (§3.1). The 'WorkdirFs' is anchored at the @.agents\/@
+<span class="lineno">  497 </span>-- directory (confinement is applied inside the handle — no 'mkSafePath'
+<span class="lineno">  498 </span>-- call here, §3.6). Returns 'Nothing' when the file is missing, unconfined,
+<span class="lineno">  499 </span>-- or unparseable.
+<span class="lineno">  500 </span>loadProjectAgentDef :: WorkdirFs -&gt; IO (Maybe AgentDef)
+<span class="lineno">  501 </span><span class="decl"><span class="istickedoff">loadProjectAgentDef fs = do</span>
+<span class="lineno">  502 </span><span class="spaces">  </span><span class="istickedoff">eContent &lt;- wfsReadFile fs =&lt;&lt; rpOrDie &quot;agents.md&quot;</span>
+<span class="lineno">  503 </span><span class="spaces">  </span><span class="istickedoff">case eContent of</span>
+<span class="lineno">  504 </span><span class="spaces">    </span><span class="istickedoff">Left _        -&gt; <span class="nottickedoff">pure Nothing</span>  -- symlink escape, missing, oversize → skip</span>
+<span class="lineno">  505 </span><span class="spaces">    </span><span class="istickedoff">Right content -&gt; pure (decodeProjectAgentsMd content)</span></span>
+<span class="lineno">  506 </span>
+<span class="lineno">  507 </span>-- | Load one protocol sub-agent from @agents\/\&lt;id\&gt;\/agent.md@ (§3.3). The
+<span class="lineno">  508 </span>-- id is the subdir name, unless frontmatter @id@ is present and valid
+<span class="lineno">  509 </span>-- (then frontmatter wins). @enabled: false@ → 'Nothing' (skipped). The
+<span class="lineno">  510 </span>-- 'WorkdirFs' is anchored at the @.agents\/@ directory.
+<span class="lineno">  511 </span>loadProtocolSubAgent :: WorkdirFs -&gt; Text -&gt; IO (Maybe AgentDef)
+<span class="lineno">  512 </span><span class="decl"><span class="istickedoff">loadProtocolSubAgent fs subDirName = do</span>
+<span class="lineno">  513 </span><span class="spaces">  </span><span class="istickedoff">let rel = &quot;agents/&quot; &lt;&gt; subDirName &lt;&gt; &quot;/agent.md&quot;</span>
+<span class="lineno">  514 </span><span class="spaces">  </span><span class="istickedoff">eContent &lt;- wfsReadFile fs =&lt;&lt; rpOrDie rel</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="istickedoff">case eContent of</span>
+<span class="lineno">  516 </span><span class="spaces">    </span><span class="istickedoff">Left _        -&gt; pure Nothing  -- symlink escape, missing, oversize → skip</span>
+<span class="lineno">  517 </span><span class="spaces">    </span><span class="istickedoff">Right content -&gt; pure (decodeProtocolAgentMd subDirName content)</span></span>
+<span class="lineno">  518 </span>
+<span class="lineno">  519 </span>-- | The detection predicate (§3.3): @.agents\/@ is a protocol root iff it
+<span class="lineno">  520 </span>-- contains @agents.md@ (a file) OR an @agents\/@ subdirectory. The
+<span class="lineno">  521 </span>-- 'WorkdirFs' is anchored at the @.agents\/@ directory.
+<span class="lineno">  522 </span>isProtocolRoot :: WorkdirFs -&gt; IO Bool
+<span class="lineno">  523 </span><span class="decl"><span class="nottickedoff">isProtocolRoot fs = do</span>
+<span class="lineno">  524 </span><span class="spaces">  </span><span class="nottickedoff">hasAgentsMd  &lt;- wfsDoesFileExist fs =&lt;&lt; rpOrDie &quot;agents.md&quot;</span>
+<span class="lineno">  525 </span><span class="spaces">  </span><span class="nottickedoff">hasAgentsSub &lt;- wfsDoesDirectoryExist fs =&lt;&lt; rpOrDie &quot;agents&quot;</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="nottickedoff">pure (hasAgentsMd || hasAgentsSub)</span></span>
+<span class="lineno">  527 </span>
+<span class="lineno">  528 </span>-- | The protocol allow-list scan (§3.3). Scans only @agents\/\&lt;id\&gt;\/agent.md@
+<span class="lineno">  529 </span>-- (sub-agents) + @agents.md@ (project def). Skips everything else
+<span class="lineno">  530 </span>-- (@skills\/@, @tasks\/@, @memories\/@, @mcp.json@). The 'WorkdirFs' is
+<span class="lineno">  531 </span>-- anchored at the @.agents\/@ directory.
+<span class="lineno">  532 </span>listProtocolAgentDefs :: WorkdirFs -&gt; IO [AgentDef]
+<span class="lineno">  533 </span><span class="decl"><span class="nottickedoff">listProtocolAgentDefs fs = do</span>
+<span class="lineno">  534 </span><span class="spaces">  </span><span class="nottickedoff">-- The project-level agents.md (id agents-md).</span>
+<span class="lineno">  535 </span><span class="spaces">  </span><span class="nottickedoff">mProject &lt;- loadProjectAgentDef fs</span>
+<span class="lineno">  536 </span><span class="spaces">  </span><span class="nottickedoff">-- Sub-agents under agents/&lt;id&gt;/agent.md.</span>
+<span class="lineno">  537 </span><span class="spaces">  </span><span class="nottickedoff">subExists &lt;- wfsDoesDirectoryExist fs =&lt;&lt; rpOrDie &quot;agents&quot;</span>
+<span class="lineno">  538 </span><span class="spaces">  </span><span class="nottickedoff">subDefs &lt;- if not subExists</span>
+<span class="lineno">  539 </span><span class="spaces">    </span><span class="nottickedoff">then pure []</span>
+<span class="lineno">  540 </span><span class="spaces">    </span><span class="nottickedoff">else do</span>
+<span class="lineno">  541 </span><span class="spaces">      </span><span class="nottickedoff">eEntries &lt;- wfsListDirectory fs =&lt;&lt; rpOrDie &quot;agents&quot;</span>
+<span class="lineno">  542 </span><span class="spaces">      </span><span class="nottickedoff">let entries = fromRight [] eEntries</span>
+<span class="lineno">  543 </span><span class="spaces">          </span><span class="nottickedoff">candidate e = do</span>
+<span class="lineno">  544 </span><span class="spaces">            </span><span class="nottickedoff">isDir &lt;- wfsDoesDirectoryExist fs =&lt;&lt; rpOrDie (&quot;agents/&quot; &lt;&gt; e)</span>
+<span class="lineno">  545 </span><span class="spaces">            </span><span class="nottickedoff">pure (if isDir &amp;&amp; isValidAgentDefId e then Just e else Nothing)</span>
+<span class="lineno">  546 </span><span class="spaces">      </span><span class="nottickedoff">mEntries &lt;- mapM candidate (sortOn id entries)</span>
+<span class="lineno">  547 </span><span class="spaces">      </span><span class="nottickedoff">catMaybes &lt;$&gt; mapM (loadProtocolSubAgent fs) (catMaybes mEntries)</span>
+<span class="lineno">  548 </span><span class="spaces">  </span><span class="nottickedoff">let allDefs = catMaybes [mProject] &lt;&gt; subDefs</span>
+<span class="lineno">  549 </span><span class="spaces">  </span><span class="nottickedoff">pure (sortOn (agentDefIdText . adId) allDefs)</span></span>
+<span class="lineno">  550 </span>
+<span class="lineno">  551 </span>-- | Dispatch for the @.agents\/@ convention dir: protocol-root detection
+<span class="lineno">  552 </span>-- (§3.3). When @.agents\/@ contains @agents.md@ OR an @agents\/@
+<span class="lineno">  553 </span>-- subdirectory, scan the protocol allow-list; otherwise fall back to legacy
+<span class="lineno">  554 </span>-- 'listAgentDefsFs' (DirScheme with @SOUL.md@\/@AGENTS.md@ bootstrap
+<span class="lineno">  555 </span>-- files). The 'WorkdirFs' is anchored at the @.agents\/@ directory.
+<span class="lineno">  556 </span>listAgentsDotAgents :: WorkdirFs -&gt; IO [AgentDef]
+<span class="lineno">  557 </span><span class="decl"><span class="nottickedoff">listAgentsDotAgents fs = do</span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="nottickedoff">isProto &lt;- isProtocolRoot fs</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="nottickedoff">if isProto</span>
+<span class="lineno">  560 </span><span class="spaces">    </span><span class="nottickedoff">then listProtocolAgentDefs fs</span>
+<span class="lineno">  561 </span><span class="spaces">    </span><span class="nottickedoff">else listAgentDefsFs fs</span></span>
+<span class="lineno">  562 </span>
+<span class="lineno">  563 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  564 </span>-- Workdir-scoped backend
+<span class="lineno">  565 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  566 </span>
+<span class="lineno">  567 </span>-- | A read-only 'AgentDefBackend' that scans a session workdir for agent
+<span class="lineno">  568 </span>-- definitions shipped by cloned repositories. For each top-level directory
+<span class="lineno">  569 </span>-- in the workdir (a cloned repo), it checks the conventional agent-def
+<span class="lineno">  570 </span>-- locations (@.agents\/@, @.seal\/agents\/@, @agents\/@).
+<span class="lineno">  571 </span>--
+<span class="lineno">  572 </span>-- This backend is /read-only/: 'adbUpdate'/'adbDelete' are no-ops (repo-local
+<span class="lineno">  573 </span>-- agent defs are immutable from the model's perspective). 'adbRead' scans
+<span class="lineno">  574 </span>-- on every call (workdirs are small). Within-workdir collisions (two repos
+<span class="lineno">  575 </span>-- ship a def with the same id): the alphabetically-first repo wins
+<span class="lineno">  576 </span>-- (deterministic; same as the skill backend's policy).
+<span class="lineno">  577 </span>--
+<span class="lineno">  578 </span>-- Every file open goes through the 'WorkdirFs' handle (symlink-escape
+<span class="lineno">  579 </span>-- confinement — §3.8; single chokepoint, §3.6) and is size-capped at
+<span class="lineno">  580 </span>-- 'maxScanBytes' + 'truncateSection'.
+<span class="lineno">  581 </span>workdirAgentDefBackend :: WorkdirFs -&gt; IO AgentDefBackend
+<span class="lineno">  582 </span><span class="decl"><span class="istickedoff">workdirAgentDefBackend fs = pure AgentDefBackend</span>
+<span class="lineno">  583 </span><span class="spaces">    </span><span class="istickedoff">{ adbRead   = <span class="nottickedoff">\aid -&gt; do</span></span>
+<span class="lineno">  584 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">defs &lt;- listWorkdirAgentDefs fs</span></span>
+<span class="lineno">  585 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure (Map.lookup aid (Map.fromList [(adId d, d) | d &lt;- defs]))</span></span>
+<span class="lineno">  586 </span><span class="spaces">    </span><span class="istickedoff">, adbUpdate = <span class="nottickedoff">\_ -&gt; pure ()</span></span>
+<span class="lineno">  587 </span><span class="spaces">    </span><span class="istickedoff">, adbList   = listWorkdirAgentDefs fs</span>
+<span class="lineno">  588 </span><span class="spaces">    </span><span class="istickedoff">, adbDelete = <span class="nottickedoff">\_ -&gt; pure ()</span></span>
+<span class="lineno">  589 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  590 </span>
+<span class="lineno">  591 </span>-- | Enumerate every agent def found under the conventional locations across
+<span class="lineno">  592 </span>-- all top-level directories (cloned repos) in the workdir anchored at the
+<span class="lineno">  593 </span>-- 'WorkdirFs'. The alphabetically-first repo wins on prefixed-id
+<span class="lineno">  594 </span>-- collisions (deterministic). Missing or empty workdirs yield @[]@.
+<span class="lineno">  595 </span>--
+<span class="lineno">  596 </span>-- Each def's id is prefixed with its repo's top-level directory name + @&quot;--&quot;@
+<span class="lineno">  597 </span>-- (e.g. @vtag--architect-agent@) and its @adName@ with @\&lt;repo\&gt;\/@ (e.g.
+<span class="lineno">  598 </span>-- @vtag\/Architect Agent@). This disambiguates repo-local agents from the
+<span class="lineno">  599 </span>-- user's own agents (and from other repos' agents) when the union backend
+<span class="lineno">  600 </span>-- merges workdir ⊕ user. The @--@ separator is charset-safe
+<span class="lineno">  601 </span>-- (@isValidAgentDefId@); the @/@ in the display name is for human
+<span class="lineno">  602 </span>-- readability only.
+<span class="lineno">  603 </span>--
+<span class="lineno">  604 </span>-- /Round-trip economy/: all structural questions (which repos exist, which
+<span class="lineno">  605 </span>-- convention dirs exist, which entries are dirs) are answered from ONE
+<span class="lineno">  606 </span>-- 'wfsSnapshot' call; only file CONTENTS are read through 'wfsReadFile'
+<span class="lineno">  607 </span>-- (the symlink-containment chokepoint). On @mode=remote@ this collapses a
+<span class="lineno">  608 </span>-- scan from one SSH round trip per probe to one round trip + two calls per
+<span class="lineno">  609 </span>-- discovered def file.
+<span class="lineno">  610 </span>listWorkdirAgentDefs :: WorkdirFs -&gt; IO [AgentDef]
+<span class="lineno">  611 </span><span class="decl"><span class="istickedoff">listWorkdirAgentDefs fs = do</span>
+<span class="lineno">  612 </span><span class="spaces">  </span><span class="istickedoff">eSnap &lt;- wfsSnapshot fs</span>
+<span class="lineno">  613 </span><span class="spaces">  </span><span class="istickedoff">case eSnap of</span>
+<span class="lineno">  614 </span><span class="spaces">    </span><span class="istickedoff">-- Fail-soft-to-empty: a missing/stub/failing workdir yields no defs —</span>
+<span class="lineno">  615 </span><span class="spaces">    </span><span class="istickedoff">-- the same terminal state as today's empty listings.</span>
+<span class="lineno">  616 </span><span class="spaces">    </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  617 </span><span class="spaces">    </span><span class="istickedoff">Right snap -&gt; listWorkdirAgentDefsSnap snap fs</span></span>
+<span class="lineno">  618 </span>
+<span class="lineno">  619 </span>-- | 'listWorkdirAgentDefs' over a caller-supplied snapshot — lets a
+<span class="lineno">  620 </span>-- consumer (the discovery cache) fetch ONE workspace snapshot and serve
+<span class="lineno">  621 </span>-- both scanners from it.
+<span class="lineno">  622 </span>listWorkdirAgentDefsSnap :: WorkspaceSnapshot -&gt; WorkdirFs -&gt; IO [AgentDef]
+<span class="lineno">  623 </span><span class="decl"><span class="istickedoff">listWorkdirAgentDefsSnap snap fs = do</span>
+<span class="lineno">  624 </span><span class="spaces">  </span><span class="istickedoff">let repos = snapTopDirs snap</span>
+<span class="lineno">  625 </span><span class="spaces">  </span><span class="istickedoff">perRepo &lt;- forM repos $ \repo -&gt; do</span>
+<span class="lineno">  626 </span><span class="spaces">    </span><span class="istickedoff">defs &lt;- concat &lt;$&gt; forM workdirAgentDefConventions (\conv -&gt; do</span>
+<span class="lineno">  627 </span><span class="spaces">      </span><span class="istickedoff">let convRp = repo &lt;&gt; &quot;/&quot; &lt;&gt; T.pack conv</span>
+<span class="lineno">  628 </span><span class="spaces">      </span><span class="istickedoff">if not (snapIsDirectoryAt snap convRp)</span>
+<span class="lineno">  629 </span><span class="spaces">        </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  630 </span><span class="spaces">        </span><span class="istickedoff">else</span>
+<span class="lineno">  631 </span><span class="spaces">          </span><span class="istickedoff">-- Dispatch: .agents/ is protocol-aware; the rest use legacy.</span>
+<span class="lineno">  632 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlytrue">conv == &quot;.agents&quot;</span></span>
+<span class="lineno">  633 </span><span class="spaces">            </span><span class="istickedoff">then listAgentsDotAgentsSnap snap fs convRp</span>
+<span class="lineno">  634 </span><span class="spaces">            </span><span class="istickedoff">else <span class="nottickedoff">listAgentDefsFsSnap snap fs convRp</span>)</span>
+<span class="lineno">  635 </span><span class="spaces">    </span><span class="istickedoff">pure (mapMaybe (prefixWorkdirDef repo) defs)</span>
+<span class="lineno">  636 </span><span class="spaces">  </span><span class="istickedoff">let merge m [] = m</span>
+<span class="lineno">  637 </span><span class="spaces">      </span><span class="istickedoff">merge m (d:ds) = merge (Map.insertWith <span class="nottickedoff">(\_new old -&gt; old)</span> (adId d) d m) ds</span>
+<span class="lineno">  638 </span><span class="spaces">      </span><span class="istickedoff">merged = merge Map.empty (concat perRepo)</span>
+<span class="lineno">  639 </span><span class="spaces">  </span><span class="istickedoff">pure (Map.elems merged)</span></span>
+<span class="lineno">  640 </span>
+<span class="lineno">  641 </span>-- | Basename of a snapshot-relative path (@a\/b\/c@ → @c@). Inputs are
+<span class="lineno">  642 </span>-- snapshot-derived paths, never user input.
+<span class="lineno">  643 </span>snapBasename :: Text -&gt; Text
+<span class="lineno">  644 </span><span class="decl"><span class="istickedoff">snapBasename = snd . T.breakOnEnd &quot;/&quot;</span></span>
+<span class="lineno">  645 </span>
+<span class="lineno">  646 </span>-- | A read-only backend serving a PRE-COMPUTED def list (the discovery
+<span class="lineno">  647 </span>-- cache's point-in-time scan of the workdir). Mirrors
+<span class="lineno">  648 </span>-- 'workdirAgentDefBackend''s semantics: reads from memory, writes/deletes
+<span class="lineno">  649 </span>-- are no-ops (repo-local defs are immutable from the model's perspective).
+<span class="lineno">  650 </span>staticAgentDefBackend :: [AgentDef] -&gt; IO AgentDefBackend
+<span class="lineno">  651 </span><span class="decl"><span class="istickedoff">staticAgentDefBackend defs = pure AgentDefBackend</span>
+<span class="lineno">  652 </span><span class="spaces">  </span><span class="istickedoff">{ adbRead   = \aid -&gt; pure (Map.lookup aid (Map.fromList [(adId d, d) | d &lt;- defs]))</span>
+<span class="lineno">  653 </span><span class="spaces">  </span><span class="istickedoff">, adbUpdate = <span class="nottickedoff">\_ -&gt; pure ()</span></span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">, adbList   = pure defs</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">, adbDelete = <span class="nottickedoff">\_ -&gt; pure ()</span></span>
+<span class="lineno">  656 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  657 </span>
+<span class="lineno">  658 </span>-- | Snapshot-driven dispatch for the @.agents\/@ convention dir: protocol-
+<span class="lineno">  659 </span>-- root detection (§3.3) answered from the snapshot, contents read through
+<span class="lineno">  660 </span>-- the anchored 'WorkdirFs'. Mirrors 'listAgentsDotAgents'.
+<span class="lineno">  661 </span>listAgentsDotAgentsSnap :: WorkspaceSnapshot -&gt; WorkdirFs -&gt; Text -&gt; IO [AgentDef]
+<span class="lineno">  662 </span><span class="decl"><span class="istickedoff">listAgentsDotAgentsSnap snap fs anchor</span>
+<span class="lineno">  663 </span><span class="spaces">  </span><span class="istickedoff">| snapIsFileAt snap (anchor &lt;&gt; &quot;/agents.md&quot;)</span>
+<span class="lineno">  664 </span><span class="spaces">      </span><span class="istickedoff">|| snapIsDirectoryAt snap (anchor &lt;&gt; &quot;/agents&quot;)</span>
+<span class="lineno">  665 </span><span class="spaces">  </span><span class="istickedoff">= listProtocolAgentDefsSnap snap fs anchor</span>
+<span class="lineno">  666 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = listAgentDefsFsSnap snap fs anchor</span></span>
+<span class="lineno">  667 </span>
+<span class="lineno">  668 </span>-- | Snapshot-driven protocol allow-list scan (§3.3): @agents.md@ (project
+<span class="lineno">  669 </span>-- def) + @agents\/\&lt;id\&gt;\/agent.md@ (sub-agents), mirroring
+<span class="lineno">  670 </span>-- 'listProtocolAgentDefs' with structure from the snapshot.
+<span class="lineno">  671 </span>listProtocolAgentDefsSnap :: WorkspaceSnapshot -&gt; WorkdirFs -&gt; Text -&gt; IO [AgentDef]
+<span class="lineno">  672 </span><span class="decl"><span class="istickedoff">listProtocolAgentDefsSnap snap fs anchor = do</span>
+<span class="lineno">  673 </span><span class="spaces">  </span><span class="istickedoff">let anchored = reanchorFs fs anchor</span>
+<span class="lineno">  674 </span><span class="spaces">      </span><span class="istickedoff">agentsPath = anchor &lt;&gt; &quot;/agents&quot;</span>
+<span class="lineno">  675 </span><span class="spaces">  </span><span class="istickedoff">mProject &lt;- loadProjectAgentDef anchored</span>
+<span class="lineno">  676 </span><span class="spaces">  </span><span class="istickedoff">subDefs &lt;-</span>
+<span class="lineno">  677 </span><span class="spaces">    </span><span class="istickedoff">if not (snapIsDirectoryAt snap agentsPath)</span>
+<span class="lineno">  678 </span><span class="spaces">      </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  679 </span><span class="spaces">      </span><span class="istickedoff">else do</span>
+<span class="lineno">  680 </span><span class="spaces">        </span><span class="istickedoff">let candidates =</span>
+<span class="lineno">  681 </span><span class="spaces">              </span><span class="istickedoff">filter isValidAgentDefId (map snapBasename (snapChildDirsAt snap agentsPath))</span>
+<span class="lineno">  682 </span><span class="spaces">        </span><span class="istickedoff">catMaybes &lt;$&gt; mapM (loadProtocolSubAgent anchored) candidates</span>
+<span class="lineno">  683 </span><span class="spaces">  </span><span class="istickedoff">pure (sortOn (agentDefIdText . adId) (catMaybes [mProject] &lt;&gt; subDefs))</span></span>
+<span class="lineno">  684 </span>
+<span class="lineno">  685 </span>-- | Snapshot-driven legacy enumerator (flat + DirScheme), mirroring
+<span class="lineno">  686 </span>-- 'listAgentDefsFs' with structure from the snapshot. Flat @\&lt;id\&gt;.md@
+<span class="lineno">  687 </span>-- files win on collision with same-id dirs.
+<span class="lineno">  688 </span>listAgentDefsFsSnap :: WorkspaceSnapshot -&gt; WorkdirFs -&gt; Text -&gt; IO [AgentDef]
+<span class="lineno">  689 </span><span class="decl"><span class="istickedoff">listAgentDefsFsSnap snap fs anchor = do</span>
+<span class="lineno">  690 </span><span class="spaces">  </span><span class="istickedoff">let mdFiles = [<span class="nottickedoff">p</span> | p &lt;- snapChildFilesAt snap anchor, <span class="nottickedoff">&quot;.md&quot; `T.isSuffixOf` p</span>]</span>
+<span class="lineno">  691 </span><span class="spaces">  </span><span class="istickedoff">flatDefs &lt;- forM mdFiles $ <span class="nottickedoff">\rel -&gt; do</span></span>
+<span class="lineno">  692 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">eContent &lt;- wfsReadFile fs =&lt;&lt; rpOrDie rel</span></span>
+<span class="lineno">  693 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">pure $ case eContent of</span></span>
+<span class="lineno">  694 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Left _    -&gt; Nothing</span></span>
+<span class="lineno">  695 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Right txt -&gt; decodeAgentDef txt</span></span>
+<span class="lineno">  696 </span><span class="spaces">  </span><span class="istickedoff">let flatIds = Set.fromList (map <span class="nottickedoff">(agentDefIdText . adId)</span> (catMaybes flatDefs))</span>
+<span class="lineno">  697 </span><span class="spaces">      </span><span class="istickedoff">dirNames =</span>
+<span class="lineno">  698 </span><span class="spaces">        </span><span class="istickedoff">[ n | n &lt;- map snapBasename (snapChildDirsAt snap anchor)</span>
+<span class="lineno">  699 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">isValidAgentDefId n</span>, <span class="tickonlytrue">not (Set.member n flatIds)</span> ]</span>
+<span class="lineno">  700 </span><span class="spaces">  </span><span class="istickedoff">dirDefs &lt;- forM dirNames $ \n -&gt;</span>
+<span class="lineno">  701 </span><span class="spaces">    </span><span class="istickedoff">case mkAgentDefId n of</span>
+<span class="lineno">  702 </span><span class="spaces">      </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  703 </span><span class="spaces">      </span><span class="istickedoff">Right aid -&gt; loadDirAgentDef (reanchorFs fs anchor) aid</span>
+<span class="lineno">  704 </span><span class="spaces">  </span><span class="istickedoff">pure (sortOn (agentDefIdText . adId) (catMaybes flatDefs &lt;&gt; catMaybes dirDefs))</span></span>
+<span class="lineno">  705 </span>
+<span class="lineno">  706 </span>-- | Prefix a workdir-discovered def's id with @\&lt;repo\&gt;--\&lt;id\&gt;@ and its
+<span class="lineno">  707 </span>-- @adName@ with @\&lt;repo\&gt;\/\&lt;name\&gt;@. The id prefix uses @&quot;--&quot;@ (charset-safe
+<span class="lineno">  708 </span>-- per 'isValidAgentDefId'); the display name uses @&quot;/&quot;@ for readability. If
+<span class="lineno">  709 </span>-- the prefixed id fails validation (e.g. the repo dir has a char outside the
+<span class="lineno">  710 </span>-- charset), the def is dropped ('Nothing' — fail-closed).
+<span class="lineno">  711 </span>prefixWorkdirDef :: Text -&gt; AgentDef -&gt; Maybe AgentDef
+<span class="lineno">  712 </span><span class="decl"><span class="istickedoff">prefixWorkdirDef repo d =</span>
+<span class="lineno">  713 </span><span class="spaces">  </span><span class="istickedoff">let prefixedIdText = repo &lt;&gt; &quot;--&quot; &lt;&gt; agentDefIdText (adId d)</span>
+<span class="lineno">  714 </span><span class="spaces">  </span><span class="istickedoff">in case mkAgentDefId prefixedIdText of</span>
+<span class="lineno">  715 </span><span class="spaces">       </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  716 </span><span class="spaces">       </span><span class="istickedoff">Right aid -&gt; Just d</span>
+<span class="lineno">  717 </span><span class="spaces">         </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  718 </span><span class="spaces">         </span><span class="istickedoff">, adName = repo &lt;&gt; &quot;/&quot; &lt;&gt; adName d</span>
+<span class="lineno">  719 </span><span class="spaces">         </span><span class="istickedoff">}</span></span>
+<span class="lineno">  720 </span>
+<span class="lineno">  721 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  722 </span>-- Workdir-local legacy enumerator (flat + dir, over WorkdirFs)
+<span class="lineno">  723 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  724 </span>
+<span class="lineno">  725 </span>-- | The workdir-local legacy enumerator (mirrors the user store's
+<span class="lineno">  726 </span>-- 'listAgentDefs' but over 'WorkdirFs'). Enumerates flat @\&lt;id\&gt;.md@ files
+<span class="lineno">  727 </span>-- + DirScheme @\&lt;id\&gt;\/@ subdirectories under the anchor, sorted by id.
+<span class="lineno">  728 </span>-- Malformed entries are skipped. On flat/dir collision for the same id,
+<span class="lineno">  729 </span>-- the flat file wins and the dir is dropped. The 'WorkdirFs' is anchored
+<span class="lineno">  730 </span>-- at the agents directory.
+<span class="lineno">  731 </span>listAgentDefsFs :: WorkdirFs -&gt; IO [AgentDef]
+<span class="lineno">  732 </span><span class="decl"><span class="nottickedoff">listAgentDefsFs fs = do</span>
+<span class="lineno">  733 </span><span class="spaces">  </span><span class="nottickedoff">eEntries &lt;- wfsListDirectory fs =&lt;&lt; rpOrDie &quot;.&quot;</span>
+<span class="lineno">  734 </span><span class="spaces">  </span><span class="nottickedoff">let entries = fromRight [] eEntries</span>
+<span class="lineno">  735 </span><span class="spaces">  </span><span class="nottickedoff">flatDefs &lt;- collectFlatFs fs entries</span>
+<span class="lineno">  736 </span><span class="spaces">  </span><span class="nottickedoff">dirDefs  &lt;- collectDirsFs fs entries (map adId flatDefs)</span>
+<span class="lineno">  737 </span><span class="spaces">  </span><span class="nottickedoff">pure (sortOn (agentDefIdText . adId) (flatDefs &lt;&gt; dirDefs))</span></span>
+<span class="lineno">  738 </span>
+<span class="lineno">  739 </span>-- | Decode all flat @.md@ files under the anchor (workdir-local legacy).
+<span class="lineno">  740 </span>collectFlatFs :: WorkdirFs -&gt; [Text] -&gt; IO [AgentDef]
+<span class="lineno">  741 </span><span class="decl"><span class="nottickedoff">collectFlatFs fs entries = do</span>
+<span class="lineno">  742 </span><span class="spaces">  </span><span class="nottickedoff">let mdFiles = [e | e &lt;- entries, &quot;.md&quot; `T.isSuffixOf` e]</span>
+<span class="lineno">  743 </span><span class="spaces">  </span><span class="nottickedoff">defs &lt;- forM mdFiles $ \e -&gt; do</span>
+<span class="lineno">  744 </span><span class="spaces">    </span><span class="nottickedoff">eContent &lt;- wfsReadFile fs =&lt;&lt; rpOrDie e</span>
+<span class="lineno">  745 </span><span class="spaces">    </span><span class="nottickedoff">pure $ case eContent of</span>
+<span class="lineno">  746 </span><span class="spaces">      </span><span class="nottickedoff">Left _    -&gt; Nothing</span>
+<span class="lineno">  747 </span><span class="spaces">      </span><span class="nottickedoff">Right txt -&gt; decodeAgentDef txt</span>
+<span class="lineno">  748 </span><span class="spaces">  </span><span class="nottickedoff">pure (catMaybes defs)</span></span>
+<span class="lineno">  749 </span>
+<span class="lineno">  750 </span>-- | Load DirScheme defs from subdirectories under the anchor (workdir-local
+<span class="lineno">  751 </span>-- legacy), skipping ids already provided by the flat scheme (flat wins on
+<span class="lineno">  752 </span>-- conflict).
+<span class="lineno">  753 </span>collectDirsFs :: WorkdirFs -&gt; [Text] -&gt; [AgentDefId] -&gt; IO [AgentDef]
+<span class="lineno">  754 </span><span class="decl"><span class="nottickedoff">collectDirsFs fs entries flatIds = do</span>
+<span class="lineno">  755 </span><span class="spaces">  </span><span class="nottickedoff">let flatIdTexts = Set.fromList (map agentDefIdText flatIds)</span>
+<span class="lineno">  756 </span><span class="spaces">      </span><span class="nottickedoff">candidate e = do</span>
+<span class="lineno">  757 </span><span class="spaces">        </span><span class="nottickedoff">isDir &lt;- wfsDoesDirectoryExist fs =&lt;&lt; rpOrDie e</span>
+<span class="lineno">  758 </span><span class="spaces">        </span><span class="nottickedoff">let validDir = isDir &amp;&amp; isValidAgentDefId e</span>
+<span class="lineno">  759 </span><span class="spaces">        </span><span class="nottickedoff">pure (if validDir then Just e else Nothing)</span>
+<span class="lineno">  760 </span><span class="spaces">  </span><span class="nottickedoff">mEntries &lt;- mapM candidate entries</span>
+<span class="lineno">  761 </span><span class="spaces">  </span><span class="nottickedoff">let dirNames = catMaybes mEntries</span>
+<span class="lineno">  762 </span><span class="spaces">  </span><span class="nottickedoff">defs &lt;- forM dirNames $ \e -&gt; do</span>
+<span class="lineno">  763 </span><span class="spaces">    </span><span class="nottickedoff">case mkAgentDefId e of</span>
+<span class="lineno">  764 </span><span class="spaces">      </span><span class="nottickedoff">Left _   -&gt; pure Nothing</span>
+<span class="lineno">  765 </span><span class="spaces">      </span><span class="nottickedoff">Right aid -&gt;</span>
+<span class="lineno">  766 </span><span class="spaces">        </span><span class="nottickedoff">if agentDefIdText aid `Set.member` flatIdTexts</span>
+<span class="lineno">  767 </span><span class="spaces">          </span><span class="nottickedoff">then pure Nothing  -- skip the dir def; flat wins</span>
+<span class="lineno">  768 </span><span class="spaces">          </span><span class="nottickedoff">else loadDirAgentDef fs aid</span>
+<span class="lineno">  769 </span><span class="spaces">  </span><span class="nottickedoff">pure (catMaybes defs)</span></span>
+<span class="lineno">  770 </span>
+<span class="lineno">  771 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  772 </span>-- WorkdirFs re-anchoring + RemotePath helpers (internal)
+<span class="lineno">  773 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  774 </span>
+<span class="lineno">  775 </span>-- | Produce a 'WorkdirFs' &quot;view&quot; anchored at a sub-directory of the original
+<span class="lineno">  776 </span>-- anchor. Every 'wfs*' call on the re-anchored handle prepends @prefix@ to
+<span class="lineno">  777 </span>-- the supplied 'RemotePath'. Works for both the local and remote arms (no
+<span class="lineno">  778 </span>-- new constructor — pure record wrapper). The prefix is a relative path
+<span class="lineno">  779 </span>-- (e.g. @&quot;my-repo\/.agents&quot;@); the join uses @\/@ as the separator.
+<span class="lineno">  780 </span>reanchorFs :: WorkdirFs -&gt; Text -&gt; WorkdirFs
+<span class="lineno">  781 </span><span class="decl"><span class="istickedoff">reanchorFs fs prefix = WorkdirFs</span>
+<span class="lineno">  782 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile            = wfsReadFile fs           &lt;=&lt; joinRp prefix</span>
+<span class="lineno">  783 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist       = <span class="nottickedoff">wfsDoesFileExist fs      &lt;=&lt; joinRp prefix</span></span>
+<span class="lineno">  784 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist  = wfsDoesDirectoryExist fs &lt;=&lt; joinRp prefix</span>
+<span class="lineno">  785 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory       = <span class="nottickedoff">wfsListDirectory fs      &lt;=&lt; joinRp prefix</span></span>
+<span class="lineno">  786 </span><span class="spaces">  </span><span class="istickedoff">, wfsFileSize            = <span class="nottickedoff">wfsFileSize fs           &lt;=&lt; joinRp prefix</span></span>
+<span class="lineno">  787 </span><span class="spaces">  </span><span class="istickedoff">, wfsModificationTime    = wfsModificationTime fs   &lt;=&lt; joinRp prefix</span>
+<span class="lineno">  788 </span><span class="spaces">  </span><span class="istickedoff">, wfsSnapshot            = <span class="nottickedoff">wfsSnapshot fs</span></span>
+<span class="lineno">  789 </span><span class="spaces">    </span><span class="istickedoff">-- ^ Whole-workspace: re-anchoring changes where relative reads land,</span>
+<span class="lineno">  790 </span><span class="spaces">    </span><span class="istickedoff">-- never the snapshot's root-relative frame.</span>
+<span class="lineno">  791 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  792 </span>
+<span class="lineno">  793 </span>-- | Join a prefix and a (possibly @&quot;\.@) relative 'RemotePath' into a single
+<span class="lineno">  794 </span>-- 'RemotePath'. A @&quot;\. &quot;@ suffix collapses to the prefix (so re-anchoring at
+<span class="lineno">  795 </span>-- @&quot;\. &quot;@ is the identity). Crashes on invalid input — the prefix/suffix
+<span class="lineno">  796 </span>-- are internally generated from validated components, never user/LLM input.
+<span class="lineno">  797 </span>joinRp :: Text -&gt; RemotePath -&gt; IO RemotePath
+<span class="lineno">  798 </span><span class="decl"><span class="istickedoff">joinRp prefix rp' =</span>
+<span class="lineno">  799 </span><span class="spaces">  </span><span class="istickedoff">let suffix = getRemotePath rp'</span>
+<span class="lineno">  800 </span><span class="spaces">      </span><span class="istickedoff">joined</span>
+<span class="lineno">  801 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlyfalse">T.null prefix</span>            = <span class="nottickedoff">suffix</span></span>
+<span class="lineno">  802 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlyfalse">suffix == &quot;.&quot;</span>            = <span class="nottickedoff">prefix</span></span>
+<span class="lineno">  803 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlyfalse">T.isPrefixOf &quot;./&quot; suffix</span> = <span class="nottickedoff">prefix &lt;&gt; &quot;/&quot; &lt;&gt; T.drop 2 suffix</span></span>
+<span class="lineno">  804 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>                = prefix &lt;&gt; &quot;/&quot; &lt;&gt; suffix</span>
+<span class="lineno">  805 </span><span class="spaces">  </span><span class="istickedoff">in case mkRemotePath joined of</span>
+<span class="lineno">  806 </span><span class="spaces">       </span><span class="istickedoff">Right r  -&gt; pure r</span>
+<span class="lineno">  807 </span><span class="spaces">       </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">error (&quot;joinRp: invalid remote path: &quot; &lt;&gt; T.unpack err</span></span>
+<span class="lineno">  808 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;: &quot; &lt;&gt; T.unpack joined)</span></span></span>
+<span class="lineno">  809 </span>
+<span class="lineno">  810 </span>-- | Construct a 'RemotePath', crashing on invalid input. Used only for
+<span class="lineno">  811 </span>-- internally-generated, validated path components (never user/LLM input).
+<span class="lineno">  812 </span>rpOrDie :: Text -&gt; IO RemotePath
+<span class="lineno">  813 </span><span class="decl"><span class="istickedoff">rpOrDie t = case mkRemotePath t of</span>
+<span class="lineno">  814 </span><span class="spaces">  </span><span class="istickedoff">Right r  -&gt; pure r</span>
+<span class="lineno">  815 </span><span class="spaces">  </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">error (&quot;rpOrDie: invalid remote path: &quot; &lt;&gt; T.unpack err</span></span>
+<span class="lineno">  816 </span><span class="spaces">                     </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;: &quot; &lt;&gt; T.unpack t)</span></span></span>
+
+</pre>
+</body>
+</html>

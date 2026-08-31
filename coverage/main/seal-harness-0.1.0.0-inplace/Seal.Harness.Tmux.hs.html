@@ -1,0 +1,331 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The sole chokepoint for tmux subprocesses. Every tmux invocation builds
+<span class="lineno">    3 </span>-- its 'createProcess' config from a fixed argv (no shell, no constructed
+<span class="lineno">    4 </span>-- command string) built by the pure functions below. The tmux
+<span class="lineno">    5 </span>-- session/window/pane identifiers are smart-constructed 'TmuxIdent'
+<span class="lineno">    6 </span>-- newtypes (charset predicate, no leading dash, no colon — option-injection
+<span class="lineno">    7 </span>-- + separator defense) so an attacker-supplied label fails to compile into
+<span class="lineno">    8 </span>-- the argv.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- This module is split: the pure argv builders + 'validateTmuxIdent' +
+<span class="lineno">   11 </span>-- 'stripAnsi' (re-exported) are here; the IO wrappers + the
+<span class="lineno">   12 </span>-- 'TmuxRunner' seam land in T4 (same module).
+<span class="lineno">   13 </span>module Seal.Harness.Tmux
+<span class="lineno">   14 </span>  ( TmuxIdent (..)
+<span class="lineno">   15 </span>  , mkTmuxIdent
+<span class="lineno">   16 </span>  , tmuxIdentText
+<span class="lineno">   17 </span>  , validateTmuxIdent
+<span class="lineno">   18 </span>  -- * Pure argv builders
+<span class="lineno">   19 </span>  , sendKeysNamedArgs
+<span class="lineno">   20 </span>  , sendEnterNamedArgs
+<span class="lineno">   21 </span>  , pasteBufferNamedArgs
+<span class="lineno">   22 </span>  , captureNamedArgs
+<span class="lineno">   23 </span>  , killWindowNamedArgs
+<span class="lineno">   24 </span>  , renameWindowNamedArgs
+<span class="lineno">   25 </span>  , newWindowNamedArgs
+<span class="lineno">   26 </span>  , setWindowMarkerArgs
+<span class="lineno">   27 </span>  , clearWindowMarkerArgs
+<span class="lineno">   28 </span>  , setRemainOnExitArgs
+<span class="lineno">   29 </span>  -- * IO seam + wrappers
+<span class="lineno">   30 </span>  , TmuxRunner (..)
+<span class="lineno">   31 </span>  , mkRealTmuxRunner
+<span class="lineno">   32 </span>  , startTmuxSessionStatus
+<span class="lineno">   33 </span>  , addHarnessWindowNamed
+<span class="lineno">   34 </span>  , sendToWindowNamed
+<span class="lineno">   35 </span>  , captureWindowNamed
+<span class="lineno">   36 </span>  , stopHarnessWindowNamed
+<span class="lineno">   37 </span>  , renameWindowNamed
+<span class="lineno">   38 </span>  , readMarkers
+<span class="lineno">   39 </span>  , setWindowMarker
+<span class="lineno">   40 </span>  , clearWindowMarker
+<span class="lineno">   41 </span>  , setRemainOnExit
+<span class="lineno">   42 </span>  , checkTmuxCapabilities
+<span class="lineno">   43 </span>  ) where
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>import Control.Exception (IOException, try)
+<span class="lineno">   46 </span>import Data.ByteString qualified as BS
+<span class="lineno">   47 </span>import Data.Map.Strict (Map)
+<span class="lineno">   48 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   49 </span>import Data.Set (Set)
+<span class="lineno">   50 </span>import Data.Set qualified as Set
+<span class="lineno">   51 </span>import Data.Text (Text)
+<span class="lineno">   52 </span>import Data.Text qualified as T
+<span class="lineno">   53 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   54 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   55 </span>import System.Process
+<span class="lineno">   56 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>import Seal.Handles.Harness (HarnessError (..))
+<span class="lineno">   59 </span>import Seal.Harness.Id (HarnessId, harnessIdToText)
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | A validated tmux identifier (session name, window name, pane id).
+<span class="lineno">   62 </span>-- Smart-constructed: rejects empty, leading dash, control chars, and @:@
+<span class="lineno">   63 </span>-- (tmux's separator — a @:@ in a name would break coordinate parsing).
+<span class="lineno">   64 </span>newtype TmuxIdent = TmuxIdent Text
+<span class="lineno">   65 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- | The charset a tmux ident may contain: @A-Za-z0-9_.%@@ (no @:@ — tmux's
+<span class="lineno">   68 </span>-- separator; no control chars; no leading dash — option injection). @%@
+<span class="lineno">   69 </span>-- is used by tmux pane ids (@%5@).
+<span class="lineno">   70 </span>tmuxIdentChars :: Set Char
+<span class="lineno">   71 </span><span class="decl"><span class="istickedoff">tmuxIdentChars = Set.fromList</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">$ ['A'..'Z'] &lt;&gt; ['a'..'z'] &lt;&gt; ['0'..'9'] &lt;&gt; &quot;_.%-&quot;</span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | Smart constructor for 'TmuxIdent'. 'Left' on a malformed ident.
+<span class="lineno">   75 </span>mkTmuxIdent :: Text -&gt; Either Text TmuxIdent
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">mkTmuxIdent t = case validateTmuxIdent t of</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">Left err -&gt; Left <span class="nottickedoff">err</span></span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">Right _  -&gt; Right (TmuxIdent t)</span></span>
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>-- | The bare predicate: 'Right ()' if valid, 'Left' with an error otherwise.
+<span class="lineno">   81 </span>validateTmuxIdent :: Text -&gt; Either Text ()
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">validateTmuxIdent t</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">| T.null t              = Left <span class="nottickedoff">&quot;tmux ident is empty&quot;</span></span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-'       = Left <span class="nottickedoff">&quot;tmux ident must not start with '-' (option injection)&quot;</span></span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">| T.any (== ':') t      = Left <span class="nottickedoff">&quot;tmux ident must not contain ':' (tmux separator)&quot;</span></span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">| not (T.all validChar t) = Left <span class="nottickedoff">&quot;tmux ident has invalid characters&quot;</span></span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = Right ()</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">validChar c = c `Set.member` tmuxIdentChars</span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>tmuxIdentText :: TmuxIdent -&gt; Text
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">tmuxIdentText (TmuxIdent t) = t</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   95 </span>-- Pure argv builders — each returns the exact argv list (no shell) that the
+<span class="lineno">   96 </span>-- IO wrapper passes to @tmux@. The target ident is rendered via
+<span class="lineno">   97 </span>-- 'tmuxIdentText' so a 'TmuxIdent' (validated) reaches the argv, never raw
+<span class="lineno">   98 </span>-- 'Text'.
+<span class="lineno">   99 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | @send-keys -t &lt;target&gt; -l -- &lt;text&gt;@ — send literal text. The @-l@ +
+<span class="lineno">  102 </span>-- @--@ separator guards against option injection: a payload starting with
+<span class="lineno">  103 </span>-- @-@ is sent as literal text, not interpreted as a flag. 'sendEnterNamedArgs'
+<span class="lineno">  104 </span>-- is separate so a payload like @&quot;Enter&quot;@ is never parsed as the Enter key.
+<span class="lineno">  105 </span>sendKeysNamedArgs :: TmuxIdent -&gt; Text -&gt; [String]
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">sendKeysNamedArgs target text =</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;send-keys&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;-l&quot;, &quot;--&quot;, T.unpack text ]</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | @send-keys -t &lt;target&gt; Enter@ — send the Enter keystroke. No @-l@/@--@
+<span class="lineno">  110 </span>-- (the key name IS the token).
+<span class="lineno">  111 </span>sendEnterNamedArgs :: TmuxIdent -&gt; [String]
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">sendEnterNamedArgs target =</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;send-keys&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;Enter&quot; ]</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | @paste-buffer -t &lt;target&gt; -d seal-paste@ — paste the named paste buffer.
+<span class="lineno">  116 </span>-- (The caller pre-loads the buffer via @load-buffer@; this is the paste
+<span class="lineno">  117 </span>-- half.)
+<span class="lineno">  118 </span>pasteBufferNamedArgs :: TmuxIdent -&gt; Text -&gt; [String]
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">pasteBufferNamedArgs target _bufName =</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;paste-buffer&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;-d&quot;, &quot;seal-paste&quot; ]</span></span>
+<span class="lineno">  121 </span>
+<span class="lineno">  122 </span>-- | @capture-pane -t &lt;target&gt; -p@ — capture the pane content as text.
+<span class="lineno">  123 </span>captureNamedArgs :: TmuxIdent -&gt; [String]
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">captureNamedArgs target =</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;capture-pane&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;-p&quot; ]</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | @kill-window -t &lt;target&gt;@.
+<span class="lineno">  128 </span>killWindowNamedArgs :: TmuxIdent -&gt; [String]
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">killWindowNamedArgs target =</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;kill-window&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target) ]</span></span>
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>-- | @rename-window -t &lt;target&gt; &lt;newName&gt;@.
+<span class="lineno">  133 </span>renameWindowNamedArgs :: TmuxIdent -&gt; TmuxIdent -&gt; [String]
+<span class="lineno">  134 </span><span class="decl"><span class="istickedoff">renameWindowNamedArgs target newName =</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;rename-window&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), T.unpack (tmuxIdentText newName) ]</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | @new-window -t &lt;target&gt; -n &lt;name&gt;@.
+<span class="lineno">  138 </span>newWindowNamedArgs :: TmuxIdent -&gt; TmuxIdent -&gt; [String]
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">newWindowNamedArgs target name =</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;new-window&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;-n&quot;, T.unpack (tmuxIdentText name) ]</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | @set-option -t &lt;target&gt; @&lt;marker&gt; &lt;value&gt;@ — stamp a tmux user option
+<span class="lineno">  143 </span>-- (the @seal_id marker).
+<span class="lineno">  144 </span>setWindowMarkerArgs :: TmuxIdent -&gt; Text -&gt; Text -&gt; [String]
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">setWindowMarkerArgs target marker value =</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;set-option&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target)</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">, T.unpack (&quot;@&quot; &lt;&gt; marker), T.unpack value ]</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | @set-option -t &lt;target&gt; -u @&lt;marker&gt;@ — unset (clear) a marker.
+<span class="lineno">  150 </span>clearWindowMarkerArgs :: TmuxIdent -&gt; Text -&gt; [String]
+<span class="lineno">  151 </span><span class="decl"><span class="istickedoff">clearWindowMarkerArgs target marker =</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;set-option&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;-u&quot;, T.unpack (&quot;@&quot; &lt;&gt; marker) ]</span></span>
+<span class="lineno">  153 </span>
+<span class="lineno">  154 </span>-- | @set-option -t &lt;target&gt; remain-on-exit on@.
+<span class="lineno">  155 </span>setRemainOnExitArgs :: TmuxIdent -&gt; [String]
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">setRemainOnExitArgs target =</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;set-option&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target), &quot;remain-on-exit&quot;, &quot;on&quot; ]</span></span>
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  160 </span>-- IO seam + wrappers
+<span class="lineno">  161 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | The process-execution seam: a function that runs @tmux@ with a given
+<span class="lineno">  164 </span>-- argv and returns its stdout. The real implementation uses
+<span class="lineno">  165 </span>-- &quot;System.Process&quot; (no stdin, capture stdout); tests supply a fake that
+<span class="lineno">  166 </span>-- records the argv and returns scripted output.
+<span class="lineno">  167 </span>newtype TmuxRunner = TmuxRunner { <span class="istickedoff"><span class="decl"><span class="istickedoff">runTmux</span></span></span> :: [String] -&gt; IO (Either HarnessError Text) }
+<span class="lineno">  168 </span>
+<span class="lineno">  169 </span>-- | The real tmux runner via System.Process. Preflight @tmux --version@
+<span class="lineno">  170 </span>-- (fail-closes with 'HeTmuxMissing' if absent).
+<span class="lineno">  171 </span>mkRealTmuxRunner :: IO TmuxRunner
+<span class="lineno">  172 </span><span class="decl"><span class="istickedoff">mkRealTmuxRunner = do</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">ok &lt;- probeTmux</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">(TmuxRunner (if ok then runReal else const (pure (Left HeTmuxMissing))))</span></span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">runReal args = do</span></span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">res &lt;- try @IOException (readTmuxNoInput args)</span></span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case res of</span></span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right (ExitSuccess, out, _err) -&gt; pure (Right (TE.decodeUtf8Lenient out))</span></span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right (ExitFailure 127, _, _) -&gt; pure (Left HeTmuxMissing)</span></span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right (ExitFailure n, _, err) -&gt; pure (Left (HeCaptureFailed (&quot;tmux exited &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot;: &quot; &lt;&gt; TE.decodeUtf8Lenient err)))</span></span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left _e                        -&gt; pure (Left HeTmuxMissing)</span></span></span>  -- launch failure = not on PATH
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | Run tmux with no stdin, capturing stdout/stderr as strict ByteStrings.
+<span class="lineno">  185 </span>readTmuxNoInput :: [String] -&gt; IO (ExitCode, BS.ByteString, BS.ByteString)
+<span class="lineno">  186 </span><span class="decl"><span class="istickedoff">readTmuxNoInput args =</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">withCreateProcess</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">( (proc &quot;tmux&quot; args)</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">{ std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">) $ \_ mOut mErr ph -&gt; do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">(hOut, hErr) &lt;- case (mOut, mErr) of</span>
+<span class="lineno">  192 </span><span class="spaces">        </span><span class="istickedoff">(Just a, Just b) -&gt; pure (a, b)</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">error &quot;readTmuxNoInput: pipe creation failed (unreachable)&quot;</span></span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">out &lt;- BS.hGetContents hOut</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="istickedoff">err &lt;- BS.hGetContents hErr</span>
+<span class="lineno">  196 </span><span class="spaces">      </span><span class="istickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">let !_ = BS.length out</span>
+<span class="lineno">  198 </span><span class="spaces">          </span><span class="istickedoff">!_ = BS.length err</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">pure (ec, <span class="nottickedoff">out</span>, <span class="nottickedoff">err</span>)</span></span>
+<span class="lineno">  200 </span>
+<span class="lineno">  201 </span>-- | Preflight @tmux --version@.
+<span class="lineno">  202 </span>probeTmux :: IO Bool
+<span class="lineno">  203 </span><span class="decl"><span class="istickedoff">probeTmux = do</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- try @IOException (readTmuxNoInput [&quot;--version&quot;])</span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">case r of</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="istickedoff">Right (ExitSuccess, _, _) -&gt; <span class="nottickedoff">pure True</span></span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="istickedoff">_                         -&gt; pure <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | Run a tmux command that's expected to produce no useful stdout (just
+<span class="lineno">  210 </span>-- succeed/fail). Uses the pure argv builder supplied.
+<span class="lineno">  211 </span>runVoid :: TmuxRunner -&gt; [String] -&gt; IO (Either HarnessError ())
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">runVoid runner args = either Left (const (Right ())) &lt;$&gt; runTmux runner args</span></span>
+<span class="lineno">  213 </span>
+<span class="lineno">  214 </span>-- | Start a tmux session (if absent) — @tmux new-session -d -s &lt;name&gt;@.
+<span class="lineno">  215 </span>startTmuxSessionStatus :: TmuxRunner -&gt; TmuxIdent -&gt; IO (Either HarnessError ())
+<span class="lineno">  216 </span><span class="decl"><span class="istickedoff">startTmuxSessionStatus runner session =</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">runVoid runner [&quot;new-session&quot;, &quot;-d&quot;, &quot;-s&quot;, T.unpack (tmuxIdentText session)]</span></span>
+<span class="lineno">  218 </span>
+<span class="lineno">  219 </span>-- | Add a harness window to a session, stamp the @seal_id marker.
+<span class="lineno">  220 </span>-- @new-window -t &lt;session&gt; -n &lt;name&gt;@ then @set-option -t &lt;target&gt; @seal_id &lt;id&gt;@.
+<span class="lineno">  221 </span>addHarnessWindowNamed
+<span class="lineno">  222 </span>  :: TmuxRunner -&gt; TmuxIdent -&gt; TmuxIdent -&gt; HarnessId -&gt; IO (Either HarnessError ())
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">addHarnessWindowNamed runner session name hid = do</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">r1 &lt;- runVoid runner (newWindowNamedArgs session name)</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">case r1 of</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  227 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; runVoid runner (setWindowMarkerArgs name &quot;seal_id&quot; <span class="nottickedoff">(harnessIdToText hid)</span>)</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Send literal text to a window.
+<span class="lineno">  230 </span>sendToWindowNamed :: TmuxRunner -&gt; TmuxIdent -&gt; Text -&gt; IO (Either HarnessError ())
+<span class="lineno">  231 </span><span class="decl"><span class="istickedoff">sendToWindowNamed runner target text =</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">runVoid runner (sendKeysNamedArgs target text)</span></span>
+<span class="lineno">  233 </span>
+<span class="lineno">  234 </span>-- | Capture the window's pane content as sanitized lines.
+<span class="lineno">  235 </span>captureWindowNamed :: TmuxRunner -&gt; TmuxIdent -&gt; IO (Either HarnessError [Text])
+<span class="lineno">  236 </span><span class="decl"><span class="istickedoff">captureWindowNamed runner target = do</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- runTmux runner <span class="nottickedoff">(captureNamedArgs target)</span></span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">pure $ case r of</span>
+<span class="lineno">  239 </span><span class="spaces">    </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">Right t -&gt; Right (filter (not . T.null) (T.lines (T.strip t)))</span></span>
+<span class="lineno">  241 </span>
+<span class="lineno">  242 </span>-- | Stop a harness window (kill-window).
+<span class="lineno">  243 </span>stopHarnessWindowNamed :: TmuxRunner -&gt; TmuxIdent -&gt; IO (Either HarnessError ())
+<span class="lineno">  244 </span><span class="decl"><span class="istickedoff">stopHarnessWindowNamed runner target =</span>
+<span class="lineno">  245 </span><span class="spaces">  </span><span class="istickedoff">runVoid runner (killWindowNamedArgs target)</span></span>
+<span class="lineno">  246 </span>
+<span class="lineno">  247 </span>-- | Rename a window.
+<span class="lineno">  248 </span>renameWindowNamed :: TmuxRunner -&gt; TmuxIdent -&gt; TmuxIdent -&gt; IO (Either HarnessError ())
+<span class="lineno">  249 </span><span class="decl"><span class="nottickedoff">renameWindowNamed runner target newName =</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="nottickedoff">runVoid runner (renameWindowNamedArgs target newName)</span></span>
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | Read the tmux user options (markers) for a window.
+<span class="lineno">  253 </span>-- @show-options -t &lt;target&gt;@ → parse @@&quot;key&quot; &quot;value&quot;@ lines into a map.
+<span class="lineno">  254 </span>readMarkers :: TmuxRunner -&gt; TmuxIdent -&gt; IO (Either HarnessError (Map Text Text))
+<span class="lineno">  255 </span><span class="decl"><span class="istickedoff">readMarkers runner target = do</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- runTmux runner <span class="nottickedoff">[&quot;show-options&quot;, &quot;-t&quot;, T.unpack (tmuxIdentText target)]</span></span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">pure $ case r of</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">Right t -&gt; Right (parseMarkers t)</span></span>
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | Parse tmux @show-options@ output: lines like @@&quot;seal_id&quot; &quot;abc-uuid&quot;@.
+<span class="lineno">  262 </span>-- Strip the leading @@, unquote the key + value.
+<span class="lineno">  263 </span>parseMarkers :: Text -&gt; Map Text Text
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">parseMarkers = Map.fromList . mapMaybe parseLine . T.lines</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">parseLine ln =</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">case T.words ln of</span>
+<span class="lineno">  268 </span><span class="spaces">        </span><span class="istickedoff">[k, v] -&gt; case T.uncons k of</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff">Just ('@', rest) -&gt; Just (rest, unquote v)</span>
+<span class="lineno">  270 </span><span class="spaces">          </span><span class="istickedoff">_                -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">unquote v = fromMaybe <span class="nottickedoff">v</span> (T.stripSuffix &quot;\&quot;&quot; (fromMaybe <span class="nottickedoff">v</span> (T.stripPrefix &quot;\&quot;&quot; v)))</span></span>
+<span class="lineno">  273 </span>
+<span class="lineno">  274 </span>-- | Stamp a tmux user option (the @seal_id marker).
+<span class="lineno">  275 </span>setWindowMarker :: TmuxRunner -&gt; TmuxIdent -&gt; Text -&gt; Text -&gt; IO (Either HarnessError ())
+<span class="lineno">  276 </span><span class="decl"><span class="istickedoff">setWindowMarker runner target marker value =</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">runVoid runner (setWindowMarkerArgs target marker value)</span></span>
+<span class="lineno">  278 </span>
+<span class="lineno">  279 </span>-- | Clear a tmux user option.
+<span class="lineno">  280 </span>clearWindowMarker :: TmuxRunner -&gt; TmuxIdent -&gt; Text -&gt; IO (Either HarnessError ())
+<span class="lineno">  281 </span><span class="decl"><span class="nottickedoff">clearWindowMarker runner target marker =</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="nottickedoff">runVoid runner (clearWindowMarkerArgs target marker)</span></span>
+<span class="lineno">  283 </span>
+<span class="lineno">  284 </span>-- | Set remain-on-exit on a window.
+<span class="lineno">  285 </span>setRemainOnExit :: TmuxRunner -&gt; TmuxIdent -&gt; IO (Either HarnessError ())
+<span class="lineno">  286 </span><span class="decl"><span class="nottickedoff">setRemainOnExit runner target =</span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="nottickedoff">runVoid runner (setRemainOnExitArgs target)</span></span>
+<span class="lineno">  288 </span>
+<span class="lineno">  289 </span>-- | Probe tmux capabilities: @seal_id marker support + pane_dead. Returns
+<span class="lineno">  290 </span>-- 'False' if tmux is too old (the show-options call fails).
+<span class="lineno">  291 </span>checkTmuxCapabilities :: TmuxRunner -&gt; IO Bool
+<span class="lineno">  292 </span><span class="decl"><span class="nottickedoff">checkTmuxCapabilities runner = do</span>
+<span class="lineno">  293 </span><span class="spaces">  </span><span class="nottickedoff">r &lt;- runTmux runner [&quot;show-options&quot;, &quot;-g&quot;]</span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="nottickedoff">case r of</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="nottickedoff">Right _ -&gt; pure True</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="nottickedoff">Left _  -&gt; pure False</span></span>
+<span class="lineno">  297 </span>
+<span class="lineno">  298 </span>-- | A fromMaybe that's imported here to avoid an extra import line.
+<span class="lineno">  299 </span>fromMaybe :: a -&gt; Maybe a -&gt; a
+<span class="lineno">  300 </span><span class="decl"><span class="istickedoff">fromMaybe d Nothing  = <span class="nottickedoff">d</span></span>
+<span class="lineno">  301 </span><span class="spaces"></span><span class="istickedoff">fromMaybe _ (Just x) = x</span></span>
+<span class="lineno">  302 </span>
+<span class="lineno">  303 </span>-- | A mapMaybe (local — avoids a Data.Maybe import for one helper).
+<span class="lineno">  304 </span>mapMaybe :: (a -&gt; Maybe b) -&gt; [a] -&gt; [b]
+<span class="lineno">  305 </span><span class="decl"><span class="istickedoff">mapMaybe _ []     = []</span>
+<span class="lineno">  306 </span><span class="spaces"></span><span class="istickedoff">mapMaybe f (x:xs) = case f x of</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="istickedoff">Just y  -&gt; y : mapMaybe f xs</span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">mapMaybe f xs</span></span></span>
+
+</pre>
+</body>
+</html>

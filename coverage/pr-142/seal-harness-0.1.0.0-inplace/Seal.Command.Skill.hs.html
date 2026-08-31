@@ -1,0 +1,175 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @/skill@ command group: list defined skills, show one skill's
+<span class="lineno">    3 </span>-- full body, and load a skill into the current session. Skills are stored
+<span class="lineno">    4 </span>-- as structured records materialized from the Audited log into the
+<span class="lineno">    5 </span>-- in-memory 'SkillBackend'; @/skill list@ and @/skill info@ read that
+<span class="lineno">    6 </span>-- backend directly (no filesystem discovery, no audit-trail entry).
+<span class="lineno">    7 </span>-- @/skill load@ dispatches the 'SKILL_LOAD' opcode via the channel-supplied
+<span class="lineno">    8 </span>-- 'CallDispatcher' (the same closure @/call@ uses), which records an
+<span class="lineno">    9 </span>-- 'EKHarness' entry to the session transcript with
+<span class="lineno">   10 </span>-- @erMeta.op.name = &quot;SKILL_LOAD&quot;@ and @erMeta.input.id = &lt;id&gt;@ — the
+<span class="lineno">   11 </span>-- audit-trail attribution that distinguishes a skill load from a user
+<span class="lineno">   12 </span>-- pasting the body.
+<span class="lineno">   13 </span>module Seal.Command.Skill
+<span class="lineno">   14 </span>  ( skillCommandSpec
+<span class="lineno">   15 </span>  , renderSkillLine
+<span class="lineno">   16 </span>  , renderSkillInfo
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Aeson (object, (.=))
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>import Options.Applicative
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   25 </span>import Seal.Command.Call
+<span class="lineno">   26 </span>  ( CallDispatcher, renderDispatchError, renderOpResult )
+<span class="lineno">   27 </span>import Seal.Command.Spec
+<span class="lineno">   28 </span>  ( Availability (..), CommandAction (..), CommandGroup (..)
+<span class="lineno">   29 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   30 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   31 </span>import Seal.ISA.Opcode (OpResult (..))
+<span class="lineno">   32 </span>import Seal.Skills.Backend (SkillBackend (..))
+<span class="lineno">   33 </span>import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | The @/skill@ command spec. Closes over the 'SkillBackend' (for
+<span class="lineno">   36 </span>-- @/skill list@ \/ @/skill info@, which read the materialized view of the
+<span class="lineno">   37 </span>-- Audited log directly) and the channel-supplied 'CallDispatcher' (for
+<span class="lineno">   38 </span>-- @/skill load@, which dispatches the 'SKILL_LOAD' opcode against the
+<span class="lineno">   39 </span>-- active session's ISA registry + transcript — the same dispatcher
+<span class="lineno">   40 </span>-- @/call@ uses, so the audit trail records both paths uniformly).
+<span class="lineno">   41 </span>skillCommandSpec :: SkillBackend -&gt; CallDispatcher -&gt; CommandSpec
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">skillCommandSpec backend dispatcher = CommandSpec</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = CommandName &quot;skill&quot;</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = []</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = <span class="nottickedoff">GroupSkills</span></span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = <span class="nottickedoff">&quot;List defined skills, show one skill's body, or load one into the session&quot;</span></span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = skillParserInfo backend dispatcher</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">InteractiveOnly</span></span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>skillParserInfo :: SkillBackend -&gt; CallDispatcher -&gt; ParserInfo CommandAction
+<span class="lineno">   52 </span><span class="decl"><span class="istickedoff">skillParserInfo backend dispatcher =</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">info (skillParser backend dispatcher &lt;**&gt; helper)</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Inspect or load agent skills&quot;</span></span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;skill — list, show, or load a skill&quot;</span></span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>skillParser :: SkillBackend -&gt; CallDispatcher -&gt; Parser CommandAction
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">skillParser backend dispatcher = hsubparser</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">(  command &quot;list&quot;</span>
+<span class="lineno">   61 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (listCmd backend)) (progDesc <span class="nottickedoff">&quot;List all defined skills (id + description)&quot;</span>))</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;info&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">       </span><span class="istickedoff">(info (infoCmd backend &lt;$&gt; skillArg)</span>
+<span class="lineno">   64 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Show one skill's full body&quot;</span>))</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;load&quot;</span>
+<span class="lineno">   66 </span><span class="spaces">       </span><span class="istickedoff">(info (loadCmd dispatcher &lt;$&gt; skillArg &lt;*&gt; messageArg)</span>
+<span class="lineno">   67 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Load one skill into the current session, with an optional trailing message&quot;</span>))</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;COMMAND&quot;</span></span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | Required skill-id argument.
+<span class="lineno">   72 </span>skillArg :: Parser Text
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">skillArg = T.pack &lt;$&gt; strArgument (metavar <span class="nottickedoff">&quot;SKILL&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Skill id (e.g. greet)&quot;</span>)</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | Optional trailing message (everything after the skill id). Joined with
+<span class="lineno">   76 </span>-- spaces so @/skill load foo do something@ yields the message @do something@.
+<span class="lineno">   77 </span>-- Empty when no trailing text is supplied (just a skill load, no message).
+<span class="lineno">   78 </span>messageArg :: Parser Text
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">messageArg = T.intercalate &quot; &quot; . map T.pack &lt;$&gt; many (strArgument (metavar <span class="nottickedoff">&quot;MESSAGE...&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Optional message appended after the skill body&quot;</span>))</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>listCmd :: SkillBackend -&gt; CommandAction
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">listCmd backend = CommandAction $ \caps -&gt; do</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">skills &lt;- sbList backend</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">if null skills</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">then ccSend caps &quot;no skills defined&quot;</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">else mapM_ (ccSend caps . renderSkillLine) skills</span></span>
+<span class="lineno">   87 </span>
+<span class="lineno">   88 </span>infoCmd :: SkillBackend -&gt; Text -&gt; CommandAction
+<span class="lineno">   89 </span><span class="decl"><span class="istickedoff">infoCmd backend raw = CommandAction $ \caps -&gt;</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">case mkSkillId raw of</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; ccSend caps err</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">Right sid -&gt; do</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">mSkill &lt;- sbRead backend sid</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">case mSkill of</span>
+<span class="lineno">   95 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; ccSend caps (&quot;skill not found: &quot; &lt;&gt; skillIdText sid)</span>
+<span class="lineno">   96 </span><span class="spaces">        </span><span class="istickedoff">Just s  -&gt; mapM_ (ccSend caps) (renderSkillInfo s)</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | @/skill load &lt;id&gt; [message...]@ — dispatch the 'SKILL_LOAD' opcode with
+<span class="lineno">   99 </span>-- @{&quot;id&quot;: &lt;id&gt;, &quot;message&quot;: &lt;message&gt;}@ via the channel-supplied
+<span class="lineno">  100 </span>-- 'CallDispatcher'. Mirrors @/call@'s pattern: echo a header line first (so
+<span class="lineno">  101 </span>-- the &quot;Command output&quot; bubble is self-contained).
+<span class="lineno">  102 </span>--
+<span class="lineno">  103 </span>-- The optional trailing @message@ is forwarded to the dispatcher as a
+<span class="lineno">  104 </span>-- @message@ field in the opcode input. 'recordSkillLoadResult' appends it to
+<span class="lineno">  105 </span>-- @conversation.jsonl@ as a separate 'User' message AFTER the skill body, so
+<span class="lineno">  106 </span>-- the model sees the skill followed by the user's request on the next turn
+<span class="lineno">  107 </span>-- (e.g. @/skill load start #123@ loads the @start@ skill then sends
+<span class="lineno">  108 </span>-- @#123@ as the user's message). When no message is supplied, the input
+<span class="lineno">  109 </span>-- omits the @message@ key and the load behaves as before (skill body only).
+<span class="lineno">  110 </span>--
+<span class="lineno">  111 </span>-- On success, the skill body is NOT rendered via 'ccSend' — the dispatcher
+<span class="lineno">  112 </span>-- records a second 'EKHarness' entry to the transcript carrying the
+<span class="lineno">  113 </span>-- @orRecorded@ value (which includes the body), and the frontend renders
+<span class="lineno">  114 </span>-- that entry as a collapsible tool-call box. This keeps the slash bubble
+<span class="lineno">  115 </span>-- to just the echo line and avoids duplicating the body in the &quot;command
+<span class="lineno">  116 </span>-- output — not saved&quot; transient bubble.
+<span class="lineno">  117 </span>--
+<span class="lineno">  118 </span>-- On error (dispatch 'Left' or 'Right' with the error flag set), the error
+<span class="lineno">  119 </span>-- text IS rendered via 'ccSend' so the user sees it in the slash bubble —
+<span class="lineno">  120 </span>-- error paths produce no transcript body entry, so the slash bubble is
+<span class="lineno">  121 </span>-- the only surface for the error message.
+<span class="lineno">  122 </span>loadCmd :: CallDispatcher -&gt; Text -&gt; Text -&gt; CommandAction
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">loadCmd dispatcher raw message = CommandAction $ \caps -&gt; do</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps (&quot;$ /skill load &quot; &lt;&gt; raw)</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">case mkSkillId raw of</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">Right sid -&gt; do</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">let input = object</span>
+<span class="lineno">  129 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;id&quot; .= skillIdText sid</span>
+<span class="lineno">  130 </span><span class="spaces">            </span><span class="istickedoff">, &quot;message&quot; .= message</span>
+<span class="lineno">  131 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- dispatcher (OpName &quot;SKILL_LOAD&quot;) input</span>
+<span class="lineno">  133 </span><span class="spaces">      </span><span class="istickedoff">case res of</span>
+<span class="lineno">  134 </span><span class="spaces">        </span><span class="istickedoff">Left e  -&gt; ccSend caps (renderDispatchError e)</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="istickedoff">Right r</span>
+<span class="lineno">  136 </span><span class="spaces">          </span><span class="istickedoff">| orIsError r -&gt; mapM_ (ccSend caps) (renderOpResult r)</span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | One line per skill for @/skill list@.
+<span class="lineno">  140 </span>renderSkillLine :: Skill -&gt; Text
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">renderSkillLine s = skillIdText (skId s) &lt;&gt; &quot;  &quot; &lt;&gt; skDescription s</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Multi-line detail for @/skill info@.
+<span class="lineno">  144 </span>renderSkillInfo :: Skill -&gt; [Text]
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">renderSkillInfo s =</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;id:          &quot; &lt;&gt; skillIdText (skId s)</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">, &quot;description: &quot; &lt;&gt; skDescription s</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">, &quot;updated:     &quot; &lt;&gt; T.pack (show (skUpdatedAt s))</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">, &quot;session:     &quot; &lt;&gt; T.pack (show (skSession s))</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">, skBody s</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+
+</pre>
+</body>
+</html>

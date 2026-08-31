@@ -1,0 +1,163 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @/agent@ command group: list defined agent definitions, show one
+<span class="lineno">    3 </span>-- agent def's fields, and view or set the default agent. Agent defs are stored
+<span class="lineno">    4 </span>-- as structured records materialized from the Audited log into the in-memory
+<span class="lineno">    5 </span>-- 'AgentDefBackend'; this command reads that backend (no filesystem
+<span class="lineno">    6 </span>-- discovery). The default agent is persisted in @config.toml@ as
+<span class="lineno">    7 </span>-- @default_agent@.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- Scope (mirrors pureclaw's @\/agent@ surface): discovery over definitions
+<span class="lineno">   10 </span>-- only. The running-agent lifecycle (@AGENT_START@\/@STOP@\/@STATUS@) is
+<span class="lineno">   11 </span>-- reachable via the ISA tool calls, not via slash commands.
+<span class="lineno">   12 </span>module Seal.Command.Agent
+<span class="lineno">   13 </span>  ( agentCommandSpec
+<span class="lineno">   14 </span>  , renderAgentLine
+<span class="lineno">   15 </span>  , renderAgentInfo
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.List (sortOn)
+<span class="lineno">   19 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   20 </span>import Data.Set qualified as Set
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import Options.Applicative
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Seal.Agent.Def.Backend (AgentDefBackend (..))
+<span class="lineno">   26 </span>import Seal.Agent.Def.Types (AgentDef (..), mkAgentDefId, agentDefIdText)
+<span class="lineno">   27 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   28 </span>import Seal.Command.Spec
+<span class="lineno">   29 </span>  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
+<span class="lineno">   30 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   31 </span>import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig, updateRuntimeConfig)
+<span class="lineno">   32 </span>import Seal.Core.Types (ModelId (..), OpName (..))
+<span class="lineno">   33 </span>import Seal.Security.Policy (AllowList (..))
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | The @/agent@ command spec. Closes over the 'AgentDefBackend' (for
+<span class="lineno">   36 </span>-- list/info) and the config path (for default get/set).
+<span class="lineno">   37 </span>agentCommandSpec :: AgentDefBackend -&gt; FilePath -&gt; CommandSpec
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">agentCommandSpec backend cfgPath = CommandSpec</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = <span class="nottickedoff">CommandName &quot;agent&quot;</span></span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = <span class="nottickedoff">[]</span></span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = <span class="nottickedoff">GroupAgent</span></span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = <span class="nottickedoff">&quot;List agent defs, show one, or view/set the default agent&quot;</span></span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = agentParserInfo backend cfgPath</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">InteractiveOnly</span></span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>agentParserInfo :: AgentDefBackend -&gt; FilePath -&gt; ParserInfo CommandAction
+<span class="lineno">   48 </span><span class="decl"><span class="istickedoff">agentParserInfo backend cfgPath =</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">info (agentParser backend cfgPath &lt;**&gt; helper)</span>
+<span class="lineno">   50 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Inspect agent definitions and the default agent&quot;</span></span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;agent — list defs, show one, or view/set the default&quot;</span></span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>agentParser :: AgentDefBackend -&gt; FilePath -&gt; Parser CommandAction
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">agentParser backend cfgPath = hsubparser</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">(  command &quot;list&quot;</span>
+<span class="lineno">   57 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (listCmd backend))</span>
+<span class="lineno">   58 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;List all defined agent defs (id + name + provider/model)&quot;</span>))</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;info&quot;</span>
+<span class="lineno">   60 </span><span class="spaces">       </span><span class="istickedoff">(info (infoCmd backend &lt;$&gt; agentArg)</span>
+<span class="lineno">   61 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Show one agent def's fields&quot;</span>))</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;default&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">       </span><span class="istickedoff">(info (defaultCmd backend cfgPath &lt;$&gt; optional agentArg)</span>
+<span class="lineno">   64 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;View or set the default agent&quot;</span>))</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;COMMAND&quot;</span></span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Required agent-def-id argument.
+<span class="lineno">   69 </span>agentArg :: Parser Text
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">agentArg = T.pack &lt;$&gt; strArgument (metavar <span class="nottickedoff">&quot;AGENT&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Agent def id (e.g. worker)&quot;</span>)</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>listCmd :: AgentDefBackend -&gt; CommandAction
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">listCmd backend = commandAction $ \caps -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">defs &lt;- adbList backend</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">if null defs</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">then ccSend caps &quot;no agent defs defined&quot;</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">else mapM_ (ccSend caps . renderAgentLine) (sortOn adName defs)</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>infoCmd :: AgentDefBackend -&gt; Text -&gt; CommandAction
+<span class="lineno">   80 </span><span class="decl"><span class="istickedoff">infoCmd backend raw = commandAction $ \caps -&gt;</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">case mkAgentDefId raw of</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ccSend caps err</span></span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">Right aid -&gt; do</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">mDef &lt;- adbRead backend aid</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">case mDef of</span>
+<span class="lineno">   86 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; ccSend caps (&quot;agent def not found: &quot; &lt;&gt; agentDefIdText aid)</span>
+<span class="lineno">   87 </span><span class="spaces">        </span><span class="istickedoff">Just d  -&gt; mapM_ (ccSend caps) (renderAgentInfo d)</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | @/agent default@ with no arg views; with an arg validates-then-persists.
+<span class="lineno">   90 </span>defaultCmd :: AgentDefBackend -&gt; FilePath -&gt; Maybe Text -&gt; CommandAction
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">defaultCmd backend cfgPath mArg = commandAction $ \caps -&gt;</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">case mArg of</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">eCfg &lt;- loadRuntimeConfig cfgPath</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">let cur = either <span class="nottickedoff">(const Nothing)</span> rcDefaultAgent eCfg</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">case cur of</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; ccSend caps &quot;no default agent set. Use /agent default &lt;id&gt; to set one.&quot;</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff">Just a  -&gt; <span class="nottickedoff">ccSend caps (&quot;default agent: &quot; &lt;&gt; a)</span></span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">Just raw -&gt;</span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">case mkAgentDefId raw of</span>
+<span class="lineno">  101 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; ccSend caps err</span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">Right aid -&gt; do</span>
+<span class="lineno">  103 </span><span class="spaces">          </span><span class="istickedoff">mDef &lt;- adbRead backend aid</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">case mDef of</span>
+<span class="lineno">  105 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; ccSend caps (&quot;agent def not found: &quot; &lt;&gt; agentDefIdText aid)</span>
+<span class="lineno">  106 </span><span class="spaces">            </span><span class="istickedoff">Just _ -&gt; do</span>
+<span class="lineno">  107 </span><span class="spaces">              </span><span class="istickedoff">res &lt;- updateRuntimeConfig cfgPath</span>
+<span class="lineno">  108 </span><span class="spaces">                       </span><span class="istickedoff">(\fc -&gt; fc { rcDefaultAgent = Just (agentDefIdText aid) })</span>
+<span class="lineno">  109 </span><span class="spaces">              </span><span class="istickedoff">case res of</span>
+<span class="lineno">  110 </span><span class="spaces">                </span><span class="istickedoff">Left e   -&gt; <span class="nottickedoff">ccSend caps e</span></span>
+<span class="lineno">  111 </span><span class="spaces">                </span><span class="istickedoff">Right () -&gt; ccSend caps (&quot;default agent set to: &quot; &lt;&gt; agentDefIdText aid)</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | One line per def for @/agent list@. Empty provider/model (e.g. a
+<span class="lineno">  114 </span>-- DirScheme agent with no @AGENTS.md@ frontmatter) render as @default@.
+<span class="lineno">  115 </span>renderAgentLine :: AgentDef -&gt; Text
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">renderAgentLine d =</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">agentDefIdText (adId d) &lt;&gt; &quot;  &quot; &lt;&gt; adName d</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot;  (&quot; &lt;&gt; providerLabel &lt;&gt; &quot;/&quot; &lt;&gt; modelLabel &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">ModelId modelName = adModel d</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">providerLabel = if <span class="tickonlyfalse">T.null (adProvider d)</span> then <span class="nottickedoff">&quot;default&quot;</span> else adProvider d</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">modelLabel = if <span class="tickonlyfalse">T.null modelName</span> then <span class="nottickedoff">&quot;default&quot;</span> else modelName</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | Multi-line detail for @/agent info@.
+<span class="lineno">  125 </span>renderAgentInfo :: AgentDef -&gt; [Text]
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">renderAgentInfo d =</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;id:          &quot; &lt;&gt; agentDefIdText (adId d)</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">, &quot;name:        &quot; &lt;&gt; adName d</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">, &quot;provider:    &quot; &lt;&gt; adProvider d</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">, &quot;model:       &quot; &lt;&gt; modelName</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, &quot;system:      &quot; &lt;&gt; fromMaybe <span class="nottickedoff">&quot;(none)&quot;</span> (adSystem d)</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">, &quot;tools:       &quot; &lt;&gt; renderTools (adTools d)</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, &quot;updated:     &quot; &lt;&gt; T.pack (show (adUpdatedAt d))</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">, &quot;session:     &quot; &lt;&gt; T.pack (show (adSession d))</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">ModelId modelName = adModel d</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">renderTools AllowAll       = &quot;all&quot;</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">renderTools (AllowOnly xs) =</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">T.intercalate &quot;, &quot; [ t | OpName t &lt;- Set.toList xs ]</span></span>
+
+</pre>
+</body>
+</html>

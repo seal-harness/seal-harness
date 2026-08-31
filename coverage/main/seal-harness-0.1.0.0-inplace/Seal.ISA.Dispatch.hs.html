@@ -1,0 +1,317 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The dispatcher. Runs the pure authorization gate, then — for Untrusted
+<span class="lineno">    3 </span>-- opcodes — durably records the invocation (tfwRecordAndAck) BEFORE executing,
+<span class="lineno">    4 </span>-- so no untrusted action runs until its audit entry is on disk. Trusted
+<span class="lineno">    5 </span>-- opcodes record concurrently with execution.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- Invariant: for an Untrusted opcode, tfwRecordAndAck completes before opRun
+<span class="lineno">    8 </span>-- is called. This ordering is the whole point of the module.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- There is no longer an Audited branch: the four evolutionary stores
+<span class="lineno">   11 </span>-- (memory, skills, agent-defs) are file-backed under @config\/@ and versioned
+<span class="lineno">   12 </span>-- by git; their opcodes are Trusted file writes that auto-commit. The session
+<span class="lineno">   13 </span>-- transcript (two-file format) remains the per-session record of every opcode
+<span class="lineno">   14 </span>-- invocation, recorded here as an 'EKHarness' entry.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- Opcode invocations are recorded as 'EKHarness' entries in @entries.jsonl@:
+<span class="lineno">   17 </span>-- the opcode name goes into 'erMeta' under @&quot;op&quot;@, and the secret-free input
+<span class="lineno">   18 </span>-- goes into 'erMeta' under @&quot;input&quot;@. No conversation lines are added.
+<span class="lineno">   19 </span>module Seal.ISA.Dispatch
+<span class="lineno">   20 </span>  ( DispatchError (..)
+<span class="lineno">   21 </span>  , dispatch
+<span class="lineno">   22 </span>  , recordSkillLoadResult
+<span class="lineno">   23 </span>  , recordSetupRepoResult
+<span class="lineno">   24 </span>  ) where
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   27 </span>import Control.Monad.Reader (ask)
+<span class="lineno">   28 </span>import Data.Aeson (Value, object, (.=))
+<span class="lineno">   29 </span>import Data.Aeson qualified as A
+<span class="lineno">   30 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Seal.Core.Types (OpName (..), TrustLevel (..))
+<span class="lineno">   36 </span>import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
+<span class="lineno">   37 </span>import Seal.ISA.Opcode
+<span class="lineno">   38 </span>import Seal.ISA.Registry
+<span class="lineno">   39 </span>import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
+<span class="lineno">   40 </span>import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+<span class="lineno">   41 </span>import Seal.Types.App
+<span class="lineno">   42 </span>import Seal.Tools.Exec.Abort (AbortFlag)
+<span class="lineno">   43 </span>import Seal.Tools.Exec.Timeout (runWithTimeoutAbortRetry)
+<span class="lineno">   44 </span>import Seal.Tools.Exec.UIO.Internal (UIOEnv)
+<span class="lineno">   45 </span>import Seal.Tools.Exec.UIO (runUIOWithEnv)
+<span class="lineno">   46 </span>import Seal.Tools.Timeout (Microseconds (..), ToolError, ToolTimeoutConfig, errorClass, extractPerCallTimeout, renderToolError)
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
+<span class="lineno">   49 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Dispatch an opcode invocation. The dispatcher threads a 'UIOEnv'
+<span class="lineno">   52 </span>-- for Untrusted opcodes (the restricted execution environment carrying
+<span class="lineno">   53 </span>-- the 'UntrustedIO' capability handle + the Git 'CloneDeps' surface);
+<span class="lineno">   54 </span>-- Trusted/Audited opcodes ignore it (they have no 'UIOEnv' in scope —
+<span class="lineno">   55 </span>-- type-level capability scoping, spec §4/§8).
+<span class="lineno">   56 </span>dispatch
+<span class="lineno">   57 </span>  :: Registry -&gt; TwoFileHandle -&gt; BackendExec -&gt; UIOEnv
+<span class="lineno">   58 </span>  -&gt; ToolTimeoutConfig -&gt; AbortFlag
+<span class="lineno">   59 </span>  -&gt; OpName -&gt; Value
+<span class="lineno">   60 </span>  -&gt; App (Either DispatchError OpResult)
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">dispatch reg h backend uioEnv toolTimeout abortFlag name input =</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">case lookupOp reg name of</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Left (OpNotFound name))</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">Just op -&gt;</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">case opAuthorize op input of</span>
+<span class="lineno">   66 </span><span class="spaces">        </span><span class="istickedoff">Left why -&gt; pure (Left (Denied why))</span>
+<span class="lineno">   67 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">   68 </span><span class="spaces">          </span><span class="istickedoff">entry &lt;- liftIO (mkInvocationEntry name input)</span>
+<span class="lineno">   69 </span><span class="spaces">          </span><span class="istickedoff">let -- Extract the per-call timeout (in seconds → microseconds)</span>
+<span class="lineno">   70 </span><span class="spaces">              </span><span class="istickedoff">-- from the input JSON, clamped to the max.</span>
+<span class="lineno">   71 </span><span class="spaces">              </span><span class="istickedoff">Microseconds perCallMicros = extractPerCallTimeout input toolTimeout</span>
+<span class="lineno">   72 </span><span class="spaces">          </span><span class="istickedoff">case op of</span>
+<span class="lineno">   73 </span><span class="spaces">            </span><span class="istickedoff">UntrustedOpcode {} -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">              </span><span class="istickedoff">liftIO (tfwRecordAndAck h (TwoFileWrite [] entry))   -- ACK-before-execute</span>
+<span class="lineno">   75 </span><span class="spaces">              </span><span class="istickedoff">-- Wrap uoRun in the timeout/abort/retry race. The untrusted</span>
+<span class="lineno">   76 </span><span class="spaces">              </span><span class="istickedoff">-- action runs via 'runUIOWithEnv' (the UIO→IO bridge carrying</span>
+<span class="lineno">   77 </span><span class="spaces">              </span><span class="istickedoff">-- the 'UntrustedIO' capability handle + Git 'CloneDeps'</span>
+<span class="lineno">   78 </span><span class="spaces">              </span><span class="istickedoff">-- surface from the 'UIOEnv'); the race wrapper treats it as a</span>
+<span class="lineno">   79 </span><span class="spaces">              </span><span class="istickedoff">-- plain 'IO' action. OpResult semantic errors are NOT</span>
+<span class="lineno">   80 </span><span class="spaces">              </span><span class="istickedoff">-- ToolErrors (wrapped Right).</span>
+<span class="lineno">   81 </span><span class="spaces">              </span><span class="istickedoff">let ioAction :: IO (Either ToolError OpResult)</span>
+<span class="lineno">   82 </span><span class="spaces">                  </span><span class="istickedoff">ioAction = do</span>
+<span class="lineno">   83 </span><span class="spaces">                    </span><span class="istickedoff">r &lt;- runUIOWithEnv uioEnv (uoRun op input)</span>
+<span class="lineno">   84 </span><span class="spaces">                    </span><span class="istickedoff">pure (Right r)</span>
+<span class="lineno">   85 </span><span class="spaces">              </span><span class="istickedoff">raced &lt;- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)</span>
+<span class="lineno">   86 </span><span class="spaces">              </span><span class="istickedoff">case raced of</span>
+<span class="lineno">   87 </span><span class="spaces">                </span><span class="istickedoff">Right opResult -&gt; pure (Right opResult)</span>
+<span class="lineno">   88 </span><span class="spaces">                </span><span class="istickedoff">Left toolErr -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">   89 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- Record the error class in the transcript (design Task 8:</span></span>
+<span class="lineno">   90 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- orRecorded carries the error class only — never the full</span></span>
+<span class="lineno">   91 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- ToolIOError Text payload, which could contain paths/host</span></span>
+<span class="lineno">   92 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- info, design Blocker Resolution #13).</span></span>
+<span class="lineno">   93 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">liftIO (recordToolError h name input toolErr perCallMicros)</span></span>
+<span class="lineno">   94 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">pure (Left (ExecFailed (renderToolError name toolErr)))</span></span>
+<span class="lineno">   95 </span><span class="spaces">            </span><span class="istickedoff">TrustedOpcode {} -&gt;</span>
+<span class="lineno">   96 </span><span class="spaces">              </span><span class="istickedoff">case opTrust op of</span>
+<span class="lineno">   97 </span><span class="spaces">                </span><span class="istickedoff">Trusted -&gt; do</span>
+<span class="lineno">   98 </span><span class="spaces">                  </span><span class="istickedoff">liftIO (tfwRecordAsync h (TwoFileWrite [] entry))</span>
+<span class="lineno">   99 </span><span class="spaces">                  </span><span class="istickedoff">runTrustedOpcode h <span class="nottickedoff">backend</span> toolTimeout abortFlag op <span class="nottickedoff">name</span> input perCallMicros</span>
+<span class="lineno">  100 </span><span class="spaces">                </span><span class="istickedoff">Audited -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  101 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- No Audited log remains; treat as Trusted (record to the</span></span>
+<span class="lineno">  102 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- session transcript, then run). The evolutionary-store</span></span>
+<span class="lineno">  103 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">-- opcodes that used to be Audited are now Trusted file writes.</span></span>
+<span class="lineno">  104 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">liftIO (tfwRecordAsync h (TwoFileWrite [] entry))</span></span>
+<span class="lineno">  105 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros</span></span>
+<span class="lineno">  106 </span><span class="spaces">                </span><span class="istickedoff">Untrusted -&gt;</span>
+<span class="lineno">  107 </span><span class="spaces">                  </span><span class="istickedoff">-- Unreachable: an UntrustedOpcode would have matched above.</span>
+<span class="lineno">  108 </span><span class="spaces">                  </span><span class="istickedoff">-- Kept for exhaustiveness (the GADT already separates the</span>
+<span class="lineno">  109 </span><span class="spaces">                  </span><span class="istickedoff">-- arms; opTrust on a TrustedOpcode returns its stored tl,</span>
+<span class="lineno">  110 </span><span class="spaces">                  </span><span class="istickedoff">-- which the Opcode invariants guarantee is Trusted or Audited).</span>
+<span class="lineno">  111 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">error &quot;dispatch: invariant violation — Untrusted trust on a TrustedOpcode&quot;</span></span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">-- | Run a Trusted opcode, conditionally wrapping it in the</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">-- timeout/abort/retry race. Blocking opcodes (ASK_HUMAN) skip the</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">-- race — they block on human input which can take arbitrarily long,</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">-- and the 'AskReplyStore' has its own cancel mechanism. Non-blocking</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">-- opcodes get the full timeout/abort/retry treatment.</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">runTrustedOpcode</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">:: TwoFileHandle -&gt; BackendExec -&gt; ToolTimeoutConfig -&gt; AbortFlag</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">-&gt; Opcode -&gt; OpName -&gt; Value -&gt; Int</span>
+<span class="lineno">  121 </span><span class="spaces">      </span><span class="istickedoff">-&gt; App (Either DispatchError OpResult)</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">runTrustedOpcode h' backend' tt abort op' nm inp micros</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">| opBlocking op' = do</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">-- Blocking: run directly, no timeout race.</span>
+<span class="lineno">  125 </span><span class="spaces">          </span><span class="istickedoff">r &lt;- toRun op' <span class="nottickedoff">backend'</span> inp</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="istickedoff">pure (Right r)</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="istickedoff">env &lt;- ask</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="istickedoff">let ioAction :: IO (Either ToolError OpResult)</span>
+<span class="lineno">  130 </span><span class="spaces">              </span><span class="istickedoff">ioAction = do</span>
+<span class="lineno">  131 </span><span class="spaces">                </span><span class="istickedoff">r &lt;- runApp <span class="nottickedoff">env</span> (toRun op' <span class="nottickedoff">backend'</span> inp)</span>
+<span class="lineno">  132 </span><span class="spaces">                </span><span class="istickedoff">pure (Right r)</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">raced &lt;- liftIO (runWithTimeoutAbortRetry tt abort (Microseconds micros) ioAction)</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="istickedoff">case raced of</span>
+<span class="lineno">  135 </span><span class="spaces">            </span><span class="istickedoff">Right opResult -&gt; pure (Right opResult)</span>
+<span class="lineno">  136 </span><span class="spaces">            </span><span class="istickedoff">Left toolErr -&gt; do</span>
+<span class="lineno">  137 </span><span class="spaces">              </span><span class="istickedoff">liftIO (recordToolError h' <span class="nottickedoff">nm</span> <span class="nottickedoff">inp</span> <span class="nottickedoff">toolErr</span> <span class="nottickedoff">micros</span>)</span>
+<span class="lineno">  138 </span><span class="spaces">              </span><span class="istickedoff">pure <span class="nottickedoff">(Left (ExecFailed (renderToolError nm toolErr)))</span></span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | Build the 'EntryRecord' for an opcode invocation. The opcode name and the
+<span class="lineno">  141 </span>-- secret-free input are recorded in 'erMeta'; the entry kind is 'EKHarness'.
+<span class="lineno">  142 </span>-- 'erConvLen' is 0 because no conversation lines are added by an opcode
+<span class="lineno">  143 </span>-- invocation.
+<span class="lineno">  144 </span>mkInvocationEntry :: OpName -&gt; Value -&gt; IO EntryRecord
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">mkInvocationEntry name input = do</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">pure EntryRecord</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">, erKind = EKHarness</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">, erConvLen = 0</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">, erEnvelope = Nothing</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">, erMeta = Map.fromList [(&quot;op&quot;, object [&quot;name&quot; .= name]), (&quot;input&quot;, input)]</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>-- | Record a second 'EKHarness' entry carrying the opcode's 'orRecorded'
+<span class="lineno">  162 </span>-- value as @result@ in @erMeta@. Called by the 'CallDispatcher' sites
+<span class="lineno">  163 </span>-- (webCallDispatcher, channelCallDispatcher, CLI callDispatcher) after
+<span class="lineno">  164 </span>-- 'dispatch' returns a successful 'Right' for the 'SKILL_LOAD' opcode.
+<span class="lineno">  165 </span>-- The invocation entry (recorded by 'dispatch' before the opcode runs)
+<span class="lineno">  166 </span>-- carries only @op.name@ + @input@; this result entry adds the
+<span class="lineno">  167 </span>-- @orRecorded@ payload (which for 'SKILL_LOAD' includes the skill id,
+<span class="lineno">  168 </span>-- description, body, updated_at, and session) so the frontend can render
+<span class="lineno">  169 </span>-- the skill body in a collapsible tool-call box without duplicating it
+<span class="lineno">  170 </span>-- in the transient slash bubble.
+<span class="lineno">  171 </span>--
+<span class="lineno">  172 </span>-- Only fires for 'SKILL_LOAD' (the v1 user-surfacing opcode). Other
+<span class="lineno">  173 </span>-- opcodes' 'orRecorded' is not surfaced to the frontend via this path.
+<span class="lineno">  174 </span>-- Error results ('orIsError' = True) are NOT recorded here — the error
+<span class="lineno">  175 </span>-- text is rendered via 'ccSend' to the slash bubble instead.
+<span class="lineno">  176 </span>--
+<span class="lineno">  177 </span>-- The skill body is ALSO appended to @conversation.jsonl@ as an 'Assistant'
+<span class="lineno">  178 </span>-- message carrying the rendered body text (harness output, not user input).
+<span class="lineno">  179 </span>-- The agent loop builds its
+<span class="lineno">  180 </span>-- next-turn context from @conversation.jsonl@ ('runTurn' at
+<span class="lineno">  181 </span>-- 'Seal.Agent.Loop' reads @tfwReadConversation@); without this write,
+<span class="lineno">  182 </span>-- a user-invoked @/skill load@ would record the body only to
+<span class="lineno">  183 </span>-- @entries.jsonl@ (the audit sidecar) and the model would never see
+<span class="lineno">  184 </span>-- the skill on the next turn — the @/skill load@ &quot;Command output&quot; box
+<span class="lineno">  185 </span>-- would display but the skill would not actually load. The agent's own
+<span class="lineno">  186 </span>-- tool-call path needs no such write because 'runTurn' already folds
+<span class="lineno">  187 </span>-- the 'CbToolResult' into @conversation.jsonl@; this closes the gap
+<span class="lineno">  188 </span>-- for the user-invoked path, which bypasses the agent loop.
+<span class="lineno">  189 </span>--
+<span class="lineno">  190 </span>-- The @channel@ argument is the communications-channel label of the
+<span class="lineno">  191 </span>-- session the skill was loaded into (e.g. @&quot;telegram&quot;@, @&quot;web&quot;@,
+<span class="lineno">  192 </span>-- @&quot;cli&quot;@), or 'Nothing' when the caller didn't supply one. It is
+<span class="lineno">  193 </span>-- recorded under @&quot;channel&quot;@ in @erMeta@ so the frontend can surface
+<span class="lineno">  194 </span>-- the channel provenance in the skill-load row's source label (e.g.
+<span class="lineno">  195 </span>-- @&quot;Skill · telegram&quot;@), making it clear how/why the skill was loaded.
+<span class="lineno">  196 </span>--
+<span class="lineno">  197 </span>-- The @input@'s optional @message@ field (a string) is appended to
+<span class="lineno">  198 </span>-- @conversation.jsonl@ as a SECOND 'User' message AFTER the skill body,
+<span class="lineno">  199 </span>-- so the model sees the skill followed by the user's trailing message on
+<span class="lineno">  200 </span>-- the next turn (e.g. @/skill load start #123@ loads the @start@ skill
+<span class="lineno">  201 </span>-- then sends @#123@ as the user's message). When @message@ is absent or
+<span class="lineno">  202 </span>-- blank, no second message is written (the load behaves as before — skill
+<span class="lineno">  203 </span>-- body only).
+<span class="lineno">  204 </span>recordSkillLoadResult :: TwoFileHandle -&gt; OpName -&gt; Value -&gt; OpResult -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">  205 </span><span class="decl"><span class="istickedoff">recordSkillLoadResult h (OpName nm) input result mChannel</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">| nm == &quot;SKILL_LOAD&quot; &amp;&amp; not (orIsError result) = do</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  208 </span><span class="spaces">      </span><span class="istickedoff">let channelMeta = case mChannel of</span>
+<span class="lineno">  209 </span><span class="spaces">            </span><span class="istickedoff">Just ch  -&gt; [(&quot;channel&quot;, A.String ch)]</span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="istickedoff">Nothing  -&gt; []</span>
+<span class="lineno">  211 </span><span class="spaces">          </span><span class="istickedoff">entry = EntryRecord</span>
+<span class="lineno">  212 </span><span class="spaces">            </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  213 </span><span class="spaces">            </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  214 </span><span class="spaces">            </span><span class="istickedoff">, erKind = EKHarness</span>
+<span class="lineno">  215 </span><span class="spaces">            </span><span class="istickedoff">, erConvLen = 0</span>
+<span class="lineno">  216 </span><span class="spaces">            </span><span class="istickedoff">, erEnvelope = Nothing</span>
+<span class="lineno">  217 </span><span class="spaces">            </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  218 </span><span class="spaces">            </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  219 </span><span class="spaces">            </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  220 </span><span class="spaces">            </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  221 </span><span class="spaces">            </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  222 </span><span class="spaces">            </span><span class="istickedoff">, erMeta = Map.fromList</span>
+<span class="lineno">  223 </span><span class="spaces">                </span><span class="istickedoff">([ (&quot;op&quot;, object [&quot;name&quot; .= OpName nm])</span>
+<span class="lineno">  224 </span><span class="spaces">                 </span><span class="istickedoff">, (&quot;input&quot;, input)</span>
+<span class="lineno">  225 </span><span class="spaces">                 </span><span class="istickedoff">, (&quot;result&quot;, orRecorded result)</span>
+<span class="lineno">  226 </span><span class="spaces">                 </span><span class="istickedoff">] &lt;&gt; channelMeta)</span>
+<span class="lineno">  227 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="istickedoff">bodyText = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> [ t | TrpText t &lt;- orParts result ]</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="istickedoff">convMsgs =</span>
+<span class="lineno">  230 </span><span class="spaces">            </span><span class="istickedoff">[ Message Assistant [CbText bodyText] | <span class="tickonlytrue">not (T.null bodyText)</span> ]</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">tfwRecordAndAck h (TwoFileWrite convMsgs entry)</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  233 </span>
+<span class="lineno">  234 </span>-- | Record the result of a 'SETUP_REPO' opcode invocation as an
+<span class="lineno">  235 </span>-- 'EKHarness' transcript entry + a conversation message. Unlike
+<span class="lineno">  236 </span>-- 'recordSkillLoadResult', this records BOTH success and failure (a
+<span class="lineno">  237 </span>-- failed clone is the case the operator most needs to see in the
+<span class="lineno">  238 </span>-- transcript — the error text tells them why the repo didn't appear).
+<span class="lineno">  239 </span>-- The conversation message carries the opcode's text result so the
+<span class="lineno">  240 </span>-- user sees the clone/no-op/conflict/failure message in the chat.
+<span class="lineno">  241 </span>recordSetupRepoResult :: TwoFileHandle -&gt; OpName -&gt; Value -&gt; OpResult -&gt; Maybe Text -&gt; IO ()
+<span class="lineno">  242 </span><span class="decl"><span class="istickedoff">recordSetupRepoResult h (OpName nm) input result mChannel = do</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">let channelMeta = case mChannel of</span>
+<span class="lineno">  245 </span><span class="spaces">        </span><span class="istickedoff">Just ch  -&gt; [(&quot;channel&quot;, A.String ch)]</span>
+<span class="lineno">  246 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">entry = EntryRecord</span>
+<span class="lineno">  248 </span><span class="spaces">        </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  249 </span><span class="spaces">        </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  250 </span><span class="spaces">        </span><span class="istickedoff">, erKind = EKHarness</span>
+<span class="lineno">  251 </span><span class="spaces">        </span><span class="istickedoff">, erConvLen = 0</span>
+<span class="lineno">  252 </span><span class="spaces">        </span><span class="istickedoff">, erEnvelope = Nothing</span>
+<span class="lineno">  253 </span><span class="spaces">        </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  254 </span><span class="spaces">        </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  256 </span><span class="spaces">        </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  257 </span><span class="spaces">        </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  258 </span><span class="spaces">        </span><span class="istickedoff">, erMeta = Map.fromList</span>
+<span class="lineno">  259 </span><span class="spaces">            </span><span class="istickedoff">([ (&quot;op&quot;, object [&quot;name&quot; .= OpName nm])</span>
+<span class="lineno">  260 </span><span class="spaces">             </span><span class="istickedoff">, (&quot;input&quot;, input)</span>
+<span class="lineno">  261 </span><span class="spaces">             </span><span class="istickedoff">, (&quot;result&quot;, orRecorded result)</span>
+<span class="lineno">  262 </span><span class="spaces">            </span><span class="istickedoff">] &lt;&gt; channelMeta)</span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">bodyText = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> [ t | TrpText t &lt;- orParts result ]</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">convMsgs = [ Message Assistant [CbText bodyText] | <span class="tickonlytrue">not (T.null bodyText)</span> ]</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">tfwRecordAndAck h (TwoFileWrite convMsgs entry)</span></span>
+<span class="lineno">  267 </span>
+<span class="lineno">  268 </span>-- | Record a 'ToolError' as an 'EKHarness' transcript entry carrying the
+<span class="lineno">  269 </span>-- error CLASS (secret-free — design Blocker Resolution #13: never the full
+<span class="lineno">  270 </span>-- 'ToolIOError' Text payload, which could contain paths/host info). The
+<span class="lineno">  271 </span>-- metadata includes the timeout value (seconds) and the error class string.
+<span class="lineno">  272 </span>-- Called by 'dispatch' when the timeout/abort/retry wrapper returns 'Left'.
+<span class="lineno">  273 </span>recordToolError :: TwoFileHandle -&gt; OpName -&gt; Value -&gt; ToolError -&gt; Int -&gt; IO ()
+<span class="lineno">  274 </span><span class="decl"><span class="istickedoff">recordToolError h name input toolErr timeoutMicros = do</span>
+<span class="lineno">  275 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  276 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">entry = EntryRecord</span></span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">{ erId = &quot;&quot;</span></span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erTimestamp = now</span></span>
+<span class="lineno">  279 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erKind = EKHarness</span></span>
+<span class="lineno">  280 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erConvLen = 0</span></span>
+<span class="lineno">  281 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erEnvelope = Nothing</span></span>
+<span class="lineno">  282 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erUsage = Nothing</span></span>
+<span class="lineno">  283 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erStop = Nothing</span></span>
+<span class="lineno">  284 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erDurationMs = Nothing</span></span>
+<span class="lineno">  285 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erHarness = Nothing</span></span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erCorrelation = Nothing</span></span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, erMeta = Map.fromList</span></span>
+<span class="lineno">  288 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ (&quot;op&quot;, object [&quot;name&quot; .= name])</span></span>
+<span class="lineno">  289 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, (&quot;input&quot;, input)</span></span>
+<span class="lineno">  290 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, (&quot;error&quot;, A.String (errorClass toolErr))</span></span>
+<span class="lineno">  291 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, (&quot;timeout_s&quot;, A.toJSON (timeoutMicros `div` 1_000_000))</span></span>
+<span class="lineno">  292 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="istickedoff">tfwRecordAndAck h (TwoFileWrite [] <span class="nottickedoff">entry</span>)</span></span>
+
+</pre>
+</body>
+</html>

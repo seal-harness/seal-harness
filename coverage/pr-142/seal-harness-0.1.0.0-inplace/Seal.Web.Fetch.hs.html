@@ -1,0 +1,188 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | WEB_FETCH (Untrusted): fetch a URL via @http-client@, bounded bytes,
+<span class="lineno">    3 </span>-- domain allow list, auth redaction, and SSRF defense (private/internal/
+<span class="lineno">    4 </span>-- metadata IPs blocked before the HTTP call). 'orRecorded' captures the
+<span class="lineno">    5 </span>-- URL + status + byte count (NOT the body — the body may be large; the
+<span class="lineno">    6 </span>-- transcript records metadata only).
+<span class="lineno">    7 </span>module Seal.Web.Fetch
+<span class="lineno">    8 </span>  ( webFetchOp
+<span class="lineno">    9 </span>  , WebFetchConfig (..)
+<span class="lineno">   10 </span>  ) where
+<span class="lineno">   11 </span>
+<span class="lineno">   12 </span>import Control.Exception (try)
+<span class="lineno">   13 </span>import Seal.Tools.Exec.UIO (uioLiftIO)
+<span class="lineno">   14 </span>import Data.Aeson (Value, object, withObject, (.:), (.=))
+<span class="lineno">   15 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   16 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   17 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   18 </span>import Data.Text (Text)
+<span class="lineno">   19 </span>import Data.Text qualified as T
+<span class="lineno">   20 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   21 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   22 </span>import Network.HTTP.Client
+<span class="lineno">   23 </span>  ( HttpException, Manager, httpLbs, parseRequest, responseBody
+<span class="lineno">   24 </span>  , responseStatus )
+<span class="lineno">   25 </span>import Network.HTTP.Types (statusCode)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   28 </span>import Seal.ISA.Opcode
+<span class="lineno">   29 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   30 </span>import Seal.Web.UrlSafety (isSafeUrl, renderUrlSafetyError)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>-- | The configuration for WEB_FETCH.
+<span class="lineno">   33 </span>data WebFetchConfig = WebFetchConfig
+<span class="lineno">   34 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">wfcManager</span></span></span>    :: Maybe Manager  -- ^ HTTP manager (Nothing = fail-closed)
+<span class="lineno">   35 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wfcAllowList</span></span></span>  :: [Text]         -- ^ allowed domains (empty = all allowed)
+<span class="lineno">   36 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wfcMaxBytes</span></span></span>   :: Int            -- ^ operator-configured byte ceiling
+<span class="lineno">   37 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">wfcAuthKey</span></span></span>    :: Maybe Text    -- ^ vault key reference (NOT inline auth)
+<span class="lineno">   38 </span>  }
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | WEB_FETCH opcode. Input: @{ url: Text }@. Fetches the URL via
+<span class="lineno">   41 </span>-- @http-client@, truncates the response body to 'wfcMaxBytes', and enforces
+<span class="lineno">   42 </span>-- the domain allow-list at the gate. 'orRecorded' carries the URL + status +
+<span class="lineno">   43 </span>-- byte count (secret-free metadata; the body is NOT recorded).
+<span class="lineno">   44 </span>webFetchOp :: WebFetchConfig -&gt; Opcode
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">webFetchOp cfg = UntrustedOpcode</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;WEB_FETCH&quot;</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Fetch a URL (bounded bytes, allow-listed, auth-redacted).&quot;</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = webFetchSchema</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   51 </span><span class="spaces">      </span><span class="istickedoff">case urlField v of</span>
+<span class="lineno">   52 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; Left &quot;WEB_FETCH requires {url:string}&quot;</span>
+<span class="lineno">   53 </span><span class="spaces">        </span><span class="istickedoff">Just u</span>
+<span class="lineno">   54 </span><span class="spaces">          </span><span class="istickedoff">| T.null u -&gt; Left &quot;WEB_FETCH: url is empty&quot;</span>
+<span class="lineno">   55 </span><span class="spaces">          </span><span class="istickedoff">| not (domainAllowed u (wfcAllowList cfg)) -&gt;</span>
+<span class="lineno">   56 </span><span class="spaces">              </span><span class="istickedoff">Left (&quot;WEB_FETCH: domain not in allow-list: &quot; &lt;&gt; hostOf u)</span>
+<span class="lineno">   57 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Right ()</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">   59 </span><span class="spaces">      </span><span class="istickedoff">let u = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (urlField v)</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="istickedoff">case wfcManager cfg of</span>
+<span class="lineno">   61 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult</span>
+<span class="lineno">   62 </span><span class="spaces">          </span><span class="istickedoff">[TrpText &quot;WEB_FETCH: no HTTP manager configured&quot;]</span>
+<span class="lineno">   63 </span><span class="spaces">          </span><span class="istickedoff">True (object [&quot;url&quot; .= u, &quot;status&quot; .= (0 :: Int), &quot;bytes&quot; .= (0 :: Int)]))</span>
+<span class="lineno">   64 </span><span class="spaces">        </span><span class="istickedoff">Just mgr -&gt; <span class="nottickedoff">uioLiftIO (doFetch mgr (wfcMaxBytes cfg) u)</span></span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- | Perform the HTTP fetch: SSRF check → parse the URL → execute the
+<span class="lineno">   68 </span>-- request → truncate the response body to the byte ceiling → return the
+<span class="lineno">   69 </span>-- decoded body + recorded metadata. Errors (SSRF, transport, non-2xx)
+<span class="lineno">   70 </span>-- surface as structured 'OpResult's with @isError=True@.
+<span class="lineno">   71 </span>doFetch :: Manager -&gt; Int -&gt; Text -&gt; IO OpResult
+<span class="lineno">   72 </span><span class="decl"><span class="nottickedoff">doFetch mgr maxBytes u = do</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="nottickedoff">-- SSRF defense: block private/internal/metadata IPs BEFORE the HTTP call.</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="nottickedoff">eSafe &lt;- isSafeUrl u</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="nottickedoff">case eSafe of</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; pure (OpResult</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="nottickedoff">[TrpText (&quot;WEB_FETCH: blocked by SSRF protection: &quot; &lt;&gt; renderUrlSafetyError err)]</span>
+<span class="lineno">   78 </span><span class="spaces">      </span><span class="nottickedoff">True recordedErr)</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="nottickedoff">Right () -&gt; doFetchHttp mgr maxBytes u</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="nottickedoff">recordedErr = object [&quot;url&quot; .= u, &quot;status&quot; .= (0 :: Int), &quot;bytes&quot; .= (0 :: Int)]</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | The HTTP fetch proper (SSRF check already passed).
+<span class="lineno">   84 </span>doFetchHttp :: Manager -&gt; Int -&gt; Text -&gt; IO OpResult
+<span class="lineno">   85 </span><span class="decl"><span class="nottickedoff">doFetchHttp mgr maxBytes u = do</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try (parseRequest (T.unpack u))</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="nottickedoff">pure (OpResult [TrpText (&quot;WEB_FETCH: invalid URL: &quot; &lt;&gt; u)] True recordedErr)</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="nottickedoff">Right req -&gt; do</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try (httpLbs req mgr)</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">   93 </span><span class="spaces">        </span><span class="nottickedoff">Left (_ :: HttpException) -&gt;</span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="nottickedoff">pure (OpResult [TrpText &quot;WEB_FETCH: HTTP request failed (connection or transport error)&quot;]</span>
+<span class="lineno">   95 </span><span class="spaces">                           </span><span class="nottickedoff">True recordedErr)</span>
+<span class="lineno">   96 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">   97 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">   98 </span><span class="spaces">              </span><span class="nottickedoff">body = responseBody resp</span>
+<span class="lineno">   99 </span><span class="spaces">              </span><span class="nottickedoff">truncated = truncateBytes body maxBytes</span>
+<span class="lineno">  100 </span><span class="spaces">              </span><span class="nottickedoff">bodyText = TE.decodeUtf8With TEE.lenientDecode (BL.toStrict truncated)</span>
+<span class="lineno">  101 </span><span class="spaces">              </span><span class="nottickedoff">byteCount = BL.length truncated</span>
+<span class="lineno">  102 </span><span class="spaces">              </span><span class="nottickedoff">recorded = object</span>
+<span class="lineno">  103 </span><span class="spaces">                </span><span class="nottickedoff">[ &quot;url&quot; .= u</span>
+<span class="lineno">  104 </span><span class="spaces">                </span><span class="nottickedoff">, &quot;status&quot; .= code</span>
+<span class="lineno">  105 </span><span class="spaces">                </span><span class="nottickedoff">, &quot;bytes&quot; .= byteCount</span>
+<span class="lineno">  106 </span><span class="spaces">                </span><span class="nottickedoff">]</span>
+<span class="lineno">  107 </span><span class="spaces">          </span><span class="nottickedoff">if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  108 </span><span class="spaces">            </span><span class="nottickedoff">then pure (OpResult [TrpText bodyText] False recorded)</span>
+<span class="lineno">  109 </span><span class="spaces">            </span><span class="nottickedoff">else pure (OpResult</span>
+<span class="lineno">  110 </span><span class="spaces">              </span><span class="nottickedoff">[TrpText (&quot;WEB_FETCH: HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; bodyText)]</span>
+<span class="lineno">  111 </span><span class="spaces">              </span><span class="nottickedoff">True recorded)</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="nottickedoff">recordedErr = object [&quot;url&quot; .= u, &quot;status&quot; .= (0 :: Int), &quot;bytes&quot; .= (0 :: Int)]</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | Truncate a lazy 'ByteString' to at most @n@ bytes.
+<span class="lineno">  116 </span>truncateBytes :: BL.ByteString -&gt; Int -&gt; BL.ByteString
+<span class="lineno">  117 </span><span class="decl"><span class="nottickedoff">truncateBytes bs n</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="nottickedoff">| n &lt;= 0    = BL.empty</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise = BL.take (fromIntegral n) bs</span></span>
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>-- | Check whether the URL's host is in the allow-list. An empty allow-list
+<span class="lineno">  122 </span>-- means all domains are permitted.
+<span class="lineno">  123 </span>domainAllowed :: Text -&gt; [Text] -&gt; Bool
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">domainAllowed _ [] = True</span>
+<span class="lineno">  125 </span><span class="spaces"></span><span class="istickedoff">domainAllowed url allowList =</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">case hostOfMaybe url of</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">Nothing  -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">Just host -&gt; any (`T.isSuffixOf` host) allowList</span></span>
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>-- | Extract the host from a URL (the authority component). Returns the
+<span class="lineno">  131 </span>-- empty string when the URL has no parseable host.
+<span class="lineno">  132 </span>hostOf :: Text -&gt; Text
+<span class="lineno">  133 </span><span class="decl"><span class="istickedoff">hostOf url = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (hostOfMaybe url)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Extract the host from a URL, returning 'Nothing' when absent.
+<span class="lineno">  136 </span>-- Handles @scheme://host/path@ and @scheme://host:port/path@.
+<span class="lineno">  137 </span>hostOfMaybe :: Text -&gt; Maybe Text
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">hostOfMaybe url =</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;://&quot; url of</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">(_, after) | <span class="tickonlyfalse">T.null after</span> -&gt; <span class="nottickedoff">Nothing</span>  -- no scheme separator</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">(_, after) -&gt;</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">let noScheme = T.drop 3 after  -- drop the &quot;://&quot; (3 chars)</span>
+<span class="lineno">  143 </span><span class="spaces">          </span><span class="istickedoff">authority = T.takeWhile (\c -&gt; c /= '/' &amp;&amp; c /= '?' &amp;&amp; c /= '#') noScheme</span>
+<span class="lineno">  144 </span><span class="spaces">          </span><span class="istickedoff">host = T.takeWhile (/= ':') authority  -- strip port</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null host</span> then <span class="nottickedoff">Nothing</span> else Just host</span></span>
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>webFetchSchema :: Value
+<span class="lineno">  148 </span><span class="decl"><span class="istickedoff">webFetchSchema =</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;url&quot; .= object</span>
+<span class="lineno">  153 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  154 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The URL to fetch.&quot; :: Text)</span>
+<span class="lineno">  155 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">, &quot;timeout&quot; .= object</span>
+<span class="lineno">  157 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  158 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Per-call timeout in seconds; if the fetch doesn't finish in this time, it's killed. Default 120, max 600.&quot; :: Text)</span>
+<span class="lineno">  159 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;url&quot;] :: [Text])</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>urlField :: Value -&gt; Maybe Text
+<span class="lineno">  165 </span><span class="decl"><span class="istickedoff">urlField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;url&quot;))</span></span>
+
+</pre>
+</body>
+</html>

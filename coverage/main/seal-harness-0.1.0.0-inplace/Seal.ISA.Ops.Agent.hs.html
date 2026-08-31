@@ -1,0 +1,709 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Agent opcode group: three Audited definition opcodes
+<span class="lineno">    3 </span>-- (@AGENT_DEF_WRITE@, @AGENT_DEF_READ@, @AGENT_DEF_LIST@, @AGENT_DEF_DELETE@)
+<span class="lineno">    4 </span>-- and four Trusted lifecycle opcodes (@AGENT_INSTANCES@, @AGENT_START@,
+<span class="lineno">    5 </span>-- @AGENT_STATUS@, @AGENT_STOP@, @AGENT_INTERRUPT@). Only the *definition*
+<span class="lineno">    6 </span>-- mutations are Audited — running an instance is harness-internal, not an
+<span class="lineno">    7 </span>-- evolutionary mutation, so the lifecycle ops are Trusted.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- @AGENT_DEF_WRITE@ is an upsert: if the def already exists, its name/system/
+<span class="lineno">   10 </span>-- tools are updated (the original 'adSession' provenance and 'adCreatedAt' are
+<span class="lineno">   11 </span>-- preserved; only 'adUpdatedAt' is bumped); if not, a fresh def is created.
+<span class="lineno">   12 </span>-- This merges the former AGENT_DEF_CREATE + AGENT_DEF_UPDATE into a single
+<span class="lineno">   13 </span>-- opcode. @orRecorded@ carries a @was_new@ flag so the audit log still
+<span class="lineno">   14 </span>-- distinguishes create vs update.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- @AGENT_INSTANCES@ (renamed from @AGENT_LIST@) snapshots the in-process agent
+<span class="lineno">   17 </span>-- runtime (running instances), NOT the definitions. @AGENT_DEF_LIST@ lists the
+<span class="lineno">   18 </span>-- definitions. The rename stops the confusion between &quot;list definitions&quot; and
+<span class="lineno">   19 </span>-- &quot;list running instances&quot;.
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- @AGENT_START@ is the Seal analog of Hermes' @delegate_task@: it spawns one
+<span class="lineno">   22 </span>-- or more child agents with isolated context, runs each against a goal to
+<span class="lineno">   23 </span>-- completion (synchronously), and returns a structured JSON result per child.
+<span class="lineno">   24 </span>-- The parent blocks until all children finish (or time out). See
+<span class="lineno">   25 </span>-- 'Seal.Agent.Runtime.Delegation' for the full feature list. The opcode is a
+<span class="lineno">   26 </span>-- thin shim over 'runDelegate' — it normalizes the model's input, resolves the
+<span class="lineno">   27 </span>-- def, delegates the worker construction to the wiring layer's
+<span class="lineno">   28 </span>-- 'AgentWorkerBuilder', and serializes the 'ChildResult' list to JSON.
+<span class="lineno">   29 </span>module Seal.ISA.Ops.Agent
+<span class="lineno">   30 </span>  ( agentDefWriteOp
+<span class="lineno">   31 </span>  , agentDefReadOp
+<span class="lineno">   32 </span>  , agentDefListOp
+<span class="lineno">   33 </span>  , agentDefDeleteOp
+<span class="lineno">   34 </span>  , agentInstancesOp
+<span class="lineno">   35 </span>  , agentStartOp
+<span class="lineno">   36 </span>  , agentStatusOp
+<span class="lineno">   37 </span>  , agentStopOp
+<span class="lineno">   38 </span>  , agentInterruptOp
+<span class="lineno">   39 </span>  , AgentWorkerBuilder
+<span class="lineno">   40 </span>  , AgentStartWiring (..)
+<span class="lineno">   41 </span>  ) where
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   44 </span>import Control.Monad (zipWithM_)
+<span class="lineno">   45 </span>import Data.Aeson
+<span class="lineno">   46 </span>  ( Value (..), object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   47 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   48 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   49 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   50 </span>import Data.Set qualified as Set
+<span class="lineno">   51 </span>import Data.Text (Text)
+<span class="lineno">   52 </span>import Data.Text qualified as T
+<span class="lineno">   53 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   54 </span>import Data.Vector qualified as V
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>import Seal.Agent.Def.Backend (AgentDefBackend (..))
+<span class="lineno">   57 </span>import Seal.Agent.Def.Types
+<span class="lineno">   58 </span>  ( AgentDef (..), mkAgentDefId, agentDefIdText )
+<span class="lineno">   59 </span>import Seal.Agent.Runtime.Delegation
+<span class="lineno">   60 </span>  ( AgentWorkerBuilder
+<span class="lineno">   61 </span>  , ChildResult (..)
+<span class="lineno">   62 </span>  , ChildTask (..)
+<span class="lineno">   63 </span>  , DelegationConfig
+<span class="lineno">   64 </span>  , DelegateInput (..)
+<span class="lineno">   65 </span>  , SpawnPauseFlag
+<span class="lineno">   66 </span>  , ParentActivity
+<span class="lineno">   67 </span>  , SubagentId (..)
+<span class="lineno">   68 </span>  , runDelegate
+<span class="lineno">   69 </span>  , subagentIdText
+<span class="lineno">   70 </span>  )
+<span class="lineno">   71 </span>import Seal.Agent.Runtime.Registry
+<span class="lineno">   72 </span>  ( AgentInstance (..), AgentRuntime, AgentStatus (..), agentStatus
+<span class="lineno">   73 </span>  , interruptAgent, listAgents, registerCompletedAgent, stopAgent )
+<span class="lineno">   74 </span>import Seal.Core.Types (ModelId (..), OpName (..), SessionId, TrustLevel (..))
+<span class="lineno">   75 </span>import Seal.ISA.Opcode
+<span class="lineno">   76 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   77 </span>import Seal.Security.Policy (AllowList (..))
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   80 </span>-- Worker-builder type
+<span class="lineno">   81 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- (The 'AgentWorkerBuilder' type is re-exported from
+<span class="lineno">   84 </span>-- 'Seal.Agent.Runtime.Delegation'; the wiring layer imports it from here for
+<span class="lineno">   85 </span>-- convenience.)
+<span class="lineno">   86 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   87 </span>-- Helpers
+<span class="lineno">   88 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | Extract the @id@ string field from a JSON object.
+<span class="lineno">   91 </span>idField :: Value -&gt; Maybe Text
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">idField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;id&quot;))</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Extract a required text field (defaults to empty when absent).
+<span class="lineno">   95 </span>textField :: Text -&gt; Value -&gt; Text
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">textField name v = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: fromText name)) v)</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | Extract an optional text field (defaults to 'Nothing' when absent).
+<span class="lineno">   99 </span>textFieldMaybe :: Text -&gt; Value -&gt; Maybe Text
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">textFieldMaybe name v =</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText name)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">Just (Just t) -&gt; Just t</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; Nothing</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | Decode the @tools@ field: @\&quot;all\&quot;@ (or absent) -&gt; 'AllowAll'; an array of
+<span class="lineno">  106 </span>-- opcode-name strings -&gt; 'AllowOnly'. Malformed -&gt; 'AllowAll' (permissive).
+<span class="lineno">  107 </span>toolsField :: Value -&gt; AllowList OpName
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">toolsField v =</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;tools&quot;)) v :: Maybe (Maybe Value) of</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">Just (Just (String &quot;all&quot;)) -&gt; <span class="nottickedoff">AllowAll</span></span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">Just (Just (Array xs))     -&gt; <span class="nottickedoff">AllowOnly (Set.fromList [ OpName t | String t &lt;- V.toList xs ])</span></span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">_                          -&gt; AllowAll</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Resolve the @group@ field from the opcode input, preserving the existing
+<span class="lineno">  115 </span>-- def's group when the input omits it (mirrors the gateway @stampAgentDef@
+<span class="lineno">  116 </span>-- and the skill @stampSkill@ back-compat policy). An explicit empty string
+<span class="lineno">  117 </span>-- clears the group (sets 'Nothing'); a non-empty stripped value sets it.
+<span class="lineno">  118 </span>groupField :: Value -&gt; Maybe AgentDef -&gt; Maybe Text
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">groupField v mExisting =</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">case textFieldMaybe &quot;group&quot; v of</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">Just g  -&gt; let g' = T.strip g in if <span class="tickonlyfalse">T.null g'</span> then <span class="nottickedoff">Nothing</span> else Just g'</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; adGroup =&lt;&lt; mExisting</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  125 </span>-- AGENT_DEF_WRITE
+<span class="lineno">  126 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | AGENT_DEF_WRITE: upsert an agent definition by id. If the def already
+<span class="lineno">  129 </span>-- exists, its name/system/tools are updated (the original 'adSession'
+<span class="lineno">  130 </span>-- provenance and 'adCreatedAt' are preserved; only 'adUpdatedAt' is bumped);
+<span class="lineno">  131 </span>-- if not, a fresh def is created. The name, provider, model, system prompt,
+<span class="lineno">  132 </span>-- and tool list are recorded in full (agent-visible data); 'orRecorded'
+<span class="lineno">  133 </span>-- carries the id + op name + fields + @was_new@.
+<span class="lineno">  134 </span>agentDefWriteOp :: AgentDefBackend -&gt; SessionId -&gt; Opcode
+<span class="lineno">  135 </span><span class="decl"><span class="istickedoff">agentDefWriteOp backend session = TrustedOpcode</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_DEF_WRITE&quot;</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Create or update an agent definition by id (upsert; preserves provenance on update).&quot;</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  142 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;id&quot; .= object</span>
+<span class="lineno">  143 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  144 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Agent def id ([A-Za-z0-9_-]+).&quot; :: Text)</span>
+<span class="lineno">  145 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  146 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;name&quot; .= object</span>
+<span class="lineno">  147 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  148 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Human-readable agent name.&quot; :: Text)</span>
+<span class="lineno">  149 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  150 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;provider&quot; .= object</span>
+<span class="lineno">  151 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  152 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Provider label, e.g. \&quot;ollama\&quot;.&quot; :: Text)</span>
+<span class="lineno">  153 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  154 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;model&quot; .= object</span>
+<span class="lineno">  155 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  156 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Model id, e.g. \&quot;llama3\&quot;.&quot; :: Text)</span>
+<span class="lineno">  157 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;system&quot; .= object</span>
+<span class="lineno">  159 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  160 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional system prompt.&quot; :: Text)</span>
+<span class="lineno">  161 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  162 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;tools&quot; .= object</span>
+<span class="lineno">  163 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span>
+<span class="lineno">  164 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Allowed opcode names, or \&quot;all\&quot;.&quot; :: Text)</span>
+<span class="lineno">  165 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  166 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;group&quot; .= object</span>
+<span class="lineno">  167 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  168 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional display group (e.g. \&quot;core\&quot;). Omit for the default (ungrouped) section.&quot; :: Text)</span>
+<span class="lineno">  169 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  170 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;id&quot;, &quot;name&quot;, &quot;provider&quot;, &quot;model&quot;] :: [Text])</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_DEF_WRITE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either (const Nothing) Just . mkAgentDefId</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;invalid agent def id&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff">Just aid -&gt; do</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (adbRead backend aid)</span>
+<span class="lineno">  182 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  183 </span><span class="spaces">          </span><span class="istickedoff">let (def, wasNew) = case mExisting of</span>
+<span class="lineno">  184 </span><span class="spaces">                </span><span class="istickedoff">Just existing -&gt;</span>
+<span class="lineno">  185 </span><span class="spaces">                  </span><span class="istickedoff">( existing</span>
+<span class="lineno">  186 </span><span class="spaces">                      </span><span class="istickedoff">{ adName = textField &quot;name&quot; v</span>
+<span class="lineno">  187 </span><span class="spaces">                      </span><span class="istickedoff">, adSystem = textFieldMaybe &quot;system&quot; v</span>
+<span class="lineno">  188 </span><span class="spaces">                      </span><span class="istickedoff">, adTools = toolsField v</span>
+<span class="lineno">  189 </span><span class="spaces">                      </span><span class="istickedoff">, adGroup = groupField v (Just existing)</span>
+<span class="lineno">  190 </span><span class="spaces">                      </span><span class="istickedoff">, adUpdatedAt = now</span>
+<span class="lineno">  191 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  192 </span><span class="spaces">                  </span><span class="istickedoff">, False</span>
+<span class="lineno">  193 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  194 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  195 </span><span class="spaces">                  </span><span class="istickedoff">( AgentDef</span>
+<span class="lineno">  196 </span><span class="spaces">                      </span><span class="istickedoff">{ adId = aid</span>
+<span class="lineno">  197 </span><span class="spaces">                      </span><span class="istickedoff">, adName = textField &quot;name&quot; v</span>
+<span class="lineno">  198 </span><span class="spaces">                      </span><span class="istickedoff">, adProvider = textField &quot;provider&quot; v</span>
+<span class="lineno">  199 </span><span class="spaces">                      </span><span class="istickedoff">, adModel = ModelId (textField &quot;model&quot; v)</span>
+<span class="lineno">  200 </span><span class="spaces">                      </span><span class="istickedoff">, adSystem = textFieldMaybe &quot;system&quot; v</span>
+<span class="lineno">  201 </span><span class="spaces">                      </span><span class="istickedoff">, adTools = toolsField v</span>
+<span class="lineno">  202 </span><span class="spaces">                      </span><span class="istickedoff">, adGroup = groupField v Nothing</span>
+<span class="lineno">  203 </span><span class="spaces">                      </span><span class="istickedoff">, adCreatedAt = now</span>
+<span class="lineno">  204 </span><span class="spaces">                      </span><span class="istickedoff">, adUpdatedAt = now</span>
+<span class="lineno">  205 </span><span class="spaces">                      </span><span class="istickedoff">, adSession = session</span>
+<span class="lineno">  206 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  207 </span><span class="spaces">                  </span><span class="istickedoff">, True</span>
+<span class="lineno">  208 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="istickedoff">liftIO (adbUpdate backend def)</span>
+<span class="lineno">  210 </span><span class="spaces">          </span><span class="istickedoff">let recorded = encodeDefRecorded def wasNew</span>
+<span class="lineno">  211 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText (if wasNew then &quot;defined&quot; else &quot;updated&quot;)] False recorded)</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid agent def id: &quot; &lt;&gt;))</span> (const (Right ())) (mkAgentDefId t)</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  217 </span>-- AGENT_DEF_READ
+<span class="lineno">  218 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  219 </span>
+<span class="lineno">  220 </span>agentDefReadOp :: AgentDefBackend -&gt; Opcode
+<span class="lineno">  221 </span><span class="decl"><span class="istickedoff">agentDefReadOp backend = TrustedOpcode</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_DEF_READ&quot;</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Read one agent definition by id.&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;id&quot; &quot;The agent def id to read.&quot;</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_DEF_READ requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  230 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkAgentDefId</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  232 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid agent def id&quot;] True (object []))</span></span>
+<span class="lineno">  233 </span><span class="spaces">        </span><span class="istickedoff">Just aid -&gt; do</span>
+<span class="lineno">  234 </span><span class="spaces">          </span><span class="istickedoff">mDef &lt;- liftIO (adbRead backend aid)</span>
+<span class="lineno">  235 </span><span class="spaces">          </span><span class="istickedoff">case mDef of</span>
+<span class="lineno">  236 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure (OpResult [TrpText &quot;agent def not found&quot;] True <span class="nottickedoff">(object [&quot;id&quot; .= agentDefIdText aid])</span>)</span>
+<span class="lineno">  237 </span><span class="spaces">            </span><span class="istickedoff">Just d  -&gt; do</span>
+<span class="lineno">  238 </span><span class="spaces">              </span><span class="istickedoff">let rendered = renderDef d</span>
+<span class="lineno">  239 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">recorded = encodeDefRecorded d False</span></span>
+<span class="lineno">  240 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid agent def id: &quot; &lt;&gt;))</span> (const (Right ())) (mkAgentDefId t)</span></span>
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  246 </span>-- AGENT_DEF_LIST
+<span class="lineno">  247 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  248 </span>
+<span class="lineno">  249 </span>agentDefListOp :: AgentDefBackend -&gt; Opcode
+<span class="lineno">  250 </span><span class="decl"><span class="istickedoff">agentDefListOp backend = TrustedOpcode</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_DEF_LIST&quot;</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;List all agent definitions (id + name + provider/model).&quot;</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object []</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">  260 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ _ -&gt; do</span>
+<span class="lineno">  262 </span><span class="spaces">      </span><span class="istickedoff">defs &lt;- liftIO (adbList backend)</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">let rendered = case defs of</span>
+<span class="lineno">  264 </span><span class="spaces">            </span><span class="istickedoff">[] -&gt; &quot;(no agent definitions)&quot;</span>
+<span class="lineno">  265 </span><span class="spaces">            </span><span class="istickedoff">_  -&gt; T.intercalate <span class="nottickedoff">&quot;\n&quot;</span></span>
+<span class="lineno">  266 </span><span class="spaces">                    </span><span class="istickedoff">[ agentDefIdText (adId d) &lt;&gt; &quot;: &quot; &lt;&gt; adName d</span>
+<span class="lineno">  267 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot; (&quot; &lt;&gt; adProvider d &lt;&gt; &quot;/&quot; &lt;&gt; modelName &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  268 </span><span class="spaces">                    </span><span class="istickedoff">| d &lt;- defs, let ModelId modelName = adModel d ]</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  270 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;count&quot; .= length defs</span></span>
+<span class="lineno">  271 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;ids&quot; .= fmap (agentDefIdText . adId) defs</span></span>
+<span class="lineno">  272 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  274 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  275 </span>
+<span class="lineno">  276 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  277 </span>-- AGENT_DEF_DELETE
+<span class="lineno">  278 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  279 </span>
+<span class="lineno">  280 </span>agentDefDeleteOp :: AgentDefBackend -&gt; Opcode
+<span class="lineno">  281 </span><span class="decl"><span class="istickedoff">agentDefDeleteOp backend = TrustedOpcode</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_DEF_DELETE&quot;</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Delete an agent definition by id (idempotent).&quot;</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;id&quot; &quot;The agent def id to delete.&quot;</span>
+<span class="lineno">  286 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_DEF_DELETE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  288 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  289 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  290 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkAgentDefId</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid agent def id&quot;] True (object []))</span></span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff">Just aid -&gt; do</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (adbRead backend aid)</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">liftIO (adbDelete backend aid)</span>
+<span class="lineno">  296 </span><span class="spaces">          </span><span class="istickedoff">let msg = case mExisting of</span>
+<span class="lineno">  297 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; &quot;deleted (was not present)&quot;</span>
+<span class="lineno">  298 </span><span class="spaces">                </span><span class="istickedoff">Just _  -&gt; &quot;deleted&quot;</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">recorded = object [&quot;id&quot; .= agentDefIdText aid]</span></span>
+<span class="lineno">  300 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText msg] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid agent def id: &quot; &lt;&gt;))</span> (const (Right ())) (mkAgentDefId t)</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  306 </span>-- AGENT_INSTANCES
+<span class="lineno">  307 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  308 </span>
+<span class="lineno">  309 </span>-- | AGENT_INSTANCES: snapshot the in-process agent runtime (running
+<span class="lineno">  310 </span>-- instances). Trusted — listing running instances is harness-internal, not an
+<span class="lineno">  311 </span>-- evolutionary mutation.
+<span class="lineno">  312 </span>agentInstancesOp :: AgentRuntime -&gt; Opcode
+<span class="lineno">  313 </span><span class="decl"><span class="istickedoff">agentInstancesOp runtime = TrustedOpcode</span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_INSTANCES&quot;</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  316 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;List running agent instances (subagent_id + def id + status).&quot;</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object []</span>
+<span class="lineno">  320 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  321 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">  323 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ _ -&gt; do</span>
+<span class="lineno">  325 </span><span class="spaces">      </span><span class="istickedoff">insts &lt;- liftIO (listAgents runtime)</span>
+<span class="lineno">  326 </span><span class="spaces">      </span><span class="istickedoff">let rendered = case insts of</span>
+<span class="lineno">  327 </span><span class="spaces">            </span><span class="istickedoff">[] -&gt; &quot;(no agents running)&quot;</span>
+<span class="lineno">  328 </span><span class="spaces">            </span><span class="istickedoff">_  -&gt; T.intercalate <span class="nottickedoff">&quot;\n&quot;</span></span>
+<span class="lineno">  329 </span><span class="spaces">                    </span><span class="istickedoff">[ subagentIdText (aiSubagentId i) &lt;&gt; &quot;: &quot; &lt;&gt; agentDefIdText (aiId i) &lt;&gt; &quot; — &quot; &lt;&gt; renderStatus (aiStatus i)</span>
+<span class="lineno">  330 </span><span class="spaces">                    </span><span class="istickedoff">| i &lt;- insts ]</span>
+<span class="lineno">  331 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  332 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;count&quot; .= length insts</span></span>
+<span class="lineno">  333 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;ids&quot; .= fmap (subagentIdText . aiSubagentId) insts</span></span>
+<span class="lineno">  334 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  335 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  336 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  337 </span>
+<span class="lineno">  338 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  339 </span>-- AGENT_START (synchronous goal-driven delegation)
+<span class="lineno">  340 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>-- | The wiring-layer bundle the AGENT_START opcode closes over. The
+<span class="lineno">  343 </span>-- 'AgentWorkerBuilder' resolves the def's provider+model, opens a fresh
+<span class="lineno">  344 </span>-- two-file transcript under @\&lt;parent-session\&gt;\/agents\/\&lt;child-id\&gt;@, builds
+<span class="lineno">  345 </span>-- a fresh 'AgentEnv' bound to the new session + child transcript, runs the
+<span class="lineno">  346 </span>-- turn with the goal as the first user message, and reports the outcome via
+<span class="lineno">  347 </span>-- 'ChildWorkerOutcome'. The 'DelegationConfig' / 'SpawnPauseFlag' /
+<span class="lineno">  348 </span>-- 'ParentActivity' are process-global (or per-channel) and threaded in
+<span class="lineno">  349 </span>-- here so the opcode doesn't read config.
+<span class="lineno">  350 </span>data AgentStartWiring = AgentStartWiring
+<span class="lineno">  351 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">aswDefBackend</span></span></span>   :: AgentDefBackend
+<span class="lineno">  352 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswRuntime</span></span></span>      :: AgentRuntime
+<span class="lineno">  353 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswConfig</span></span></span>       :: IO DelegationConfig
+<span class="lineno">  354 </span>    -- ^ Re-read the [delegation] config per AGENT_START call (so config
+<span class="lineno">  355 </span>    -- changes take effect without a restart). The IO action reads
+<span class="lineno">  356 </span>    -- @config.toml@ and returns the resolved 'DelegationConfig'.
+<span class="lineno">  357 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswPauseFlag</span></span></span>    :: SpawnPauseFlag
+<span class="lineno">  358 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswParentActivity</span></span></span> :: Maybe ParentActivity
+<span class="lineno">  359 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswMintSession</span></span></span>  :: IO SessionId
+<span class="lineno">  360 </span>    -- ^ Mint a fresh 'SessionId' for a child.
+<span class="lineno">  361 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswParentDepth</span></span></span>  :: Int
+<span class="lineno">  362 </span>    -- ^ The parent's delegation depth (0 for a top-level turn).
+<span class="lineno">  363 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aswWorker</span></span></span>       :: AgentWorkerBuilder
+<span class="lineno">  364 </span>    -- ^ The worker-builder (closes over per-turn 'AgentEnv' deps).
+<span class="lineno">  365 </span>  }
+<span class="lineno">  366 </span>
+<span class="lineno">  367 </span>-- | AGENT_START: spawn one or more child agents, run each against a goal to
+<span class="lineno">  368 </span>-- completion, return a JSON result per child. Input is either
+<span class="lineno">  369 </span>-- @{id, goal, context?, role?}@ (single mode) or @{tasks: [{id, goal, context?, role?}, ...]}@
+<span class="lineno">  370 </span>-- (batch mode). Returns JSON with a @results@ array, one entry per task.
+<span class="lineno">  371 </span>agentStartOp :: AgentStartWiring -&gt; Opcode
+<span class="lineno">  372 </span><span class="decl"><span class="istickedoff">agentStartOp wiring = TrustedOpcode</span>
+<span class="lineno">  373 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_START&quot;</span>
+<span class="lineno">  374 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  375 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Spawn one or more child agents, run each against a goal to completion, return a JSON result per child. Single mode: {id, goal, context?, role?}. Batch mode: {tasks: [{id, goal, context?, role?}, ...]}.&quot;</span>
+<span class="lineno">  376 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  377 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  378 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  379 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;id&quot; .= object</span>
+<span class="lineno">  380 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  381 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Agent def id (single-task mode).&quot; :: Text)</span>
+<span class="lineno">  382 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  383 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;goal&quot; .= object</span>
+<span class="lineno">  384 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  385 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The task goal — becomes the child's first user message (single-task mode).&quot; :: Text)</span>
+<span class="lineno">  386 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  387 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;context&quot; .= object</span>
+<span class="lineno">  388 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  389 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional background context appended to the child's system prompt.&quot; :: Text)</span>
+<span class="lineno">  390 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  391 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;role&quot; .= object</span>
+<span class="lineno">  392 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  393 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;\&quot;leaf\&quot; (default) or \&quot;orchestrator\&quot;. Orchestrators may spawn their own subagents, bounded by max_spawn_depth.&quot; :: Text)</span>
+<span class="lineno">  394 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  395 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;tasks&quot; .= object</span>
+<span class="lineno">  396 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span>
+<span class="lineno">  397 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Batch mode: array of {id, goal, context?, role?}. Cap on parallelism is delegation.max_concurrent_children.&quot; :: Text)</span>
+<span class="lineno">  398 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  399 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;goal&quot;] :: [Text])</span>
+<span class="lineno">  401 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = \v -&gt;</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">-- Require either a top-level goal (single) or a tasks array (batch).</span>
+<span class="lineno">  405 </span><span class="spaces">      </span><span class="istickedoff">let hasGoal = case textFieldMaybe &quot;goal&quot; v of { Just _ -&gt; True; Nothing -&gt; False }</span>
+<span class="lineno">  406 </span><span class="spaces">          </span><span class="istickedoff">hasTasks = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;tasks&quot;)) v :: Maybe (Maybe Value) of { Just (Just _) -&gt; <span class="nottickedoff">True</span>; _ -&gt; False }</span>
+<span class="lineno">  407 </span><span class="spaces">      </span><span class="istickedoff">in if hasGoal || hasTasks</span>
+<span class="lineno">  408 </span><span class="spaces">           </span><span class="istickedoff">then Right ()</span>
+<span class="lineno">  409 </span><span class="spaces">           </span><span class="istickedoff">else Left &quot;AGENT_START requires {goal:string} (single) or {tasks:array} (batch).&quot;</span>
+<span class="lineno">  410 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  411 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  412 </span><span class="spaces">      </span><span class="istickedoff">input &lt;- liftIO (parseInput v)</span>
+<span class="lineno">  413 </span><span class="spaces">      </span><span class="istickedoff">case input of</span>
+<span class="lineno">  414 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; pure (OpResult <span class="nottickedoff">[TrpText err]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  415 </span><span class="spaces">        </span><span class="istickedoff">Right di -&gt; do</span>
+<span class="lineno">  416 </span><span class="spaces">          </span><span class="istickedoff">cfg &lt;- liftIO (aswConfig wiring)</span>
+<span class="lineno">  417 </span><span class="spaces">          </span><span class="istickedoff">eResults &lt;- liftIO (runDelegate</span>
+<span class="lineno">  418 </span><span class="spaces">                                </span><span class="istickedoff">cfg</span>
+<span class="lineno">  419 </span><span class="spaces">                                </span><span class="istickedoff">(aswPauseFlag wiring)</span>
+<span class="lineno">  420 </span><span class="spaces">                                </span><span class="istickedoff">(aswParentActivity wiring)</span>
+<span class="lineno">  421 </span><span class="spaces">                                </span><span class="istickedoff">(aswParentDepth wiring)</span>
+<span class="lineno">  422 </span><span class="spaces">                                </span><span class="istickedoff">di</span>
+<span class="lineno">  423 </span><span class="spaces">                                </span><span class="istickedoff">(resolveTask (aswDefBackend wiring)</span>
+<span class="lineno">  424 </span><span class="spaces">                                             </span><span class="istickedoff"><span class="nottickedoff">(aswRuntime wiring)</span></span>
+<span class="lineno">  425 </span><span class="spaces">                                             </span><span class="istickedoff">(aswMintSession wiring)</span>
+<span class="lineno">  426 </span><span class="spaces">                                             </span><span class="istickedoff"><span class="nottickedoff">(aswParentDepth wiring)</span></span>
+<span class="lineno">  427 </span><span class="spaces">                                             </span><span class="istickedoff">(aswWorker wiring)))</span>
+<span class="lineno">  428 </span><span class="spaces">          </span><span class="istickedoff">case eResults of</span>
+<span class="lineno">  429 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; pure (OpResult <span class="nottickedoff">[TrpText err]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  430 </span><span class="spaces">            </span><span class="istickedoff">Right results -&gt; do</span>
+<span class="lineno">  431 </span><span class="spaces">              </span><span class="istickedoff">-- Register each finished child in the runtime registry so</span>
+<span class="lineno">  432 </span><span class="spaces">              </span><span class="istickedoff">-- AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe</span>
+<span class="lineno">  433 </span><span class="spaces">              </span><span class="istickedoff">-- it after the synchronous run completes. The child is</span>
+<span class="lineno">  434 </span><span class="spaces">              </span><span class="istickedoff">-- recorded with status Stopped (the synchronous worker has</span>
+<span class="lineno">  435 </span><span class="spaces">              </span><span class="istickedoff">-- already finished by the time we reach here). Zipped with</span>
+<span class="lineno">  436 </span><span class="spaces">              </span><span class="istickedoff">-- the input tasks to recover the AgentDefId (the ChildResult</span>
+<span class="lineno">  437 </span><span class="spaces">              </span><span class="istickedoff">-- carries the SubagentId but not the def id).</span>
+<span class="lineno">  438 </span><span class="spaces">              </span><span class="istickedoff">let tasks = diTasks di</span>
+<span class="lineno">  439 </span><span class="spaces">              </span><span class="istickedoff">zipWithM_ (\t r -&gt; liftIO (registerChild (aswRuntime wiring) t r)) tasks results</span>
+<span class="lineno">  440 </span><span class="spaces">              </span><span class="istickedoff">let rendered = encodeResultsJson results</span>
+<span class="lineno">  441 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">(object [&quot;results&quot; .= results])</span>)</span>
+<span class="lineno">  442 </span><span class="spaces">   </span><span class="istickedoff">}</span></span>
+<span class="lineno">  443 </span>
+<span class="lineno">  444 </span>-- | Parse the model's input into a 'DelegateInput'. Single mode requires
+<span class="lineno">  445 </span>-- @id@ + @goal@; batch mode requires a @tasks@ array of @{id, goal, ...}@.
+<span class="lineno">  446 </span>parseInput :: Value -&gt; IO (Either Text DelegateInput)
+<span class="lineno">  447 </span><span class="decl"><span class="istickedoff">parseInput v =</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;tasks&quot;)) v :: Maybe (Maybe Value) of</span>
+<span class="lineno">  449 </span><span class="spaces">    </span><span class="istickedoff">Just (Just (Array arr)) | <span class="tickonlytrue">not (V.null arr)</span> -&gt; do</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">tasks &lt;- mapM parseTask (V.toList arr)</span>
+<span class="lineno">  451 </span><span class="spaces">      </span><span class="istickedoff">case sequence tasks of</span>
+<span class="lineno">  452 </span><span class="spaces">        </span><span class="istickedoff">Left err     -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  453 </span><span class="spaces">        </span><span class="istickedoff">Right tsList -&gt; pure (Right (DiBatch tsList))</span>
+<span class="lineno">  454 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  455 </span><span class="spaces">      </span><span class="istickedoff">let mDefId = idField v</span>
+<span class="lineno">  456 </span><span class="spaces">          </span><span class="istickedoff">mGoal  = textFieldMaybe &quot;goal&quot; v</span>
+<span class="lineno">  457 </span><span class="spaces">      </span><span class="istickedoff">case (mDefId, mGoal) of</span>
+<span class="lineno">  458 </span><span class="spaces">        </span><span class="istickedoff">(Just defId, Just goal) | <span class="tickonlytrue">not (T.null goal)</span> -&gt;</span>
+<span class="lineno">  459 </span><span class="spaces">          </span><span class="istickedoff">pure (Right (DiSingle (ChildTask defId goal (textFieldMaybe &quot;context&quot; v) (textFieldMaybe &quot;role&quot; v))))</span>
+<span class="lineno">  460 </span><span class="spaces">        </span><span class="istickedoff">(Just _, Just _) -&gt; <span class="nottickedoff">pure (Left &quot;AGENT_START requires a non-empty 'goal'.&quot;)</span></span>
+<span class="lineno">  461 </span><span class="spaces">        </span><span class="istickedoff">(Just _, Nothing) -&gt; pure (Left <span class="nottickedoff">&quot;AGENT_START single-task mode requires a 'goal'.&quot;</span>)</span>
+<span class="lineno">  462 </span><span class="spaces">        </span><span class="istickedoff">(Nothing, _) -&gt; <span class="nottickedoff">pure (Left &quot;AGENT_START requires an 'id' (agent def id) in single-task mode, or a 'tasks' array in batch mode.&quot;)</span></span></span>
+<span class="lineno">  463 </span>
+<span class="lineno">  464 </span>-- | Parse one element of the @tasks@ array into a 'ChildTask'.
+<span class="lineno">  465 </span>parseTask :: Value -&gt; IO (Either Text ChildTask)
+<span class="lineno">  466 </span><span class="decl"><span class="istickedoff">parseTask v =</span>
+<span class="lineno">  467 </span><span class="spaces">  </span><span class="istickedoff">case idField v of</span>
+<span class="lineno">  468 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left &quot;Each task requires an 'id' (agent def id).&quot;)</span></span>
+<span class="lineno">  469 </span><span class="spaces">    </span><span class="istickedoff">Just defId -&gt;</span>
+<span class="lineno">  470 </span><span class="spaces">      </span><span class="istickedoff">case textFieldMaybe &quot;goal&quot; v of</span>
+<span class="lineno">  471 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left &quot;Each task requires a 'goal'.&quot;)</span></span>
+<span class="lineno">  472 </span><span class="spaces">        </span><span class="istickedoff">Just goal | <span class="tickonlyfalse">T.null goal</span> -&gt; <span class="nottickedoff">pure (Left &quot;Each task requires a non-empty 'goal'.&quot;)</span></span>
+<span class="lineno">  473 </span><span class="spaces">                 </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; pure (Right (ChildTask defId goal (textFieldMaybe &quot;context&quot; v) (textFieldMaybe &quot;role&quot; v)))</span></span>
+<span class="lineno">  474 </span>
+<span class="lineno">  475 </span>-- | Resolve a task to its def + worker + fresh session id. Returns Left if
+<span class="lineno">  476 </span>-- the def id is invalid or the def doesn't exist.
+<span class="lineno">  477 </span>resolveTask
+<span class="lineno">  478 </span>  :: AgentDefBackend
+<span class="lineno">  479 </span>  -&gt; AgentRuntime
+<span class="lineno">  480 </span>  -&gt; IO SessionId
+<span class="lineno">  481 </span>  -&gt; Int
+<span class="lineno">  482 </span>  -&gt; AgentWorkerBuilder
+<span class="lineno">  483 </span>  -&gt; ChildTask
+<span class="lineno">  484 </span>  -&gt; IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId))
+<span class="lineno">  485 </span><span class="decl"><span class="istickedoff">resolveTask defBackend _runtime mintSession _parentDepth worker task = do</span>
+<span class="lineno">  486 </span><span class="spaces">  </span><span class="istickedoff">case mkAgentDefId (ctDefId task) of</span>
+<span class="lineno">  487 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  488 </span><span class="spaces">    </span><span class="istickedoff">Right aid -&gt; do</span>
+<span class="lineno">  489 </span><span class="spaces">      </span><span class="istickedoff">mDef &lt;- adbRead defBackend aid</span>
+<span class="lineno">  490 </span><span class="spaces">      </span><span class="istickedoff">case mDef of</span>
+<span class="lineno">  491 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; pure (Left (&quot;agent def not found: &quot; &lt;&gt; ctDefId task))</span>
+<span class="lineno">  492 </span><span class="spaces">        </span><span class="istickedoff">Just def -&gt; do</span>
+<span class="lineno">  493 </span><span class="spaces">          </span><span class="istickedoff">sid &lt;- mintSession</span>
+<span class="lineno">  494 </span><span class="spaces">          </span><span class="istickedoff">pure (Right (<span class="nottickedoff">def</span>, worker, <span class="nottickedoff">sid</span>))</span></span>
+<span class="lineno">  495 </span>
+<span class="lineno">  496 </span>-- | Register a finished child in the runtime registry (post-hoc; the worker
+<span class="lineno">  497 </span>-- ran synchronously to completion). Records the instance with status
+<span class="lineno">  498 </span>-- 'Stopped' (the synchronous child has already finished by the time this is
+<span class="lineno">  499 </span>-- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
+<span class="lineno">  500 </span>-- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
+<span class="lineno">  501 </span>-- carries the 'SubagentId' but not the def id).
+<span class="lineno">  502 </span>registerChild :: AgentRuntime -&gt; ChildTask -&gt; ChildResult -&gt; IO ()
+<span class="lineno">  503 </span><span class="decl"><span class="istickedoff">registerChild runtime task result =</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="istickedoff">case mkAgentDefId (ctDefId task) of</span>
+<span class="lineno">  505 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure ()</span>  -- malformed def id; skip registration</span>
+<span class="lineno">  506 </span><span class="spaces">    </span><span class="istickedoff">Right aid -&gt;</span>
+<span class="lineno">  507 </span><span class="spaces">      </span><span class="istickedoff">case crChildSession result of</span>
+<span class="lineno">  508 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span>  -- no child session; skip (error/timeout case)</span>
+<span class="lineno">  509 </span><span class="spaces">        </span><span class="istickedoff">Just session -&gt; do</span>
+<span class="lineno">  510 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">depth = 0</span>  -- parent depth; the child's is depth+1 (not tracked here)</span>
+<span class="lineno">  511 </span><span class="spaces">          </span><span class="istickedoff">registerCompletedAgent runtime aid (crSubagentId result) <span class="nottickedoff">session</span> <span class="nottickedoff">depth</span></span></span>
+<span class="lineno">  512 </span>
+<span class="lineno">  513 </span>-- | Extract the task list from a 'DelegateInput' (in order).
+<span class="lineno">  514 </span>diTasks :: DelegateInput -&gt; [ChildTask]
+<span class="lineno">  515 </span><span class="decl"><span class="istickedoff">diTasks (DiSingle t) = [t]</span>
+<span class="lineno">  516 </span><span class="spaces"></span><span class="istickedoff">diTasks (DiBatch ts) = ts</span></span>
+<span class="lineno">  517 </span>
+<span class="lineno">  518 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  519 </span>-- AGENT_STATUS
+<span class="lineno">  520 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  521 </span>
+<span class="lineno">  522 </span>agentStatusOp :: AgentRuntime -&gt; Opcode
+<span class="lineno">  523 </span><span class="decl"><span class="istickedoff">agentStatusOp runtime = TrustedOpcode</span>
+<span class="lineno">  524 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_STATUS&quot;</span>
+<span class="lineno">  525 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Read one running agent's status by subagent_id.&quot;</span>
+<span class="lineno">  527 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;subagent_id&quot; &quot;The subagent id (from AGENT_START's result).&quot;</span>
+<span class="lineno">  528 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  529 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_STATUS requires {subagent_id:string}&quot;)</span> checkSubagentId . subagentIdField</span>
+<span class="lineno">  530 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  531 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  532 </span><span class="spaces">      </span><span class="istickedoff">let mSid = subagentIdField v</span>
+<span class="lineno">  533 </span><span class="spaces">      </span><span class="istickedoff">case mSid of</span>
+<span class="lineno">  534 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid subagent id&quot;] True (object []))</span></span>
+<span class="lineno">  535 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  536 </span><span class="spaces">          </span><span class="istickedoff">mStatus &lt;- liftIO (agentStatus runtime sid)</span>
+<span class="lineno">  537 </span><span class="spaces">          </span><span class="istickedoff">case mStatus of</span>
+<span class="lineno">  538 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure (OpResult [TrpText &quot;not running&quot;] False <span class="nottickedoff">(object [&quot;subagent_id&quot; .= subagentIdText sid, &quot;status&quot; .= (&quot;stopped&quot; :: Text)])</span>)</span>
+<span class="lineno">  539 </span><span class="spaces">            </span><span class="istickedoff">Just s  -&gt; <span class="nottickedoff">pure (OpResult [TrpText (renderStatus s)] False (object [&quot;subagent_id&quot; .= subagentIdText sid, &quot;status&quot; .= renderStatus s]))</span></span>
+<span class="lineno">  540 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  541 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  542 </span><span class="spaces">    </span><span class="istickedoff">checkSubagentId _ = Right ()</span></span>
+<span class="lineno">  543 </span>
+<span class="lineno">  544 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  545 </span>-- AGENT_STOP
+<span class="lineno">  546 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  547 </span>
+<span class="lineno">  548 </span>-- | AGENT_STOP: stop a running agent instance (kill the thread, deregister).
+<span class="lineno">  549 </span>-- Idempotent. Now keyed by @subagent_id@ (the new AGENT_START returns
+<span class="lineno">  550 </span>-- subagent ids, not def ids).
+<span class="lineno">  551 </span>agentStopOp :: AgentRuntime -&gt; Opcode
+<span class="lineno">  552 </span><span class="decl"><span class="istickedoff">agentStopOp runtime = TrustedOpcode</span>
+<span class="lineno">  553 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_STOP&quot;</span>
+<span class="lineno">  554 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  555 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Stop a running agent instance by subagent_id (idempotent).&quot;</span>
+<span class="lineno">  556 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;subagent_id&quot; &quot;The subagent id to stop.&quot;</span>
+<span class="lineno">  557 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_STOP requires {subagent_id:string}&quot;)</span> (const (Right ())) . subagentIdField</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  560 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  561 </span><span class="spaces">      </span><span class="istickedoff">let mSid = subagentIdField v</span>
+<span class="lineno">  562 </span><span class="spaces">      </span><span class="istickedoff">case mSid of</span>
+<span class="lineno">  563 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid subagent id&quot;] True (object []))</span></span>
+<span class="lineno">  564 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  565 </span><span class="spaces">          </span><span class="istickedoff">_ &lt;- liftIO (stopAgent runtime sid)</span>
+<span class="lineno">  566 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText &quot;stopped&quot;] False <span class="nottickedoff">(object [&quot;subagent_id&quot; .= subagentIdText sid])</span>)</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  568 </span>
+<span class="lineno">  569 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  570 </span>-- AGENT_INTERRUPT
+<span class="lineno">  571 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  572 </span>
+<span class="lineno">  573 </span>-- | AGENT_INTERRUPT: request that a single running subagent stop at its next
+<span class="lineno">  574 </span>-- iteration boundary. Unlike AGENT_STOP (which hard-kills the thread),
+<span class="lineno">  575 </span>-- AGENT_INTERRUPT sets a flag the worker polls between turns, letting it
+<span class="lineno">  576 </span>-- exit cleanly. Trusted.
+<span class="lineno">  577 </span>agentInterruptOp :: AgentRuntime -&gt; Opcode
+<span class="lineno">  578 </span><span class="decl"><span class="istickedoff">agentInterruptOp runtime = TrustedOpcode</span>
+<span class="lineno">  579 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;AGENT_INTERRUPT&quot;</span>
+<span class="lineno">  580 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  581 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Request that a running subagent stop at its next iteration boundary (cooperative; the worker polls an interrupt flag between turns).&quot;</span>
+<span class="lineno">  582 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;subagent_id&quot; &quot;The subagent id to interrupt.&quot;</span>
+<span class="lineno">  583 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  584 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;AGENT_INTERRUPT requires {subagent_id:string}&quot;)</span> (const (Right ())) . subagentIdField</span>
+<span class="lineno">  585 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  586 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  587 </span><span class="spaces">      </span><span class="istickedoff">let mSid = subagentIdField v</span>
+<span class="lineno">  588 </span><span class="spaces">      </span><span class="istickedoff">case mSid of</span>
+<span class="lineno">  589 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid subagent id&quot;] True (object []))</span></span>
+<span class="lineno">  590 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  591 </span><span class="spaces">          </span><span class="istickedoff">found &lt;- liftIO (interruptAgent runtime sid)</span>
+<span class="lineno">  592 </span><span class="spaces">          </span><span class="istickedoff">let msg = if <span class="tickonlyfalse">found</span> then <span class="nottickedoff">&quot;interrupt requested&quot;</span> else &quot;subagent not running&quot;</span>
+<span class="lineno">  593 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText msg] False <span class="nottickedoff">(object [&quot;subagent_id&quot; .= subagentIdText sid, &quot;found&quot; .= found])</span>)</span>
+<span class="lineno">  594 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  595 </span>
+<span class="lineno">  596 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  597 </span>-- JSON encoding of ChildResult
+<span class="lineno">  598 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  599 </span>
+<span class="lineno">  600 </span>-- | Render the results list as a JSON string for the model (the @orParts@
+<span class="lineno">  601 </span>-- text the model sees). One line per result:
+<span class="lineno">  602 </span>-- @subagent_id | status | summary-or-error@. The full structured JSON goes
+<span class="lineno">  603 </span>-- into 'orRecorded' via the 'ToJSON ChildResult' instance defined in
+<span class="lineno">  604 </span>-- 'Seal.Agent.Runtime.Delegation'.
+<span class="lineno">  605 </span>encodeResultsJson :: [ChildResult] -&gt; Text
+<span class="lineno">  606 </span><span class="decl"><span class="istickedoff">encodeResultsJson [] = <span class="nottickedoff">&quot;(no results)&quot;</span></span>
+<span class="lineno">  607 </span><span class="spaces"></span><span class="istickedoff">encodeResultsJson rs = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> (map renderOne rs)</span>
+<span class="lineno">  608 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  609 </span><span class="spaces">    </span><span class="istickedoff">renderOne r =</span>
+<span class="lineno">  610 </span><span class="spaces">      </span><span class="istickedoff">subagentIdText (crSubagentId r) &lt;&gt; &quot; | &quot; &lt;&gt;</span>
+<span class="lineno">  611 </span><span class="spaces">      </span><span class="istickedoff">T.pack (show (crStatus r)) &lt;&gt; &quot; | &quot; &lt;&gt;</span>
+<span class="lineno">  612 </span><span class="spaces">      </span><span class="istickedoff">maybe <span class="nottickedoff">&quot;(no summary)&quot;</span> (T.take 200) (summaryOrError r)</span>
+<span class="lineno">  613 </span><span class="spaces">    </span><span class="istickedoff">summaryOrError r = case crSummary r of</span>
+<span class="lineno">  614 </span><span class="spaces">      </span><span class="istickedoff">Just s  -&gt; Just s</span>
+<span class="lineno">  615 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; crError r</span></span>
+<span class="lineno">  616 </span>
+<span class="lineno">  617 </span>renderStatus :: AgentStatus -&gt; Text
+<span class="lineno">  618 </span><span class="decl"><span class="istickedoff">renderStatus = \case</span>
+<span class="lineno">  619 </span><span class="spaces">  </span><span class="istickedoff">Starting     -&gt; <span class="nottickedoff">&quot;starting&quot;</span></span>
+<span class="lineno">  620 </span><span class="spaces">  </span><span class="istickedoff">Running      -&gt; <span class="nottickedoff">&quot;running&quot;</span></span>
+<span class="lineno">  621 </span><span class="spaces">  </span><span class="istickedoff">Idle         -&gt; <span class="nottickedoff">&quot;idle&quot;</span></span>
+<span class="lineno">  622 </span><span class="spaces">  </span><span class="istickedoff">Stopped      -&gt; &quot;stopped&quot;</span>
+<span class="lineno">  623 </span><span class="spaces">  </span><span class="istickedoff">Interrupted  -&gt; <span class="nottickedoff">&quot;interrupted&quot;</span></span>
+<span class="lineno">  624 </span><span class="spaces">  </span><span class="istickedoff">Crashed m    -&gt; <span class="nottickedoff">&quot;crashed: &quot; &lt;&gt; m</span></span></span>
+<span class="lineno">  625 </span>
+<span class="lineno">  626 </span>-- | Extract the @subagent_id@ string field from a JSON object.
+<span class="lineno">  627 </span>subagentIdField :: Value -&gt; Maybe SubagentId
+<span class="lineno">  628 </span><span class="decl"><span class="istickedoff">subagentIdField v = do</span>
+<span class="lineno">  629 </span><span class="spaces">  </span><span class="istickedoff">t &lt;- parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;subagent_id&quot;)) v</span>
+<span class="lineno">  630 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">T.null t</span> then <span class="nottickedoff">Nothing</span> else Just (SubagentId t)</span></span>
+<span class="lineno">  631 </span>
+<span class="lineno">  632 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  633 </span>-- Helpers (def rendering / encoding)
+<span class="lineno">  634 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  635 </span>
+<span class="lineno">  636 </span>-- | Build a JSON-Schema object with a single required string property.
+<span class="lineno">  637 </span>singleStringSchema :: Text -&gt; Text -&gt; Value
+<span class="lineno">  638 </span><span class="decl"><span class="istickedoff">singleStringSchema fieldName fieldDesc =</span>
+<span class="lineno">  639 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  640 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  641 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  642 </span><span class="spaces">        </span><span class="istickedoff">[fromText fieldName .= object</span>
+<span class="lineno">  643 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  644 </span><span class="spaces">           </span><span class="istickedoff">, &quot;description&quot; .= fieldDesc</span>
+<span class="lineno">  645 </span><span class="spaces">           </span><span class="istickedoff">]]</span>
+<span class="lineno">  646 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([fieldName] :: [Text])</span>
+<span class="lineno">  647 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  648 </span>
+<span class="lineno">  649 </span>-- | Encode the secret-free 'AgentDef' fields into the 'orRecorded' payload.
+<span class="lineno">  650 </span>-- The @was_new@ flag distinguishes create vs update in the audit log.
+<span class="lineno">  651 </span>encodeDefRecorded :: AgentDef -&gt; Bool -&gt; Value
+<span class="lineno">  652 </span><span class="decl"><span class="istickedoff">encodeDefRecorded d wasNew = object</span>
+<span class="lineno">  653 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;id&quot;         .= agentDefIdText (adId d)</span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">, &quot;name&quot;       .= adName d</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">, &quot;provider&quot;   .= adProvider d</span>
+<span class="lineno">  656 </span><span class="spaces">  </span><span class="istickedoff">, &quot;model&quot;      .= adModel d</span>
+<span class="lineno">  657 </span><span class="spaces">  </span><span class="istickedoff">, &quot;system&quot;     .= adSystem d</span>
+<span class="lineno">  658 </span><span class="spaces">  </span><span class="istickedoff">, &quot;tools&quot;      .= encodeTools (adTools d)</span>
+<span class="lineno">  659 </span><span class="spaces">  </span><span class="istickedoff">, &quot;group&quot;      .= adGroup d</span>
+<span class="lineno">  660 </span><span class="spaces">  </span><span class="istickedoff">, &quot;created_at&quot; .= adCreatedAt d</span>
+<span class="lineno">  661 </span><span class="spaces">  </span><span class="istickedoff">, &quot;updated_at&quot; .= adUpdatedAt d</span>
+<span class="lineno">  662 </span><span class="spaces">  </span><span class="istickedoff">, &quot;session&quot;    .= adSession d</span>
+<span class="lineno">  663 </span><span class="spaces">  </span><span class="istickedoff">, &quot;was_new&quot;    .= wasNew</span>
+<span class="lineno">  664 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  665 </span>
+<span class="lineno">  666 </span>-- | Encode an 'AllowList OpName' for the recorded payload: @\&quot;all\&quot;@ for
+<span class="lineno">  667 </span>-- 'AllowAll', or a JSON array of opcode-name strings for 'AllowOnly'.
+<span class="lineno">  668 </span>encodeTools :: AllowList OpName -&gt; Value
+<span class="lineno">  669 </span><span class="decl"><span class="istickedoff">encodeTools AllowAll       = String &quot;all&quot;</span>
+<span class="lineno">  670 </span><span class="spaces"></span><span class="istickedoff">encodeTools (AllowOnly xs) = <span class="nottickedoff">Array (V.fromList [ String t | OpName t &lt;- Set.toList xs ])</span></span></span>
+<span class="lineno">  671 </span>
+<span class="lineno">  672 </span>-- | Render an 'AgentDef' as a Markdown-ish text block for the model.
+<span class="lineno">  673 </span>renderDef :: AgentDef -&gt; Text
+<span class="lineno">  674 </span><span class="decl"><span class="istickedoff">renderDef d =</span>
+<span class="lineno">  675 </span><span class="spaces">  </span><span class="istickedoff">&quot;# &quot; &lt;&gt; adName d &lt;&gt; &quot; (&quot; &lt;&gt; agentDefIdText (adId d) &lt;&gt; &quot;)\n\n&quot;</span>
+<span class="lineno">  676 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;provider: &quot; &lt;&gt; adProvider d &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  677 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;model: &quot; &lt;&gt; modelName &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  678 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;system: &quot; &lt;&gt; fromMaybe &quot;(none)&quot; (adSystem d) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  679 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;tools: &quot; &lt;&gt; renderTools (adTools d)</span>
+<span class="lineno">  680 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  681 </span><span class="spaces">    </span><span class="istickedoff">ModelId modelName = adModel d</span></span>
+<span class="lineno">  682 </span>
+<span class="lineno">  683 </span>-- | Render an 'AllowList OpName' as a comma-separated list, or @\&quot;all\&quot;@.
+<span class="lineno">  684 </span>renderTools :: AllowList OpName -&gt; Text
+<span class="lineno">  685 </span><span class="decl"><span class="istickedoff">renderTools AllowAll       = &quot;all&quot;</span>
+<span class="lineno">  686 </span><span class="spaces"></span><span class="istickedoff">renderTools (AllowOnly xs) = <span class="nottickedoff">T.intercalate &quot;, &quot; [ t | OpName t &lt;- Set.toList xs ]</span></span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,175 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE RankNTypes #-}
+<span class="lineno">    2 </span>{-# OPTIONS_GHC -Wno-partial-fields #-}
+<span class="lineno">    3 </span>-- | The ISA as data: an 'Opcode' is a GADT-style sum keyed by trust level.
+<span class="lineno">    4 </span>-- A 'TrustedOpcode' carries 'toRun' (no untrusted capability); an
+<span class="lineno">    5 </span>-- 'UntrustedOpcode' carries 'uoRun' (which threads an 'UntrustedIO' — the
+<span class="lineno">    6 </span>-- unified capability handle for all side-effecting IO an untrusted opcode
+<span class="lineno">    7 </span>-- can perform). This split makes the capability-scoping guarantee
+<span class="lineno">    8 </span>-- type-level (spec §4 line 129, §8): a Trusted opcode that shells out
+<span class="lineno">    9 </span>-- literally cannot be constructed — it has no 'UntrustedIO' in scope. The
+<span class="lineno">   10 </span>-- compile-fail fixture ('Seal.Tools.Exec.CapabilityScopingFail') asserts
+<span class="lineno">   11 </span>-- this.
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- Trusted opcodes use 'BackendExec' for their own non-untrusted IO (e.g.
+<span class="lineno">   14 </span>-- memory/skill file writes under @config/@); Untrusted opcodes use
+<span class="lineno">   15 </span>-- 'UntrustedIO' for ALL their side-effecting IO (files, commands, process
+<span class="lineno">   16 </span>-- management, search). The 'UntrustedIO' is the single seam — backend
+<span class="lineno">   17 </span>-- (local vs remote SSH) is selected once at wiring time; the opcode never
+<span class="lineno">   18 </span>-- sees the backend, only the capability.
+<span class="lineno">   19 </span>module Seal.ISA.Opcode
+<span class="lineno">   20 </span>  ( OpResult (..)
+<span class="lineno">   21 </span>  , Opcode (..)
+<span class="lineno">   22 </span>  , BackendExec (..)
+<span class="lineno">   23 </span>  , localBackend
+<span class="lineno">   24 </span>  , opName
+<span class="lineno">   25 </span>  , opTrust
+<span class="lineno">   26 </span>  , opDesc
+<span class="lineno">   27 </span>  , opInSchema
+<span class="lineno">   28 </span>  , opOutSchema
+<span class="lineno">   29 </span>  , opAuthorize
+<span class="lineno">   30 </span>  , opBlocking
+<span class="lineno">   31 </span>  , opRun
+<span class="lineno">   32 </span>  , withAuthorize
+<span class="lineno">   33 </span>  ) where
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   36 </span>import Data.Aeson (Value)
+<span class="lineno">   37 </span>import Data.Text (Text)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Seal.Core.Types
+<span class="lineno">   40 </span>import Seal.Providers.Class (ToolResultPart)
+<span class="lineno">   41 </span>import Seal.Types.App
+<span class="lineno">   42 </span>import Seal.Tools.Exec.UIO (UIO)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>data OpResult = OpResult
+<span class="lineno">   45 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">orParts</span></span></span> :: [ToolResultPart]  -- ^ what the model sees (may include secret values)
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">orIsError</span></span></span> :: Bool
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">orRecorded</span></span></span> :: Value          -- ^ what the transcript records (secret-free)
+<span class="lineno">   48 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- | Manual Show that never renders 'orParts': those slots may hold secret values
+<span class="lineno">   51 </span>-- (e.g. vault credentials returned by SECRET_GET) that must not appear in logs.
+<span class="lineno">   52 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show OpResult</span></span></span></span> where
+<span class="lineno">   53 </span>  <span class="decl"><span class="nottickedoff">show r = &quot;OpResult {orParts = &lt;&quot; &lt;&gt; show (length (orParts r)) &lt;&gt; &quot; part(s) redacted&gt;, orIsError = &quot;</span>
+<span class="lineno">   54 </span><span class="spaces">             </span><span class="nottickedoff">&lt;&gt; show (orIsError r) &lt;&gt; &quot;, orRecorded = &quot; &lt;&gt; show (orRecorded r) &lt;&gt; &quot;}&quot;</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | The execution seam. Untrusted opcodes funnel their IO through 'runLocal';
+<span class="lineno">   57 </span>-- Phase 4 introduces a remote-SSH 'BackendExec' with the same shape.
+<span class="lineno">   58 </span>newtype BackendExec = BackendExec { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">runLocal</span></span></span> :: forall a. IO a -&gt; App a }
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>localBackend :: BackendExec
+<span class="lineno">   61 </span><span class="decl"><span class="nottickedoff">localBackend = BackendExec liftIO</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | The opcode sum. 'TrustedOpcode' covers both 'Trusted' and 'Audited'
+<span class="lineno">   64 </span>-- (Audited is treated as Trusted by the dispatcher — record async, then
+<span class="lineno">   65 </span>-- run; the 'toTrust' field carries the distinction for 'opTrust').
+<span class="lineno">   66 </span>-- 'UntrustedOpcode' is always 'Untrusted' and carries the 'UntrustedIO'
+<span class="lineno">   67 </span>-- its 'uoRun' threads. The field-name prefixes (@to@ / @uo@) keep the two
+<span class="lineno">   68 </span>-- constructors' record namespaces disjoint (Haskell requires this when
+<span class="lineno">   69 </span>-- constructors share a type but have different fields).
+<span class="lineno">   70 </span>--
+<span class="lineno">   71 </span>-- The 'toBlocking' flag on 'TrustedOpcode' marks opcodes that block on
+<span class="lineno">   72 </span>-- human input (ASK_HUMAN). The dispatcher skips the timeout/abort/retry
+<span class="lineno">   73 </span>-- race for blocking opcodes — the timeout is designed for subprocess
+<span class="lineno">   74 </span>-- execution, not human prompts. A human can take arbitrarily long to
+<span class="lineno">   75 </span>-- answer, and the 'AskReplyStore' has its own cancel mechanism
+<span class="lineno">   76 </span>-- ('cancelAsk'/'cancelSessionAsks'). Always 'False' for 'UntrustedOpcode'
+<span class="lineno">   77 </span>-- (untrusted opcodes never block on human input — the confirmation gate
+<span class="lineno">   78 </span>-- is in the agent loop, not the opcode).
+<span class="lineno">   79 </span>data Opcode
+<span class="lineno">   80 </span>  = TrustedOpcode
+<span class="lineno">   81 </span>      { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toName</span></span></span>       :: OpName
+<span class="lineno">   82 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toTrust</span></span></span>      :: TrustLevel       -- ^ 'Trusted' or 'Audited'
+<span class="lineno">   83 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toDesc</span></span></span>       :: Text
+<span class="lineno">   84 </span>      , <span class="istickedoff"><span class="decl"><span class="istickedoff">toInSchema</span></span></span>   :: Value
+<span class="lineno">   85 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toOutSchema</span></span></span>  :: Value
+<span class="lineno">   86 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toAuthorize</span></span></span>  :: Value -&gt; Either Text ()
+<span class="lineno">   87 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">toBlocking</span></span></span>   :: Bool            -- ^ blocks on human input (ASK_HUMAN); skips the timeout/abort/retry race
+<span class="lineno">   88 </span>      , <span class="istickedoff"><span class="decl"><span class="istickedoff">toRun</span></span></span>        :: BackendExec -&gt; Value -&gt; App OpResult
+<span class="lineno">   89 </span>      }
+<span class="lineno">   90 </span>  | UntrustedOpcode
+<span class="lineno">   91 </span>      { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uoName</span></span></span>       :: OpName
+<span class="lineno">   92 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uoDesc</span></span></span>       :: Text
+<span class="lineno">   93 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uoInSchema</span></span></span>   :: Value
+<span class="lineno">   94 </span>      , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uoOutSchema</span></span></span>  :: Value
+<span class="lineno">   95 </span>      , <span class="istickedoff"><span class="decl"><span class="istickedoff">uoAuthorize</span></span></span>  :: Value -&gt; Either Text ()
+<span class="lineno">   96 </span>      , <span class="istickedoff"><span class="decl"><span class="istickedoff">uoRun</span></span></span>        :: Value -&gt; UIO OpResult
+<span class="lineno">   97 </span>      }
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Accessor: the opcode's name (works for both constructors).
+<span class="lineno">  100 </span>opName :: Opcode -&gt; OpName
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">opName (TrustedOpcode n _ _ _ _ _ _ _) = n</span>
+<span class="lineno">  102 </span><span class="spaces"></span><span class="istickedoff">opName (UntrustedOpcode n _ _ _ _ _) = n</span></span>
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Accessor: the trust level. 'UntrustedOpcode' is always 'Untrusted'.
+<span class="lineno">  105 </span>opTrust :: Opcode -&gt; TrustLevel
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">opTrust (TrustedOpcode _ tl _ _ _ _ _ _) = tl</span>
+<span class="lineno">  107 </span><span class="spaces"></span><span class="istickedoff">opTrust (UntrustedOpcode {})  = Untrusted</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Accessor: the description (for tool definitions).
+<span class="lineno">  110 </span>opDesc :: Opcode -&gt; Text
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">opDesc (TrustedOpcode _ _ d _ _ _ _ _) = d</span>
+<span class="lineno">  112 </span><span class="spaces"></span><span class="istickedoff">opDesc (UntrustedOpcode _ d _ _ _ _) = d</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Accessor: the input JSON schema.
+<span class="lineno">  115 </span>opInSchema :: Opcode -&gt; Value
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">opInSchema (TrustedOpcode _ _ _ s _ _ _ _) = s</span>
+<span class="lineno">  117 </span><span class="spaces"></span><span class="istickedoff">opInSchema (UntrustedOpcode _ _ s _ _ _) = s</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Accessor: the output JSON schema.
+<span class="lineno">  120 </span>opOutSchema :: Opcode -&gt; Value
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">opOutSchema (TrustedOpcode _ _ _ _ s _ _ _) = s</span>
+<span class="lineno">  122 </span><span class="spaces"></span><span class="istickedoff">opOutSchema (UntrustedOpcode _ _ _ s _ _) = s</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | Accessor: the authorization gate.
+<span class="lineno">  125 </span>opAuthorize :: Opcode -&gt; Value -&gt; Either Text ()
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">opAuthorize (TrustedOpcode _ _ _ _ _ a _ _) = a</span>
+<span class="lineno">  127 </span><span class="spaces"></span><span class="istickedoff">opAuthorize (UntrustedOpcode _ _ _ _ a _) = a</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | Accessor: whether this opcode blocks on human input (skips the
+<span class="lineno">  130 </span>-- timeout/abort/retry race in the dispatcher). Always 'False' for
+<span class="lineno">  131 </span>-- 'UntrustedOpcode'.
+<span class="lineno">  132 </span>opBlocking :: Opcode -&gt; Bool
+<span class="lineno">  133 </span><span class="decl"><span class="istickedoff">opBlocking (TrustedOpcode _ _ _ _ _ _ b _) = b</span>
+<span class="lineno">  134 </span><span class="spaces"></span><span class="istickedoff">opBlocking (UntrustedOpcode {}) = <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>-- | Accessor: the run action for a TRUSTED opcode. Calling this on an
+<span class="lineno">  137 </span>-- 'UntrustedOpcode' is an error (use the dispatcher, which pattern-matches
+<span class="lineno">  138 </span>-- the GADT and calls 'uoRun' for untrusted). Provided so legacy call
+<span class="lineno">  139 </span>-- sites that read 'opRun' on a known-trusted opcode keep working.
+<span class="lineno">  140 </span>opRun :: Opcode -&gt; BackendExec -&gt; Value -&gt; App OpResult
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">opRun (TrustedOpcode _ _ _ _ _ _ _ r) = r</span>
+<span class="lineno">  142 </span><span class="spaces"></span><span class="istickedoff">opRun UntrustedOpcode {} =</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">error &quot;opRun: UntrustedOpcode has no toRun; use the dispatcher's uoRun path&quot;</span></span></span>
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | Helper for the one record-update site (DispatchSpec): replace the
+<span class="lineno">  146 </span>-- authorize function on an opcode (GADTs forbid record-update on a sum
+<span class="lineno">  147 </span>-- whose fields differ per constructor).
+<span class="lineno">  148 </span>withAuthorize :: Opcode -&gt; (Value -&gt; Either Text ()) -&gt; Opcode
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">withAuthorize (TrustedOpcode n tl d is os _ b r) f =</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">TrustedOpcode n <span class="nottickedoff">tl</span> <span class="nottickedoff">d</span> <span class="nottickedoff">is</span> <span class="nottickedoff">os</span> f <span class="nottickedoff">b</span> <span class="nottickedoff">r</span></span>
+<span class="lineno">  151 </span><span class="spaces"></span><span class="istickedoff">withAuthorize (UntrustedOpcode n d is os _ r) f =</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">UntrustedOpcode n d is os f r</span></span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,226 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE LambdaCase #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The code-level provider registry: the set of providers Seal knows how to
+<span class="lineno">    4 </span>-- build, and the mapping from each to its display label, vault credential key,
+<span class="lineno">    5 </span>-- and default model. Credential resolution (reading the key from the vault and
+<span class="lineno">    6 </span>-- constructing a live 'SomeProvider') is added on top of this vocabulary.
+<span class="lineno">    7 </span>module Seal.Providers.Registry
+<span class="lineno">    8 </span>  ( KnownProvider (..)
+<span class="lineno">    9 </span>  , knownProviders
+<span class="lineno">   10 </span>  , configuredProviders
+<span class="lineno">   11 </span>  , providerLabel
+<span class="lineno">   12 </span>  , providerId
+<span class="lineno">   13 </span>  , parseProvider
+<span class="lineno">   14 </span>  , vaultKeyName
+<span class="lineno">   15 </span>  , defaultModelFor
+<span class="lineno">   16 </span>  , resolveDefaultModel
+<span class="lineno">   17 </span>  , resolveProvider
+<span class="lineno">   18 </span>  , completeSome
+<span class="lineno">   19 </span>  , listSome
+<span class="lineno">   20 </span>  , vaultErrText
+<span class="lineno">   21 </span>  ) where
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>import Control.Monad (void, filterM)
+<span class="lineno">   24 </span>import Data.IORef (IORef, newIORef)
+<span class="lineno">   25 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   26 </span>import Data.Text (Text)
+<span class="lineno">   27 </span>import Data.Text qualified as T
+<span class="lineno">   28 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Seal.Config.File (RuntimeConfig, providerBaseUrl)
+<span class="lineno">   31 </span>import Seal.Core.Types (ModelId (..), ProviderId (..))
+<span class="lineno">   32 </span>import Seal.Providers.Anthropic
+<span class="lineno">   33 </span>  ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
+<span class="lineno">   34 </span>import Seal.Providers.Anthropic.OAuth
+<span class="lineno">   35 </span>  ( deserializeTokens, refreshTokens, serializeTokens )
+<span class="lineno">   36 </span>import Seal.Providers.Class
+<span class="lineno">   37 </span>  ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
+<span class="lineno">   38 </span>import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
+<span class="lineno">   39 </span>import Seal.Security.Secrets (mkApiKey)
+<span class="lineno">   40 </span>import Seal.Security.Vault (VaultHandle (..))
+<span class="lineno">   41 </span>import Seal.Security.Vault.Age (VaultError (..))
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | The Anthropic OAuth token vault key (mirrors
+<span class="lineno">   44 </span>-- 'Seal.Command.Provider.anthropicOAuthKey'; duplicated here to avoid a
+<span class="lineno">   45 </span>-- circular import).
+<span class="lineno">   46 </span>anthropicOAuthKey :: Text
+<span class="lineno">   47 </span><span class="decl"><span class="istickedoff">anthropicOAuthKey = &quot;ANTHROPIC_OAUTH_TOKENS&quot;</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Every provider Seal can build. M1 ships Anthropic only; later milestones
+<span class="lineno">   50 </span>-- extend this sum (the totality of the functions below forces each addition to
+<span class="lineno">   51 </span>-- be handled everywhere).
+<span class="lineno">   52 </span>data KnownProvider = AnthropicProvider | OllamaProvider
+<span class="lineno">   53 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Bounded</span></span></span></span>)
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>knownProviders :: [KnownProvider]
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">knownProviders = [minBound .. maxBound]</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | The user-facing id typed at the @/provider@ prompt.
+<span class="lineno">   59 </span>providerLabel :: KnownProvider -&gt; Text
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">providerLabel AnthropicProvider = &quot;anthropic&quot;</span>
+<span class="lineno">   61 </span><span class="spaces"></span><span class="istickedoff">providerLabel OllamaProvider    = &quot;ollama&quot;</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>providerId :: KnownProvider -&gt; ProviderId
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">providerId = ProviderId . providerLabel</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | Parse a label (case-insensitive) back to a 'KnownProvider'.
+<span class="lineno">   67 </span>parseProvider :: Text -&gt; Maybe KnownProvider
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">parseProvider t =</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">let needle = T.toCaseFold (T.strip t)</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">in lookup needle [(T.toCaseFold (providerLabel p), p) | p &lt;- knownProviders]</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>-- | The vault secret name under which this provider's API key is stored.
+<span class="lineno">   73 </span>vaultKeyName :: KnownProvider -&gt; Text
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">vaultKeyName AnthropicProvider = &quot;ANTHROPIC_API_KEY&quot;</span>
+<span class="lineno">   75 </span><span class="spaces"></span><span class="istickedoff">vaultKeyName OllamaProvider    = &quot;OLLAMA_API_KEY&quot;</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | The model used when the user has not chosen one.
+<span class="lineno">   78 </span>defaultModelFor :: KnownProvider -&gt; ModelId
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">defaultModelFor AnthropicProvider = ModelId &quot;claude-opus-4-8&quot;</span>
+<span class="lineno">   80 </span><span class="spaces"></span><span class="istickedoff">defaultModelFor OllamaProvider    = ModelId &quot;llama3.2&quot;</span></span>
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>-- | A provider's default model: the configured value if given, else the
+<span class="lineno">   83 </span>-- provider's hardcoded default (Anthropic's for an unrecognized label).
+<span class="lineno">   84 </span>resolveDefaultModel :: Maybe Text -&gt; Text -&gt; ModelId
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">resolveDefaultModel (Just m) _   = ModelId m</span>
+<span class="lineno">   86 </span><span class="spaces"></span><span class="istickedoff">resolveDefaultModel Nothing  lbl =</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider lbl)</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
+<span class="lineno">   90 </span>-- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
+<span class="lineno">   91 </span>-- re-run @\/provider login@) rather than silently falling back. The @callCounter@
+<span class="lineno">   92 </span>-- is shared across turns so Ollama-synthesized tool-call ids stay unique across
+<span class="lineno">   93 </span>-- a whole session (Ollama responses carry no id, so Seal synthesizes
+<span class="lineno">   94 </span>-- @call_&lt;i&gt;@; the counter must outlive any single 'Ollama' value, which is
+<span class="lineno">   95 </span>-- rebuilt each turn — see 'ProviderRuntime.prCallCounter').
+<span class="lineno">   96 </span>resolveProvider
+<span class="lineno">   97 </span>  :: Maybe VaultHandle -&gt; Manager -&gt; Text -&gt; KnownProvider -&gt; ModelId
+<span class="lineno">   98 </span>  -&gt; IORef Int -&gt; IO (Either Text SomeProvider)
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">resolveProvider Nothing _ _ AnthropicProvider _ _ =</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">pure (Left &quot;vault not configured \x2014 run /vault setup&quot;)</span>
+<span class="lineno">  101 </span><span class="spaces"></span><span class="istickedoff">resolveProvider (Just vh) mgr _baseUrl AnthropicProvider model _ = do</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">eOAuth &lt;- vhGet vh &quot;ANTHROPIC_OAUTH_TOKENS&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">case eOAuth of</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">Right blob -&gt; case deserializeTokens blob of</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">Left e     -&gt; pure (Left (&quot;stored Anthropic OAuth tokens are unreadable (&quot;</span>
+<span class="lineno">  106 </span><span class="spaces">                                  </span><span class="istickedoff">&lt;&gt; e &lt;&gt; &quot;) — run /provider login anthropic&quot;))</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff">Right toks -&gt; do</span>
+<span class="lineno">  108 </span><span class="spaces">        </span><span class="istickedoff">ref &lt;- newIORef toks</span>
+<span class="lineno">  109 </span><span class="spaces">        </span><span class="istickedoff">let sess = OAuthSession</span>
+<span class="lineno">  110 </span><span class="spaces">              </span><span class="istickedoff">{ osTokens  = ref</span>
+<span class="lineno">  111 </span><span class="spaces">              </span><span class="istickedoff">, osRefresh = <span class="nottickedoff">refreshTokens mgr</span></span>
+<span class="lineno">  112 </span><span class="spaces">              </span><span class="istickedoff">, osPersist = <span class="nottickedoff">void . vhPut vh &quot;ANTHROPIC_OAUTH_TOKENS&quot; . serializeTokens</span></span>
+<span class="lineno">  113 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- ensureFresh sess</span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">pure (Right <span class="nottickedoff">(SomeProvider (mkAnthropicOAuth mgr sess model))</span>)</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; do</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">eKey &lt;- vhGet vh (vaultKeyName AnthropicProvider)</span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">pure $ case eKey of</span>
+<span class="lineno">  119 </span><span class="spaces">        </span><span class="istickedoff">Left e         -&gt; Left (credErr AnthropicProvider e)</span>
+<span class="lineno">  120 </span><span class="spaces">        </span><span class="istickedoff">Right keyBytes -&gt; Right (SomeProvider (mkAnthropic <span class="nottickedoff">mgr</span> <span class="nottickedoff">(mkApiKey keyBytes)</span> model))</span>
+<span class="lineno">  121 </span><span class="spaces"></span><span class="istickedoff">resolveProvider mvh mgr baseUrl OllamaProvider model callCounter</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">| not (ollamaNeedsKey baseUrl) =</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">-- local/custom host: keyless, never touch the vault</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">Right . SomeProvider &lt;$&gt; mkOllama mgr baseUrl Nothing <span class="nottickedoff">model</span> <span class="nottickedoff">callCounter</span></span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case mvh of</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">pure (Left &quot;Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama&quot;)</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">Just vh -&gt; do</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">eKey &lt;- vhGet vh (vaultKeyName OllamaProvider)</span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="istickedoff">case eKey of</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="istickedoff">Right kb -&gt; Right . <span class="nottickedoff">SomeProvider</span> &lt;$&gt; mkOllama <span class="nottickedoff">mgr</span> <span class="nottickedoff">baseUrl</span> <span class="nottickedoff">(Just (mkApiKey kb))</span> <span class="nottickedoff">model</span> <span class="nottickedoff">callCounter</span></span>
+<span class="lineno">  132 </span><span class="spaces">          </span><span class="istickedoff">Left e   -&gt; pure (Left (vaultErrText e))</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | Run a completion through an existentially-wrapped provider.
+<span class="lineno">  135 </span>completeSome :: SomeProvider -&gt; CompletionRequest -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">completeSome (SomeProvider p) = complete p</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | List a provider's models through an existentially-wrapped provider.
+<span class="lineno">  139 </span>listSome :: SomeProvider -&gt; IO (Either Text [ModelId])
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">listSome (SomeProvider p) = listModels p</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | Provider-aware credential error: a missing key points the user at the
+<span class="lineno">  143 </span>-- exact @/provider add@ they need.
+<span class="lineno">  144 </span>credErr :: KnownProvider -&gt; VaultError -&gt; Text
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">credErr kp = \case</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">VaultKeyNotFound _ -&gt;</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">&quot;no credential for &quot; &lt;&gt; providerLabel kp</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot; — run /provider add &quot; &lt;&gt; providerLabel kp</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">e -&gt; vaultErrText e</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>-- | Human-readable rendering of a vault error.
+<span class="lineno">  152 </span>vaultErrText :: VaultError -&gt; Text
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">vaultErrText = \case</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">VaultLocked         -&gt; &quot;vault is locked — run /vault unlock&quot;</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">VaultNotFound       -&gt; <span class="nottickedoff">&quot;vault not found — run /vault setup&quot;</span></span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">VaultAlreadyExists  -&gt; <span class="nottickedoff">&quot;vault already exists&quot;</span></span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">VaultKeyNotFound k  -&gt; <span class="nottickedoff">&quot;no such secret: &quot; &lt;&gt; k</span></span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">VaultBackendError t -&gt; <span class="nottickedoff">&quot;backend error: &quot; &lt;&gt; t</span></span></span>
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>-- | The set of providers that are *configured* (have a usable credential or
+<span class="lineno">  161 </span>-- are usable keyless). A provider appears in @/provider list@ and in the
+<span class="lineno">  162 </span>-- frontend's provider select only when this returns 'True'. The rules mirror
+<span class="lineno">  163 </span>-- the auth labels in 'Seal.Command.Provider.listCmd':
+<span class="lineno">  164 </span>--
+<span class="lineno">  165 </span>--   * __Ollama__ is configured when its base URL needs no key (local daemon)
+<span class="lineno">  166 </span>--     OR an API key / OAuth blob is stored in the vault. A cloud URL
+<span class="lineno">  167 </span>--     (@ollama.com@) without a key is NOT configured.
+<span class="lineno">  168 </span>--   * __Anthropic__ is configured when either an OAuth blob or an API key is
+<span class="lineno">  169 </span>--     stored in the vault.
+<span class="lineno">  170 </span>--
+<span class="lineno">  171 </span>-- A missing vault ('Nothing') means no provider has credentials, so only a
+<span class="lineno">  172 </span>-- keyless local Ollama would survive the filter (and only when its base URL
+<span class="lineno">  173 </span>-- is the default local URL).
+<span class="lineno">  174 </span>configuredProviders :: Maybe VaultHandle -&gt; RuntimeConfig -&gt; IO [KnownProvider]
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">configuredProviders mvh cfg = filterM isConfigured knownProviders</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">isConfigured kp = case kp of</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">OllamaProvider -&gt; do</span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff">let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg &quot;ollama&quot;)</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff">if not (ollamaNeedsKey baseUrl)</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff">then pure True</span>
+<span class="lineno">  182 </span><span class="spaces">          </span><span class="istickedoff">else hasVaultKey mvh (vaultKeyName OllamaProvider)</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">AnthropicProvider -&gt;</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="istickedoff">hasVaultKey mvh (vaultKeyName AnthropicProvider)</span>
+<span class="lineno">  185 </span><span class="spaces">          </span><span class="istickedoff">||^ hasVaultKey mvh anthropicOAuthKey</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>-- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
+<span class="lineno">  188 </span>-- (locked / key missing) → 'False'; a present key → 'True'.
+<span class="lineno">  189 </span>hasVaultKey :: Maybe VaultHandle -&gt; Text -&gt; IO Bool
+<span class="lineno">  190 </span><span class="decl"><span class="istickedoff">hasVaultKey Nothing _ = pure False</span>
+<span class="lineno">  191 </span><span class="spaces"></span><span class="istickedoff">hasVaultKey (Just vh) k = do</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- vhGet vh k</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">pure $ case r of</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; True</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="istickedoff">Left _  -&gt; False</span></span>
+<span class="lineno">  196 </span>
+<span class="lineno">  197 </span>-- | Short-circuit OR for two 'IO' booleans (so the second is only run when the
+<span class="lineno">  198 </span>-- first is 'False'). Avoids touching OAuth when an API key is already present.
+<span class="lineno">  199 </span>infixr 2 ||^
+<span class="lineno">  200 </span>(||^) :: IO Bool -&gt; IO Bool -&gt; IO Bool
+<span class="lineno">  201 </span><span class="decl"><span class="istickedoff">a ||^ b = do</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">x &lt;- a</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">if x then pure True else b</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The evolutionary-store backends + the in-process agent runtime.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Lives in 'Seal.Core' (not 'Seal.Channel.Cli') to avoid a module cycle:
+<span class="lineno">    5 </span>-- 'Seal.Core.TurnEngine' needs 'Backends' for the ISA registry builder, and
+<span class="lineno">    6 </span>-- 'Seal.Channel.Cli' needs 'Seal.Core.TurnEngine' for the unified
+<span class="lineno">    7 </span>-- 'buildSessionRegistry'. 'Seal.Channel.Cli' re-exports 'Backends' and
+<span class="lineno">    8 </span>-- 'newBackends' for backward compatibility.
+<span class="lineno">    9 </span>module Seal.Core.Backends
+<span class="lineno">   10 </span>  ( Backends (..)
+<span class="lineno">   11 </span>  , newBackends
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Agent.Def.Backend qualified as Def
+<span class="lineno">   17 </span>import Seal.Agent.Runtime.Delegation
+<span class="lineno">   18 </span>  ( DelegationConfig, defaultDelegationConfig
+<span class="lineno">   19 </span>  , SpawnPauseFlag, newSpawnPauseFlag
+<span class="lineno">   20 </span>  , ParentActivity, newParentActivity )
+<span class="lineno">   21 </span>import Seal.Agent.Runtime.Registry (AgentRuntime, newAgentRuntime)
+<span class="lineno">   22 </span>import Seal.Git.Repo (ConfigRepo)
+<span class="lineno">   23 </span>import Seal.Memory.Backend qualified as Mem
+<span class="lineno">   24 </span>import Seal.Skills.Backend qualified as Skill
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | The evolutionary-store backends + the in-process agent runtime, created
+<span class="lineno">   27 </span>-- once at startup and shared between the command specs (which read them via
+<span class="lineno">   28 </span>-- @\/skill@ \/ @\/agent@) and the ISA opcodes (which mutate them). The three
+<span class="lineno">   29 </span>-- store backends are disk-backed (Markdown files under @config\/@); disk is
+<span class="lineno">   30 </span>-- canonical and git is the versioning + audit layer. The agent runtime is an
+<span class="lineno">   31 </span>-- in-process STM registry (lifecycle only — not persisted). The delegation
+<span class="lineno">   32 </span>-- knobs (config, pause flag, parent-activity cell) are process-global so
+<span class="lineno">   33 </span>-- AGENT_START calls across all channels share one pause / heartbeat state.
+<span class="lineno">   34 </span>data Backends = Backends
+<span class="lineno">   35 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">bMemory</span></span></span>    :: Mem.MemoryBackend
+<span class="lineno">   36 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bSkills</span></span></span>    :: Skill.SkillBackend
+<span class="lineno">   37 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bAgentDefs</span></span></span> :: Def.AgentDefBackend
+<span class="lineno">   38 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bRuntime</span></span></span>   :: AgentRuntime
+<span class="lineno">   39 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">bDelegationConfig</span></span></span> :: IO DelegationConfig
+<span class="lineno">   40 </span>    -- ^ Reload the [delegation] config per AGENT_START call (so config
+<span class="lineno">   41 </span>    -- changes take effect without a restart). The IO action reads
+<span class="lineno">   42 </span>    -- @config.toml@ and returns the resolved 'DelegationConfig'.
+<span class="lineno">   43 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bSpawnPauseFlag</span></span></span> :: SpawnPauseFlag
+<span class="lineno">   44 </span>    -- ^ Process-global spawn-pause flag (operator can freeze new fan-out).
+<span class="lineno">   45 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">bParentActivity</span></span></span> :: ParentActivity
+<span class="lineno">   46 </span>    -- ^ Process-global parent-activity cell (heartbeat target).
+<span class="lineno">   47 </span>  }
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Construct the disk-backed backends for the given config repo. The three
+<span class="lineno">   50 </span>-- stores read their directories on demand (no startup materialization needed
+<span class="lineno">   51 </span>-- — disk is canonical, so @\/skill list@ etc. just enumerate the dir). The
+<span class="lineno">   52 </span>-- delegation knobs are process-global; the config is re-read per AGENT_START
+<span class="lineno">   53 </span>-- call so config changes take effect without a restart.
+<span class="lineno">   54 </span>newBackends :: FilePath -&gt; ConfigRepo -&gt; IO Backends
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">newBackends cfgRoot repo = do</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">let skillsDir    = cfgRoot &lt;/&gt; &quot;skills&quot;</span>
+<span class="lineno">   57 </span><span class="spaces">      </span><span class="istickedoff">agentsDir    = cfgRoot &lt;/&gt; &quot;agents&quot;</span>
+<span class="lineno">   58 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">memoryDir    = cfgRoot &lt;/&gt; &quot;memory&quot;</span></span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">rt          &lt;- newAgentRuntime</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">pauseFlag   &lt;- newSpawnPauseFlag</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">parentAct   &lt;- newParentActivity</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">Backends</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; Mem.markdownMemoryBackend <span class="nottickedoff">memoryDir</span> <span class="nottickedoff">repo</span></span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; (Skill.unionSkillBackend &lt;$&gt; Skill.markdownSkillBackend skillsDir repo)</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; Def.markdownAgentDefBackend agentsDir repo</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; pure rt</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">(pure defaultDelegationConfig)</span>  -- overridden at call sites that have a config path</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; pure pauseFlag</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; pure <span class="nottickedoff">parentAct</span></span></span>
+
+</pre>
+</body>
+</html>
