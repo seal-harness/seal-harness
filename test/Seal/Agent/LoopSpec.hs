@@ -137,7 +137,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                    (const (Right ()))
+                    (const (Right ())) False
                     (\_ _ -> do
                       liftIO (modifyIORef' ran (+ 1))
                       pure (OpResult [TrpText "pong"] False Null))
@@ -602,7 +602,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "rejected"
                    , ccPromptSecret = \_ -> pure "" }
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                     (const (Right ()))
+                     (const (Right ())) False
                      (\_ _ -> do
                        liftIO (modifyIORef' ran (+ 1))
                        pure (OpResult [TrpText "pong"] False Null))
@@ -916,7 +916,7 @@ spec = describe "Seal.Agent.Loop" $ do
           -- A tool-use loop that never terminates: each response calls PING,
           -- so the loop runs until aeMaxTurns is hit.
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                     (const (Right ()))
+                     (const (Right ())) False
                      (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
           script = replicate 20 (CompletionResponse
                                    [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
@@ -1146,7 +1146,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                    (const (Right ()))
+                    (const (Right ())) False
                     (\_ _ -> do
                       liftIO (modifyIORef' ran (+ 1))
                       pure (OpResult [TrpText "pong"] False Null))
@@ -1263,7 +1263,7 @@ spec = describe "Seal.Agent.Loop" $ do
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         selfStopOp = TrustedOpcode (OpName "SELFSTOP") Trusted "sets the abort flag"
                         (object []) (object [])
-                        (const (Right ()))
+                        (const (Right ())) False
                         (\_ _ -> do
                            liftIO (setAbort abortFlag)
                            pure (OpResult [TrpText "stopped"] False Null))

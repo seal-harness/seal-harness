@@ -13,6 +13,7 @@ stubTrustedOp :: OpName -> Opcode
 stubTrustedOp n = TrustedOpcode
   { toName = n, toTrust = Trusted, toDesc = "desc", toInSchema = object [], toOutSchema = object []
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> pure (OpResult [] False Null) }
 
 stubUntrustedOp :: OpName -> Opcode

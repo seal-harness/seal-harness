@@ -54,6 +54,7 @@ secretGetOp rt = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize =
       maybe (Left "SECRET_GET requires {name:string}") (const (Right ())) . nameField
+  , toBlocking = False
   , toRun = \_ v -> do
       let key = fromMaybe "" (nameField v)
       val <- liftIO (vaultGetByName rt key)

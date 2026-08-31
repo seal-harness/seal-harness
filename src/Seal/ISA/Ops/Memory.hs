@@ -119,6 +119,7 @@ memoryWriteOp backend session = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = maybe (Left "MEMORY_WRITE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of
@@ -187,6 +188,7 @@ memoryRecallOp params backend = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ v -> do
       let mQuery = queryField v
           offset = offsetField v
@@ -224,6 +226,7 @@ memoryDeleteOp backend = TrustedOpcode
   , toInSchema = singleStringSchema "id" "The memory id to delete."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "MEMORY_DELETE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkMemoryId
       case mId of

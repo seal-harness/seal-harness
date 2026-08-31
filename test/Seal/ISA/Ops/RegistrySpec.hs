@@ -35,6 +35,7 @@ sampleOp = TrustedOpcode
       ]
   , toOutSchema = object ["type" .= ("object" :: T.Text)]
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> pure (OpResult [TrpText "ok"] False (object []))
   }
 

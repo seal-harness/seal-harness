@@ -172,6 +172,7 @@ agentDefWriteOp backend session = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_DEF_WRITE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
@@ -224,6 +225,7 @@ agentDefReadOp backend = TrustedOpcode
   , toInSchema = singleStringSchema "id" "The agent def id to read."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_DEF_READ requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
@@ -255,6 +257,7 @@ agentDefListOp backend = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> do
       defs <- liftIO (adbList backend)
       let rendered = case defs of
@@ -282,6 +285,7 @@ agentDefDeleteOp backend = TrustedOpcode
   , toInSchema = singleStringSchema "id" "The agent def id to delete."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_DEF_DELETE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
       case mId of
@@ -316,6 +320,7 @@ agentInstancesOp runtime = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> do
       insts <- liftIO (listAgents runtime)
       let rendered = case insts of
@@ -402,6 +407,7 @@ agentStartOp wiring = TrustedOpcode
       in if hasGoal || hasTasks
            then Right ()
            else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+  , toBlocking = False
   , toRun = \_ v -> do
       input <- liftIO (parseInput v)
       case input of
@@ -521,6 +527,7 @@ agentStatusOp runtime = TrustedOpcode
   , toInSchema = singleStringSchema "subagent_id" "The subagent id (from AGENT_START's result)."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STATUS requires {subagent_id:string}") checkSubagentId . subagentIdField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mSid = subagentIdField v
       case mSid of
@@ -549,6 +556,7 @@ agentStopOp runtime = TrustedOpcode
   , toInSchema = singleStringSchema "subagent_id" "The subagent id to stop."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_STOP requires {subagent_id:string}") (const (Right ())) . subagentIdField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mSid = subagentIdField v
       case mSid of
@@ -574,6 +582,7 @@ agentInterruptOp runtime = TrustedOpcode
   , toInSchema = singleStringSchema "subagent_id" "The subagent id to interrupt."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "AGENT_INTERRUPT requires {subagent_id:string}") (const (Right ())) . subagentIdField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mSid = subagentIdField v
       case mSid of
