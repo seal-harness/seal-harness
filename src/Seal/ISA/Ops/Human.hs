@@ -97,6 +97,7 @@ showHumanOp caps = TrustedOpcode
   , toOutSchema = object []
   , toAuthorize =
       maybe (Left "SHOW_HUMAN requires {message:string}") (const (Right ())) . strField "message"
+  , toBlocking = False
   , toRun = \_ v -> do
       let msg = fromMaybe "" (strField "message" v)
       liftIO (ccShowHuman caps msg)
@@ -114,6 +115,7 @@ askHumanOp caps = TrustedOpcode
   , toDesc = "Ask the human operator a question and return their reply."
   , toInSchema = askHumanSchema
   , toOutSchema = object []
+  , toBlocking = True
   , toAuthorize = \v ->
       case strField "question" v of
         Nothing -> Left "ASK_HUMAN requires {question:string}"

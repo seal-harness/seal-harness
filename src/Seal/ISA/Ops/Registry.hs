@@ -85,6 +85,7 @@ opcodeDescribeOp reg = TrustedOpcode
           ]
       ]
   , toAuthorize = maybe (Left "OPCODE_DESCRIBE requires {name:string}") (const (Right ())) . nameField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mName = nameField v
       case mName of
@@ -127,6 +128,7 @@ opcodeListOp reg = TrustedOpcode
           ]
       ]
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> do
       let defs = registryToolDefs' False reg
           rendered = case defs of

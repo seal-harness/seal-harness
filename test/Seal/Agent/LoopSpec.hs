@@ -137,7 +137,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                    (const (Right ()))
+                    (const (Right ())) False
                     (\_ _ -> do
                       liftIO (modifyIORef' ran (+ 1))
                       pure (OpResult [TrpText "pong"] False Null))
@@ -602,7 +602,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , ccPrompt = \ap -> modifyIORef' prompts (++ [apQuestion ap]) >> pure "rejected"
                    , ccPromptSecret = \_ -> pure "" }
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                     (const (Right ()))
+                     (const (Right ())) False
                      (\_ _ -> do
                        liftIO (modifyIORef' ran (+ 1))
                        pure (OpResult [TrpText "pong"] False Null))
@@ -916,7 +916,7 @@ spec = describe "Seal.Agent.Loop" $ do
           -- A tool-use loop that never terminates: each response calls PING,
           -- so the loop runs until aeMaxTurns is hit.
           stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                     (const (Right ()))
+                     (const (Right ())) False
                      (\_ _ -> pure (OpResult [TrpText "pong"] False Null))
           script = replicate 20 (CompletionResponse
                                    [CbToolUse (ToolCallId "t1") (OpName "PING") (object [])]
@@ -1146,7 +1146,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         stubOp = TrustedOpcode (OpName "PING") Trusted "p" (object []) (object [])
-                    (const (Right ()))
+                    (const (Right ())) False
                     (\_ _ -> do
                       liftIO (modifyIORef' ran (+ 1))
                       pure (OpResult [TrpText "pong"] False Null))
@@ -1188,6 +1188,94 @@ spec = describe "Seal.Agent.Loop" $ do
     readIORef ran `shouldReturn` 1
     sentMsgs <- readIORef sent
     sentMsgs `shouldSatisfy` any ("all done" `T.isInfixOf`)
+
+  -- ── Streamed text sanitization (leaked tool-call XML) ───────────────────
+  --
+  -- Regression for sessions 20260831-162314-870 / 20260831-162806-923: some
+  -- provider stacks occasionally emit a tool call as XML in the TEXT stream
+  -- (e.g. <invoke "FILE_READ">...</invoke>) alongside the structured
+  -- tool_calls chunk. When that text is recorded verbatim as a CbText block,
+  -- the transcript and the frontend display half-parsed tool syntax and
+  -- subsequent turns feed the leaked markup back to the model.
+
+  it "aggregateStreamEvents strips a complete leaked invoke block" $ do
+    let xml = "<invoke \"FILE_READ\"><arg_key>path</arg_key><arg_value>a.hs</arg_value></invoke>"
+        evs = [StreamTextChunk xml, StreamDone StopEnd (Usage 1 2)]
+        resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+    resp `shouldBe` CompletionResponse [CbText ""] StopEnd (Usage 1 2)
+
+  it "aggregateStreamEvents strips orphan tool-call tags but keeps prose" $ do
+    let evs = [ StreamTextChunk "I'll check the file now. "
+              , StreamTextChunk "</invoke>"
+              , StreamDone StopEnd (Usage 1 2)
+              ]
+        resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+    resp `shouldBe` CompletionResponse [CbText "I'll check the file now. "] StopEnd (Usage 1 2)
+
+  it "aggregateStreamEvents drops a trailing partial tag (truncation tail)" $ do
+    let evs = [ StreamTextChunk "Reading the config now. <invoke \"FILE_RE"
+              , StreamDone StopMaxTokens (Usage 1 99)
+              ]
+        resp = aggregateStreamEvents evs (StreamOutcome StopMaxTokens (Usage 1 99))
+    resp `shouldBe` CompletionResponse [CbText "Reading the config now. "] StopMaxTokens (Usage 1 99)
+
+  it "aggregateStreamEvents leaves ordinary prose with '<' untouched" $ do
+    let evs = [ StreamTextChunk "5 < 6 and x <invoke-ish nonsense stays"
+              , StreamDone StopEnd (Usage 1 2)
+              ]
+        resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+    resp `shouldBe` CompletionResponse [CbText "5 < 6 and x <invoke-ish nonsense stays"] StopEnd (Usage 1 2)
+
+  it "aggregateStreamEvents strips <tool_call> blocks in text" $ do
+    let xml = "<tool_call>{\"name\": \"FILE_READ\"}</tool_call>"
+        evs = [StreamTextChunk ("pre " <> xml <> " post"), StreamDone StopEnd (Usage 1 2)]
+        resp = aggregateStreamEvents evs (StreamOutcome StopEnd (Usage 1 2))
+    resp `shouldBe` CompletionResponse [CbText "pre  post"] StopEnd (Usage 1 2)
+
+  -- After a StopMaxTokens auto-continuation, the prior partial text must be
+  -- present in the on-disk conversation (the model resumes from it), and
+  -- the resumed text must also be recorded.
+  it "turn after StopMaxTokens keeps the prior partial text in conversation" $ do
+    approvals <- newApprovalCache
+    sent <- newIORef ([] :: [Text])
+    let caps = def
+                 { ccSend = \t -> modifyIORef' sent (++ [t]) }
+        script =
+          [ CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100)
+          , CompletionResponse [CbText " done"] StopEnd (Usage 1 50)
+          ]
+    ref <- newIORef script
+    (h, readBack) <- fakeTwoFileTranscript
+    let env = AgentEnv
+                { aeProvider = SomeProvider (ScriptProvider ref)
+                , aeProviderLabel = "ollama"
+                , aeModel = ModelId "m"
+                , aeSystem = Nothing
+                , aeRegistry = mkRegistry []
+                , aeTranscript = h
+                , aeBackend = localBackend
+                , aeUIOEnv = mkTestUIOEnv mkRemoteUntrustedIOStub stubCloneDeps
+                , aeCaps = caps
+                , aeSession = either (error "sid") id (mkSessionId "s1")
+                , aeMaxTurns = 8
+                , aeChannel = "test"
+                , aeMessageSource = Nothing
+                , aeAutonomy = Full
+                , aeApprovals = approvals
+                , aeDebugRequestsPath = Nothing
+                , aeOnEntry = pure ()
+                , aeOnUserMessage = Nothing
+                , aeOnStop = Nothing
+                , aeOnDemandSchemas = False
+                , aeLogPath = Nothing
+                , aeAbortFlag = testAbortFlag
+                , aeToolTimeout = defaultToolTimeoutConfig
+                }
+    runTestApp (runTurn env "hi")
+    (conv, _) <- readBack
+    let assistantTexts = [ t | Message Assistant blocks <- conv, CbText t <- blocks ]
+    assistantTexts `shouldSatisfy` any ("partial" `T.isInfixOf`)
+    assistantTexts `shouldSatisfy` any ("done" `T.isInfixOf`)
 
   -- The truncation event must be logged to seal.log when aeLogPath is set.
   it "logs StopMaxTokens continuation to seal.log" $
@@ -1263,7 +1351,7 @@ spec = describe "Seal.Agent.Loop" $ do
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
         selfStopOp = TrustedOpcode (OpName "SELFSTOP") Trusted "sets the abort flag"
                         (object []) (object [])
-                        (const (Right ()))
+                        (const (Right ())) False
                         (\_ _ -> do
                            liftIO (setAbort abortFlag)
                            pure (OpResult [TrpText "stopped"] False Null))

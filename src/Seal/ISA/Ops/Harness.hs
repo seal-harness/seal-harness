@@ -55,6 +55,7 @@ harnessListOp reg = TrustedOpcode
           ]
       ]
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_back _input -> liftIO $ do
       entries <- snapshot reg
       let arr = map entryToJson entries
@@ -89,6 +90,7 @@ harnessStartOp reg runner session window flavour mintId = TrustedOpcode
       , "required" .= (["id"] :: [Text])
       ]
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_back _input -> liftIO $ do
       hid <- mintId
       r1 <- startTmuxSessionStatus runner session
@@ -127,6 +129,7 @@ harnessStopOp reg runner = TrustedOpcode
       ]
   , toOutSchema = object ["type" .= ("object" :: Text), "properties" .= object []]
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_back input -> liftIO $ do
       case idField input of
         Nothing -> pure (opErr "missing id")

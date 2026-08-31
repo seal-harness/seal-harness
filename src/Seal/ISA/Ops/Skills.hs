@@ -109,6 +109,7 @@ skillWriteOp backend session = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = maybe (Left "SKILL_WRITE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
           mNewGroup = groupField v
@@ -168,6 +169,7 @@ skillLoadOp backend = TrustedOpcode
   , toInSchema = singleStringSchema "id" "The skill id to load."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "SKILL_LOAD requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of
@@ -203,6 +205,7 @@ skillDeleteOp backend = TrustedOpcode
   , toInSchema = singleStringSchema "id" "The skill id to delete."
   , toOutSchema = object []
   , toAuthorize = maybe (Left "SKILL_DELETE requires {id:string}") checkId . idField
+  , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkSkillId
       case mId of
@@ -234,6 +237,7 @@ skillListOp backend = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = const (Right ())
+  , toBlocking = False
   , toRun = \_ _ -> do
       allSkills <- liftIO (sbList backend)
       let rendered = case allSkills of

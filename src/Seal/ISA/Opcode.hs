@@ -27,6 +27,7 @@ module Seal.ISA.Opcode
   , opInSchema
   , opOutSchema
   , opAuthorize
+  , opBlocking
   , opRun
   , withAuthorize
   ) where
@@ -66,6 +67,15 @@ localBackend = BackendExec liftIO
 -- its 'uoRun' threads. The field-name prefixes (@to@ / @uo@) keep the two
 -- constructors' record namespaces disjoint (Haskell requires this when
 -- constructors share a type but have different fields).
+--
+-- The 'toBlocking' flag on 'TrustedOpcode' marks opcodes that block on
+-- human input (ASK_HUMAN). The dispatcher skips the timeout/abort/retry
+-- race for blocking opcodes — the timeout is designed for subprocess
+-- execution, not human prompts. A human can take arbitrarily long to
+-- answer, and the 'AskReplyStore' has its own cancel mechanism
+-- ('cancelAsk'/'cancelSessionAsks'). Always 'False' for 'UntrustedOpcode'
+-- (untrusted opcodes never block on human input — the confirmation gate
+-- is in the agent loop, not the opcode).
 data Opcode
   = TrustedOpcode
       { toName       :: OpName
@@ -74,6 +84,7 @@ data Opcode
       , toInSchema   :: Value
       , toOutSchema  :: Value
       , toAuthorize  :: Value -> Either Text ()
+      , toBlocking   :: Bool            -- ^ blocks on human input (ASK_HUMAN); skips the timeout/abort/retry race
       , toRun        :: BackendExec -> Value -> App OpResult
       }
   | UntrustedOpcode
@@ -87,40 +98,47 @@ data Opcode
 
 -- | Accessor: the opcode's name (works for both constructors).
 opName :: Opcode -> OpName
-opName (TrustedOpcode n _ _ _ _ _ _) = n
+opName (TrustedOpcode n _ _ _ _ _ _ _) = n
 opName (UntrustedOpcode n _ _ _ _ _) = n
 
 -- | Accessor: the trust level. 'UntrustedOpcode' is always 'Untrusted'.
 opTrust :: Opcode -> TrustLevel
-opTrust (TrustedOpcode _ tl _ _ _ _ _) = tl
+opTrust (TrustedOpcode _ tl _ _ _ _ _ _) = tl
 opTrust (UntrustedOpcode {})  = Untrusted
 
 -- | Accessor: the description (for tool definitions).
 opDesc :: Opcode -> Text
-opDesc (TrustedOpcode _ _ d _ _ _ _) = d
+opDesc (TrustedOpcode _ _ d _ _ _ _ _) = d
 opDesc (UntrustedOpcode _ d _ _ _ _) = d
 
 -- | Accessor: the input JSON schema.
 opInSchema :: Opcode -> Value
-opInSchema (TrustedOpcode _ _ _ s _ _ _) = s
+opInSchema (TrustedOpcode _ _ _ s _ _ _ _) = s
 opInSchema (UntrustedOpcode _ _ s _ _ _) = s
 
 -- | Accessor: the output JSON schema.
 opOutSchema :: Opcode -> Value
-opOutSchema (TrustedOpcode _ _ _ _ s _ _) = s
+opOutSchema (TrustedOpcode _ _ _ _ s _ _ _) = s
 opOutSchema (UntrustedOpcode _ _ _ s _ _) = s
 
 -- | Accessor: the authorization gate.
 opAuthorize :: Opcode -> Value -> Either Text ()
-opAuthorize (TrustedOpcode _ _ _ _ _ a _) = a
+opAuthorize (TrustedOpcode _ _ _ _ _ a _ _) = a
 opAuthorize (UntrustedOpcode _ _ _ _ a _) = a
+
+-- | Accessor: whether this opcode blocks on human input (skips the
+-- timeout/abort/retry race in the dispatcher). Always 'False' for
+-- 'UntrustedOpcode'.
+opBlocking :: Opcode -> Bool
+opBlocking (TrustedOpcode _ _ _ _ _ _ b _) = b
+opBlocking (UntrustedOpcode {}) = False
 
 -- | Accessor: the run action for a TRUSTED opcode. Calling this on an
 -- 'UntrustedOpcode' is an error (use the dispatcher, which pattern-matches
 -- the GADT and calls 'uoRun' for untrusted). Provided so legacy call
 -- sites that read 'opRun' on a known-trusted opcode keep working.
 opRun :: Opcode -> BackendExec -> Value -> App OpResult
-opRun (TrustedOpcode _ _ _ _ _ _ r) = r
+opRun (TrustedOpcode _ _ _ _ _ _ _ r) = r
 opRun UntrustedOpcode {} =
   error "opRun: UntrustedOpcode has no toRun; use the dispatcher's uoRun path"
 
@@ -128,7 +146,7 @@ opRun UntrustedOpcode {} =
 -- authorize function on an opcode (GADTs forbid record-update on a sum
 -- whose fields differ per constructor).
 withAuthorize :: Opcode -> (Value -> Either Text ()) -> Opcode
-withAuthorize (TrustedOpcode n tl d is os _ r) f =
-  TrustedOpcode n tl d is os f r
+withAuthorize (TrustedOpcode n tl d is os _ b r) f =
+  TrustedOpcode n tl d is os f b r
 withAuthorize (UntrustedOpcode n d is os _ r) f =
   UntrustedOpcode n d is os f r

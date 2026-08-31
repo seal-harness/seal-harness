@@ -96,40 +96,46 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
               case opTrust op of
                 Trusted -> do
                   liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-                  -- Wrap toRun in the same timeout/abort/retry race.
-                  env <- ask
-                  let ioAction :: IO (Either ToolError OpResult)
-                      ioAction = do
-                        r <- runApp env (toRun op backend input)
-                        pure (Right r)
-                  raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
-                  case raced of
-                    Right opResult -> pure (Right opResult)
-                    Left toolErr -> do
-                      liftIO (recordToolError h name input toolErr perCallMicros)
-                      pure (Left (ExecFailed (renderToolError name toolErr)))
+                  runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Audited -> do
                   -- No Audited log remains; treat as Trusted (record to the
                   -- session transcript, then run). The evolutionary-store
                   -- opcodes that used to be Audited are now Trusted file writes.
                   liftIO (tfwRecordAsync h (TwoFileWrite [] entry))
-                  env <- ask
-                  let ioAction :: IO (Either ToolError OpResult)
-                      ioAction = do
-                        r <- runApp env (toRun op backend input)
-                        pure (Right r)
-                  raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
-                  case raced of
-                    Right opResult -> pure (Right opResult)
-                    Left toolErr -> do
-                      liftIO (recordToolError h name input toolErr perCallMicros)
-                      pure (Left (ExecFailed (renderToolError name toolErr)))
+                  runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Untrusted ->
                   -- Unreachable: an UntrustedOpcode would have matched above.
                   -- Kept for exhaustiveness (the GADT already separates the
                   -- arms; opTrust on a TrustedOpcode returns its stored tl,
                   -- which the Opcode invariants guarantee is Trusted or Audited).
                   error "dispatch: invariant violation — Untrusted trust on a TrustedOpcode"
+  where
+    -- | Run a Trusted opcode, conditionally wrapping it in the
+    -- timeout/abort/retry race. Blocking opcodes (ASK_HUMAN) skip the
+    -- race — they block on human input which can take arbitrarily long,
+    -- and the 'AskReplyStore' has its own cancel mechanism. Non-blocking
+    -- opcodes get the full timeout/abort/retry treatment.
+    runTrustedOpcode
+      :: TwoFileHandle -> BackendExec -> ToolTimeoutConfig -> AbortFlag
+      -> Opcode -> OpName -> Value -> Int
+      -> App (Either DispatchError OpResult)
+    runTrustedOpcode h' backend' tt abort op' nm inp micros
+      | opBlocking op' = do
+          -- Blocking: run directly, no timeout race.
+          r <- toRun op' backend' inp
+          pure (Right r)
+      | otherwise = do
+          env <- ask
+          let ioAction :: IO (Either ToolError OpResult)
+              ioAction = do
+                r <- runApp env (toRun op' backend' inp)
+                pure (Right r)
+          raced <- liftIO (runWithTimeoutAbortRetry tt abort (Microseconds micros) ioAction)
+          case raced of
+            Right opResult -> pure (Right opResult)
+            Left toolErr -> do
+              liftIO (recordToolError h' nm inp toolErr micros)
+              pure (Left (ExecFailed (renderToolError nm toolErr)))
 
 -- | Build the 'EntryRecord' for an opcode invocation. The opcode name and the
 -- secret-free input are recorded in 'erMeta'; the entry kind is 'EKHarness'.
