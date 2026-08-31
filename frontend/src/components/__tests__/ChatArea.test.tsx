@@ -1301,6 +1301,90 @@ describe('AskHumanForm', () => {
     expect(onAnswerText).toHaveBeenCalledWith('q1', 'main')
   })
 
+  it('shows a submitting indicator after clicking a stock button', () => {
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    // Never resolves — simulates a slow/lost response
+    let _resolve: ((v: boolean) => void) | undefined
+    const onAnswerText = vi.fn(() => new Promise<boolean>((resolve) => { _resolve = resolve }))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByText('main'))
+    // A submitting indicator should be visible
+    expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
+    // The form should still be visible (not unmounted)
+    expect(screen.getByTestId('ask-human-form')).toBeTruthy()
+    // Cleanup: resolve the promise so the test doesn't hang
+    if (_resolve) _resolve(true)
+  })
+
+  it('marks the clicked button as selected after clicking', () => {
+    const messages = [makeAskMessage([
+      { label: 'main', description: 'd' },
+      { label: 'develop', description: 'd2' },
+    ])]
+    const pendingQuestions = [makePendingQuestion([
+      { label: 'main', description: 'd' },
+      { label: 'develop', description: 'd2' },
+    ])]
+    let _resolve: ((v: boolean) => void) | undefined
+    const onAnswerText = vi.fn(() => new Promise<boolean>((resolve) => { _resolve = resolve }))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByText('main'))
+    // The clicked button should have aria-checked=true (selected state)
+    const mainBtn = screen.getByText('main').closest('button')!
+    expect(mainBtn.getAttribute('aria-checked')).toBe('true')
+    // The other button should NOT be selected
+    const devBtn = screen.getByText('develop').closest('button')!
+    expect(devBtn.getAttribute('aria-checked')).toBe('false')
+    if (_resolve) _resolve(true)
+  })
+
+  it('resets submitting after a timeout if WS ask_resolved never arrives', async () => {
+    vi.useFakeTimers()
+    const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
+    const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
+    // Promise resolves true (accepted), but the pendingQuestions prop never
+    // changes (simulating WS ask_resolved never arriving).
+    const onAnswerText = vi.fn(() => Promise.resolve(true))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        pendingQuestions={pendingQuestions}
+        onAnswerQuestionText={onAnswerText}
+        onCancelQuestion={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByText('main'))
+    // The submitting indicator should be visible
+    expect(screen.getByTestId('ask-human-submitting')).toBeTruthy()
+    // Advance past the 15s grace period. This fires the fallback timeout
+    // that resets submitting. The promise microtask (Promise.resolve) is
+    // flushed as part of advancing timers.
+    await vi.advanceTimersByTimeAsync(16_000)
+    // The submitting indicator should be gone
+    expect(screen.queryByTestId('ask-human-submitting')).toBeNull()
+    // An error should be shown
+    expect(screen.getByText('No confirmation from server — try again')).toBeTruthy()
+    vi.useRealTimers()
+  })
+
   it('typing + Enter submits the Other textarea', () => {
     const messages = [makeAskMessage([{ label: 'main', description: 'd' }])]
     const pendingQuestions = [makePendingQuestion([{ label: 'main', description: 'd' }])]
