@@ -74,6 +74,7 @@ import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.ExecCache (SessionExecCache)
 import Seal.Session.Meta (SessionMeta (..))
@@ -97,6 +98,9 @@ data SendDeps = SendDeps
   { sdPaths      :: SealPaths
   , sdVault      :: VaultRuntime
   , sdRepoReg    :: RepoRegistryHandle
+  , sdAgentReg   :: AgentRegistryHandle
+    -- ^ The shared ssh-agent registry (one per process). Threaded through
+    -- 'TurnDeps' so all git-op call sites share the same 'arhLive' set.
   , sdProvider   :: ProviderRuntime
   , sdSession    :: SessionRuntime
   , sdBackends   :: Backends
@@ -211,6 +215,7 @@ mkWebTurnDeps deps = TurnDeps
   , tdProvider     = sdProvider deps
   , tdResolve      = sdResolve deps
   , tdRepoReg      = sdRepoReg deps
+  , tdAgentReg     = sdAgentReg deps
   , tdAutonomy     = sdAutonomy deps
   , tdBroker       = sdBroker deps
   , tdHarnessReg   = sdHarnessRegistry deps

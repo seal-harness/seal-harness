@@ -46,7 +46,7 @@ import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, vaultFilePath)
+import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, reposFilePath, securityFilePath, sshAgentsDir, vaultFilePath)
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (MessageSource, UserId)
 import Seal.Core.Types (mkSessionId)
@@ -61,6 +61,7 @@ import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), emptyChain, ingest)
 import Seal.Routing.Route qualified
 import Seal.Security.Policy (AutonomyLevel)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs, newTabsHandle)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), TabSlashCommand (..), ForceMode (..), tabCount, tlTabs, lookupByRef)
@@ -319,11 +320,14 @@ runSignalMain autonomy logger = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  -- Shared ssh-agent registry (one per process — #88).
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep agentRegH
   cursorsH <- newPersistingCursorStore (cursorMapPath paths)
   mCursors <- loadCursorMap (cursorMapPath paths)
   for_ mCursors (seedCursorStore cursorsH)
   chanDeps <- newChannelDeps
-        paths rt repoRegH pr backends autonomy Nothing
+        paths rt repoRegH agentRegH pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger cursorsH
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt

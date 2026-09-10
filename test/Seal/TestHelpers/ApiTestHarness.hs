@@ -80,7 +80,7 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
-import Seal.Config.Paths (SealPaths (..), securityFilePath)
+import Seal.Config.Paths (SealPaths (..), securityFilePath, sshAgentsDir)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
@@ -104,6 +104,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
@@ -420,6 +421,7 @@ buildTestEnv tmp mode mRepo opts = do
         { rrhList = pure (Right repos)
         , rrhMutate = \_ -> pure (Right ())
         }
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
 
   -- Security config: remote mode needs untrusted_execution.remote.
   -- Write it to security.toml so runTurnBody picks it up (the turn
@@ -449,6 +451,7 @@ buildTestEnv tmp mode mRepo opts = do
         { sdPaths = paths
         , sdVault = rt
         , sdRepoReg = repoRegH
+        , sdAgentReg = agentRegH
         , sdProvider = pr
         , sdSession = sr
         , sdBackends = backends
@@ -487,6 +490,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry = repoRegH
+        , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
         , adVault = rt
         , adPaths = paths

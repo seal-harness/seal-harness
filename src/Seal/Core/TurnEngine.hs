@@ -64,7 +64,7 @@ import Seal.Config.File
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
    sessionDir,
-   sessionLogPath, sessionRequestsPath, sshAgentsDir)
+   sessionLogPath, sessionRequestsPath)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
@@ -131,7 +131,7 @@ import Seal.Skills.Types qualified as SealSkillTypes
 import Seal.Skills.Prompt (injectAvailableSkills)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
-import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, lookupOrCreateAbortFlag)
@@ -375,6 +375,10 @@ data TurnDeps = TurnDeps
   , tdProvider     :: ProviderRuntime
   , tdResolve      :: SessionMeta -> IO (Either Text (SomeProvider, ModelId))
   , tdRepoReg      :: RepoRegistryHandle
+  , tdAgentReg     :: AgentRegistryHandle
+    -- ^ The shared ssh-agent registry (one per process). Threaded through
+    -- all 'CloneDeps' call sites so the 'arhLive' set + 'arhLock' +
+    -- 'arhCache' are shared — prevents duplicate ssh-agent processes.
   , tdAutonomy     :: Policy.AutonomyLevel
   , tdBroker       :: Maybe StreamBroker
   , tdHarnessReg   :: HarnessRegistry
@@ -689,12 +693,11 @@ recordPreamble tHandle model mSystem isaReg = do
 -- 'mkRealSshAgentHandle'); the pinned host keys are compile-time-embedded.
 mkCloneDepsTurn :: TurnDeps -> IO Clone.CloneDeps
 mkCloneDepsTurn td = do
-  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (tdPaths td))
   pure Clone.CloneDeps
     { Clone.cdVault = tdVault td
     , Clone.cdRepoReg = tdRepoReg td
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentRegH
+    , Clone.cdAgentRegistry = tdAgentReg td
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (tdPaths td)
     , Clone.cdIsRemote = tdIsRemote td
