@@ -267,6 +267,7 @@ agentDefWriteOp backend session = TrustedOpcode
       , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
       , "WEB_FETCH", "WEB_SEARCH"
       , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
+      , "OPCODE_DESCRIBE", "OPCODE_LIST"
       ]
 
 -- ---------------------------------------------------------------------------

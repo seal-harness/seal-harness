@@ -108,15 +108,16 @@ agentFenceTokens :: [Text]
 agentFenceTokens = ["</available_agents>", "</available_skills>", "---"]
 
 -- | Sanitize one agent-def text field for prompt/catalog rendering:
--- newlines and carriage returns become spaces, C0 control characters are
--- stripped, the catalog fence tokens become underscores, and the result
--- is truncated at @cap@ characters with a truncation marker. Pure; used
--- by both decode paths and AGENT_DEF_WRITE (single chokepoint each).
+-- newlines, carriage returns, and tabs become spaces, C0 control
+-- characters are stripped, the catalog fence tokens become underscores,
+-- and the result is truncated at @cap@ characters with a truncation
+-- marker. Pure; used by both decode paths and AGENT_DEF_WRITE (single
+-- chokepoint each).
 sanitizeAgentTextField :: Int -> Text -> Text
 sanitizeAgentTextField cap = truncateField cap . T.strip . replaceFences . stripControl . singleLine
   where
-    singleLine = T.replace "\r" " " . T.replace "\n" " "
-    stripControl = T.filter (\c -> c >= ' ' || c == '\t')
+    singleLine = T.replace "\r" " " . T.replace "\n" " " . T.replace "\t" " "
+    stripControl = T.filter (>= ' ')
     replaceFences t = foldl' (\acc tok -> T.replace tok "_" acc) t agentFenceTokens
     truncateField n txt
       | T.length txt <= n = txt
