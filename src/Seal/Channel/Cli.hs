@@ -84,6 +84,7 @@ import Seal.Types.App (runApp)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Types.Env (Env, envLogger)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
@@ -139,11 +140,11 @@ handlePlain agentEnv env t = do
 -- session on every turn so mid-session @\/model use@ changes take effect
 -- immediately.
 runCliTui
-  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> SessionRuntime
+  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> ProviderRuntime -> SessionRuntime
   -> Registry -> PreprocessChain -> Backends -> TabsHandle -> AutonomyLevel
   -> AskReplyStore -> SealLogger -> HarnessRegistry -> TmuxRunner
   -> SessionAbortRegistry -> IO ()
-runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg = do
+runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg = do
   approvals <- newApprovalCache
   replies <- newReplyRegistry
   locks <- newSessionLocks
@@ -208,6 +209,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdProvider     = pr
               , tdResolve      = resolveSessionProvider pr
               , tdRepoReg      = repoReg
+              , tdAgentReg     = agentReg
               , tdAutonomy     = autonomy
               , tdBroker       = Nothing
               , tdHarnessReg   = harnessReg
@@ -257,6 +259,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdProvider     = pr
               , tdResolve      = resolveSessionProvider pr
               , tdRepoReg      = repoReg
+              , tdAgentReg     = agentReg
               , tdAutonomy     = autonomy
               , tdBroker       = Nothing
               , tdHarnessReg   = harnessReg
@@ -283,6 +286,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , tdProvider     = pr
               , tdResolve      = resolveSessionProvider pr
               , tdRepoReg      = repoReg
+              , tdAgentReg     = agentReg
               , tdAutonomy     = autonomy
               , tdBroker       = Nothing  -- CLI has no WS broker
               , tdHarnessReg   = harnessReg

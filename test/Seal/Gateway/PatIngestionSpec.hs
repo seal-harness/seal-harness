@@ -51,7 +51,7 @@ import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Command.Tab (noTabCloseNotifier)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (mkSessionId)
@@ -249,6 +249,7 @@ mkVaultDeps vr tmp = do
   let paths = fakePaths { spState = tmp }
   uiState <- newUiStateHandle paths
   repoRegH <- mkRepoRegistryHandle (tmp </> "repos.toml")
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   let sr = SessionRuntime { srPaths = paths, srConfigPath = "", srActive = activeRef }
       deps = ApiDeps
         { adSessionRuntime  = sr
@@ -264,6 +265,7 @@ mkVaultDeps vr tmp = do
         , adBroker          = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = agentRegH
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
         , adVault            = vr
         , adPaths            = paths

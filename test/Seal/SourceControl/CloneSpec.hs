@@ -405,6 +405,107 @@ spec = describe "Seal.SourceControl.Clone" $ do
           , SahAddKey kf1 "passphrase-1"
           ]
 
+    it "shared registry across CloneDeps → no second sahStart (one handle)" $
+      withSystemTempDirectory "seal-home" $ \homeDir -> do
+        let keyfilesDir = homeDir </> ".seal/state/repos/keys"
+        createDirectoryIfMissing True keyfilesDir
+        let kf1 = keyfilesDir </> "repo-a"
+        BS.writeFile kf1 "ciphertext-1"
+        vault <- makeFakeVaultRuntime
+          [ ("K1", "passphrase-1")
+          ]
+        callsRef <- newIORef []
+        -- THE FIX: one shared AgentRegistryHandle for both CloneDeps
+        -- (mirrors the production fix: one handle threaded through
+        -- TurnDeps/ChannelDeps/SendDeps/ApiDeps).
+        sharedReg <- mkAgentRegistryHandle keyfilesDir
+        let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+            deps1 = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = fakeRepoRegistryHandle
+              , cdSshAgent = agent
+              , cdAgentRegistry = sharedReg
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
+              }
+            deps2 = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = fakeRepoRegistryHandle
+              , cdSshAgent = agent
+              , cdAgentRegistry = sharedReg
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
+              }
+        -- Op 1 via deps1 (start + addkey)
+        Right t1 <- resolveCloneTarget deps1 repo1
+        withCloneTarget t1 $ \_env -> pure ()
+        -- Op 2 via deps2 (same repo, same shared registry: cached agent
+        -- — no start, no addkey)
+        Right t2 <- resolveCloneTarget deps2 repo1
+        withCloneTarget t2 $ \_env -> pure ()
+        calls <- readIORef callsRef
+        calls `shouldBe`
+          [ SahStart
+          , SahAddKey kf1 "passphrase-1"
+          ]
+
+    it "separate registries (the bug) → second sahStart (duplicate agent)" $
+      withSystemTempDirectory "seal-home" $ \homeDir -> do
+        let keyfilesDir = homeDir </> ".seal/state/repos/keys"
+        createDirectoryIfMissing True keyfilesDir
+        let kf1 = keyfilesDir </> "repo-a"
+        BS.writeFile kf1 "ciphertext-1"
+        vault <- makeFakeVaultRuntime
+          [ ("K1", "passphrase-1")
+          ]
+        callsRef <- newIORef []
+        -- THE BUG: two separate AgentRegistryHandles (simulates the
+        -- production bug where each call site creates its own handle
+        -- via mkAgentRegistryHandle). The second handle's arhLive set
+        -- is empty, so it doesn't know about the agent the first handle
+        -- started. It falls through to the probe path; with a fake
+        -- agent, the probe fails (the socket doesn't exist), so it
+        -- starts a DUPLICATE agent.
+        reg1 <- mkAgentRegistryHandle keyfilesDir
+        reg2 <- mkAgentRegistryHandle keyfilesDir
+        let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
+            deps1 = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = fakeRepoRegistryHandle
+              , cdSshAgent = agent
+              , cdAgentRegistry = reg1
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
+              }
+            deps2 = CloneDeps
+              { cdVault = vault
+              , cdRepoReg = fakeRepoRegistryHandle
+              , cdSshAgent = agent
+              , cdAgentRegistry = reg2
+              , cdPinnedKnownHosts = pinnedGithubKnownHosts
+              , cdKeyfilesDir = keyfilesDir
+              , cdIsRemote = False
+              }
+        -- Op 1 via deps1 (start + addkey)
+        Right t1 <- resolveCloneTarget deps1 repo1
+        withCloneTarget t1 $ \_env -> pure ()
+        -- Op 2 via deps2 (same repo, but SEPARATE registry: the second
+        -- handle doesn't know the agent is live, probes the fake socket,
+        -- finds it dead, and starts a DUPLICATE agent).
+        Right t2 <- resolveCloneTarget deps2 repo1
+        withCloneTarget t2 $ \_env -> pure ()
+        calls <- readIORef callsRef
+        -- THE BUG: a second SahStart + SahAddKey (duplicate agent)
+        calls `shouldBe`
+          [ SahStart
+          , SahAddKey kf1 "passphrase-1"
+          , SahStart
+          , SahAddKey kf1 "passphrase-1"
+          ]
+
   --------------------------------------------------------------------------
   -- deploy-key env (SSH_AUTH_SOCK + GIT_SSH_COMMAND, no key bytes)
   --------------------------------------------------------------------------

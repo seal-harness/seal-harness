@@ -72,7 +72,7 @@ import Seal.SourceControl.Clone (lsRemoteRepo)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.Session.AgentMetaCache
   ( agentMetaCacheDir, gcAgentMetaCache, agentMetaCacheKeepN )
-import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
@@ -96,8 +96,11 @@ runServeMain autonomy logger = do
   -- Probe + sweep the persistent ssh-agent registry: GC dead agents from
   -- a crashed/killed seal process so their stale entries don't accumulate
   -- (#88). Live agents are reused (the key is still loaded).
-  startupAgentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
-  arProbeAndSweep startupAgentRegH
+  -- This handle is THE shared handle for the entire process — threaded
+  -- through ChannelDeps, SendDeps, ApiDeps, and mkRepoTestSeam so all
+  -- git-op call sites share the same arhLive/arhLock/arhCache.
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep agentRegH
   -- GC the content-addressed agent-metadata snapshot cache: keep the
   -- newest N entries, drop the rest. Best-effort — failures are ignored.
   gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN
@@ -142,7 +145,7 @@ runServeMain autonomy logger = do
   -- non-blocking vault-key advisory. The vault handle (mHandle) may be
   -- 'Nothing' if the vault is not configured — in that case /repo test
   -- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.
-  repoSeam <- mkRepoTestSeam rt repoRegH paths
+  repoSeam <- mkRepoTestSeam rt repoRegH agentRegH paths
   -- W5: persisting tab handle. Load the persisted tab list, drop tabs whose
   -- session.json is missing on disk (stale), and seed the TVar. Harness tabs
   -- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)
@@ -190,7 +193,7 @@ runServeMain autonomy logger = do
         Just uec -> uecMode uec == UemRemote
         Nothing  -> False
   chanDeps <- newChannelDeps
-        paths rt repoRegH pr backends autonomy (Just broker)
+        paths rt repoRegH agentRegH pr backends autonomy (Just broker)
         reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger cursorsH
   let sr = SessionRuntime
              { srPaths      = paths
@@ -251,6 +254,7 @@ runServeMain autonomy logger = do
         { sdPaths      = paths
         , sdVault      = rt
         , sdRepoReg    = repoRegH
+        , sdAgentReg   = agentRegH
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends
@@ -301,6 +305,7 @@ runServeMain autonomy logger = do
         , adBroker          = Just broker
         , adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)
         , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = agentRegH
         , adConfigRepo       = repo
         , adVault            = rt
         , adPaths            = paths
@@ -347,9 +352,8 @@ runServeMain autonomy logger = do
 -- 'Clone.resolveVaultHandle') and @rtsVaultList@ returns 'Left VaultLocked'
 -- (/repo info shows the locked advisory). Mirrors 'vaultGetByName' in
 -- 'Seal.ISA.Ops.Secret'.
-mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> SealPaths -> IO RepoTestSeam
-mkRepoTestSeam rt repoRegH paths = do
-  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> SealPaths -> IO RepoTestSeam
+mkRepoTestSeam rt repoRegH agentRegH paths = do
   pure RepoTestSeam
     { rtsLsRemote  = \repo -> do
         let deps = Clone.CloneDeps
