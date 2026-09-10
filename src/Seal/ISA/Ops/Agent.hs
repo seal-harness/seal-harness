@@ -55,7 +55,9 @@ import Data.Vector qualified as V
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
-  ( AgentDef (..), mkAgentDefId, agentDefIdText )
+  ( AgentDef (..), mkAgentDefId, agentDefIdText
+  , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
+  )
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , ChildResult (..)
@@ -130,7 +132,13 @@ groupField v mExisting =
 -- provenance and 'adCreatedAt' are preserved; only 'adUpdatedAt' is bumped);
 -- if not, a fresh def is created. The name, provider, model, system prompt,
 -- and tool list are recorded in full (agent-visible data); 'orRecorded'
--- carries the id + op name + fields + @was_new@.
+-- carries the id + op name + fields + @was_new@ (+ @unknown_tools@ when the
+-- tools list names opcodes the harness does not have — a def-author typo
+-- is discoverable in the audit trail). The optional @role@ field gates
+-- delegation (\"orchestrator\" | \"leaf\"); anything else fails the
+-- authorize gate (role controls spawning — it must be explicit, never
+-- permissive). Optional @description@ is a one-line catalog summary; both
+-- are sanitized via 'sanitizeAgentDefFields'.
 agentDefWriteOp :: AgentDefBackend -> SessionId -> Opcode
 agentDefWriteOp backend session = TrustedOpcode
   { toName = OpName "AGENT_DEF_WRITE"
@@ -167,26 +175,50 @@ agentDefWriteOp backend session = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "description" .= ("Optional display group (e.g. \"core\"). Omit for the default (ungrouped) section." :: Text)
               ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional delegation role: \"orchestrator\" (may spawn sub-agents, depth-capped) or \"leaf\" (default; cannot spawn). The def is authoritative — AGENT_START's per-task role can only narrow an orchestrator def to leaf, never widen a leaf." :: Text)
+              ]
+          , fromText "description" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional one-line description rendered into the <available_agents> catalog (single line; control characters and catalog-fence tokens are sanitized)." :: Text)
+              ]
           ]
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_WRITE requires {id:string}") checkId . idField
+  , toAuthorize = \v ->
+      case idField v of
+        Nothing -> Left "AGENT_DEF_WRITE requires {id:string}"
+        Just idTxt -> case checkId idTxt of
+          Left e -> Left e
+          Right () -> case T.strip <$> textFieldMaybe "role" v of
+            Nothing -> Right ()
+            Just "" -> Right ()   -- empty role = unset (leaf)
+            Just r
+              | r == "orchestrator" || r == "leaf" -> Right ()
+              | otherwise ->
+                Left ("AGENT_DEF_WRITE: role must be \"orchestrator\" or \"leaf\" (got: " <> r <> ")")
   , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
+          roleField vv = case T.strip <$> textFieldMaybe "role" vv of
+            Just ""  -> Nothing
+            r        -> r
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
         Just aid -> do
           mExisting <- liftIO (adbRead backend aid)
           now <- liftIO getCurrentTime
-          let (def, wasNew) = case mExisting of
+          let (def0, wasNew) = case mExisting of
                 Just existing ->
                   ( existing
                       { adName = textField "name" v
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
                       , adGroup = groupField v (Just existing)
+                      , adRole = roleField v
+                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
                       , adUpdatedAt = now
                       }
                   , False
@@ -200,18 +232,42 @@ agentDefWriteOp backend session = TrustedOpcode
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
                       , adGroup = groupField v Nothing
+                      , adRole = roleField v
+                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
                       , adCreatedAt = now
                       , adUpdatedAt = now
                       , adSession = session
                       }
                   , True
                   )
+              def = sanitizeAgentDefFields def0
+              unknownTools =
+                case adTools def of
+                  AllowOnly xs ->
+                    [ t | OpName t <- Set.toList xs, Set.notMember t knownOpNames ]
+                  AllowAll -> []
           liftIO (adbUpdate backend def)
-          let recorded = encodeDefRecorded def wasNew
+          let recorded = encodeDefRecorded def wasNew unknownTools
           pure (OpResult [TrpText (if wasNew then "defined" else "updated")] False recorded)
   }
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
+    -- The universe of opcode names the harness actually exposes. A tools
+    -- entry outside this set is silently dropped from the child registry
+    -- (intersection semantics) but recorded here so a def-author typo is
+    -- discoverable in the audit trail.
+    knownOpNames :: Set.Set Text
+    knownOpNames = Set.fromList
+      [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_GET"
+      , "MEMORY_WRITE", "MEMORY_RECALL", "MEMORY_DELETE"
+      , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
+      , "AGENT_DEF_WRITE", "AGENT_DEF_READ", "AGENT_DEF_LIST", "AGENT_DEF_DELETE"
+      , "AGENT_INSTANCES", "AGENT_START", "AGENT_STATUS", "AGENT_STOP", "AGENT_INTERRUPT"
+      , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
+      , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
+      , "WEB_FETCH", "WEB_SEARCH"
+      , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
+      ]
 
 -- ---------------------------------------------------------------------------
 -- AGENT_DEF_READ
@@ -236,7 +292,7 @@ agentDefReadOp backend = TrustedOpcode
             Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
             Just d  -> do
               let rendered = renderDef d
-                  recorded = encodeDefRecorded d False
+                  recorded = encodeDefRecorded d False []
               pure (OpResult [TrpText rendered] False recorded)
   }
   where
@@ -250,7 +306,7 @@ agentDefListOp :: AgentDefBackend -> Opcode
 agentDefListOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_LIST"
   , toTrust = Trusted
-  , toDesc = "List all agent definitions (id + name + provider/model)."
+  , toDesc = "List all agent definitions (id + role + name + provider/model)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
@@ -263,12 +319,14 @@ agentDefListOp backend = TrustedOpcode
       let rendered = case defs of
             [] -> "(no agent definitions)"
             _  -> T.intercalate "\n"
-                    [ agentDefIdText (adId d) <> ": " <> adName d
+                    [ agentDefIdText (adId d) <> roleSuffix (adRole d) <> ": " <> adName d
                         <> " (" <> adProvider d <> "/" <> modelName <> ")"
                     | d <- defs, let ModelId modelName = adModel d ]
           recorded = object
             [ "count" .= length defs
             , "ids" .= fmap (agentDefIdText . adId) defs
+            , "roles" .= object
+                [ fromText (agentDefIdText (adId d)) .= adRole d | d <- defs ]
             ]
       pure (OpResult [TrpText rendered] False recorded)
   }
@@ -390,7 +448,7 @@ agentStartOp wiring = TrustedOpcode
               ]
           , fromText "role" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("\"leaf\" (default) or \"orchestrator\". Orchestrators may spawn their own subagents, bounded by max_spawn_depth." :: Text)
+              , "description" .= ("Optional narrow-only role hint: only \"leaf\" is meaningful per-task (downgrades an orchestrator def's child to leaf). Spawning capability comes from the def's role field — a leaf def can never be widened by task input." :: Text)
               ]
           , fromText "tasks" .= object
               [ "type" .= ("array" :: Text)
@@ -648,8 +706,8 @@ singleStringSchema fieldName fieldDesc =
 
 -- | Encode the secret-free 'AgentDef' fields into the 'orRecorded' payload.
 -- The @was_new@ flag distinguishes create vs update in the audit log.
-encodeDefRecorded :: AgentDef -> Bool -> Value
-encodeDefRecorded d wasNew = object
+encodeDefRecorded :: AgentDef -> Bool -> [Text] -> Value
+encodeDefRecorded d wasNew unknownTools = object $
   [ "id"         .= agentDefIdText (adId d)
   , "name"       .= adName d
   , "provider"   .= adProvider d
@@ -657,11 +715,19 @@ encodeDefRecorded d wasNew = object
   , "system"     .= adSystem d
   , "tools"      .= encodeTools (adTools d)
   , "group"      .= adGroup d
+  , "role"       .= adRole d
+  , "description" .= adDescription d
   , "created_at" .= adCreatedAt d
   , "updated_at" .= adUpdatedAt d
   , "session"    .= adSession d
   , "was_new"    .= wasNew
-  ]
+  ] ++ [ "unknown_tools" .= unknownTools | not (null unknownTools) ]
+
+-- | The @[\<role\>]@ suffix rendered after a def id in AGENT_DEF_LIST
+-- output (and the W3 catalog): present only when the def carries a role.
+roleSuffix :: Maybe Text -> Text
+roleSuffix (Just r) = " [" <> r <> "]"
+roleSuffix Nothing  = ""
 
 -- | Encode an 'AllowList OpName' for the recorded payload: @\"all\"@ for
 -- 'AllowAll', or a JSON array of opcode-name strings for 'AllowOnly'.

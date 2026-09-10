@@ -250,9 +250,11 @@ data ChildTask = ChildTask
   , ctContext :: !(Maybe Text)
     -- ^ Optional background context appended to the system prompt.
   , ctRole    :: !(Maybe Text)
-    -- ^ @\"leaf\"@ (default) or @\"orchestrator\"@. Per-task role beats the
-    -- top-level one. Orchestrators may spawn their own subagents, bounded by
-    -- @max_spawn_depth@.
+    -- ^ Narrow-only per-task hint: @\"leaf\"@ downgrades an orchestrator
+    -- def's child to a leaf (no spawning). Spawning capability is
+    -- DEF-authoritative — a leaf def can never be widened by task input
+    -- (issue #154: the effective role is computed in W2; this field is
+    -- parsed but not yet dispatched on).
   } deriving stock (Eq, Show)
 
 -- | Why a child stopped.

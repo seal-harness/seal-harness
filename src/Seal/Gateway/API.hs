@@ -47,7 +47,8 @@ import Seal.Agent.Def.Backend
   , staticAgentDefBackend
   )
 import Seal.Agent.Def.Types
-  ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId )
+  ( AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId
+  , sanitizeAgentDefFields )
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
@@ -1175,9 +1176,19 @@ stampAgentDef _deps aid v mExisting = do
         (Just g, _) | not (T.null g) -> Just g
         (Nothing, Just ex)           -> adGroup ex
         _                            -> Nothing
+      mRole       = T.strip <$> lookupStr "role"
+      role_       = case (mRole, mExisting) of
+        (Just r, _) | not (T.null r) -> Just r
+        (Nothing, Just ex)           -> adRole ex
+        _                            -> Nothing
+      mDesc       = lookupStr "description"
+      description_ = case (mDesc, mExisting) of
+        (Just d, _) | not (T.null d) -> Just d
+        (Nothing, Just ex)           -> adDescription ex
+        _                            -> Nothing
       createdAt   = maybe now adCreatedAt mExisting
       session     = maybe (mkSystemSessionId "web") adSession mExisting
-  pure AgentDef
+  pure (sanitizeAgentDefFields AgentDef
     { adId        = aid
     , adName      = nm
     , adProvider  = provider
@@ -1185,10 +1196,12 @@ stampAgentDef _deps aid v mExisting = do
     , adSystem    = mSystem
     , adTools     = tools
     , adGroup     = group_
+    , adRole      = role_
+    , adDescription = description_
     , adCreatedAt = createdAt
     , adUpdatedAt = now
     , adSession   = session
-    }
+    })
 
 -- | Parse the @id@ field from a POST /api/agents body. Returns 'Left' with
 -- an error message when absent, empty, or fails 'isValidAgentDefId'.
