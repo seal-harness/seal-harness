@@ -719,16 +719,21 @@ listAgentDefsFsSnap snap fs anchor = do
 -- @adName@ with @\<repo\>\/\<name\>@. The id prefix uses @"--"@ (charset-safe
 -- per 'isValidAgentDefId'); the display name uses @"/"@ for readability. If
 -- the prefixed id fails validation (e.g. the repo dir has a char outside the
--- charset), the def is dropped ('Nothing' — fail-closed).
+-- charset), the def is dropped ('Nothing' — fail-closed). The result passes
+-- through 'sanitizeAgentDefFields' so the repo directory name (operator-
+-- controlled but rendered into the W3 catalog) can never re-introduce a
+-- fence token or control char after the decode-time chokepoint — the same
+-- treatment 'stampGroup' gives the group directory name.
 prefixWorkdirDef :: Text -> AgentDef -> Maybe AgentDef
 prefixWorkdirDef repo d =
   let prefixedIdText = repo <> "--" <> agentDefIdText (adId d)
   in case mkAgentDefId prefixedIdText of
        Left _ -> Nothing
-       Right aid -> Just d
-         { adId = aid
-         , adName = repo <> "/" <> adName d
-         }
+       Right aid ->
+         Just (sanitizeAgentDefFields d
+           { adId = aid
+           , adName = repo <> "/" <> adName d
+           })
 
 -- ---------------------------------------------------------------------------
 -- Workdir-local legacy enumerator (flat + dir, over WorkdirFs)

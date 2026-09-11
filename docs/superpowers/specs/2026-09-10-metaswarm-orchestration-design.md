@@ -82,8 +82,10 @@ Designer, Security, CTO). Minor revisions applied in v3:
 - **Stub-seam threading specified** (CTO item 6): `tdMkWorker`'s
   `AgentWorkerBuilder` seam is honored by the nested wiring too (the
   re-anchored builder composes the override: production =
-  `buildWorker …`, tests = the injected stub for EVERY level, incl.
-  grandchildren). Test 8 note updated.
+  `buildWorker …`, tests = the DEPTH-CONDITIONAL stub policy
+  (`tdMkWorkerStubDepth`, default 2 — orchestrator children run real
+  scripted turns, the leaf-most workers/grandchildren are stubbed)).
+  Test 8 note updated.
 - **Concurrency claim corrected** (Security item 9): `bracketSem`
   (`Delegation.hs:501-506`) is a single-token MVar, not a counting
   semaphore — effective parallelism is 1 today; the note now states the
@@ -267,9 +269,11 @@ back-compat (it already parses); its semantics change from
      own depth; CTO item 4 wording),
    - `aswWorker` = the re-anchored worker-builder, which COMPOSES the
      `tdMkWorker` override (production = `buildWorker …` re-anchored to
-     the child's sid/depth; tests = the injected stub at EVERY level,
-     including grandchildren — the seam must thread through the nested
-     wiring, not be silently dropped).
+     the child's sid/depth; tests = the DEPTH-CONDITIONAL stub policy —
+     the stub applies only at depth ≥ `tdMkWorkerStubDepth` so
+     orchestrator children run real scripted turns while the leaf-most
+     workers (grandchildren) get the stub; the seam must thread through
+     the nested wiring, not be silently dropped).
    The op's `authorize`/`run` gates on the effective role + kill switch:
    - orchestrator + enabled ⇒ operates normally (depth check per level);
    - leaf OR kill-switch off ⇒ rejects with the DEDICATED message
@@ -372,8 +376,12 @@ New `injectAvailableAgents` (mirroring `injectAvailableSkills` in
   computed at registry-build time (§3.2); `childSystemPrompt` receives it
   (its signature gains the effective role + capability flag — the plumb
   exists since `dwdChildSystemPrompt` already receives the def).
-- Config kill switch: `[runtime] available_agents = false` disables
-  injection (mirrors `available_skills`).
+- Config kill switch: `[agent] available_agents = false` disables
+  injection (mirrors `available_skills`). Errata: the config knob lives
+  in the `[agent]` table (next to `available_skills`' `[skills]`-sibling
+  guidance flags), not `[runtime]` — the implementation
+  (`Seal.Config.File.acAvailableAgents` / `resolvedAvailableAgents`)
+  confirms this.
 
 ### 3.6 End-to-end wiring (revised)
 
@@ -434,8 +442,9 @@ reads beyond what def resolution does today.
    grandchild — grandchild result JSON reaches the orchestrator's
    summary; `AGENT_INSTANCES` = 2 with correct depths. Uses the real
    `buildWorker` path with the harness's scripted provider seam, and the
-   `tdMkWorker` stub for the leaf-most worker at EVERY level (the seam
-   composes through the nested wiring — CTO item 6).
+   `tdMkWorker` stub for the leaf-most worker per the depth-conditional
+   stub policy (`tdMkWorkerStubDepth` — the stub applies at depth ≥
+   threshold; the seam composes through the nested wiring — CTO item 6).
 9. **Batch orchestrator**: `tasks: [orch, leaf]` — both register, the
    orchestrator child still spawns (CTO S1a); concurrency interplay
    documented in the assertion comment (§3.6 step 6).
