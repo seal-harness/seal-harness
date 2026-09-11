@@ -16,11 +16,8 @@
 --     'atoChildWorker = Just stubChildWorker' so the start completes
 --     without a real provider call.
 --
--- The 4 tests #9, #10, #11, #16b are REAL tests asserting the CORRECT
--- behavior (e.g. instances=1 after start). They FAIL because
--- 'Seal.ISA.Ops.Agent.registerChild' (Agent.hs:489-490) is a no-op, so the
--- runtime registry stays empty even when the stub worker completes. The
--- failures surface the no-op — see issue #136 for the production fix.
+-- (The former #9/#10/#11/#16b registerChild no-op was fixed in issue
+-- #136; those tests now pass against the synchronous model.
 module Seal.Gateway.AgentIntegrationSpec (spec) where
 
 import Data.Aeson ((.=))
@@ -259,7 +256,7 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       textOf (firstResult listResults) `shouldSatisfy` ("(no agents running)" `T.isInfixOf`)
       countOf (firstResult listResults) `shouldBe` (0 :: Int)
 
-  describe "#9 Start increases instances by one — FAILS (registerChild no-op)" $
+  describe "#9 Start increases instances by one" $
     runLifecycleTest $ \env -> do
       sid <- callApiNewTab env "ollama" "llama3.2"
       setScript env
@@ -282,9 +279,8 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- The CORRECT behavior: count = 1 after a successful start. FAILS
-      -- because registerChild (Agent.hs:489-490) is a no-op, so the
-      -- registry stays empty even when the stub worker completes.
+      -- The CORRECT behavior: count = 1 after a successful start
+      -- (registerChild records the synchronous child).
       countOf (firstResult listResults) `shouldBe` 1
 
   describe "#10 Stop decreases instances by one — after start, AGENT_INSTANCES shows 1" $
@@ -520,10 +516,16 @@ runDefTest :: (ApiTestEnv -> IO ()) -> Spec
 runDefTest = runApiTest Nothing
 
 -- | Run a lifecycle-group test that exercises AGENT_START. The stub child
--- worker is injected so the start completes without a real provider call.
+-- worker is injected so the start completes without a real provider call;
+-- with W2's depth-conditional stub policy the threshold is set to 1 so the
+-- stub applies at the FIRST spawn (depth 1) — matching the pre-W2
+-- behavior of stubbing every spawn.
 runLifecycleTest :: (ApiTestEnv -> IO ()) -> Spec
 runLifecycleTest =
-  runApiTestOpts Nothing defaultApiTestOptions { atoChildWorker = Just stubChildWorker }
+  runApiTestOpts Nothing defaultApiTestOptions
+    { atoChildWorker = Just stubChildWorker
+    , atoStubWorkerFromDepth = 1
+    }
 
 -- | Run a W2 orchestration test. The child-provider seam makes the
 -- orchestrator child run a REAL scripted turn (popping the same script

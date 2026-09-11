@@ -76,17 +76,14 @@ delegationBlocklist = Set.fromList
   ]
 
 -- | The role-aware child blocklist (issue #154 §3.2): the delegation
--- blocklist a CHILD's registry must apply, given the child's effective
--- role and the orchestrator kill switch. Leaf children (or an
--- orchestrator while @delegation.orchestrator_enabled = false@) get the
--- full static blocklist; an enabled orchestrator keeps @AGENT_START@ (the
--- rest of the blocklist always applies — def mutation and lifecycle
--- control stay parent/operator-only).
+-- blocklist a CHILD's registry must apply. AGENT_START is ALWAYS
+-- present-but-rejecting in a child registry — the gate (its authorize)
+-- is the enforcement, returning the dedicated leaf/kill-switch messages
+-- (§3.2 item 6) instead of unknown-tool. So the blocklist drops only
+-- AGENT_START; every other entry (def mutation, lifecycle control)
+-- always applies — those stay parent/operator-only.
 childBlocklist :: Maybe Text -> Bool -> Set.Set OpName
-childBlocklist mRole orchEnabled
-  | mRole == Just "orchestrator" && orchEnabled =
-      Set.delete (OpName "AGENT_START") delegationBlocklist
-  | otherwise = delegationBlocklist
+childBlocklist _ _ = Set.delete (OpName "AGENT_START") delegationBlocklist
 
 -- | The effective role for a spawned child (issue #154 §3.1): the def's
 -- role is AUTHORITATIVE; the per-task @role@ hint may only NARROW (an

@@ -22,19 +22,13 @@ agentStart = OpName "AGENT_START"
 spec :: Spec
 spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
   describe "childBlocklist" $ do
-    it "leaf role blocks AGENT_START" $
-      Set.member agentStart (childBlocklist (Just "leaf") True) `shouldBe` True
-
-    it "Nothing role (implicit leaf) blocks AGENT_START" $
-      Set.member agentStart (childBlocklist Nothing True) `shouldBe` True
-
-    it "orchestrator + enabled does NOT block AGENT_START" $
+    it "always drops AGENT_START (the gated nested op is the enforcement)" $ do
+      Set.member agentStart (childBlocklist (Just "leaf") True) `shouldBe` False
+      Set.member agentStart (childBlocklist Nothing True) `shouldBe` False
       Set.member agentStart (childBlocklist (Just "orchestrator") True) `shouldBe` False
+      Set.member agentStart (childBlocklist (Just "orchestrator") False) `shouldBe` False
 
-    it "orchestrator + kill switch OFF blocks AGENT_START" $
-      Set.member agentStart (childBlocklist (Just "orchestrator") False) `shouldBe` True
-
-    it "keeps the rest of the blocklist for orchestrators (membership)" $ do
+    it "always blocks the rest of the blocklist (membership)" $ do
       let bl = childBlocklist (Just "orchestrator") True
       Set.member (OpName "AGENT_DEF_WRITE") bl `shouldBe` True
       Set.member (OpName "AGENT_DEF_DELETE") bl `shouldBe` True
@@ -48,17 +42,11 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         Set.isSubsetOf (childBlocklist (roleText <$> r) e) delegationBlocklist
 
   describe "narrowAllowList (role-aware)" $ do
-    it "keeps AGENT_START for an AllowOnly orchestrator def listing it" $
-      narrowAllowListWith
-        (childBlocklist (Just "orchestrator") True)
-        (AllowOnly (Set.fromList [agentStart, OpName "FILE_READ"]))
-        `shouldBe` AllowOnly (Set.fromList [agentStart, OpName "FILE_READ"])
-
-    it "drops AGENT_START for an AllowOnly leaf def listing it" $
+    it "keeps AGENT_START (present-but-rejecting via the gate)" $
       narrowAllowListWith
         (childBlocklist (Just "leaf") True)
         (AllowOnly (Set.fromList [agentStart, OpName "FILE_READ"]))
-        `shouldBe` AllowOnly (Set.fromList [OpName "FILE_READ"])
+        `shouldBe` AllowOnly (Set.fromList [agentStart, OpName "FILE_READ"])
 
   describe "effectiveRole" $ do
     it "orchestrator def + no ctRole = orchestrator" $

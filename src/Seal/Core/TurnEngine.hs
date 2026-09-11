@@ -987,8 +987,8 @@ buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
+        , nestedAgentStartOp
         ]
-        ++ [ nestedAgentStartOp | mRole == Just "orchestrator" && orchEnabled ]
       securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
       childWebFetchCfg = WebFetchConfig
         { wfcManager = tdHttpManager td, wfcAllowList = []
@@ -1037,6 +1037,11 @@ buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
         _ -> buildWorker td (tdBaseBackends td) childSid adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
+  -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
+  -- gated nested AGENT_START (which is always present and self-gating at
+  -- authorize: leaf/kill-switch rejections carry the dedicated messages
+  -- instead of unknown-tool). The gate is the enforcement — the
+  -- blocklist's AGENT_START entry would undo always-present.
   pure (ISA.mkRegistry
          (Worker.filterBlocklistedWith
             (applyDefAllowList def baseOps)
