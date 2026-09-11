@@ -260,6 +260,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -284,6 +285,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("nope" :: Text), "goal" .= ("x" :: Text)]))
@@ -309,6 +311,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend (object ["id" .= ("a1" :: Text)]))
       orIsError r `shouldBe` True
@@ -329,6 +332,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("task one" :: Text)]
@@ -354,6 +358,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))

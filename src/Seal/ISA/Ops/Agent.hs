@@ -38,6 +38,8 @@ module Seal.ISA.Ops.Agent
   , agentInterruptOp
   , AgentWorkerBuilder
   , AgentStartWiring (..)
+  , AgentStartGate (..)
+  , gateOpen
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -58,6 +60,7 @@ import Seal.Agent.Def.Types
   ( AgentDef (..), mkAgentDefId, agentDefIdText
   , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
   )
+import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , ChildResult (..)
@@ -67,6 +70,7 @@ import Seal.Agent.Runtime.Delegation
   , SpawnPauseFlag
   , ParentActivity
   , SubagentId (..)
+  , resolveDelegationConfig
   , runDelegate
   , subagentIdText
   )
@@ -421,7 +425,30 @@ data AgentStartWiring = AgentStartWiring
     -- ^ The parent's delegation depth (0 for a top-level turn).
   , aswWorker       :: AgentWorkerBuilder
     -- ^ The worker-builder (closes over per-turn 'AgentEnv' deps).
+  , aswGate         :: AgentStartGate
+    -- ^ The role/kill-switch gate (issue #154 §3.2): a nested (child-side)
+    -- AGENT_START carries the spawning child's effective role + the
+    -- resolved kill-switch state so the op can reject with the dedicated
+    -- leaf/kill-switch messages. A top-level turn's wiring passes
+    -- 'gateOpen'.
   }
+
+-- | The role/switch condition the nested AGENT_START enforces before it
+-- will spawn. Leaf children (and orchestrator children while the kill
+-- switch is off) get a present-but-rejecting op whose authorize returns
+-- the dedicated error.
+data AgentStartGate = AgentStartGate
+  { gEffectiveRole :: Maybe Text
+    -- ^ The spawning agent's effective role ('Nothing' = leaf).
+  , gOrchEnabled   :: Bool
+    -- ^ The resolved @delegation.orchestrator_enabled@.
+  }
+
+-- | The open gate for top-level (operator-authorized) turns: spawning is
+-- governed only by the depth cap, spawn-pause, and per-spawn resolver
+-- checks.
+gateOpen :: AgentStartGate
+gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
 
 -- | AGENT_START: spawn one or more child agents, run each against a goal to
 -- completion, return a JSON result per child. Input is either
@@ -460,12 +487,18 @@ agentStartOp wiring = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = \v ->
-      -- Require either a top-level goal (single) or a tasks array (batch).
-      let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
-          hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
-      in if hasGoal || hasTasks
-           then Right ()
-           else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+      let shapeGate =
+            -- Require either a top-level goal (single) or a tasks array (batch).
+            let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
+                hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
+            in if hasGoal || hasTasks
+                 then Right ()
+                 else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+          roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
+            (Just "orchestrator", True) -> Right ()
+            (Just "orchestrator", False) -> Left killSwitchMsg
+            (_, _) -> Left leafMsg
+      in shapeGate *> roleGate
   , toBlocking = False
   , toRun = \_ v -> do
       input <- liftIO (parseInput v)
@@ -473,6 +506,7 @@ agentStartOp wiring = TrustedOpcode
         Left err -> pure (OpResult [TrpText err] True (object []))
         Right di -> do
           cfg <- liftIO (aswConfig wiring)
+          let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           eResults <- liftIO (runDelegate
                                 cfg
                                 (aswPauseFlag wiring)
@@ -483,6 +517,7 @@ agentStartOp wiring = TrustedOpcode
                                              (aswRuntime wiring)
                                              (aswMintSession wiring)
                                              (aswParentDepth wiring)
+                                             orchEnabled
                                              (aswWorker wiring)))
           case eResults of
             Left err -> pure (OpResult [TrpText err] True (object []))
@@ -495,7 +530,8 @@ agentStartOp wiring = TrustedOpcode
               -- the input tasks to recover the AgentDefId (the ChildResult
               -- carries the SubagentId but not the def id).
               let tasks = diTasks di
-              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) t r)) tasks results
+                  childDepth = aswParentDepth wiring + 1
+              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) childDepth t r)) tasks results
               let rendered = encodeResultsJson results
               pure (OpResult [TrpText rendered] False (object ["results" .= results]))
    }
@@ -532,16 +568,23 @@ parseTask v =
                  | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v)))
 
 -- | Resolve a task to its def + worker + fresh session id. Returns Left if
--- the def id is invalid or the def doesn't exist.
+-- the def id is invalid, the def doesn't exist, or the effective-role /
+-- kill-switch gate rejects the spawn (issue #154 §3.2 item 5 — the
+-- dispatch-time TOCTOU gate: the def is in hand here, which is the only
+-- place the effective role is computable). @orchEnabled@ is the resolved
+-- @delegation.orchestrator_enabled@; @parentDepth@ is the spawning
+-- parent's depth (consumed for the error message context and forwarded
+-- via the wiring, not stored here).
 resolveTask
   :: AgentDefBackend
   -> AgentRuntime
   -> IO SessionId
   -> Int
+  -> Bool
   -> AgentWorkerBuilder
   -> ChildTask
   -> IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId))
-resolveTask defBackend _runtime mintSession _parentDepth worker task = do
+resolveTask defBackend _runtime mintSession _parentDepth orchEnabled worker task = do
   case mkAgentDefId (ctDefId task) of
     Left err -> pure (Left err)
     Right aid -> do
@@ -549,25 +592,41 @@ resolveTask defBackend _runtime mintSession _parentDepth worker task = do
       case mDef of
         Nothing  -> pure (Left ("agent def not found: " <> ctDefId task))
         Just def -> do
-          sid <- mintSession
-          pure (Right (def, worker, sid))
+          let role = effectiveRole (adRole def) (ctRole task)
+          if role == Just "orchestrator" && not orchEnabled
+            then pure (Left killSwitchMsg)
+            else do
+              sid <- mintSession
+              pure (Right (def, worker, sid))
+
+-- | The dedicated kill-switch error (§3.2 item 6). Distinct from the
+-- depth/leaf/pause messages so the parent transcript distinguishes all
+-- spawn-failure causes.
+killSwitchMsg :: Text
+killSwitchMsg = "Delegation spawning is disabled: delegation.orchestrator_enabled = false. Re-trying will not succeed until the operator re-enables it."
+
+-- | The dedicated leaf-role error (§3.2 item 6): a leaf agent cannot
+-- spawn — actionable for both the model and the operator.
+leafMsg :: Text
+leafMsg = "AGENT_START is not available to this agent: its definition is a leaf (role: leaf). Ask the operator to grant the orchestrator role if delegation is required."
 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
 -- ran synchronously to completion). Records the instance with status
 -- 'Stopped' (the synchronous child has already finished by the time this is
 -- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
 -- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
--- carries the 'SubagentId' but not the def id).
-registerChild :: AgentRuntime -> ChildTask -> ChildResult -> IO ()
-registerChild runtime task result =
+-- carries the 'SubagentId' but not the def id). The recorded depth is the
+-- CHILD's own depth — the wiring's parent depth + 1 (issue #154: the
+-- former hardcoded 0 recorded every child at the root).
+registerChild :: AgentRuntime -> Int -> ChildTask -> ChildResult -> IO ()
+registerChild runtime childDepth task result =
   case mkAgentDefId (ctDefId task) of
     Left _ -> pure ()  -- malformed def id; skip registration
     Right aid ->
       case crChildSession result of
         Nothing -> pure ()  -- no child session; skip (error/timeout case)
         Just session -> do
-          let depth = 0  -- parent depth; the child's is depth+1 (not tracked here)
-          registerCompletedAgent runtime aid (crSubagentId result) session depth
+          registerCompletedAgent runtime aid (crSubagentId result) session childDepth
 
 -- | Extract the task list from a 'DelegateInput' (in order).
 diTasks :: DelegateInput -> [ChildTask]

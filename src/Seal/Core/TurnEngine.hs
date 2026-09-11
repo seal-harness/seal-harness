@@ -13,7 +13,7 @@
 -- originates it.
 module Seal.Core.TurnEngine
   ( buildSessionRegistry
-  , buildChildRegistry
+  , buildChildRegistryAdapter
   , resolveSystemPrompt
   , TurnDeps (..)
   , TurnAdapter (..)
@@ -34,6 +34,7 @@ import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
+import Data.Set (member)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
@@ -50,7 +51,7 @@ import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
 import Seal.Agent.Loop (runTurn, defaultMaxTokens)
 import Seal.Agent.PromptParts (injectStaticGuidance)
 import Seal.Agent.Runtime.Delegation
-  (ChildTask (..), ctContext, fromFileConfig)
+  (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
   (mkDelegateWorker, DelegationWorkerDeps (..))
 import Seal.Channel.Caps (ChannelCaps)
@@ -89,6 +90,10 @@ import Seal.ISA.Dispatch
   (DispatchError (..), dispatch, recordSetupRepoResult,
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
+  ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
+  , agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
+  , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
 import Seal.ISA.Ops.File (fileReadOp, fileWriteOp, filePatchOp)
 import Seal.ISA.Ops.Harness (harnessListOp, harnessStartOp, harnessStopOp)
@@ -101,7 +106,7 @@ import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretGetOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Skills
-import Seal.ISA.Opcode (OpResult (..), localBackend, opName, orIsError)
+import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Logging.Logger (SealLogger)
@@ -152,7 +157,7 @@ import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
 import qualified Seal.Agent.Runtime.Delegation.Worker as Worker
-  (filterBlocklisted)
+  ( childBlocklist, filterBlocklistedWith )
 
 -- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
 -- the default when the @[web]@ section is absent or the field is 'Nothing'.
@@ -296,66 +301,6 @@ buildSessionRegistry rt cloneDeps backends wsRoot sid operatorCeiling autonomy w
     harnessSession = either (error "unreachable: seal is a valid TmuxIdent") id (mkTmuxIdent "seal")
     harnessWindow  = either (error "unreachable: harness is a valid TmuxIdent") id (mkTmuxIdent "harness")
 
--- | Build the narrowed ISA registry for a delegated child agent. Blocklists
--- the management opcodes (AGENT_DEF_WRITE/DELETE, AGENT_INSTANCES,
--- AGENT_START/STATUS/STOP/INTERRUPT). Includes web/harness ops — the CLI
--- child previously lacked these; the unified child includes them.
-buildChildRegistry
-  :: VaultRuntime
-  -> Clone.CloneDeps
-  -> Backends
-  -> WorkspaceRoot
-  -> SessionId
-  -> Int
-  -> Policy.AutonomyLevel
-  -> Maybe WebConfig
-  -> Maybe Manager
-  -> ChannelCaps
-  -> ISA.Registry
-buildChildRegistry rt cloneDeps backends childWsRoot childSid operatorCeiling
-                   autonomy webCfg httpManager childCaps =
-  ISA.mkRegistry (Worker.filterBlocklisted childBaseOps opName)
-  where
-    childBaseOps =
-      [ showHumanOp childCaps
-      , askHumanOp childCaps
-      , secretGetOp rt
-      , memoryWriteOp (bMemory backends) childSid
-      , memoryRecallOp defaultPageParams (bMemory backends)
-      , memoryDeleteOp (bMemory backends)
-      , skillWriteOp (bSkills backends) childSid
-      , skillLoadOp (bSkills backends)
-      , skillListOp (bSkills backends)
-      , skillDeleteOp (bSkills backends)
-      , agentDefReadOp (bAgentDefs backends)
-      , agentDefListOp (bAgentDefs backends)
-      , searchFilesOp childWsRoot securityPolicy operatorCeiling
-      , fileReadOp childWsRoot operatorCeiling
-      , fileWriteOp childWsRoot operatorCeiling
-      , filePatchOp childWsRoot
-      , shellExecOp childWsRoot securityPolicy
-      , setupRepoOp cloneDeps childWsRoot autonomy
-      , binExecOp childWsRoot securityPolicy binAllowList
-      , processManageOp childWsRoot securityPolicy
-      , webFetchOp webFetchCfg
-      , webSearchOp webSearchCfg
-      ]
-    securityPolicy = Policy.SecurityPolicy Policy.AllowAll autonomy
-    binAllowList = Nothing
-    webFetchCfg = WebFetchConfig
-      { wfcManager = httpManager, wfcAllowList = []
-      , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }
-    webSearchCfg = WebSearchConfig
-      { wscManager = httpManager
-      , wscProvider = parseProvider (unwrapOpt wcSearchProvider webCfg "parallel")
-      , wscEndpoint = unwrapOpt wcSearchEndpoint webCfg ""
-      , wscAllowList = unwrapOpt wcSearchAllowList webCfg []
-      , wscAuthKey = unwrapOptMaybe wcSearchAuthKey webCfg
-      , wscMaxResults = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault = Just rt
-      , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl webCfg
-      }
-
 -- ---------------------------------------------------------------------------
 -- TurnDeps — the unified wiring record (design §5.1)
 -- ---------------------------------------------------------------------------
@@ -409,6 +354,22 @@ data TurnDeps = TurnDeps
     -- gateway without a real provider call. Never set in production; the
     -- field exists solely so gateway API integration tests can exercise
     -- 'AGENT_START' end-to-end.
+  , tdResolveProviderOverride
+      :: Maybe (AgentDef -> IO (Either Text (SomeProvider, ModelId)))
+    -- ^ Test seam (issue #154 W2): when 'Just', replaces 'resolveChild' as
+    -- the CHILD provider resolver for every spawn (the orchestrator-child
+    -- real-scripted-turn path). 'Nothing' in production. Gateway tests
+    -- inject a resolver that returns the SAME ScriptProvider ref the
+    -- top-level seam ('tdResolve') wraps, so child turns pop the same
+    -- scripted queue. Mirrors 'tdMkWorker'/'tdRemoteRunner'.
+  , tdMkWorkerStubDepth :: Int
+    -- ^ The depth-conditional stub threshold (issue #154 W2; test-only —
+    -- production always leaves 'tdMkWorker' = 'Nothing' so this is
+    -- irrelevant). When 'tdMkWorker' is set, the stub worker replaces the
+    -- real builder only for spawns at depth >= this threshold, so an
+    -- orchestrator child can run a REAL scripted turn while its
+    -- grandchildren get the stub. The harness's default (2) means
+    -- depth-1 spawns are real, depth-2+ are stubbed.
   }
 
 -- | The adapter-owned per-turn hooks (design §5.2 step table). These are the
@@ -903,7 +864,19 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswParentActivity = Just (bParentActivity (tdBaseBackends td))
     , aswMintSession = mintSession parentSid
     , aswParentDepth = 0
-    , aswWorker = fromMaybe (buildWorker td parentSid appEnv eCfg operatorCeiling channel) (tdMkWorker td)
+      -- The depth-conditional stub policy (issue #154 W2): when
+      -- 'tdMkWorker' is set, a stub applies only at depth >=
+      -- 'tdMkWorkerStubDepth'. A top-level spawn (depth 1) is below the
+      -- harness default (2), so the real 'buildWorker' runs — giving an
+      -- orchestrator child a REAL scripted turn while its grandchildren
+      -- (depth 2+) get the stub.
+    , aswWorker =
+        case tdMkWorker td of
+          Just stub | 1 >= tdMkWorkerStubDepth td -> stub
+          _ -> buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel 0
+      -- Top-level turns: the gate is OPEN (operator-authorized spawning —
+      -- the depth cap, spawn-pause, and resolver checks govern it).
+    , aswGate = gateOpen
     }
 
 -- | Mint a fresh 'SessionId' for a forked agent instance (mirrors the three
@@ -923,9 +896,13 @@ mintSession fallback = do
 -- 'buildChildRegistry'), and runs 'runTurn' with the goal as the first user
 -- message.
 buildWorker
-  :: TurnDeps -> SessionId -> Env -> Either a RuntimeConfig -> Int -> Text
+  :: TurnDeps -> Backends -> SessionId -> Env -> Either a RuntimeConfig -> Int -> Text
+  -> Int
+     -- ^ This worker's OWN delegation depth (0 = a top-level session's
+     -- worker; its children run at depth 1). Threaded so an orchestrator
+     -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
   -> AgentWorkerBuilder
-buildWorker td parentSid appEnv eCfg operatorCeiling channel =
+buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel ownDepth =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
@@ -939,9 +916,11 @@ buildWorker td parentSid appEnv eCfg operatorCeiling channel =
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
     , dwdOnDemand = either (const False) onDemandSchemas eCfg
-    , dwdParentDepth = 0
+    , dwdParentDepth = ownDepth
     , dwdResolveProvider = resolveChild
-    , dwdChildRegistry = buildChildRegistryAdapter td eCfg operatorCeiling
+    , dwdResolveProviderOverride = tdResolveProviderOverride td
+    , dwdUnionDefBackend = bAgentDefs sessionBackends
+    , dwdChildRegistry = buildChildRegistryAdapter td eCfg operatorCeiling appEnv channel
     , dwdChildSystemPrompt = childSystemPrompt td eCfg
     , dwdOnEntry = pure ()
     , dwdChannel = channel
@@ -964,11 +943,17 @@ buildWorker td parentSid appEnv eCfg operatorCeiling channel =
       , smDescription = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
--- | Build a narrowed child registry via the unified 'buildChildRegistry'.
+-- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
+-- @adTools@ allow-list is ENFORCED (intersection with the base ops), the
+-- role-aware blocklist is applied, and an ORCHESTRATOR child gets a
+-- role-conditioned nested @AGENT_START@ wired with a child-side
+-- 'AgentStartWiring' (child depth+1, child-rooted session mint, the SAME
+-- workdir⊕user union def backend, and a re-anchored worker-builder).
 buildChildRegistryAdapter
-  :: TurnDeps -> Either a RuntimeConfig -> Int
-  -> AgentDef -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do
+  :: TurnDeps -> Either a RuntimeConfig -> Int -> Env -> Text
+  -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
+buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
+                          def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
@@ -976,9 +961,95 @@ buildChildRegistryAdapter td eCfg operatorCeiling _def childSid childCaps = do
                       eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
-  pure (buildChildRegistry (tdVault td) childCloneDeps (tdBaseBackends td)
-          childWsRoot childSid operatorCeiling (tdAutonomy td)
-          childWebCfg (tdHttpManager td) childCaps)
+      (_, _, _, orchEnabled) =
+        resolveDelegationConfig (fromFileConfig (either (const Nothing) rcDelegation eCfg))
+      bl = Worker.childBlocklist mRole orchEnabled
+      baseOps =
+        [ showHumanOp childCaps
+        , askHumanOp childCaps
+        , secretGetOp (tdVault td)
+        , memoryWriteOp (bMemory (tdBaseBackends td)) childSid
+        , memoryRecallOp defaultPageParams (bMemory (tdBaseBackends td))
+        , memoryDeleteOp (bMemory (tdBaseBackends td))
+        , skillWriteOp (bSkills (tdBaseBackends td)) childSid
+        , skillLoadOp (bSkills (tdBaseBackends td))
+        , skillListOp (bSkills (tdBaseBackends td))
+        , skillDeleteOp (bSkills (tdBaseBackends td))
+        , agentDefReadOp (bAgentDefs (tdBaseBackends td))
+        , agentDefListOp (bAgentDefs (tdBaseBackends td))
+        , searchFilesOp childWsRoot securityPolicy operatorCeiling
+        , fileReadOp childWsRoot operatorCeiling
+        , fileWriteOp childWsRoot operatorCeiling
+        , filePatchOp childWsRoot
+        , shellExecOp childWsRoot securityPolicy
+        , setupRepoOp childCloneDeps childWsRoot (tdAutonomy td)
+        , binExecOp childWsRoot securityPolicy Nothing
+        , processManageOp childWsRoot securityPolicy
+        , webFetchOp childWebFetchCfg
+        , webSearchOp childWebSearchCfg
+        ]
+        ++ [ nestedAgentStartOp | mRole == Just "orchestrator" && orchEnabled ]
+      securityPolicy = Policy.SecurityPolicy Policy.AllowAll (tdAutonomy td)
+      childWebFetchCfg = WebFetchConfig
+        { wfcManager = tdHttpManager td, wfcAllowList = []
+        , wfcMaxBytes = operatorCeiling, wfcAuthKey = Nothing }
+      childWebSearchCfg = WebSearchConfig
+        { wscManager = tdHttpManager td
+        , wscProvider = parseProvider (unwrapOpt wcSearchProvider childWebCfg "parallel")
+        , wscEndpoint = unwrapOpt wcSearchEndpoint childWebCfg ""
+        , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
+        , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
+        , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
+        , wscVault = Just (tdVault td)
+        , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
+        }
+      -- §3.2 item 3 (design v4): the nested AGENT_START is ALWAYS PRESENT
+      -- in the child registry, role-gated at the resolver. For an
+      -- orchestrator child (+ kill switch on) it spawns (depth-capped).
+      -- For a leaf child — or an orchestrator while the kill switch is
+      -- off — the op's authorize rejects with the DEDICATED message
+      -- (§3.2 item 6), so the error is distinguishable rather than
+      -- unknown-tool. The wiring: child depth+1, child-rooted session
+      -- mint, the SAME workdir⊕user union def backend, and a re-anchored
+      -- worker composing the tdMkWorker test seam via the
+      -- depth-conditional stub policy (the stub applies only at depth ≥
+      -- the threshold so orchestrator children run real scripted turns;
+      -- grandchildren get the stub).
+      nestedAgentStartOp =
+        agentStartOp AgentStartWiring
+          { aswDefBackend = bAgentDefs (tdBaseBackends td)
+          , aswRuntime = bRuntime (tdBaseBackends td)
+          , aswConfig = do
+              eCfg' <- loadRuntimeConfig (prConfigPath (tdProvider td))
+              pure (fromFileConfig (either (const Nothing) rcDelegation eCfg'))
+          , aswPauseFlag = bSpawnPauseFlag (tdBaseBackends td)
+          , aswParentActivity = Just (bParentActivity (tdBaseBackends td))
+          , aswMintSession = mintSession childSid
+          , aswParentDepth = childDepth
+          , aswWorker = nestedWorker
+          , aswGate = AgentStartGate
+                { gEffectiveRole = mRole
+                , gOrchEnabled = orchEnabled
+                }
+          }
+      nestedWorker = case tdMkWorker td of
+        Just stub
+          | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
+        _ -> buildWorker td (tdBaseBackends td) childSid adapterAppEnv
+                          eCfg operatorCeiling adapterChannel (childDepth + 1)
+  pure (ISA.mkRegistry
+         (Worker.filterBlocklistedWith
+            (applyDefAllowList def baseOps)
+            bl
+            opName))
+
+-- | §3.3: enforce the def's @tools@ allow-list as an INTERSECTION with the
+-- harness's base ops (only narrows; unknown names silently drop; the
+-- blocklist is applied AFTER this — blocklist wins).
+applyDefAllowList :: AgentDef -> [Opcode] -> [Opcode]
+applyDefAllowList def ops = case adTools def of
+  Policy.AllowAll     -> ops
+  Policy.AllowOnly ts -> [ o | o <- ops, member (opName o) ts ]
 
 -- | Resolve the child agent's system prompt. Mirrors the three original
 -- @*ChildSystemPrompt@ helpers: the def's 'adSystem' (with the task context

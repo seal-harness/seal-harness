@@ -38,6 +38,7 @@ import Network.HTTP.Client (Manager)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
+import Seal.Agent.Def.Types (AgentDef)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Data.Default (def)
 import Seal.Channel.Cli
@@ -184,6 +185,17 @@ data SendDeps = SendDeps
     -- 'mkDelegateWorker' path. Gateway API integration tests inject a stub
     -- worker so 'AGENT_START' can run through the gateway without a real
     -- provider call.
+  , sdResolveProviderOverride
+      :: Maybe (AgentDef -> IO (Either Text (SomeProvider, ModelId)))
+    -- ^ Test seam (issue #154 W2; mirrors 'sdMkWorker'): when 'Just',
+    -- replaces 'resolveChild' as the CHILD provider resolver for every
+    -- spawn. 'Nothing' (production). Gateway tests inject the harness's
+    -- ScriptProvider so orchestrator children run REAL scripted turns.
+  , sdMkWorkerStubDepth :: Int
+    -- ^ The depth-conditional stub threshold (issue #154 W2; test-only —
+    -- production leaves 'sdMkWorker' = 'Nothing'). The harness's default
+    -- (2) stubs depth-2+ spawns so orchestrator children run real
+    -- scripted turns while grandchildren get the stub.
   }
 
 -- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
@@ -227,6 +239,8 @@ mkWebTurnDeps deps = TurnDeps
   , tdExecCache    = sdExecCache deps
   , tdRemoteRunner = sdRemoteRunner deps
   , tdMkWorker    = sdMkWorker deps
+  , tdResolveProviderOverride = sdResolveProviderOverride deps
+  , tdMkWorkerStubDepth = sdMkWorkerStubDepth deps
   }
 
 -- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:

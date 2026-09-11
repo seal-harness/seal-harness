@@ -80,6 +80,7 @@ import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
+import Seal.Config.File (updateRuntimeConfig, DelegationFileConfig (..), rcDelegation)
 import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
@@ -164,17 +165,36 @@ data ApiTestOptions = ApiTestOptions
   , atoChildWorker :: Maybe AgentWorkerBuilder
     -- ^ When 'Just', inject a stub 'AgentWorkerBuilder' (via 'sdMkWorker' →
     -- 'tdMkWorker') so 'AGENT_START' can run through the gateway without a
-    -- real provider call. 'Nothing' (the default — preserves existing
-    -- tests' behavior) uses the production 'buildWorker' →
-    -- 'mkDelegateWorker' path. Gateway API integration tests inject a stub
-    -- that returns a 'ChildWorkerOutcome' immediately so the start completes
-    -- synchronously.
+    -- real provider call. With W2's depth-conditional stub policy the stub
+    -- applies only at depth >= 'atoStubWorkerFromDepth' so orchestrator
+    -- children can run REAL scripted turns while grandchildren get the
+    -- stub. 'Nothing' (the default — preserves existing tests' behavior)
+    -- uses the production 'buildWorker' → 'mkDelegateWorker' path.
+  , atoStubWorkerFromDepth :: Int
+    -- ^ The depth-conditional stub threshold for 'atoChildWorker'
+    -- (issue #154 W2). Default 2: depth-1 spawns run REAL scripted turns
+    -- (the orchestrator child), depth-2+ spawns get the stub (the
+    -- leaf-most workers). Ignored when 'atoChildWorker' is 'Nothing'.
+  , atoChildProvider :: Bool
+    -- ^ The child-provider test seam (issue #154 W2): when 'True', the
+    -- harness wires 'sdResolveProviderOverride' to a resolver returning
+    -- the SAME 'ScriptProvider' ref the top-level 'sdResolve' seam wraps,
+    -- so child turns pop the same scripted queue as the parent turn
+    -- ('setScript' drives both). 'False' (default) = production resolver.
+  , atoDelegationConfig :: Maybe DelegationFileConfig
+    -- ^ When 'Just', written into the harness's config.toml
+    -- @[delegation]@ section before boot (max_spawn_depth /
+    -- orchestrator_enabled overrides for the W2 tests). 'Nothing' (the
+    -- default) leaves the delegation config absent (defaults).
   }
 
 defaultApiTestOptions :: ApiTestOptions
 defaultApiTestOptions = ApiTestOptions
   { atoFakeRemoteRunner = False
   , atoChildWorker = Nothing
+  , atoStubWorkerFromDepth = 2
+  , atoChildProvider = False
+  , atoDelegationConfig = Nothing
   }
 
 -- ---------------------------------------------------------------------------
@@ -363,6 +383,14 @@ buildTestEnv tmp mode mRepo opts = do
   createDirectoryIfMissing True sessionRoot
   createDirectoryIfMissing True (tmp </> "cache")
   ensureConfigRepo configRoot
+  -- Delegation-config override (issue #154 W2): write [delegation] into
+  -- config.toml BEFORE boot so aswConfig's per-call re-read resolves it.
+  case atoDelegationConfig opts of
+    Nothing -> pure ()
+    Just dfc -> do
+      _ <- updateRuntimeConfig (configRoot </> "config.toml")
+             (\rc -> rc { rcDelegation = Just dfc })
+      pure ()
   let configRepo = openConfigRepo configRoot
   backends <- newBackends configRoot configRepo
   tabsH <- newTabsHandle
@@ -472,6 +500,11 @@ buildTestEnv tmp mode mRepo opts = do
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
         , sdMkWorker = atoChildWorker opts
+        , sdMkWorkerStubDepth = atoStubWorkerFromDepth opts
+        , sdResolveProviderOverride =
+            if atoChildProvider opts
+              then Just (\_ -> pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2")))
+              else Nothing
         }
       deps = ApiDeps
         { adSessionRuntime = sr

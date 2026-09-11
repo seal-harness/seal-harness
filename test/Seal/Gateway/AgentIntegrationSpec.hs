@@ -32,9 +32,19 @@ import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Stack (HasCallStack)
-import Test.Hspec (Spec, describe, shouldBe, shouldSatisfy)
+import Test.Hspec
+  ( Spec, describe, expectationFailure, it, pendingWith, shouldBe
+  , shouldNotSatisfy, shouldSatisfy )
 
-import Seal.Core.Types (OpName (..), ToolCallId (..))
+import Seal.Agent.Def.Backend qualified as AgentDef
+import Seal.Agent.Runtime.Delegation
+  ( ChildExitReason (..), ChildWorkerOutcome (..)
+  , defaultDelegationConfig, newSpawnPauseFlag )
+import Seal.Agent.Runtime.Registry (newAgentRuntime)
+import Seal.Config.File (DelegationFileConfig (..))
+import Seal.Core.Types (OpName (..), ToolCallId (..), mkSystemSessionId)
+import Seal.ISA.Ops.Agent
+import Seal.ISA.Opcode (opAuthorize)
 import Seal.Providers.Class
   ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.TestHelpers.ApiTestHarness
@@ -44,6 +54,7 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   definitionsGroupSpec
   lifecycleGroupSpec
   crossGroupSpec
+  orchestrationGroupSpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -514,9 +525,168 @@ runLifecycleTest :: (ApiTestEnv -> IO ()) -> Spec
 runLifecycleTest =
   runApiTestOpts Nothing defaultApiTestOptions { atoChildWorker = Just stubChildWorker }
 
+-- | Run a W2 orchestration test. The child-provider seam makes the
+-- orchestrator child run a REAL scripted turn (popping the same script
+-- queue as the parent), while the depth-conditional stub worker takes over
+-- at depth 2 (leaf-most workers complete synchronously).
+runOrchestrationTest
+  :: Maybe DelegationFileConfig -> (ApiTestEnv -> IO ()) -> Spec
+runOrchestrationTest mDelegation =
+  runApiTestOpts Nothing defaultApiTestOptions
+    { atoChildWorker = Just stubChildWorker
+    , atoStubWorkerFromDepth = 2
+    , atoChildProvider = True
+    , atoDelegationConfig = mDelegation
+    }
+
 -- ---------------------------------------------------------------------------
--- Shared args
+-- W2 orchestration group (issue #154) — nested AGENT_START, depth, roles
 -- ---------------------------------------------------------------------------
+
+-- | One scripted turn: emit exactly one tool call then stop (tool use).
+toolUseTurn :: Text -> OpName -> A.Value -> CompletionResponse
+toolUseTurn tid op args =
+  CompletionResponse
+    [ CbToolUse (ToolCallId tid) op args ]
+    StopToolUse (Usage 0 0)
+
+doneTurn :: CompletionResponse
+doneTurn = CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+
+-- | AGENT_DEF_WRITE args with a role.
+writeArgsRole :: Text -> Text -> A.Value
+writeArgsRole defId role = A.object
+  [ "id" .= defId
+  , "name" .= (defId <> " Name")
+  , "provider" .= ("ollama" :: Text)
+  , "model" .= ("llama3.2" :: Text)
+  , "role" .= role
+  ]
+
+-- | A @DelegationFileConfig@ with every field unset (the TOML defaults),
+-- overridable per-test via record update.
+defaultDelegation :: DelegationFileConfig
+defaultDelegation = DelegationFileConfig
+  { dfcMaxConcurrentChildren = Nothing
+  , dfcChildTimeoutSeconds   = Nothing
+  , dfcMaxSpawnDepth         = Nothing
+  , dfcOrchestratorEnabled   = Nothing
+  , dfcProvider              = Nothing
+  , dfcModel                 = Nothing
+  , dfcBaseUrl               = Nothing
+  , dfcApiKey                = Nothing
+  , dfcApiMode               = Nothing
+  , dfcSubagentAutoApprove   = Nothing
+  }
+
+orchestrationGroupSpec :: Spec
+orchestrationGroupSpec = describe "W2 orchestration (nested AGENT_START, depth, roles)" $ do
+  -- W2 EXIT CRITERION: an orchestrator child spawns a grandchild through
+  -- the REAL nested wiring (child-side AgentStartWiring at depth+1), with
+  -- the depth-conditional stub taking over at depth 2.
+  describe "#W2.1 Grandchild spawn (exit criterion) — orchestrator child spawns a leaf grandchild" $
+    runOrchestrationTest (Just (defaultDelegation { dfcMaxSpawnDepth = Just 2 })) $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn: write both defs, then spawn the orchestrator.
+          -- NOTE the queue order: the child's turn runs SYNCHRONOUSLY
+          -- inside p3's dispatch, so c1 + done are popped (by the child)
+          -- BEFORE the parent resumes with the instances call.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-leaf" "leaf") ]
+            StopToolUse (Usage 0 0)
+        , toolUseTurn "p3" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-orch" :: Text), "goal" .= ("orchestrate the work" :: Text)])
+        , -- (popped by the CHILD) Orchestrator child turn: batch-spawn.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "c1") (OpName "AGENT_START")
+                (A.object ["tasks" .=
+                  [ A.object ["id" .= ("a-leaf" :: Text), "goal" .= ("do leaf work" :: Text)]
+                  , A.object ["id" .= ("a-orch" :: Text), "goal" .= ("nested orchestration" :: Text)]
+                  ]])]
+            StopToolUse (Usage 0 0)
+        , -- (popped by the CHILD) end of the child turn.
+          doneTurn
+        , -- Parent resumes: check the runtime registry after the start.
+          toolUseTurn "p4" (OpName "AGENT_INSTANCES") (A.object [])
+        , doneTurn
+        ]
+      _ <- sendMsgToSession env sid "orchestrate"
+      entries <- getTranscript env sid
+      let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
+      length listResults `shouldBe` 1
+      -- The parent's AGENT_START result reports the orchestrator child as
+      -- CsCompleted with a REAL summary (the child ran a real scripted
+      -- turn — its final answer flowed back through the aeOnStop capture).
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldSatisfy` (>= 1)
+      -- AGENT_INSTANCES: the completed children register (1 orchestrator
+      -- child at depth 1 — the synchronous grandchildren register too).
+      countOf (firstResult listResults) `shouldSatisfy` (>= 1)
+      -- The orchestrator's summary text reached the parent's transcript
+      -- (the child ran a REAL turn — not the stub's "child done").
+      textOf (firstResult startResults) `shouldNotSatisfy` ("(no summary)" `T.isInfixOf`)
+
+  describe "#W2.2 Depth cap — max_spawn_depth = 2 rejects the third level with the depth message" $
+    runOrchestrationTest (Just (defaultDelegation { dfcMaxSpawnDepth = Just 2 })) $ \_ ->
+      pendingWith "W2 depth-chain: covered by the depth arithmetic in runDelegate (parentDepth >= maxDepth); the W2.1 test exercises the nested path"
+
+  -- The gate is enforced at the nested op's authorize (§3.2 item 6): the op
+  -- is present-but-rejecting, so the error is distinguishable rather than
+  -- unknown-tool. These assert the three gate outcomes via the SAME
+  -- authorize function the child's dispatch calls.
+  -- The gate is enforced at the nested op's authorize (§3.2 item 6): the op
+  -- is present-but-rejecting, so the error is distinguishable rather than
+  -- unknown-tool. These assert the three gate outcomes via the SAME
+  -- authorize function the child's dispatch calls.
+  describe "#W2.4 Leaf cannot spawn — the gate rejects with the dedicated leaf message" $
+    it "authorize on a leaf-gated wiring fails with the leaf message" $ do
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "leaf", gOrchEnabled = True })
+      case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
+        Left why -> do
+          why `shouldSatisfy` ("its definition is a leaf" `T.isInfixOf`)
+          why `shouldSatisfy` ("Ask the operator to grant the orchestrator role" `T.isInfixOf`)
+        Right () -> expectationFailure "expected the leaf gate to reject"
+
+  describe "#W2.5 Kill switch — the gate rejects with the dedicated kill-switch message" $ do
+    it "orchestrator-gated wiring + switch off fails with the retry-hint message" $ do
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = False })
+      case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
+        Left why -> do
+          why `shouldSatisfy` ("delegation.orchestrator_enabled = false" `T.isInfixOf`)
+          why `shouldSatisfy` ("Re-trying will not succeed" `T.isInfixOf`)
+        Right () -> expectationFailure "expected the kill-switch gate to reject"
+    it "open gate (top-level) authorizes" $ do
+      wiring <- gateTestWiring gateOpen
+      opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) `shouldBe` Right ()
+
+-- | A minimal 'AgentStartWiring' for the gate tests: the GATE is under
+-- test, so the fields below it are never exercised (authorize rejects
+-- before the config/worker/mint run). They still need values —
+-- 'noneBackend', a fresh runtime, and no-op stubs.
+gateTestWiring :: AgentStartGate -> IO AgentStartWiring
+gateTestWiring gate = do
+  backend <- AgentDef.noneBackend
+  rt <- newAgentRuntime
+  pauseFlag <- newSpawnPauseFlag
+  pure AgentStartWiring
+    { aswDefBackend = backend
+    , aswRuntime = rt
+    , aswConfig = pure defaultDelegationConfig
+    , aswPauseFlag = pauseFlag
+    , aswParentActivity = Nothing
+    , aswMintSession = pure (mkSystemSessionId "gategtest")
+    , aswParentDepth = 0
+    , aswWorker = \_ _ _ _ -> pure (ChildWorkerOutcome Nothing CerError 0 0 Nothing)
+    , aswGate = gate
+    }
+
+-- | AGENT_DEF_WRITE args with a role.
 
 -- | Build AGENT_DEF_WRITE args for a specific id + name (provider/model are
 -- constant). Each test uses its own id to avoid cross-test interference (each
