@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Profiler, memo } from 'react'
 import type { Agent, AgentInfo, Message, MessageContent, CodeSpan, ToolCallInfo, ToolDefsBlock, SessionInfo, TranscriptEntry } from '../types'
@@ -433,38 +433,46 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
 
   const closeBtnRef = useRef<HTMLButtonElement>(null)
   const titleId = useRef(`raw-json-title-${Math.random().toString(36).slice(2, 10)}`).current
-  // Detect the skills-catalog truncation marker in the body. When present,
-  // the user can load the full (untruncated) catalog via the API.
-  const truncationMatch = useMemo(
-    () => body.match(/\[\.\.\.catalog truncated at \d+ chars; (\d+) more chars elided\.\.\.\]/),
-    [body],
-  )
-  const [catalogText, setCatalogText] = useState<string | null>(null)
+
+  // Parse + pretty-print ONCE on mount (not on every render). The body
+  // string doesn't change during the modal's lifetime, so memoizing avoids
+  // re-parsing a multi-MB payload every time the user switches tabs or
+  // triggers any re-render.
+  const { pretty, parsed, truncationMarkers } = useMemo(() => {
+    const done = perf.begin('rawJsonModal.parse')
+    // Find all truncation markers in the pretty-printed text so we can
+    // render an inline "Load full catalog" button at each occurrence.
+    const markerRe = /\[\.\.\.catalog truncated at \d+ chars; (\d+) more chars elided\.\.\.\]/g
+    const markers: { index: number; text: string; elided: number }[] = []
+    let m: RegExpExecArray | null
+    while ((m = markerRe.exec(prettyJsonOrRaw(body))) !== null) {
+      markers.push({ index: m.index, text: m[0], elided: parseInt(m[1] ?? '0', 10) })
+    }
+    const result = { pretty: prettyJsonOrRaw(body), parsed: tryParse(body), truncationMarkers: markers }
+    done({ meta: { bodyBytes: body.length } })
+    return result
+  }, [body]) as { pretty: string; parsed: { ok: true; value: unknown } | { ok: false }; truncationMarkers: { index: number; text: string; elided: number }[] }
+
+  // Track which marker indices have been expanded (loaded). Each marker
+  // gets its own "Load full catalog" button; clicking loads the full
+  // catalog text and displays it inline at that marker's position.
+  const [loadedMarkers, setLoadedMarkers] = useState<Set<number>>(new Set())
   const [catalogLoading, setCatalogLoading] = useState(false)
   const [catalogError, setCatalogError] = useState(false)
-  const loadCatalog = useCallback(() => {
+  const [catalogText, setCatalogText] = useState<string | null>(null)
+  const loadCatalog = useCallback((markerIdx: number) => {
     setCatalogLoading(true)
     setCatalogError(false)
     void fetchSkillsCatalog().then((result) => {
       setCatalogLoading(false)
       if (result && result.catalog) {
         setCatalogText(result.catalog)
+        setLoadedMarkers(prev => new Set(prev).add(markerIdx))
       } else {
         setCatalogError(true)
       }
     })
   }, [])
-
-  // Parse + pretty-print ONCE on mount (not on every render). The body
-  // string doesn't change during the modal's lifetime, so memoizing avoids
-  // re-parsing a multi-MB payload every time the user switches tabs or
-  // triggers any re-render.
-  const { pretty, parsed } = useMemo(() => {
-    const done = perf.begin('rawJsonModal.parse')
-    const result = { pretty: prettyJsonOrRaw(body), parsed: tryParse(body) }
-    done({ meta: { bodyBytes: body.length } })
-    return result
-  }, [body])
 
   const [tab, setTab] = useState<JsonTab>('formatted')
 
@@ -551,35 +559,62 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
             </div>
           )
         ) : (
-          <pre className="raw-json-body" data-testid="raw-json-body">{pretty}</pre>
-        )}
-        {truncationMatch && !catalogText && (
-          <div className="catalog-truncation-notice" data-testid="catalog-truncation-notice">
-            <span className="catalog-truncation-text">
-              {truncationMatch[0]}
-            </span>
-            <button
-              className="catalog-load-button"
-              data-testid="catalog-load-button"
-              disabled={catalogLoading}
-              onClick={loadCatalog}
-            >
-              {catalogLoading ? 'Loading…' : 'Load full catalog'}
-            </button>
-            {catalogError && (
-              <span className="catalog-error-text" data-testid="catalog-error-text">
-                Failed to load. Try again.
-              </span>
+          <div className="raw-json-body raw-json-body-segmented" data-testid="raw-json-body">
+            {truncationMarkers.length === 0 ? (
+              <pre className="raw-json-pre-inline">{pretty}</pre>
+            ) : (
+              (() => {
+                const segments: ReactNode[] = []
+                let lastIdx = 0
+                truncationMarkers.forEach((marker, mi) => {
+                  // Text before the marker
+                  segments.push(
+                    <pre key={`seg-${mi}`} className="raw-json-pre-inline">
+                      {pretty.slice(lastIdx, marker.index)}
+                    </pre>,
+                  )
+                  // Inline load button (or loaded catalog) at the marker position
+                  if (loadedMarkers.has(mi) && catalogText) {
+                    segments.push(
+                      <div key={`loaded-${mi}`} className="catalog-inline-loaded" data-testid="catalog-full-section">
+                        <div className="catalog-full-header">
+                          <span className="catalog-full-title">Full available-skills catalog</span>
+                          <CopyJsonButton text={catalogText} />
+                        </div>
+                        <pre className="catalog-full-body" data-testid="catalog-full-body">{catalogText}</pre>
+                      </div>,
+                    )
+                  } else {
+                    segments.push(
+                      <div key={`marker-${mi}`} className="catalog-truncation-inline" data-testid="catalog-truncation-notice">
+                        <span className="catalog-truncation-text">{marker.text}</span>
+                        <button
+                          className="catalog-load-button"
+                          data-testid="catalog-load-button"
+                          disabled={catalogLoading}
+                          onClick={() => loadCatalog(mi)}
+                        >
+                          {catalogLoading ? 'Loading…' : 'Load full catalog'}
+                        </button>
+                        {catalogError && (
+                          <span className="catalog-error-text" data-testid="catalog-error-text">
+                            Failed to load. Try again.
+                          </span>
+                        )}
+                      </div>,
+                    )
+                  }
+                  lastIdx = marker.index + marker.text.length
+                })
+                // Trailing text after the last marker
+                segments.push(
+                  <pre key={`seg-last`} className="raw-json-pre-inline">
+                    {pretty.slice(lastIdx)}
+                  </pre>,
+                )
+                return segments
+              })()
             )}
-          </div>
-        )}
-        {catalogText && (
-          <div className="catalog-full-section" data-testid="catalog-full-section">
-            <div className="catalog-full-header">
-              <span className="catalog-full-title">Full available-skills catalog</span>
-              <CopyJsonButton text={catalogText} />
-            </div>
-            <pre className="catalog-full-body" data-testid="catalog-full-body">{catalogText}</pre>
           </div>
         )}
       </div>

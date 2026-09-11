@@ -895,6 +895,8 @@ describe('ChatArea', () => {
     // Open the raw JSON modal.
     fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
     expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    // Switch to the Raw tab — the inline buttons appear in the raw text view.
+    fireEvent.click(screen.getByRole('tab', { name: 'Raw' }))
     // The truncation notice + "Load full catalog" button are present.
     expect(screen.getByTestId('catalog-truncation-notice')).toBeTruthy()
     expect(screen.getByTestId('catalog-load-button')).toBeTruthy()
@@ -904,6 +906,52 @@ describe('ChatArea', () => {
     const fullSection = await screen.findByTestId('catalog-full-section')
     expect(fullSection).toBeTruthy()
     expect(screen.getByTestId('catalog-full-body').textContent).toContain('Beta skill')
+    vi.unstubAllGlobals()
+  })
+
+  it('shows a separate "Load full catalog" button for each truncation marker', async () => {
+    // Two truncation markers in the same body (e.g. the system prompt
+    // appears twice in the raw JSON — once in the "system" field and once
+    // in the messages array).
+    const marker = '[...catalog truncated at 4096 chars; 1234 more chars elided...]'
+    const sys = 'You are a helpful assistant.\n\n<available_skills>\n## Skills\n- alpha: Alpha skill\n' + marker
+    const rawJson = JSON.stringify({
+      system: sys,
+      messages: [{ role: 'system', content: sys }],
+    }, null, 2)
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'System Prompt',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', collapsedText: sys }],
+        rawJson,
+      },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/skills/catalog') {
+        return new Response(
+          JSON.stringify({ catalog: '<available_skills>\n## Skills\n- alpha: Alpha skill\n- beta: Beta skill\n</available_skills>', truncated: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // Open the raw JSON modal.
+    fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
+    expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    // Switch to the Raw tab — the inline buttons appear in the raw text view.
+    fireEvent.click(screen.getByRole('tab', { name: 'Raw' }))
+    // Two truncation markers → two inline "Load full catalog" buttons.
+    const buttons = screen.getAllByTestId('catalog-load-button')
+    expect(buttons).toHaveLength(2)
     vi.unstubAllGlobals()
   })
 
@@ -927,6 +975,8 @@ describe('ChatArea', () => {
     // Open the raw JSON modal.
     fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
     expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    // Check the Raw tab too — no markers means no buttons there either.
+    fireEvent.click(screen.getByRole('tab', { name: 'Raw' }))
     // No truncation notice or load button.
     expect(screen.queryByTestId('catalog-truncation-notice')).toBeNull()
     expect(screen.queryByTestId('catalog-load-button')).toBeNull()

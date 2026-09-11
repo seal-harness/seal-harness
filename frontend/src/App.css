@@ -583,6 +583,42 @@ body {
 
 /* ── Skills-catalog truncation notice + full catalog ─────────────────── */
 
+/* ── Skills-catalog truncation inline + full catalog ─────────────────── */
+
+.raw-json-body-segmented {
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  white-space: normal;
+  flex: 1;
+}
+
+.raw-json-pre-inline {
+  margin: 0;
+  padding: 14px 16px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+.catalog-truncation-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--bg-sunken);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
 .catalog-truncation-notice {
   display: flex;
   align-items: center;
@@ -674,6 +710,13 @@ body {
   background: var(--bg-base);
   white-space: pre;
   flex: 1;
+}
+
+.catalog-inline-loaded {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
 /* ── JSON tree (Formatted tab) ────────────────────────────────────────── */
