@@ -6,7 +6,7 @@ import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
-import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
+import { fetchModelContext, fetchSkillsCatalog, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 
 /** Click-to-edit chat-header title. Displays the cascade
@@ -433,6 +433,27 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
 
   const closeBtnRef = useRef<HTMLButtonElement>(null)
   const titleId = useRef(`raw-json-title-${Math.random().toString(36).slice(2, 10)}`).current
+  // Detect the skills-catalog truncation marker in the body. When present,
+  // the user can load the full (untruncated) catalog via the API.
+  const truncationMatch = useMemo(
+    () => body.match(/\[\.\.\.catalog truncated at \d+ chars; (\d+) more chars elided\.\.\.\]/),
+    [body],
+  )
+  const [catalogText, setCatalogText] = useState<string | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogError, setCatalogError] = useState(false)
+  const loadCatalog = useCallback(() => {
+    setCatalogLoading(true)
+    setCatalogError(false)
+    void fetchSkillsCatalog().then((result) => {
+      setCatalogLoading(false)
+      if (result && result.catalog) {
+        setCatalogText(result.catalog)
+      } else {
+        setCatalogError(true)
+      }
+    })
+  }, [])
 
   // Parse + pretty-print ONCE on mount (not on every render). The body
   // string doesn't change during the modal's lifetime, so memoizing avoids
@@ -531,6 +552,35 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
           )
         ) : (
           <pre className="raw-json-body" data-testid="raw-json-body">{pretty}</pre>
+        )}
+        {truncationMatch && !catalogText && (
+          <div className="catalog-truncation-notice" data-testid="catalog-truncation-notice">
+            <span className="catalog-truncation-text">
+              {truncationMatch[0]}
+            </span>
+            <button
+              className="catalog-load-button"
+              data-testid="catalog-load-button"
+              disabled={catalogLoading}
+              onClick={loadCatalog}
+            >
+              {catalogLoading ? 'Loading…' : 'Load full catalog'}
+            </button>
+            {catalogError && (
+              <span className="catalog-error-text" data-testid="catalog-error-text">
+                Failed to load. Try again.
+              </span>
+            )}
+          </div>
+        )}
+        {catalogText && (
+          <div className="catalog-full-section" data-testid="catalog-full-section">
+            <div className="catalog-full-header">
+              <span className="catalog-full-title">Full available-skills catalog</span>
+              <CopyJsonButton text={catalogText} />
+            </div>
+            <pre className="catalog-full-body" data-testid="catalog-full-body">{catalogText}</pre>
+          </div>
         )}
       </div>
     </div>,

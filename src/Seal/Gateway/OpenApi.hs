@@ -116,6 +116,7 @@ openApiMeta = \case
   RouteSkillCreate -> api (match "skills" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteSkillUpdate -> api (match "skills" ./ capture oaSkillId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
   RouteSkillDelete -> api (match "skills" ./ capture oaSkillId ./ end) qend bodyless (resp (one ffBody)) M.delete
+  RouteSkillsCatalog -> api (match "skills" ./ match "catalog" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteReposList -> api (match "repos" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteRepoCreate -> api (match "repos" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteRepoGet -> api (match "repos" ./ capture oaRepoId ./ end) qend bodyless (resp (one ffBody)) M.get

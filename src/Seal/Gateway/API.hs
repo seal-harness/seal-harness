@@ -52,6 +52,7 @@ import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
+import Seal.Skills.Prompt (fullBlock, availableSkillsBudget)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
 import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security
@@ -416,6 +417,13 @@ apiApp deps req respond =
     (m', ["api", "skills"]) | m' == methodGet -> do
       skills <- sbList (adSkills deps)
       respond (jsonLBS status200 (A.encode (map skillInfoJson skills)))
+    -- GET /api/skills/catalog -> the full (untruncated) available-skills
+    -- catalog text. Returns 200 with {catalog, truncated} where catalog is
+    -- the untruncated block text and truncated is whether the truncation
+    -- budget would have been hit.
+    (m', ["api", "skills", "catalog"]) | m' == methodGet -> do
+      skills <- sbList (adSkills deps)
+      respond (jsonOk (skillsCatalogJson skills))
     -- GET /api/skills/:id -> a single skill by id. 404 when absent or the id
     -- fails 'mkSkillId'.
     (m', ["api", "skills", sid]) | m' == methodGet ->
@@ -1975,6 +1983,23 @@ skillInfoJson s = A.object
   , "updated_at" .= skUpdatedAt s
   , "session" .= skSession s
   ]
+
+-- | JSON for GET /api/skills/catalog. Returns the full (untruncated)
+-- catalog block text and whether the truncation budget would have been
+-- hit. When there are no skills, the catalog is the empty string and
+-- truncated is False.
+skillsCatalogJson :: [Skill] -> Value
+skillsCatalogJson [] = A.object
+  [ "catalog" .= ("" :: Text)
+  , "truncated" .= False
+  ]
+skillsCatalogJson skills =
+  let block = fullBlock skills
+      truncated = T.length block > availableSkillsBudget
+  in A.object
+    [ "catalog" .= block
+    , "truncated" .= truncated
+    ]
 
 -- | A 201 Created with a JSON body + CORS headers.
 jsonCreated :: Value -> Response

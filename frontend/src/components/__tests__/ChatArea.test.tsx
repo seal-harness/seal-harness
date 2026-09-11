@@ -865,6 +865,73 @@ describe('ChatArea', () => {
     expect(screen.getByText('"input_schema"')).toBeTruthy()
   })
 
+  it('shows "Load full catalog" button when the truncation marker is present in rawJson', async () => {
+    const truncatedSystem = 'You are a helpful assistant.\n\n<available_skills>\n## Skills\n- alpha: Alpha skill\n[...catalog truncated at 4096 chars; 1234 more chars elided...]'
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'System Prompt',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', collapsedText: truncatedSystem }],
+        rawJson: JSON.stringify({ system: truncatedSystem }),
+      },
+    ]
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/skills/catalog') {
+        return new Response(
+          JSON.stringify({ catalog: '<available_skills>\n## Skills\n- alpha: Alpha skill\n- beta: Beta skill\n</available_skills>', truncated: true }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // Open the raw JSON modal.
+    fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
+    expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    // The truncation notice + "Load full catalog" button are present.
+    expect(screen.getByTestId('catalog-truncation-notice')).toBeTruthy()
+    expect(screen.getByTestId('catalog-load-button')).toBeTruthy()
+    // Click the button to load the full catalog.
+    fireEvent.click(screen.getByTestId('catalog-load-button'))
+    // The full catalog section appears with the loaded text.
+    const fullSection = await screen.findByTestId('catalog-full-section')
+    expect(fullSection).toBeTruthy()
+    expect(screen.getByTestId('catalog-full-body').textContent).toContain('Beta skill')
+    vi.unstubAllGlobals()
+  })
+
+  it('does not show "Load full catalog" button when there is no truncation marker', () => {
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        agentName: 'System Prompt',
+        agentStatus: 'idle',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', collapsedText: 'You are a helpful assistant.' }],
+        rawJson: '{"system":"You are a helpful assistant."}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+      />,
+    )
+    // Open the raw JSON modal.
+    fireEvent.click(screen.getByLabelText('View raw JSON (message)'))
+    expect(screen.getByTestId('raw-json-modal')).toBeTruthy()
+    // No truncation notice or load button.
+    expect(screen.queryByTestId('catalog-truncation-notice')).toBeNull()
+    expect(screen.queryByTestId('catalog-load-button')).toBeNull()
+  })
+
   it('slash bubble renders transiently with the "command output — not saved" label', () => {
     const messages: Message[] = [
       {
