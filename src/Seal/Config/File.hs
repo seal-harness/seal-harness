@@ -39,6 +39,7 @@ module Seal.Config.File
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement
   , resolvedTaskCompletionGuidance
+  , resolvedAvailableAgents
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
@@ -325,6 +326,12 @@ data AgentConfig = AgentConfig
     -- ^ Whether to inject the task-completion / anti-fabrication guidance
     -- ("don't stop after a stub; don't fabricate output when blocked").
     -- Absent → @true@.
+  , acAvailableAgents :: Maybe Bool
+    -- ^ Whether to inject the @\<available_agents\>@ catalog (a grouped
+    -- listing of all agent-def ids + roles + descriptions) into the
+    -- system prompt so the model discovers and delegates to agents.
+    -- Absent (the default) → @true@. Set @available_agents = false@ to
+    -- disable (issue #154 §3.4).
   } deriving stock (Eq, Show)
 
 -- | 'RetrievalConfig' with all fields absent (operator did not set them).
@@ -491,6 +498,7 @@ agentConfigCodec = AgentConfig
   <$> Toml.dioptional (Toml.bool "parallel_tool_guidance") .= acParallelToolGuidance
   <*> Toml.dioptional (Toml.bool "tool_use_enforcement") .= acToolUseEnforcement
   <*> Toml.dioptional (Toml.bool "task_completion_guidance") .= acTaskCompletionGuidance
+  <*> Toml.dioptional (Toml.bool "available_agents") .= acAvailableAgents
 
 -- ---------------------------------------------------------------------------
 -- @providers@ table normalization
@@ -650,6 +658,13 @@ resolvedToolUseEnforcement cfg =
 resolvedTaskCompletionGuidance :: RuntimeConfig -> Bool
 resolvedTaskCompletionGuidance cfg =
   fromMaybe True (rcAgent cfg >>= acTaskCompletionGuidance)
+
+-- | Resolve whether the @\<available_agents\>@ catalog is injected (issue
+-- #154 §3.4). Absent @[agent]@ section or @available_agents@ key →
+-- @True@ (injected); an explicit @false@ disables.
+resolvedAvailableAgents :: RuntimeConfig -> Bool
+resolvedAvailableAgents cfg =
+  fromMaybe True (rcAgent cfg >>= acAvailableAgents)
 
 -- | Insert or update one provider section by applying @f@ to its current
 -- config (or to an empty one if absent).

@@ -49,7 +49,7 @@ import Seal.Agent.Def.Backend qualified as Def
 import Seal.Agent.Def.Types (adSystem, adModel, adProvider, AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..), TurnEnv (..), mkSessionAgentEnv)
 import Seal.Agent.Loop (runTurn, defaultMaxTokens)
-import Seal.Agent.PromptParts (injectStaticGuidance)
+import Seal.Agent.PromptParts (injectAvailableAgents, injectStaticGuidance, leafAgentNote)
 import Seal.Agent.Runtime.Delegation
   (ChildTask (..), ctContext, fromFileConfig, resolveDelegationConfig)
 import Seal.Agent.Runtime.Delegation.Worker
@@ -59,7 +59,8 @@ import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
   , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript
-  , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedParallelToolGuidance
+  , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
+  , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
   , WebConfig (..) )
 import Seal.Config.Paths
@@ -157,7 +158,7 @@ import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
 import qualified Seal.Agent.Runtime.Delegation.Worker as Worker
-  ( childBlocklist, filterBlocklistedWith )
+  ( childBlocklist, effectiveRole, filterBlocklistedWith )
 
 -- | Unwrap a nested 'Maybe' field from an optional 'WebConfig'. Returns
 -- the default when the @[web]@ section is absent or the field is 'Nothing'.
@@ -193,6 +194,12 @@ resolveSystemPrompt
   -> Bool
   -- ^ Whether to inject the @\<available_skills\>@ catalog.
   -> Bool
+  -- ^ Whether to inject the @\<available_agents\>@ catalog (issue #154
+  -- §3.4; the caller passes 'resolvedAvailableAgents').
+  -> [AgentDef]
+  -- ^ The agent-def catalog source (the per-turn union backend's
+  -- 'adbList' — the caller fetches once; injection stays pure).
+  -> Bool
   -- ^ Whether to inject the parallel tool-call guidance block.
   -> Bool
   -- ^ Whether to inject the tool-use enforcement guidance block.
@@ -204,7 +211,8 @@ resolveSystemPrompt
   -> SessionMeta
   -> IO (Maybe Text)
 resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
-                   parallel toolUse taskCompletion mCodegraphBody meta = do
+                    injectAgents agentDefs
+                    parallel toolUse taskCompletion mCodegraphBody meta = do
   base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
@@ -213,9 +221,14 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
   let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
   withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
   let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload
-  if injectCatalog
-    then injectAvailableSkills skillBackend withCodegraph
-    else pure withCodegraph
+  withSkills <- if injectCatalog
+                  then injectAvailableSkills skillBackend withCodegraph
+                  else pure withCodegraph
+  -- The agents catalog is appended AFTER the skills catalog (W3: skills
+  -- keep their established tail position; agents follow).
+  pure (if injectAgents
+          then injectAvailableAgents agentDefs withSkills
+          else withSkills)
 
 -- | Build the ISA registry for a session turn. This is the **single**
 -- implementation — used by all four surfaces (Web, TUI, Telegram, Signal).
@@ -568,9 +581,14 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
   -- [engine] Check if any cloned repo has a .codegraph/ directory; if so,
   -- inject the codegraph skill body into the system prompt.
   mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
+  -- [engine] Agent catalog source (W3): ONE adbList on the per-turn union
+  -- backend feeds both the prompt catalog and the nested spawn resolution.
+  catalogAgentDefs <- Def.adbList agentDefBackend
+  let injectAgents = either (const True) resolvedAvailableAgents eCfg
   -- [engine] System prompt (single resolver, honors smSystemOverride).
   mSystem <- resolveSystemPrompt agentDefBackend sessionSkills
-              autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'
+              autoloadId injectCatalog injectAgents catalogAgentDefs
+              parallel toolUse taskCompletion mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
@@ -832,9 +850,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
                       { bAgentDefs = Def.unionAgentDefBackend freshAgentDefs (bAgentDefs (tdBaseBackends td)) }
                     sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
                 mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
+                catalogAgentDefs' <- Def.adbList (bAgentDefs freshBackends)
+                let injectAgents = either (const True) resolvedAvailableAgents eCfg
                 mSystem <- resolveSystemPrompt
                   (bAgentDefs freshBackends) sessionSkills
-                  autoloadId injectCatalog parallel toolUse taskCompletion mCodegraphBody meta'
+                  autoloadId injectCatalog injectAgents catalogAgentDefs'
+                  parallel toolUse taskCompletion mCodegraphBody meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
@@ -921,7 +942,10 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
     , dwdChildRegistry = buildChildRegistryAdapter td eCfg operatorCeiling appEnv channel
-    , dwdChildSystemPrompt = childSystemPrompt td eCfg
+    , dwdChildSystemPrompt =
+        let (_, _, _, orch) = resolveDelegationConfig
+                                (fromFileConfig (either (const Nothing) rcDelegation eCfg))
+        in childSystemPrompt td eCfg (bAgentDefs sessionBackends) orch
     , dwdOnEntry = pure ()
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
@@ -1062,9 +1086,9 @@ applyDefAllowList def ops = case adTools def of
 -- catalog. Uses 'tdBaseBackends' (the child registry doesn't get
 -- workdir-aware skills — matching the original implementations).
 childSystemPrompt
-  :: TurnDeps -> Either a RuntimeConfig
+  :: TurnDeps -> Either a RuntimeConfig -> Def.AgentDefBackend -> Bool
   -> AgentDef -> ChildTask -> IO (Maybe Text)
-childSystemPrompt td eCfg agentDef task = do
+childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
   let base = adSystem agentDef
       ctx  = ctContext task
       basePrompt = case (base, ctx) of
@@ -1077,11 +1101,27 @@ childSystemPrompt td eCfg agentDef task = do
       parallel = either (const True) resolvedParallelToolGuidance eCfg
       toolUse = either (const True) resolvedToolUseEnforcement eCfg
       taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+      injectAgents = either (const True) resolvedAvailableAgents eCfg
+      -- W3 (§3.4): the effective role (def-authoritative, ctRole
+      -- narrowed) + the kill switch decide the CHILD's catalog plane —
+      -- the same predicate the registry's gate used (both planes gated
+      -- together, computed once in the adapter and threaded here). An
+      -- orchestrator child (+ switch on) gets the catalog; a leaf child
+      -- (or switch-off) gets the one-line leaf note.
+      effRole = Worker.effectiveRole (adRole agentDef) (ctRole task)
+      canSpawn = effRole == Just "orchestrator" && orchEnabled
       withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
   withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
-  if injectCatalog
+  withSkills <- if injectCatalog
     then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload
     else pure withAutoload
+  if not injectAgents
+    then pure withSkills
+    else if canSpawn
+      then do
+        agentDefs <- Def.adbList unionDefBackend
+        pure (injectAvailableAgents agentDefs withSkills)
+      else pure (Just (maybe leafAgentNote (\p -> p <> "\n\n" <> leafAgentNote) withSkills))
 
 -- | Check if any cloned repo in the workdir has a @.codegraph/@ directory.
 -- If so, look up the codegraph skill body from the skill backend and return

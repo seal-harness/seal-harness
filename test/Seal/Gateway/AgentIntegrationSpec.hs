@@ -52,6 +52,8 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   lifecycleGroupSpec
   crossGroupSpec
   orchestrationGroupSpec
+  w3CatalogSpec
+  w2GateSpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -638,14 +640,57 @@ orchestrationGroupSpec = describe "W2 orchestration (nested AGENT_START, depth, 
     runOrchestrationTest (Just (defaultDelegation { dfcMaxSpawnDepth = Just 2 })) $ \_ ->
       pendingWith "W2 depth-chain: covered by the depth arithmetic in runDelegate (parentDepth >= maxDepth); the W2.1 test exercises the nested path"
 
-  -- The gate is enforced at the nested op's authorize (§3.2 item 6): the op
-  -- is present-but-rejecting, so the error is distinguishable rather than
-  -- unknown-tool. These assert the three gate outcomes via the SAME
-  -- authorize function the child's dispatch calls.
-  -- The gate is enforced at the nested op's authorize (§3.2 item 6): the op
-  -- is present-but-rejecting, so the error is distinguishable rather than
-  -- unknown-tool. These assert the three gate outcomes via the SAME
-  -- authorize function the child's dispatch calls.
+-- ---------------------------------------------------------------------------
+-- W3 orchestration (issue #154) — the <available_agents> catalog
+-- ---------------------------------------------------------------------------
+
+w3CatalogSpec :: Spec
+w3CatalogSpec = describe "W3 catalog (<available_agents> injection)" $ do
+  -- The catalog appears in the PARENT prompt's preamble entry (the
+  -- EKRequest entry carrying the full system-prompt envelope), after the
+  -- skills catalog.
+  describe "#W3.1 Parent prompt — catalog present" $
+    runDefTest $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Turn 1: write the def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , doneTurn
+        , -- Turn 2: the system prompt's catalog now includes the def.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "write a def"
+      _ <- sendMsgToSession env sid "again"
+      entries <- getTranscript env sid
+      let systemTexts = mapMaybe payloadSystemText entries
+          withAgents = [ t | t <- systemTexts, "<available_agents>" `T.isInfixOf` t ]
+      length withAgents `shouldSatisfy` (>= 1)
+      -- The rendered def bullet (id + role + description).
+      any (\t -> "a-orch [orchestrator]" `T.isInfixOf` t) withAgents
+        `shouldBe` True
+
+-- | Extract the @payload.system@ text from a transcript entry ('Nothing'
+-- when the entry has no system field).
+payloadSystemText :: A.Value -> Maybe Text
+payloadSystemText entry = do
+  obj <- asObject entry
+  payload <- KeyMap.lookup payloadKey obj >>= asObject
+  case KeyMap.lookup systemKey payload of
+    Just (A.String t) -> pure t
+    _                 -> Nothing
+  where
+    systemKey = Key.fromString "system"
+
+-- ---------------------------------------------------------------------------
+-- W2 gate authorize tests (§3.2 item 6) — the SAME authorize function the
+-- child's dispatch calls
+-- ---------------------------------------------------------------------------
+
+w2GateSpec :: Spec
+w2GateSpec = describe "W2 gate (present-but-rejecting op)" $ do
   describe "#W2.4 Leaf cannot spawn — the gate rejects with the dedicated leaf message" $
     it "authorize on a leaf-gated wiring fails with the leaf message" $ do
       wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "leaf", gOrchEnabled = True })
