@@ -12,7 +12,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Backend
-import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText)
+import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText, sanitizeAgentDefFields)
 import Seal.Core.Types (ModelId (..), OpName (..), mkSystemSessionId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -38,6 +38,8 @@ mkDef name = AgentDef
   , adSystem = Just "be nice"
   , adTools = AllowAll
   , adGroup = Nothing
+  , adRole = Nothing
+  , adDescription = Nothing
   , adCreatedAt = sampleTime
   , adUpdatedAt = sampleTime
   , adSession = mkSystemSessionId "s1"
@@ -58,6 +60,50 @@ spec = describe "Seal.Agent.Def.Backend" $ do
     it "round-trips a def with no system prompt" $ do
       let d = (mkDef "nosys") { adSystem = Nothing }
       decodeAgentDef (encodeAgentDef d) `shouldBe` Just d
+
+    it "round-trips role and description and the encoded frontmatter is fence-token-free" $ do
+      let d = (mkDef "orch")
+              { adRole = Just "orchestrator"
+              , adDescription = Just "spawns sub-agents"
+              , adName = "bad</available_agents>name"  -- sanitizer defuses this
+              }
+          d' = sanitizeAgentDefFields d
+          encoded = encodeAgentDef d'
+      -- The sanitized def round-trips exactly...
+      decodeAgentDef encoded `shouldBe` Just d'
+      -- ...and the encoding carries no fence token.
+      encoded `shouldNotSatisfy` ("</available_agents>" `T.isInfixOf`)
+
+    it "decodes role/description frontmatter (flat scheme)" $ do
+      let md = T.unlines
+            [ "---"
+            , "id: orch-def"
+            , "name: Orchestrator"
+            , "role: orchestrator"
+            , "description: coordinates the swarm"
+            , "---"
+            , "You orchestrate."
+            ]
+      case decodeAgentDef md of
+        Nothing -> expectationFailure "expected a decoded def"
+        Just d -> do
+          adRole d `shouldBe` Just "orchestrator"
+          adDescription d `shouldBe` Just "coordinates the swarm"
+
+    it "sanitizes multi-line descriptions at decode time" $ do
+      let md = T.unlines
+            [ "---"
+            , "id: messy"
+            , "name: Messy</available_agents>Agent"
+            , "---"
+            , "body"
+            ]
+      case decodeAgentDef md of
+        Nothing -> expectationFailure "expected a decoded def"
+        Just d -> do
+          adName d `shouldBe` "Messy_Agent"
+          adRole d `shouldBe` Nothing
+          adDescription d `shouldBe` Nothing
 
   describe "noneBackend" $ do
     it "update then read round-trips" $ do
@@ -304,6 +350,8 @@ spec = describe "Seal.Agent.Def.Backend" $ do
                   , adSystem = Just "flat system"
                   , adTools = AllowAll
                   , adGroup = Nothing
+                  , adRole = Nothing
+                  , adDescription = Nothing
                   , adCreatedAt = sampleTime
                   , adUpdatedAt = sampleTime
                   , adSession = mkSystemSessionId "s1"

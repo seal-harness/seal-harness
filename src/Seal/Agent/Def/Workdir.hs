@@ -103,7 +103,7 @@ import Toml qualified
 
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
-  , isValidAgentDefId
+  , isValidAgentDefId, sanitizeAgentDefFields
   )
 import Seal.Core.Types (ModelId (..), OpName (..), mkSessionId, mkSystemSessionId, sessionIdText)
 import Seal.Security.Policy (AllowList (..))
@@ -266,16 +266,20 @@ encodeAgentDef d = encodeDoc fm body
       , ("updated_at", isoTime (adUpdatedAt d))
       , ("session", sessionIdText (adSession d))
       ] ++ maybe [] (\g -> [("group", g)]) (adGroup d)
+        ++ maybe [] (\r -> [("role", r)]) (adRole d)
+        ++ maybe [] (\desc -> [("description", desc)]) (adDescription d)
 
 -- | Decode a Markdown document into an 'AgentDef'. Returns 'Nothing' if the id
--- field is missing or fails 'mkAgentDefId'.
+-- field is missing or fails 'mkAgentDefId'. Every renderable field passes
+-- through 'sanitizeAgentDefFields' (the single decode chokepoint) so no
+-- unsanitized field reaches a prompt or tool output.
 decodeAgentDef :: Text -> Maybe AgentDef
 decodeAgentDef content =
   case decodeDoc content of
     (fm, body) -> do
       aidT <- fmLookup "id" fm
       aid  <- either (const Nothing) Just (mkAgentDefId aidT)
-      Just AgentDef
+      Just (sanitizeAgentDefFields AgentDef
         { adId = aid
         , adName = fromMaybe "" (fmLookup "name" fm)
         , adProvider = fromMaybe "" (fmLookup "provider" fm)
@@ -283,10 +287,12 @@ decodeAgentDef content =
         , adSystem = if T.null body then Nothing else Just body
         , adTools = decodeTools fm
         , adGroup = fmLookup "group" fm
+        , adRole = fmLookup "role" fm
+        , adDescription = fmLookup "description" fm
         , adCreatedAt = parseTime (fmLookup "created_at" fm)
         , adUpdatedAt = parseTime (fmLookup "updated_at" fm)
         , adSession = fromRight (mkSystemSessionId "unknown") (mkSessionId (fromMaybe "unknown" (fmLookup "session" fm)))
-        }
+        })
 
 -- ---------------------------------------------------------------------------
 -- Shared pure helpers (flat + dir)
@@ -406,6 +412,8 @@ loadDirAgentDef fs aid = do
         , adSystem = if T.null body then Nothing else Just body
         , adTools = decodeDirTools (dacTools cfg)
         , adGroup = Nothing
+        , adRole = Nothing
+        , adDescription = Nothing
         , adCreatedAt = mtime
         , adUpdatedAt = mtime
         , adSession = mkSystemSessionId "manual"
@@ -449,7 +457,7 @@ decodeProjectAgentsMd content =
     (fm, body) ->
       case mkAgentDefId deriveAgentsMdId of
         Left _ -> Nothing
-        Right aid -> Just AgentDef
+        Right aid -> Just (sanitizeAgentDefFields AgentDef
           { adId = aid
           , adName = fromMaybe projectAgentsMdDisplayName (fmLookup "name" fm)
           , adProvider = fromMaybe "" (fmLookup "provider" fm)
@@ -457,10 +465,12 @@ decodeProjectAgentsMd content =
           , adSystem = if T.null body then Nothing else Just body
           , adTools = decodeTools fm
           , adGroup = Nothing
+          , adRole = Nothing
+          , adDescription = Nothing
           , adCreatedAt = epochZero
           , adUpdatedAt = epochZero
           , adSession = mkSystemSessionId "manual"
-          }
+          })
 
 -- | Decode a protocol @agent.md@ frontmatter + body into an 'AgentDef'.
 -- The id is the subdir name, unless frontmatter @id@ is present and valid
@@ -477,7 +487,7 @@ decodeProtocolAgentMd subDirName content =
           let idText = fromMaybe subDirName (fmLookup "id" fm >>= validId)
           in case mkAgentDefId idText of
                Left _ -> Nothing
-               Right aid -> Just AgentDef
+               Right aid -> Just (sanitizeAgentDefFields AgentDef
                  { adId = aid
                  , adName = fromMaybe idText (fmLookup "name" fm)
                  , adProvider = fromMaybe "" (fmLookup "provider" fm)
@@ -485,10 +495,12 @@ decodeProtocolAgentMd subDirName content =
                  , adSystem = if T.null body then Nothing else Just body
                  , adTools = decodeTools fm
                  , adGroup = Nothing
+                 , adRole = fmLookup "role" fm
+                 , adDescription = fmLookup "description" fm
                  , adCreatedAt = epochZero
                  , adUpdatedAt = epochZero
                  , adSession = mkSystemSessionId "manual"
-                 }
+                 })
   where
     validId t = if isValidAgentDefId t then Just t else Nothing
 
@@ -707,16 +719,21 @@ listAgentDefsFsSnap snap fs anchor = do
 -- @adName@ with @\<repo\>\/\<name\>@. The id prefix uses @"--"@ (charset-safe
 -- per 'isValidAgentDefId'); the display name uses @"/"@ for readability. If
 -- the prefixed id fails validation (e.g. the repo dir has a char outside the
--- charset), the def is dropped ('Nothing' — fail-closed).
+-- charset), the def is dropped ('Nothing' — fail-closed). The result passes
+-- through 'sanitizeAgentDefFields' so the repo directory name (operator-
+-- controlled but rendered into the W3 catalog) can never re-introduce a
+-- fence token or control char after the decode-time chokepoint — the same
+-- treatment 'stampGroup' gives the group directory name.
 prefixWorkdirDef :: Text -> AgentDef -> Maybe AgentDef
 prefixWorkdirDef repo d =
   let prefixedIdText = repo <> "--" <> agentDefIdText (adId d)
   in case mkAgentDefId prefixedIdText of
        Left _ -> Nothing
-       Right aid -> Just d
-         { adId = aid
-         , adName = repo <> "/" <> adName d
-         }
+       Right aid ->
+         Just (sanitizeAgentDefFields d
+           { adId = aid
+           , adName = repo <> "/" <> adName d
+           })
 
 -- ---------------------------------------------------------------------------
 -- Workdir-local legacy enumerator (flat + dir, over WorkdirFs)

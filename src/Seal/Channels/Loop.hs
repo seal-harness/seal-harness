@@ -211,6 +211,8 @@ mkChannelTurnDeps deps = TurnDeps
   , tdExecCache    = cdExecCache deps
   , tdRemoteRunner = Nothing
   , tdMkWorker    = Nothing
+  , tdResolveProviderOverride = Nothing
+  , tdMkWorkerStubDepth = 2
   }
 
 -- | Build the channel 'TurnAdapter' for a given 'ChannelHandle' +
