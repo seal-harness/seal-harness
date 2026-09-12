@@ -11,7 +11,7 @@ enabled: true
 **Type**: `architect-agent`
 **Role**: Implementation planning and architecture design
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, architecture-rubric, BEADS CLI
+**Tools**: Codebase read, architecture-rubric, task documents
 
 ---
 
@@ -49,10 +49,10 @@ Triggered when:
 
 ```bash
 # Prime with planning-specific context and file patterns
-bd prime --work-type planning --keywords "<feature-keywords>"
+read docs/knowledge/ and docs/plans/ for planning context --keywords "<feature-keywords>"
 
 # If you know which files will be affected:
-bd prime --work-type planning --files "src/lib/services/*.ts" --keywords "<keywords>"
+read docs/knowledge/ and docs/plans/ for planning context --files "src/lib/services/*.ts" --keywords "<keywords>"
 ```
 
 Review the output and note:
@@ -66,10 +66,10 @@ Review the output and note:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get research findings from Researcher Agent
-bd show <research-task-id> --json
+# Show task: research-task-id> --json
 
 # Get the GitHub Issue requirements
 gh issue view <issue-number> --json title,body
@@ -326,11 +326,11 @@ model NewModel {
 
 ````
 
-### Step 6: Update BEADS
+### Step 6: Update task document
 
 ```bash
-bd update <task-id> --status completed
-bd close <task-id> --reason "Implementation plan created. Ready for CTO review."
+# Update task status: <task-id> --status completed
+# Mark task complete: <task-id> --reason "Implementation plan created. Ready for CTO review."
 ````
 
 ---
@@ -432,7 +432,7 @@ When plan is complete:
 4. Mark task as ready for review
 
 ```bash
-bd close <task-id> --reason "Plan complete. See implementation plan document."
+# Mark task complete: <task-id> --reason "Plan complete. See implementation plan document."
 ```
 
 ---
@@ -474,4 +474,4 @@ The Architect Agent produces an implementation plan document with:
 - [ ] Testing strategy uses mock factories
 - [ ] Risks identified with mitigations
 - [ ] Plan follows existing codebase patterns
-- [ ] BEADS task closed with plan reference
+- [ ] task closed with plan reference

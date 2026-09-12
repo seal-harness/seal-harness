@@ -11,7 +11,7 @@ enabled: true
 **Type**: `security-auditor-agent`
 **Role**: Security vulnerability detection and OWASP compliance
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, security-review-rubric, BEADS CLI
+**Tools**: Codebase read, security-review-rubric, task documents
 
 ---
 
@@ -48,7 +48,7 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type review --keywords "security" "authentication" "validation"
+read docs/knowledge/ for review context --keywords "security" "authentication" "validation"
 ```
 
 Review the output for security patterns and known vulnerabilities in this codebase.
@@ -57,7 +57,7 @@ Review the output for security patterns and known vulnerabilities in this codeba
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get changed files
 git diff main..HEAD --name-only
@@ -86,7 +86,7 @@ Categorize changed files by risk:
 # rubrics/security-review-rubric.md
 
 # Check for known security issues
-grep -r "security" .beads/knowledge/*.jsonl
+grep -r "security" docs/knowledge/*.jsonl
 ```
 
 ### Step 4: OWASP Top 10 Audit
@@ -278,27 +278,27 @@ where: { id: params.id, userId: session.user.id }
 
 ---
 
-### BEADS Update
+### Task Update
 
 \`\`\`bash
-bd update <task-id> --status blocked
-bd label add <task-id> security:critical
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> security:critical
 \`\`\`
 ```
 
-### Step 8: Update BEADS
+### Step 8: Update task document
 
 If APPROVED:
 
 ```bash
-bd close <task-id> --reason "Security audit passed. No critical/high findings."
+# Mark task complete: <task-id> --reason "Security audit passed. No critical/high findings."
 ```
 
 If BLOCKED:
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> security:critical  # or security:high
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> security:critical  # or security:high
 # Coder Agent must fix issues before proceeding
 ```
 
@@ -404,9 +404,9 @@ Escalate to human when:
 4. **Disputed finding**: Coder disagrees with assessment
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
-bd label add <task-id> security:needs-review
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
+# Add label: <task-id> security:needs-review
 ```
 
 ---
@@ -462,4 +462,4 @@ The Security Auditor produces a security report:
 - [ ] Authentication/authorization checked
 - [ ] No hardcoded secrets
 - [ ] Sensitive data handling verified
-- [ ] BEADS task updated with findings
+- [ ] task updated with findings

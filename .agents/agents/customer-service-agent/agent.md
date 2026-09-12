@@ -56,7 +56,7 @@ The Customer Service Agent investigates user-specific issues by analyzing their 
 
 Triggered by:
 
-- Slack: `@beads customer user@email.com`
+- Slack: `@seal customer user@email.com`
 - Issue: User support request
 - Escalation: From other agents
 
@@ -69,7 +69,7 @@ Triggered by:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type research --keywords "customer" "support" "stripe" "posthog"
+read docs/knowledge/ for research context --keywords "customer" "support" "stripe" "posthog"
 ```
 
 Review the output for relevant patterns and gotchas about user data handling.
@@ -256,9 +256,9 @@ Let me know how you'd like to proceed!
 
 ---
 
-### BEADS Update
+### Task Update
 \`\`\`bash
-bd close <task-id> --reason "User at daily email limit. Provided options."
+# Mark task complete: <task-id> --reason "User at daily email limit. Provided options."
 \`\`\`
 ```
 
@@ -371,9 +371,9 @@ Escalate when:
 5. **Angry customer** - Human touch needed
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
-bd label add <task-id> customer:escalated
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
+# Add label: <task-id> customer:escalated
 ```
 
 ---

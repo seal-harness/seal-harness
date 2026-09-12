@@ -3,7 +3,7 @@
 **Type**: `metrics-agent`
 **Role**: Collect, aggregate, and report on agent swarm performance
 **Spawned By**: Swarm Coordinator (scheduled) or manual trigger
-**Tools**: BEADS CLI, GitHub API, PostHog (read-only), Stripe (read-only), AWS (read-only), knowledge base read, Slack notifications
+**Tools**: task documents, GitHub API, PostHog (read-only), Stripe (read-only), AWS (read-only), knowledge base read, Slack notifications
 
 ---
 
@@ -30,7 +30,7 @@ Triggered when:
 
 - Scheduled (daily at 9 AM, weekly on Mondays)
 - Swarm Coordinator requests health check
-- Human requests: `@beads metrics` or `@beads stats`
+- Human requests: `@seal metrics` or `@seal stats`
 - After major milestones (10 PRs merged, etc.)
 
 ---
@@ -42,21 +42,21 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type research --keywords "metrics" "reporting"
+read docs/knowledge/ for research context --keywords "metrics" "reporting"
 ```
 
 ### Step 1: Collect Agent Metrics
 
 ```bash
 # Get all completed tasks in time period
-bd list --status=closed --since="7 days ago" --json > /tmp/completed-tasks.json
+# List tasks: --status=closed --since="7 days ago" --json > /tmp/completed-tasks.json
 
 # Get active and blocked tasks
-bd list --status=in_progress --json > /tmp/active-tasks.json
-bd blocked --json > /tmp/blocked-tasks.json
+# List tasks: --status=in_progress --json > /tmp/active-tasks.json
+show blocked tasks --json > /tmp/blocked-tasks.json
 
 # Get task durations
-bd stats --json > /tmp/stats.json
+show project stats --json > /tmp/stats.json
 ```
 
 Parse and aggregate:
@@ -80,10 +80,10 @@ interface AgentMetrics {
 git worktree list --porcelain
 
 # Queue depth
-bd ready --json | jq 'length'
+show ready tasks --json | jq 'length'
 
 # Human waiting count
-bd list --label waiting:human --json | jq 'length'
+# List tasks: --label waiting:human --json | jq 'length'
 ```
 
 Aggregate into:
@@ -107,15 +107,15 @@ interface SwarmMetrics {
 
 ```bash
 # Count facts by type
-for file in .beads/knowledge/*.jsonl; do
+for file in docs/knowledge/*.jsonl; do
   echo "$file: $(wc -l < "$file") facts"
 done
 
 # Recent additions
-find .beads/knowledge -name "*.jsonl" -mtime -7 -exec wc -l {} \;
+find docs/knowledge -name "*.jsonl" -mtime -7 -exec wc -l {} \;
 
 # Usage tracking (if implemented)
-cat .beads/knowledge/*.jsonl | jq -s '[.[].usageCount] | add'
+cat docs/knowledge/*.jsonl | jq -s '[.[].usageCount] | add'
 ```
 
 Aggregate into:
@@ -240,7 +240,7 @@ if (trends.blockerTrend === "increasing") {
 #### Daily Report Format
 
 ```markdown
-## BEADS Daily Metrics - {date}
+## Daily Metrics - {date}
 
 ### Swarm Status
 
@@ -262,7 +262,7 @@ if (trends.blockerTrend === "increasing") {
 #### Weekly Report Format
 
 ```markdown
-## BEADS Weekly Report - Week of {date}
+## Weekly Report - Week of {date}
 
 ### Executive Summary
 
@@ -322,8 +322,8 @@ if (trends.blockerTrend === "increasing") {
 # Post to Slack
 # (Use Slack daemon or direct API)
 
-# Store in BEADS
-bd create "Weekly Metrics Report - $(date +%Y-%m-%d)" \
+# Store in task documents
+# Create a task document in docs/tasks/ for: "Weekly Metrics Report - $(date +%Y-%m-%d)" \
   --type task \
   --description "$(cat /tmp/weekly-report.md)" \
   --label metrics:weekly
@@ -336,7 +336,7 @@ bd create "Weekly Metrics Report - $(date +%Y-%m-%d)" \
 Store historical metrics for trend analysis:
 
 ```bash
-# .beads/metrics/
+# docs/metrics/
 metrics/
 ├── daily/
 │   ├── 2026-01-09.json
@@ -368,7 +368,7 @@ metrics/
 ### Slack Message
 
 ```
-:chart_with_upwards_trend: *BEADS Weekly Metrics*
+:chart_with_upwards_trend: *Weekly Metrics*
 
 *Throughput*: 12 PRs merged (+20% vs last week)
 *Avg Cycle Time*: 2.3 days

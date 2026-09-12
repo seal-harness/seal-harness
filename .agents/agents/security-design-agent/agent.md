@@ -11,7 +11,7 @@ enabled: true
 **Type**: `security-design-agent`
 **Role**: Security review of designs BEFORE implementation
 **Spawned By**: Design Review Gate
-**Tools**: Codebase read, security patterns, OWASP guidelines, BEADS CLI
+**Tools**: Codebase read, security patterns, OWASP guidelines, task documents
 
 ---
 
@@ -49,14 +49,14 @@ Triggered when:
 ### Step 0: Knowledge Priming (CRITICAL)
 
 ```bash
-bd prime --work-type review --keywords "security authentication authorization"
+read docs/knowledge/ for review context --keywords "security authentication authorization"
 ```
 
 ### Step 1: Gather Context
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Read the design document
 cat <design-doc-path>
@@ -463,7 +463,7 @@ When review is complete:
 4. Design Review Gate will aggregate with other agents
 
 ```bash
-bd close <task-id> --reason "Security design review complete. Verdict: [APPROVED|NEEDS_REVISION]"
+# Mark task complete: <task-id> --reason "Security design review complete. Verdict: [APPROVED|NEEDS_REVISION]"
 ```
 
 ---

@@ -1,18 +1,20 @@
 # Task Management Guide
 
-This guide covers best practices for using BEADS (`bd` CLI) to track progress on tasks. BEADS is the single source of truth for task tracking in your project.
+This guide covers best practices for tracking progress using task
+documents — markdown files in `docs/tasks/`. Task documents are the
+single source of truth for task tracking in your project.
 
-**Do NOT use TodoWrite, TodoRead, or TaskCreate tools.** Use BEADS exclusively.
+**Do NOT use TodoWrite, TodoRead, or TaskCreate tools.** Use task
+documents exclusively.
 
-## Task Management with BEADS
+## Task Management with Task Documents
 
-**CRITICAL**: Always maintain accurate issue status to ensure task completion and proper tracking.
+**CRITICAL**: Always maintain accurate issue status to ensure task
+completion and proper tracking.
 
-## When to Use BEADS
+## When to Use Task Documents
 
-Use `bd create`, `bd update`, and `bd close` to track progress on tasks:
-
-### Use BEADS for:
+Use task documents for:
 
 - Complex multi-step tasks (3+ distinct steps)
 - Non-trivial and complex tasks requiring careful planning
@@ -21,7 +23,7 @@ Use `bd create`, `bd update`, and `bd close` to track progress on tasks:
 - Tasks requiring systematic tracking
 - When you need to maintain state across a long conversation
 
-### Skip BEADS for:
+### Skip task documents for:
 
 - Single, straightforward tasks
 - Trivial tasks where tracking provides no benefit
@@ -32,19 +34,21 @@ Use `bd create`, `bd update`, and `bd close` to track progress on tasks:
 
 Check current task list frequently, especially:
 
-- At the beginning of conversations: `bd ready`
-- Before starting new tasks: `bd list --status=open`
-- After completing tasks: `bd ready` (find next work)
-- When uncertain about next steps: `bd list --status=in_progress`
+- At the beginning of conversations: `ls docs/tasks/*.md`
+- Before starting new tasks: `grep -l "status: open" docs/tasks/*.md`
+- After completing tasks: `grep -l "status: open" docs/tasks/*.md`
+- When uncertain about next steps: `grep -l "status: in_progress" docs/tasks/*.md`
 - **Before any context switch or branch change**
 
 ## Updating Task Status
 
-Update task status in real-time:
+Update task status in real-time by editing the markdown file's front
+matter:
 
-- Mark tasks as `in_progress` BEFORE starting work: `bd update <id> --status=in_progress`
+- Mark tasks as `in_progress` BEFORE starting work
 - Only have ONE task `in_progress` at a time
-- Mark as closed IMMEDIATELY after finishing: `bd close <id> --reason="..."`
+- Mark as `completed` IMMEDIATELY after finishing — update the status
+  field and add a completion note
 - Use for tasks with 3+ steps or requiring systematic tracking
 - **NEVER leave tasks as `in_progress` when switching context**
 
@@ -52,17 +56,20 @@ Update task status in real-time:
 
 ### 1. No Abandoned Tasks
 
-If you can't complete a task, update it with notes:
+If you can't complete a task, update its document with notes:
 
-```bash
-bd update <id> --notes="Blocked on X. Remaining: Y and Z."
+```markdown
+---
+status: blocked
+notes: "Blocked on X. Remaining: Y and Z."
+---
 ```
 
 ### 2. Context Switches
 
 Before changing branches or starting new work:
 
-- Check all `in_progress` tasks: `bd list --status=in_progress`
+- Check all `in_progress` tasks: `grep -l "status: in_progress" docs/tasks/*.md`
 - Either close them or update with notes
 - Inform user of any incomplete work
 
@@ -70,52 +77,96 @@ Before changing branches or starting new work:
 
 When a task needs user action:
 
-- Update with clear next steps: `bd update <id> --notes="Needs user decision on X"`
+- Update the task document with clear next steps in a "Notes" section
 - Notify user explicitly
 
 ### 4. Dependencies
 
-When tasks depend on each other:
+When tasks depend on each other, list them in the task document's front
+matter:
 
-```bash
-bd dep add <issue> <depends-on>  # issue depends on depends-on
-bd blocked                        # show all blocked issues
+```yaml
+---
+depends_on:
+  - docs/tasks/001-setup-auth.md
+  - docs/tasks/002-auth-middleware.md
+---
 ```
 
 ## Task States
 
 - **open**: Task not yet started
 - **in_progress**: Currently working on (limit to ONE at a time)
-- **closed**: Task finished successfully
+- **blocked**: Waiting on a dependency or human decision
+- **completed**: Task finished successfully
 
-## BEADS Workflow Example
+## Task Document Format
+
+```markdown
+---
+title: "Implement feature X"
+status: open
+type: task
+priority: 2
+labels:
+  - waiting:human
+depends_on: []
+created: 2026-01-15
+completed: null
+---
+
+# Implement feature X
+
+## Description
+
+Brief description of the task.
+
+## Definition of Done
+
+- [ ] Tests written and passing
+- [ ] Implementation complete
+- [ ] Code review passed
+
+## Notes
+
+Add progress notes here as work progresses.
+```
+
+## Task Document Workflow Example
 
 ```bash
-1. bd ready              # Check available work
-2. bd show <id>          # Review issue details
-3. bd update <id> --status=in_progress  # Claim it
-4. # Complete the work
-5. bd close <id> --reason="Completed in commit <SHA>"
-6. bd ready              # Find next task
-7. bd sync               # Push BEADS changes to git
+# 1. Check available work
+ls docs/tasks/*.md
+grep -l "status: open" docs/tasks/*.md
+
+# 2. Review task details
+cat docs/tasks/001-implement-feature-x.md
+
+# 3. Claim it — edit the status field to in_progress
+# (edit the markdown file's front matter)
+
+# 4. Complete the work
+
+# 5. Mark task complete — update status to completed and add completion note
+# (edit the markdown file's front matter)
+
+# 6. Find next task
+grep -l "status: open" docs/tasks/*.md
+
+# 7. Commit changes (task documents are plain markdown, synced via git)
+git add docs/tasks/
+git commit -m "docs: update task status"
 ```
 
 ## Creating New Tasks
 
-```bash
-# Single task
-bd create --title="Implement feature X" --type=task --priority=2
-
-# Multiple related tasks (use parallel subagents for efficiency)
-bd create --title="Implement feature X" --type=feature
-bd create --title="Write tests for X" --type=task
-bd dep add <tests-id> <feature-id>  # Tests depend on feature
-```
+Create a new markdown file in `docs/tasks/` with the task document format
+shown above.
 
 ## Integration with Other Workflows
 
-- Before creating PRs: Ensure all related BEADS issues are closed
+- Before creating PRs: Ensure all related tasks are marked completed
 - Before context switches: Review and update all in_progress items
-- During long tasks: Periodically update progress with `bd update <id> --notes="..."`
-- After completing features: Close all related issues: `bd close <id1> <id2> ...`
-- At session end: Always run `bd sync`
+- During long tasks: Periodically update progress notes in the task document
+- After completing features: Close all related task documents
+- At session end: Commit any task document changes to git

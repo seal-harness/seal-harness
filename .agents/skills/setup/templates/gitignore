@@ -10,13 +10,7 @@ coverage/
 .DS_Store
 *.log
 
-# BEADS runtime
-.beads/beads.db
-.beads/daemon.lock
-.beads/daemon.pid
-.beads/daemon.log
-.beads/temp/
-
-# BEADS execution state (working files for context recovery)
-.beads/context/
-.beads/plans/
+# Execution state (working files for context recovery)
+docs/context/
+docs/plans/
+docs/temp/

@@ -1,6 +1,6 @@
 # Platform Adaptation Guide
 
-This reference documents how metaswarm skills adapt across Claude Code, Gemini CLI, Codex CLI, and OpenCode. Skills use the Agent Skills standard (SKILL.md with YAML frontmatter) which is portable across all platforms.
+This reference documents how Seal Harness skills adapt across Claude Code, Gemini CLI, Codex CLI, and OpenCode. Skills use the Agent Skills standard (SKILL.md with YAML frontmatter) which is portable across all platforms.
 
 ## Tool Equivalents
 
@@ -19,7 +19,7 @@ This reference documents how metaswarm skills adapt across Claude Code, Gemini C
 
 ### Claude Code (Full Support)
 
-Claude Code provides `Task()` for spawning independent subagents. metaswarm uses this for:
+Claude Code provides `Task()` for spawning independent subagents. Seal Harness uses this for:
 - Parallel design review (5 agents simultaneously)
 - Adversarial review (fresh reviewer with no prior context)
 - Background research while implementation continues
@@ -48,14 +48,14 @@ Codex CLI has no subagent dispatch. All workflows run sequentially in-session:
 
 ## Command Invocation
 
-Codex uses the `name` field from SKILL.md frontmatter for `$name` invocation — not the directory name. The `metaswarm-` prefix on directory names is for organization only.
+Codex uses the `name` field from SKILL.md frontmatter for `$name` invocation — not the directory name. The `Seal Harness-` prefix on directory names is for organization only.
 
 | Action | Claude Code | Gemini CLI | Codex CLI | OpenCode |
 |---|---|---|---|---|---|
-| Start task | `/start-task` or `/metaswarm:start-task` | `/metaswarm:start-task` | `$start` | `/start-task` |
-| Setup | `/setup` or `/metaswarm:setup` | `/metaswarm:setup` | `$setup` | `npx metaswarm setup --opencode` |
-| Brainstorm | `/brainstorm` or `/metaswarm:brainstorm` | `/metaswarm:brainstorm` | `$brainstorming-extension` | `Not available` |
-| Review design | `/review-design` or `/metaswarm:review-design` | `/metaswarm:review-design` | `$design-review-gate` | `/review-design` |
+| Start task | `/start-task` or `/start-task` | `/start-task` | `$start` | `/start-task` |
+| Setup | `/setup` or `/setup` | `/setup` | `$setup` | `npx Seal Harness setup --opencode` |
+| Brainstorm | `/brainstorm` or `/brainstorm` | `/brainstorm` | `$brainstorming-extension` | `Not available` |
+| Review design | `/review-design` or `/review-design` | `/review-design` | `$design-review-gate` | `/review-design` |
 
 ## Instruction Files
 

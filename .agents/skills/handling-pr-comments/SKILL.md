@@ -324,4 +324,4 @@ Before declaring PR comments handled:
 ## Reference
 
 For the complete detailed workflow with all edge cases and troubleshooting, see:
-the `/metaswarm:handle-pr-comments` command
+the `/handle-pr-comments` command

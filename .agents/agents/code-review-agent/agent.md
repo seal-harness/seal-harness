@@ -11,13 +11,13 @@ enabled: true
 **Type**: `code-review-agent`
 **Role**: Internal code review before PR creation
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, diff analysis, BEADS CLI
+**Tools**: Codebase read, diff analysis, task documents
 
 ---
 
 ## Purpose
 
-The Code Review Agent performs thorough internal code review before changes are submitted as a PR. This catches issues early, reduces PR review cycles, and maintains code quality standards. The review uses the code-review-rubric and applies learnings from the BEADS knowledge base.
+The Code Review Agent performs thorough internal code review before changes are submitted as a PR. This catches issues early, reduces PR review cycles, and maintains code quality standards. The review uses the code-review-rubric and applies learnings from the knowledge base.
 
 > **Haskell project**: This repo is a Haskell (cabal + Nix + hspec + hlint) project. **Load the `haskell-reviewer` skill BEFORE reviewing any code** (see Step 0). The TypeScript/Vitest/Prisma patterns in the inherited template below do NOT apply here — the Haskell reviewer skill is authoritative for language-specific review criteria (totality, exhaustive patterns, type-driven design, performance pitfalls, idiomatic style).
 
@@ -117,7 +117,7 @@ The Haskell reviewer skill is **authoritative** for language-specific checks. Th
 
 ```bash
 # Prime with review-specific context and the files being reviewed
-bd prime --work-type review --files "<changed-files>" --keywords "testing" "quality"
+read docs/knowledge/ for review context --files "<changed-files>" --keywords "testing" "quality"
 ```
 
 Review the output and note:
@@ -131,13 +131,13 @@ Review the output and note:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get the parent epic
-bd show <epic-id> --json
+# Show task: epic-id> --json
 
 # Get the implementation task to see what was done
-bd show <implementation-task-id> --json
+# Show task: implementation-task-id> --json
 
 # Get git diff of changes
 git diff main..HEAD --stat
@@ -163,9 +163,9 @@ git diff main..HEAD --name-only
 # Load the code-review-rubric
 # .claude/rubrics/code-review-rubric.md
 
-# Check BEADS knowledge for relevant facts
+# Check task documents knowledge for relevant facts
 # Look for known issues with changed files
-grep -l "<filename>" .beads/knowledge/*.jsonl
+grep -l "<filename>" docs/knowledge/*.jsonl
 ```
 
 ### Step 4: Review Each File
@@ -299,27 +299,27 @@ return c.json({ error: "Internal error" }, 500);
 
 ---
 
-### BEADS Update
+### Task Update
 
 \`\`\`bash
-bd update <task-id> --status blocked
-bd label add <task-id> needs:fixes
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> needs:fixes
 \`\`\`
 ```
 
-### Step 7: Update BEADS
+### Step 7: Update task document
 
 If APPROVED:
 
 ```bash
-bd close <task-id> --reason "Code review passed. All checks met."
+# Mark task complete: <task-id> --reason "Code review passed. All checks met."
 ```
 
 If CHANGES REQUIRED:
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> needs:fixes
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> needs:fixes
 # Coder Agent should be notified to address issues
 ```
 
@@ -390,19 +390,19 @@ Use this exact format:
 - `src/middleware/auth.ts` (modified, in scope)
 ```
 
-### Step A6: Update BEADS (Adversarial)
+### Step A6: Update task document (Adversarial)
 
 If PASS:
 
 ```bash
-bd close <task-id> --reason "Adversarial review PASS. All DoD items verified."
+# Mark task complete: <task-id> --reason "Adversarial review PASS. All DoD items verified."
 ```
 
 If FAIL:
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> review:adversarial-fail
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> review:adversarial-fail
 # Orchestrator will spawn a FRESH reviewer for re-review
 ```
 
@@ -483,7 +483,7 @@ This prevents anchoring bias where a reviewer checks "did they fix what I found?
 Track iteration count:
 
 ```bash
-bd label add <task-id> review:iteration-1
+# Add label: <task-id> review:iteration-1
 ```
 
 ### After Each Iteration
@@ -498,9 +498,9 @@ bd label add <task-id> review:iteration-1
 If issues persist after 3 iterations:
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
-bd label add <task-id> review:escalated
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
+# Add label: <task-id> review:escalated
 ```
 
 ---
@@ -512,18 +512,18 @@ The Code Review Agent can run in parallel with:
 - Security Auditor Agent
 - Performance Analyst Agent
 
-Coordinate via BEADS:
+Coordinate via task documents:
 
 ```bash
 # All three can start when implementation is done
-bd dep add <code-review-task> <impl-task>
-bd dep add <security-task> <impl-task>
-bd dep add <perf-task> <impl-task>
+# Add dependency: <code-review-task> <impl-task>
+# Add dependency: <security-task> <impl-task>
+# Add dependency: <perf-task> <impl-task>
 
 # PR task waits for all three
-bd dep add <pr-task> <code-review-task>
-bd dep add <pr-task> <security-task>
-bd dep add <pr-task> <perf-task>
+# Add dependency: <pr-task> <code-review-task>
+# Add dependency: <pr-task> <security-task>
+# Add dependency: <pr-task> <perf-task>
 ```
 
 ---
@@ -650,5 +650,5 @@ The Code Review Agent produces a structured review:
 - [ ] Record-of-IO-actions seams + `IORef`-recording fakes for testability (no real processes in unit tests)
 - [ ] Security patterns verified
 - [ ] `make check` (build + test + lint) verified green by independent validation (never trust the coder's self-report)
-- [ ] BEADS task updated with findings
+- [ ] task updated with findings
 - [ ] Knowledge captured if patterns discovered

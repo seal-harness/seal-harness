@@ -81,14 +81,14 @@ describe('SkillsView', () => {
       makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
       makeSkill({ id: 'coding', description: 'Coding', group: null }),
       makeSkill({ id: 'haskell-coder', description: 'Haskell', group: 'core' }),
-      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'metaswarm' }),
+      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'agents' }),
     ]
     render(<SkillsView />)
     // Ungrouped skills appear under "Skills" header
     expect(screen.getByTestId('skill-group-header-Skills')).toBeTruthy()
     // Named groups get their own headers
     expect(screen.getByTestId('skill-group-header-core')).toBeTruthy()
-    expect(screen.getByTestId('skill-group-header-metaswarm')).toBeTruthy()
+    expect(screen.getByTestId('skill-group-header-agents')).toBeTruthy()
     // All rows are present
     expect(screen.getByTestId('skill-row-coding')).toBeTruthy()
     expect(screen.getByTestId('skill-row-seal-usage')).toBeTruthy()
@@ -147,14 +147,14 @@ describe('SkillsView', () => {
   it('collapsing one group does not affect other groups', () => {
     skillsState = [
       makeSkill({ id: 'seal-usage', description: 'Usage', group: 'core' }),
-      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'metaswarm' }),
+      makeSkill({ id: 'reviewer', description: 'Reviewer', group: 'agents' }),
       makeSkill({ id: 'coding', description: 'Coding', group: null }),
     ]
     render(<SkillsView />)
     // Collapse core
     fireEvent.click(screen.getByTestId('skill-group-header-core'))
     expect(screen.queryByTestId('skill-row-seal-usage')).toBeNull()
-    // metaswarm and Skills are still expanded
+    // agents and Skills are still expanded
     expect(screen.getByTestId('skill-row-reviewer')).toBeTruthy()
     expect(screen.getByTestId('skill-row-coding')).toBeTruthy()
   })

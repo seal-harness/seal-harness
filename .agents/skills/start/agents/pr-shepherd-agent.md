@@ -3,21 +3,21 @@
 **Type**: `pr-shepherd-agent`
 **Role**: PR lifecycle management through to merge
 **Spawned By**: Issue Orchestrator
-**Tools**: GitHub CLI, your-project:pr-shepherd skill, BEADS CLI
+**Tools**: GitHub CLI, your-project:pr-shepherd skill, task documents
 
 ---
 
 ## Purpose
 
-The PR Shepherd Agent monitors a PR from creation through merge. It handles CI failures, review comments, and thread resolution, updating BEADS tasks throughout the lifecycle.
+The PR Shepherd Agent monitors a PR from creation through merge. It handles CI failures, review comments, and thread resolution, updating tasks throughout the lifecycle.
 
 ---
 
 ## Important
 
-This agent leverages the existing `your-project:pr-shepherd` skill for the core PR monitoring logic. It adds BEADS integration for task tracking.
+This agent leverages the existing `your-project:pr-shepherd` skill for the core PR monitoring logic. It adds task tracking for task tracking.
 
-**See**: the `metaswarm:pr-shepherd` skill for detailed PR monitoring behavior.
+**See**: the `Seal Harness:pr-shepherd` skill for detailed PR monitoring behavior.
 
 ---
 
@@ -26,7 +26,7 @@ This agent leverages the existing `your-project:pr-shepherd` skill for the core 
 1. **PR Monitoring**: Watch CI status and review comments
 2. **Issue Fixing**: Auto-fix lint, type, and test failures
 3. **Review Handling**: Respond to and resolve review threads
-4. **BEADS Tracking**: Update task status as PR progresses
+4. **Task Tracking**: Update task status as PR progresses
 5. **Completion**: Report when PR is ready to merge
 
 ---
@@ -36,7 +36,7 @@ This agent leverages the existing `your-project:pr-shepherd` skill for the core 
 Triggered when:
 
 - Issue Orchestrator creates a "PR shepherding" task
-- PR is created and linked to BEADS epic
+- PR is created and linked to epic
 - Code review and security audit are complete
 
 ---
@@ -48,7 +48,7 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type review --keywords "pr" "review" "ci"
+read docs/knowledge/ for review context --keywords "pr" "review" "ci"
 ```
 
 Review the output for PR handling patterns and gotchas.
@@ -56,14 +56,14 @@ Review the output for PR handling patterns and gotchas.
 ### Step 1: Initialize
 
 ```bash
-# Get the BEADS task
-bd show <task-id> --json
+# Get the task
+# Show task: task-id> --json
 
 # Get PR number from task or current branch
 PR_NUMBER=$(gh pr view --json number -q .number)
 
 # Mark task as in progress
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 ```
 
 ### Step 2: Invoke PR Shepherd Skill
@@ -80,43 +80,43 @@ Or programmatically:
 Skill({ skill: "pr-shepherd", args: prNumber.toString() });
 ```
 
-### Step 3: BEADS Status Updates
+### Step 3: Task Status Updates
 
-Update BEADS as PR progresses:
+Update task document as PR progresses:
 
 #### When CI Fails
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:ci
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:ci
 ```
 
 #### When Fixing Issues
 
 ```bash
-bd label remove <task-id> waiting:ci
-bd update <task-id> --status in_progress
+# Remove label: <task-id> waiting:ci
+# Update task status: <task-id> --status in_progress
 ```
 
 #### When Waiting for Review
 
 ```bash
-bd label add <task-id> waiting:review
+# Add label: <task-id> waiting:review
 ```
 
 #### When Handling Comments
 
 ```bash
-bd label remove <task-id> waiting:review
-bd label add <task-id> review:in_progress
+# Remove label: <task-id> waiting:review
+# Add label: <task-id> review:in_progress
 ```
 
 #### When All Checks Pass
 
 ```bash
-bd label remove <task-id> waiting:ci
-bd label remove <task-id> waiting:review
-bd label add <task-id> review:approved
+# Remove label: <task-id> waiting:ci
+# Remove label: <task-id> waiting:review
+# Add label: <task-id> review:approved
 ```
 
 ### Step 4: Completion
@@ -125,8 +125,8 @@ When PR is ready to merge:
 
 ```bash
 # All checks passing, all threads resolved
-bd update <task-id> --status completed
-bd close <task-id> --reason "PR #${PR_NUMBER} ready to merge. All CI green, all threads resolved."
+# Update task status: <task-id> --status completed
+# Mark task complete: <task-id> --reason "PR #${PR_NUMBER} ready to merge. All CI green, all threads resolved."
 
 # Notify Issue Orchestrator
 # The epic can now proceed to human approval for merge
@@ -168,12 +168,12 @@ The existing PR Shepherd skill handles:
 | Thread resolution          | your-project:handling-pr-comments |
 | User prompts for decisions | your-project:pr-shepherd          |
 
-This BEADS agent adds:
+This agent adds:
 
 - Task status updates
 - Label management
 - Epic coordination
-- BEADS sync
+- task sync
 
 ---
 
@@ -181,7 +181,7 @@ This BEADS agent adds:
 
 The PR Shepherd can auto-fix these issues:
 
-| Issue                    | Action                  | BEADS Update      |
+| Issue                    | Action                  | Task Update      |
 | ------------------------ | ----------------------- | ----------------- |
 | Lint errors              | `pnpm lint`             | Remove waiting:ci |
 | Prettier                 | `pnpm prettier --write` | Remove waiting:ci |
@@ -200,9 +200,9 @@ Escalate when:
 4. **3+ fix attempts failed** - Stuck in loop
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
-bd label add <task-id> pr:needs-help
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
+# Add label: <task-id> pr:needs-help
 ```
 
 ---
@@ -235,9 +235,9 @@ After PR Shepherd completes:
 At 4 hours, the skill checkpoints:
 
 ```bash
-# Save state to BEADS
-bd update <task-id> --status blocked
-bd label add <task-id> timeout:checkpoint
+# Save state to task documents
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> timeout:checkpoint
 
 # Report status and options
 ```
@@ -250,29 +250,29 @@ User can choose to:
 
 ---
 
-## BEADS Commands Reference
+## Task Document Reference
 
 ```bash
 # Start shepherding
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 
 # CI failed
-bd label add <task-id> waiting:ci
+# Add label: <task-id> waiting:ci
 
 # CI passed
-bd label remove <task-id> waiting:ci
+# Remove label: <task-id> waiting:ci
 
 # Waiting for review
-bd label add <task-id> waiting:review
+# Add label: <task-id> waiting:review
 
 # Reviews handled
-bd label remove <task-id> waiting:review
+# Remove label: <task-id> waiting:review
 
 # Ready to merge
-bd close <task-id> --reason "PR ready to merge"
+# Mark task complete: <task-id> --reason "PR ready to merge"
 
 # Need human help
-bd label add <task-id> waiting:human
+# Add label: <task-id> waiting:human
 ```
 
 ---
@@ -313,6 +313,6 @@ The PR Shepherd reports status via PR comments:
 - [ ] All review comments addressed
 - [ ] All threads resolved
 - [ ] No unresolved conversations
-- [ ] BEADS task updated throughout
+- [ ] task updated throughout
 - [ ] Human notified when ready
 - [ ] PR merged successfully

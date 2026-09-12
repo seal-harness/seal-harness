@@ -11,13 +11,13 @@ enabled: true
 **Type**: `learning-curator-agent`
 **Role**: Knowledge extraction and curation
 **Spawned By**: Issue Orchestrator (after PR merge), Scheduled job
-**Tools**: GitHub API, BEADS CLI, knowledge base
+**Tools**: GitHub API, task documents, knowledge base
 
 ---
 
 ## Purpose
 
-The Knowledge Curator Agent extracts learnings from completed work and curates the BEADS knowledge base. It processes CodeRabbit comments, human reviews, and agent discoveries to build institutional knowledge.
+The Knowledge Curator Agent extracts learnings from completed work and curates the knowledge base. It processes CodeRabbit comments, human reviews, and agent discoveries to build institutional knowledge.
 
 ---
 
@@ -38,7 +38,7 @@ Triggered when:
 - PR is merged (extract learnings)
 - Epic is closed (summarize discoveries)
 - Weekly schedule (maintenance review)
-- Manual: `@beads curate`
+- Manual: `@seal curate`
 
 ---
 
@@ -49,7 +49,7 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type research --keywords "knowledge" "learning" "coderabbit"
+read docs/knowledge/ for research context --keywords "knowledge" "learning" "coderabbit"
 ```
 
 Review the output for patterns about what makes good knowledge base entries.
@@ -59,8 +59,8 @@ Review the output for patterns about what makes good knowledge base entries.
 When a PR is merged:
 
 ```bash
-# Get the BEADS task
-bd show <task-id> --json
+# Get the task
+# Show task: task-id> --json
 
 # Get PR details
 gh pr view <pr-number> --json number,title,body,comments,reviews
@@ -178,7 +178,7 @@ Before adding new facts, check for duplicates:
 
 ```bash
 # Search existing knowledge
-grep -i "<keyword>" .beads/knowledge/*.jsonl
+grep -i "<keyword>" docs/knowledge/*.jsonl
 
 # Compare similarity
 # If >80% similar to existing fact, merge provenance instead of adding new
@@ -271,7 +271,7 @@ Run weekly to maintain knowledge base health:
 ## Storage Locations
 
 ```
-.beads/knowledge/
+docs/knowledge/
 ├── codebase-facts.jsonl    # How our code works
 ├── api-behaviors.jsonl     # External API quirks
 ├── patterns.jsonl          # Best practices
@@ -285,17 +285,17 @@ Run weekly to maintain knowledge base health:
 
 ---
 
-## BEADS Integration
+## Task Tracking
 
 ```bash
 # Create curation task
-bd create "Extract learnings from PR #${prNumber}" --type task --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Extract learnings from PR #${prNumber}" --type task --parent <epic-id>
 
 # Mark in progress
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 
 # Complete with summary
-bd close <task-id> --reason "Extracted ${count} learnings. Updated knowledge base."
+# Mark task complete: <task-id> --reason "Extracted ${count} learnings. Updated knowledge base."
 ```
 
 ---

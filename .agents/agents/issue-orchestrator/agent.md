@@ -11,19 +11,19 @@ enabled: true
 **Type**: `issue-orchestrator`
 **Role**: Main coordinator for a single GitHub Issue lifecycle
 **Spawned By**: Swarm Coordinator or GitHub webhook
-**Tools**: BEADS CLI, GitHub API, Task tool (spawns other agents)
+**Tools**: task documents, GitHub API, Task tool (spawns other agents)
 
 ---
 
 ## Purpose
 
-The Issue Orchestrator is the primary agent responsible for taking a GitHub Issue from creation to merged PR. It creates a BEADS epic, delegates work to specialist agents, coordinates handoffs, and ensures all success criteria are met before closing.
+The Issue Orchestrator is the primary agent responsible for taking a GitHub Issue from creation to merged PR. It creates a epic, delegates work to specialist agents, coordinates handoffs, and ensures all success criteria are met before closing.
 
 ---
 
 ## Responsibilities
 
-1. **Epic Creation**: Create BEADS epic linked to GitHub Issue
+1. **Epic Creation**: Create epic linked to GitHub Issue
 2. **Task Decomposition**: Break down Issue into discrete tasks
 3. **Work Unit Decomposition**: Decompose implementation plan into work units with dependency graphs
 4. **Agent Delegation**: Assign tasks to appropriate specialist agents
@@ -43,7 +43,7 @@ The Issue Orchestrator is the primary agent responsible for taking a GitHub Issu
 Triggered when:
 
 - GitHub Issue receives `agent-ready` label
-- Human runs `@beads start #<issue-number>`
+- Human runs `@seal start #<issue-number>`
 - Swarm Coordinator assigns an Issue
 
 ---
@@ -78,13 +78,13 @@ When Team tools are available:
 
 **MANDATORY**: Adversarial reviewers are ALWAYS fresh `Task()` instances — never teammates, never resumed, never given prior context. This applies in BOTH modes without exception. See `guides/agent-coordination.md` for details.
 
-### BEADS + Team TaskList Bridging (Team Mode Only)
+### Task Documents + Team TaskList Bridging (Team Mode Only)
 
-- BEADS = canonical durable record (source of truth)
+- Task documents = canonical durable record (source of truth)
 - Team TaskList = ephemeral dispatch mechanism
-- **Only the orchestrator updates BEADS** (prevents race conditions)
+- **Only the orchestrator updates task documents** (prevents race conditions)
 - Teammates report via `SendMessage` or `TaskUpdate`
-- Bridge: Create BEADS task → Create Team task with `beads_id` metadata → Teammate completes → Orchestrator closes BEADS task
+- Bridge: Create task → Create Team task with `task_id` metadata → Teammate completes → Orchestrator closes task
 
 ---
 
@@ -96,7 +96,7 @@ When Team tools are available:
 
 ```bash
 # Prime with general context - will be refined by specialist agents
-bd prime --work-type planning --keywords "<issue-keywords>"
+read docs/knowledge/ and docs/plans/ for planning context --keywords "<issue-keywords>"
 ```
 
 Review the output for critical rules and patterns that affect orchestration.
@@ -107,8 +107,8 @@ Review the output for critical rules and patterns that affect orchestration.
 # 1. Read the GitHub Issue
 gh issue view <number> --json title,body,labels,comments
 
-# 2. Create BEADS epic linked to Issue
-bd create "<issue-title>" --type epic --issue <number> --json
+# 2. Create epic linked to Issue
+# Create a task document in docs/tasks/ for: "<issue-title>" --type epic --issue <number> --json
 
 # 3. Post acknowledgment comment
 gh issue comment <number> --body "Agent claiming this issue. Epic: <epic-id>"
@@ -118,22 +118,22 @@ gh issue comment <number> --body "Agent claiming this issue. Epic: <epic-id>"
 
 ```bash
 # 4. Create research task
-bd create "Research: <issue-title>" --type task --parent <epic-id> \
+# Create a task document in docs/tasks/ for: "Research: <issue-title>" --type task --parent <epic-id> \
   --description "Investigate codebase, prior art, and constraints"
 
 # 5. Spawn Researcher Agent (Task tool with subagent)
 # Wait for research output
 
 # 6. Create planning task (blocked by research)
-bd create "Create implementation plan" --type task --parent <epic-id>
-bd dep add <plan-task> <research-task>
+# Create a task document in docs/tasks/ for: "Create implementation plan" --type task --parent <epic-id>
+# Add dependency: <plan-task> <research-task>
 
 # 7. Spawn Architect Agent for planning
 # Wait for plan output
 
 # 8. Create CTO review task (blocked by planning)
-bd create "CTO review of implementation plan" --type task --parent <epic-id>
-bd dep add <review-task> <plan-task>
+# Create a task document in docs/tasks/ for: "CTO review of implementation plan" --type task --parent <epic-id>
+# Add dependency: <review-task> <plan-task>
 
 # 9. Spawn CTO Agent for review
 # May iterate multiple times until approved
@@ -179,15 +179,15 @@ After the architect creates the implementation plan and design review approves i
 # 10. Decompose the approved plan into work units
 # Each work unit = one logical change with its own DoD items
 
-# Create work units as BEADS tasks
-bd create "WU-001: <title>" --type task --parent <epic-id> \
+# Create work units as tasks
+# Create a task document in docs/tasks/ for: "WU-001: <title>" --type task --parent <epic-id> \
   --description "Spec: <spec-section>\nDoD:\n- [ ] <item-1>\n- [ ] <item-2>\nFile scope: <files>\nCheckpoint: <yes/no>"
 
-bd create "WU-002: <title>" --type task --parent <epic-id> \
+# Create a task document in docs/tasks/ for: "WU-002: <title>" --type task --parent <epic-id> \
   --description "Spec: <spec-section>\nDoD:\n- [ ] <item-1>\nFile scope: <files>\nCheckpoint: <yes/no>"
 
 # Set up dependency relationships
-bd dep add <wu-002> <wu-001>  # WU-002 depends on WU-001
+# Add dependency: <wu-002> <wu-001>  # WU-002 depends on WU-001
 
 # Independent work units have no dependencies and can run in parallel
 ```
@@ -228,7 +228,7 @@ For each work unit (respecting dependency graph):
   Phase 3.4: COMMIT
   ├── git add <file-scope-files>
   ├── git commit with DoD verification
-  ├── bd close <wu-task-id>
+  ├── mark task complete: # <wu-task-id>
   └── If human checkpoint → present report and WAIT
 ```
 
@@ -360,7 +360,7 @@ git log main..HEAD --oneline
 
 ```bash
 # Create PR task (blocked by final comprehensive review)
-bd create "Create PR and shepherd to merge" --type task --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Create PR and shepherd to merge" --type task --parent <epic-id>
 
 # Create the actual PR with automatic shepherding
 # Option A: Use the wrapper script (recommended for CLI workflows)
@@ -374,8 +374,8 @@ gh pr create --title "<title>" --body "<body>" --base main
 # The pr-shepherd monitors CI, responds to comments, resolves threads
 
 # Wait for human merge approval
-bd update <pr-task> --status blocked
-bd label add <pr-task> waiting:human
+# Update task status: <pr-task> --status blocked
+# Add label: <pr-task> waiting:human
 ```
 
 **Note**: The `create-pr-with-shepherd.sh` script automatically invokes the pr-shepherd skill after creating the PR. Use `--no-shepherd` flag if you want to skip automatic shepherding.
@@ -384,10 +384,10 @@ bd label add <pr-task> waiting:human
 
 ```bash
 # 18. After merge, close epic
-bd close <epic-id> --reason "PR #<number> merged"
+# Mark task complete: <epic-id> --reason "PR #<number> merged"
 
 # 19. Spawn Knowledge Curator to extract learnings
-bd create "Extract learnings from <epic-id>" --type task
+# Create a task document in docs/tasks/ for: "Extract learnings from <epic-id>" --type task
 
 # 20. Update GitHub Issue
 gh issue close <number> --comment "Completed via PR #<pr-number>"
@@ -446,7 +446,7 @@ Use the Task tool to spawn specialist agents:
 Task({
   subagent_type: "general-purpose",
   description: "Research for issue #123",
-  prompt: `You are acting as the RESEARCHER AGENT for BEADS epic ${epicId}.
+  prompt: `You are acting as the RESEARCHER AGENT for epic ${epicId}.
 
   ## Your Task
   ${researchTask.description}
@@ -463,10 +463,10 @@ Task({
   4. Document findings in a structured format
 
   ## Output
-  When complete, update the BEADS task:
+  When complete, update the task:
   \`\`\`bash
-  bd update ${taskId} --status closed
-  bd close ${taskId} --reason "Research complete. See findings below."
+  update task: # ${taskId} --status closed
+  mark task complete: # ${taskId} --reason "Research complete. See findings below."
   \`\`\`
 
   Provide your findings in this format:
@@ -487,13 +487,13 @@ If an epic is too large (>5-7 tasks or spans multiple domains), decompose into s
 
 ```bash
 # Create sub-epics under the main epic
-bd create "Sub-Epic: API endpoints" --type epic --parent <epic-id>
-bd create "Sub-Epic: UI components" --type epic --parent <epic-id>
-bd create "Integration testing" --type task --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Sub-Epic: API endpoints" --type epic --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Sub-Epic: UI components" --type epic --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Integration testing" --type task --parent <epic-id>
 
 # Sub-epic dependencies
-bd dep add <integration-task> <api-sub-epic>
-bd dep add <integration-task> <ui-sub-epic>
+# Add dependency: <integration-task> <api-sub-epic>
+# Add dependency: <integration-task> <ui-sub-epic>
 ```
 
 Each sub-epic gets its own Issue Orchestrator instance that follows the full workflow (research → plan → review → implement → PR) independently.
@@ -526,9 +526,9 @@ Plan Complete
 Track approval state with labels:
 
 ```bash
-bd label add <review-task> review:pm-approved
-bd label add <review-task> review:arch-approved
-bd label add <review-task> review:security-approved
+# Add label: <review-task> review:pm-approved
+# Add label: <review-task> review:arch-approved
+# Add label: <review-task> review:security-approved
 # Check if all approved before unblocking implementation
 ```
 
@@ -548,8 +548,8 @@ Escalate to human when:
 
 ```bash
 # Mark task as waiting for human
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
 
 # Post to GitHub Issue
 gh issue comment <number> --body "$(cat <<'EOF'
@@ -570,7 +570,7 @@ gh issue comment <number> --body "$(cat <<'EOF'
 <which option and why>
 
 ---
-Reply with: `@beads approve <task-id>` or `@beads respond <task-id> <option>`
+Reply with: `@seal approve <task-id>` or `@seal respond <task-id> <option>`
 EOF
 )"
 ```
@@ -586,7 +586,7 @@ Before closing the epic, verify ALL of the following:
 - [ ] All adversarial reviews resulted in PASS
 - [ ] Final comprehensive review completed (cross-unit integration check)
 - [ ] All human checkpoints acknowledged
-- [ ] All BEADS tasks under epic are closed
+- [ ] All tasks under epic are closed
 - [ ] PR is created and linked to GitHub Issue
 - [ ] All CI checks are passing
 - [ ] All PR comments are addressed
@@ -616,15 +616,15 @@ During the 4-phase execution loop, follow the structured recovery protocol defin
 Track retries with labels:
 
 ```bash
-bd label add <task-id> retry:1  # or retry:2, retry:3
+# Add label: <task-id> retry:1  # or retry:2, retry:3
 ```
 
 ### Agent Failure
 
 ```bash
 # If a spawned agent fails, log error and retry or escalate
-bd update <task-id> --status blocked
-bd label add <task-id> agent:failed
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> agent:failed
 # Attempt retry or escalate to human
 ```
 
@@ -632,7 +632,7 @@ bd label add <task-id> agent:failed
 
 ```bash
 # If task is in_progress > 2 hours, check status
-bd show <task-id> --json
+# Show task: task-id> --json
 # Post checkpoint comment to GitHub Issue
 ```
 
@@ -640,38 +640,38 @@ bd show <task-id> --json
 
 ```bash
 # Check for circular dependencies
-bd doctor
+run health check
 # If found, restructure task dependencies
 ```
 
 ---
 
-## BEADS Commands Reference
+## Task Document Reference
 
 ```bash
 # Create epic linked to GitHub Issue
-bd create "<title>" --type epic --issue <number> --json
+# Create a task document in docs/tasks/ for: "<title>" --type epic --issue <number> --json
 
 # Create task under epic
-bd create "<title>" --type task --parent <epic-id> --json
+# Create a task document in docs/tasks/ for: "<title>" --type task --parent <epic-id> --json
 
 # Add dependency (task blocked by another)
-bd dep add <blocked-task> <blocking-task>
+# Add dependency: <blocked-task> <blocking-task>
 
 # Update status
-bd update <task-id> --status in_progress|blocked|closed
+# Update task status: <task-id> --status in_progress|blocked|closed
 
 # Add label for custom states
-bd label add <task-id> waiting:human|waiting:ci|agent:failed
+# Add label: <task-id> waiting:human|waiting:ci|agent:failed
 
 # Close task with reason
-bd close <task-id> --reason "<reason>"
+# Mark task complete: <task-id> --reason "<reason>"
 
 # List tasks under epic
-bd list --parent <epic-id> --json
+# List tasks: --parent <epic-id> --json
 
 # Show ready (unblocked) tasks
-bd ready --json
+show ready tasks --json
 ```
 
 ---

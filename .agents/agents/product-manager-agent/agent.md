@@ -11,7 +11,7 @@ enabled: true
 **Type**: `product-manager-agent`
 **Role**: Use case validation and user benefit review
 **Spawned By**: Design Review Gate
-**Tools**: Codebase read, product docs, user research, BEADS CLI
+**Tools**: Codebase read, product docs, user research, task documents
 
 ---
 
@@ -405,7 +405,7 @@ When review is complete:
 4. Design Review Gate will aggregate with other agents
 
 ```bash
-bd close <task-id> --reason "PM review complete. Verdict: [APPROVED|NEEDS_REVISION]"
+# Mark task complete: <task-id> --reason "PM review complete. Verdict: [APPROVED|NEEDS_REVISION]"
 ```
 
 ---

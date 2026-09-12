@@ -56,7 +56,7 @@ The SRE Agent investigates production issues, analyzes system health, and provid
 
 Triggered by:
 
-- Slack: `@beads investigate <problem>`
+- Slack: `@issue tracking investigate <problem>`
 - Issue Orchestrator: Production investigation task
 - Alert: CI/CD or monitoring alert
 
@@ -69,7 +69,7 @@ Triggered by:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type debugging --keywords "production" "monitoring" "logs"
+read docs/knowledge/ for debugging context --keywords "production" "monitoring" "logs"
 ```
 
 Review the output for production investigation patterns and known system behaviors.
@@ -91,7 +91,7 @@ This activates safety guardrails that:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Understand the reported issue
 # - What symptoms?
@@ -237,9 +237,9 @@ Gmail API rate limiting triggered due to burst of email sends.
 
 ---
 
-### BEADS Update
+### Task Update
 \`\`\`bash
-bd close <task-id> --reason "Investigation complete. Root cause: Gmail API rate limiting."
+# Mark task complete: <task-id> --reason "Investigation complete. Root cause: Gmail API rate limiting."
 \`\`\`
 ```
 
@@ -301,9 +301,9 @@ Escalate to human when:
 5. **Multiple systems affected**
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
-bd label add <task-id> severity:high
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
+# Add label: <task-id> severity:high
 ```
 
 ---
@@ -398,9 +398,9 @@ The SRE Agent produces investigation reports:
 1. <Immediate fix>
 2. <Long-term fix>
 
-### BEADS Update
+### Task Update
 
-`bd close <task-id> --reason "Investigation complete"`
+mark complete (docs/tasks/): <task-id> --reason "Investigation complete"`
 ```
 
 ---
@@ -413,5 +413,5 @@ The SRE Agent produces investigation reports:
 - [ ] Evidence collected (logs, metrics, queries)
 - [ ] Recommendations provided for fixes
 - [ ] Postmortem created for significant incidents
-- [ ] BEADS task updated with findings
+- [ ] task updated with findings
 - [ ] No production modifications made (read-only enforced)

@@ -389,19 +389,19 @@ Plan is ready for user review.
 ### Downstream (after gate approval)
 
 - Plan presented to user for final approval
-- **After user approval**: Persist the approved plan to `.beads/plans/active-plan.md` (see Section: Plan Persistence below)
+- **After user approval**: Persist the approved plan to `docs/plans/active-plan.md` (see Section: Plan Persistence below)
 - User-approved plan flows to `orchestrated-execution` for the 4-phase execution loop
 - Work unit decomposition and implementation begin
 
 ### Plan Persistence
 
-After the gate approves AND the user approves the plan, persist it to BEADS so it survives context compaction:
+After the gate approves AND the user approves the plan, persist it to task documents so it survives context compaction:
 
 ```bash
-mkdir -p .beads/plans
+mkdir -p docs/plans
 
 # Write with metadata header
-cat > .beads/plans/active-plan.md << 'PLAN_EOF'
+cat > docs/plans/active-plan.md << 'PLAN_EOF'
 # Active Plan
 <!-- approved: <timestamp> -->
 <!-- gate-iterations: <N> -->

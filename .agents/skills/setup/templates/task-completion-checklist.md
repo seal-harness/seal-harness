@@ -158,25 +158,23 @@ When working as a task agent in a worktree (spawned by an orchestrator), you own
 
 **The orchestrator will NOT start the next phase until your PR is merged to main.**
 
-### 9. BEADS Issue Tracking (MANDATORY for tracked tasks)
+### 9. Task Document Tracking (MANDATORY for tracked tasks)
 
-If working on a BEADS-tracked issue, update its status before declaring complete:
+If working on a tracked task, update its task document before declaring complete:
 
 ```bash
-# View current issue status
-bd show <ISSUE_ID>
+# View current task status
+cat docs/tasks/<task-file>.md
 
-# Mark issue as closed
-bd close <ISSUE_ID> --reason "Completed in commit <SHA>. All tests pass."
-
-# Close multiple issues at once
-bd close <ID1> <ID2> --reason "Completed in commit <SHA>"
+# Mark task as completed — edit the front matter:
+#   status: completed
+#   Add "Completed in commit <SHA>. All tests pass." to the Notes section
 ```
 
-- [ ] BEADS issue closed (if applicable)
+- [ ] task document updated to completed status
 - [ ] Completion reason included with commit reference
-- [ ] Any follow-up work captured as new BEADS issues: `bd create --title "..." --priority 2`
-- [ ] Run `bd sync` to push BEADS changes to git
+- [ ] Any follow-up work captured as new task documents in docs/tasks/
+- [ ] Commit task document changes to git
 
 ## Final Verification
 

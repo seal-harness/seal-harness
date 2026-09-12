@@ -1,6 +1,6 @@
 # Status
 
-Show metaswarm diagnostic information.
+Show Seal Harness diagnostic information.
 
 ## Usage
 
@@ -10,13 +10,13 @@ Show metaswarm diagnostic information.
 
 ## Behavior
 
-Invokes the `metaswarm:status` skill, which reports:
+Invokes the `Seal Harness:status` skill, which reports:
 
 - Installed plugin version
 - Project setup state
 - Command shims status
 - Legacy install detection
-- BEADS plugin status
+- documentation system status
 - External tools configuration
 - Coverage threshold configuration
 - Node.js availability
@@ -25,5 +25,5 @@ Use this to troubleshoot installation or configuration issues.
 
 ## Related
 
-- `/metaswarm:setup` — configure metaswarm for a project
-- `/metaswarm:migrate` — migrate from npm-installed metaswarm
+- `/setup` — configure Seal Harness for a project
+- `/migrate` — migrate from npm-installed Seal Harness

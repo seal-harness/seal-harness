@@ -42,15 +42,15 @@ Review the session to date and answer, concretely:
 
 Pull from: the user's original request, any GitHub Issue (`gh issue view <n>`), the design/plan docs, and the arc of the conversation.
 
-### Step 2 — Load any persisted metaswarm state
+### Step 2 — Load any persisted Seal Harness state
 
-If this project uses metaswarm's context persistence, read and fold in whatever exists — do **not** duplicate it blindly, summarize and link:
+If this project uses Seal Harness's context persistence, read and fold in whatever exists — do **not** duplicate it blindly, summarize and link:
 
 ```bash
-ls .beads/plans/active-plan.md            # the approved plan (if mid-execution)
-ls .beads/context/project-context.md      # completed work units, patterns, tooling
-ls .beads/context/execution-state.md      # current work unit, phase, retry count
-bd prime --work-type recovery 2>/dev/null # reload plan + state + knowledge, if beads present
+ls docs/plans/active-plan.md            # the approved plan (if mid-execution)
+ls docs/context/project-context.md      # completed work units, patterns, tooling
+ls docs/context/execution-state.md      # current work unit, phase, retry count
+cat docs/knowledge/*.jsonl 2>/dev/null | jq -r '.fact'  # load knowledge facts, if docs/ present
 ```
 
 If an active plan exists, the handoff must point to it explicitly and state which work unit/phase is in progress.
@@ -81,7 +81,7 @@ List every artifact the next agent must read **before acting**, and for each one
 
 - **Specs / Issues** — the requirements source of truth (GitHub Issue, spec section, DoD).
 - **Design docs** — `docs/plans/*-design.md` and any approved design.
-- **Plans** — `.beads/plans/active-plan.md`, `docs/plans/*-plan.md`.
+- **Plans** — `docs/plans/active-plan.md`, `docs/plans/*-plan.md`.
 - **Code** — the specific files and `file:line` anchors that are the focus of the work, plus any pattern files to imitate.
 - **Tests** — the tests that define correctness (failing tests are the spec under TDD).
 - **Config / gates** — `.coverage-thresholds.json`, CLAUDE.md rules, CI config that the change must satisfy.
@@ -199,5 +199,5 @@ Expected: <what green looks like>.
 ## Relationship to Other Metaswarm Pieces
 
 - Complements `/prime` (which loads knowledge **into** a session) by serializing context **out of** a session for the next one.
-- For mid-execution work, this skill should reference `.beads/plans/active-plan.md` and `.beads/context/execution-state.md` rather than restating them, so the next agent can `bd prime --work-type recovery` and then read the handoff for the human-readable narrative.
+- For mid-execution work, this skill should reference `docs/plans/active-plan.md` and `docs/context/execution-state.md` rather than restating them, so the next agent can `read docs/plans/active-plan.md and docs/context/execution-state.md to reload state` and then read the handoff for the human-readable narrative.
 - Run `/self-reflect` separately to capture durable *learnings* into the knowledge base; `/handoff` captures *this task's* transient state to resume it.

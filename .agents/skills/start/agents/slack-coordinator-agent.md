@@ -3,7 +3,7 @@
 **Type**: `swarm-coordinator` (Slack interface specialization)
 **Role**: Human-agent communication bridge via Slack
 **Spawned By**: Issue Orchestrator, Human prompt responses
-**Tools**: Slack API, BEADS CLI, GitHub API
+**Tools**: Slack API, task documents, GitHub API
 
 ---
 
@@ -29,7 +29,7 @@ Your Machine                         Slack
 **Running the daemon:**
 
 ```bash
-pnpm tsx scripts/beads-slack-daemon.ts
+pnpm tsx scripts/seal-slack-daemon.ts
 ```
 
 ---
@@ -43,7 +43,7 @@ The Slack Coordinator Agent manages all communication between the agent swarm an
 ## Responsibilities
 
 1. **Notification Management**: Send task updates and alerts to Slack
-2. **Command Processing**: Handle `beads` commands via @mention or DM
+2. **Command Processing**: Handle `issue tracking` commands via @mention or DM
 3. **Human Prompts**: Coordinate human input requests and responses
 4. **Status Reporting**: Provide swarm status summaries on demand
 5. **Alert Escalation**: Route critical alerts to appropriate channels
@@ -69,7 +69,7 @@ Triggered when:
 **BEFORE processing commands**, prime your context:
 
 ```bash
-bd prime --work-type research --keywords "slack" "notification" "communication"
+read docs/knowledge/ for research context --keywords "slack" "notification" "communication"
 ```
 
 Review the output for patterns about agent-human communication.
@@ -82,19 +82,19 @@ Review the output for patterns about agent-human communication.
 
 | Command               | Description                |
 | --------------------- | -------------------------- |
-| `beads status`        | Show task counts by status |
-| `beads list [status]` | List tasks (default: open) |
-| `beads show <id>`     | Show task details          |
-| `beads ready`         | Show tasks ready for work  |
-| `beads blocked`       | Show blocked tasks         |
-| `beads help`          | Show command help          |
+| `issue tracking status`        | Show task counts by status |
+| `issue tracking list [status]` | List tasks (default: open) |
+| `issue tracking show <id>`     | Show task details          |
+| `issue tracking ready`         | Show tasks ready for work  |
+| `issue tracking blocked`       | Show blocked tasks         |
+| `issue tracking help`          | Show command help          |
 
 ### Example Interactions
 
-**@beads status**
+**@seal status**
 
 ```
-🐝 BEADS Status
+🐝 Task Status
 
 *Open:*          12
 *In Progress:*   3
@@ -102,23 +102,23 @@ Review the output for patterns about agent-human communication.
 *Closed:*        8
 ```
 
-**@beads list in_progress**
+**@seal list in_progress**
 
 ```
-*BEADS Tasks (in_progress)*
-📋 `bd-a1b2` Implement OAuth2 flow
+*Tasks (in_progress)*
+📋 `task-a1b2` Implement OAuth2 flow
 📋 `bd-c3d4` Write auth tests
 📋 `bd-e5f6` Review PR #892
 
 3 task(s)
 ```
 
-**@beads show bd-a1b2**
+**@seal show task-a1b2**
 
 ```
 📋 *Implement OAuth2 authentication flow*
 
-*ID:*        `bd-a1b2`
+*ID:*        `task-a1b2`
 *Status:*    in_progress
 *Priority:*  P1
 
@@ -132,15 +132,15 @@ Implement OAuth2 authentication flow with Google and GitHub providers.
 
 ```bash
 # Required for Socket Mode
-SLACK_BEADS_APP_TOKEN=xapp-...    # App-level token for Socket Mode
-SLACK_BEADS_BOT_TOKEN=xoxb-...    # Bot OAuth token
+SLACK_APP_TOKEN=xapp-...    # App-level token for Socket Mode
+SLACK_BOT_TOKEN=xoxb-...    # Bot OAuth token
 
 # Security (recommended)
-BEADS_ALLOWED_USERS=U12345,U67890  # Comma-separated Slack user IDs
+ALLOWED_USERS=U12345,U67890  # Comma-separated Slack user IDs
 
 # Optional (for notification service)
-SLACK_BEADS_CHANNEL=C0XXXXXXXX        # Main notification channel
-SLACK_BEADS_ALERTS_CHANNEL=C0XXXXXXXX # Critical alerts channel
+SLACK_CHANNEL=C0XXXXXXXX        # Main notification channel
+SLACK_ALERTS_CHANNEL=C0XXXXXXXX # Critical alerts channel
 ```
 
 ---
@@ -166,16 +166,16 @@ SLACK_BEADS_ALERTS_CHANNEL=C0XXXXXXXX # Critical alerts channel
 
 ## Notification Service
 
-The `BeadsSlackNotificationService` can still be used for programmatic notifications:
+The `Issue TrackingSlackNotificationService` can still be used for programmatic notifications:
 
 ```typescript
-import { getBeadsSlackNotificationService } from "@/lib/services/beads";
+import { getIssue TrackingSlackNotificationService } from "@/lib/services/issue tracking";
 
-const slack = getBeadsSlackNotificationService();
+const slack = getIssue TrackingSlackNotificationService();
 
 // Send task update
 await slack.notifyTaskUpdate({
-  taskId: "bd-a1b2",
+  taskId: "task-a1b2",
   title: "Implement feature X",
   status: "closed",
   agentType: "coder-agent",
@@ -206,7 +206,7 @@ if (!slackService.isAvailable()) {
 
 ### Authorization
 
-The daemon validates user IDs against `BEADS_ALLOWED_USERS`:
+The daemon validates user IDs against `ALLOWED_USERS`:
 
 ```typescript
 if (config.allowedUsers.length > 0 && !config.allowedUsers.includes(userId)) {
@@ -233,12 +233,12 @@ The Slack Coordinator formats messages as:
 ```markdown
 ### Status Response
 
-🐝 BEADS Status
+🐝 Task Status
 _Open:_ N | _In Progress:_ N | _Blocked:_ N
 
 ### Task List
 
-_BEADS Tasks (status)_
+_Tasks (status)_
 • bd-xxx - Task title
 • bd-yyy - Task title
 
@@ -257,6 +257,6 @@ Reply with number to respond
 - [ ] Commands processed correctly
 - [ ] Responses formatted for Slack
 - [ ] User authorization verified
-- [ ] BEADS CLI commands executed
+- [ ] task commands executed
 - [ ] Notifications delivered to correct channels
 - [ ] Human prompts tracked to completion

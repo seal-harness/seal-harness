@@ -7,7 +7,7 @@
 <!-- branch: test/agent-opcode-invariants -->
 
 ## Resume instruction
-Read `.beads/plans/active-plan.md` and continue the orchestrated execution of issue #135 (AGENT_ opcode invariant integration tests). The plan-review gate approved this plan (3 iterations, all 3 reviewers PASS on Rev 3). Work units WU-1 → WU-1.5 → WU-2 → WU-3 → WU-4 → WU-5 are sequential. Current progress is tracked in the "Execution state" section below — pick up at the next pending WU. The branch `test/agent-opcode-invariants` is already checked out. Follow the 4-phase loop per WU: IMPLEMENT → VALIDATE (`make check` or cabal test --match) → ADVERSARIAL REVIEW → COMMIT. The human checkpoint is WU-5: present the 4 failing tests to the user, who decides fix / pendingWith / defer.
+Read `docs/plans/active-plan.md` and continue the orchestrated execution of issue #135 (AGENT_ opcode invariant integration tests). The plan-review gate approved this plan (3 iterations, all 3 reviewers PASS on Rev 3). Work units WU-1 → WU-1.5 → WU-2 → WU-3 → WU-4 → WU-5 are sequential. Current progress is tracked in the "Execution state" section below — pick up at the next pending WU. The branch `test/agent-opcode-invariants` is already checked out. Follow the 4-phase loop per WU: IMPLEMENT → VALIDATE (`make check` or cabal test --match) → ADVERSARIAL REVIEW → COMMIT. The human checkpoint is WU-5: present the 4 failing tests to the user, who decides fix / pendingWith / defer.
 
 ## Execution state
 - [x] WU-1 — Scaffold the spec + wire it (RED)

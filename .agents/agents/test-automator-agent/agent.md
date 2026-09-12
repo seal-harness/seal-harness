@@ -54,7 +54,7 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type implementation --keywords "testing" "mock" "tdd"
+read docs/knowledge/ for implementation context --keywords "testing" "mock" "tdd"
 ```
 
 Review the output for testing patterns, mock factory usage, and TDD requirements.
@@ -63,7 +63,7 @@ Review the output for testing patterns, mock factory usage, and TDD requirements
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get the implementation plan
 # Read what functionality needs testing
@@ -383,12 +383,12 @@ For each method, ensure:
 
 ---
 
-## BEADS Integration
+## Task Tracking
 
 ```bash
 # Mark test writing complete
-bd update <task-id> --status completed
-bd close <task-id> --reason "Tests written. Coverage: 100%"
+# Update task status: <task-id> --status completed
+# Mark task complete: <task-id> --reason "Tests written. Coverage: 100%"
 ```
 
 ---
@@ -425,9 +425,9 @@ The Test Automator produces test coverage reports:
 - Created: `createMockFeature()` in mock-factories.ts
 - Updated: None
 
-### BEADS Update
+### Task Update
 
-`bd close <task-id> --reason "Tests written. Coverage: 100%"`
+mark complete (docs/tasks/): <task-id> --reason "Tests written. Coverage: 100%"`
 ```
 
 ---
@@ -444,4 +444,4 @@ The Test Automator produces test coverage reports:
 - [ ] No `as any` type casting (NEVER)
 - [ ] DI wiring uses `as never` (not `as unknown as ConstructorParameters<...>`)
 - [ ] SERVICE_INVENTORY.md updated for new factories
-- [ ] BEADS task closed with coverage report
+- [ ] task closed with coverage report
