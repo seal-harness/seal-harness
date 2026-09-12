@@ -14,6 +14,7 @@ module Seal.Skills.Prompt
   ( availableSkillsBlock
   , injectAvailableSkills
   , availableSkillsBudget
+  , fullBlock
   ) where
 
 import Data.List (groupBy, sortOn)

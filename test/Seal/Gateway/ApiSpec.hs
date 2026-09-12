@@ -2098,6 +2098,76 @@ spec = describe "Seal.Gateway.API" $ do
 
   -- ── Skill CRUD ───────────────────────────────────────────────────────
 
+  -- ── Skills catalog (full, untruncated) ──────────────────────────────
+
+  it "GET /api/skills/catalog returns 200 with the full catalog text" $ do
+    app <- mkApp
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "skills", "catalog"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        case lookupK "catalog" o of
+          Just (A.String t) ->
+            -- With no skills configured, the catalog is empty (the backend
+            -- returns an empty string). Verify the key is present and is a
+            -- string.
+            t `shouldBe` ""
+          _ -> expectationFailure "expected 'catalog' string field"
+        case lookupK "truncated" o of
+          Just (A.Bool b) -> b `shouldBe` False
+          _ -> expectationFailure "expected 'truncated' boolean field"
+      _ -> expectationFailure "expected JSON object for GET /api/skills/catalog"
+
+  it "GET /api/skills/catalog with skills returns the untruncated catalog" $ do
+    adb <- noneBackend
+    skills <- Skill.noneBackend
+    tabsH <- newTabsHandle
+    reg <- newHarnessRegistry
+    activeRef <- newIORef fakeMeta
+    uiState <- newUiStateHandle mkPaths
+    let now = UTCTime (fromGregorian 2026 7 1) 0
+        mkS n desc = case mkSkillId n of
+          Right sid -> Skill sid desc "body" Nothing now now (mkSystemSessionId "manual")
+          Left _    -> error "sid"
+    Skill.sbCreate skills (mkS "alpha" "Alpha skill")
+    Skill.sbCreate skills (mkS "beta" "Beta skill")
+    let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
+        deps = ApiDeps
+          { adSessionRuntime  = sr
+          , adTabsHandle      = tabsH
+          , adHarnessRegistry = reg
+          , adAdoptConsent    = Just CcWeb
+          , adAgentDefs       = adb
+          , adSkills          = skills
+          , adProviders       = pure knownProviders
+          , adUiState         = uiState
+          , adSend            = Nothing
+          , adDefaultAgent    = pure Nothing
+          , adBroker          = Nothing
+    , adTabCloseNotifier = noTabCloseNotifier
+    , adRepoRegistry     = fakeRepoRegistryHandle
+    , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+                , adVault            = fakeLockedVaultRuntime
+                , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
+    , adSecurityConfig = defaultSecurityConfig
+    , adMkSessionExec = Nothing
+          }
+        app = apiApp deps
+    (_, body) <- runAppBody app (testRequest methodGet ["api", "skills", "catalog"])
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        case lookupK "catalog" o of
+          Just (A.String t) -> do
+            -- The untruncated catalog contains both skill descriptions
+            -- and no truncation marker.
+            "Alpha skill" `T.isInfixOf` t `shouldBe` True
+            "Beta skill" `T.isInfixOf` t `shouldBe` True
+            "catalog truncated" `T.isInfixOf` t `shouldBe` False
+          _ -> expectationFailure "expected 'catalog' string field"
+        case lookupK "truncated" o of
+          Just (A.Bool b) -> b `shouldBe` False
+          _ -> expectationFailure "expected 'truncated' boolean field"
+      _ -> expectationFailure "expected JSON object for GET /api/skills/catalog with skills"
+
   it "GET /api/skills returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "skills"])
