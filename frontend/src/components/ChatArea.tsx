@@ -559,35 +559,29 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
             </div>
           )
         ) : (
-          <div className="raw-json-body raw-json-body-segmented" data-testid="raw-json-body">
+          <pre className="raw-json-body" data-testid="raw-json-body">
             {truncationMarkers.length === 0 ? (
-              <pre className="raw-json-pre-inline">{pretty}</pre>
+              pretty
             ) : (
               (() => {
-                const segments: ReactNode[] = []
+                const parts: ReactNode[] = []
                 let lastIdx = 0
                 truncationMarkers.forEach((marker, mi) => {
-                  // Text before the marker
-                  segments.push(
-                    <pre key={`seg-${mi}`} className="raw-json-pre-inline">
-                      {pretty.slice(lastIdx, marker.index)}
-                    </pre>,
-                  )
-                  // Inline load button (or loaded catalog) at the marker position
+                  // Text before the marker — rendered as plain text inline
+                  if (marker.index > lastIdx) {
+                    parts.push(pretty.slice(lastIdx, marker.index))
+                  }
                   if (loadedMarkers.has(mi) && catalogText) {
-                    segments.push(
-                      <div key={`loaded-${mi}`} className="catalog-inline-loaded" data-testid="catalog-full-section">
-                        <div className="catalog-full-header">
-                          <span className="catalog-full-title">Full available-skills catalog</span>
-                          <CopyJsonButton text={catalogText} />
-                        </div>
-                        <pre className="catalog-full-body" data-testid="catalog-full-body">{catalogText}</pre>
-                      </div>,
+                    // Expanded catalog inline at the marker position
+                    parts.push(
+                      <span key={`loaded-${mi}`} className="catalog-inline-expanded" data-testid="catalog-full-section">
+                        <span className="catalog-inline-expanded-text" data-testid="catalog-full-body">{catalogText}</span>
+                      </span>,
                     )
                   } else {
-                    segments.push(
-                      <div key={`marker-${mi}`} className="catalog-truncation-inline" data-testid="catalog-truncation-notice">
-                        <span className="catalog-truncation-text">{marker.text}</span>
+                    // Inline button at the marker position
+                    parts.push(
+                      <span key={`marker-${mi}`} className="catalog-inline-marker" data-testid="catalog-truncation-notice">
                         <button
                           className="catalog-load-button"
                           data-testid="catalog-load-button"
@@ -601,21 +595,19 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
                             Failed to load. Try again.
                           </span>
                         )}
-                      </div>,
+                      </span>,
                     )
                   }
                   lastIdx = marker.index + marker.text.length
                 })
                 // Trailing text after the last marker
-                segments.push(
-                  <pre key={`seg-last`} className="raw-json-pre-inline">
-                    {pretty.slice(lastIdx)}
-                  </pre>,
-                )
-                return segments
+                if (lastIdx < pretty.length) {
+                  parts.push(pretty.slice(lastIdx))
+                }
+                return parts
               })()
             )}
-          </div>
+          </pre>
         )}
       </div>
     </div>,
