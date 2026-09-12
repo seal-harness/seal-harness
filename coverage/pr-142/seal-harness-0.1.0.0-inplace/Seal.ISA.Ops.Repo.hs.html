@@ -1,0 +1,367 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | SETUP_REPO (Untrusted): clone a remote repository into the session's
+<span class="lineno">    3 </span>-- workspace so the model can work with its code and discover any skills it
+<span class="lineno">    4 </span>-- ships. The opcode is VCS-agnostic in name and result shape (\&quot;cloned at
+<span class="lineno">    5 </span>-- \&lt;path\&gt;\&quot;) but git-only in implementation for now; a future @vcs@ arg or
+<span class="lineno">    6 </span>-- URL-scheme dispatch can add others without changing the contract.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- Untrusted because upstream repo content is untrusted — a clone is a
+<span class="lineno">    9 </span>-- filesystem mutation of untrusted-origin data, so it goes through the
+<span class="lineno">   10 </span>-- sandboxed 'UntrustedIO' + the 'Autonomy' confirmation gate, not a
+<span class="lineno">   11 </span>-- trusted shell. This is strictly safer than the prior pattern of the
+<span class="lineno">   12 </span>-- model running @git clone@ via 'SHELL_EXEC' and hoping.
+<span class="lineno">   13 </span>--
+<span class="lineno">   14 </span>-- Semantics:
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>--   * Shallow clone (@git clone --depth 1@) to keep large repos cheap.
+<span class="lineno">   17 </span>--   * Multiple repos are supported: each clones into
+<span class="lineno">   18 </span>--     @\&lt;workdir\&gt;\/\&lt;sanitized-repo-name\&gt;\/@.
+<span class="lineno">   19 </span>--   * Idempotent: if the target dir already holds a clone of the same
+<span class="lineno">   20 </span>--     remote URL, the call is a no-op (\&quot;Repo already exists — no-op\&quot;).
+<span class="lineno">   21 </span>--     If the dir exists but its remote differs, the call errors (\&quot;a
+<span class="lineno">   22 </span>--     different repo already occupies that path\&quot;) rather than silently
+<span class="lineno">   23 </span>--     clobbering.
+<span class="lineno">   24 </span>--   * The clone runs in the workspace root (cwd = workdir) via
+<span class="lineno">   25 </span>--     'uioShellExec'; the URL is validated to a safe charset so it cannot
+<span class="lineno">   26 </span>--     inject shell metacharacters into the @\/bin\/sh -c@ single-arg
+<span class="lineno">   27 </span>--     boundary.
+<span class="lineno">   28 </span>--
+<span class="lineno">   29 </span>-- Credential resolution (W3 — design §4.2/§4.3, rev 3): 'setupRepoOp' takes
+<span class="lineno">   30 </span>-- a 'CloneDeps' closed-over param (mirrors @secretGetOp (cdVault deps)@).
+<span class="lineno">   31 </span>-- 'cloneRepoIO' does @lookupRepoByUrl@ against the registry
+<span class="lineno">   32 </span>-- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
+<span class="lineno">   33 </span>-- credential via the no-disk seam ('Seal.SourceControl.Clone.resolveCloneTarget'
+<span class="lineno">   34 </span>-- using @cdVault@/@cdSshAgent@/@cdPinnedKnownHosts@/@cdKeyfilesDir@) and
+<span class="lineno">   35 </span>-- clones via @gh repo clone@ with @GH_TOKEN@ (PAT/MachineUser: the raw
+<span class="lineno">   36 </span>-- token from 'ceRawToken' injected as @GH_TOKEN@ env) or @git clone@ via
+<span class="lineno">   37 </span>-- 'uioShellExecGitEnv' (deploy key: @SSH_AUTH_SOCK@ + @GIT_SSH_COMMAND@).
+<span class="lineno">   38 </span>-- If the URL is NOT registered, fall through to a bare-URL clone (public
+<span class="lineno">   39 </span>-- repos, backward-compat). Stays Untrusted; credential resolution via
+<span class="lineno">   40 </span>-- 'liftIO' in the trusted plane. NO @runLocal@/@BackendExec@.
+<span class="lineno">   41 </span>module Seal.ISA.Ops.Repo
+<span class="lineno">   42 </span>  ( setupRepoOp
+<span class="lineno">   43 </span>  , validateRepoUrl
+<span class="lineno">   44 </span>  , sanitizeRepoName
+<span class="lineno">   45 </span>  , normalizeRepoUrl
+<span class="lineno">   46 </span>  , isShellMetachar
+<span class="lineno">   47 </span>  , CloneResult (..)
+<span class="lineno">   48 </span>  , cloneRepoIO
+<span class="lineno">   49 </span>  ) where
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>import Data.Aeson (Value, object, withObject, (.:), (.=))
+<span class="lineno">   52 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   53 </span>import Data.Char (isAlphaNum)
+<span class="lineno">   54 </span>import Data.ByteString qualified as BS
+<span class="lineno">   55 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   56 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   57 </span>import Data.Text (Text)
+<span class="lineno">   58 </span>import Data.Text qualified as T
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   61 </span>import Seal.ISA.Opcode
+<span class="lineno">   62 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   63 </span>import Seal.Security.Policy (AutonomyLevel (..))
+<span class="lineno">   64 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   65 </span>import Seal.SourceControl.Clone
+<span class="lineno">   66 </span>  ( CloneDeps (..), CloneEnv (..), renderCloneError, resolveCloneTarget
+<span class="lineno">   67 </span>  , withCloneTarget )
+<span class="lineno">   68 </span>import Seal.SourceControl.Repo (normalizeRepoUrl, lookupRepoByUrl, SourceRepo (..), RepoRegistry (..))
+<span class="lineno">   69 </span>import Seal.SourceControl.Registry (RepoRegistryHandle (..))
+<span class="lineno">   70 </span>import Seal.Tools.Args (mkShellCommand, ShellCommand)
+<span class="lineno">   71 </span>import Seal.Tools.Exec.UIO
+<span class="lineno">   72 </span>  ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
+<span class="lineno">   73 </span>import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
+<span class="lineno">   74 </span>import Seal.Tools.Exec.UntrustedIO qualified as UIORec
+<span class="lineno">   75 </span>  (UntrustedIO (uioShellExec, uioShellExecEnv, uioShellExecGitEnv))
+<span class="lineno">   76 </span>import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | SETUP_REPO opcode. Input: @{url: Text}@. Authorize: autonomy must not
+<span class="lineno">   79 </span>-- be 'Deny' and the URL must validate ('validateRepoUrl'). Run: a shallow
+<span class="lineno">   80 </span>-- @git clone@ into @\&lt;workdir\&gt;\/\&lt;sanitized-repo-name\&gt;@ via
+<span class="lineno">   81 </span>-- 'uioShellExec', after an idempotency check (read the existing remote).
+<span class="lineno">   82 </span>-- 'orRecorded': the url + target path + status (secret-free).
+<span class="lineno">   83 </span>setupRepoOp :: CloneDeps -&gt; WorkspaceRoot -&gt; AutonomyLevel -&gt; Opcode
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">setupRepoOp deps _wsRoot autonomy = UntrustedOpcode</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;SETUP_REPO&quot;</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Clone a remote repository into the session workspace (shallow, idempotent). Discover any skills it ships via the available-skills catalog on the next turn.&quot;</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = setupRepoSchema</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff">case urlField v of</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;SETUP_REPO requires {url:string}&quot;</span></span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">Just url -&gt; case validateRepoUrl url of</span>
+<span class="lineno">   93 </span><span class="spaces">          </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;SETUP_REPO: invalid url: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="istickedoff">Right _ -&gt; case autonomy of</span>
+<span class="lineno">   95 </span><span class="spaces">            </span><span class="istickedoff">Deny -&gt; <span class="nottickedoff">Left &quot;SETUP_REPO denied by autonomy policy&quot;</span></span>
+<span class="lineno">   96 </span><span class="spaces">            </span><span class="istickedoff">_   -&gt; Right ()</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">let mUrl = urlField v</span>
+<span class="lineno">   99 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object [ &quot;url&quot; .= (mUrl :: Maybe Text) ]</span></span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">case mUrl of</span>
+<span class="lineno">  101 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;SETUP_REPO requires {url:string}&quot;] True recorded)</span></span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">Just url -&gt; case validateRepoUrl url of</span>
+<span class="lineno">  103 </span><span class="spaces">          </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;SETUP_REPO: invalid url: &quot; &lt;&gt; err)] True recorded)</span></span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">Right url' -&gt; runSetupRepo deps url' <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>setupRepoSchema :: Value
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">setupRepoSchema =</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  112 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;url&quot; .= object</span>
+<span class="lineno">  113 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  114 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The repository URL to clone (https://, git://, ssh://, or git@host:path). Cloned shallowly into &lt;workdir&gt;/&lt;repo-name&gt;.&quot; :: Text)</span>
+<span class="lineno">  115 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  116 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;url&quot;] :: [Text])</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>urlField :: Value -&gt; Maybe Text
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">urlField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;url&quot;))</span></span>
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | Validate a repo URL. Accepts @https://@, @http://@, @git://@,
+<span class="lineno">  124 </span>-- @ssh://@, and the @git\@host:path@ SCP-style form. Rejects any URL
+<span class="lineno">  125 </span>-- containing shell metacharacters that could break out of the
+<span class="lineno">  126 </span>-- @\/bin\/sh -c@ single-arg boundary (the @uioShellExec@ contract).
+<span class="lineno">  127 </span>-- Returns the trimmed URL on success, or an error message.
+<span class="lineno">  128 </span>validateRepoUrl :: Text -&gt; Either Text Text
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">validateRepoUrl raw =</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">let url = T.strip raw</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">in if T.null url</span>
+<span class="lineno">  132 </span><span class="spaces">       </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;url is empty&quot;</span></span>
+<span class="lineno">  133 </span><span class="spaces">       </span><span class="istickedoff">else if not (hasAcceptableScheme url)</span>
+<span class="lineno">  134 </span><span class="spaces">              </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;url must use https://, http://, git://, ssh://, or git@host:path&quot;</span></span>
+<span class="lineno">  135 </span><span class="spaces">              </span><span class="istickedoff">else if T.any isShellMetachar url</span>
+<span class="lineno">  136 </span><span class="spaces">                     </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;url contains forbidden shell metacharacters&quot;</span></span>
+<span class="lineno">  137 </span><span class="spaces">                     </span><span class="istickedoff">else Right url</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | True if the URL begins with an acceptable scheme or is SCP-style
+<span class="lineno">  140 </span>-- (@git\@host:path@, more generally @user\@host:path@).
+<span class="lineno">  141 </span>hasAcceptableScheme :: Text -&gt; Bool
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">hasAcceptableScheme url =</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">any (`T.isPrefixOf` url)</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;https://&quot;, &quot;http://&quot;, &quot;git://&quot;, &quot;ssh://&quot; ]</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">|| isScpStyle url</span></span>
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>-- | Heuristic for @user\@host:path@ (SCP-style). Has an @\@ before the
+<span class="lineno">  148 </span>-- first @/@ (if any), and a @:@ after the host, and no scheme prefix.
+<span class="lineno">  149 </span>isScpStyle :: Text -&gt; Bool
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">isScpStyle url =</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;@&quot; url of</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">(user, rest) | <span class="tickonlytrue">not (T.null user)</span>, not (T.null rest) -&gt;</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">let afterAt = T.drop 1 rest</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">in T.any (== ':') afterAt</span>
+<span class="lineno">  155 </span><span class="spaces">             </span><span class="istickedoff">&amp;&amp; not (&quot;:&quot; `T.isPrefixOf` afterAt)   -- not ':host:path' (no user)</span>
+<span class="lineno">  156 </span><span class="spaces">             </span><span class="istickedoff">&amp;&amp; not (&quot;/&quot; `T.isPrefixOf` user)      -- not a path with an '@'</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; False</span></span>
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- | Shell metacharacters forbidden in a repo URL (the @\/bin\/sh -c@
+<span class="lineno">  160 </span>-- single-arg boundary treats these specially). A legit git URL never
+<span class="lineno">  161 </span>-- contains them; their presence signals an injection attempt.
+<span class="lineno">  162 </span>isShellMetachar :: Char -&gt; Bool
+<span class="lineno">  163 </span><span class="decl"><span class="istickedoff">isShellMetachar c = c `elem` (&quot;;`$\\\&quot;'|\n\r&amp;&lt;&gt;(){}*?[]#!~&quot; :: String)</span></span>
+<span class="lineno">  164 </span>
+<span class="lineno">  165 </span>-- | 'normalizeRepoUrl' is the shared normalizer in &quot;Seal.SourceControl.Repo&quot;
+<span class="lineno">  166 </span>-- (W1 moved it there so both 'ISA.Ops.Repo' and 'lookupRepoByUrl' use the SAME
+<span class="lineno">  167 </span>-- normalizer). Re-exported here for backward compatibility with existing
+<span class="lineno">  168 </span>-- callers (e.g. 'runSetupRepo's idempotency check below).
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>sanitizeRepoName :: Text -&gt; Text
+<span class="lineno">  171 </span><span class="decl"><span class="istickedoff">sanitizeRepoName url =</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">-- Strip trailing slashes first so a trailing slash doesn't yield an</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">-- empty last segment. Then take the last '/' segment; fall back to the</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">-- ':' split for SCP-style (git@host:path); then the whole url.</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">let trimmed = T.dropWhileEnd (== '/') url</span>
+<span class="lineno">  176 </span><span class="spaces">      </span><span class="istickedoff">lastSeg = case T.breakOnEnd &quot;/&quot; trimmed of</span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="istickedoff">(_, seg) | <span class="tickonlytrue">not (T.null seg)</span> -&gt; seg</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">case T.breakOnEnd &quot;:&quot; trimmed of</span></span>
+<span class="lineno">  179 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">(_, seg) | not (T.null seg) -&gt; seg</span></span>
+<span class="lineno">  180 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; trimmed</span></span>
+<span class="lineno">  181 </span><span class="spaces">      </span><span class="istickedoff">withoutGit = fromMaybe lastSeg (T.stripSuffix &quot;.git&quot; lastSeg)</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">sanitized = T.map (\c -&gt; if isAlphaNum c || c == '_' || c == '-' then c else '-') withoutGit</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">trimmedName = T.dropWhile (== '-') (T.dropWhileEnd (== '-') sanitized)</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null trimmedName</span> then <span class="nottickedoff">&quot;repo&quot;</span> else trimmedName</span></span>
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- | The outcome of a clone attempt. Shared by the opcode (model-invoked)
+<span class="lineno">  187 </span>-- and the @POST /api/sessions/:id/setup-repo@ endpoint (web combo box).
+<span class="lineno">  188 </span>data CloneResult
+<span class="lineno">  189 </span>  = CloneCloned Text    -- ^ cloned into &lt;repo-name&gt; (shallow)
+<span class="lineno">  190 </span>  | CloneNoop Text      -- ^ repo already exists at &lt;repo-name&gt;
+<span class="lineno">  191 </span>  | CloneConflict Text Text  -- ^ a different repo occupies &lt;repo-name&gt; (existing url)
+<span class="lineno">  192 </span>  | CloneFailed Text    -- ^ clone or idempotency check failed (&lt;error&gt;)
+<span class="lineno">  193 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  194 </span>
+<span class="lineno">  195 </span>-- | Run the clone (or no-op) via an 'UntrustedIO' capability and return a
+<span class="lineno">  196 </span>-- structured 'CloneResult'. This is the shared seam between the
+<span class="lineno">  197 </span>-- model-invoked 'SETUP_REPO' opcode and the web combo box's
+<span class="lineno">  198 </span>-- @POST /api/sessions/:id/setup-repo@ endpoint — both build the same
+<span class="lineno">  199 </span>-- 'UntrustedIO' (sandboxed to the session workdir) and call this.
+<span class="lineno">  200 </span>--
+<span class="lineno">  201 </span>-- Credential resolution (W3): @lookupRepoByUrl@ against the registry
+<span class="lineno">  202 </span>-- (@cdRepoReg@) → if the URL matches a registered repo, resolve the
+<span class="lineno">  203 </span>-- credential via the no-disk seam ('resolveCloneTarget' using @cdVault@/
+<span class="lineno">  204 </span>-- @cdSshAgent@/@cdPinnedKnownHosts@/@cdKeyfilesDir@) and run @git clone@
+<span class="lineno">  205 </span>-- via 'uioShellExecEnv' (deploy key: @SSH_AUTH_SOCK@ + @GIT_SSH_COMMAND@
+<span class="lineno">  206 </span>-- env) or 'uioBinExecEnv' (PAT: @http.extraHeader@ argv) with the resolved
+<span class="lineno">  207 </span>-- env. If the URL is NOT registered, fall through to a bare-URL clone
+<span class="lineno">  208 </span>-- (public repos, backward-compat).
+<span class="lineno">  209 </span>cloneRepoIO :: CloneDeps -&gt; UntrustedIO -&gt; Text -&gt; IO CloneResult
+<span class="lineno">  210 </span><span class="decl"><span class="istickedoff">cloneRepoIO deps uio url = do</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">let repoName = sanitizeRepoName url</span>
+<span class="lineno">  212 </span><span class="spaces">      </span><span class="istickedoff">mCwdPath = case mkRemotePath &quot;.&quot; of</span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">Right rp -&gt; Just rp</span>
+<span class="lineno">  214 </span><span class="spaces">        </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">checkCmd = &quot;if [ -d &quot; &lt;&gt; shellQ repoName &lt;&gt; &quot;/.git ]; then git -C &quot;</span>
+<span class="lineno">  216 </span><span class="spaces">                 </span><span class="istickedoff">&lt;&gt; shellQ repoName &lt;&gt; &quot; config --get remote.origin.url; else rm -rf &quot;</span>
+<span class="lineno">  217 </span><span class="spaces">                 </span><span class="istickedoff">&lt;&gt; shellQ repoName &lt;&gt; &quot;; echo __NONE__; fi&quot;</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">checkRes &lt;- UIORec.uioShellExec uio (shellCmd checkCmd) mCwdPath</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">case checkRes of</span>
+<span class="lineno">  220 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (CloneFailed (&quot;idempotency check failed: &quot; &lt;&gt; renderUntrustedErr err))</span></span>
+<span class="lineno">  221 </span><span class="spaces">    </span><span class="istickedoff">Right existing -&gt; do</span>
+<span class="lineno">  222 </span><span class="spaces">      </span><span class="istickedoff">let existingUrl = T.strip (T.filter (/= '\n') existing)</span>
+<span class="lineno">  223 </span><span class="spaces">          </span><span class="istickedoff">cleanUrl = T.strip url</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">if existingUrl /= &quot;__NONE__&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">then if normalizeRepoUrl existingUrl == normalizeRepoUrl cleanUrl</span>
+<span class="lineno">  226 </span><span class="spaces">               </span><span class="istickedoff">then pure (CloneNoop repoName)</span>
+<span class="lineno">  227 </span><span class="spaces">               </span><span class="istickedoff">else pure (CloneConflict <span class="nottickedoff">repoName</span> existingUrl)</span>
+<span class="lineno">  228 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="istickedoff">-- Look up the URL in the repo registry. If registered, resolve</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="istickedoff">-- the credential via the no-disk seam; else fall through to a</span>
+<span class="lineno">  231 </span><span class="spaces">          </span><span class="istickedoff">-- bare-URL clone (public repos).</span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="istickedoff">eRepos &lt;- rrhList (cdRepoReg deps)</span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff">let mRepo = case eRepos of</span>
+<span class="lineno">  234 </span><span class="spaces">                </span><span class="istickedoff">Right repos -&gt; lookupRepoByUrl cleanUrl (RepoRegistry (Map.fromList [(srId r, r) | r &lt;- repos]))</span>
+<span class="lineno">  235 </span><span class="spaces">                </span><span class="istickedoff">Left _       -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  236 </span><span class="spaces">          </span><span class="istickedoff">case mRepo of</span>
+<span class="lineno">  237 </span><span class="spaces">            </span><span class="istickedoff">Just repo -&gt; cloneWithCredential deps uio repo repoName mCwdPath</span>
+<span class="lineno">  238 </span><span class="spaces">            </span><span class="istickedoff">Nothing   -&gt; cloneBareUrl uio cleanUrl repoName mCwdPath</span></span>
+<span class="lineno">  239 </span>
+<span class="lineno">  240 </span>-- | Clone a registered repo via the no-disk seam. Resolves the credential
+<span class="lineno">  241 </span>-- via 'resolveCloneTarget', then branches on the credential kind:
+<span class="lineno">  242 </span>--
+<span class="lineno">  243 </span>--   * **PAT/MachineUser** ('ceRawToken' is 'Just'): clones via
+<span class="lineno">  244 </span>--     @gh repo clone &lt;url&gt; &lt;dest&gt; -- --depth 1@ with @GH_TOKEN@ injected
+<span class="lineno">  245 </span>--     into the process env. This mirrors the BIN_EXEC @gh@ path
+<span class="lineno">  246 </span>--     ('runGhWithCredentials' in &quot;Seal.ISA.Ops.Bin&quot;) — the raw token
+<span class="lineno">  247 </span>--     bytes (from 'ceRawToken') go to @GH_TOKEN@, never to argv or disk.
+<span class="lineno">  248 </span>--     @gh@ authenticates via the token, not via @http.extraHeader@.
+<span class="lineno">  249 </span>--
+<span class="lineno">  250 </span>--   * **Deploy key** ('ceRawToken' is 'Nothing'): clones via
+<span class="lineno">  251 </span>--     @git clone@ with the agent-forwarding env (@SSH_AUTH_SOCK@ /
+<span class="lineno">  252 </span>--     @GIT_SSH_COMMAND@) — @gh@ cannot use an SSH agent.
+<span class="lineno">  253 </span>cloneWithCredential
+<span class="lineno">  254 </span>  :: CloneDeps -&gt; UntrustedIO -&gt; SourceRepo -&gt; Text -&gt; Maybe RemotePath
+<span class="lineno">  255 </span>  -&gt; IO CloneResult
+<span class="lineno">  256 </span><span class="decl"><span class="istickedoff">cloneWithCredential deps uio repo repoName mCwdPath = do</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">eTarget &lt;- resolveCloneTarget deps repo</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">case eTarget of</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (CloneFailed (&quot;credential resolution failed: &quot; &lt;&gt; renderCloneError err))</span></span>
+<span class="lineno">  260 </span><span class="spaces">    </span><span class="istickedoff">Right target -&gt; withCloneTarget target $ \env -&gt; do</span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">case ceRawToken env of</span>
+<span class="lineno">  262 </span><span class="spaces">        </span><span class="istickedoff">Just tokenBytes -&gt; do</span>
+<span class="lineno">  263 </span><span class="spaces">          </span><span class="istickedoff">let token = map (toEnum . fromIntegral) (BS.unpack tokenBytes)</span>
+<span class="lineno">  264 </span><span class="spaces">              </span><span class="istickedoff">envExtras = (&quot;GH_TOKEN&quot;, token) : ceEnvExtras env</span>
+<span class="lineno">  265 </span><span class="spaces">              </span><span class="istickedoff">ghCmd = &quot;gh repo clone &quot; &lt;&gt; shellQ (ceUrl env) &lt;&gt; &quot; &quot;</span>
+<span class="lineno">  266 </span><span class="spaces">                      </span><span class="istickedoff">&lt;&gt; shellQ repoName &lt;&gt; &quot; -- --depth 1&quot;</span>
+<span class="lineno">  267 </span><span class="spaces">          </span><span class="istickedoff">cloneRes &lt;- UIORec.uioShellExecEnv uio envExtras (shellCmd ghCmd) mCwdPath</span>
+<span class="lineno">  268 </span><span class="spaces">          </span><span class="istickedoff">case cloneRes of</span>
+<span class="lineno">  269 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (CloneFailed (&quot;clone failed: &quot; &lt;&gt; renderUntrustedErr err))</span></span>
+<span class="lineno">  270 </span><span class="spaces">            </span><span class="istickedoff">Right _out -&gt; verifyClone uio repoName <span class="nottickedoff">_out</span> mCwdPath</span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  272 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">let gitConfigArgs = map T.unpack (ceGitConfigArgs env)</span></span>
+<span class="lineno">  273 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">cloneCmd = &quot;git &quot; &lt;&gt; T.unwords (map T.pack gitConfigArgs)</span></span>
+<span class="lineno">  274 </span><span class="spaces">                         </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; clone --depth 1 -- &quot; &lt;&gt; shellQ (ceUrl env) &lt;&gt; &quot; &quot; &lt;&gt; shellQ repoName</span></span>
+<span class="lineno">  275 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">cloneRes &lt;- UIORec.uioShellExecGitEnv uio (ceEnvExtras env) (ceKnownHostsContent env) (shellCmd cloneCmd) mCwdPath</span></span>
+<span class="lineno">  276 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case cloneRes of</span></span>
+<span class="lineno">  277 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left err -&gt; pure (CloneFailed (&quot;clone failed: &quot; &lt;&gt; renderUntrustedErr err))</span></span>
+<span class="lineno">  278 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right _out -&gt; verifyClone uio repoName _out mCwdPath</span></span></span>
+<span class="lineno">  279 </span>
+<span class="lineno">  280 </span>-- | Clone a bare URL (no credential — public repo, backward-compat).
+<span class="lineno">  281 </span>cloneBareUrl :: UntrustedIO -&gt; Text -&gt; Text -&gt; Maybe RemotePath -&gt; IO CloneResult
+<span class="lineno">  282 </span><span class="decl"><span class="istickedoff">cloneBareUrl uio cleanUrl repoName mCwdPath = do</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">let cloneCmd = &quot;git clone --depth 1 -- &quot; &lt;&gt; shellQ cleanUrl &lt;&gt; &quot; &quot; &lt;&gt; shellQ repoName</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">cloneRes &lt;- UIORec.uioShellExec uio (shellCmd cloneCmd) mCwdPath</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">case cloneRes of</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (CloneFailed (&quot;clone failed: &quot; &lt;&gt; renderUntrustedErr err))</span></span>
+<span class="lineno">  287 </span><span class="spaces">    </span><span class="istickedoff">Right _out -&gt; verifyClone uio repoName <span class="nottickedoff">_out</span> mCwdPath</span></span>
+<span class="lineno">  288 </span>
+<span class="lineno">  289 </span>-- | Verify a clone actually landed by checking for @&lt;repoName&gt;/.git@.
+<span class="lineno">  290 </span>-- 'uioShellExec' returns 'Right' even on non-zero exit (it surfaces
+<span class="lineno">  291 </span>-- stderr to the model for SHELL_EXEC), so the exit code is unreliable
+<span class="lineno">  292 </span>-- for distinguishing success from failure. The filesystem is the source
+<span class="lineno">  293 </span>-- of truth. Returns 'CloneCloned' on success, 'CloneFailed' (with the
+<span class="lineno">  294 </span>-- clone's output text so the user sees /why/) on failure.
+<span class="lineno">  295 </span>verifyClone :: UntrustedIO -&gt; Text -&gt; Text -&gt; Maybe RemotePath -&gt; IO CloneResult
+<span class="lineno">  296 </span><span class="decl"><span class="istickedoff">verifyClone uio repoName cloneOut mCwdPath = do</span>
+<span class="lineno">  297 </span><span class="spaces">  </span><span class="istickedoff">let verifyCmd = &quot;test -d &quot; &lt;&gt; shellQ repoName &lt;&gt; &quot;/.git &amp;&amp; echo __OK__ || echo __MISSING__&quot;</span>
+<span class="lineno">  298 </span><span class="spaces">  </span><span class="istickedoff">vRes &lt;- UIORec.uioShellExec uio (shellCmd verifyCmd) mCwdPath</span>
+<span class="lineno">  299 </span><span class="spaces">  </span><span class="istickedoff">case vRes of</span>
+<span class="lineno">  300 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (CloneFailed (&quot;clone verify failed: &quot; &lt;&gt; renderUntrustedErr err))</span></span>
+<span class="lineno">  301 </span><span class="spaces">    </span><span class="istickedoff">Right vOut</span>
+<span class="lineno">  302 </span><span class="spaces">      </span><span class="istickedoff">| &quot;__OK__&quot; `T.isInfixOf` vOut -&gt; pure (CloneCloned repoName)</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; pure (CloneFailed</span>
+<span class="lineno">  304 </span><span class="spaces">                            </span><span class="istickedoff"><span class="nottickedoff">(&quot;clone did not land — git output: &quot;</span></span>
+<span class="lineno">  305 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.strip (T.filter (/= '\n') cloneOut))</span>)</span></span>
+<span class="lineno">  306 </span>
+<span class="lineno">  307 </span>-- | Run the clone (or no-op) and build the 'OpResult' (opcode path; wraps
+<span class="lineno">  308 </span>-- 'cloneRepoIO' with the audit 'orRecorded' payload).
+<span class="lineno">  309 </span>runSetupRepo :: CloneDeps -&gt; Text -&gt; Value -&gt; UIO OpResult
+<span class="lineno">  310 </span><span class="decl"><span class="istickedoff">runSetupRepo deps url recorded = do</span>
+<span class="lineno">  311 </span><span class="spaces">  </span><span class="istickedoff">uio &lt;- uioUntrustedIO</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- uioLiftIO (cloneRepoIO deps uio url)</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  314 </span><span class="spaces">    </span><span class="istickedoff">CloneCloned repoName -&gt;</span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="istickedoff">OpResult [TrpText (&quot;Cloned &quot; &lt;&gt; T.strip url &lt;&gt; &quot; into &quot; &lt;&gt; repoName &lt;&gt; &quot; (shallow).&quot;)]</span>
+<span class="lineno">  316 </span><span class="spaces">               </span><span class="istickedoff">False (recordWith <span class="nottickedoff">recorded</span> repoName &quot;cloned&quot;)</span>
+<span class="lineno">  317 </span><span class="spaces">    </span><span class="istickedoff">CloneNoop repoName -&gt;</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">OpResult [TrpText (&quot;Repo already exists — no-op (&quot; &lt;&gt; repoName &lt;&gt; &quot;).&quot;)]</span></span>
+<span class="lineno">  319 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">False (recordWith recorded repoName &quot;noop&quot;)</span></span>
+<span class="lineno">  320 </span><span class="spaces">    </span><span class="istickedoff">CloneConflict repoName existing -&gt;</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">OpResult [TrpText (&quot;A different repo already occupies &quot; &lt;&gt; repoName &lt;&gt; &quot; (existing: &quot; &lt;&gt; existing &lt;&gt; &quot;).&quot;)]</span></span>
+<span class="lineno">  322 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">True (recordWith recorded repoName &quot;conflict&quot;)</span></span>
+<span class="lineno">  323 </span><span class="spaces">    </span><span class="istickedoff">CloneFailed err -&gt;</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">OpResult [TrpText (&quot;SETUP_REPO: &quot; &lt;&gt; err)] True (recordWith recorded &quot;&quot; &quot;failed&quot;)</span></span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | Construct a 'ShellCommand', total on our internally-built command
+<span class="lineno">  327 </span>-- strings (they contain no NULs). 'mkShellCommand' only fails on NUL, so
+<span class="lineno">  328 </span>-- this never triggers the error branch in practice.
+<span class="lineno">  329 </span>shellCmd :: Text -&gt; ShellCommand
+<span class="lineno">  330 </span><span class="decl"><span class="istickedoff">shellCmd t = case mkShellCommand t of</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">Right c  -&gt; c</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">Left _e  -&gt; <span class="nottickedoff">error &quot;SETUP_REPO: internal: shell command rejected (NUL?) — unreachable&quot;</span></span></span>
+<span class="lineno">  333 </span>
+<span class="lineno">  334 </span>-- | Re-build the recorded object with the target repo name + a status.
+<span class="lineno">  335 </span>recordWith :: Value -&gt; Text -&gt; Text -&gt; Value
+<span class="lineno">  336 </span><span class="decl"><span class="istickedoff">recordWith _ target status =</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">object [ &quot;target&quot; .= target, &quot;status&quot; .= status ]</span></span>
+<span class="lineno">  338 </span>
+<span class="lineno">  339 </span>-- | Single-quote a shell token (the safe way to embed a literal in a
+<span class="lineno">  340 </span>-- @\/bin\/sh -c@ single-arg command). Any embedded @'@ becomes @'\''@.
+<span class="lineno">  341 </span>-- The URL has already been validated to contain no shell metacharacters,
+<span class="lineno">  342 </span>-- but quoting is defense-in-depth.
+<span class="lineno">  343 </span>shellQ :: Text -&gt; Text
+<span class="lineno">  344 </span><span class="decl"><span class="istickedoff">shellQ t = &quot;'&quot; &lt;&gt; T.concatMap (\c -&gt; if <span class="tickonlyfalse">c == '\''</span> then <span class="nottickedoff">&quot;'\\''&quot;</span> else T.singleton c) t &lt;&gt; &quot;'&quot;</span></span>
+
+</pre>
+</body>
+</html>

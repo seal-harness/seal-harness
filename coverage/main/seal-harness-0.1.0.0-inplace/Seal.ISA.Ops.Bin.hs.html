@@ -1,0 +1,515 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | BIN_EXEC (Untrusted): run a named binary with a list of argv
+<span class="lineno">    3 </span>-- arguments, via 'System.Process.proc' (RawCommand — no shell
+<span class="lineno">    4 </span>-- interpreter) — on the local or remote backend, selected at wiring time
+<span class="lineno">    5 </span>-- via the 'UntrustedIO' capability. The binary name and args are
+<span class="lineno">    6 </span>-- validated 'BinName' / 'BinArg' (reject empty, NUL). An optional
+<span class="lineno">    7 </span>-- operator-configured allow-list (a 'Set' of permitted binary names)
+<span class="lineno">    8 </span>-- gates the binary; when the allow-list is 'Nothing' the binary is
+<span class="lineno">    9 </span>-- permitted by the gate (the autonomy policy still applies). An optional
+<span class="lineno">   10 </span>-- @cwd@ parameter selects the working directory: a relative path is
+<span class="lineno">   11 </span>-- SafePath-confined to the workspace root (the session's workdir); an
+<span class="lineno">   12 </span>-- absolute path is passed through verbatim. When omitted, the executor
+<span class="lineno">   13 </span>-- defaults to the workspace root. All IO through the 'UntrustedIO' seam;
+<span class="lineno">   14 </span>-- this module never imports 'System.Process'.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- **Git credential injection:** when @binary == &quot;git&quot;@, the opcode
+<span class="lineno">   17 </span>-- resolves the cwd's @remote.origin.url@ (via a pre-flight @git config
+<span class="lineno">   18 </span>-- --get remote.origin.url@ — no auth needed, reads @.git/config@), looks
+<span class="lineno">   19 </span>-- it up in the repo registry, and — if the URL matches a registered repo
+<span class="lineno">   20 </span>-- with a credential — resolves the credential via 'resolveCloneTarget'
+<span class="lineno">   21 </span>-- (deploy key: starts the per-repo ssh-agent + injects @SSH_AUTH_SOCK@ /
+<span class="lineno">   22 </span>-- @GIT_SSH_COMMAND@; PAT: injects @GIT_TERMINAL_PROMPT=0@). The git
+<span class="lineno">   23 </span>-- command then runs via 'uioBinExecGitEnv' (agent forwarding for remote
+<span class="lineno">   24 </span>-- deploy keys) or 'uioBinExecEnv' (PAT) instead of 'uioBinExec', so
+<span class="lineno">   25 </span>-- @git fetch@ / @git pull@ / @git push@ authenticate without the model
+<span class="lineno">   26 </span>-- needing to know the credential mechanism. Unregistered repos and
+<span class="lineno">   27 </span>-- non-git binaries fall through to the plain 'uioBinExec' path.
+<span class="lineno">   28 </span>--
+<span class="lineno">   29 </span>-- **gh credential injection:** when @binary == &quot;gh&quot;@, the opcode mirrors
+<span class="lineno">   30 </span>-- the git path's pre-flight + registry lookup, but differs in the final
+<span class="lineno">   31 </span>-- exec step: for a PAT/MachineUser repo it injects @GH_TOKEN@ (the raw
+<span class="lineno">   32 </span>-- token bytes from 'ceRawToken') into the env via 'uioBinExecEnv' (gh
+<span class="lineno">   33 </span>-- authenticates via @GH_TOKEN@, not @http.extraHeader@ or SSH). Deploy-key
+<span class="lineno">   34 </span>-- repos fall through to plain exec (gh can't use SSH). When the argv
+<span class="lineno">   35 </span>-- contains @-R@ / @--repo@ (gh acts on a different repo than the cwd's
+<span class="lineno">   36 </span>-- @origin@), credential injection is skipped (plain exec + a non-secret
+<span class="lineno">   37 </span>-- NOTE in 'orParts' so the agent learns the skip was deliberate).
+<span class="lineno">   38 </span>module Seal.ISA.Ops.Bin
+<span class="lineno">   39 </span>  ( binExecOp
+<span class="lineno">   40 </span>  , binExecSchema
+<span class="lineno">   41 </span>  , extractGhRepoFlag
+<span class="lineno">   42 </span>  ) where
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   45 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   46 </span>import Data.ByteString qualified as BS
+<span class="lineno">   47 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   48 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   49 </span>import Data.Set (Set)
+<span class="lineno">   50 </span>import Data.Set qualified as Set
+<span class="lineno">   51 </span>import Data.Text (Text)
+<span class="lineno">   52 </span>import Data.Text qualified as T
+<span class="lineno">   53 </span>import System.FilePath (isAbsolute)
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   56 </span>import Seal.ISA.Opcode
+<span class="lineno">   57 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   58 </span>import Seal.Security.Path
+<span class="lineno">   59 </span>  ( PathError (..), WorkspaceRoot (..), mkSafePathRemote )
+<span class="lineno">   60 </span>import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
+<span class="lineno">   61 </span>import Seal.SourceControl.Clone (CloneEnv (..), renderCloneError)
+<span class="lineno">   62 </span>import Seal.SourceControl.Repo (lookupRepoByUrl, RepoRegistry (..), SourceRepo (srId))
+<span class="lineno">   63 </span>import Seal.Tools.Args (BinArg, BinName, mkBinName, mkBinArg, textBinArg, textBinName)
+<span class="lineno">   64 </span>import Seal.Tools.Exec.UIO
+<span class="lineno">   65 </span>  ( UIO, renderUntrustedErr, uioBinExec, uioBinExecEnv, uioBinExecGitEnv
+<span class="lineno">   66 </span>  )
+<span class="lineno">   67 </span>import Seal.Tools.Exec.UIOGit (uioCdRepoRegList, uioResolveClone, uioWithClone)
+<span class="lineno">   68 </span>import Seal.Tools.Exec.Types (RemotePath, getRemotePath, mkRemotePath)
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | BIN_EXEC opcode. Input: @{ binary: BinName, args: [BinArg, ...],
+<span class="lineno">   71 </span>-- cwd?: Text }@. The @args@ field is optional (defaults to @[]@); the
+<span class="lineno">   72 </span>-- @binary@ field is required; the @cwd@ field is optional (defaults to
+<span class="lineno">   73 </span>-- the workspace root). When 'sbAllowList' is 'Nothing', any 'BinName'
+<span class="lineno">   74 </span>-- passes the authorize gate (the autonomy policy still applies); when it
+<span class="lineno">   75 </span>-- is @'Just' set@, the binary must be in @set@ or the gate returns
+<span class="lineno">   76 </span>-- 'Denied'.
+<span class="lineno">   77 </span>binExecOp
+<span class="lineno">   78 </span>  :: WorkspaceRoot
+<span class="lineno">   79 </span>  -&gt; SecurityPolicy
+<span class="lineno">   80 </span>  -&gt; Maybe (Set Text)
+<span class="lineno">   81 </span>  -&gt; Opcode
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">binExecOp wsRoot policy mAllowList = UntrustedOpcode</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;BIN_EXEC&quot;</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Run a named binary with argv args (no shell, optional allow-list). Git and gh binaries get credential injection from registered repos.&quot;</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = binExecSchema</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">case (binaryField v, argsField v) of</span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff">(Nothing, _) -&gt; Left &quot;BIN_EXEC requires {binary:string, args:[string]}&quot;</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">(Just binText, mArgsText) -&gt;</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">case spAutonomy policy of</span>
+<span class="lineno">   92 </span><span class="spaces">            </span><span class="istickedoff">Deny -&gt; <span class="nottickedoff">Left &quot;BIN_EXEC denied by autonomy policy&quot;</span></span>
+<span class="lineno">   93 </span><span class="spaces">            </span><span class="istickedoff">_    -&gt; case mAllowList of</span>
+<span class="lineno">   94 </span><span class="spaces">              </span><span class="istickedoff">Just allowList</span>
+<span class="lineno">   95 </span><span class="spaces">                </span><span class="istickedoff">| binText `Set.notMember` allowList -&gt;</span>
+<span class="lineno">   96 </span><span class="spaces">                  </span><span class="istickedoff">Left (&quot;BIN_EXEC: binary \&quot;&quot; &lt;&gt; binText &lt;&gt; &quot;\&quot; not in the allow-list&quot;)</span>
+<span class="lineno">   97 </span><span class="spaces">              </span><span class="istickedoff">_ -&gt; case mkBinName binText of</span>
+<span class="lineno">   98 </span><span class="spaces">                     </span><span class="istickedoff">Left _err -&gt; Left &quot;BIN_EXEC: invalid binary name&quot;</span>
+<span class="lineno">   99 </span><span class="spaces">                     </span><span class="istickedoff">Right _   -&gt; case traverse mkBinArg &lt;$&gt; mArgsText of</span>
+<span class="lineno">  100 </span><span class="spaces">                                    </span><span class="istickedoff">Just (Left _err) -&gt; Left &quot;BIN_EXEC: invalid arg&quot;</span>
+<span class="lineno">  101 </span><span class="spaces">                                    </span><span class="istickedoff">_                -&gt; authorizeCwd wsRoot v</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">let mBin  = binaryField v</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">mArgs = argsField v</span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">mCwd  = cwdField v</span>
+<span class="lineno">  106 </span><span class="spaces">          </span><span class="istickedoff">recorded = object</span>
+<span class="lineno">  107 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;binary&quot; .= mBin</span>
+<span class="lineno">  108 </span><span class="spaces">            </span><span class="istickedoff">, &quot;arg_count&quot; .= (fmap length mArgs :: Maybe Int)</span>
+<span class="lineno">  109 </span><span class="spaces">            </span><span class="istickedoff">, &quot;cwd&quot; .= mCwd</span>
+<span class="lineno">  110 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">case mBin of</span>
+<span class="lineno">  112 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;BIN_EXEC: missing binary&quot;] True recorded)</span></span>
+<span class="lineno">  113 </span><span class="spaces">        </span><span class="istickedoff">Just binText -&gt;</span>
+<span class="lineno">  114 </span><span class="spaces">          </span><span class="istickedoff">case mkBinName binText of</span>
+<span class="lineno">  115 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: invalid binary: &quot; &lt;&gt; err)] True recorded)</span></span>
+<span class="lineno">  116 </span><span class="spaces">            </span><span class="istickedoff">Right bin -&gt;</span>
+<span class="lineno">  117 </span><span class="spaces">              </span><span class="istickedoff">case traverse mkBinArg (fromMaybe [] mArgs) of</span>
+<span class="lineno">  118 </span><span class="spaces">                   </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: invalid arg: &quot; &lt;&gt; err)] True recorded)</span></span>
+<span class="lineno">  119 </span><span class="spaces">                   </span><span class="istickedoff">Right args -&gt;</span>
+<span class="lineno">  120 </span><span class="spaces">                      </span><span class="istickedoff">case resolveCwd wsRoot mCwd of</span>
+<span class="lineno">  121 </span><span class="spaces">                        </span><span class="istickedoff">Left _err -&gt;</span>
+<span class="lineno">  122 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">pure (OpResult [TrpText &quot;BIN_EXEC: invalid cwd&quot;] True recorded)</span></span>
+<span class="lineno">  123 </span><span class="spaces">                        </span><span class="istickedoff">Right mCwdPath -&gt; do</span>
+<span class="lineno">  124 </span><span class="spaces">                           </span><span class="istickedoff">if textBinName bin == &quot;git&quot;</span>
+<span class="lineno">  125 </span><span class="spaces">                             </span><span class="istickedoff">then runGitWithCredentials bin args <span class="nottickedoff">mCwdPath</span> <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  126 </span><span class="spaces">                              </span><span class="istickedoff">else if textBinName bin == &quot;gh&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">                                </span><span class="istickedoff">then case args of</span>
+<span class="lineno">  128 </span><span class="spaces">                                  </span><span class="istickedoff">-- Block dangerous `gh auth` subcommands</span>
+<span class="lineno">  129 </span><span class="spaces">                                  </span><span class="istickedoff">-- — they write secrets to disk on the</span>
+<span class="lineno">  130 </span><span class="spaces">                                  </span><span class="istickedoff">-- untrusted machine (gh auth login stores</span>
+<span class="lineno">  131 </span><span class="spaces">                                  </span><span class="istickedoff">-- a token in ~/.config/gh/hosts.yml; gh</span>
+<span class="lineno">  132 </span><span class="spaces">                                  </span><span class="istickedoff">-- auth token prints the token to stdout →</span>
+<span class="lineno">  133 </span><span class="spaces">                                  </span><span class="istickedoff">-- transcript; gh auth setup-git configures</span>
+<span class="lineno">  134 </span><span class="spaces">                                  </span><span class="istickedoff">-- a credential helper that writes to disk).</span>
+<span class="lineno">  135 </span><span class="spaces">                                  </span><span class="istickedoff">-- `gh auth status` is read-only and allowed.</span>
+<span class="lineno">  136 </span><span class="spaces">                                  </span><span class="istickedoff">(firstArg : secondArg : _)</span>
+<span class="lineno">  137 </span><span class="spaces">                                    </span><span class="istickedoff">| textBinArg firstArg == &quot;auth&quot;</span>
+<span class="lineno">  138 </span><span class="spaces">                                    </span><span class="istickedoff">, let sub = textBinArg secondArg</span>
+<span class="lineno">  139 </span><span class="spaces">                                    </span><span class="istickedoff">, sub `elem` [&quot;login&quot;, &quot;token&quot;, &quot;setup-git&quot;, &quot;refresh&quot;, &quot;git-credential&quot;] -&gt;</span>
+<span class="lineno">  140 </span><span class="spaces">                                      </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  141 </span><span class="spaces">                                      </span><span class="istickedoff">[ TrpText (&quot;BIN_EXEC: `gh auth &quot; &lt;&gt; sub &lt;&gt; &quot;` is blocked — it writes secrets to disk on the untrusted machine (gh auth login stores a token in ~/.config/gh/hosts.yml; gh auth token prints the token to stdout → transcript). The harness injects GH_TOKEN from the vault automatically. Use gh pr create / gh repo clone / etc. directly — they authenticate via the injected GH_TOKEN.&quot;)</span>
+<span class="lineno">  142 </span><span class="spaces">                                      </span><span class="istickedoff">] True <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  143 </span><span class="spaces">                                  </span><span class="istickedoff">_ -&gt; runGhWithCredentials bin args mCwdPath recorded</span>
+<span class="lineno">  144 </span><span class="spaces">                               </span><span class="istickedoff">else do</span>
+<span class="lineno">  145 </span><span class="spaces">                                 </span><span class="istickedoff">res &lt;- uioBinExec bin args mCwdPath</span>
+<span class="lineno">  146 </span><span class="spaces">                                 </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  147 </span><span class="spaces">                                   </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  148 </span><span class="spaces">                                   </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False recorded</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>binExecSchema :: Value
+<span class="lineno">  152 </span><span class="decl"><span class="istickedoff">binExecSchema =</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;binary&quot; .= object</span>
+<span class="lineno">  157 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  158 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The binary name (PATH lookup) or path. Must be in the operator allow-list when one is configured.&quot; :: Text)</span>
+<span class="lineno">  159 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">, &quot;args&quot; .= object</span>
+<span class="lineno">  161 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff">, &quot;items&quot; .= object [ &quot;type&quot; .= (&quot;string&quot; :: Text) ]</span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Argv tokens passed verbatim to the binary (no shell interpretation).&quot; :: Text)</span>
+<span class="lineno">  164 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff">, &quot;cwd&quot; .= object</span>
+<span class="lineno">  166 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  167 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional working directory. A relative path is confined to the session workdir; an absolute path is used verbatim. Defaults to the session workdir.&quot; :: Text)</span>
+<span class="lineno">  168 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="istickedoff">, &quot;timeout&quot; .= object</span>
+<span class="lineno">  170 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  171 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Per-call timeout in seconds; if the tool doesn't finish in this time, it's killed. Default 120, max 600.&quot; :: Text)</span>
+<span class="lineno">  172 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  174 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;binary&quot;] :: [Text])</span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- | Run a @git@ binary with credential injection when the cwd is inside a
+<span class="lineno">  178 </span>-- registered repo. Pre-flight: resolve the repo root + remote URL (no
+<span class="lineno">  179 </span>-- auth needed — reads @.git/config@), look up the URL in the repo
+<span class="lineno">  180 </span>-- registry, and — if found — resolve the credential via
+<span class="lineno">  181 </span>-- 'resolveCloneTarget' and execute via 'uioBinExecGitEnv' (deploy key:
+<span class="lineno">  182 </span>-- agent forwarding) or 'uioBinExecEnv' (PAT). If the URL is not registered
+<span class="lineno">  183 </span>-- or no credential is resolved, fall through to 'uioBinExec'. Errors
+<span class="lineno">  184 </span>-- from the pre-flight or credential resolution are surfaced (not
+<span class="lineno">  185 </span>-- silently swallowed).
+<span class="lineno">  186 </span>runGitWithCredentials
+<span class="lineno">  187 </span>  :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath -&gt; Value -&gt; UIO OpResult
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">runGitWithCredentials bin args mCwdPath recorded = do</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">-- Pre-flight: resolve the remote URL from the cwd's .git/config.</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">-- `git config --get remote.origin.url` reads local config only — no</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">-- network, no auth needed. Parse -C &lt;path&gt; / --git-dir=&lt;path&gt; from the</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">-- git args so the pre-flight reads config from the right repo (the</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">-- agent may pass `git -C subdir push ...`).</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">mRemoteUrl &lt;- resolveRemoteUrl bin args <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">case mRemoteUrl of</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText err] True recorded)</span></span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing -&gt; do</span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="istickedoff">-- Not a git repo (or no remote) — fall through to plain exec.</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- uioBinExec bin args <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  202 </span><span class="spaces">        </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">Right (Just remoteUrl) -&gt; do</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">-- Look up the URL in the repo registry.</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">eRepos &lt;- uioCdRepoRegList</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">case eRepos of</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: repo registry error: &quot; &lt;&gt; err)] True recorded)</span></span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="istickedoff">Right repos -&gt; do</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="istickedoff">let registry = RepoRegistry (Map.fromList [(srId r, r) | r &lt;- repos])</span>
+<span class="lineno">  210 </span><span class="spaces">              </span><span class="istickedoff">mRepo = lookupRepoByUrl remoteUrl registry</span>
+<span class="lineno">  211 </span><span class="spaces">          </span><span class="istickedoff">case mRepo of</span>
+<span class="lineno">  212 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  213 </span><span class="spaces">              </span><span class="istickedoff">-- URL not registered — fall through to plain exec (public repo).</span>
+<span class="lineno">  214 </span><span class="spaces">              </span><span class="istickedoff">res &lt;- uioBinExec bin args <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  215 </span><span class="spaces">              </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  216 </span><span class="spaces">                </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  217 </span><span class="spaces">                </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  218 </span><span class="spaces">            </span><span class="istickedoff">Just repo -&gt; do</span>
+<span class="lineno">  219 </span><span class="spaces">              </span><span class="istickedoff">-- Resolve the credential via the clone seam.</span>
+<span class="lineno">  220 </span><span class="spaces">              </span><span class="istickedoff">eTarget &lt;- uioResolveClone repo</span>
+<span class="lineno">  221 </span><span class="spaces">              </span><span class="istickedoff">case eTarget of</span>
+<span class="lineno">  222 </span><span class="spaces">                </span><span class="istickedoff">Left cloneErr -&gt;</span>
+<span class="lineno">  223 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: credential resolution failed: &quot; &lt;&gt; renderCloneError cloneErr)] True recorded)</span></span>
+<span class="lineno">  224 </span><span class="spaces">                </span><span class="istickedoff">Right target -&gt;</span>
+<span class="lineno">  225 </span><span class="spaces">                  </span><span class="istickedoff">uioWithClone target $ \cloneEnv -&gt; do</span>
+<span class="lineno">  226 </span><span class="spaces">                    </span><span class="istickedoff">let envExtras = ceEnvExtras cloneEnv</span>
+<span class="lineno">  227 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">mKnownHosts = ceKnownHostsContent cloneEnv</span></span>
+<span class="lineno">  228 </span><span class="spaces">                        </span><span class="istickedoff">-- Deploy keys use uioBinExecGitEnv (agent forwarding);</span>
+<span class="lineno">  229 </span><span class="spaces">                        </span><span class="istickedoff">-- PATs use uioBinExecEnv (no agent, just env overrides</span>
+<span class="lineno">  230 </span><span class="spaces">                        </span><span class="istickedoff">-- + the http.extraHeader git config args). The</span>
+<span class="lineno">  231 </span><span class="spaces">                        </span><span class="istickedoff">-- distinction: deploy keys have SSH_AUTH_SOCK in</span>
+<span class="lineno">  232 </span><span class="spaces">                        </span><span class="istickedoff">-- ceEnvExtras; PATs don't. For PATs, ceGitConfigArgs</span>
+<span class="lineno">  233 </span><span class="spaces">                        </span><span class="istickedoff">-- carries [&quot;-c&quot;, &quot;http.extraHeader=Authorization:</span>
+<span class="lineno">  234 </span><span class="spaces">                        </span><span class="istickedoff">-- Basic &lt;base64&gt;&quot;] — these MUST be prepended to the</span>
+<span class="lineno">  235 </span><span class="spaces">                        </span><span class="istickedoff">-- git argv or git push/fetch/pull won't authenticate.</span>
+<span class="lineno">  236 </span><span class="spaces">                        </span><span class="istickedoff">hasAgent = any (\(k, _) -&gt; k == &quot;SSH_AUTH_SOCK&quot;) envExtras</span>
+<span class="lineno">  237 </span><span class="spaces">                    </span><span class="istickedoff">res &lt;- if hasAgent</span>
+<span class="lineno">  238 </span><span class="spaces">                             </span><span class="istickedoff">then uioBinExecGitEnv envExtras <span class="nottickedoff">mKnownHosts</span> bin args <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  239 </span><span class="spaces">                             </span><span class="istickedoff">else do</span>
+<span class="lineno">  240 </span><span class="spaces">                               </span><span class="istickedoff">let -- Prepend ceGitConfigArgs to the git argv</span>
+<span class="lineno">  241 </span><span class="spaces">                                   </span><span class="istickedoff">-- so the http.extraHeader (PAT auth) is</span>
+<span class="lineno">  242 </span><span class="spaces">                                   </span><span class="istickedoff">-- applied. ceGitConfigArgs is a list of</span>
+<span class="lineno">  243 </span><span class="spaces">                                   </span><span class="istickedoff">-- complete argv tokens (e.g. [&quot;-c&quot;,</span>
+<span class="lineno">  244 </span><span class="spaces">                                   </span><span class="istickedoff">-- &quot;http.extraHeader=...&quot;]); convert each</span>
+<span class="lineno">  245 </span><span class="spaces">                                   </span><span class="istickedoff">-- to a BinArg via mkBinArg (the literal</span>
+<span class="lineno">  246 </span><span class="spaces">                                   </span><span class="istickedoff">-- is safe — it's harness-built, not</span>
+<span class="lineno">  247 </span><span class="spaces">                                   </span><span class="istickedoff">-- user-supplied).</span>
+<span class="lineno">  248 </span><span class="spaces">                                   </span><span class="istickedoff">configArgs = case traverse mkBinArg (ceGitConfigArgs cloneEnv) of</span>
+<span class="lineno">  249 </span><span class="spaces">                                     </span><span class="istickedoff">Right as -&gt; as</span>
+<span class="lineno">  250 </span><span class="spaces">                                     </span><span class="istickedoff">Left _   -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  251 </span><span class="spaces">                               </span><span class="istickedoff">uioBinExecEnv envExtras bin (configArgs ++ args) <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  252 </span><span class="spaces">                    </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  253 </span><span class="spaces">                      </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  254 </span><span class="spaces">                      </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span></span>
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>-- | Run a @gh@ binary with credential injection when the cwd is inside a
+<span class="lineno">  257 </span>-- registered repo with a PAT/MachineUser credential. Mirrors
+<span class="lineno">  258 </span>-- 'runGitWithCredentials' in shape (same pre-flight + registry lookup +
+<span class="lineno">  259 </span>-- credential resolution) but differs in the final exec step: gh
+<span class="lineno">  260 </span>-- authenticates via @GH_TOKEN@ in the env (not @http.extraHeader@ in
+<span class="lineno">  261 </span>-- argv, and not SSH). When the argv contains @-R@ / @--repo@ (gh acts on
+<span class="lineno">  262 </span>-- a different repo than the cwd's @origin@), credential injection is
+<span class="lineno">  263 </span>-- skipped (plain exec + a non-secret NOTE in 'orParts'). Deploy-key repos
+<span class="lineno">  264 </span>-- fall through to plain exec (gh can't use SSH). Unregistered repos and
+<span class="lineno">  265 </span>-- non-git-cwd repos fall through to plain exec. Errors from the
+<span class="lineno">  266 </span>-- pre-flight or credential resolution are surfaced (not silently
+<span class="lineno">  267 </span>-- swallowed). The pre-flight always runs @git@ (not @gh@) — @gh@ doesn't
+<span class="lineno">  268 </span>-- expose @git config@.
+<span class="lineno">  269 </span>runGhWithCredentials
+<span class="lineno">  270 </span>  :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath -&gt; Value -&gt; UIO OpResult
+<span class="lineno">  271 </span><span class="decl"><span class="istickedoff">runGhWithCredentials bin args mCwdPath recorded =</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">case extractGhRepoFlag (map textBinArg args) of</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">Just _ -&gt; do</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">-- -R/--repo present: gh acts on a different repo than the cwd's</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">-- origin. Skip injection (plain exec) + surface a non-secret NOTE</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">-- so the agent learns the skip was deliberate (not an opaque auth</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">-- failure).</span>
+<span class="lineno">  278 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- uioBinExec bin <span class="nottickedoff">args</span> <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  279 </span><span class="spaces">      </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  280 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  281 </span><span class="spaces">        </span><span class="istickedoff">Right out -&gt; OpResult</span>
+<span class="lineno">  282 </span><span class="spaces">          </span><span class="istickedoff">[ TrpText out</span>
+<span class="lineno">  283 </span><span class="spaces">          </span><span class="istickedoff">, TrpText &quot;BIN_EXEC: gh -R/--repo detected — credential injection skipped (gh uses ambient auth). Run gh from the target repo's workdir for credential injection.&quot;</span>
+<span class="lineno">  284 </span><span class="spaces">          </span><span class="istickedoff">] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">-- Pre-flight: resolve the remote URL from the cwd's .git/config.</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">-- Uses `git` (not `gh`) — gh doesn't expose `git config`.</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">mRemoteUrl &lt;- resolveRemoteUrl gitBin args mCwdPath</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">case mRemoteUrl of</span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; pure (OpResult [TrpText err] True <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  291 </span><span class="spaces">        </span><span class="istickedoff">Right Nothing -&gt; do</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">-- Not a git repo (or no origin) — fall through to plain exec.</span>
+<span class="lineno">  293 </span><span class="spaces">          </span><span class="istickedoff">res &lt;- uioBinExec bin <span class="nottickedoff">args</span> <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  295 </span><span class="spaces">            </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  296 </span><span class="spaces">            </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  297 </span><span class="spaces">        </span><span class="istickedoff">Right (Just remoteUrl) -&gt; do</span>
+<span class="lineno">  298 </span><span class="spaces">          </span><span class="istickedoff">eRepos &lt;- uioCdRepoRegList</span>
+<span class="lineno">  299 </span><span class="spaces">          </span><span class="istickedoff">case eRepos of</span>
+<span class="lineno">  300 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: repo registry error: &quot; &lt;&gt; err)] True recorded)</span></span>
+<span class="lineno">  301 </span><span class="spaces">            </span><span class="istickedoff">Right repos -&gt; do</span>
+<span class="lineno">  302 </span><span class="spaces">              </span><span class="istickedoff">let registry = RepoRegistry (Map.fromList [(srId r, r) | r &lt;- repos])</span>
+<span class="lineno">  303 </span><span class="spaces">                  </span><span class="istickedoff">mRepo = lookupRepoByUrl remoteUrl registry</span>
+<span class="lineno">  304 </span><span class="spaces">              </span><span class="istickedoff">case mRepo of</span>
+<span class="lineno">  305 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  306 </span><span class="spaces">                  </span><span class="istickedoff">-- URL not registered — fall through to plain exec.</span>
+<span class="lineno">  307 </span><span class="spaces">                  </span><span class="istickedoff">res &lt;- uioBinExec bin <span class="nottickedoff">args</span> <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  308 </span><span class="spaces">                  </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  309 </span><span class="spaces">                    </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  310 </span><span class="spaces">                    </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  311 </span><span class="spaces">                </span><span class="istickedoff">Just repo -&gt; do</span>
+<span class="lineno">  312 </span><span class="spaces">                  </span><span class="istickedoff">eTarget &lt;- uioResolveClone repo</span>
+<span class="lineno">  313 </span><span class="spaces">                  </span><span class="istickedoff">case eTarget of</span>
+<span class="lineno">  314 </span><span class="spaces">                    </span><span class="istickedoff">Left cloneErr -&gt;</span>
+<span class="lineno">  315 </span><span class="spaces">                      </span><span class="istickedoff">pure (OpResult [TrpText (&quot;BIN_EXEC: credential resolution failed: &quot; &lt;&gt; renderCloneError cloneErr)] True <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  316 </span><span class="spaces">                    </span><span class="istickedoff">Right target -&gt;</span>
+<span class="lineno">  317 </span><span class="spaces">                      </span><span class="istickedoff">uioWithClone target $ \cloneEnv -&gt;</span>
+<span class="lineno">  318 </span><span class="spaces">                        </span><span class="istickedoff">case ceRawToken cloneEnv of</span>
+<span class="lineno">  319 </span><span class="spaces">                          </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  320 </span><span class="spaces">                            </span><span class="istickedoff">-- Deploy key: gh can't use SSH. Fall through</span>
+<span class="lineno">  321 </span><span class="spaces">                            </span><span class="istickedoff">-- to plain exec (gh surfaces its own auth error).</span>
+<span class="lineno">  322 </span><span class="spaces">                            </span><span class="istickedoff">res &lt;- uioBinExec bin <span class="nottickedoff">args</span> <span class="nottickedoff">mCwdPath</span></span>
+<span class="lineno">  323 </span><span class="spaces">                            </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  324 </span><span class="spaces">                              </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  325 </span><span class="spaces">                              </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  326 </span><span class="spaces">                          </span><span class="istickedoff">Just tokenBytes -&gt; do</span>
+<span class="lineno">  327 </span><span class="spaces">                            </span><span class="istickedoff">-- PAT/MachineUser: inject GH_TOKEN (byte-accurate</span>
+<span class="lineno">  328 </span><span class="spaces">                            </span><span class="istickedoff">-- — map each Word8 to the Char with that</span>
+<span class="lineno">  329 </span><span class="spaces">                            </span><span class="istickedoff">-- codepoint via toEnum . fromIntegral, avoiding</span>
+<span class="lineno">  330 </span><span class="spaces">                            </span><span class="istickedoff">-- the U+FFFD corruption of decodeUtf8Lenient on</span>
+<span class="lineno">  331 </span><span class="spaces">                            </span><span class="istickedoff">-- non-UTF-8 tokens; mirrors renderPatHeader's</span>
+<span class="lineno">  332 </span><span class="spaces">                            </span><span class="istickedoff">-- raw-bytes discipline).</span>
+<span class="lineno">  333 </span><span class="spaces">                            </span><span class="istickedoff">let token = map (toEnum . fromIntegral) (BS.unpack tokenBytes)</span>
+<span class="lineno">  334 </span><span class="spaces">                                </span><span class="istickedoff">envExtras = (&quot;GH_TOKEN&quot;, token)</span>
+<span class="lineno">  335 </span><span class="spaces">                                          </span><span class="istickedoff">: ceEnvExtras cloneEnv</span>
+<span class="lineno">  336 </span><span class="spaces">                            </span><span class="istickedoff">res &lt;- uioBinExecEnv envExtras bin args mCwdPath</span>
+<span class="lineno">  337 </span><span class="spaces">                            </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  338 </span><span class="spaces">                              </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">  339 </span><span class="spaces">                              </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False recorded</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="istickedoff">-- The pre-flight always runs `git` (not `gh`) — gh doesn't expose</span>
+<span class="lineno">  342 </span><span class="spaces">    </span><span class="istickedoff">-- `git config`. The literal &quot;git&quot; always parses as a valid BinName.</span>
+<span class="lineno">  343 </span><span class="spaces">    </span><span class="istickedoff">gitBin = either <span class="nottickedoff">(error &quot;unreachable: mkBinName rejected a literal&quot;)</span> id (mkBinName &quot;git&quot;)</span></span>
+<span class="lineno">  344 </span>
+<span class="lineno">  345 </span>-- | Pre-flight: resolve the @remote.origin.url@ from the cwd's git
+<span class="lineno">  346 </span>-- config. Runs @git config --get remote.origin.url@ via 'uioBinExec'
+<span class="lineno">  347 </span>-- (no auth needed — reads @.git/config@). Returns:
+<span class="lineno">  348 </span>--
+<span class="lineno">  349 </span>--   * @Left err@ — the pre-flight git call itself failed (surfacable error).
+<span class="lineno">  350 </span>--   * @Right Nothing@ — the cwd is not inside a git repo, or the repo
+<span class="lineno">  351 </span>--     has no @remote.origin.url@ (fall through to plain exec).
+<span class="lineno">  352 </span>--   * @Right (Just url)@ — the remote URL, trimmed.
+<span class="lineno">  353 </span>--
+<span class="lineno">  354 </span>-- Parses @-C &lt;path&gt;@ and @--git-dir=&lt;path&gt;@ from the git args (the agent
+<span class="lineno">  355 </span>-- may pass @git -C subdir push ...@) so the pre-flight reads config from
+<span class="lineno">  356 </span>-- the right repo, not the workdir root.
+<span class="lineno">  357 </span>resolveRemoteUrl :: BinName -&gt; [BinArg] -&gt; Maybe RemotePath -&gt; UIO (Either Text (Maybe Text))
+<span class="lineno">  358 </span><span class="decl"><span class="istickedoff">resolveRemoteUrl bin args mCwdPath = do</span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">let arg t = case mkBinArg t of</span>
+<span class="lineno">  360 </span><span class="spaces">        </span><span class="istickedoff">Right a -&gt; a</span>
+<span class="lineno">  361 </span><span class="spaces">        </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">error &quot;unreachable: mkBinArg rejected a literal&quot;</span></span>
+<span class="lineno">  362 </span><span class="spaces">      </span><span class="istickedoff">-- Extract -C &lt;path&gt; or --git-dir=&lt;path&gt; from the git args so the</span>
+<span class="lineno">  363 </span><span class="spaces">      </span><span class="istickedoff">-- pre-flight reads config from the right repo.</span>
+<span class="lineno">  364 </span><span class="spaces">      </span><span class="istickedoff">mGitDir = extractGitDir (map textBinArg args)</span>
+<span class="lineno">  365 </span><span class="spaces">      </span><span class="istickedoff">preflightArgs = case mGitDir of</span>
+<span class="lineno">  366 </span><span class="spaces">        </span><span class="istickedoff">Just dir -&gt; <span class="nottickedoff">[arg &quot;-C&quot;, arg dir, arg &quot;config&quot;, arg &quot;--get&quot;, arg &quot;remote.origin.url&quot;]</span></span>
+<span class="lineno">  367 </span><span class="spaces">        </span><span class="istickedoff">Nothing  -&gt; [arg &quot;config&quot;, arg &quot;--get&quot;, arg &quot;remote.origin.url&quot;]</span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- uioBinExec bin preflightArgs mCwdPath</span>
+<span class="lineno">  369 </span><span class="spaces">  </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  370 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; Left (&quot;BIN_EXEC: pre-flight git config failed: &quot; &lt;&gt; renderUntrustedErr err)</span>
+<span class="lineno">  371 </span><span class="spaces">    </span><span class="istickedoff">Right out -&gt;</span>
+<span class="lineno">  372 </span><span class="spaces">      </span><span class="istickedoff">let trimmed = T.strip (T.filter (/= '\n') out)</span>
+<span class="lineno">  373 </span><span class="spaces">      </span><span class="istickedoff">in if T.null trimmed</span>
+<span class="lineno">  374 </span><span class="spaces">           </span><span class="istickedoff">then Right Nothing</span>
+<span class="lineno">  375 </span><span class="spaces">           </span><span class="istickedoff">else Right (Just trimmed)</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>binaryField :: Value -&gt; Maybe Text
+<span class="lineno">  378 </span><span class="decl"><span class="istickedoff">binaryField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;binary&quot;))</span></span>
+<span class="lineno">  379 </span>
+<span class="lineno">  380 </span>-- | Extract the optional @args@ array. Returns 'Nothing' when the field
+<span class="lineno">  381 </span>-- is absent; returns @'Just' []@ when present-but-empty.
+<span class="lineno">  382 </span>argsField :: Value -&gt; Maybe [Text]
+<span class="lineno">  383 </span><span class="decl"><span class="istickedoff">argsField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;args&quot;))</span></span>
+<span class="lineno">  384 </span>
+<span class="lineno">  385 </span>-- | Extract the optional @cwd@ string. Returns 'Nothing' when the field
+<span class="lineno">  386 </span>-- is absent.
+<span class="lineno">  387 </span>cwdField :: Value -&gt; Maybe Text
+<span class="lineno">  388 </span><span class="decl"><span class="istickedoff">cwdField v = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;cwd&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">Just (Just t) -&gt; Just t</span>
+<span class="lineno">  390 </span><span class="spaces">  </span><span class="istickedoff">_             -&gt; Nothing</span></span>
+<span class="lineno">  391 </span>
+<span class="lineno">  392 </span>-- | Validate the @cwd@ at the authorize gate. A relative path is
+<span class="lineno">  393 </span>-- SafePath-confined (rejects @..@ escapes + blocked names); an absolute
+<span class="lineno">  394 </span>-- path is accepted verbatim (the operator explicitly chose an
+<span class="lineno">  395 </span>-- out-of-workspace directory). 'mkRemotePath' defends against
+<span class="lineno">  396 </span>-- option-injection (leading dash) + control chars for both kinds.
+<span class="lineno">  397 </span>authorizeCwd :: WorkspaceRoot -&gt; Value -&gt; Either Text ()
+<span class="lineno">  398 </span><span class="decl"><span class="istickedoff">authorizeCwd wsRoot v =</span>
+<span class="lineno">  399 </span><span class="spaces">  </span><span class="istickedoff">case cwdField v of</span>
+<span class="lineno">  400 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Right ()</span>
+<span class="lineno">  401 </span><span class="spaces">    </span><span class="istickedoff">Just cwdText -&gt;</span>
+<span class="lineno">  402 </span><span class="spaces">      </span><span class="istickedoff">case mkRemotePath cwdText of</span>
+<span class="lineno">  403 </span><span class="spaces">        </span><span class="istickedoff">Left _err -&gt; Left &quot;BIN_EXEC: cwd must not start with '-'&quot;</span>
+<span class="lineno">  404 </span><span class="spaces">        </span><span class="istickedoff">Right rp -&gt;</span>
+<span class="lineno">  405 </span><span class="spaces">          </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  406 </span><span class="spaces">          </span><span class="istickedoff">in if <span class="tickonlyfalse">isAbsolute rel</span></span>
+<span class="lineno">  407 </span><span class="spaces">               </span><span class="istickedoff">then <span class="nottickedoff">Right ()</span></span>
+<span class="lineno">  408 </span><span class="spaces">               </span><span class="istickedoff">else case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  409 </span><span class="spaces">                      </span><span class="istickedoff">Left pe  -&gt; Left (cwdEscapeErr pe)</span>
+<span class="lineno">  410 </span><span class="spaces">                      </span><span class="istickedoff">Right _  -&gt; <span class="nottickedoff">Right ()</span></span></span>
+<span class="lineno">  411 </span>
+<span class="lineno">  412 </span>-- | Resolve the @cwd@ to a 'Maybe RemotePath' for the executor. 'Nothing'
+<span class="lineno">  413 </span>-- means the caller omitted @cwd@ → the executor defaults to the workspace
+<span class="lineno">  414 </span>-- root. @'Just' rp@ carries the validated 'RemotePath' (the arm applies
+<span class="lineno">  415 </span>-- SafePath confinement for relative paths, pass-through for absolute).
+<span class="lineno">  416 </span>resolveCwd :: WorkspaceRoot -&gt; Maybe Text -&gt; Either Text (Maybe RemotePath)
+<span class="lineno">  417 </span><span class="decl"><span class="istickedoff">resolveCwd _ Nothing = Right Nothing</span>
+<span class="lineno">  418 </span><span class="spaces"></span><span class="istickedoff">resolveCwd wsRoot (Just cwdText) =</span>
+<span class="lineno">  419 </span><span class="spaces">  </span><span class="istickedoff">case mkRemotePath cwdText of</span>
+<span class="lineno">  420 </span><span class="spaces">    </span><span class="istickedoff">Left _err -&gt; <span class="nottickedoff">Left &quot;BIN_EXEC: cwd must not start with '-'&quot;</span></span>
+<span class="lineno">  421 </span><span class="spaces">    </span><span class="istickedoff">Right rp -&gt;</span>
+<span class="lineno">  422 </span><span class="spaces">      </span><span class="istickedoff">let rel = T.unpack (getRemotePath rp)</span>
+<span class="lineno">  423 </span><span class="spaces">      </span><span class="istickedoff">in if isAbsolute rel</span>
+<span class="lineno">  424 </span><span class="spaces">           </span><span class="istickedoff">then Right (Just rp)</span>
+<span class="lineno">  425 </span><span class="spaces">           </span><span class="istickedoff">else case mkSafePathRemote wsRoot rel of</span>
+<span class="lineno">  426 </span><span class="spaces">                  </span><span class="istickedoff">Left pe  -&gt; <span class="nottickedoff">Left (cwdEscapeErr pe)</span></span>
+<span class="lineno">  427 </span><span class="spaces">                  </span><span class="istickedoff">Right _  -&gt; Right (Just rp)</span></span>
+<span class="lineno">  428 </span>
+<span class="lineno">  429 </span>-- | Render a 'PathError' from cwd validation as a user-facing 'Text'.
+<span class="lineno">  430 </span>-- Maps the two confinement failures to stable messages the authorize
+<span class="lineno">  431 </span>-- gate returns (so the test suite can assert on them).
+<span class="lineno">  432 </span>cwdEscapeErr :: PathError -&gt; Text
+<span class="lineno">  433 </span><span class="decl"><span class="istickedoff">cwdEscapeErr (PathEscapesWorkspace _) = &quot;BIN_EXEC: cwd escapes the workspace&quot;</span>
+<span class="lineno">  434 </span><span class="spaces"></span><span class="istickedoff">cwdEscapeErr (PathIsBlocked _)        = &quot;BIN_EXEC: cwd touches a blocked location&quot;</span>
+<span class="lineno">  435 </span><span class="spaces"></span><span class="istickedoff">cwdEscapeErr (PathDoesNotExist _)     = <span class="nottickedoff">&quot;BIN_EXEC: cwd does not exist&quot;</span></span>
+<span class="lineno">  436 </span><span class="spaces"></span><span class="istickedoff">cwdEscapeErr (PathInsecureMode _)     = <span class="nottickedoff">&quot;BIN_EXEC: cwd has insecure mode&quot;</span></span></span>
+<span class="lineno">  437 </span>
+<span class="lineno">  438 </span>-- | Extract a @-C &lt;path&gt;@ or @--git-dir=&lt;path&gt;@ value from a git argv
+<span class="lineno">  439 </span>-- list. Returns 'Nothing' when neither flag is present (the pre-flight
+<span class="lineno">  440 </span>-- reads config from the workdir root / cwd). Handles both the
+<span class="lineno">  441 </span>-- space-separated form (@-C subdir@) and the joined form (@-Csubdir@,
+<span class="lineno">  442 </span>-- @--git-dir=subdir@). Only the first occurrence is used (git itself
+<span class="lineno">  443 </span>-- takes the last, but for a single git invocation the first is
+<span class="lineno">  444 </span>-- sufficient — the agent doesn't pass multiple -C flags).
+<span class="lineno">  445 </span>extractGitDir :: [Text] -&gt; Maybe Text
+<span class="lineno">  446 </span><span class="decl"><span class="istickedoff">extractGitDir = go</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  448 </span><span class="spaces">    </span><span class="istickedoff">go [] = Nothing</span>
+<span class="lineno">  449 </span><span class="spaces">    </span><span class="istickedoff">go (x : xs)</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">x == &quot;-C&quot;</span> = <span class="nottickedoff">case xs of</span></span>
+<span class="lineno">  451 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(p : _) -&gt; Just p</span></span>
+<span class="lineno">  452 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[]      -&gt; Nothing</span></span>
+<span class="lineno">  453 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">&quot;-C&quot; `T.isPrefixOf` x</span></span>
+<span class="lineno">  454 </span><span class="spaces">      </span><span class="istickedoff">, <span class="nottickedoff">x /= &quot;-C&quot;</span></span>
+<span class="lineno">  455 </span><span class="spaces">      </span><span class="istickedoff">= <span class="nottickedoff">Just (T.drop 2 x)</span></span>
+<span class="lineno">  456 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">&quot;--git-dir=&quot; `T.isPrefixOf` x</span></span>
+<span class="lineno">  457 </span><span class="spaces">      </span><span class="istickedoff">= <span class="nottickedoff">Just (T.drop (T.length &quot;--git-dir=&quot;) x)</span></span>
+<span class="lineno">  458 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go xs</span></span>
+<span class="lineno">  459 </span>
+<span class="lineno">  460 </span>-- | Extract the @-R owner\/repo@ or @--repo owner\/repo@ value from a
+<span class="lineno">  461 </span>-- @gh@ argv list. Returns 'Just' the first value or 'Nothing' when
+<span class="lineno">  462 </span>-- neither flag is present. @gh@ (cobra/pflag) accepts four forms:
+<span class="lineno">  463 </span>--
+<span class="lineno">  464 </span>--   * @-R value@ (space-separated short)
+<span class="lineno">  465 </span>--   * @-Rvalue@ (joined short — pflag supports this for string
+<span class="lineno">  466 </span>--     shorthand flags)
+<span class="lineno">  467 </span>--   * @--repo value@ (space-separated long)
+<span class="lineno">  468 </span>--   * @--repo=value@ (joined long with @=@)
+<span class="lineno">  469 </span>--
+<span class="lineno">  470 </span>-- Scans the ENTIRE argv (global flags may appear after the subcommand:
+<span class="lineno">  471 </span>-- @gh pr create -R owner\/repo@ is valid). Only the first occurrence is
+<span class="lineno">  472 </span>-- used (the return value is only used for the &quot;is @-R@ present?&quot; skip
+<span class="lineno">  473 </span>-- decision, not for credential lookup — first-vs-last is irrelevant).
+<span class="lineno">  474 </span>-- Mirrors 'extractGitDir' (which handles both space and joined forms for
+<span class="lineno">  475 </span>-- @-C@ / @--git-dir=@).
+<span class="lineno">  476 </span>extractGhRepoFlag :: [Text] -&gt; Maybe Text
+<span class="lineno">  477 </span><span class="decl"><span class="istickedoff">extractGhRepoFlag = go</span>
+<span class="lineno">  478 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  479 </span><span class="spaces">    </span><span class="istickedoff">go [] = Nothing</span>
+<span class="lineno">  480 </span><span class="spaces">    </span><span class="istickedoff">go (x : xs)</span>
+<span class="lineno">  481 </span><span class="spaces">      </span><span class="istickedoff">| x == &quot;-R&quot; = case xs of</span>
+<span class="lineno">  482 </span><span class="spaces">          </span><span class="istickedoff">(v : _) -&gt; Just v</span>
+<span class="lineno">  483 </span><span class="spaces">          </span><span class="istickedoff">[]      -&gt; Nothing</span>
+<span class="lineno">  484 </span><span class="spaces">      </span><span class="istickedoff">| &quot;-R&quot; `T.isPrefixOf` x</span>
+<span class="lineno">  485 </span><span class="spaces">      </span><span class="istickedoff">, <span class="tickonlytrue">x /= &quot;-R&quot;</span></span>
+<span class="lineno">  486 </span><span class="spaces">      </span><span class="istickedoff">= Just (T.drop 2 x)</span>
+<span class="lineno">  487 </span><span class="spaces">      </span><span class="istickedoff">| x == &quot;--repo&quot; = case xs of</span>
+<span class="lineno">  488 </span><span class="spaces">          </span><span class="istickedoff">(v : _) -&gt; Just v</span>
+<span class="lineno">  489 </span><span class="spaces">          </span><span class="istickedoff">[]      -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  490 </span><span class="spaces">      </span><span class="istickedoff">| &quot;--repo=&quot; `T.isPrefixOf` x</span>
+<span class="lineno">  491 </span><span class="spaces">      </span><span class="istickedoff">= Just (T.drop (T.length &quot;--repo=&quot;) x)</span>
+<span class="lineno">  492 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go xs</span></span>
+
+</pre>
+</body>
+</html>

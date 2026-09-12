@@ -1,0 +1,171 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @/call@ command: directly invoke a named ISA opcode with
+<span class="lineno">    3 </span>-- user-supplied JSON arguments, bypassing the LLM. The opcode name is
+<span class="lineno">    4 </span>-- matched case-sensitively against the active session's ISA registry
+<span class="lineno">    5 </span>-- (the same registry the agent loop dispatches against). The argument
+<span class="lineno">    6 </span>-- payload is parsed as JSON; missing/invalid payloads are surfaced as
+<span class="lineno">    7 </span>-- plain-text errors.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- Runs the opcode under 'Full' autonomy semantics: the operator is the
+<span class="lineno">   10 </span>-- human approver by typing the command, so the per-call confirmation
+<span class="lineno">   11 </span>-- gate ('Supervised' autonomy) is skipped — exactly mirroring how a
+<span class="lineno">   12 </span>-- turn under @--yolo@ dispatches. The opcode's own authorize gate still
+<span class="lineno">   13 </span>-- applies (e.g. BIN_EXEC's allow-list, SHELL_EXEC's policy).
+<span class="lineno">   14 </span>module Seal.Command.Call
+<span class="lineno">   15 </span>  ( callCommandSpec
+<span class="lineno">   16 </span>  , CallDispatcher
+<span class="lineno">   17 </span>  , renderOpResult
+<span class="lineno">   18 </span>  , renderDispatchError
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Data.Aeson (Value, eitherDecode')
+<span class="lineno">   22 </span>import Data.Aeson qualified as Aeson
+<span class="lineno">   23 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>import Data.Text qualified as T
+<span class="lineno">   26 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   27 </span>import Options.Applicative
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import Seal.Channel.Caps (ChannelCaps (..))
+<span class="lineno">   30 </span>import Seal.Command.Spec
+<span class="lineno">   31 </span>  ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
+<span class="lineno">   32 </span>  , CommandName (..), CommandSpec (..) )
+<span class="lineno">   33 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   34 </span>import Seal.ISA.Dispatch (DispatchError (..))
+<span class="lineno">   35 </span>import Seal.ISA.Opcode (OpResult (..))
+<span class="lineno">   36 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | The channel-supplied dispatcher. Built by the wiring at each channel
+<span class="lineno">   39 </span>-- (CLI TUI, web) with the right 'Seal.ISA.Registry.Registry',
+<span class="lineno">   40 </span>-- 'Seal.Handles.Transcript.TwoFileHandle', 'Seal.ISA.Opcode.BackendExec',
+<span class="lineno">   41 </span>-- 'Seal.Tools.Exec.Types.ExecBackend', and 'Seal.Types.App.Env' for the
+<span class="lineno">   42 </span>-- active session. Returns the structured 'DispatchError' \/ 'OpResult'
+<span class="lineno">   43 </span>-- so the command can render either outcome.
+<span class="lineno">   44 </span>type CallDispatcher = OpName -&gt; Value -&gt; IO (Either DispatchError OpResult)
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | The @/call@ command spec. Closes over the channel-supplied
+<span class="lineno">   47 </span>-- 'CallDispatcher'. The dispatcher is per-session (it threads the active
+<span class="lineno">   48 </span>-- session's transcript + registry); the wiring rebuilds the spec on
+<span class="lineno">   49 </span>-- session change.
+<span class="lineno">   50 </span>callCommandSpec :: CallDispatcher -&gt; CommandSpec
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">callCommandSpec dispatcher = CommandSpec</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = CommandName &quot;call&quot;</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = []</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = GroupTools</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = &quot;Invoke an ISA opcode directly with JSON args&quot;</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = callParserInfo dispatcher</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">InteractiveOnly</span></span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>callParserInfo :: CallDispatcher -&gt; ParserInfo CommandAction
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">callParserInfo dispatcher =</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">info (callParser dispatcher &lt;**&gt; helper)</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Invoke an ISA opcode directly (bypassing the LLM)&quot;</span></span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;call — directly dispatch an opcode with JSON args&quot;</span></span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>callParser :: CallDispatcher -&gt; Parser CommandAction
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">callParser dispatcher = callCmd dispatcher</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; opNameArg</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; jsonArg</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>-- | @/call OP NAME JSON-ARGS@ — invoke the opcode with the parsed JSON
+<span class="lineno">   73 </span>-- value. If the JSON argument is omitted, an empty object is passed (for
+<span class="lineno">   74 </span>-- opcodes that take no input). The command line is echoed as the first
+<span class="lineno">   75 </span>-- line of the output so the &quot;Command output&quot; bubble is self-contained
+<span class="lineno">   76 </span>-- (the web channel clears the optimistic &quot;You&quot; bubble on slash responses).
+<span class="lineno">   77 </span>callCmd :: CallDispatcher -&gt; Text -&gt; Maybe Text -&gt; CommandAction
+<span class="lineno">   78 </span><span class="decl"><span class="istickedoff">callCmd dispatcher opNameText mJson = commandAction $ \caps -&gt; do</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">ccSend caps (echoLine opNameText mJson)</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">case mkOpNameText opNameText of</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; ccSend caps (&quot;invalid opcode name: &quot; &lt;&gt; err)</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">Right opName -&gt;</span>
+<span class="lineno">   83 </span><span class="spaces">      </span><span class="istickedoff">case mJson of</span>
+<span class="lineno">   84 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; run dispatcher caps opName (Aeson.object [])</span>
+<span class="lineno">   85 </span><span class="spaces">        </span><span class="istickedoff">Just raw -&gt;</span>
+<span class="lineno">   86 </span><span class="spaces">          </span><span class="istickedoff">case eitherDecode' (BL.fromStrict (TE.encodeUtf8 raw)) of</span>
+<span class="lineno">   87 </span><span class="spaces">            </span><span class="istickedoff">Left err   -&gt; ccSend caps</span>
+<span class="lineno">   88 </span><span class="spaces">              </span><span class="istickedoff">( &quot;invalid JSON: &quot; &lt;&gt; T.pack err</span>
+<span class="lineno">   89 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; &quot;\nThe JSON arg must be a complete JSON value (object, array, or string).&quot;</span>
+<span class="lineno">   90 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; &quot;\nFor a bare token like a name, wrap it as a JSON object, e.g.:&quot;</span>
+<span class="lineno">   91 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; &quot;\n  /call &quot; &lt;&gt; opNameText &lt;&gt; &quot; {\&quot;name\&quot;:\&quot;&quot; &lt;&gt; raw &lt;&gt; &quot;\&quot;}&quot; )</span>
+<span class="lineno">   92 </span><span class="spaces">            </span><span class="istickedoff">Right val  -&gt; run dispatcher caps <span class="nottickedoff">opName</span> <span class="nottickedoff">val</span></span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | Reconstruct the command line for the echo header.
+<span class="lineno">   95 </span>echoLine :: Text -&gt; Maybe Text -&gt; Text
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">echoLine op mJson = &quot;$ /call &quot; &lt;&gt; op &lt;&gt; maybe &quot;&quot; (&quot; &quot; &lt;&gt;) mJson</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | Validate the opcode name (only the constructor check; the lookup
+<span class="lineno">   99 </span>-- happens in the dispatcher).
+<span class="lineno">  100 </span>mkOpNameText :: Text -&gt; Either Text OpName
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">mkOpNameText t</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">| T.null t            = Left &quot;opcode name is empty&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.any (== '\0') t</span>   = <span class="nottickedoff">Left &quot;opcode name contains NUL&quot;</span></span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Right (OpName t)</span></span>
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>run :: CallDispatcher -&gt; ChannelCaps -&gt; OpName -&gt; Value -&gt; IO ()
+<span class="lineno">  107 </span><span class="decl"><span class="istickedoff">run dispatcher caps opName val = do</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- dispatcher opName val</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">case res of</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; ccSend caps (renderDispatchError e)</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">Right r -&gt; mapM_ (ccSend caps) (renderOpResult r)</span></span>
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | Render a 'DispatchError' as a single line.
+<span class="lineno">  114 </span>renderDispatchError :: DispatchError -&gt; Text
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">renderDispatchError = \case</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">OpNotFound (OpName n) -&gt; &quot;opcode not found: &quot; &lt;&gt; n</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">Denied why            -&gt; &quot;denied: &quot; &lt;&gt; why</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">ExecFailed why         -&gt; &quot;exec failed: &quot; &lt;&gt; why</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | Render an 'OpResult' as one line per text part. Non-text parts are
+<span class="lineno">  121 </span>-- shown via their 'Show' instance. The error flag is prefixed when set
+<span class="lineno">  122 </span>-- so the operator can tell a failed run from a successful one.
+<span class="lineno">  123 </span>renderOpResult :: OpResult -&gt; [Text]
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">renderOpResult r =</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">let prefix = if orIsError r then &quot;[error] &quot; else &quot;&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">body = case orParts r of</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; [prefix &lt;&gt; &quot;(no output)&quot;]</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">xs -&gt; [ prefix &lt;&gt; t | TrpText t &lt;- xs ]</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlyfalse">null body</span> then <span class="nottickedoff">[prefix &lt;&gt; &quot;(no output)&quot;]</span> else body</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  132 </span>-- optparse helpers
+<span class="lineno">  133 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Required opcode-name argument. The metavar @OP@ hints at the
+<span class="lineno">  136 </span>-- opcodes' convention (e.g. @SHELL_EXEC@, @FILE_READ@).
+<span class="lineno">  137 </span>opNameArg :: Parser Text
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">opNameArg = T.pack &lt;$&gt; strArgument</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">( metavar <span class="nottickedoff">&quot;OP&quot;</span></span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">&quot;Opcode name (e.g. SHELL_EXEC, FILE_READ, BIN_EXEC)&quot;</span> )</span></span>
+<span class="lineno">  141 </span>
+<span class="lineno">  142 </span>-- | Optional JSON argument. Parsed by 'eitherDecode'' at dispatch time;
+<span class="lineno">  143 </span>-- parse errors are surfaced to the user. Quoting is up to the shell
+<span class="lineno">  144 </span>-- (the tokenizer handles double-quoted tokens).
+<span class="lineno">  145 </span>jsonArg :: Parser (Maybe Text)
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">jsonArg = optional (T.pack &lt;$&gt; strArgument</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">( metavar <span class="nottickedoff">&quot;JSON&quot;</span></span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; help <span class="nottickedoff">&quot;Opcode input as a JSON object (default: {})&quot;</span> ))</span></span>
+
+</pre>
+</body>
+</html>

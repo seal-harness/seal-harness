@@ -1,0 +1,109 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Static behavioral guidance blocks injected into the system prompt.
+<span class="lineno">    3 </span>-- Each block is a few sentences of operational guidance that improves
+<span class="lineno">    4 </span>-- model behavior across providers without being model-specific. The
+<span class="lineno">    5 </span>-- blocks are config-gated (see 'Seal.Config.File': @[agent]@
+<span class="lineno">    6 </span>-- @parallel_tool_guidance@, @tool_use_enforcement@,
+<span class="lineno">    7 </span>-- @task_completion_guidance@); each defaults to injected (true).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The blocks are appended /before/ the dynamic @\&lt;available_skills\&gt;@
+<span class="lineno">   10 </span>-- catalog so the stable text precedes the volatile catalog (cache-
+<span class="lineno">   11 </span>-- friendly ordering: stable identity prefix → static guidance →
+<span class="lineno">   12 </span>-- autoload body → available-skills catalog).
+<span class="lineno">   13 </span>module Seal.Agent.PromptParts
+<span class="lineno">   14 </span>  ( parallelToolGuidance
+<span class="lineno">   15 </span>  , toolUseEnforcement
+<span class="lineno">   16 </span>  , taskCompletionGuidance
+<span class="lineno">   17 </span>  , staticGuidanceBlock
+<span class="lineno">   18 </span>  , injectStaticGuidance
+<span class="lineno">   19 </span>  ) where
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>-- | Parallel tool-call guidance. Tells the model to batch independent
+<span class="lineno">   25 </span>-- tool calls into one turn rather than running them sequentially across
+<span class="lineno">   26 </span>-- turns. A real latency/token win with no risk.
+<span class="lineno">   27 </span>parallelToolGuidance :: Text
+<span class="lineno">   28 </span><span class="decl"><span class="istickedoff">parallelToolGuidance =</span>
+<span class="lineno">   29 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Parallel tool calls\n\n\</span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">\When several tool calls are independent (no output of one is needed to \</span>
+<span class="lineno">   31 </span><span class="spaces">  </span><span class="istickedoff">\call another), batch them into a single turn. Do not call them \</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="istickedoff">\sequentially across turns when you could have called them together.&quot;</span></span>
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | Tool-use enforcement. Tells the model to actually call tools instead
+<span class="lineno">   35 </span>-- of describing actions. Improves reliability on weaker models that tend
+<span class="lineno">   36 </span>-- to narrate instead of act.
+<span class="lineno">   37 </span>toolUseEnforcement :: Text
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">toolUseEnforcement =</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Tool use\n\n\</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">\When a task requires a tool, actually call the tool. Do not describe \</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">\or narrate the action you would take (\&quot;I would run X\&quot;) and then stop \</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">\— call it. Do not answer from memory when a current tool call could \</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">\get the real state.&quot;</span></span>
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- | Task-completion / anti-fabrication guidance. Tells the model not to
+<span class="lineno">   46 </span>-- stop after a stub and not to fabricate output when a path is blocked.
+<span class="lineno">   47 </span>taskCompletionGuidance :: Text
+<span class="lineno">   48 </span><span class="decl"><span class="istickedoff">taskCompletionGuidance =</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">&quot;## Task completion\n\n\</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">\Do not stop after producing a stub, TODO, or skeleton and report the \</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">\task done. Complete the implementation through to working, tested \</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">\code. If a path is genuinely blocked (missing input, failed tool, \</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">\permission denied), say so explicitly and ask for what you need — do \</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">\not fabricate output to fill the gap.&quot;</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | Render the enabled guidance blocks as a single section, joined with
+<span class="lineno">   57 </span>-- blank lines. Returns the empty 'Text' when no block is enabled (so the
+<span class="lineno">   58 </span>-- caller can skip emitting anything). Each enabled block is a
+<span class="lineno">   59 </span>-- @## header@ + body, so the whole section reads as a sequence of
+<span class="lineno">   60 </span>-- short guidance notes.
+<span class="lineno">   61 </span>staticGuidanceBlock :: Bool -&gt; Bool -&gt; Bool -&gt; Text
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">staticGuidanceBlock parallel toolUse taskCompletion =</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">let parts = [ parallelToolGuidance    | parallel ]</span>
+<span class="lineno">   64 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; [ toolUseEnforcement      | toolUse ]</span>
+<span class="lineno">   65 </span><span class="spaces">           </span><span class="istickedoff">&lt;&gt; [ taskCompletionGuidance  | taskCompletion ]</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">in if null parts then &quot;&quot; else T.intercalate &quot;\n\n&quot; parts</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Append the enabled static guidance blocks to the resolved system
+<span class="lineno">   69 </span>-- prompt. The blocks go /before/ the auto-loaded skill body and the
+<span class="lineno">   70 </span>-- available-skills catalog (the caller runs this first, then
+<span class="lineno">   71 </span>-- 'Seal.Skills.Autoload.injectAutoloadSkill', then
+<span class="lineno">   72 </span>-- 'Seal.Skills.Prompt.injectAvailableSkills'). Returns the prompt
+<span class="lineno">   73 </span>-- unchanged when no block is enabled.
+<span class="lineno">   74 </span>injectStaticGuidance
+<span class="lineno">   75 </span>  :: Bool    -- ^ parallel tool-call guidance
+<span class="lineno">   76 </span>  -&gt; Bool    -- ^ tool-use enforcement
+<span class="lineno">   77 </span>  -&gt; Bool    -- ^ task-completion guidance
+<span class="lineno">   78 </span>  -&gt; Maybe Text
+<span class="lineno">   79 </span>  -&gt; Maybe Text
+<span class="lineno">   80 </span><span class="decl"><span class="istickedoff">injectStaticGuidance parallel toolUse taskCompletion mPrompt =</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">let block = staticGuidanceBlock parallel toolUse taskCompletion</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">in if T.null block</span>
+<span class="lineno">   83 </span><span class="spaces">       </span><span class="istickedoff">then mPrompt</span>
+<span class="lineno">   84 </span><span class="spaces">       </span><span class="istickedoff">else Just (case mPrompt of</span>
+<span class="lineno">   85 </span><span class="spaces">                    </span><span class="istickedoff">Nothing  -&gt; block</span>
+<span class="lineno">   86 </span><span class="spaces">                    </span><span class="istickedoff">Just base -&gt; base &lt;&gt; &quot;\n\n&quot; &lt;&gt; block)</span></span>
+
+</pre>
+</body>
+</html>

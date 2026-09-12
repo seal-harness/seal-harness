@@ -1,0 +1,100 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Tab list persistence — the 'TabList' survives a @seal serve@ restart.
+<span class="lineno">    3 </span>-- Written atomically (0600) to @\&lt;state\&gt;\/tabs.json@ on every tab mutation;
+<span class="lineno">    4 </span>-- loaded at boot and re-resolved to the tab refs (ids validated; unparseable
+<span class="lineno">    5 </span>-- refs skipped — defense-in-depth against a tampered file). Writes are
+<span class="lineno">    6 </span>-- serialized via a module-level MVar so concurrent mutations cannot
+<span class="lineno">    7 </span>-- interleave file writes.
+<span class="lineno">    8 </span>module Seal.Tabs.Persist
+<span class="lineno">    9 </span>  ( saveTabList
+<span class="lineno">   10 </span>  , loadTabList
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar)
+<span class="lineno">   14 </span>import Data.Aeson qualified as A
+<span class="lineno">   15 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   16 </span>import System.Directory (doesFileExist)
+<span class="lineno">   17 </span>import System.IO.Unsafe (unsafePerformIO)
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Katip (Severity (..))
+<span class="lineno">   20 </span>import Seal.Core.Types (mkSessionId, sessionIdText)
+<span class="lineno">   21 </span>import Seal.Harness.Id (parseHarnessId, harnessIdToText)
+<span class="lineno">   22 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   23 </span>import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+<span class="lineno">   24 </span>import Seal.Util.AtomicJson (saveJsonAtomic)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | Module-level write lock — serializes concurrent 'saveTabList' calls so
+<span class="lineno">   27 </span>-- two tab mutations cannot interleave file writes (a bare forkIO TVar
+<span class="lineno">   28 </span>-- listener would race; the explicit MVar guarantees atomicity). One lock
+<span class="lineno">   29 </span>-- per process, shared across all paths (a single @tabs.json@ per state dir).
+<span class="lineno">   30 </span>--
+<span class="lineno">   31 </span>-- NOTE: 'Seal.Util.AtomicJson.saveJsonAtomic' has its own module-level
+<span class="lineno">   32 </span>-- lock, so the MVar here is redundant for the write itself. It is retained
+<span class="lineno">   33 </span>-- because 'loadTabList' / 'filterValidTabs' are pure and do not take the
+<span class="lineno">   34 </span>-- lock; keeping the local lock documents the serialization invariant. A
+<span class="lineno">   35 </span>-- future cleanup can drop it once all callers route through
+<span class="lineno">   36 </span>-- 'saveJsonAtomic' (which they now do).
+<span class="lineno">   37 </span>writeLock :: MVar ()
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">writeLock = unsafePerformIO (newMVar <span class="nottickedoff">()</span>)</span></span>
+<span class="lineno">   39 </span>{-# NOINLINE writeLock #-}
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | Save a 'TabList' to @path@ atomically via 'saveJsonAtomic' (0600,
+<span class="lineno">   42 </span>-- MVar-serialized). A thrown IO error propagates to the caller
+<span class="lineno">   43 </span>-- ('Seal.Tabs.persistIf') which catches, logs a warning, and swallows —
+<span class="lineno">   44 </span>-- the in-memory handle stays authoritative within the session. Takes the
+<span class="lineno">   45 </span>-- 'TabList' directly (not a 'TabsHandle') so this module does NOT import
+<span class="lineno">   46 </span>-- 'Seal.Tabs' (avoids a cycle).
+<span class="lineno">   47 </span>saveTabList :: FilePath -&gt; TabList -&gt; IO ()
+<span class="lineno">   48 </span><span class="decl"><span class="istickedoff">saveTabList path tl = modifyMVar_ writeLock $ \_ -&gt;</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">saveJsonAtomic path (A.encode tl)</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Load the tab list from @path@. Missing file -&gt; 'Nothing' (fresh empty
+<span class="lineno">   52 </span>-- list). Corrupt JSON -&gt; 'Nothing' + a stderr warning (ids + error type
+<span class="lineno">   53 </span>-- only — no session content). Every 'TabRef' id is re-validated via
+<span class="lineno">   54 </span>-- 'mkSessionId' / 'parseHarnessId'; tabs carrying an unparseable id are
+<span class="lineno">   55 </span>-- skipped (defense-in-depth against a tampered @tabs.json@).
+<span class="lineno">   56 </span>loadTabList :: FilePath -&gt; IO (Maybe TabList)
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">loadTabList path = do</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">bs &lt;- BL.readFile path</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">case A.decode bs :: Maybe TabList of</span>
+<span class="lineno">   64 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   65 </span><span class="spaces">          </span><span class="istickedoff">globalLogIO <span class="nottickedoff">WarningS</span> <span class="nottickedoff">&quot;could not parse tabs.json; using empty tab list&quot;</span></span>
+<span class="lineno">   66 </span><span class="spaces">          </span><span class="istickedoff">pure Nothing</span>
+<span class="lineno">   67 </span><span class="spaces">        </span><span class="istickedoff">Just tl -&gt; pure (Just (filterValidTabs tl))</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | Drop tabs whose 'TabRef' id fails to re-parse. The on-disk ids were
+<span class="lineno">   70 </span>-- validated when written, so a parse failure here means the file was
+<span class="lineno">   71 </span>-- tampered or written by a future/incompatible version — skip rather than
+<span class="lineno">   72 </span>-- error so a corrupt file self-heals on the next save.
+<span class="lineno">   73 </span>filterValidTabs :: TabList -&gt; TabList
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">filterValidTabs tl = <span class="nottickedoff">tl</span> { tlTabs = filter (validRef . tRef) (tlTabs tl) }</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">validRef (BoundSession sid) = case mkSessionId (sessionIdText sid) of Right _ -&gt; True; Left _ -&gt; False</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">validRef (BoundHarness hid) = case parseHarnessId (harnessIdToText hid) of Right _ -&gt; <span class="nottickedoff">True</span>; Left _ -&gt; False</span></span>
+
+</pre>
+</body>
+</html>

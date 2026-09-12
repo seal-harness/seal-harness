@@ -1,0 +1,611 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The turn loop: user message -&gt; provider completion -&gt; opcode dispatch -&gt;
+<span class="lineno">    3 </span>-- tool results -&gt; repeat until no tool calls, then emit the final text. Fed only
+<span class="lineno">    4 </span>-- after Seal.Ingest has classified input as a PlainMessage. Bounded by aeMaxTurns.
+<span class="lineno">    5 </span>module Seal.Agent.Loop
+<span class="lineno">    6 </span>  ( runTurn
+<span class="lineno">    7 </span>  , defaultMaxTokens
+<span class="lineno">    8 </span>  ) where
+<span class="lineno">    9 </span>
+<span class="lineno">   10 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   11 </span>import Control.Concurrent (threadDelay)
+<span class="lineno">   12 </span>import Control.Concurrent.Async (race)
+<span class="lineno">   13 </span>import Control.Monad (unless)
+<span class="lineno">   14 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   15 </span>import Data.Aeson (Value (..), object, (.=))
+<span class="lineno">   16 </span>import Data.Aeson qualified as A
+<span class="lineno">   17 </span>import Data.ByteString qualified as BS
+<span class="lineno">   18 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   19 </span>import Data.ByteString.Lazy.Char8 qualified as BLC
+<span class="lineno">   20 </span>import Data.IORef
+<span class="lineno">   21 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   22 </span>import Data.Text (Text)
+<span class="lineno">   23 </span>import Data.Text qualified as T
+<span class="lineno">   24 </span>import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
+<span class="lineno">   25 </span>import qualified System.IO as IO
+<span class="lineno">   26 </span>import System.Timeout (timeout)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Seal.Agent.Env (AgentEnv (..))
+<span class="lineno">   29 </span>import Seal.Core.MessageSource
+<span class="lineno">   30 </span>  ( MessageSource (..), conversationIdText )
+<span class="lineno">   31 </span>import Seal.Core.Types (ModelId (..), OpName (..), TrustLevel (..))
+<span class="lineno">   32 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   33 </span>import Seal.Handles.AskReply
+<span class="lineno">   34 </span>  ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
+<span class="lineno">   35 </span>import Seal.Handles.Transcript (TwoFileHandle (..), TwoFileWrite (..))
+<span class="lineno">   36 </span>import Seal.ISA.Dispatch (DispatchError (..), dispatch)
+<span class="lineno">   37 </span>import Seal.Tools.Exec.Abort (clearAbort, isAborted)
+<span class="lineno">   38 </span>import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust)
+<span class="lineno">   39 </span>import Seal.ISA.Registry (registryToolDefs', lookupOp)
+<span class="lineno">   40 </span>import Seal.Providers.Class
+<span class="lineno">   41 </span>import Seal.Security.Policy (AutonomyLevel (..))
+<span class="lineno">   42 </span>import Seal.Session.Log
+<span class="lineno">   43 </span>  ( logTurnStart, logTurnEnd, logProviderError, logMaxTurns
+<span class="lineno">   44 </span>  , logTruncation, logTruncationGiveUp, maxLengthContinueRetries )
+<span class="lineno">   45 </span>import Seal.Transcript.Entries
+<span class="lineno">   46 </span>  ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
+<span class="lineno">   47 </span>import Seal.Types.App (App)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | The output-token cap sent to the provider on every completion request.
+<span class="lineno">   50 </span>-- Raised from 4096 to 8192 so tool-using agents (which often emit large
+<span class="lineno">   51 </span>-- tool-call inputs, e.g. embedding file contents into @task@ prompts) have
+<span class="lineno">   52 </span>-- headroom and are less likely to hit 'StopMaxTokens'. This alone does not
+<span class="lineno">   53 </span>-- fix truncation handling — the loop must still handle 'StopMaxTokens'
+<span class="lineno">   54 </span>-- explicitly (see 'go') — but it reduces the frequency.
+<span class="lineno">   55 </span>defaultMaxTokens :: Int
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">defaultMaxTokens = 8192</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Hard timeout for a single provider streaming call, in microseconds.
+<span class="lineno">   59 </span>-- 5 minutes gives generous headroom for large contexts on remote models
+<span class="lineno">   60 </span>-- (the Ollama HTTP client has its own 5-minute response timeout; this is
+<span class="lineno">   61 </span>-- a safety net for a stalled connection that never closes). If the stream
+<span class="lineno">   62 </span>-- does not complete within this window, the turn aborts with a provider
+<span class="lineno">   63 </span>-- error so the session does not hang forever in &quot;thinking&quot; with no log
+<span class="lineno">   64 </span>-- output. The error is logged to seal.log and surfaced to the user as a
+<span class="lineno">   65 </span>-- normal provider error (not an exception), so the bracket cleanup in
+<span class="lineno">   66 </span>-- the send path still fires the idle broadcast.
+<span class="lineno">   67 </span>streamTimeoutUs :: Int
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">streamTimeoutUs = 5 * 60 * 1_000_000</span></span>
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | The synthetic user message appended after a 'StopMaxTokens' truncation
+<span class="lineno">   71 </span>-- with no tool calls, asking the model to continue exactly where it left off
+<span class="lineno">   72 </span>-- without repeating prior text. Mirrors Hermes' @_get_continuation_prompt@.
+<span class="lineno">   73 </span>continuationPrompt :: Text
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">continuationPrompt =</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">&quot;[System: Your previous response was truncated by the output length \</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">\limit. Continue exactly where you left off. Do not restart or repeat \</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">\prior text. Finish the answer directly.]&quot;</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Build the request @erMeta@: a @channel@ key (always present, sourced
+<span class="lineno">   80 </span>-- from 'aeChannel' so every channel — including web/CLI with no
+<span class="lineno">   81 </span>-- 'MessageSource' — is attributed) plus a @conversationId@ key when
+<span class="lineno">   82 </span>-- 'aeMessageSource' is present (carrying the server-derived conversation
+<span class="lineno">   83 </span>-- id for channels that have one). This is the single place channel
+<span class="lineno">   84 </span>-- provenance is stamped into the transcript, so every turn is attributed
+<span class="lineno">   85 </span>-- regardless of the source channel.
+<span class="lineno">   86 </span>requestMeta :: Text -&gt; Maybe MessageSource -&gt; Map.Map Text Value
+<span class="lineno">   87 </span><span class="decl"><span class="istickedoff">requestMeta channel mSrc =</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">Map.fromList</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">([ (&quot;channel&quot;, String channel)</span>
+<span class="lineno">   90 </span><span class="spaces">     </span><span class="istickedoff">] &lt;&gt; conversationIdField)</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">conversationIdField = case mSrc of</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">Just ms -&gt; [(&quot;conversationId&quot;, String (conversationIdText (msConversationId ms)))]</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>runTurn :: AgentEnv -&gt; Text -&gt; App ()
+<span class="lineno">   97 </span><span class="decl"><span class="istickedoff">runTurn env userText = do</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">-- Clear the per-turn abort flag at turn entry (design: clearAbort fires</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">-- once at runTurn entry, before any tool call; a mid-turn abort keeps the</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">-- flag set until the next turn begins).</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">liftIO (clearAbort (aeAbortFlag env))</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">-- Load the prior conversation from disk so the model sees the full history</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">-- (not just this turn's new message). The two-file writer's diff-based</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">-- appender requires the incoming message list to be a prefix-extension of</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">-- the on-disk conversation; without the prior messages, the diff falls back</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">-- to re-appending the whole list every iteration, corrupting</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">-- @conversation.jsonl@ with duplicate user + assistant lines.</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">prior &lt;- liftIO (tfwReadConversation (aeTranscript env))</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">let userMsg = textMsg User userText</span>
+<span class="lineno">  110 </span><span class="spaces">      </span><span class="istickedoff">turn0   = prior &lt;&gt; [userMsg]</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">-- Record the initial user message as a Request entry. The envelope delta</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">-- carries the full envelope in effect for this turn (model / system / tools</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">-- / maxTokens), so reconstruction can rebuild the exact CompletionRequest.</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">-- The request's @erMeta@ carries the channel + conversation id when</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">-- 'aeMessageSource' is present (Signal), so the transcript records which</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">-- channel + conversation this turn served. @erConvLen@ is the full</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">-- conversation length in effect at this request (prior + new user message),</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">-- so reconstruction can slice the right prefix from @conversation.jsonl@.</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">liftIO $ do</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">let env0 = EnvelopeDelta</span>
+<span class="lineno">  122 </span><span class="spaces">          </span><span class="istickedoff">{ edModel = Just (aeModel env)</span>
+<span class="lineno">  123 </span><span class="spaces">          </span><span class="istickedoff">, edSystem = Just (aeSystem env)</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">, edTools = Just (registryToolDefs' (aeOnDemandSchemas env) (aeRegistry env))</span>
+<span class="lineno">  125 </span><span class="spaces">          </span><span class="istickedoff">, edToolChoice = Just ToolAuto</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="istickedoff">, edMaxTokens = Just defaultMaxTokens</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">entry = EntryRecord</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">          </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="istickedoff">, erKind = EKRequest</span>
+<span class="lineno">  132 </span><span class="spaces">          </span><span class="istickedoff">, erConvLen = length turn0</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">, erEnvelope = Just env0</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  136 </span><span class="spaces">          </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  138 </span><span class="spaces">          </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  139 </span><span class="spaces">          </span><span class="istickedoff">, erMeta = requestMeta (aeChannel env) (aeMessageSource env)</span>
+<span class="lineno">  140 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">-- When a caller wants to react to the user message being durable</span>
+<span class="lineno">  142 </span><span class="spaces">    </span><span class="istickedoff">-- (e.g. the /bg path broadcasts a lists snapshot so the sidebar shows</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="istickedoff">-- the session name immediately), record it with tfwRecordAndAck</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">-- (synchronously fsync'd) and run the hook. Otherwise keep the async</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">-- write (no fsync latency at turn start).</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">case aeOnUserMessage env of</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">Just after -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">tfwRecordAndAck (aeTranscript env) (TwoFileWrite turn0 entry)</span></span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">liftIO after</span></span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="istickedoff">tfwRecordAsync (aeTranscript env) (TwoFileWrite turn0 entry)</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">go (aeMaxTurns env) 0 turn0</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">-- | Fan out the final user-visible text to every chat channel subscribed</span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">-- to the session ('aeOnStop'). This does NOT call 'ccSend' (the arrival</span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">-- channel); the stop branches handle that separately, guarded by</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">-- 'alreadySentText' so the arrival channel doesn't get double-delivered</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">-- when text was already streamed.</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">notifyStop :: Text -&gt; IO ()</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">notifyStop text =</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">case aeOnStop env of</span>
+<span class="lineno">  162 </span><span class="spaces">        </span><span class="istickedoff">Just fanout -&gt; fanout <span class="nottickedoff">text</span></span>
+<span class="lineno">  163 </span><span class="spaces">        </span><span class="istickedoff">Nothing     -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">go :: Int -&gt; Int -&gt; [Message] -&gt; App ()</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">go 0 _ msgs = liftIO $ do</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">logMaxTurns (aeLogPath env)</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">let stopMsg = &quot;(stopped: reached the &quot; &lt;&gt; T.pack (show (aeMaxTurns env))</span>
+<span class="lineno">  168 </span><span class="spaces">            </span><span class="istickedoff">&lt;&gt; &quot;-turn limit for this message. Ask again to continue, &quot;</span>
+<span class="lineno">  169 </span><span class="spaces">            </span><span class="istickedoff">&lt;&gt; &quot;or raise `max_turns` in config.toml.)&quot;</span>
+<span class="lineno">  170 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">assistantMsg = Message Assistant [CbText stopMsg]</span></span>
+<span class="lineno">  171 </span><span class="spaces">          </span><span class="istickedoff">conv = msgs &lt;&gt; [<span class="nottickedoff">assistantMsg</span>]</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">entry = EntryRecord</span></span>
+<span class="lineno">  174 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">{ erId = &quot;&quot;</span></span>
+<span class="lineno">  175 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erTimestamp = now</span></span>
+<span class="lineno">  176 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erKind = EKResponse</span></span>
+<span class="lineno">  177 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erConvLen = length conv</span></span>
+<span class="lineno">  178 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erEnvelope = Nothing</span></span>
+<span class="lineno">  179 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erUsage = Nothing</span></span>
+<span class="lineno">  180 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erStop = Nothing</span></span>
+<span class="lineno">  181 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erDurationMs = Nothing</span></span>
+<span class="lineno">  182 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erHarness = Nothing</span></span>
+<span class="lineno">  183 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erCorrelation = Nothing</span></span>
+<span class="lineno">  184 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, erMeta = Map.empty</span></span>
+<span class="lineno">  185 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  186 </span><span class="spaces">      </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv <span class="nottickedoff">entry</span>)</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">aeOnEntry env</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">ccSend (aeCaps env) stopMsg</span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="istickedoff">notifyStop <span class="nottickedoff">stopMsg</span></span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">go n lenContinue msgs = do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">liftIO (logTurnStart (aeLogPath env) n)</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">tStart &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  193 </span><span class="spaces">      </span><span class="istickedoff">let req = CompletionRequest</span>
+<span class="lineno">  194 </span><span class="spaces">                  </span><span class="istickedoff">{ crModel = aeModel env</span>
+<span class="lineno">  195 </span><span class="spaces">                  </span><span class="istickedoff">, crSystem = aeSystem env</span>
+<span class="lineno">  196 </span><span class="spaces">                  </span><span class="istickedoff">, crMessages = msgs</span>
+<span class="lineno">  197 </span><span class="spaces">                  </span><span class="istickedoff">, crTools = registryToolDefs' <span class="nottickedoff">(aeOnDemandSchemas env)</span> (aeRegistry env)</span>
+<span class="lineno">  198 </span><span class="spaces">                  </span><span class="istickedoff">, crToolChoice = ToolAuto</span>
+<span class="lineno">  199 </span><span class="spaces">                  </span><span class="istickedoff">, crMaxTokens = defaultMaxTokens</span>
+<span class="lineno">  200 </span><span class="spaces">                  </span><span class="istickedoff">}</span>
+<span class="lineno">  201 </span><span class="spaces">      </span><span class="istickedoff">liftIO (appendDebugRequest (aeDebugRequestsPath env) req)</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">-- Stream the completion, aggregating events into ContentBlocks. Text</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">-- deltas are broadcast live via ccSend (CLI/Telegram/Signal) so the</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">-- user sees incremental output. This replaces the blocking</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">-- providerCompleteWithRetry call — the first token arrives in ~2s</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">-- instead of waiting for the entire response (which could take 74+s</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">-- for large contexts on remote models, hitting the 90s timeout).</span>
+<span class="lineno">  208 </span><span class="spaces">      </span><span class="istickedoff">-- Events are collected in an IORef so we can reconstruct the final</span>
+<span class="lineno">  209 </span><span class="spaces">      </span><span class="istickedoff">-- ContentBlocks for the transcript entry after the stream completes.</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="istickedoff">collectedRef &lt;- liftIO (newIORef ([] :: [StreamEvent]))</span>
+<span class="lineno">  211 </span><span class="spaces">      </span><span class="istickedoff">let streamSends = ccStreaming (aeCaps env)</span>
+<span class="lineno">  212 </span><span class="spaces">      </span><span class="istickedoff">let isTransient = isTransientError</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">-- Wrap the stream in a hard timeout so a stalled provider</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">-- connection (TCP open but no data) cannot hang the session</span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">-- forever in &quot;thinking&quot;. On timeout, the turn surfaces a provider</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">-- error — logged to seal.log + the transcript — and the bracket@.</span>
+<span class="lineno">  217 </span><span class="spaces">      </span><span class="istickedoff">-- cleanup in the send path fires the idle broadcast.</span>
+<span class="lineno">  218 </span><span class="spaces">      </span><span class="istickedoff">-- Race the provider stream against the abort-poll so a /stop</span>
+<span class="lineno">  219 </span><span class="spaces">      </span><span class="istickedoff">-- (web POST /api/sessions/:id/stop, CLI Ctrl+C, channel /stop)</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="istickedoff">-- interrupts the in-flight LLM call, not just tool calls. When</span>
+<span class="lineno">  221 </span><span class="spaces">      </span><span class="istickedoff">-- abort wins the race, the stream is cancelled and a &quot;(stopped)&quot;</span>
+<span class="lineno">  222 </span><span class="spaces">      </span><span class="istickedoff">-- message is recorded — the user can immediately send a new</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">-- prompt. The abort poll interval matches the tool-call poll</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">-- (100ms, from ttcAbortPollMicros).</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">let abortPoll = do</span>
+<span class="lineno">  226 </span><span class="spaces">            </span><span class="istickedoff">aborted &lt;- isAborted (aeAbortFlag env)</span>
+<span class="lineno">  227 </span><span class="spaces">            </span><span class="istickedoff">if <span class="tickonlyfalse">aborted</span> then <span class="nottickedoff">pure ()</span> else do</span>
+<span class="lineno">  228 </span><span class="spaces">              </span><span class="istickedoff">threadDelay 100_000</span>
+<span class="lineno">  229 </span><span class="spaces">              </span><span class="istickedoff">abortPoll</span>
+<span class="lineno">  230 </span><span class="spaces">      </span><span class="istickedoff">mResult &lt;- liftIO (timeout streamTimeoutUs $</span>
+<span class="lineno">  231 </span><span class="spaces">        </span><span class="istickedoff">race abortPoll</span>
+<span class="lineno">  232 </span><span class="spaces">             </span><span class="istickedoff">(providerStreamWithRetry (aeProvider env) isTransient req (\ev -&gt; do</span>
+<span class="lineno">  233 </span><span class="spaces">               </span><span class="istickedoff">case ev of</span>
+<span class="lineno">  234 </span><span class="spaces">                 </span><span class="istickedoff">StreamTextChunk delta</span>
+<span class="lineno">  235 </span><span class="spaces">                   </span><span class="istickedoff">| <span class="tickonlytrue">streamSends</span> -&gt; ccSend (aeCaps env) delta</span>
+<span class="lineno">  236 </span><span class="spaces">                 </span><span class="istickedoff">_ -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  237 </span><span class="spaces">               </span><span class="istickedoff">modifyIORef' collectedRef (++ [ev])</span>
+<span class="lineno">  238 </span><span class="spaces">               </span><span class="istickedoff">pure <span class="nottickedoff">True</span>)))</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">let estream = case mResult of</span>
+<span class="lineno">  240 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;stream timed out (no data for 5 minutes)&quot;</span></span>
+<span class="lineno">  241 </span><span class="spaces">            </span><span class="istickedoff">Just (Left ()) -&gt; <span class="nottickedoff">Left &quot;(stopped)&quot;</span></span>
+<span class="lineno">  242 </span><span class="spaces">            </span><span class="istickedoff">Just (Right r) -&gt; r</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">case estream of</span>
+<span class="lineno">  244 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; liftIO $ do</span>
+<span class="lineno">  245 </span><span class="spaces">          </span><span class="istickedoff">-- Distinguish a user-initiated stop from a genuine provider</span>
+<span class="lineno">  246 </span><span class="spaces">          </span><span class="istickedoff">-- error. &quot;(stopped)&quot; is the abort-signal message; everything</span>
+<span class="lineno">  247 </span><span class="spaces">          </span><span class="istickedoff">-- else is a provider failure.</span>
+<span class="lineno">  248 </span><span class="spaces">          </span><span class="istickedoff">let isStop = err == &quot;(stopped)&quot;</span>
+<span class="lineno">  249 </span><span class="spaces">          </span><span class="istickedoff">unless isStop $ logProviderError (aeLogPath env) err</span>
+<span class="lineno">  250 </span><span class="spaces">          </span><span class="istickedoff">let errMsg = if <span class="tickonlyfalse">isStop</span> then <span class="nottickedoff">err</span> else &quot;provider error: &quot; &lt;&gt; err</span>
+<span class="lineno">  251 </span><span class="spaces">              </span><span class="istickedoff">assistantMsg = Message Assistant [CbText errMsg]</span>
+<span class="lineno">  252 </span><span class="spaces">              </span><span class="istickedoff">conv = msgs &lt;&gt; [assistantMsg]</span>
+<span class="lineno">  253 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  254 </span><span class="spaces">          </span><span class="istickedoff">let entry = EntryRecord</span>
+<span class="lineno">  255 </span><span class="spaces">                </span><span class="istickedoff">{ erId = <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  256 </span><span class="spaces">                </span><span class="istickedoff">, erTimestamp = <span class="nottickedoff">now</span></span>
+<span class="lineno">  257 </span><span class="spaces">                </span><span class="istickedoff">, erKind = EKResponse</span>
+<span class="lineno">  258 </span><span class="spaces">                </span><span class="istickedoff">, erConvLen = <span class="nottickedoff">length conv</span></span>
+<span class="lineno">  259 </span><span class="spaces">                </span><span class="istickedoff">, erEnvelope = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  260 </span><span class="spaces">                </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  261 </span><span class="spaces">                </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  262 </span><span class="spaces">                </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  263 </span><span class="spaces">                </span><span class="istickedoff">, erHarness = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  264 </span><span class="spaces">                </span><span class="istickedoff">, erCorrelation = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  265 </span><span class="spaces">                </span><span class="istickedoff">, erMeta = <span class="nottickedoff">Map.empty</span></span>
+<span class="lineno">  266 </span><span class="spaces">                </span><span class="istickedoff">}</span>
+<span class="lineno">  267 </span><span class="spaces">          </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env) (TwoFileWrite conv entry)</span>
+<span class="lineno">  268 </span><span class="spaces">          </span><span class="istickedoff">aeOnEntry env</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff">ccSend (aeCaps env) errMsg</span>
+<span class="lineno">  270 </span><span class="spaces">          </span><span class="istickedoff">notifyStop <span class="nottickedoff">errMsg</span></span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="istickedoff">Right outcome -&gt; do</span>
+<span class="lineno">  272 </span><span class="spaces">          </span><span class="istickedoff">events &lt;- liftIO (readIORef collectedRef)</span>
+<span class="lineno">  273 </span><span class="spaces">          </span><span class="istickedoff">let resp = aggregateStreamEvents events outcome</span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff">handleResponse env tStart n lenContinue msgs resp <span class="nottickedoff">streamSends</span></span>
+<span class="lineno">  275 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="istickedoff">-- | Handle a completed provider response: record it to the transcript,</span>
+<span class="lineno">  277 </span><span class="spaces">    </span><span class="istickedoff">-- then branch on tool calls vs final text vs StopMaxTokens. When</span>
+<span class="lineno">  278 </span><span class="spaces">    </span><span class="istickedoff">-- @alreadySentText@ is True, the text was already streamed live via</span>
+<span class="lineno">  279 </span><span class="spaces">    </span><span class="istickedoff">-- ccSend (streaming path) — don't re-send the full text, only send the</span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="istickedoff">-- prefix / truncation notice if applicable.</span>
+<span class="lineno">  281 </span><span class="spaces">    </span><span class="istickedoff">handleResponse :: AgentEnv -&gt; UTCTime -&gt; Int -&gt; Int -&gt; [Message] -&gt; CompletionResponse -&gt; Bool -&gt; App ()</span>
+<span class="lineno">  282 </span><span class="spaces">    </span><span class="istickedoff">handleResponse env' tStart n lenContinue msgs resp _alreadySentText = do</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">-- Record the provider response.</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">liftIO $ do</span>
+<span class="lineno">  285 </span><span class="spaces">        </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="istickedoff">let assistantMsg = Message Assistant (rsContent resp)</span>
+<span class="lineno">  287 </span><span class="spaces">            </span><span class="istickedoff">conv = msgs &lt;&gt; [assistantMsg]</span>
+<span class="lineno">  288 </span><span class="spaces">            </span><span class="istickedoff">entry = EntryRecord</span>
+<span class="lineno">  289 </span><span class="spaces">              </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  290 </span><span class="spaces">              </span><span class="istickedoff">, erTimestamp = now</span>
+<span class="lineno">  291 </span><span class="spaces">              </span><span class="istickedoff">, erKind = EKResponse</span>
+<span class="lineno">  292 </span><span class="spaces">              </span><span class="istickedoff">, erConvLen = length conv</span>
+<span class="lineno">  293 </span><span class="spaces">              </span><span class="istickedoff">, erEnvelope = Nothing</span>
+<span class="lineno">  294 </span><span class="spaces">              </span><span class="istickedoff">, erUsage = Just (rsUsage resp)</span>
+<span class="lineno">  295 </span><span class="spaces">              </span><span class="istickedoff">, erStop = Just (rsStop resp)</span>
+<span class="lineno">  296 </span><span class="spaces">              </span><span class="istickedoff">, erDurationMs = Nothing</span>
+<span class="lineno">  297 </span><span class="spaces">              </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  298 </span><span class="spaces">              </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff">, erMeta = Map.empty</span>
+<span class="lineno">  300 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  301 </span><span class="spaces">        </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv entry)</span>
+<span class="lineno">  302 </span><span class="spaces">        </span><span class="istickedoff">aeOnEntry env'</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">let toolUses = [b | b@CbToolUse{} &lt;- rsContent resp]</span>
+<span class="lineno">  304 </span><span class="spaces">      </span><span class="istickedoff">if null toolUses</span>
+<span class="lineno">  305 </span><span class="spaces">        </span><span class="istickedoff">then</span>
+<span class="lineno">  306 </span><span class="spaces">          </span><span class="istickedoff">if rsStop resp == StopMaxTokens &amp;&amp; lenContinue &lt; maxLengthContinueRetries</span>
+<span class="lineno">  307 </span><span class="spaces">            </span><span class="istickedoff">then do</span>
+<span class="lineno">  308 </span><span class="spaces">              </span><span class="istickedoff">liftIO (logTruncation (aeLogPath env') (lenContinue + 1))</span>
+<span class="lineno">  309 </span><span class="spaces">              </span><span class="istickedoff">let assistantMsg = Message Assistant (rsContent resp)</span>
+<span class="lineno">  310 </span><span class="spaces">                  </span><span class="istickedoff">contMsg = textMsg User continuationPrompt</span>
+<span class="lineno">  311 </span><span class="spaces">                  </span><span class="istickedoff">conv2 = msgs &lt;&gt; [assistantMsg, contMsg]</span>
+<span class="lineno">  312 </span><span class="spaces">              </span><span class="istickedoff">liftIO $ do</span>
+<span class="lineno">  313 </span><span class="spaces">                </span><span class="istickedoff">now2 &lt;- getCurrentTime</span>
+<span class="lineno">  314 </span><span class="spaces">                </span><span class="istickedoff">let <span class="nottickedoff">entry2 = EntryRecord</span></span>
+<span class="lineno">  315 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">{ erId = &quot;&quot;</span></span>
+<span class="lineno">  316 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erTimestamp = now2</span></span>
+<span class="lineno">  317 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erKind = EKRequest</span></span>
+<span class="lineno">  318 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erConvLen = length conv2</span></span>
+<span class="lineno">  319 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erEnvelope = Nothing</span></span>
+<span class="lineno">  320 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erUsage = Nothing</span></span>
+<span class="lineno">  321 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erStop = Nothing</span></span>
+<span class="lineno">  322 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erDurationMs = Nothing</span></span>
+<span class="lineno">  323 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erHarness = Nothing</span></span>
+<span class="lineno">  324 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erCorrelation = Nothing</span></span>
+<span class="lineno">  325 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">, erMeta = Map.empty</span></span>
+<span class="lineno">  326 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  327 </span><span class="spaces">                </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 <span class="nottickedoff">entry2</span>)</span>
+<span class="lineno">  328 </span><span class="spaces">                </span><span class="istickedoff">aeOnEntry env'</span>
+<span class="lineno">  329 </span><span class="spaces">              </span><span class="istickedoff">tEnd &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  330 </span><span class="spaces">              </span><span class="istickedoff">liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))</span>
+<span class="lineno">  331 </span><span class="spaces">              </span><span class="istickedoff">go (n - 1) (lenContinue + 1) conv2</span>
+<span class="lineno">  332 </span><span class="spaces">            </span><span class="istickedoff">else liftIO $ do</span>
+<span class="lineno">  333 </span><span class="spaces">              </span><span class="istickedoff">tEnd &lt;- getCurrentTime</span>
+<span class="lineno">  334 </span><span class="spaces">              </span><span class="istickedoff">logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd)</span>
+<span class="lineno">  335 </span><span class="spaces">              </span><span class="istickedoff">let texts = [t | CbText t &lt;- rsContent resp]</span>
+<span class="lineno">  336 </span><span class="spaces">                  </span><span class="istickedoff">ModelId m = aeModel env'</span>
+<span class="lineno">  337 </span><span class="spaces">                  </span><span class="istickedoff">prefix = aeProviderLabel env' &lt;&gt; &quot;/&quot; &lt;&gt; m &lt;&gt; &quot;&gt; &quot;</span>
+<span class="lineno">  338 </span><span class="spaces">              </span><span class="istickedoff">if rsStop resp == StopMaxTokens</span>
+<span class="lineno">  339 </span><span class="spaces">                </span><span class="istickedoff">then do</span>
+<span class="lineno">  340 </span><span class="spaces">                  </span><span class="istickedoff">logTruncationGiveUp (aeLogPath env')</span>
+<span class="lineno">  341 </span><span class="spaces">                  </span><span class="istickedoff">let notice = &quot;(stopped: response truncated at the &quot;</span>
+<span class="lineno">  342 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; T.pack (show defaultMaxTokens)</span>
+<span class="lineno">  343 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot;-token output limit after &quot;</span>
+<span class="lineno">  344 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; T.pack (show maxLengthContinueRetries)</span>
+<span class="lineno">  345 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot; continuation attempts. Send any message to \</span>
+<span class="lineno">  346 </span><span class="spaces">                        </span><span class="istickedoff">\continue.)&quot;</span>
+<span class="lineno">  347 </span><span class="spaces">                      </span><span class="istickedoff">combined = case texts of</span>
+<span class="lineno">  348 </span><span class="spaces">                        </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">notice</span></span>
+<span class="lineno">  349 </span><span class="spaces">                        </span><span class="istickedoff">ts -&gt; T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> ts &lt;&gt; &quot;\n\n&quot; &lt;&gt; notice</span>
+<span class="lineno">  350 </span><span class="spaces">                  </span><span class="istickedoff">-- The truncation notice is always sent to the arrival</span>
+<span class="lineno">  351 </span><span class="spaces">                  </span><span class="istickedoff">-- channel (it's new information — the user needs to know</span>
+<span class="lineno">  352 </span><span class="spaces">                  </span><span class="istickedoff">-- the turn was truncated), even if the partial text was</span>
+<span class="lineno">  353 </span><span class="spaces">                  </span><span class="istickedoff">-- already streamed.</span>
+<span class="lineno">  354 </span><span class="spaces">                  </span><span class="istickedoff">ccSend (aeCaps env') (prefix &lt;&gt; combined)</span>
+<span class="lineno">  355 </span><span class="spaces">                  </span><span class="istickedoff">notifyStop <span class="nottickedoff">(prefix &lt;&gt; combined)</span></span>
+<span class="lineno">  356 </span><span class="spaces">                </span><span class="istickedoff">else do</span>
+<span class="lineno">  357 </span><span class="spaces">                  </span><span class="istickedoff">-- Normal final answer: text was already streamed live;</span>
+<span class="lineno">  358 </span><span class="spaces">                  </span><span class="istickedoff">-- don't re-send via ccSend (would double-deliver). Only</span>
+<span class="lineno">  359 </span><span class="spaces">                  </span><span class="istickedoff">-- fan out to other chat channels via notifyStop.</span>
+<span class="lineno">  360 </span><span class="spaces">                  </span><span class="istickedoff">-- For non-streaming channels (Telegram, Signal — chStreaming</span>
+<span class="lineno">  361 </span><span class="spaces">                  </span><span class="istickedoff">-- = False), alreadySentText is False, so ccSend would fire.</span>
+<span class="lineno">  362 </span><span class="spaces">                  </span><span class="istickedoff">-- But notifyStop (replyFanout) already sends to ALL</span>
+<span class="lineno">  363 </span><span class="spaces">                  </span><span class="istickedoff">-- subscribed channels INCLUDING the arrival channel. So</span>
+<span class="lineno">  364 </span><span class="spaces">                  </span><span class="istickedoff">-- ccSend would double-deliver. Fix: skip ccSend entirely;</span>
+<span class="lineno">  365 </span><span class="spaces">                  </span><span class="istickedoff">-- replyFanout handles all delivery (it sends to every</span>
+<span class="lineno">  366 </span><span class="spaces">                  </span><span class="istickedoff">-- subscribed channel, which includes the arrival one).</span>
+<span class="lineno">  367 </span><span class="spaces">                  </span><span class="istickedoff">notifyStop <span class="nottickedoff">(prefix &lt;&gt; T.intercalate &quot;\n&quot; texts)</span></span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  369 </span><span class="spaces">          </span><span class="istickedoff">results &lt;- mapM dispatchOne toolUses</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="istickedoff">-- Abort guard: if a tool call was aborted mid-flight (the user</span>
+<span class="lineno">  371 </span><span class="spaces">          </span><span class="istickedoff">-- clicked stop, set the abort flag), terminate the turn</span>
+<span class="lineno">  372 </span><span class="spaces">          </span><span class="istickedoff">-- immediately instead of feeding the aborted tool results back</span>
+<span class="lineno">  373 </span><span class="spaces">          </span><span class="istickedoff">-- to the LLM and continuing. Without this guard the loop would</span>
+<span class="lineno">  374 </span><span class="spaces">          </span><span class="istickedoff">-- recurse into `go`, the LLM would emit a follow-up response,</span>
+<span class="lineno">  375 </span><span class="spaces">          </span><span class="istickedoff">-- and the tab would stay &quot;thinking&quot; until that response</span>
+<span class="lineno">  376 </span><span class="spaces">          </span><span class="istickedoff">-- completes — the user-visible stop button would appear to do</span>
+<span class="lineno">  377 </span><span class="spaces">          </span><span class="istickedoff">-- nothing. Mirrors the stream-abort `Left &quot;(stopped)&quot;` path</span>
+<span class="lineno">  378 </span><span class="spaces">          </span><span class="istickedoff">-- above so the bracket cleanup fires the idle broadcast.</span>
+<span class="lineno">  379 </span><span class="spaces">          </span><span class="istickedoff">aborted &lt;- liftIO (isAborted (aeAbortFlag env'))</span>
+<span class="lineno">  380 </span><span class="spaces">          </span><span class="istickedoff">if aborted</span>
+<span class="lineno">  381 </span><span class="spaces">            </span><span class="istickedoff">then liftIO $ do</span>
+<span class="lineno">  382 </span><span class="spaces">              </span><span class="istickedoff">let stopMsg = &quot;(stopped)&quot;</span>
+<span class="lineno">  383 </span><span class="spaces">                  </span><span class="istickedoff">assistantMsg = Message Assistant (rsContent resp)</span>
+<span class="lineno">  384 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">resultMsg = Message User results</span></span>
+<span class="lineno">  385 </span><span class="spaces">                  </span><span class="istickedoff">conv = msgs &lt;&gt; [assistantMsg, <span class="nottickedoff">resultMsg</span>]</span>
+<span class="lineno">  386 </span><span class="spaces">                          </span><span class="istickedoff">&lt;&gt; [<span class="nottickedoff">Message Assistant [CbText stopMsg]</span>]</span>
+<span class="lineno">  387 </span><span class="spaces">              </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  388 </span><span class="spaces">              </span><span class="istickedoff">let <span class="nottickedoff">entry = EntryRecord</span></span>
+<span class="lineno">  389 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">{ erId = &quot;&quot;</span></span>
+<span class="lineno">  390 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erTimestamp = now</span></span>
+<span class="lineno">  391 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erKind = EKResponse</span></span>
+<span class="lineno">  392 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erConvLen = length conv</span></span>
+<span class="lineno">  393 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erEnvelope = Nothing</span></span>
+<span class="lineno">  394 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erUsage = Nothing</span></span>
+<span class="lineno">  395 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erStop = Nothing</span></span>
+<span class="lineno">  396 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erDurationMs = Nothing</span></span>
+<span class="lineno">  397 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erHarness = Nothing</span></span>
+<span class="lineno">  398 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erCorrelation = Nothing</span></span>
+<span class="lineno">  399 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, erMeta = Map.empty</span></span>
+<span class="lineno">  400 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  401 </span><span class="spaces">              </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv <span class="nottickedoff">entry</span>)</span>
+<span class="lineno">  402 </span><span class="spaces">              </span><span class="istickedoff">aeOnEntry env'</span>
+<span class="lineno">  403 </span><span class="spaces">              </span><span class="istickedoff">ccSend (aeCaps env') stopMsg</span>
+<span class="lineno">  404 </span><span class="spaces">              </span><span class="istickedoff">notifyStop <span class="nottickedoff">stopMsg</span></span>
+<span class="lineno">  405 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">  406 </span><span class="spaces">              </span><span class="istickedoff">let assistantMsg = Message Assistant (rsContent resp)</span>
+<span class="lineno">  407 </span><span class="spaces">                  </span><span class="istickedoff">resultMsg = Message User results</span>
+<span class="lineno">  408 </span><span class="spaces">              </span><span class="istickedoff">liftIO $ do</span>
+<span class="lineno">  409 </span><span class="spaces">                </span><span class="istickedoff">now2 &lt;- getCurrentTime</span>
+<span class="lineno">  410 </span><span class="spaces">                </span><span class="istickedoff">let conv2 = msgs &lt;&gt; [assistantMsg, resultMsg]</span>
+<span class="lineno">  411 </span><span class="spaces">                    </span><span class="istickedoff">entry2 = EntryRecord</span>
+<span class="lineno">  412 </span><span class="spaces">                      </span><span class="istickedoff">{ erId = &quot;&quot;</span>
+<span class="lineno">  413 </span><span class="spaces">                      </span><span class="istickedoff">, erTimestamp = now2</span>
+<span class="lineno">  414 </span><span class="spaces">                      </span><span class="istickedoff">, erKind = EKRequest</span>
+<span class="lineno">  415 </span><span class="spaces">                      </span><span class="istickedoff">, erConvLen = length conv2</span>
+<span class="lineno">  416 </span><span class="spaces">                      </span><span class="istickedoff">, erEnvelope = Nothing</span>
+<span class="lineno">  417 </span><span class="spaces">                      </span><span class="istickedoff">, erUsage = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  418 </span><span class="spaces">                      </span><span class="istickedoff">, erStop = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  419 </span><span class="spaces">                      </span><span class="istickedoff">, erDurationMs = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  420 </span><span class="spaces">                      </span><span class="istickedoff">, erHarness = Nothing</span>
+<span class="lineno">  421 </span><span class="spaces">                      </span><span class="istickedoff">, erCorrelation = Nothing</span>
+<span class="lineno">  422 </span><span class="spaces">                      </span><span class="istickedoff">, erMeta = Map.empty</span>
+<span class="lineno">  423 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  424 </span><span class="spaces">                </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env') (TwoFileWrite conv2 entry2)</span>
+<span class="lineno">  425 </span><span class="spaces">                </span><span class="istickedoff">aeOnEntry env'</span>
+<span class="lineno">  426 </span><span class="spaces">              </span><span class="istickedoff">tEnd &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  427 </span><span class="spaces">              </span><span class="istickedoff">liftIO (logTurnEnd (aeLogPath env') (n - 1) (msDiff tStart tEnd))</span>
+<span class="lineno">  428 </span><span class="spaces">              </span><span class="istickedoff">go (n - 1) <span class="nottickedoff">0</span> (msgs &lt;&gt; [assistantMsg, resultMsg])</span>
+<span class="lineno">  429 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  430 </span><span class="spaces">    </span><span class="istickedoff">dispatchOne :: ContentBlock -&gt; App ContentBlock</span>
+<span class="lineno">  431 </span><span class="spaces">    </span><span class="istickedoff">dispatchOne (CbToolUse tcid name input) = do</span>
+<span class="lineno">  432 </span><span class="spaces">      </span><span class="istickedoff">let mOp = lookupOp (aeRegistry env) name</span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="istickedoff">mConfirmed &lt;- checkConfirmation name mOp <span class="nottickedoff">input</span></span>
+<span class="lineno">  434 </span><span class="spaces">      </span><span class="istickedoff">res &lt;- case mConfirmed of</span>
+<span class="lineno">  435 </span><span class="spaces">        </span><span class="istickedoff">Left denyMsg -&gt; pure (Left (Denied denyMsg))</span>
+<span class="lineno">  436 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; dispatch (aeRegistry env) (aeTranscript env) <span class="nottickedoff">(aeBackend env)</span> (aeUIOEnv env) (aeToolTimeout env) (aeAbortFlag env) name input</span>
+<span class="lineno">  437 </span><span class="spaces">      </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  438 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; CbToolResult tcid [TrpText (T.pack (show e))] True</span>
+<span class="lineno">  439 </span><span class="spaces">        </span><span class="istickedoff">Right r -&gt; CbToolResult tcid (orParts r) (orIsError r)</span>
+<span class="lineno">  440 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  441 </span><span class="spaces">        </span><span class="istickedoff">-- | The human-confirmation gate. 'Full' autonomy (@--yolo@) bypasses</span>
+<span class="lineno">  442 </span><span class="spaces">        </span><span class="istickedoff">-- the gate. 'Supervised' checks the approval cache first; on a miss,</span>
+<span class="lineno">  443 </span><span class="spaces">        </span><span class="istickedoff">-- prompts the human via 'ccPrompt' (the reply text is the approval</span>
+<span class="lineno">  444 </span><span class="spaces">        </span><span class="istickedoff">-- scope's wire form: @&quot;once&quot;@, @&quot;for_session&quot;@, @&quot;always&quot;@, or</span>
+<span class="lineno">  445 </span><span class="spaces">        </span><span class="istickedoff">-- @&quot;rejected&quot;@ on the web; on the CLI, @&quot;y&quot;/@&quot;yes&quot;@ → 'ScopeOnce',</span>
+<span class="lineno">  446 </span><span class="spaces">        </span><span class="istickedoff">-- anything else → 'ScopeRejected'). On a hit, records the approval</span>
+<span class="lineno">  447 </span><span class="spaces">        </span><span class="istickedoff">-- scope in the transcript, then proceeds (or denies for 'ScopeRejected').</span>
+<span class="lineno">  448 </span><span class="spaces">        </span><span class="istickedoff">-- Trusted opcodes skip the gate.</span>
+<span class="lineno">  449 </span><span class="spaces">        </span><span class="istickedoff">checkConfirmation :: OpName -&gt; Maybe Opcode -&gt; Value -&gt; App (Either Text ())</span>
+<span class="lineno">  450 </span><span class="spaces">        </span><span class="istickedoff">checkConfirmation opName' mOp input' =</span>
+<span class="lineno">  451 </span><span class="spaces">          </span><span class="istickedoff">case aeAutonomy env of</span>
+<span class="lineno">  452 </span><span class="spaces">            </span><span class="istickedoff">Full -&gt; pure (Right ())</span>
+<span class="lineno">  453 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt;</span>
+<span class="lineno">  454 </span><span class="spaces">              </span><span class="istickedoff">case mOp of</span>
+<span class="lineno">  455 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  456 </span><span class="spaces">                </span><span class="istickedoff">Just op -&gt;</span>
+<span class="lineno">  457 </span><span class="spaces">                  </span><span class="istickedoff">case opTrust op of</span>
+<span class="lineno">  458 </span><span class="spaces">                    </span><span class="istickedoff">Untrusted -&gt; do</span>
+<span class="lineno">  459 </span><span class="spaces">                      </span><span class="istickedoff">mCached &lt;- liftIO (checkApproval (aeApprovals env) <span class="nottickedoff">(aeSession env)</span> opName')</span>
+<span class="lineno">  460 </span><span class="spaces">                      </span><span class="istickedoff">case mCached of</span>
+<span class="lineno">  461 </span><span class="spaces">                        </span><span class="istickedoff">Just ScopeRejected -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  462 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">recordApprovalEvidence opName' input' ScopeRejected</span></span>
+<span class="lineno">  463 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">pure (Left (&quot;SHELL_EXEC denied by human&quot; &lt;&gt; suffixFor opName'))</span></span>
+<span class="lineno">  464 </span><span class="spaces">                        </span><span class="istickedoff">Just ScopeForSession -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  465 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">recordApprovalEvidence opName' input' ScopeForSession</span></span>
+<span class="lineno">  466 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  467 </span><span class="spaces">                        </span><span class="istickedoff">Just ScopeAlways -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  468 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">recordApprovalEvidence opName' input' ScopeAlways</span></span>
+<span class="lineno">  469 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  470 </span><span class="spaces">                        </span><span class="istickedoff">Just ScopeOnce -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  471 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">-- ScopeOnce is never cached (recordApproval is a</span></span>
+<span class="lineno">  472 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">-- no-op for it), so this branch is unreachable.</span></span>
+<span class="lineno">  473 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">-- If it somehow appears, treat it as a cache miss.</span></span>
+<span class="lineno">  474 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">recordApprovalEvidence opName' input' ScopeOnce</span></span>
+<span class="lineno">  475 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  476 </span><span class="spaces">                        </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  477 </span><span class="spaces">                          </span><span class="istickedoff">let <span class="nottickedoff">prompt = buildConfirmationPrompt opName' input'</span></span>
+<span class="lineno">  478 </span><span class="spaces">                          </span><span class="istickedoff">-- The confirmation gate's prompt (Allow &lt;NAME&gt;</span>
+<span class="lineno">  479 </span><span class="spaces">                          </span><span class="istickedoff">-- &lt;JSON&gt;? [y/N]) is NOT model text, so it must be</span>
+<span class="lineno">  480 </span><span class="spaces">                          </span><span class="istickedoff">-- sent to the channel. ccPrompt no longer sends</span>
+<span class="lineno">  481 </span><span class="spaces">                          </span><span class="istickedoff">-- (the model already streamed ASK_HUMAN text), so</span>
+<span class="lineno">  482 </span><span class="spaces">                          </span><span class="istickedoff">-- we send here.</span>
+<span class="lineno">  483 </span><span class="spaces">                          </span><span class="istickedoff">liftIO (ccSend (aeCaps env) <span class="nottickedoff">prompt</span>)</span>
+<span class="lineno">  484 </span><span class="spaces">                          </span><span class="istickedoff">reply &lt;- liftIO (ccPrompt (aeCaps env) <span class="nottickedoff">(AskPrompt prompt [])</span>)</span>
+<span class="lineno">  485 </span><span class="spaces">                          </span><span class="istickedoff">let scope = parseScopeReply reply</span>
+<span class="lineno">  486 </span><span class="spaces">                          </span><span class="istickedoff">liftIO (recordApproval (aeApprovals env) <span class="nottickedoff">(aeSession env)</span> <span class="nottickedoff">opName'</span> scope)</span>
+<span class="lineno">  487 </span><span class="spaces">                          </span><span class="istickedoff">recordApprovalEvidence <span class="nottickedoff">opName'</span> <span class="nottickedoff">input'</span> <span class="nottickedoff">scope</span></span>
+<span class="lineno">  488 </span><span class="spaces">                          </span><span class="istickedoff">case scope of</span>
+<span class="lineno">  489 </span><span class="spaces">                            </span><span class="istickedoff">ScopeRejected -&gt; pure (Left (&quot;SHELL_EXEC denied by human&quot; &lt;&gt; suffixFor opName'))</span>
+<span class="lineno">  490 </span><span class="spaces">                            </span><span class="istickedoff">_ -&gt; pure (Right ())</span>
+<span class="lineno">  491 </span><span class="spaces">                    </span><span class="istickedoff">_ -&gt; pure (Right ())</span>
+<span class="lineno">  492 </span><span class="spaces">        </span><span class="istickedoff">-- | Parse the 'ccPrompt' reply into an 'ApprovalScope'. The web</span>
+<span class="lineno">  493 </span><span class="spaces">        </span><span class="istickedoff">-- returns the scope's wire form (@once@, @for_session@, @always@,</span>
+<span class="lineno">  494 </span><span class="spaces">        </span><span class="istickedoff">-- @rejected@). The CLI returns free text (@y@/@yes@ → 'ScopeOnce',</span>
+<span class="lineno">  495 </span><span class="spaces">        </span><span class="istickedoff">-- anything else → 'ScopeRejected').</span>
+<span class="lineno">  496 </span><span class="spaces">        </span><span class="istickedoff">parseScopeReply :: Text -&gt; ApprovalScope</span>
+<span class="lineno">  497 </span><span class="spaces">        </span><span class="istickedoff">parseScopeReply reply =</span>
+<span class="lineno">  498 </span><span class="spaces">          </span><span class="istickedoff">case parseApprovalScope reply of</span>
+<span class="lineno">  499 </span><span class="spaces">            </span><span class="istickedoff">Right scope -&gt; scope</span>
+<span class="lineno">  500 </span><span class="spaces">            </span><span class="istickedoff">Left _ -&gt;</span>
+<span class="lineno">  501 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">let lower = T.toLower (T.strip reply) in</span></span>
+<span class="lineno">  502 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">if lower == &quot;y&quot; || lower == &quot;yes&quot;</span></span>
+<span class="lineno">  503 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">then ScopeOnce</span></span>
+<span class="lineno">  504 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">else ScopeRejected</span></span>
+<span class="lineno">  505 </span><span class="spaces">        </span><span class="istickedoff">buildConfirmationPrompt :: OpName -&gt; Value -&gt; Text</span>
+<span class="lineno">  506 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">buildConfirmationPrompt (OpName n) inp =</span></span>
+<span class="lineno">  507 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&quot;Allow &quot; &lt;&gt; n &lt;&gt; &quot; &quot; &lt;&gt; T.pack (BLC.unpack (A.encode inp)) &lt;&gt; &quot;? [y/N] &quot;</span></span>
+<span class="lineno">  508 </span><span class="spaces">        </span><span class="istickedoff">suffixFor :: OpName -&gt; Text</span>
+<span class="lineno">  509 </span><span class="spaces">        </span><span class="istickedoff">suffixFor (OpName n) = &quot; (&quot; &lt;&gt; n &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  510 </span><span class="spaces">        </span><span class="istickedoff">-- | Record an EKHarness entry in the transcript carrying the opcode</span>
+<span class="lineno">  511 </span><span class="spaces">        </span><span class="istickedoff">-- name, input, and approval scope as evidence of the human's</span>
+<span class="lineno">  512 </span><span class="spaces">        </span><span class="istickedoff">-- decision. This is separate from the dispatcher's own entry (which</span>
+<span class="lineno">  513 </span><span class="spaces">        </span><span class="istickedoff">-- records the invocation, not the approval).</span>
+<span class="lineno">  514 </span><span class="spaces">        </span><span class="istickedoff">recordApprovalEvidence :: OpName -&gt; Value -&gt; ApprovalScope -&gt; App ()</span>
+<span class="lineno">  515 </span><span class="spaces">        </span><span class="istickedoff">recordApprovalEvidence opName' input' scope = liftIO $ do</span>
+<span class="lineno">  516 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  517 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">entry = EntryRecord</span></span>
+<span class="lineno">  518 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">{ erId = &quot;&quot;</span></span>
+<span class="lineno">  519 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erTimestamp = now</span></span>
+<span class="lineno">  520 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erKind = EKHarness</span></span>
+<span class="lineno">  521 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erConvLen = 0</span></span>
+<span class="lineno">  522 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erEnvelope = Nothing</span></span>
+<span class="lineno">  523 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erUsage = Nothing</span></span>
+<span class="lineno">  524 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erStop = Nothing</span></span>
+<span class="lineno">  525 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erDurationMs = Nothing</span></span>
+<span class="lineno">  526 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erHarness = Nothing</span></span>
+<span class="lineno">  527 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erCorrelation = Nothing</span></span>
+<span class="lineno">  528 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, erMeta = Map.fromList</span></span>
+<span class="lineno">  529 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">[ (&quot;op&quot;, object [&quot;name&quot; .= opName'])</span></span>
+<span class="lineno">  530 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, (&quot;input&quot;, input')</span></span>
+<span class="lineno">  531 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, (&quot;approval&quot;, object [&quot;scope&quot; .= scope])</span></span>
+<span class="lineno">  532 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  533 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  534 </span><span class="spaces">          </span><span class="istickedoff">tfwRecordAndAck (aeTranscript env) (TwoFileWrite [] <span class="nottickedoff">entry</span>)</span>
+<span class="lineno">  535 </span><span class="spaces">          </span><span class="istickedoff">aeOnEntry env</span>
+<span class="lineno">  536 </span><span class="spaces">    </span><span class="istickedoff">dispatchOne other = <span class="nottickedoff">pure other</span></span></span>  -- non-tool blocks never reach dispatchOne
+<span class="lineno">  537 </span>
+<span class="lineno">  538 </span>-- | Is a provider error text transient (worth retrying)? Transport failures
+<span class="lineno">  539 </span>-- (the common &quot;Ollama not running&quot; case), rate limits (HTTP 429), and server
+<span class="lineno">  540 </span>-- errors (HTTP 5xx) are transient — the daemon might come back, a rate limit
+<span class="lineno">  541 </span>-- might clear, a 5xx might be a transient upstream fault. Auth errors (401),
+<span class="lineno">  542 </span>-- bad requests (400), and decode failures are permanent — retrying wastes
+<span class="lineno">  543 </span>-- time and delays surfacing the real problem to the user.
+<span class="lineno">  544 </span>isTransientError :: Text -&gt; Bool
+<span class="lineno">  545 </span><span class="decl"><span class="istickedoff">isTransientError err =</span>
+<span class="lineno">  546 </span><span class="spaces">  </span><span class="istickedoff">any (`T.isInfixOf` err) transientMarkers</span>
+<span class="lineno">  547 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  548 </span><span class="spaces">    </span><span class="istickedoff">transientMarkers =</span>
+<span class="lineno">  549 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;could not reach&quot;           -- Ollama transport failure</span>
+<span class="lineno">  550 </span><span class="spaces">      </span><span class="istickedoff">, &quot;connection or transport error&quot;  -- Anthropic transport failure</span>
+<span class="lineno">  551 </span><span class="spaces">      </span><span class="istickedoff">, &quot;HTTP 429&quot;                  -- rate limit (Anthropic + Ollama)</span>
+<span class="lineno">  552 </span><span class="spaces">      </span><span class="istickedoff">, &quot;HTTP 500&quot;                  -- server error</span>
+<span class="lineno">  553 </span><span class="spaces">      </span><span class="istickedoff">, &quot;HTTP 502&quot;                  -- bad gateway</span>
+<span class="lineno">  554 </span><span class="spaces">      </span><span class="istickedoff">, &quot;HTTP 503&quot;                  -- service unavailable</span>
+<span class="lineno">  555 </span><span class="spaces">      </span><span class="istickedoff">, &quot;HTTP 504&quot;                  -- gateway timeout</span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">  557 </span>
+<span class="lineno">  558 </span>-- | When the debug-transcript flag is set ('aeDebugRequestsPath' = 'Just path'),
+<span class="lineno">  559 </span>-- append the full 'CompletionRequest' (one JSONL line, with trailing newline)
+<span class="lineno">  560 </span>-- to @requests.jsonl@. The contract: each line is the complete request exactly
+<span class="lineno">  561 </span>-- as sent to the LLM, including the full 'crMessages' history. When the path
+<span class="lineno">  562 </span>-- is 'Nothing' (the default), this is a no-op. Best-effort: an IO error is
+<span class="lineno">  563 </span>-- swallowed (the debug file must never break the agent loop).
+<span class="lineno">  564 </span>appendDebugRequest :: Maybe FilePath -&gt; CompletionRequest -&gt; IO ()
+<span class="lineno">  565 </span><span class="decl"><span class="istickedoff">appendDebugRequest Nothing _ = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  566 </span><span class="spaces"></span><span class="istickedoff">appendDebugRequest (Just path) req =</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">let line = BL.toStrict (A.encode req) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">in IO.withFile path IO.AppendMode (`BS.hPutStr` line)</span>
+<span class="lineno">  569 </span><span class="spaces">     </span><span class="istickedoff">`catch` <span class="nottickedoff">\(_ :: SomeException) -&gt; pure ()</span></span></span>
+<span class="lineno">  570 </span>
+<span class="lineno">  571 </span>-- | Compute the millisecond difference between two 'UTCTime' timestamps
+<span class="lineno">  572 </span>-- (for turn-duration logging).
+<span class="lineno">  573 </span>msDiff :: UTCTime -&gt; UTCTime -&gt; Integer
+<span class="lineno">  574 </span><span class="decl"><span class="istickedoff">msDiff start end = round (realToFrac (diffUTCTime end start) * 1000 :: Double)</span></span>
+<span class="lineno">  575 </span>
+<span class="lineno">  576 </span>-- | Aggregate a list of 'StreamEvent's (collected during streaming) into a
+<span class="lineno">  577 </span>-- 'CompletionResponse' for the transcript. Text chunks are concatenated into
+<span class="lineno">  578 </span>-- a single 'CbText' block; tool-call start/end pairs become 'CbToolUse'
+<span class="lineno">  579 </span>-- blocks. The stop reason + usage come from the 'StreamOutcome'.
+<span class="lineno">  580 </span>aggregateStreamEvents :: [StreamEvent] -&gt; StreamOutcome -&gt; CompletionResponse
+<span class="lineno">  581 </span><span class="decl"><span class="istickedoff">aggregateStreamEvents events outcome =</span>
+<span class="lineno">  582 </span><span class="spaces">  </span><span class="istickedoff">CompletionResponse blocks (soStop outcome) (soUsage outcome)</span>
+<span class="lineno">  583 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  584 </span><span class="spaces">    </span><span class="istickedoff">textChunks = [t | StreamTextChunk t &lt;- events]</span>
+<span class="lineno">  585 </span><span class="spaces">    </span><span class="istickedoff">textBlocks = [CbText (T.intercalate <span class="nottickedoff">&quot;&quot;</span> textChunks) | not (null textChunks)]</span>
+<span class="lineno">  586 </span><span class="spaces">    </span><span class="istickedoff">toolBlocks = [CbToolUse tcid name args</span>
+<span class="lineno">  587 </span><span class="spaces">                </span><span class="istickedoff">| StreamToolEnd tcid name args &lt;- events]</span>
+<span class="lineno">  588 </span><span class="spaces">    </span><span class="istickedoff">blocks = textBlocks &lt;&gt; toolBlocks</span></span>
+
+</pre>
+</body>
+</html>

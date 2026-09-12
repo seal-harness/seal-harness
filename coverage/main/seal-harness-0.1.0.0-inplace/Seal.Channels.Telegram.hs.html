@@ -1,0 +1,198 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TypeApplications #-}
+<span class="lineno">    3 </span>-- | The Telegram channel: a 'TelegramChannel' record (resolved allow-list +
+<span class="lineno">    4 </span>-- chunk limit + inbox 'TQueue' + transport + last-sender 'IORef' + logger)
+<span class="lineno">    5 </span>-- and its 'Channel' instance. The reader thread loops 'tgReceive',
+<span class="lineno">    6 </span>-- allow-lists the sender, and pushes @(MessageSource, body)@ to the inbox;
+<span class="lineno">    7 </span>-- sends are chunked via 'Seal.Channels.Telegram.Transport.chunkMessage' to the
+<span class="lineno">    8 </span>-- configured limit and addressed to the last sender's chat id. Mirrors
+<span class="lineno">    9 </span>-- &quot;Seal.Channels.Signal&quot; in structure.
+<span class="lineno">   10 </span>module Seal.Channels.Telegram
+<span class="lineno">   11 </span>  ( TelegramChannel (..)
+<span class="lineno">   12 </span>  , withTelegramChannel
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Control.Concurrent (forkIO, killThread, threadDelay)
+<span class="lineno">   16 </span>import Control.Concurrent.STM
+<span class="lineno">   17 </span>  (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+<span class="lineno">   18 </span>import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
+<span class="lineno">   19 </span>import Control.Monad (void)
+<span class="lineno">   20 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Seal.Channels.Class (Channel (..))
+<span class="lineno">   25 </span>import Seal.Channels.Telegram.Transport
+<span class="lineno">   26 </span>  ( TelegramTransport (..), TelegramUpdate (..), chunkMessage )
+<span class="lineno">   27 </span>import Seal.Core.AllowList (AllowList (..), isAllowed)
+<span class="lineno">   28 </span>import Seal.Core.ChannelKind (ChannelKind (..))
+<span class="lineno">   29 </span>import Seal.Core.MessageSource
+<span class="lineno">   30 </span>  ( MessageSource, UserId, mkMessageSource, userIdText )
+<span class="lineno">   31 </span>import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
+<span class="lineno">   32 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>import Katip (Severity (..), ls)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | The live Telegram channel state.
+<span class="lineno">   37 </span>data TelegramChannel = TelegramChannel
+<span class="lineno">   38 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgAllowList</span></span></span>   :: AllowList UserId   -- ^ resolved sender allow-list
+<span class="lineno">   39 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgChunkLimit</span></span></span>  :: Int                -- ^ chunk limit for sends
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgInbox</span></span></span>       :: TQueue (MessageSource, Text)
+<span class="lineno">   41 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgTransport</span></span></span>   :: TelegramTransport
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgLastChat</span></span></span>    :: IORef (Maybe Text)  -- ^ last sender's chat id (for replies)
+<span class="lineno">   43 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgReaderAlive</span></span></span> :: IORef Bool
+<span class="lineno">   44 </span>    -- ^ 'True' while the reader thread is running. 'chReceive' stops
+<span class="lineno">   45 </span>    -- returning once the inbox drains and this is 'False'.
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tcgLogger</span></span></span>      :: SealLogger
+<span class="lineno">   47 </span>    -- ^ The shared logger for structured katip logging.
+<span class="lineno">   48 </span>  }
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>instance Channel TelegramChannel where
+<span class="lineno">   51 </span>  <span class="decl"><span class="istickedoff">toHandle ch = ChannelHandle</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">{ chLabel       = <span class="nottickedoff">&quot;telegram&quot;</span></span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">, chSend         = sendChunked ch</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">, chSendError    = <span class="nottickedoff">\t -&gt; sendChunked ch (&quot;error: &quot; &lt;&gt; t)</span></span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">, chSendChunk    = <span class="nottickedoff">sendRaw ch</span></span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">, chPrompt       = \_ -&gt; pure (Left Deferred)  -- Telegram can't answer inline</span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">, chPromptSecret = <span class="nottickedoff">\_ -&gt; pure (Left Deferred)</span></span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">, chStreaming    = False  -- per-token messages flood the chat; send accumulated text once</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">, chReadSecret   = <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">, chReceive      = receiveFromInbox ch</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">, chLastChatId   = readIORef (tcgLastChat ch)</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Run the reader thread with cleanup. Spawns a background thread that
+<span class="lineno">   65 </span>-- loops 'tgReceive', allow-lists the sender, and pushes
+<span class="lineno">   66 </span>-- @(MessageSource, body)@ to 'tcgInbox'. On transport close or exception,
+<span class="lineno">   67 </span>-- the thread exits. The action runs with the channel; on exit the transport
+<span class="lineno">   68 </span>-- is closed and the reader is killed. Mirrors 'withSignalChannel'.
+<span class="lineno">   69 </span>withTelegramChannel
+<span class="lineno">   70 </span>  :: (AllowList UserId, Int)
+<span class="lineno">   71 </span>  -&gt; TelegramTransport
+<span class="lineno">   72 </span>  -&gt; SealLogger
+<span class="lineno">   73 </span>  -&gt; (TelegramChannel -&gt; IO a)
+<span class="lineno">   74 </span>  -&gt; IO a
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">withTelegramChannel (allow, chunkLimit) transport logger action =</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">bracket before after (action . snd)</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">before = do</span>
+<span class="lineno">   79 </span><span class="spaces">      </span><span class="istickedoff">inbox   &lt;- newTQueueIO</span>
+<span class="lineno">   80 </span><span class="spaces">      </span><span class="istickedoff">lastChat &lt;- newIORef Nothing</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">alive   &lt;- newIORef True</span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">let ch = TelegramChannel</span>
+<span class="lineno">   83 </span><span class="spaces">            </span><span class="istickedoff">{ tcgAllowList   = allow</span>
+<span class="lineno">   84 </span><span class="spaces">            </span><span class="istickedoff">, tcgChunkLimit  = chunkLimit</span>
+<span class="lineno">   85 </span><span class="spaces">            </span><span class="istickedoff">, tcgInbox       = inbox</span>
+<span class="lineno">   86 </span><span class="spaces">            </span><span class="istickedoff">, tcgTransport   = transport</span>
+<span class="lineno">   87 </span><span class="spaces">            </span><span class="istickedoff">, tcgLastChat    = lastChat</span>
+<span class="lineno">   88 </span><span class="spaces">            </span><span class="istickedoff">, tcgReaderAlive = alive</span>
+<span class="lineno">   89 </span><span class="spaces">            </span><span class="istickedoff">, tcgLogger      = logger</span>
+<span class="lineno">   90 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff">tid &lt;- forkIO (readerLoop ch)</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">pure (tid, ch)</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">after (tid, _ch) = do</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">killThread tid</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">tgClose transport</span></span>
+<span class="lineno">   96 </span>
+<span class="lineno">   97 </span>-- | The background reader: loop 'tgReceive', allow-list the sender, and push
+<span class="lineno">   98 </span>-- to the inbox. A malformed update or a non-allow-listed sender is logged
+<span class="lineno">   99 </span>-- via 'logIO' and dropped (not fatal). Exits when 'tgReceive' returns 'Left'
+<span class="lineno">  100 </span>-- (the transport is closing). 'ThreadKilled' is logged at 'InfoS' (normal
+<span class="lineno">  101 </span>-- shutdown); other 'AsyncException's at 'WarningS'; synchronous exceptions
+<span class="lineno">  102 </span>-- at 'ErrorS'.
+<span class="lineno">  103 </span>readerLoop :: TelegramChannel -&gt; IO ()
+<span class="lineno">  104 </span><span class="decl"><span class="istickedoff">readerLoop ch = go</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">logger = tcgLogger ch</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">go = do</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="istickedoff">eUpd &lt;- try @SomeException (tgReceive (tcgTransport ch))</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="istickedoff">case eUpd of</span>
+<span class="lineno">  110 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  111 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case (fromException e :: Maybe AsyncException) of</span></span>
+<span class="lineno">  112 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just ThreadKilled -&gt;</span></span>
+<span class="lineno">  113 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger InfoS &quot;reader thread stopped (channel shutting down)&quot;</span></span>
+<span class="lineno">  114 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just _ -&gt;</span></span>
+<span class="lineno">  115 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger WarningS (&quot;reader thread terminated by async exception: &quot; &lt;&gt; ls (T.pack (show e)))</span></span>
+<span class="lineno">  116 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt;</span></span>
+<span class="lineno">  117 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger ErrorS (&quot;reader thread exception: &quot; &lt;&gt; ls (T.pack (show e)))</span></span>
+<span class="lineno">  118 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">writeIORef (tcgReaderAlive ch) False</span></span>
+<span class="lineno">  119 </span><span class="spaces">        </span><span class="istickedoff">Right (Left err) -&gt; do</span>
+<span class="lineno">  120 </span><span class="spaces">          </span><span class="istickedoff">logIO logger ErrorS <span class="nottickedoff">(&quot;reader exiting: &quot; &lt;&gt; ls err)</span></span>
+<span class="lineno">  121 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (tcgReaderAlive ch) False</span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="istickedoff">Right (Right upd) -&gt; do</span>
+<span class="lineno">  123 </span><span class="spaces">          </span><span class="istickedoff">let sender = tuSender upd</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">if isAllowed sender (tcgAllowList ch)</span>
+<span class="lineno">  125 </span><span class="spaces">            </span><span class="istickedoff">then do</span>
+<span class="lineno">  126 </span><span class="spaces">              </span><span class="istickedoff">writeIORef (tcgLastChat ch) (Just (tuChatId upd))</span>
+<span class="lineno">  127 </span><span class="spaces">              </span><span class="istickedoff">-- Acknowledge a callback_query (button tap) so the button's</span>
+<span class="lineno">  128 </span><span class="spaces">              </span><span class="istickedoff">-- loading spinner dismisses, and remove the inline keyboard</span>
+<span class="lineno">  129 </span><span class="spaces">              </span><span class="istickedoff">-- so the buttons can't be re-clicked. Both best-effort.</span>
+<span class="lineno">  130 </span><span class="spaces">              </span><span class="istickedoff">case tuCallbackId upd of</span>
+<span class="lineno">  131 </span><span class="spaces">                </span><span class="istickedoff">Just cbId -&gt; do</span>
+<span class="lineno">  132 </span><span class="spaces">                  </span><span class="istickedoff">void (try @SomeException (tgAnswerCallback (tcgTransport ch) cbId))</span>
+<span class="lineno">  133 </span><span class="spaces">                  </span><span class="istickedoff">case tuCallbackMessageId upd of</span>
+<span class="lineno">  134 </span><span class="spaces">                    </span><span class="istickedoff">Just msgId -&gt; void (try @SomeException (tgEditReplyMarkup (tcgTransport ch) <span class="nottickedoff">(tuChatId upd)</span> <span class="nottickedoff">msgId</span>))</span>
+<span class="lineno">  135 </span><span class="spaces">                    </span><span class="istickedoff">Nothing    -&gt; <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  136 </span><span class="spaces">                </span><span class="istickedoff">Nothing   -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  137 </span><span class="spaces">              </span><span class="istickedoff">case mkMessageSource (tuConversationId upd) Telegram <span class="nottickedoff">(Just sender)</span> mempty of</span>
+<span class="lineno">  138 </span><span class="spaces">                </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">logIO logger WarningS (&quot;MessageSource construction failed: &quot; &lt;&gt; ls err)</span></span>
+<span class="lineno">  139 </span><span class="spaces">                </span><span class="istickedoff">Right ms -&gt; atomically (writeTQueue (tcgInbox ch) (ms, tuBody upd))</span>
+<span class="lineno">  140 </span><span class="spaces">            </span><span class="istickedoff">else logIO logger InfoS <span class="nottickedoff">(&quot;dropped non-allow-listed sender: &quot; &lt;&gt; ls (userIdText sender))</span></span>
+<span class="lineno">  141 </span><span class="spaces">          </span><span class="istickedoff">go</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | Send a message, chunked to 'tcgChunkLimit', addressed to the last chat.
+<span class="lineno">  144 </span>-- If no chat has been seen yet, the send is dropped with a warning log.
+<span class="lineno">  145 </span>sendChunked :: TelegramChannel -&gt; Text -&gt; IO ()
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">sendChunked ch t = do</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">mChat &lt;- readIORef (tcgLastChat ch)</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">case mChat of</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; logIO (tcgLogger ch) WarningS <span class="nottickedoff">&quot;telegram: dropping send — no last chat yet&quot;</span></span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; mapM_ (sendRaw ch) (chunkMessage (tcgChunkLimit ch) t)</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Send one chunk verbatim to the last chat (no further splitting).
+<span class="lineno">  153 </span>sendRaw :: TelegramChannel -&gt; Text -&gt; IO ()
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">sendRaw ch t = do</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">mChat &lt;- readIORef (tcgLastChat ch)</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">case mChat of</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">logIO (tcgLogger ch) WarningS &quot;telegram: dropping chunk — no last chat yet&quot;</span></span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">Just chatId -&gt; tgSend (tcgTransport ch) <span class="nottickedoff">chatId</span> t</span></span>
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>-- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:
+<span class="lineno">  161 </span>-- returns @(Nothing, &quot;&quot;)@ when the inbox is empty AND the reader thread has
+<span class="lineno">  162 </span>-- exited. Returns @(Nothing, &quot;&quot;)@ immediately in that state so the loop can
+<span class="lineno">  163 </span>-- terminate rather than block forever. Mirrors 'receiveFromInbox' in Signal.
+<span class="lineno">  164 </span>receiveFromInbox :: TelegramChannel -&gt; IO (Maybe MessageSource, Text)
+<span class="lineno">  165 </span><span class="decl"><span class="istickedoff">receiveFromInbox ch = do</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="istickedoff">mNext &lt;- atomically (tryReadTQueue (tcgInbox ch))</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">case mNext of</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">Just (ms, body) -&gt; pure (Just ms, body)</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">alive &lt;- readIORef (tcgReaderAlive ch)</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">if alive</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">then do</span>
+<span class="lineno">  173 </span><span class="spaces">          </span><span class="istickedoff">threadDelay 1000  -- 1ms</span>
+<span class="lineno">  174 </span><span class="spaces">          </span><span class="istickedoff">receiveFromInbox ch</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">else pure (Nothing, <span class="nottickedoff">&quot;&quot;</span>)</span></span>
+
+</pre>
+</body>
+</html>

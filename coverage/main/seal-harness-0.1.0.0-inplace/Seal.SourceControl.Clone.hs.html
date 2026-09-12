@@ -1,0 +1,675 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Source-control clone seam — the W2 no-disk design (design §4.1, §4.4,
+<span class="lineno">    3 </span>-- §4.6, §5). The credential mechanism (rev 3): the encrypted keyfile lives
+<span class="lineno">    4 </span>-- on the harness disk (ciphertext); the passphrase lives in the vault;
+<span class="lineno">    5 </span>-- per-op @ssh-agent@ decrypts the keyfile into memory using the passphrase
+<span class="lineno">    6 </span>-- piped to @ssh-add@'s stdin; @ssh -A@ forwards the @SSH_AUTH_SOCK@ to the
+<span class="lineno">    7 </span>-- untrusted machine; after the op, @ssh-add -D@ + @ssh-agent -k@.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- Security invariants (enforced by construction — the W2 self-reviewed
+<span class="lineno">   10 </span>-- checkpoint audits these):
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- 1. **No un-encrypted secret on disk, on either machine.** The encrypted
+<span class="lineno">   13 </span>--    keyfile under @cdKeyfilesDir@ IS permitted (ciphertext — same category
+<span class="lineno">   14 </span>--    as the age-encrypted vault file). The cleartext key exists only in:
+<span class="lineno">   15 </span>--    the vault (age-encrypted at rest) → harness process memory (@vhGet@)
+<span class="lineno">   16 </span>--    → ssh-agent memory (@ssh-add@ decrypts the encrypted keyfile using the
+<span class="lineno">   17 </span>--    passphrase piped to its stdin) → signing requests over the forwarded
+<span class="lineno">   18 </span>--    agent socket. The untrusted machine only ever sees the forwarded
+<span class="lineno">   19 </span>--    @SSH_AUTH_SOCK@.
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- 2. **Per-op agent lifecycle.** Each clone/git-op gets a fresh
+<span class="lineno">   22 </span>--    @ssh-agent@ via 'withCloneTarget' (bracket semantics): start →
+<span class="lineno">   23 </span>--    @sahAddKey &lt;enc-keyfile&gt; &lt;passphrase&gt;@ → run → @sahDeleteAll@ +
+<span class="lineno">   24 </span>--    @sahKill@. Exactly one identity is live at forwarding time (the
+<span class="lineno">   25 </span>--    security-critical scoping — design §4.6).
+<span class="lineno">   26 </span>--
+<span class="lineno">   27 </span>-- 3. **PAT (fallback) uses @http.extraHeader@ in argv (memory, no file).**
+<span class="lineno">   28 </span>--    The token lives only in the git config args (in-memory argv); it is
+<span class="lineno">   29 </span>--    NEVER written to disk. The token-in-untrusted-memory residual is
+<span class="lineno">   30 </span>--    documented (deploy keys preferred).
+<span class="lineno">   31 </span>--
+<span class="lineno">   32 </span>-- 4. **Pinned @known_hosts@ (public data).** 'cdPinnedKnownHosts' is the
+<span class="lineno">   33 </span>--    compile-time-embedded GitHub host keys (tamper-resistant via
+<span class="lineno">   34 </span>--    'file-embed'). Per-op it is written to a temp @known_hosts@ file
+<span class="lineno">   35 </span>--    (0644, public data, bracket-cleaned) and referenced by
+<span class="lineno">   36 </span>--    @UserKnownHostsFile=@ in @GIT_SSH_COMMAND@. @StrictHostKeyChecking=yes@
+<span class="lineno">   37 </span>--    (NOT @accept-new@ / @/dev/null@ — §5.3: MITM defense).
+<span class="lineno">   38 </span>--
+<span class="lineno">   39 </span>-- 5. **The encrypted keyfile never leaves the harness.** The untrusted
+<span class="lineno">   40 </span>--    machine never sees the keyfile (encrypted or otherwise) — only the
+<span class="lineno">   41 </span>--    forwarded @SSH_AUTH_SOCK@ via @ssh -A@.
+<span class="lineno">   42 </span>--
+<span class="lineno">   43 </span>-- 6. **'CloneGitFailed' carries the exit code ONLY — no stderr** (§5.4:
+<span class="lineno">   44 </span>--    git can echo a token-bearing URL in stderr on auth failure).
+<span class="lineno">   45 </span>--
+<span class="lineno">   46 </span>-- 7. **'withCloneTarget' is CPS** (mirrors 'Seal.Security.Secrets.withApiKey'):
+<span class="lineno">   47 </span>--    the authenticated bits are scoped to the continuation and the cleanup
+<span class="lineno">   48 </span>--    always runs (bracket semantics).
+<span class="lineno">   49 </span>module Seal.SourceControl.Clone
+<span class="lineno">   50 </span>  ( CloneError (..)
+<span class="lineno">   51 </span>  , ClonePlan (..)
+<span class="lineno">   52 </span>  , CloneTarget
+<span class="lineno">   53 </span>  , CloneEnv (..)
+<span class="lineno">   54 </span>  , CloneDeps (..)
+<span class="lineno">   55 </span>  , planClone
+<span class="lineno">   56 </span>  , resolveCloneTarget
+<span class="lineno">   57 </span>  , withCloneTarget
+<span class="lineno">   58 </span>  , cloneRepo
+<span class="lineno">   59 </span>  , lsRemoteRepo
+<span class="lineno">   60 </span>  , renderCloneError
+<span class="lineno">   61 </span>  , renderPatHeader
+<span class="lineno">   62 </span>  , stubCloneDeps
+<span class="lineno">   63 </span>  ) where
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>import Control.Exception (bracket, try)
+<span class="lineno">   66 </span>import Data.ByteString (ByteString)
+<span class="lineno">   67 </span>import Data.ByteString qualified as BS
+<span class="lineno">   68 </span>import Data.ByteString.Base64 qualified as B64
+<span class="lineno">   69 </span>import Data.IORef (readIORef)
+<span class="lineno">   70 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   71 </span>import Data.Text (Text)
+<span class="lineno">   72 </span>import Data.Text qualified as T
+<span class="lineno">   73 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   74 </span>import System.Directory (createDirectoryIfMissing, removeFile)
+<span class="lineno">   75 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   76 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   77 </span>import System.IO (hClose, openBinaryTempFile)
+<span class="lineno">   78 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>import Seal.Git.Repo (readProcessBinaryCwdEnv)
+<span class="lineno">   81 </span>import Seal.Security.Vault (VaultHandle (vhGet))
+<span class="lineno">   82 </span>import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
+<span class="lineno">   83 </span>import Seal.SourceControl.Repo
+<span class="lineno">   84 </span>  ( RepoCredential (..), SourceRepo (..), VcsKind (..)
+<span class="lineno">   85 </span>  , hostAllowed, parseRepoHost, repoIdText )
+<span class="lineno">   86 </span>import Seal.SourceControl.AgentRegistry
+<span class="lineno">   87 </span>  ( AgentRegistryHandle, arIsLive, arLoad, arRemove, arUpsert
+<span class="lineno">   88 </span>  , probeAgent, AgentStatus (..) )
+<span class="lineno">   89 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">   90 </span>import Seal.Tools.Ssh.Agent
+<span class="lineno">   91 </span>  ( SshAgentEnv (..), SshAgentHandle (sahAddKey, sahDeleteAll, sahGetAuthEnv
+<span class="lineno">   92 </span>                                      , sahStart) )
+<span class="lineno">   93 </span>import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>----------------------------------------------------------------------------
+<span class="lineno">   96 </span>-- Errors
+<span class="lineno">   97 </span>----------------------------------------------------------------------------
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | The clone seam's error type. 'CloneGitFailed' carries the exit code ONLY
+<span class="lineno">  100 </span>-- (no stderr — §5.4: git can echo a token-bearing URL in stderr on auth
+<span class="lineno">  101 </span>-- failure; a &quot;redacted one-liner&quot; heuristic is fragile, so stderr is dropped
+<span class="lineno">  102 </span>-- entirely for this pass).
+<span class="lineno">  103 </span>data CloneError
+<span class="lineno">  104 </span>  = CloneVaultError VaultError
+<span class="lineno">  105 </span>    -- ^ A vault access failure. Preserves the 'VaultError' so the caller can
+<span class="lineno">  106 </span>    -- distinguish 'VaultLocked' from 'VaultKeyNotFound'.
+<span class="lineno">  107 </span>  | CloneNoCredentialForUrl Text
+<span class="lineno">  108 </span>    -- ^ The URL is malformed (host unparseable) — no credential can be
+<span class="lineno">  109 </span>    -- resolved.
+<span class="lineno">  110 </span>  | CloneUnsupportedVcs VcsKind
+<span class="lineno">  111 </span>    -- ^ The 'VcsKind' has no credential-injection path in this pass
+<span class="lineno">  112 </span>    -- (only 'VcsGitHub' is supported).
+<span class="lineno">  113 </span>  | CloneHostNotSupported Text
+<span class="lineno">  114 </span>    -- ^ The parsed host is not in the allow-list (defense-in-depth on top of
+<span class="lineno">  115 </span>    -- write-time validation).
+<span class="lineno">  116 </span>  | CloneAgentError Text
+<span class="lineno">  117 </span>    -- ^ The per-op ssh-agent lifecycle failed (start, add-key, etc.). The
+<span class="lineno">  118 </span>    -- cleartext key never made it to the agent — fail closed.
+<span class="lineno">  119 </span>  | CloneGitFailed Int
+<span class="lineno">  120 </span>    -- ^ @git@ exited non-zero. Carries the exit code ONLY — NO stderr (§5.4).
+<span class="lineno">  121 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | Render a 'CloneError' to the exact user-facing message used by the slash
+<span class="lineno">  124 </span>-- command (W5) and a future @CLONE@ opcode. The mapping is total and stable:
+<span class="lineno">  125 </span>-- each variant maps to a distinct, actionable message.
+<span class="lineno">  126 </span>renderCloneError :: CloneError -&gt; Text
+<span class="lineno">  127 </span><span class="decl"><span class="istickedoff">renderCloneError = \case</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError VaultLocked -&gt;</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">&quot;vault locked — run /vault unlock&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError (VaultKeyNotFound k) -&gt;</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">&quot;vault key &quot; &lt;&gt; k &lt;&gt; &quot; not found&quot;</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">CloneVaultError v -&gt;</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;vault error: &quot; &lt;&gt; T.pack (show v)</span></span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">CloneNoCredentialForUrl u -&gt;</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">&quot;no credential resolvable for &quot; &lt;&gt; u</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">CloneUnsupportedVcs v -&gt;</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">&quot;unsupported VCS: &quot; &lt;&gt; T.pack (show v)</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">CloneHostNotSupported h -&gt;</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">&quot;host &quot; &lt;&gt; h &lt;&gt; &quot; not supported (only github.com is supported in this pass)&quot;</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">CloneAgentError msg -&gt;</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">&quot;ssh-agent error: &quot; &lt;&gt; msg</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">CloneGitFailed n -&gt;</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="istickedoff">&quot;git failed (exit &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot;)&quot;</span></span>
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>----------------------------------------------------------------------------
+<span class="lineno">  146 </span>-- ClonePlan (pure — no IO, no vault)
+<span class="lineno">  147 </span>----------------------------------------------------------------------------
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | The pure credential-injection strategy for a 'SourceRepo'. Carries only
+<span class="lineno">  150 </span>-- public data (URLs + vault key /names/) — never secret bytes.
+<span class="lineno">  151 </span>data ClonePlan
+<span class="lineno">  152 </span>  = ClonePlanExtraHeader Text Text
+<span class="lineno">  153 </span>    -- ^ Token-free HTTPS URL + the vault key name (PAT / MachineUser). The
+<span class="lineno">  154 </span>    -- token is fetched at clone time and passed via @http.extraHeader@ in
+<span class="lineno">  155 </span>    -- the git argv (memory, no file).
+<span class="lineno">  156 </span>  | ClonePlanSshKey Text Text
+<span class="lineno">  157 </span>    -- ^ SSH URL (host-bound) + the vault key name (DeployKey). The
+<span class="lineno">  158 </span>    -- /passphrase/ is fetched at clone time and piped to @ssh-add@'s stdin;
+<span class="lineno">  159 </span>    -- the encrypted keyfile is read from @cdKeyfilesDir@ by @ssh-add@.
+<span class="lineno">  160 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  161 </span>
+<span class="lineno">  162 </span>-- | Decide the clone strategy for a 'SourceRepo' (pure, no IO, no vault).
+<span class="lineno">  163 </span>-- Re-parses the URL host and asserts the allow-list (§5.2 defense-in-depth),
+<span class="lineno">  164 </span>-- then routes on 'srVcsKind' / 'srCredential'.
+<span class="lineno">  165 </span>--
+<span class="lineno">  166 </span>-- * Malformed URL (host unparseable) → 'CloneNoCredentialForUrl'.
+<span class="lineno">  167 </span>-- * Parsed host not in the allow-list → 'CloneHostNotSupported'.
+<span class="lineno">  168 </span>-- * 'VcsGit' (non-GitHub git) → 'CloneUnsupportedVcs' (no
+<span class="lineno">  169 </span>--   credential-injection path this pass).
+<span class="lineno">  170 </span>-- * 'CredPat' / 'CredMachineUser' → 'ClonePlanExtraHeader' (SSH URL
+<span class="lineno">  171 </span>--   rewritten to token-free HTTPS).
+<span class="lineno">  172 </span>-- * 'CredDeployKey' → 'ClonePlanSshKey' (URL unchanged, SSH).
+<span class="lineno">  173 </span>planClone :: SourceRepo -&gt; Either CloneError ClonePlan
+<span class="lineno">  174 </span><span class="decl"><span class="istickedoff">planClone repo =</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">case parseRepoHost (srUrl repo) of</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff">Left _err -&gt; Left (CloneNoCredentialForUrl (srUrl repo))</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">Right host</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">| not (hostAllowed host) -&gt; Left (CloneHostNotSupported host)</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">| srVcsKind repo == VcsGit -&gt; Left (CloneUnsupportedVcs VcsGit)</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; case srCredential repo of</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff">CredPat vaultKey -&gt;</span>
+<span class="lineno">  182 </span><span class="spaces">            </span><span class="istickedoff">Right (ClonePlanExtraHeader (sshToHttps (srUrl repo)) vaultKey)</span>
+<span class="lineno">  183 </span><span class="spaces">          </span><span class="istickedoff">CredMachineUser vaultKey _username -&gt;</span>
+<span class="lineno">  184 </span><span class="spaces">            </span><span class="istickedoff">Right (ClonePlanExtraHeader (sshToHttps (srUrl repo)) vaultKey)</span>
+<span class="lineno">  185 </span><span class="spaces">          </span><span class="istickedoff">CredDeployKey vaultKey -&gt;</span>
+<span class="lineno">  186 </span><span class="spaces">            </span><span class="istickedoff">Right (ClonePlanSshKey (srUrl repo) vaultKey)</span></span>
+<span class="lineno">  187 </span>
+<span class="lineno">  188 </span>-- | Rewrite an SSH GitHub URL (@git\@github.com:owner\/repo.git@) to a
+<span class="lineno">  189 </span>-- token-free HTTPS URL (@https:\/\/github.com\/owner\/repo.git@). An
+<span class="lineno">  190 </span>-- already-HTTPS URL is returned unchanged. The result NEVER contains a
+<span class="lineno">  191 </span>-- credential fragment.
+<span class="lineno">  192 </span>sshToHttps :: Text -&gt; Text
+<span class="lineno">  193 </span><span class="decl"><span class="istickedoff">sshToHttps url</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">| &quot;https://&quot; `T.isPrefixOf` url = url</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">&quot;http://&quot; `T.isPrefixOf` url</span>  = <span class="nottickedoff">url</span></span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">| &quot;git@&quot; `T.isPrefixOf` url =</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">let afterAt = T.drop (T.length &quot;git@&quot;) url</span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="istickedoff">in case T.breakOn &quot;:&quot; afterAt of</span>
+<span class="lineno">  199 </span><span class="spaces">           </span><span class="istickedoff">(host, rest)</span>
+<span class="lineno">  200 </span><span class="spaces">             </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rest</span> -&gt; <span class="nottickedoff">url</span></span>
+<span class="lineno">  201 </span><span class="spaces">             </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>  -&gt;</span>
+<span class="lineno">  202 </span><span class="spaces">                 </span><span class="istickedoff">&quot;https://&quot; &lt;&gt; host &lt;&gt; &quot;/&quot; &lt;&gt; T.drop (T.length &quot;:&quot;) rest</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = url</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>----------------------------------------------------------------------------
+<span class="lineno">  206 </span>-- CloneDeps — the closed-over opcode param (W2)
+<span class="lineno">  207 </span>----------------------------------------------------------------------------
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | The per-op credential dependencies, passed as a closed-over param to
+<span class="lineno">  210 </span>-- 'resolveCloneTarget' / 'cloneRepo' / 'lsRemoteRepo' (mirrors
+<span class="lineno">  211 </span>-- @secretGetOp (cdVault deps)@ at @Channels/Loop.hs:1094@ — NOT via
+<span class="lineno">  212 </span>-- 'Env'/'mkEnv'; the codebase proved 'Env' is the wrong vehicle).
+<span class="lineno">  213 </span>--
+<span class="lineno">  214 </span>-- Carries:
+<span class="lineno">  215 </span>--
+<span class="lineno">  216 </span>-- * @cdVault@ — the 'VaultRuntime' (yields the live 'VaultHandle' via
+<span class="lineno">  217 </span>--   'vrHandleRef' at runtime; fail-closed to 'CloneVaultError VaultLocked'
+<span class="lineno">  218 </span>--   if the vault is unconfigured/locked). Mirrors @secretGetOp rt@ which
+<span class="lineno">  219 </span>--   takes 'VaultRuntime', not the raw handle.
+<span class="lineno">  220 </span>-- * @cdSshAgent@ — the 'SshAgentHandle' seam (real or fake). Shared agent:
+<span class="lineno">  221 </span>--   started once (lazily on first use, cached in 'cdAgentEnvRef'),
+<span class="lineno">  222 </span>--   reused across all ops. Per-op: @sahAddKey@ → run → @sahDeleteAll@
+<span class="lineno">  223 </span>--   (the per-op key scoping — exactly one key live at forwarding time).
+<span class="lineno">  224 </span>-- * @cdAgentEnvRef@ — caches the shared 'SshAgentEnv' (the socket + PID
+<span class="lineno">  225 </span>--   from the first @sahStart@ call). 'Nothing' until the first deploy-key
+<span class="lineno">  226 </span>--   op starts the agent. Subsequent ops reuse the cached env (no
+<span class="lineno">  227 </span>--   re-start).
+<span class="lineno">  228 </span>-- * @cdPinnedKnownHosts@ — compile-time-embedded GitHub host keys (public
+<span class="lineno">  229 </span>--   data, tamper-resistant via 'file-embed'). Written per-op to a temp
+<span class="lineno">  230 </span>--   @known_hosts@ file.
+<span class="lineno">  231 </span>-- * @cdKeyfilesDir@ — the harness-private dir holding the encrypted
+<span class="lineno">  232 </span>--   keyfiles (@~\/.seal\/state\/repos\/keys\/\&lt;repo-id\&gt;@). The encrypted
+<span class="lineno">  233 </span>--   keyfile lives only on the harness disk (ciphertext).
+<span class="lineno">  234 </span>data CloneDeps = CloneDeps
+<span class="lineno">  235 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cdVault</span></span></span>           :: VaultRuntime
+<span class="lineno">  236 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdRepoReg</span></span></span>         :: RepoRegistryHandle
+<span class="lineno">  237 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdSshAgent</span></span></span>        :: SshAgentHandle
+<span class="lineno">  238 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdAgentRegistry</span></span></span>   :: AgentRegistryHandle
+<span class="lineno">  239 </span>    -- ^ One-agent-per-repo registry, keyed by the repo's vault key. Each
+<span class="lineno">  240 </span>    -- unique repo gets its own @ssh-agent@ process, started lazily on
+<span class="lineno">  241 </span>    -- first use. The agent + key persist for the harness lifetime AND
+<span class="lineno">  242 </span>    -- across @seal serve@ restarts (the registry is persisted to disk —
+<span class="lineno">  243 </span>    -- #88). At startup, 'arProbeAndSweep' GCs dead agents from crashed
+<span class="lineno">  244 </span>    -- processes; live agents are reused (the key is still loaded).
+<span class="lineno">  245 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdPinnedKnownHosts</span></span></span> :: ByteString
+<span class="lineno">  246 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdKeyfilesDir</span></span></span>     :: FilePath
+<span class="lineno">  247 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdIsRemote</span></span></span>        :: Bool
+<span class="lineno">  248 </span>    -- ^ Whether the untrusted executor runs commands over SSH (remote
+<span class="lineno">  249 </span>    -- mode). When 'True', the deploy-key clone path uses @ssh -A@ agent
+<span class="lineno">  250 </span>    -- forwarding with no @GIT_SSH_COMMAND@ (the remote @git clone@ uses
+<span class="lineno">  251 </span>    -- the default @ssh@ + the forwarded agent + the remote machine's
+<span class="lineno">  252 </span>    -- default @known_hosts@). When 'False', the local path writes a
+<span class="lineno">  253 </span>    -- per-op @known_hosts@ temp file + uses @GIT_SSH_COMMAND@.
+<span class="lineno">  254 </span>  }
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>-- | A stub 'CloneDeps' whose fields are all @error@ bottoms. Used by
+<span class="lineno">  257 </span>-- 'uoRunLegacy' for non-Git opcodes (which never access 'CloneDeps' —
+<span class="lineno">  258 </span>-- they don't call 'uioCd*'). Accessing any field of this stub is a
+<span class="lineno">  259 </span>-- runtime error, which is the correct behavior: non-Git opcodes must
+<span class="lineno">  260 </span>-- never touch the Git credential surface.
+<span class="lineno">  261 </span>stubCloneDeps :: CloneDeps
+<span class="lineno">  262 </span><span class="decl"><span class="istickedoff">stubCloneDeps = CloneDeps</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">{ cdVault = <span class="nottickedoff">error &quot;stubCloneDeps: cdVault (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="istickedoff">, cdRepoReg = <span class="nottickedoff">error &quot;stubCloneDeps: cdRepoReg (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">, cdSshAgent = <span class="nottickedoff">error &quot;stubCloneDeps: cdSshAgent (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">, cdAgentRegistry = <span class="nottickedoff">error &quot;stubCloneDeps: cdAgentRegistry (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="istickedoff">, cdPinnedKnownHosts = <span class="nottickedoff">error &quot;stubCloneDeps: cdPinnedKnownHosts (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  268 </span><span class="spaces">  </span><span class="istickedoff">, cdKeyfilesDir = <span class="nottickedoff">error &quot;stubCloneDeps: cdKeyfilesDir (non-Git opcode must not access)&quot;</span></span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">, cdIsRemote = <span class="nottickedoff">False</span></span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  271 </span>
+<span class="lineno">  272 </span>----------------------------------------------------------------------------
+<span class="lineno">  273 </span>-- CloneTarget / CloneEnv (opaque, redacted Show, CPS-scoped)
+<span class="lineno">  274 </span>----------------------------------------------------------------------------
+<span class="lineno">  275 </span>
+<span class="lineno">  276 </span>-- | The authenticated bits for a single clone, scoped to 'withCloneTarget'.
+<span class="lineno">  277 </span>-- The constructors are NOT exported — callers observe the bits only via the
+<span class="lineno">  278 </span>-- CPS continuation, mirroring 'Seal.Security.Secrets.withApiKey'. 'Show' is
+<span class="lineno">  279 </span>-- redacted so a stray log/exception cannot leak the env extras.
+<span class="lineno">  280 </span>data CloneTarget = CloneTarget
+<span class="lineno">  281 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ctEnv</span></span></span> :: CloneEnv
+<span class="lineno">  282 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ctCleanup</span></span></span> :: IO ()
+<span class="lineno">  283 </span>  }
+<span class="lineno">  284 </span>
+<span class="lineno">  285 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show CloneTarget</span></span></span></span> where
+<span class="lineno">  286 </span>  <span class="decl"><span class="nottickedoff">show _ = &quot;CloneTarget &lt;redacted&gt;&quot;</span></span>
+<span class="lineno">  287 </span>
+<span class="lineno">  288 </span>-- | The environment passed to @git@. 'ceUrl' is the TOKEN-FREE URL;
+<span class="lineno">  289 </span>-- 'ceEnvExtras' carries only non-secret values (@SSH_AUTH_SOCK@ +
+<span class="lineno">  290 </span>-- @GIT_SSH_COMMAND@ for deploy keys, @GIT_TERMINAL_PROMPT=0@ always). The
+<span class="lineno">  291 </span>-- secret bytes (the passphrase for deploy keys, the token for PATs) live
+<span class="lineno">  292 </span>-- only in the ssh-agent's memory (deploy keys) or the git argv
+<span class="lineno">  293 </span>-- (@http.extraHeader@ for PATs — memory, no file).
+<span class="lineno">  294 </span>data CloneEnv = CloneEnv
+<span class="lineno">  295 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ceUrl</span></span></span> :: Text
+<span class="lineno">  296 </span>    -- ^ The token-free URL passed to @git clone@ / @git ls-remote@.
+<span class="lineno">  297 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ceGitConfigArgs</span></span></span> :: [Text]
+<span class="lineno">  298 </span>    -- ^ Extra @-c@ config args. PAT/MachineUser: @[&quot;-c&quot;,
+<span class="lineno">  299 </span>    -- &quot;http.extraHeader=Authorization: Basic \&lt;base64\&gt;&quot;]@ (memory, no
+<span class="lineno">  300 </span>    -- file). DeployKey: @[]@ (uses the agent, not extraHeader).
+<span class="lineno">  301 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ceSshCommand</span></span></span> :: Maybe Text
+<span class="lineno">  302 </span>    -- ^ @GIT_SSH_COMMAND@ value (deploy-key only). Carries the pinned
+<span class="lineno">  303 </span>    -- @known_hosts@ PATH, not the key bytes (the key is in the agent).
+<span class="lineno">  304 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ceEnvExtras</span></span></span> :: [(String, String)]
+<span class="lineno">  305 </span>    -- ^ Env overrides MERGED over the inherited environment. Carries
+<span class="lineno">  306 </span>    -- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ / @GIT_TERMINAL_PROMPT@ — only
+<span class="lineno">  307 </span>    -- non-secret values (paths + &quot;0&quot;). On the remote executor (deploy
+<span class="lineno">  308 </span>    -- key), @SSH_AUTH_SOCK@ / @SSH_AGENT_PID@ are OMITTED (the forwarded
+<span class="lineno">  309 </span>    -- agent via @ssh -A@ replaces them) and @GIT_SSH_COMMAND@ carries no
+<span class="lineno">  310 </span>    -- @UserKnownHostsFile=@ path (the remote arm writes the known_hosts
+<span class="lineno">  311 </span>    -- to a remote temp file + rewrites the command).
+<span class="lineno">  312 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ceKnownHostsContent</span></span></span> :: Maybe ByteString
+<span class="lineno">  313 </span>    -- ^ The pinned @known_hosts@ content (public data) for the REMOTE
+<span class="lineno">  314 </span>    -- deploy-key path. 'Just' the bytes when @cdIsRemote@ + deploy key;
+<span class="lineno">  315 </span>    -- 'Nothing' otherwise (the local arm writes its own temp file). The
+<span class="lineno">  316 </span>    -- remote arm of 'uioShellExecGitEnv' writes this to a remote temp
+<span class="lineno">  317 </span>    -- file + rewrites @GIT_SSH_COMMAND@ to reference it.
+<span class="lineno">  318 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ceRawToken</span></span></span> :: Maybe ByteString
+<span class="lineno">  319 </span>    -- ^ The raw PAT/MachineUser token bytes for the @gh@ credential
+<span class="lineno">  320 </span>    -- injection path (design §3.4 Option A). 'Just' the raw bytes for
+<span class="lineno">  321 </span>    -- PAT/MachineUser (the @gh@ path injects @GH_TOKEN@ from these
+<span class="lineno">  322 </span>    -- bytes); 'Nothing' for deploy keys (@gh@ can't use SSH, falls
+<span class="lineno">  323 </span>    -- through to plain exec). The @git@ path ignores this field (it
+<span class="lineno">  324 </span>    -- uses 'ceGitConfigArgs' for the base64 @http.extraHeader@). Same
+<span class="lineno">  325 </span>    -- security category as 'ceGitConfigArgs' (which carries the
+<span class="lineno">  326 </span>    -- base64-encoded header — trivially reversible); CPS-scoped via
+<span class="lineno">  327 </span>    -- 'withCloneTarget' (the value is only obtainable inside the
+<span class="lineno">  328 </span>    -- continuation). 'CloneEnv' has NO 'Show' instance by design — a
+<span class="lineno">  329 </span>    -- stray @show@/log/exception cannot leak any field.
+<span class="lineno">  330 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ceCleanup</span></span></span> :: IO ()
+<span class="lineno">  331 </span>    -- ^ Removes the per-op @known_hosts@ temp file + kills the agent. Run
+<span class="lineno">  332 </span>    -- by 'withCloneTarget' after the continuation (bracket — on success AND
+<span class="lineno">  333 </span>    -- failure).
+<span class="lineno">  334 </span>  }
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- | Scope the authenticated bits + cleanup to the continuation (mirrors
+<span class="lineno">  337 </span>-- 'Seal.Security.Secrets.withApiKey'). The cleanup ALWAYS runs, even if the
+<span class="lineno">  338 </span>-- continuation throws — 'bracket' semantics.
+<span class="lineno">  339 </span>withCloneTarget :: CloneTarget -&gt; (CloneEnv -&gt; IO r) -&gt; IO r
+<span class="lineno">  340 </span><span class="decl"><span class="istickedoff">withCloneTarget target k =</span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="istickedoff">bracket (pure target) ctCleanup (k . ctEnv)</span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>----------------------------------------------------------------------------
+<span class="lineno">  344 </span>-- resolveCloneTarget
+<span class="lineno">  345 </span>----------------------------------------------------------------------------
+<span class="lineno">  346 </span>
+<span class="lineno">  347 </span>-- | Resolve a 'SourceRepo' to a 'CloneTarget' — fetches the secret bytes
+<span class="lineno">  348 </span>-- from the vault, runs the per-op ssh-agent lifecycle (deploy keys), and
+<span class="lineno">  349 </span>-- writes the per-op @known_hosts@ temp file (public data, bracket-cleaned).
+<span class="lineno">  350 </span>--
+<span class="lineno">  351 </span>-- For deploy keys: @sahStart@ → @sahAddKey &lt;enc-keyfile&gt; &lt;passphrase&gt;@
+<span class="lineno">  352 </span>-- (passphrase from the vault, piped to @ssh-add@'s stdin via the fake/real
+<span class="lineno">  353 </span>-- 'SshAgentHandle'). The agent decrypts the encrypted keyfile into memory.
+<span class="lineno">  354 </span>-- On any agent failure → 'CloneAgentError' (fail closed — the cleartext key
+<span class="lineno">  355 </span>-- never made it to the agent).
+<span class="lineno">  356 </span>--
+<span class="lineno">  357 </span>-- For PAT/MachineUser: the token is fetched from the vault and base64-encoded
+<span class="lineno">  358 </span>-- into @http.extraHeader=Authorization: Basic \&lt;base64(user:token)\&gt;@ (for
+<span class="lineno">  359 </span>-- MachineUser, the username is the public @cUsername@). The header lives
+<span class="lineno">  360 </span>-- only in 'ceGitConfigArgs' (memory, no file).
+<span class="lineno">  361 </span>--
+<span class="lineno">  362 </span>-- The per-op @known_hosts@ temp file is written under a random-suffix name
+<span class="lineno">  363 </span>-- (§5.5) and @bracket@-cleaned via 'withCloneTarget'.
+<span class="lineno">  364 </span>resolveCloneTarget
+<span class="lineno">  365 </span>  :: CloneDeps -&gt; SourceRepo -&gt; IO (Either CloneError CloneTarget)
+<span class="lineno">  366 </span><span class="decl"><span class="istickedoff">resolveCloneTarget deps repo =</span>
+<span class="lineno">  367 </span><span class="spaces">  </span><span class="istickedoff">case planClone repo of</span>
+<span class="lineno">  368 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  369 </span><span class="spaces">    </span><span class="istickedoff">Right plan -&gt; case plan of</span>
+<span class="lineno">  370 </span><span class="spaces">      </span><span class="istickedoff">ClonePlanExtraHeader httpsUrl vaultKey -&gt; do</span>
+<span class="lineno">  371 </span><span class="spaces">        </span><span class="istickedoff">eVault &lt;- resolveVaultHandle deps</span>
+<span class="lineno">  372 </span><span class="spaces">        </span><span class="istickedoff">case eVault of</span>
+<span class="lineno">  373 </span><span class="spaces">          </span><span class="istickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  374 </span><span class="spaces">          </span><span class="istickedoff">Right vault -&gt; do</span>
+<span class="lineno">  375 </span><span class="spaces">            </span><span class="istickedoff">mtoken &lt;- vhGet vault vaultKey</span>
+<span class="lineno">  376 </span><span class="spaces">            </span><span class="istickedoff">case mtoken of</span>
+<span class="lineno">  377 </span><span class="spaces">              </span><span class="istickedoff">Left ve -&gt; pure (Left (CloneVaultError ve))</span>
+<span class="lineno">  378 </span><span class="spaces">              </span><span class="istickedoff">Right tokenBytes -&gt; do</span>
+<span class="lineno">  379 </span><span class="spaces">                </span><span class="istickedoff">let header = renderPatHeader repo tokenBytes</span>
+<span class="lineno">  380 </span><span class="spaces">                    </span><span class="istickedoff">envExtras = [(&quot;GIT_TERMINAL_PROMPT&quot;, &quot;0&quot;)]</span>
+<span class="lineno">  381 </span><span class="spaces">                    </span><span class="istickedoff">env = CloneEnv</span>
+<span class="lineno">  382 </span><span class="spaces">                      </span><span class="istickedoff">{ ceUrl = httpsUrl</span>
+<span class="lineno">  383 </span><span class="spaces">                      </span><span class="istickedoff">, ceGitConfigArgs = [&quot;-c&quot;, &quot;http.extraHeader=&quot; &lt;&gt; header]</span>
+<span class="lineno">  384 </span><span class="spaces">                      </span><span class="istickedoff">, ceSshCommand = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  385 </span><span class="spaces">                      </span><span class="istickedoff">, ceEnvExtras = envExtras</span>
+<span class="lineno">  386 </span><span class="spaces">                      </span><span class="istickedoff">, ceKnownHostsContent = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  387 </span><span class="spaces">                      </span><span class="istickedoff">, ceRawToken = Just tokenBytes</span>
+<span class="lineno">  388 </span><span class="spaces">                      </span><span class="istickedoff">, ceCleanup = <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  389 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  390 </span><span class="spaces">                </span><span class="istickedoff">pure (Right CloneTarget { ctEnv = env, ctCleanup = pure <span class="nottickedoff">()</span> })</span>
+<span class="lineno">  391 </span><span class="spaces">      </span><span class="istickedoff">ClonePlanSshKey sshUrl _vaultKey -&gt; do</span>
+<span class="lineno">  392 </span><span class="spaces">        </span><span class="istickedoff">-- The encrypted keyfile path: &lt;keyfilesDir&gt;/&lt;repo-id&gt;.</span>
+<span class="lineno">  393 </span><span class="spaces">        </span><span class="istickedoff">let keyfilePath = cdKeyfilesDir deps &lt;/&gt; keyfileBaseName repo</span>
+<span class="lineno">  394 </span><span class="spaces">            </span><span class="istickedoff">vaultKey = cVaultKey (srCredential repo)</span>
+<span class="lineno">  395 </span><span class="spaces">        </span><span class="istickedoff">eVault &lt;- resolveVaultHandle deps</span>
+<span class="lineno">  396 </span><span class="spaces">        </span><span class="istickedoff">case eVault of</span>
+<span class="lineno">  397 </span><span class="spaces">          </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  398 </span><span class="spaces">          </span><span class="istickedoff">Right vault -&gt; do</span>
+<span class="lineno">  399 </span><span class="spaces">            </span><span class="istickedoff">-- Fetch the passphrase from the vault (decrypts the keyfile).</span>
+<span class="lineno">  400 </span><span class="spaces">            </span><span class="istickedoff">mpass &lt;- vhGet vault vaultKey</span>
+<span class="lineno">  401 </span><span class="spaces">            </span><span class="istickedoff">case mpass of</span>
+<span class="lineno">  402 </span><span class="spaces">              </span><span class="istickedoff">Left ve -&gt; <span class="nottickedoff">pure (Left (CloneVaultError ve))</span></span>
+<span class="lineno">  403 </span><span class="spaces">              </span><span class="istickedoff">Right passphrase -&gt; do</span>
+<span class="lineno">  404 </span><span class="spaces">                </span><span class="istickedoff">-- One-agent-per-repo: look up the persistent registry by</span>
+<span class="lineno">  405 </span><span class="spaces">                </span><span class="istickedoff">-- vault key. If a live agent is cached (in this process or</span>
+<span class="lineno">  406 </span><span class="spaces">                </span><span class="istickedoff">-- persisted from a prior seal process), reuse it — the key</span>
+<span class="lineno">  407 </span><span class="spaces">                </span><span class="istickedoff">-- is still loaded. If the persisted agent is dead (crashed</span>
+<span class="lineno">  408 </span><span class="spaces">                </span><span class="istickedoff">-- seal), remove the stale entry and start a fresh agent.</span>
+<span class="lineno">  409 </span><span class="spaces">                </span><span class="istickedoff">-- If no entry exists, start a new agent + load the key</span>
+<span class="lineno">  410 </span><span class="spaces">                </span><span class="istickedoff">-- once, then persist (#88).</span>
+<span class="lineno">  411 </span><span class="spaces">                </span><span class="istickedoff">registry &lt;- arLoad (cdAgentRegistry deps)</span>
+<span class="lineno">  412 </span><span class="spaces">                </span><span class="istickedoff">agentEnv &lt;- case Map.lookup vaultKey registry of</span>
+<span class="lineno">  413 </span><span class="spaces">                  </span><span class="istickedoff">Just cachedEnv -&gt; do</span>
+<span class="lineno">  414 </span><span class="spaces">                    </span><span class="istickedoff">-- If the agent was started in THIS process, reuse it</span>
+<span class="lineno">  415 </span><span class="spaces">                    </span><span class="istickedoff">-- directly (no probe — it's alive). If it was loaded</span>
+<span class="lineno">  416 </span><span class="spaces">                    </span><span class="istickedoff">-- from a prior process's persisted registry, probe to</span>
+<span class="lineno">  417 </span><span class="spaces">                    </span><span class="istickedoff">-- check liveness (#88).</span>
+<span class="lineno">  418 </span><span class="spaces">                    </span><span class="istickedoff">isLive &lt;- arIsLive (cdAgentRegistry deps) vaultKey</span>
+<span class="lineno">  419 </span><span class="spaces">                    </span><span class="istickedoff">if isLive</span>
+<span class="lineno">  420 </span><span class="spaces">                      </span><span class="istickedoff">then pure <span class="nottickedoff">cachedEnv</span>  -- reuse (key still loaded)</span>
+<span class="lineno">  421 </span><span class="spaces">                      </span><span class="istickedoff">else do</span>
+<span class="lineno">  422 </span><span class="spaces">                        </span><span class="istickedoff">status &lt;- probeAgent cachedEnv</span>
+<span class="lineno">  423 </span><span class="spaces">                        </span><span class="istickedoff">case status of</span>
+<span class="lineno">  424 </span><span class="spaces">                          </span><span class="istickedoff">AgentAlive -&gt; <span class="nottickedoff">pure cachedEnv</span>  -- reuse across restart</span>
+<span class="lineno">  425 </span><span class="spaces">                          </span><span class="istickedoff">AgentDead -&gt; do</span>
+<span class="lineno">  426 </span><span class="spaces">                            </span><span class="istickedoff">-- GC the stale entry + start a fresh agent.</span>
+<span class="lineno">  427 </span><span class="spaces">                            </span><span class="istickedoff">arRemove (cdAgentRegistry deps) vaultKey</span>
+<span class="lineno">  428 </span><span class="spaces">                            </span><span class="istickedoff">startAndLoadAgent deps vaultKey <span class="nottickedoff">keyfilePath</span> <span class="nottickedoff">passphrase</span></span>
+<span class="lineno">  429 </span><span class="spaces">                  </span><span class="istickedoff">Nothing -&gt; startAndLoadAgent deps vaultKey keyfilePath passphrase</span>
+<span class="lineno">  430 </span><span class="spaces">                </span><span class="istickedoff">-- Build the CloneEnv. The key stays loaded (no per-op</span>
+<span class="lineno">  431 </span><span class="spaces">                </span><span class="istickedoff">-- sahDeleteAll); the cleanup is a no-op (the agent is</span>
+<span class="lineno">  432 </span><span class="spaces">                </span><span class="istickedoff">-- killed at harness shutdown, not per-op).</span>
+<span class="lineno">  433 </span><span class="spaces">                </span><span class="istickedoff">if cdIsRemote deps</span>
+<span class="lineno">  434 </span><span class="spaces">                  </span><span class="istickedoff">then do</span>
+<span class="lineno">  435 </span><span class="spaces">                    </span><span class="istickedoff">-- REMOTE deploy-key path (simple approach matching the</span>
+<span class="lineno">  436 </span><span class="spaces">                    </span><span class="istickedoff">-- verified working command): no GIT_SSH_COMMAND, no</span>
+<span class="lineno">  437 </span><span class="spaces">                    </span><span class="istickedoff">-- remote known_hosts file. The remote git clone uses</span>
+<span class="lineno">  438 </span><span class="spaces">                    </span><span class="istickedoff">-- the default ssh + the forwarded agent (via ssh -A)</span>
+<span class="lineno">  439 </span><span class="spaces">                    </span><span class="istickedoff">-- + the remote machine's default known_hosts. The</span>
+<span class="lineno">  440 </span><span class="spaces">                    </span><span class="istickedoff">-- SSH_AUTH_SOCK/SSH_AGENT_PID are in ceEnvExtras for</span>
+<span class="lineno">  441 </span><span class="spaces">                    </span><span class="istickedoff">-- the LOCAL ssh -A process (the remote arm extracts</span>
+<span class="lineno">  442 </span><span class="spaces">                    </span><span class="istickedoff">-- them for local env + strips from remote env prefix).</span>
+<span class="lineno">  443 </span><span class="spaces">                    </span><span class="istickedoff">let authEnv = sahGetAuthEnv (cdSshAgent deps) <span class="nottickedoff">agentEnv</span></span>
+<span class="lineno">  444 </span><span class="spaces">                        </span><span class="istickedoff">envExtras =</span>
+<span class="lineno">  445 </span><span class="spaces">                          </span><span class="istickedoff">authEnv ++</span>
+<span class="lineno">  446 </span><span class="spaces">                          </span><span class="istickedoff">[ (&quot;GIT_TERMINAL_PROMPT&quot;, &quot;0&quot;)</span>
+<span class="lineno">  447 </span><span class="spaces">                          </span><span class="istickedoff">]</span>
+<span class="lineno">  448 </span><span class="spaces">                        </span><span class="istickedoff">env = CloneEnv</span>
+<span class="lineno">  449 </span><span class="spaces">                          </span><span class="istickedoff">{ ceUrl = <span class="nottickedoff">sshUrl</span></span>
+<span class="lineno">  450 </span><span class="spaces">                          </span><span class="istickedoff">, ceGitConfigArgs = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  451 </span><span class="spaces">                          </span><span class="istickedoff">, ceSshCommand = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  452 </span><span class="spaces">                          </span><span class="istickedoff">, ceEnvExtras = envExtras</span>
+<span class="lineno">  453 </span><span class="spaces">                          </span><span class="istickedoff">, ceKnownHostsContent = Nothing</span>
+<span class="lineno">  454 </span><span class="spaces">                          </span><span class="istickedoff">, ceRawToken = Nothing</span>
+<span class="lineno">  455 </span><span class="spaces">                          </span><span class="istickedoff">, ceCleanup = <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  456 </span><span class="spaces">                          </span><span class="istickedoff">}</span>
+<span class="lineno">  457 </span><span class="spaces">                    </span><span class="istickedoff">pure (Right CloneTarget { ctEnv = env, ctCleanup = pure <span class="nottickedoff">()</span> })</span>
+<span class="lineno">  458 </span><span class="spaces">                  </span><span class="istickedoff">else do</span>
+<span class="lineno">  459 </span><span class="spaces">                    </span><span class="istickedoff">-- LOCAL deploy-key path: write the per-op</span>
+<span class="lineno">  460 </span><span class="spaces">                    </span><span class="istickedoff">-- @known_hosts@ temp file (public data) to the</span>
+<span class="lineno">  461 </span><span class="spaces">                    </span><span class="istickedoff">-- harness-private @cdKeyfilesDir@.</span>
+<span class="lineno">  462 </span><span class="spaces">                    </span><span class="istickedoff">(knownHostsPath, knownHostsCleanup) &lt;-</span>
+<span class="lineno">  463 </span><span class="spaces">                      </span><span class="istickedoff">writeKnownHostsTemp (cdKeyfilesDir deps)</span>
+<span class="lineno">  464 </span><span class="spaces">                                           </span><span class="istickedoff">(cdPinnedKnownHosts deps)</span>
+<span class="lineno">  465 </span><span class="spaces">                    </span><span class="istickedoff">-- NOTE: IdentitiesOnly is intentionally omitted from</span>
+<span class="lineno">  466 </span><span class="spaces">                    </span><span class="istickedoff">-- GIT_SSH_COMMAND. On macOS, the bundled /usr/bin/ssh</span>
+<span class="lineno">  467 </span><span class="spaces">                    </span><span class="istickedoff">-- suppresses agent-offered keys when</span>
+<span class="lineno">  468 </span><span class="spaces">                    </span><span class="istickedoff">-- IdentitiesOnly=yes is set and no -i flag is passed</span>
+<span class="lineno">  469 </span><span class="spaces">                    </span><span class="istickedoff">-- — it only tries identity files, not the agent.</span>
+<span class="lineno">  470 </span><span class="spaces">                    </span><span class="istickedoff">-- Without this flag, ssh tries agent keys first (which</span>
+<span class="lineno">  471 </span><span class="spaces">                    </span><span class="istickedoff">-- is what we want — the per-op agent holds exactly one</span>
+<span class="lineno">  472 </span><span class="spaces">                    </span><span class="istickedoff">-- deploy key). The per-op agent scoping invariant</span>
+<span class="lineno">  473 </span><span class="spaces">                    </span><span class="istickedoff">-- (exactly one key live at forwarding time) replaces</span>
+<span class="lineno">  474 </span><span class="spaces">                    </span><span class="istickedoff">-- what IdentitiesOnly would enforce.</span>
+<span class="lineno">  475 </span><span class="spaces">                    </span><span class="istickedoff">let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv</span>
+<span class="lineno">  476 </span><span class="spaces">                        </span><span class="istickedoff">sshCmd = T.pack</span>
+<span class="lineno">  477 </span><span class="spaces">                          </span><span class="istickedoff">( &quot;ssh&quot;</span>
+<span class="lineno">  478 </span><span class="spaces">                          </span><span class="istickedoff">&lt;&gt; &quot; -o StrictHostKeyChecking=yes&quot;</span>
+<span class="lineno">  479 </span><span class="spaces">                          </span><span class="istickedoff">&lt;&gt; &quot; -o BatchMode=yes&quot;</span>
+<span class="lineno">  480 </span><span class="spaces">                          </span><span class="istickedoff">&lt;&gt; &quot; -o UserKnownHostsFile=&quot; &lt;&gt; knownHostsPath</span>
+<span class="lineno">  481 </span><span class="spaces">                          </span><span class="istickedoff">)</span>
+<span class="lineno">  482 </span><span class="spaces">                        </span><span class="istickedoff">envExtras =</span>
+<span class="lineno">  483 </span><span class="spaces">                          </span><span class="istickedoff">[ (&quot;SSH_AUTH_SOCK&quot;, saeAuthSock agentEnv)</span>
+<span class="lineno">  484 </span><span class="spaces">                          </span><span class="istickedoff">, (&quot;SSH_AGENT_PID&quot;, saeAgentPid agentEnv)</span>
+<span class="lineno">  485 </span><span class="spaces">                          </span><span class="istickedoff">, (&quot;GIT_SSH_COMMAND&quot;, T.unpack sshCmd)</span>
+<span class="lineno">  486 </span><span class="spaces">                          </span><span class="istickedoff">, (<span class="nottickedoff">&quot;GIT_TERMINAL_PROMPT&quot;</span>, &quot;0&quot;)</span>
+<span class="lineno">  487 </span><span class="spaces">                          </span><span class="istickedoff">]</span>
+<span class="lineno">  488 </span><span class="spaces">                        </span><span class="istickedoff">env = CloneEnv</span>
+<span class="lineno">  489 </span><span class="spaces">                          </span><span class="istickedoff">{ ceUrl = <span class="nottickedoff">sshUrl</span></span>
+<span class="lineno">  490 </span><span class="spaces">                          </span><span class="istickedoff">, ceGitConfigArgs = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  491 </span><span class="spaces">                          </span><span class="istickedoff">, ceSshCommand = <span class="nottickedoff">Just sshCmd</span></span>
+<span class="lineno">  492 </span><span class="spaces">                          </span><span class="istickedoff">, ceEnvExtras = authEnv ++ envExtras</span>
+<span class="lineno">  493 </span><span class="spaces">                          </span><span class="istickedoff">, ceKnownHostsContent = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  494 </span><span class="spaces">                          </span><span class="istickedoff">, ceRawToken = Nothing</span>
+<span class="lineno">  495 </span><span class="spaces">                          </span><span class="istickedoff">, ceCleanup = <span class="nottickedoff">knownHostsCleanup</span></span>
+<span class="lineno">  496 </span><span class="spaces">                          </span><span class="istickedoff">}</span>
+<span class="lineno">  497 </span><span class="spaces">                    </span><span class="istickedoff">pure (Right CloneTarget { ctEnv = env, ctCleanup = knownHostsCleanup })</span></span>
+<span class="lineno">  498 </span>
+<span class="lineno">  499 </span>-- | Start a fresh ssh-agent + load the deploy key once, then persist the
+<span class="lineno">  500 </span>-- agent env to the registry so it's reused across ops (and across seal
+<span class="lineno">  501 </span>-- restarts — #88). On failure, fail closed (delete-all + error).
+<span class="lineno">  502 </span>startAndLoadAgent :: CloneDeps -&gt; Text -&gt; FilePath -&gt; ByteString -&gt; IO SshAgentEnv
+<span class="lineno">  503 </span><span class="decl"><span class="istickedoff">startAndLoadAgent deps vaultKey keyfilePath passphrase = do</span>
+<span class="lineno">  504 </span><span class="spaces">  </span><span class="istickedoff">eStart &lt;- sahStart (cdSshAgent deps)</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="istickedoff">case eStart of</span>
+<span class="lineno">  506 </span><span class="spaces">    </span><span class="istickedoff">Left msg -&gt; <span class="nottickedoff">error (T.unpack msg)</span></span>
+<span class="lineno">  507 </span><span class="spaces">    </span><span class="istickedoff">Right env -&gt; do</span>
+<span class="lineno">  508 </span><span class="spaces">      </span><span class="istickedoff">eAdd &lt;- sahAddKey (cdSshAgent deps) <span class="nottickedoff">env</span> keyfilePath passphrase</span>
+<span class="lineno">  509 </span><span class="spaces">      </span><span class="istickedoff">case eAdd of</span>
+<span class="lineno">  510 </span><span class="spaces">        </span><span class="istickedoff">Left msg -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  511 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">-- Fail closed: delete-all even on add failure.</span></span>
+<span class="lineno">  512 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">sahDeleteAll (cdSshAgent deps) env</span></span>
+<span class="lineno">  513 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">error (T.unpack msg)</span></span>
+<span class="lineno">  514 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  515 </span><span class="spaces">          </span><span class="istickedoff">-- Persist the agent env so a second seal process (or a restart)</span>
+<span class="lineno">  516 </span><span class="spaces">          </span><span class="istickedoff">-- reuses this agent instead of spawning a new one (#88).</span>
+<span class="lineno">  517 </span><span class="spaces">          </span><span class="istickedoff">arUpsert (cdAgentRegistry deps) vaultKey env</span>
+<span class="lineno">  518 </span><span class="spaces">          </span><span class="istickedoff">pure env</span></span>
+<span class="lineno">  519 </span>
+<span class="lineno">  520 </span>-- | The base name of the encrypted keyfile for a 'SourceRepo' — the
+<span class="lineno">  521 </span>-- 'repoIdText' (validated @[A-Za-z0-9_-]+@, no path separators — §5.2
+<span class="lineno">  522 </span>-- defense-in-depth). The keyfile lives at
+<span class="lineno">  523 </span>-- @\&lt;cdKeyfilesDir\&gt;\/\&lt;repo-id\&gt;@.
+<span class="lineno">  524 </span>keyfileBaseName :: SourceRepo -&gt; FilePath
+<span class="lineno">  525 </span><span class="decl"><span class="istickedoff">keyfileBaseName repo = T.unpack (repoIdText (srId repo))</span></span>
+<span class="lineno">  526 </span>
+<span class="lineno">  527 </span>-- | Resolve the live 'VaultHandle' from the 'VaultRuntime' (mirrors
+<span class="lineno">  528 </span>-- @secretGetOp@'s pattern at @Seal.ISA.Ops.Secret:73@). Fail-closed to
+<span class="lineno">  529 </span>-- 'CloneVaultError VaultLocked' if the vault is unconfigured/locked (the
+<span class="lineno">  530 </span>-- 'IORef' holds 'Nothing'). This is the W3 evolution: @cdVault@ is now
+<span class="lineno">  531 </span>-- 'VaultRuntime' (not the raw 'VaultHandle') so the opcode can be built once
+<span class="lineno">  532 </span>-- at startup and the vault-locked state is surfaced per-op at run time
+<span class="lineno">  533 </span>-- (rather than crashing at startup or silently using a stale handle).
+<span class="lineno">  534 </span>resolveVaultHandle :: CloneDeps -&gt; IO (Either CloneError VaultHandle)
+<span class="lineno">  535 </span><span class="decl"><span class="istickedoff">resolveVaultHandle deps = do</span>
+<span class="lineno">  536 </span><span class="spaces">  </span><span class="istickedoff">mh &lt;- readIORef (vrHandleRef (cdVault deps))</span>
+<span class="lineno">  537 </span><span class="spaces">  </span><span class="istickedoff">pure $ case mh of</span>
+<span class="lineno">  538 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left (CloneVaultError VaultLocked)</span>
+<span class="lineno">  539 </span><span class="spaces">    </span><span class="istickedoff">Just h  -&gt; Right h</span></span>
+<span class="lineno">  540 </span>
+<span class="lineno">  541 </span>-- | Render the @http.extraHeader@ value for a PAT/MachineUser: @Authorization:
+<span class="lineno">  542 </span>-- Basic \&lt;base64(user:token)\&gt;@. For 'CredPat' the &quot;user&quot; is
+<span class="lineno">  543 </span>-- @x-access-token@; for 'CredMachineUser' it's the public @cUsername@. The
+<span class="lineno">  544 </span>-- header lives only in the git argv (memory, no file).
+<span class="lineno">  545 </span>--
+<span class="lineno">  546 </span>-- The base64 is computed over the RAW @user:token@ bytes (NOT a UTF-8
+<span class="lineno">  547 </span>-- round-trip through 'Text') — a vault token containing non-UTF-8 bytes
+<span class="lineno">  548 </span>-- (rare for GitHub PATs which are ASCII, but possible for MachineUser
+<span class="lineno">  549 </span>-- tokens or future cred types) is base64-encoded verbatim, avoiding the
+<span class="lineno">  550 </span>-- U+FFFD corruption that 'TE.decodeUtf8Lenient' would introduce before
+<span class="lineno">  551 </span>-- base64. The base64 output is pure ASCII, so the final
+<span class="lineno">  552 </span>-- 'TE.decodeUtf8Lenient' is lossless.
+<span class="lineno">  553 </span>renderPatHeader :: SourceRepo -&gt; ByteString -&gt; Text
+<span class="lineno">  554 </span><span class="decl"><span class="istickedoff">renderPatHeader repo tokenBytes =</span>
+<span class="lineno">  555 </span><span class="spaces">  </span><span class="istickedoff">let userBytes = case srCredential repo of</span>
+<span class="lineno">  556 </span><span class="spaces">        </span><span class="istickedoff">CredPat _            -&gt; &quot;x-access-token&quot;</span>
+<span class="lineno">  557 </span><span class="spaces">        </span><span class="istickedoff">CredMachineUser _ u  -&gt; TE.encodeUtf8 u</span>
+<span class="lineno">  558 </span><span class="spaces">        </span><span class="istickedoff">CredDeployKey _       -&gt; <span class="nottickedoff">&quot;x-access-token&quot;</span></span>
+<span class="lineno">  559 </span><span class="spaces">      </span><span class="istickedoff">basic = userBytes &lt;&gt; &quot;:&quot; &lt;&gt; tokenBytes</span>
+<span class="lineno">  560 </span><span class="spaces">      </span><span class="istickedoff">encoded = B64.encode basic</span>
+<span class="lineno">  561 </span><span class="spaces">  </span><span class="istickedoff">in &quot;Authorization: Basic &quot; &lt;&gt; TE.decodeUtf8Lenient encoded</span></span>
+<span class="lineno">  562 </span>
+<span class="lineno">  563 </span>----------------------------------------------------------------------------
+<span class="lineno">  564 </span>-- Private temp file writer (random suffix + O_EXCL — §5.5)
+<span class="lineno">  565 </span>----------------------------------------------------------------------------
+<span class="lineno">  566 </span>
+<span class="lineno">  567 </span>-- | Write a temp @known_hosts@ file (public data — the pinned GitHub host
+<span class="lineno">  568 </span>-- keys) under the harness-private @parentDir@ (the 0700 @cdKeyfilesDir@)
+<span class="lineno">  569 </span>-- with a random-suffix name via 'openBinaryTempFile' (which uses @O_EXCL@
+<span class="lineno">  570 </span>-- under the hood — prevents a symlink-race / TOCTOU attack on the path git
+<span class="lineno">  571 </span>-- reads: an attacker cannot pre-plant a symlink at the chosen path because
+<span class="lineno">  572 </span>-- @O_EXCL@ fails if the file already exists). The file is 0600 (private —
+<span class="lineno">  573 </span>-- the content is public but the path git reads must be tamper-resistant, so
+<span class="lineno">  574 </span>-- we don't make it world-readable). Returns the path + a cleanup action
+<span class="lineno">  575 </span>-- (removes the file). 'bracket'-cleaned via the post-add bracket in
+<span class="lineno">  576 </span>-- 'resolveCloneTarget'.
+<span class="lineno">  577 </span>--
+<span class="lineno">  578 </span>-- Security rationale: the path git reads via @UserKnownHostsFile=@ must be
+<span class="lineno">  579 </span>-- integrity-protected, not just the content. A @/tmp@ location would be
+<span class="lineno">  580 </span>-- world-writable + symlink-raceable; a local attacker could swap the file
+<span class="lineno">  581 </span>-- between our write and git's read, planting an attacker-controlled host
+<span class="lineno">  582 </span>-- key → MITM the next git SSH connection. The 0700 @cdKeyfilesDir@ closes
+<span class="lineno">  583 </span>-- the race (only the harness user can write there) + @O_EXCL@ closes the
+<span class="lineno">  584 </span>-- symlink plant (the open fails if the path already exists).
+<span class="lineno">  585 </span>writeKnownHostsTemp :: FilePath -&gt; ByteString -&gt; IO (FilePath, IO ())
+<span class="lineno">  586 </span><span class="decl"><span class="istickedoff">writeKnownHostsTemp parentDir contents = do</span>
+<span class="lineno">  587 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True parentDir</span>
+<span class="lineno">  588 </span><span class="spaces">  </span><span class="istickedoff">(path, h) &lt;- openBinaryTempFile parentDir &quot;seal-known-hosts-&quot;</span>
+<span class="lineno">  589 </span><span class="spaces">  </span><span class="istickedoff">BS.hPutStr h contents</span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">setFileMode path 0o600</span>
+<span class="lineno">  592 </span><span class="spaces">  </span><span class="istickedoff">-- Idempotent cleanup: the bracket release in 'resolveCloneTarget' AND</span>
+<span class="lineno">  593 </span><span class="spaces">  </span><span class="istickedoff">-- 'withCloneTarget' both call this (the bracket release runs first on</span>
+<span class="lineno">  594 </span><span class="spaces">  </span><span class="istickedoff">-- success, then 'ctCleanup' runs again — the second 'removeFile' would</span>
+<span class="lineno">  595 </span><span class="spaces">  </span><span class="istickedoff">-- throw NoSuchThing). Swallow the IOException so double-cleanup is safe.</span>
+<span class="lineno">  596 </span><span class="spaces">  </span><span class="istickedoff">let cleanup = do</span>
+<span class="lineno">  597 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- try @IOError (removeFile path)</span>
+<span class="lineno">  598 </span><span class="spaces">        </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  599 </span><span class="spaces">  </span><span class="istickedoff">pure (path, cleanup)</span></span>
+<span class="lineno">  600 </span>
+<span class="lineno">  601 </span>----------------------------------------------------------------------------
+<span class="lineno">  602 </span>-- cloneRepo / lsRemoteRepo
+<span class="lineno">  603 </span>----------------------------------------------------------------------------
+<span class="lineno">  604 </span>
+<span class="lineno">  605 </span>-- | @git clone@ a 'SourceRepo' into @destDir@ using the resolved credential.
+<span class="lineno">  606 </span>-- The token/passphrase NEVER appears in argv, the URL, or the env (only
+<span class="lineno">  607 </span>-- @SSH_AUTH_SOCK@ / @GIT_SSH_COMMAND@ / @http.extraHeader@ — non-secret
+<span class="lineno">  608 </span>-- paths + the base64-encoded Basic header which is in argv, in memory). On
+<span class="lineno">  609 </span>-- non-zero exit → 'CloneGitFailed' with the exit code ONLY (stderr is
+<span class="lineno">  610 </span>-- DROPPED — §5.4). Cleanup runs via 'withCloneTarget' (bracket — on success
+<span class="lineno">  611 </span>-- AND failure).
+<span class="lineno">  612 </span>cloneRepo
+<span class="lineno">  613 </span>  :: CloneDeps -&gt; FilePath -&gt; SourceRepo -&gt; IO (Either CloneError ())
+<span class="lineno">  614 </span><span class="decl"><span class="nottickedoff">cloneRepo deps destDir repo =</span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="nottickedoff">resolveCloneTarget deps repo &gt;&gt;= \case</span>
+<span class="lineno">  616 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  617 </span><span class="spaces">    </span><span class="nottickedoff">Right target -&gt; withCloneTarget target $ \env -&gt; do</span>
+<span class="lineno">  618 </span><span class="spaces">      </span><span class="nottickedoff">let gitArgs = ceGitConfigArgsList env</span>
+<span class="lineno">  619 </span><span class="spaces">                     </span><span class="nottickedoff">&lt;&gt; [&quot;clone&quot;, &quot;--&quot;, T.unpack (ceUrl env), destDir]</span>
+<span class="lineno">  620 </span><span class="spaces">      </span><span class="nottickedoff">(ec, _out, _err) &lt;-</span>
+<span class="lineno">  621 </span><span class="spaces">        </span><span class="nottickedoff">readProcessBinaryCwdEnv Nothing (ceEnvExtras env) &quot;git&quot; gitArgs BS.empty</span>
+<span class="lineno">  622 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  623 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess   -&gt; Right ()</span>
+<span class="lineno">  624 </span><span class="spaces">        </span><span class="nottickedoff">ExitFailure n -&gt; Left (CloneGitFailed n)</span></span>
+<span class="lineno">  625 </span>
+<span class="lineno">  626 </span>-- | @git ls-remote@ a 'SourceRepo' (for @/repo test@). Same seam as
+<span class="lineno">  627 </span>-- 'cloneRepo'; on success returns the first line of stdout
+<span class="lineno">  628 </span>-- (@&lt;sha&gt;\\t&lt;ref&gt;@ — W5 echoes it). On non-zero exit → 'CloneGitFailed' with
+<span class="lineno">  629 </span>-- the exit code ONLY (no stderr).
+<span class="lineno">  630 </span>lsRemoteRepo
+<span class="lineno">  631 </span>  :: CloneDeps -&gt; SourceRepo -&gt; IO (Either CloneError Text)
+<span class="lineno">  632 </span><span class="decl"><span class="nottickedoff">lsRemoteRepo deps repo =</span>
+<span class="lineno">  633 </span><span class="spaces">  </span><span class="nottickedoff">resolveCloneTarget deps repo &gt;&gt;= \case</span>
+<span class="lineno">  634 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  635 </span><span class="spaces">    </span><span class="nottickedoff">Right target -&gt; withCloneTarget target $ \env -&gt; do</span>
+<span class="lineno">  636 </span><span class="spaces">      </span><span class="nottickedoff">let gitArgs = ceGitConfigArgsList env</span>
+<span class="lineno">  637 </span><span class="spaces">                     </span><span class="nottickedoff">&lt;&gt; [&quot;ls-remote&quot;, &quot;--&quot;, T.unpack (ceUrl env)]</span>
+<span class="lineno">  638 </span><span class="spaces">      </span><span class="nottickedoff">(ec, out, _err) &lt;-</span>
+<span class="lineno">  639 </span><span class="spaces">        </span><span class="nottickedoff">readProcessBinaryCwdEnv Nothing (ceEnvExtras env) &quot;git&quot; gitArgs BS.empty</span>
+<span class="lineno">  640 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case ec of</span>
+<span class="lineno">  641 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess   -&gt; Right (firstLine out)</span>
+<span class="lineno">  642 </span><span class="spaces">        </span><span class="nottickedoff">ExitFailure n -&gt; Left (CloneGitFailed n)</span>
+<span class="lineno">  643 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  644 </span><span class="spaces">    </span><span class="nottickedoff">firstLine bs =</span>
+<span class="lineno">  645 </span><span class="spaces">      </span><span class="nottickedoff">let l = BS.takeWhile (/= nl) bs</span>
+<span class="lineno">  646 </span><span class="spaces">      </span><span class="nottickedoff">in TE.decodeUtf8Lenient l</span>
+<span class="lineno">  647 </span><span class="spaces">    </span><span class="nottickedoff">nl = 10</span></span>  -- '\n'
+<span class="lineno">  648 </span>
+<span class="lineno">  649 </span>-- | Render 'ceGitConfigArgs' as a list of 'String' for the git argv. Each
+<span class="lineno">  650 </span>-- element is already a complete argv token (@-c@ / @http.extraHeader=...@).
+<span class="lineno">  651 </span>ceGitConfigArgsList :: CloneEnv -&gt; [String]
+<span class="lineno">  652 </span><span class="decl"><span class="nottickedoff">ceGitConfigArgsList env = map T.unpack (ceGitConfigArgs env)</span></span>
+
+</pre>
+</body>
+</html>

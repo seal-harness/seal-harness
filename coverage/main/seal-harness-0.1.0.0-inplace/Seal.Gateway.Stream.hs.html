@@ -1,0 +1,290 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The WebSocket stream endpoint. Runs on a separate port from the REST +
+<span class="lineno">    3 </span>-- static WARP server (the @wai-app-websockets@ bridge isn't available; a
+<span class="lineno">    4 </span>-- separate port is the clean 7a path). Every connection is gated by the
+<span class="lineno">    5 </span>-- Origin allowlist + the broker's global cap. The wire protocol: on
+<span class="lineno">    6 </span>-- connect, a one-shot @hello@ (carrying @protocolVersion@ +
+<span class="lineno">    7 </span>-- @serverStartedAt@ so the client can detect server restarts); then a
+<span class="lineno">    8 </span>-- reader/writer race forwards 'BrokerEvent's from the broker to the WS
+<span class="lineno">    9 </span>-- peer while accepting @focus@ ops from the client.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- When a @focus@ op carries a @since@ field (an entry id), the server
+<span class="lineno">   12 </span>-- replays all transcript entries after that id from disk, sends them as
+<span class="lineno">   13 </span>-- @entry@ events, then sends a @replay-end@ event so the client transitions
+<span class="lineno">   14 </span>-- from @replaying@ back to @live@. This closes the gap: entries broadcast
+<span class="lineno">   15 </span>-- while the WS was disconnected are no longer permanently lost.
+<span class="lineno">   16 </span>module Seal.Gateway.Stream
+<span class="lineno">   17 </span>  ( runStreamServer
+<span class="lineno">   18 </span>  , StreamGuard (..)
+<span class="lineno">   19 </span>  , FocusOp (..)
+<span class="lineno">   20 </span>  , filterAfterId
+<span class="lineno">   21 </span>  , extractId
+<span class="lineno">   22 </span>  ) where
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   25 </span>import Control.Exception (SomeException, catch)
+<span class="lineno">   26 </span>import Control.Monad (forever, forM_)
+<span class="lineno">   27 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   28 </span>import Data.Aeson (object, (.=), (.:), (.:?))
+<span class="lineno">   29 </span>import Data.Aeson qualified as A
+<span class="lineno">   30 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   31 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   32 </span>import Data.CaseInsensitive qualified as CI
+<span class="lineno">   33 </span>import Data.Text (Text)
+<span class="lineno">   34 </span>import Data.Text qualified as T
+<span class="lineno">   35 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   36 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   37 </span>import Network.WebSockets
+<span class="lineno">   38 </span>  ( PendingConnection, acceptRequest, receiveData, sendTextData
+<span class="lineno">   39 </span>  , withPingThread, sendClose, Connection )
+<span class="lineno">   40 </span>import Network.WebSockets qualified as WS
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>import Katip (Severity (..), ls)
+<span class="lineno">   43 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   44 </span>import Seal.Core.Types (mkSessionId, sessionIdText, SessionId)
+<span class="lineno">   45 </span>import Seal.Core.TurnEngine (loadSessionMeta)
+<span class="lineno">   46 </span>import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+<span class="lineno">   47 </span>import Seal.Gateway.StreamBroker
+<span class="lineno">   48 </span>  ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
+<span class="lineno">   49 </span>import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
+<span class="lineno">   50 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   51 </span>import Seal.Session.Meta (smModel, smCreatedAt)
+<span class="lineno">   52 </span>import Seal.Tabs (TabsHandle)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | The per-connection guard: the Origin allowlist + the global cap.
+<span class="lineno">   55 </span>-- Also carries the TabsHandle + SealPaths so the stream can send an
+<span class="lineno">   56 </span>-- initial @lists@ snapshot on connect (the frontend's @wsListsReceived@
+<span class="lineno">   57 </span>-- flag requires at least one @lists@ frame to switch from polling to WS).
+<span class="lineno">   58 </span>data StreamGuard = StreamGuard
+<span class="lineno">   59 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sgAllowedOrigins</span></span></span> :: [Text]
+<span class="lineno">   60 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sgGlobalCap</span></span></span> :: Int
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sgTabsHandle</span></span></span> :: TabsHandle
+<span class="lineno">   62 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sgPaths</span></span></span> :: SealPaths
+<span class="lineno">   63 </span>  }
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Run the WebSocket stream server on the given port. Blocks (run in a
+<span class="lineno">   66 </span>-- forked thread from @seal serve@).
+<span class="lineno">   67 </span>runStreamServer :: Text -&gt; Int -&gt; StreamGuard -&gt; StreamBroker -&gt; IO ()
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">runStreamServer host port guard broker =</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">WS.runServer (T.unpack host) port (streamApp guard broker)</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | The per-connection WS app: check the Origin, accept, send hello, then
+<span class="lineno">   72 </span>-- race the broker-forwarder against the focus-reader.
+<span class="lineno">   73 </span>streamApp :: StreamGuard -&gt; StreamBroker -&gt; PendingConnection -&gt; IO ()
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">streamApp guard broker pending = do</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">let reqHead = WS.pendingRequest pending</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">origin = lookupHeader &quot;origin&quot; reqHead</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">allowed = map T.unpack (sgAllowedOrigins guard)</span></span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">case origin of</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">Nothing                   -&gt; acceptConn  -- no Origin header (local dev client); accept</span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">Just _  | <span class="nottickedoff">null allowed</span>    -&gt; <span class="nottickedoff">acceptConn</span>  -- wildcard mode (host=0.0.0.0); accept any</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">Just o | <span class="nottickedoff">o `elem` allowed</span> -&gt; <span class="nottickedoff">acceptConn</span></span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">Just o                    -&gt; <span class="nottickedoff">globalLogIO InfoS (&quot;ws: rejected Origin &quot; &lt;&gt; ls (T.pack (show o)))</span></span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">acceptConn = do</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">conn &lt;- acceptRequest pending</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff">startedAt &lt;- getCurrentTime</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">sendTextData conn (A.encode (object</span>
+<span class="lineno">   88 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;hello&quot; :: Text)</span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff">, &quot;protocolVersion&quot; .= (&quot;v1&quot; :: Text)</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">, &quot;serverStartedAt&quot; .= T.pack (showIso startedAt)</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">]))</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">let sendEvent (BeEntryRecorded sid v) =</span>
+<span class="lineno">   93 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">   94 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;entry&quot; :: Text)</span></span>
+<span class="lineno">   95 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span></span>
+<span class="lineno">   96 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;entry&quot; .= v</span></span>
+<span class="lineno">   97 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeEntryUpdate sid v) =</span>
+<span class="lineno">   99 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  100 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;entry-update&quot; :: Text)</span></span>
+<span class="lineno">  101 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span></span>
+<span class="lineno">  102 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;entry&quot; .= v</span></span>
+<span class="lineno">  103 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeHarnessStatus v)    = <span class="nottickedoff">sendTextData conn (A.encode v)</span></span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeListsSnapshot v)    = sendTextData conn (A.encode v)</span>
+<span class="lineno">  106 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeActivity sid v)     =</span>
+<span class="lineno">  107 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  108 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;activity&quot; :: Text)</span></span>
+<span class="lineno">  109 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span></span>
+<span class="lineno">  110 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;activity&quot; .= v</span></span>
+<span class="lineno">  111 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  112 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeAsk sid v)          =</span>
+<span class="lineno">  113 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  114 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;ask&quot; :: Text)</span></span>
+<span class="lineno">  115 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span></span>
+<span class="lineno">  116 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;ask&quot; .= v</span></span>
+<span class="lineno">  117 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  118 </span><span class="spaces">          </span><span class="istickedoff">sendEvent (BeAskResolved sid v)  =</span>
+<span class="lineno">  119 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  120 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;ask_resolved&quot; :: Text)</span></span>
+<span class="lineno">  121 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span></span>
+<span class="lineno">  122 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;ask&quot; .= v</span></span>
+<span class="lineno">  123 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">sendEvent BeAgentDefsChanged =</span>
+<span class="lineno">  125 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  126 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;agent-defs-changed&quot; :: Text)</span></span>
+<span class="lineno">  127 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="istickedoff">sendEvent BeSkillsChanged =</span>
+<span class="lineno">  129 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  130 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;skills-changed&quot; :: Text)</span></span>
+<span class="lineno">  131 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  132 </span><span class="spaces">          </span><span class="istickedoff">sendEvent BeReposChanged =</span>
+<span class="lineno">  133 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">sendTextData conn (A.encode (object</span></span>
+<span class="lineno">  134 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;repos-changed&quot; :: Text)</span></span>
+<span class="lineno">  135 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span></span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">defaultSid = case mkSessionId &quot;default&quot; of Right s -&gt; s; Left _ -&gt; error &quot;sid&quot;</span></span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">closeConn = sendClose conn (&quot;subscriber evicted&quot; :: Text)</span></span>
+<span class="lineno">  138 </span><span class="spaces">      </span><span class="istickedoff">subSessionRef &lt;- subscribe broker <span class="nottickedoff">defaultSid</span> sendEvent <span class="nottickedoff">closeConn</span></span>
+<span class="lineno">  139 </span><span class="spaces">      </span><span class="istickedoff">globalLogIO <span class="nottickedoff">InfoS</span> <span class="nottickedoff">&quot;[ws] connected, initial focus=default&quot;</span></span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">-- Send an initial lists snapshot AFTER subscribing so this connection</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">-- is in the broker's subscriber list and actually receives the frame.</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">-- Without this, the snapshot is broadcast to zero subscribers, the</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">-- frontend never flips wsLive, and REST /api/lists polling stays on.</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">withPingThread <span class="nottickedoff">conn</span> 30 <span class="nottickedoff">(pure ())</span> $ do</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">let readerLoop = forever $ do</span>
+<span class="lineno">  147 </span><span class="spaces">              </span><span class="istickedoff">msg &lt;- receiveData conn</span>
+<span class="lineno">  148 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">case A.decode msg of</span></span>
+<span class="lineno">  149 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Just (focusOp :: FocusOp) -&gt;</span></span>
+<span class="lineno">  150 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">case mkSessionId (foSession focusOp) of</span></span>
+<span class="lineno">  151 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">Right s  -&gt; do</span></span>
+<span class="lineno">  152 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">globalLogIO InfoS (&quot;[ws] focus → &quot; &lt;&gt; ls (sessionIdText s))</span></span>
+<span class="lineno">  153 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">updateSubscriberSession subSessionRef s</span></span>
+<span class="lineno">  154 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">-- When the client sends a `since` entry id, replay</span></span>
+<span class="lineno">  155 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">-- all transcript entries after that id from disk so</span></span>
+<span class="lineno">  156 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">-- entries broadcast during the WS gap are recovered.</span></span>
+<span class="lineno">  157 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">forM_ (foSince focusOp) $ \sinceId -&gt;</span></span>
+<span class="lineno">  158 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">replayEntriesSince conn (sgPaths guard) s sinceId</span></span>
+<span class="lineno">  159 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">Left _e  -&gt; sendTextData conn (A.encode (object [&quot;type&quot; .= (&quot;error&quot; :: Text), &quot;message&quot; .= (&quot;invalid session id&quot; :: Text)]))</span></span>
+<span class="lineno">  160 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; sendTextData conn (A.encode (object [&quot;type&quot; .= (&quot;error&quot; :: Text), &quot;message&quot; .= (&quot;expected a focus op&quot; :: Text)]))</span></span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="istickedoff">readerLoop `catch` \(_e :: SomeException) -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Replay transcript entries after the given entry id, then send a
+<span class="lineno">  164 </span>-- @replay-end@ event so the client transitions from @replaying@ to @live@.
+<span class="lineno">  165 </span>-- Reads the full transcript from disk and filters to entries whose id is
+<span class="lineno">  166 </span>-- strictly after @sinceId@ (by position — the entry id is compared as a
+<span class="lineno">  167 </span>-- string, and entries with ids lexicographically greater than @sinceId@
+<span class="lineno">  168 </span>-- are sent). The frontend dedupes by id so any overlap with entries the
+<span class="lineno">  169 </span>-- client already has is harmless. Errors during replay are logged and
+<span class="lineno">  170 </span>-- swallowed (the client will still receive @replay-end@ and transition to
+<span class="lineno">  171 </span>-- @live@, falling back to the HTTP seed for any missing entries).
+<span class="lineno">  172 </span>--
+<span class="lineno">  173 </span>-- Entry ids are either the on-disk @teId@ (a Text) or a synthetic index
+<span class="lineno">  174 </span>-- (@\&quot;0\&quot;@, @\&quot;1\&quot;@, ...) when the two-file format has no per-entry id. We
+<span class="lineno">  175 </span>-- compare by the @id@ field in the frontend JSON shape, which is the same
+<span class="lineno">  176 </span>-- shape @readTranscriptEntries@ returns.
+<span class="lineno">  177 </span>replayEntriesSince
+<span class="lineno">  178 </span>  :: Connection -&gt; SealPaths -&gt; SessionId -&gt; Text -&gt; IO ()
+<span class="lineno">  179 </span><span class="decl"><span class="nottickedoff">replayEntriesSince conn paths sid sinceId = do</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="nottickedoff">let go = do</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="nottickedoff">mMeta &lt;- loadSessionMeta paths sid</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="nottickedoff">let model = maybe &quot;&quot; smModel mMeta</span>
+<span class="lineno">  183 </span><span class="spaces">            </span><span class="nottickedoff">fallbackTs = maybe &quot;&quot; (showIso . smCreatedAt) mMeta</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="nottickedoff">entries &lt;- readTranscriptEntries paths model fallbackTs sid</span>
+<span class="lineno">  185 </span><span class="spaces">        </span><span class="nottickedoff">let after = filterAfterId sinceId entries</span>
+<span class="lineno">  186 </span><span class="spaces">        </span><span class="nottickedoff">forM_ after $ \entry -&gt; do</span>
+<span class="lineno">  187 </span><span class="spaces">          </span><span class="nottickedoff">sendTextData conn (A.encode (object</span>
+<span class="lineno">  188 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;type&quot; .= (&quot;entry&quot; :: Text)</span>
+<span class="lineno">  189 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span>
+<span class="lineno">  190 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;entry&quot; .= entry</span>
+<span class="lineno">  191 </span><span class="spaces">            </span><span class="nottickedoff">]))</span>
+<span class="lineno">  192 </span><span class="spaces">        </span><span class="nottickedoff">-- Send replay-end with the last replayed entry id (or null when</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="nottickedoff">-- no entries were replayed — the client keeps its current</span>
+<span class="lineno">  194 </span><span class="spaces">        </span><span class="nottickedoff">-- lastEntryId in that case).</span>
+<span class="lineno">  195 </span><span class="spaces">        </span><span class="nottickedoff">let mLastId = case reverse after of</span>
+<span class="lineno">  196 </span><span class="spaces">              </span><span class="nottickedoff">[] -&gt; Nothing</span>
+<span class="lineno">  197 </span><span class="spaces">              </span><span class="nottickedoff">(last_ : _) -&gt; Just (extractId last_)</span>
+<span class="lineno">  198 </span><span class="spaces">        </span><span class="nottickedoff">sendTextData conn (A.encode (object</span>
+<span class="lineno">  199 </span><span class="spaces">          </span><span class="nottickedoff">[ &quot;type&quot; .= (&quot;replay-end&quot; :: Text)</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="nottickedoff">, &quot;lastReplayedEntryId&quot; .= mLastId</span>
+<span class="lineno">  202 </span><span class="spaces">          </span><span class="nottickedoff">]))</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="nottickedoff">go `catch` \(e :: SomeException) -&gt; do</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="nottickedoff">globalLogIO InfoS (&quot;[ws] replay error: &quot; &lt;&gt; ls (T.pack (show e)))</span>
+<span class="lineno">  205 </span><span class="spaces">    </span><span class="nottickedoff">-- Even on error, send replay-end so the client isn't stuck in</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="nottickedoff">-- replaying status. lastReplayedEntryId is null (no confirmed replay).</span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="nottickedoff">sendTextData conn (A.encode (object</span>
+<span class="lineno">  208 </span><span class="spaces">      </span><span class="nottickedoff">[ &quot;type&quot; .= (&quot;replay-end&quot; :: Text)</span>
+<span class="lineno">  209 </span><span class="spaces">      </span><span class="nottickedoff">, &quot;sessionId&quot; .= sessionIdText sid</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="nottickedoff">, &quot;lastReplayedEntryId&quot; .= (Nothing :: Maybe Text)</span>
+<span class="lineno">  211 </span><span class="spaces">      </span><span class="nottickedoff">]))</span></span>
+<span class="lineno">  212 </span>
+<span class="lineno">  213 </span>-- | Filter the frontend-shaped transcript entries to those whose @id@
+<span class="lineno">  214 </span>-- field is strictly after @sinceId@. Entry ids from the two-file format
+<span class="lineno">  215 </span>-- are synthetic line indices (@\&quot;0\&quot;@, @\&quot;1\&quot;@, ...) which sort
+<span class="lineno">  216 </span>-- lexicographically the same as numerically for single-digit counts but
+<span class="lineno">  217 </span>-- diverge for multi-digit (e.g. @\&quot;10\&quot;@ &lt; @\&quot;2\&quot;@ lexically). To be
+<span class="lineno">  218 </span>-- robust, we find the position of @sinceId@ in the list and take everything
+<span class="lineno">  219 </span>-- after it; if not found, we fall back to sending all entries (the
+<span class="lineno">  220 </span>-- frontend dedupes by id, so overlap is harmless — and this handles the
+<span class="lineno">  221 </span>-- case where the client's @lastEntryId@ is from a different transcript
+<span class="lineno">  222 </span>-- shape or the session was rebuilt).
+<span class="lineno">  223 </span>filterAfterId :: Text -&gt; [A.Value] -&gt; [A.Value]
+<span class="lineno">  224 </span><span class="decl"><span class="istickedoff">filterAfterId sinceId entries =</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">fromMaybe entries (breakOnId sinceId entries)</span></span>
+<span class="lineno">  226 </span>
+<span class="lineno">  227 </span>-- | Find the position of the entry whose @id@ matches @sinceId@ and
+<span class="lineno">  228 </span>-- return everything after it. Returns 'Nothing' when the id is not found.
+<span class="lineno">  229 </span>breakOnId :: Text -&gt; [A.Value] -&gt; Maybe [A.Value]
+<span class="lineno">  230 </span><span class="decl"><span class="istickedoff">breakOnId sinceId = go</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">go [] = Nothing</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">go (v : vs) =</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">if extractId v == sinceId</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">then Just vs</span>
+<span class="lineno">  236 </span><span class="spaces">        </span><span class="istickedoff">else go vs</span></span>
+<span class="lineno">  237 </span>
+<span class="lineno">  238 </span>-- | Extract the @id@ field from a frontend-shaped transcript entry JSON.
+<span class="lineno">  239 </span>extractId :: A.Value -&gt; Text
+<span class="lineno">  240 </span><span class="decl"><span class="istickedoff">extractId v = case v of</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromText &quot;id&quot;) o of</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">Just (A.String t) -&gt; t</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">_                 -&gt; &quot;&quot;</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno">  245 </span>
+<span class="lineno">  246 </span>-- | The focus op the client sends to change its focused session. Accepts
+<span class="lineno">  247 </span>-- both the frontend's shape (@{&quot;op&quot;:&quot;focus&quot;,&quot;sessionId&quot;:&quot;...&quot;}@) and the
+<span class="lineno">  248 </span>-- legacy shape (@{&quot;session&quot;:&quot;...&quot;}@) for robustness. The optional @since@
+<span class="lineno">  249 </span>-- field requests replay of entries after the given entry id.
+<span class="lineno">  250 </span>data FocusOp = FocusOp
+<span class="lineno">  251 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">foSession</span></span></span> :: Text
+<span class="lineno">  252 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">foSince</span></span></span>   :: Maybe Text
+<span class="lineno">  253 </span>  }
+<span class="lineno">  254 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.FromJSON FocusOp</span></span></span></span> where
+<span class="lineno">  257 </span>  <span class="decl"><span class="istickedoff">parseJSON = A.withObject <span class="nottickedoff">&quot;focus&quot;</span> $ \o -&gt;</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">FocusOp</span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; (o .: &quot;sessionId&quot; &lt;|&gt; o .: &quot;session&quot;)</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; (o .:? &quot;since&quot;)</span></span>
+<span class="lineno">  261 </span>
+<span class="lineno">  262 </span>-- | Look up a header value from the pending request headers (case-insensitive).
+<span class="lineno">  263 </span>lookupHeader :: Text -&gt; WS.RequestHead -&gt; Maybe String
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">lookupHeader name req =</span>
+<span class="lineno">  265 </span><span class="spaces">  </span><span class="istickedoff">case lookup (CI.mk (TE.encodeUtf8 $ T.toLower name)) (WS.requestHeaders req) of</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">Just v  -&gt; <span class="nottickedoff">Just (T.unpack (TE.decodeUtf8 v))</span></span>
+<span class="lineno">  267 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Nothing</span></span>
+
+</pre>
+</body>
+</html>

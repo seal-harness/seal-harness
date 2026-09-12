@@ -1,0 +1,380 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The \/vault CommandSpec: eight subcommands (setup, add, get, list, delete,
+<span class="lineno">    3 </span>-- lock, unlock, status) wired to the Phase 1 VaultHandle. Commands close over
+<span class="lineno">    4 </span>-- a VaultRuntime so they carry no global state. The optparse parser produces
+<span class="lineno">    5 </span>-- CommandActions; test code calls them through execParserPure.
+<span class="lineno">    6 </span>module Seal.Vault.Commands
+<span class="lineno">    7 </span>  ( VaultRuntime (..)
+<span class="lineno">    8 </span>  , vaultCommandSpec
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Control.Monad (when)
+<span class="lineno">   12 </span>import Data.IORef (IORef, readIORef, writeIORef)
+<span class="lineno">   13 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   14 </span>import Data.Text (Text)
+<span class="lineno">   15 </span>import Data.Text qualified as T
+<span class="lineno">   16 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   17 </span>import Options.Applicative
+<span class="lineno">   18 </span>import System.Directory (doesFileExist)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   21 </span>import Seal.Command.Spec
+<span class="lineno">   22 </span>  ( Availability (..)
+<span class="lineno">   23 </span>  , CommandAction (..)
+<span class="lineno">   24 </span>  , CommandGroup (..)
+<span class="lineno">   25 </span>  , CommandName (..)
+<span class="lineno">   26 </span>  , CommandSpec (..)
+<span class="lineno">   27 </span>  )
+<span class="lineno">   28 </span>import Seal.Config.Security
+<span class="lineno">   29 </span>  ( SecurityConfig (..), loadSecurityConfig, updateSecurityConfig )
+<span class="lineno">   30 </span>import Seal.Config.Paths (SealPaths, securityFilePath, vaultFilePath)
+<span class="lineno">   31 </span>import Seal.Security.Vault
+<span class="lineno">   32 </span>  ( VaultConfig (..)
+<span class="lineno">   33 </span>  , VaultHandle (..)
+<span class="lineno">   34 </span>  , VaultStatus (..)
+<span class="lineno">   35 </span>  , UnlockMode (..)
+<span class="lineno">   36 </span>  , openVault
+<span class="lineno">   37 </span>  )
+<span class="lineno">   38 </span>import Seal.Security.Vault.Age
+<span class="lineno">   39 </span>  ( AgeIdentity (..)
+<span class="lineno">   40 </span>  , AgeRecipient (..)
+<span class="lineno">   41 </span>  , VaultEncryptor
+<span class="lineno">   42 </span>  , VaultError (..)
+<span class="lineno">   43 </span>  , mkAgeEncryptor
+<span class="lineno">   44 </span>  )
+<span class="lineno">   45 </span>import Seal.Vault.Backend
+<span class="lineno">   46 </span>  ( ResolvedKey (..)
+<span class="lineno">   47 </span>  , detectAgePlugins
+<span class="lineno">   48 </span>  , resolveEncryptor
+<span class="lineno">   49 </span>  , setupLocalAgeKey
+<span class="lineno">   50 </span>  , setupUserSupplied
+<span class="lineno">   51 </span>  , setupYubiKey
+<span class="lineno">   52 </span>  )
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   55 </span>-- Runtime
+<span class="lineno">   56 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>data VaultRuntime = VaultRuntime
+<span class="lineno">   59 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">vrPaths</span></span></span> :: SealPaths
+<span class="lineno">   60 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">vrConfigPath</span></span></span> :: FilePath
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">vrHandleRef</span></span></span> :: IORef (Maybe VaultHandle)
+<span class="lineno">   62 </span>  }
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   65 </span>-- CommandSpec entry point
+<span class="lineno">   66 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>vaultCommandSpec :: VaultRuntime -&gt; CommandSpec
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">vaultCommandSpec rt = CommandSpec</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">{ csName         = <span class="nottickedoff">CommandName &quot;vault&quot;</span></span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">, csAliases      = <span class="nottickedoff">[]</span></span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">, csGroup        = <span class="nottickedoff">GroupVault</span></span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">, csSynopsis     = <span class="nottickedoff">&quot;Manage the encrypted secret vault&quot;</span></span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">, csParserInfo   = vaultParserInfo rt</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">, csAvailability = <span class="nottickedoff">InteractiveOnly</span></span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>vaultParserInfo :: VaultRuntime -&gt; ParserInfo CommandAction
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">vaultParserInfo rt =</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">info (vaultParser rt &lt;**&gt; helper)</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">(  progDesc <span class="nottickedoff">&quot;Encrypted secret vault operations&quot;</span></span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; header   <span class="nottickedoff">&quot;vault — manage secrets in the on-disk encrypted vault&quot;</span></span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">)</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>vaultParser :: VaultRuntime -&gt; Parser CommandAction
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">vaultParser rt = hsubparser</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">(  command <span class="nottickedoff">&quot;setup&quot;</span></span>
+<span class="lineno">   88 </span><span class="spaces">       </span><span class="istickedoff"><span class="nottickedoff">(info (pure (setupCmd rt))</span></span>
+<span class="lineno">   89 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">(progDesc &quot;Set up the vault backend and create the vault&quot;))</span></span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;add&quot;</span>
+<span class="lineno">   91 </span><span class="spaces">       </span><span class="istickedoff">(info (addCmd rt &lt;$&gt; nameArg)</span>
+<span class="lineno">   92 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Add or update a secret (value entered via hidden prompt)&quot;</span>))</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;get&quot;</span>
+<span class="lineno">   94 </span><span class="spaces">       </span><span class="istickedoff">(info (getCmd rt &lt;$&gt; nameArg)</span>
+<span class="lineno">   95 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Retrieve and reveal a secret&quot;</span>))</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;list&quot;</span>
+<span class="lineno">   97 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (listCmd rt))</span>
+<span class="lineno">   98 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;List all secret names (values are never shown)&quot;</span>))</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;delete&quot;</span>
+<span class="lineno">  100 </span><span class="spaces">       </span><span class="istickedoff">(info (deleteCmd rt &lt;$&gt; nameArg)</span>
+<span class="lineno">  101 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Delete a secret&quot;</span>))</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;lock&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (lockCmd rt))</span>
+<span class="lineno">  104 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Lock the vault (clear the decrypted cache)&quot;</span>))</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;unlock&quot;</span>
+<span class="lineno">  106 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (unlockCmd rt))</span>
+<span class="lineno">  107 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Unlock the vault (decrypt into memory cache)&quot;</span>))</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; command &quot;status&quot;</span>
+<span class="lineno">  109 </span><span class="spaces">       </span><span class="istickedoff">(info (pure (statusCmd rt))</span>
+<span class="lineno">  110 </span><span class="spaces">             </span><span class="istickedoff">(progDesc <span class="nottickedoff">&quot;Show vault status: locked, secret count, key type&quot;</span>))</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; metavar <span class="nottickedoff">&quot;COMMAND&quot;</span></span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>nameArg :: Parser Text
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">nameArg = T.pack &lt;$&gt; strArgument (metavar <span class="nottickedoff">&quot;NAME&quot;</span> &lt;&gt; help <span class="nottickedoff">&quot;Secret name&quot;</span>)</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  118 </span>-- Guard + error helpers
+<span class="lineno">  119 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>-- | Run k with the vault handle, or send &quot;not configured&quot; and return.
+<span class="lineno">  122 </span>withHandle :: VaultRuntime -&gt; ChannelCaps -&gt; (VaultHandle -&gt; IO ()) -&gt; IO ()
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">withHandle rt caps k = do</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">mh &lt;- readIORef (vrHandleRef rt)</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">case mh of</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; ccSend caps &quot;vault not configured — run /vault setup&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">Just h  -&gt; k h</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>vaultErrMsg :: VaultError -&gt; Text
+<span class="lineno">  130 </span><span class="decl"><span class="istickedoff">vaultErrMsg VaultLocked           = &quot;vault is locked — run /vault unlock&quot;</span>
+<span class="lineno">  131 </span><span class="spaces"></span><span class="istickedoff">vaultErrMsg VaultNotFound         = <span class="nottickedoff">&quot;vault not found — run /vault setup&quot;</span></span>
+<span class="lineno">  132 </span><span class="spaces"></span><span class="istickedoff">vaultErrMsg VaultAlreadyExists    = <span class="nottickedoff">&quot;vault already exists&quot;</span></span>
+<span class="lineno">  133 </span><span class="spaces"></span><span class="istickedoff">vaultErrMsg (VaultKeyNotFound k)  = &quot;no such secret: &quot; &lt;&gt; k</span>
+<span class="lineno">  134 </span><span class="spaces"></span><span class="istickedoff">vaultErrMsg (VaultBackendError t) = <span class="nottickedoff">&quot;backend error: &quot; &lt;&gt; t</span></span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>handleResult :: ChannelCaps -&gt; Either VaultError a -&gt; (a -&gt; IO ()) -&gt; IO ()
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">handleResult caps (Left e)  _ = ccSend caps (vaultErrMsg e)</span>
+<span class="lineno">  138 </span><span class="spaces"></span><span class="istickedoff">handleResult _    (Right a) k = k a</span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  141 </span>-- Subcommand handlers
+<span class="lineno">  142 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>setupCmd :: VaultRuntime -&gt; CommandAction
+<span class="lineno">  145 </span><span class="decl"><span class="nottickedoff">setupCmd rt = CommandAction $ \caps -&gt; do</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="nottickedoff">-- Snapshot old security config BEFORE any modifications so rekeyExisting can use it.</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="nottickedoff">let secPath = securityFilePath (vrPaths rt)</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="nottickedoff">oldCfg &lt;- loadSecurityConfig secPath</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="nottickedoff">let vaultPath = case oldCfg of</span>
+<span class="lineno">  150 </span><span class="spaces">        </span><span class="nottickedoff">Left _    -&gt; vaultFilePath (vrPaths rt)</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="nottickedoff">Right cfg -&gt; maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath cfg)</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="nottickedoff">hasKey = case oldCfg of</span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="nottickedoff">Right cfg -&gt; isJust (scVaultRecipient cfg) &amp;&amp; isJust (scVaultIdentity cfg)</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="nottickedoff">Left _    -&gt; False</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="nottickedoff">vaultExists &lt;- doesFileExist vaultPath</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="nottickedoff">-- An existing vault WITH a recorded key means re-running setup rotates that</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="nottickedoff">-- key; confirm first and reassure that secrets are preserved (the old key is</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">-- kept and nothing is decrypted-then-lost). A vault file with no key recorded</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">-- in config is an orphan from an interrupted setup — fall through so the</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="nottickedoff">-- orphan branch in rekeyExisting can tell the user to delete it.</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">proceed &lt;-</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="nottickedoff">if vaultExists &amp;&amp; hasKey</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="nottickedoff">then do</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="nottickedoff">ccSend caps</span>
+<span class="lineno">  165 </span><span class="spaces">          </span><span class="nottickedoff">(  &quot;A vault already exists. Continuing will ROTATE its key: every &quot;</span>
+<span class="lineno">  166 </span><span class="spaces">          </span><span class="nottickedoff">&lt;&gt; &quot;secret is re-encrypted to a new key. Your existing secrets are &quot;</span>
+<span class="lineno">  167 </span><span class="spaces">          </span><span class="nottickedoff">&lt;&gt; &quot;preserved, and the current key file is kept (never overwritten).&quot;)</span>
+<span class="lineno">  168 </span><span class="spaces">        </span><span class="nottickedoff">ans &lt;- ccPrompt caps (AskPrompt &quot;Rotate the vault key? [y/N]: &quot; [])</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="nottickedoff">pure (T.toLower (T.strip ans) `elem` [&quot;y&quot;, &quot;yes&quot;])</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="nottickedoff">else pure True</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="nottickedoff">if not proceed</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="nottickedoff">then ccSend caps &quot;Setup cancelled; the vault is unchanged.&quot;</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="nottickedoff">else runSetup rt caps oldCfg</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | Backend selection + key generation + vault init/rekey. Split out of
+<span class="lineno">  176 </span>-- 'setupCmd' so the existing-vault rotation guard stays readable. New keys are
+<span class="lineno">  177 </span>-- always written to a fresh identity file (see 'freshKeyName' in
+<span class="lineno">  178 </span>-- &quot;Seal.Vault.Backend&quot;), so a rotation never overwrites the key the current
+<span class="lineno">  179 </span>-- vault still depends on.
+<span class="lineno">  180 </span>runSetup :: VaultRuntime -&gt; ChannelCaps -&gt; Either Text SecurityConfig -&gt; IO ()
+<span class="lineno">  181 </span><span class="decl"><span class="nottickedoff">runSetup rt caps oldCfg = do</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="nottickedoff">plugins &lt;- detectAgePlugins</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="nottickedoff">let hasYubi = &quot;yubikey&quot; `elem` plugins</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="nottickedoff">ccSend caps &quot;Available vault backends:&quot;</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="nottickedoff">ccSend caps &quot;  1. Local age key (age-keygen) — key stored on disk&quot;</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="nottickedoff">when hasYubi $</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="nottickedoff">ccSend caps &quot;  2. YubiKey (age-plugin-yubikey) — key stays on token [recommended]&quot;</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">let userNum = if hasYubi then &quot;3&quot; else &quot;2&quot;</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="nottickedoff">ccSend caps (&quot;  &quot; &lt;&gt; userNum &lt;&gt; &quot;. User-supplied (bring your own key)&quot;)</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">choice &lt;- T.strip &lt;$&gt; ccPrompt caps (AskPrompt &quot;Choose backend [1]: &quot; [])</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="nottickedoff">let effective = if T.null choice then &quot;1&quot; else choice</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="nottickedoff">rkResult &lt;- case (effective, hasYubi) of</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="nottickedoff">(&quot;1&quot;, _)     -&gt; setupLocalAgeKey (vrPaths rt) &quot;default&quot;</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="nottickedoff">(&quot;2&quot;, True)  -&gt; do</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="nottickedoff">tp &lt;- ccPrompt caps (AskPrompt &quot;Require touch? [y/N]: &quot; [])</span>
+<span class="lineno">  196 </span><span class="spaces">      </span><span class="nottickedoff">let touch = T.toLower (T.strip tp) `elem` [&quot;y&quot;, &quot;yes&quot;]</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="nottickedoff">pp &lt;- ccPrompt caps</span>
+<span class="lineno">  198 </span><span class="spaces">        </span><span class="nottickedoff">(AskPrompt &quot;Require PIN on each decrypt session? [Y/n] (choose n for no PIN): &quot; [])</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="nottickedoff">let pin = T.toLower (T.strip pp) `notElem` [&quot;n&quot;, &quot;no&quot;]</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="nottickedoff">setupYubiKey (vrPaths rt) &quot;default&quot; touch pin caps</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="nottickedoff">(&quot;2&quot;, False) -&gt; setupUserSupplied caps</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="nottickedoff">(&quot;3&quot;, True)  -&gt; setupUserSupplied caps</span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="nottickedoff">(other, _)   -&gt; pure (Left (&quot;Invalid choice: &quot; &lt;&gt; other))</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="nottickedoff">case rkResult of</span>
+<span class="lineno">  205 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; ccSend caps (&quot;Setup failed: &quot; &lt;&gt; err)</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="nottickedoff">Right rk -&gt; do</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="nottickedoff">encResult &lt;- mkAgeEncryptor</span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="nottickedoff">(AgeRecipient (rkRecipient rk))</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="nottickedoff">(AgeIdentity  (rkIdentity  rk))</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="nottickedoff">case encResult of</span>
+<span class="lineno">  211 </span><span class="spaces">        </span><span class="nottickedoff">Left e -&gt; ccSend caps (vaultErrMsg e)</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="nottickedoff">Right enc -&gt; do</span>
+<span class="lineno">  213 </span><span class="spaces">          </span><span class="nottickedoff">-- Honor vault_path from config if set; fall back to the default path.</span>
+<span class="lineno">  214 </span><span class="spaces">          </span><span class="nottickedoff">-- tryOpenVault in Seal.Tui uses the same expression to stay in sync.</span>
+<span class="lineno">  215 </span><span class="spaces">          </span><span class="nottickedoff">let vaultPath = case oldCfg of</span>
+<span class="lineno">  216 </span><span class="spaces">                </span><span class="nottickedoff">Left _    -&gt; vaultFilePath (vrPaths rt)</span>
+<span class="lineno">  217 </span><span class="spaces">                </span><span class="nottickedoff">Right cfg -&gt; maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath cfg)</span>
+<span class="lineno">  218 </span><span class="spaces">              </span><span class="nottickedoff">vaultCfg = VaultConfig</span>
+<span class="lineno">  219 </span><span class="spaces">                </span><span class="nottickedoff">{ vcPath   = vaultPath</span>
+<span class="lineno">  220 </span><span class="spaces">                </span><span class="nottickedoff">, vcKeyType = rkKeyType rk</span>
+<span class="lineno">  221 </span><span class="spaces">                </span><span class="nottickedoff">, vcUnlock  = UnlockOnDemand</span>
+<span class="lineno">  222 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  223 </span><span class="spaces">          </span><span class="nottickedoff">h &lt;- openVault vaultCfg enc</span>
+<span class="lineno">  224 </span><span class="spaces">          </span><span class="nottickedoff">initResult &lt;- vhInit h</span>
+<span class="lineno">  225 </span><span class="spaces">          </span><span class="nottickedoff">case initResult of</span>
+<span class="lineno">  226 </span><span class="spaces">            </span><span class="nottickedoff">Right () -&gt; do</span>
+<span class="lineno">  227 </span><span class="spaces">              </span><span class="nottickedoff">ur &lt;- updateSecurityConfig (securityFilePath (vrPaths rt)) $ \sc -&gt; sc</span>
+<span class="lineno">  228 </span><span class="spaces">                </span><span class="nottickedoff">{ scVaultRecipient = Just (rkRecipient rk)</span>
+<span class="lineno">  229 </span><span class="spaces">                </span><span class="nottickedoff">, scVaultIdentity  = Just (rkIdentity  rk)</span>
+<span class="lineno">  230 </span><span class="spaces">                </span><span class="nottickedoff">, scVaultKeyType   = Just (rkKeyType   rk)</span>
+<span class="lineno">  231 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  232 </span><span class="spaces">              </span><span class="nottickedoff">case ur of</span>
+<span class="lineno">  233 </span><span class="spaces">                </span><span class="nottickedoff">Left err -&gt; ccSend caps (&quot;Config write failed: &quot; &lt;&gt; err)</span>
+<span class="lineno">  234 </span><span class="spaces">                </span><span class="nottickedoff">Right () -&gt; do</span>
+<span class="lineno">  235 </span><span class="spaces">                  </span><span class="nottickedoff">writeIORef (vrHandleRef rt) (Just h)</span>
+<span class="lineno">  236 </span><span class="spaces">                  </span><span class="nottickedoff">ccSend caps &quot;Vault created successfully.&quot;</span>
+<span class="lineno">  237 </span><span class="spaces">            </span><span class="nottickedoff">Left VaultAlreadyExists -&gt;</span>
+<span class="lineno">  238 </span><span class="spaces">              </span><span class="nottickedoff">rekeyExisting rt caps enc rk oldCfg</span>
+<span class="lineno">  239 </span><span class="spaces">            </span><span class="nottickedoff">Left e -&gt;</span>
+<span class="lineno">  240 </span><span class="spaces">              </span><span class="nottickedoff">ccSend caps (vaultErrMsg e)</span></span>
+<span class="lineno">  241 </span>
+<span class="lineno">  242 </span>-- | Rekey an existing vault with a new encryptor.
+<span class="lineno">  243 </span>-- Uses the OLD config snapshot (captured before any modifications) to build
+<span class="lineno">  244 </span>-- the old encryptor; updates the config after a successful rekey.
+<span class="lineno">  245 </span>rekeyExisting
+<span class="lineno">  246 </span>  :: VaultRuntime
+<span class="lineno">  247 </span>  -&gt; ChannelCaps
+<span class="lineno">  248 </span>  -&gt; VaultEncryptor
+<span class="lineno">  249 </span>  -&gt; ResolvedKey
+<span class="lineno">  250 </span>  -&gt; Either Text SecurityConfig
+<span class="lineno">  251 </span>  -&gt; IO ()
+<span class="lineno">  252 </span><span class="decl"><span class="nottickedoff">rekeyExisting rt caps newEnc rk eCfg = do</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="nottickedoff">case eCfg of</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt;</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="nottickedoff">ccSend caps (&quot;Cannot read existing config for rekey: &quot; &lt;&gt; err)</span>
+<span class="lineno">  256 </span><span class="spaces">    </span><span class="nottickedoff">Right oldCfg -&gt;</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="nottickedoff">-- Honor vault_path from config if set; fall back to the default path.</span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="nottickedoff">-- tryOpenVault in Seal.Tui uses the same expression to stay in sync.</span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="nottickedoff">let vaultPath = maybe (vaultFilePath (vrPaths rt)) T.unpack (scVaultPath oldCfg)</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="nottickedoff">in case (scVaultRecipient oldCfg, scVaultIdentity oldCfg) of</span>
+<span class="lineno">  261 </span><span class="spaces">        </span><span class="nottickedoff">(Nothing, Nothing) -&gt;</span>
+<span class="lineno">  262 </span><span class="spaces">          </span><span class="nottickedoff">-- Vault file exists but config has no key: a previous setup was</span>
+<span class="lineno">  263 </span><span class="spaces">          </span><span class="nottickedoff">-- interrupted before the config was written.  Tell the user to</span>
+<span class="lineno">  264 </span><span class="spaces">          </span><span class="nottickedoff">-- remove the orphaned file rather than trying to re-encrypt it.</span>
+<span class="lineno">  265 </span><span class="spaces">          </span><span class="nottickedoff">ccSend caps</span>
+<span class="lineno">  266 </span><span class="spaces">            </span><span class="nottickedoff">(  &quot;vault file exists at &quot;</span>
+<span class="lineno">  267 </span><span class="spaces">            </span><span class="nottickedoff">&lt;&gt; T.pack vaultPath</span>
+<span class="lineno">  268 </span><span class="spaces">            </span><span class="nottickedoff">&lt;&gt; &quot; but the config has no key recorded — it was likely left from&quot;</span>
+<span class="lineno">  269 </span><span class="spaces">            </span><span class="nottickedoff">&lt;&gt; &quot; an interrupted setup. Delete that file and re-run '/vault setup'.&quot;)</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; do</span>
+<span class="lineno">  271 </span><span class="spaces">          </span><span class="nottickedoff">oldEncResult &lt;- resolveEncryptor oldCfg</span>
+<span class="lineno">  272 </span><span class="spaces">          </span><span class="nottickedoff">case oldEncResult of</span>
+<span class="lineno">  273 </span><span class="spaces">            </span><span class="nottickedoff">Left e -&gt;</span>
+<span class="lineno">  274 </span><span class="spaces">              </span><span class="nottickedoff">ccSend caps (&quot;Cannot load existing key for rekey: &quot; &lt;&gt; vaultErrMsg e)</span>
+<span class="lineno">  275 </span><span class="spaces">            </span><span class="nottickedoff">Right oldEnc -&gt; do</span>
+<span class="lineno">  276 </span><span class="spaces">              </span><span class="nottickedoff">let oldVaultCfg = VaultConfig</span>
+<span class="lineno">  277 </span><span class="spaces">                    </span><span class="nottickedoff">{ vcPath    = vaultPath</span>
+<span class="lineno">  278 </span><span class="spaces">                    </span><span class="nottickedoff">, vcKeyType = fromMaybe &quot;unknown&quot; (scVaultKeyType oldCfg)</span>
+<span class="lineno">  279 </span><span class="spaces">                    </span><span class="nottickedoff">, vcUnlock  = UnlockOnDemand</span>
+<span class="lineno">  280 </span><span class="spaces">                    </span><span class="nottickedoff">}</span>
+<span class="lineno">  281 </span><span class="spaces">              </span><span class="nottickedoff">oldH &lt;- openVault oldVaultCfg oldEnc</span>
+<span class="lineno">  282 </span><span class="spaces">              </span><span class="nottickedoff">-- vhRekey reads from disk directly; no explicit unlock needed.</span>
+<span class="lineno">  283 </span><span class="spaces">              </span><span class="nottickedoff">-- Rotation was already confirmed up front in setupCmd, so show the</span>
+<span class="lineno">  284 </span><span class="spaces">              </span><span class="nottickedoff">-- old/new key summary and proceed without a second prompt.</span>
+<span class="lineno">  285 </span><span class="spaces">              </span><span class="nottickedoff">let confirmRekey msg = ccSend caps msg &gt;&gt; pure True</span>
+<span class="lineno">  286 </span><span class="spaces">              </span><span class="nottickedoff">rekeyResult &lt;- vhRekey oldH newEnc (rkKeyType rk) confirmRekey</span>
+<span class="lineno">  287 </span><span class="spaces">              </span><span class="nottickedoff">case rekeyResult of</span>
+<span class="lineno">  288 </span><span class="spaces">                </span><span class="nottickedoff">Right () -&gt; do</span>
+<span class="lineno">  289 </span><span class="spaces">                  </span><span class="nottickedoff">ur &lt;- updateSecurityConfig (securityFilePath (vrPaths rt)) $ \sc -&gt; sc</span>
+<span class="lineno">  290 </span><span class="spaces">                    </span><span class="nottickedoff">{ scVaultRecipient = Just (rkRecipient rk)</span>
+<span class="lineno">  291 </span><span class="spaces">                    </span><span class="nottickedoff">, scVaultIdentity  = Just (rkIdentity  rk)</span>
+<span class="lineno">  292 </span><span class="spaces">                    </span><span class="nottickedoff">, scVaultKeyType   = Just (rkKeyType   rk)</span>
+<span class="lineno">  293 </span><span class="spaces">                    </span><span class="nottickedoff">}</span>
+<span class="lineno">  294 </span><span class="spaces">                  </span><span class="nottickedoff">case ur of</span>
+<span class="lineno">  295 </span><span class="spaces">                    </span><span class="nottickedoff">Left err -&gt; ccSend caps</span>
+<span class="lineno">  296 </span><span class="spaces">                      </span><span class="nottickedoff">(  &quot;ERROR: vault was re-encrypted with the new key, but saving the&quot;</span>
+<span class="lineno">  297 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; config failed (&quot; &lt;&gt; err &lt;&gt; &quot;). The vault on disk now uses the&quot;</span>
+<span class="lineno">  298 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; NEW key, but security.toml still names the OLD key. Do NOT re-run&quot;</span>
+<span class="lineno">  299 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; '/vault setup' — that would attempt to decrypt with the old key&quot;</span>
+<span class="lineno">  300 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; and fail. Instead, manually edit config.toml to set&quot;</span>
+<span class="lineno">  301 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; vault_recipient, vault_identity, and vault_key_type to the&quot;</span>
+<span class="lineno">  302 </span><span class="spaces">                      </span><span class="nottickedoff">&lt;&gt; &quot; values just configured, or restore config.toml from a backup.&quot;)</span>
+<span class="lineno">  303 </span><span class="spaces">                    </span><span class="nottickedoff">Right () -&gt; do</span>
+<span class="lineno">  304 </span><span class="spaces">                      </span><span class="nottickedoff">writeIORef (vrHandleRef rt) (Just oldH)</span>
+<span class="lineno">  305 </span><span class="spaces">                      </span><span class="nottickedoff">ccSend caps &quot;Vault rekeyed successfully.&quot;</span>
+<span class="lineno">  306 </span><span class="spaces">                </span><span class="nottickedoff">Left e -&gt;</span>
+<span class="lineno">  307 </span><span class="spaces">                  </span><span class="nottickedoff">ccSend caps (vaultErrMsg e)</span></span>
+<span class="lineno">  308 </span>
+<span class="lineno">  309 </span>addCmd :: VaultRuntime -&gt; Text -&gt; CommandAction
+<span class="lineno">  310 </span><span class="decl"><span class="istickedoff">addCmd rt name = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  311 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt caps $ \h -&gt; do</span>
+<span class="lineno">  312 </span><span class="spaces">    </span><span class="istickedoff">val &lt;- ccPromptSecret caps <span class="nottickedoff">(&quot;Value for &quot; &lt;&gt; name &lt;&gt; &quot;: &quot;)</span></span>
+<span class="lineno">  313 </span><span class="spaces">    </span><span class="istickedoff">result &lt;- vhPut h name (TE.encodeUtf8 val)</span>
+<span class="lineno">  314 </span><span class="spaces">    </span><span class="istickedoff">handleResult <span class="nottickedoff">caps</span> result $ \() -&gt;</span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps (&quot;Secret '&quot; &lt;&gt; name &lt;&gt; &quot;' stored.&quot;)</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>getCmd :: VaultRuntime -&gt; Text -&gt; CommandAction
+<span class="lineno">  318 </span><span class="decl"><span class="istickedoff">getCmd rt name = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  319 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt <span class="nottickedoff">caps</span> $ \h -&gt; do</span>
+<span class="lineno">  320 </span><span class="spaces">    </span><span class="istickedoff">result &lt;- vhGet h name</span>
+<span class="lineno">  321 </span><span class="spaces">    </span><span class="istickedoff">handleResult caps result (ccSend caps . TE.decodeUtf8Lenient)</span></span>
+<span class="lineno">  322 </span>
+<span class="lineno">  323 </span>listCmd :: VaultRuntime -&gt; CommandAction
+<span class="lineno">  324 </span><span class="decl"><span class="istickedoff">listCmd rt = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt caps $ \h -&gt; do</span>
+<span class="lineno">  326 </span><span class="spaces">    </span><span class="istickedoff">result &lt;- vhList h</span>
+<span class="lineno">  327 </span><span class="spaces">    </span><span class="istickedoff">handleResult <span class="nottickedoff">caps</span> result (mapM_ (ccSend caps))</span></span>
+<span class="lineno">  328 </span>
+<span class="lineno">  329 </span>deleteCmd :: VaultRuntime -&gt; Text -&gt; CommandAction
+<span class="lineno">  330 </span><span class="decl"><span class="istickedoff">deleteCmd rt name = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt <span class="nottickedoff">caps</span> $ \h -&gt; do</span>
+<span class="lineno">  332 </span><span class="spaces">    </span><span class="istickedoff">result &lt;- vhDelete h name</span>
+<span class="lineno">  333 </span><span class="spaces">    </span><span class="istickedoff">handleResult caps result $ \() -&gt;</span>
+<span class="lineno">  334 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps (&quot;Secret '&quot; &lt;&gt; name &lt;&gt; &quot;' deleted.&quot;)</span></span>
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>lockCmd :: VaultRuntime -&gt; CommandAction
+<span class="lineno">  337 </span><span class="decl"><span class="istickedoff">lockCmd rt = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt <span class="nottickedoff">caps</span> $ \h -&gt; do</span>
+<span class="lineno">  339 </span><span class="spaces">    </span><span class="istickedoff">vhLock h</span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="istickedoff">ccSend caps &quot;Vault locked.&quot;</span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>unlockCmd :: VaultRuntime -&gt; CommandAction
+<span class="lineno">  343 </span><span class="decl"><span class="istickedoff">unlockCmd rt = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  344 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt <span class="nottickedoff">caps</span> $ \h -&gt; do</span>
+<span class="lineno">  345 </span><span class="spaces">    </span><span class="istickedoff">result &lt;- vhUnlock h</span>
+<span class="lineno">  346 </span><span class="spaces">    </span><span class="istickedoff">handleResult <span class="nottickedoff">caps</span> result $ \() -&gt;</span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff">ccSend caps <span class="nottickedoff">&quot;Vault unlocked.&quot;</span></span></span>
+<span class="lineno">  348 </span>
+<span class="lineno">  349 </span>statusCmd :: VaultRuntime -&gt; CommandAction
+<span class="lineno">  350 </span><span class="decl"><span class="istickedoff">statusCmd rt = CommandAction $ \caps -&gt;</span>
+<span class="lineno">  351 </span><span class="spaces">  </span><span class="istickedoff">withHandle rt caps $ \h -&gt; do</span>
+<span class="lineno">  352 </span><span class="spaces">    </span><span class="istickedoff">st &lt;- vhStatus h</span>
+<span class="lineno">  353 </span><span class="spaces">    </span><span class="istickedoff">ccSend caps $ T.unlines</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;locked:  &quot; &lt;&gt; (if <span class="tickonlyfalse">vsLocked st</span> then <span class="nottickedoff">&quot;yes&quot;</span> else &quot;no&quot;)</span>
+<span class="lineno">  355 </span><span class="spaces">      </span><span class="istickedoff">, &quot;secrets: &quot; &lt;&gt; T.pack (show (vsSecretCount st))</span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff">, &quot;key:     &quot; &lt;&gt; vsKeyType st</span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+
+</pre>
+</body>
+</html>

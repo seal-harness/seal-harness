@@ -1,0 +1,272 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Skills opcode group: SKILL_WRITE, SKILL_LOAD, SKILL_LIST, SKILL_DELETE.
+<span class="lineno">    3 </span>-- All Audited — the dispatcher writes both the session transcript and the
+<span class="lineno">    4 </span>-- Audited log; the opcodes mutate the in-memory/Markdown backend (the
+<span class="lineno">    5 </span>-- materialized view). 'orRecorded' carries the secret-free 'SkillId' + op name
+<span class="lineno">    6 </span>-- + @was_new@ flag (so the audit log distinguishes create vs update); the
+<span class="lineno">    7 </span>-- skill DESCRIPTION and BODY are agent-visible data (not a vault secret) and
+<span class="lineno">    8 </span>-- are recorded in full in both logs.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- 'SKILL_WRITE' is an upsert: if the skill already exists, its description
+<span class="lineno">   11 </span>-- and/or body are updated (the original 'skSession' provenance and
+<span class="lineno">   12 </span>-- 'skCreatedAt' are preserved; only 'skUpdatedAt' is bumped); if not, a
+<span class="lineno">   13 </span>-- fresh skill is created. This merges the former SKILL_CREATE + SKILL_UPDATE
+<span class="lineno">   14 </span>-- into a single opcode, eliminating one failure path.
+<span class="lineno">   15 </span>module Seal.ISA.Ops.Skills
+<span class="lineno">   16 </span>  ( skillWriteOp
+<span class="lineno">   17 </span>  , skillLoadOp
+<span class="lineno">   18 </span>  , skillListOp
+<span class="lineno">   19 </span>  , skillDeleteOp
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   23 </span>import Data.Aeson
+<span class="lineno">   24 </span>  ( Value, object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   25 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   26 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   27 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   28 </span>import Data.Text (Text)
+<span class="lineno">   29 </span>import Data.Text qualified as T
+<span class="lineno">   30 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Seal.Core.Types (OpName (..), SessionId, TrustLevel (..))
+<span class="lineno">   33 </span>import Seal.ISA.Opcode
+<span class="lineno">   34 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   35 </span>import Seal.Skills.Backend (SkillBackend (..))
+<span class="lineno">   36 </span>import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | Build a JSON-Schema object with a single required string property.
+<span class="lineno">   39 </span>singleStringSchema :: Text -&gt; Text -&gt; Value
+<span class="lineno">   40 </span><span class="decl"><span class="istickedoff">singleStringSchema fieldName fieldDesc =</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">   42 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   44 </span><span class="spaces">        </span><span class="istickedoff">[fromText fieldName .= object</span>
+<span class="lineno">   45 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   46 </span><span class="spaces">           </span><span class="istickedoff">, &quot;description&quot; .= fieldDesc</span>
+<span class="lineno">   47 </span><span class="spaces">           </span><span class="istickedoff">]]</span>
+<span class="lineno">   48 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([fieldName] :: [Text])</span>
+<span class="lineno">   49 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Extract the @id@ string field from a JSON object.
+<span class="lineno">   52 </span>idField :: Value -&gt; Maybe Text
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">idField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;id&quot;))</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | Extract the @description@ string field (defaults to empty when absent).
+<span class="lineno">   56 </span>descriptionField :: Value -&gt; Text
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">descriptionField v = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;description&quot;)) v)</span></span>
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- | Extract the @body@ string field (defaults to empty when absent).
+<span class="lineno">   60 </span>bodyField :: Value -&gt; Text
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">bodyField v = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;body&quot;)) v)</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Extract the optional @group@ string field. 'Nothing' when absent or
+<span class="lineno">   64 </span>-- empty (after stripping). A skill's group controls its on-disk location
+<span class="lineno">   65 </span>-- (@config\/skills\/\&lt;group\&gt;\/\&lt;id\&gt;.md@) and its display grouping in the
+<span class="lineno">   66 </span>-- @\&lt;available_skills\&gt;@ catalog.
+<span class="lineno">   67 </span>groupField :: Value -&gt; Maybe Text
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">groupField v = do</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">raw &lt;- parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;group&quot;)) v</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">t &lt;- raw</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">t' = T.strip t</span></span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">if T.null t' then Nothing else Just t'</span></span></span>
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | SKILL_WRITE: upsert a skill by id. If the skill already exists, its
+<span class="lineno">   75 </span>-- description, body, and group are updated (the original 'skSession'
+<span class="lineno">   76 </span>-- provenance and 'skCreatedAt' are preserved; only 'skUpdatedAt' is
+<span class="lineno">   77 </span>-- bumped); if not, a fresh skill is created with the current session as
+<span class="lineno">   78 </span>-- provenance. The description and body are recorded in full (agent-visible
+<span class="lineno">   79 </span>-- data); 'orRecorded' carries the id + op name + description + body +
+<span class="lineno">   80 </span>-- @was_new@ (secret-free).
+<span class="lineno">   81 </span>skillWriteOp :: SkillBackend -&gt; SessionId -&gt; Opcode
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">skillWriteOp backend session = TrustedOpcode</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SKILL_WRITE&quot;</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Create or update an agent skill by id (upsert; preserves provenance on update).&quot;</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   89 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;id&quot; .= object</span>
+<span class="lineno">   90 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   91 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Skill id ([A-Za-z0-9_-]+).&quot; :: Text)</span>
+<span class="lineno">   92 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">   93 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;description&quot; .= object</span>
+<span class="lineno">   94 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   95 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Short human-readable description of the skill.&quot; :: Text)</span>
+<span class="lineno">   96 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">   97 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;body&quot; .= object</span>
+<span class="lineno">   98 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   99 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The skill body (Markdown). Agent-visible.&quot; :: Text)</span>
+<span class="lineno">  100 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  101 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;group&quot; .= object</span>
+<span class="lineno">  102 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  103 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional category for grouping in the available-skills catalog. When set, the skill is stored under config/skills/&lt;group&gt;/&lt;id&gt;.md; when omitted, the skill keeps its existing group (or is ungrouped on create).&quot; :: Text)</span>
+<span class="lineno">  104 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;id&quot;, &quot;description&quot;, &quot;body&quot;] :: [Text])</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;SKILL_WRITE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either (const Nothing) Just . mkSkillId</span>
+<span class="lineno">  112 </span><span class="spaces">          </span><span class="istickedoff">mNewGroup = groupField v</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;invalid skill id&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  116 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (sbRead backend sid)</span>
+<span class="lineno">  117 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  118 </span><span class="spaces">          </span><span class="istickedoff">let (skill, wasNew) = case mExisting of</span>
+<span class="lineno">  119 </span><span class="spaces">                </span><span class="istickedoff">Just existing -&gt;</span>
+<span class="lineno">  120 </span><span class="spaces">                  </span><span class="istickedoff">( existing</span>
+<span class="lineno">  121 </span><span class="spaces">                      </span><span class="istickedoff">{ skDescription = descriptionField v</span>
+<span class="lineno">  122 </span><span class="spaces">                      </span><span class="istickedoff">, skBody = bodyField v</span>
+<span class="lineno">  123 </span><span class="spaces">                      </span><span class="istickedoff">, skGroup = <span class="nottickedoff">case mNewGroup of</span></span>
+<span class="lineno">  124 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">Just g  -&gt; Just g</span></span>
+<span class="lineno">  125 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; skGroup existing</span></span>
+<span class="lineno">  126 </span><span class="spaces">                      </span><span class="istickedoff">, skUpdatedAt = <span class="nottickedoff">now</span></span>
+<span class="lineno">  127 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  128 </span><span class="spaces">                  </span><span class="istickedoff">, False</span>
+<span class="lineno">  129 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  130 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  131 </span><span class="spaces">                  </span><span class="istickedoff">( Skill</span>
+<span class="lineno">  132 </span><span class="spaces">                      </span><span class="istickedoff">{ skId = sid</span>
+<span class="lineno">  133 </span><span class="spaces">                      </span><span class="istickedoff">, skDescription = descriptionField v</span>
+<span class="lineno">  134 </span><span class="spaces">                      </span><span class="istickedoff">, skBody = bodyField v</span>
+<span class="lineno">  135 </span><span class="spaces">                      </span><span class="istickedoff">, skGroup = mNewGroup</span>
+<span class="lineno">  136 </span><span class="spaces">                      </span><span class="istickedoff">, skCreatedAt = now</span>
+<span class="lineno">  137 </span><span class="spaces">                      </span><span class="istickedoff">, skUpdatedAt = now</span>
+<span class="lineno">  138 </span><span class="spaces">                      </span><span class="istickedoff">, skSession = session</span>
+<span class="lineno">  139 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  140 </span><span class="spaces">                  </span><span class="istickedoff">, True</span>
+<span class="lineno">  141 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  142 </span><span class="spaces">          </span><span class="istickedoff">liftIO (sbCreate backend skill)</span>
+<span class="lineno">  143 </span><span class="spaces">          </span><span class="istickedoff">let recorded = object</span>
+<span class="lineno">  144 </span><span class="spaces">                </span><span class="istickedoff">[ &quot;id&quot; .= skillIdText sid</span>
+<span class="lineno">  145 </span><span class="spaces">                </span><span class="istickedoff">, &quot;description&quot; .= skDescription skill</span>
+<span class="lineno">  146 </span><span class="spaces">                </span><span class="istickedoff">, &quot;body&quot; .= skBody skill</span>
+<span class="lineno">  147 </span><span class="spaces">                </span><span class="istickedoff">, &quot;group&quot; .= skGroup skill</span>
+<span class="lineno">  148 </span><span class="spaces">                </span><span class="istickedoff">, &quot;created_at&quot; .= skCreatedAt skill</span>
+<span class="lineno">  149 </span><span class="spaces">                </span><span class="istickedoff">, &quot;updated_at&quot; .= skUpdatedAt skill</span>
+<span class="lineno">  150 </span><span class="spaces">                </span><span class="istickedoff">, &quot;session&quot; .= skSession skill</span>
+<span class="lineno">  151 </span><span class="spaces">                </span><span class="istickedoff">, &quot;was_new&quot; .= wasNew</span>
+<span class="lineno">  152 </span><span class="spaces">                </span><span class="istickedoff">]</span>
+<span class="lineno">  153 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText (if wasNew then &quot;created&quot; else &quot;updated&quot;)] False recorded)</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid skill id: &quot; &lt;&gt;))</span> (const (Right ())) (mkSkillId t)</span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | SKILL_LOAD: return one skill by id. Audited — the agent reading its own
+<span class="lineno">  159 </span>-- skills is an evolutionary event worth logging, with secret-free metadata.
+<span class="lineno">  160 </span>-- The skill body is returned to the model (agent-visible) and recorded in full.
+<span class="lineno">  161 </span>skillLoadOp :: SkillBackend -&gt; Opcode
+<span class="lineno">  162 </span><span class="decl"><span class="istickedoff">skillLoadOp backend = TrustedOpcode</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SKILL_LOAD&quot;</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Load one agent skill by id into the current session.&quot;</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;id&quot; &quot;The skill id to load.&quot;</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;SKILL_LOAD requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either (const Nothing) Just . mkSkillId</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;invalid skill id&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  174 </span><span class="spaces">          </span><span class="istickedoff">mSkill &lt;- liftIO (sbRead backend sid)</span>
+<span class="lineno">  175 </span><span class="spaces">          </span><span class="istickedoff">case mSkill of</span>
+<span class="lineno">  176 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;skill not found&quot;]</span> True <span class="nottickedoff">(object [&quot;id&quot; .= skillIdText sid])</span>)</span>
+<span class="lineno">  177 </span><span class="spaces">            </span><span class="istickedoff">Just s  -&gt; do</span>
+<span class="lineno">  178 </span><span class="spaces">              </span><span class="istickedoff">let rendered = &quot;# &quot; &lt;&gt; skillIdText (skId s) &lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno">  179 </span><span class="spaces">                      </span><span class="istickedoff">&lt;&gt; skDescription s &lt;&gt; &quot;\n\n---\n\n&quot; &lt;&gt; skBody s</span>
+<span class="lineno">  180 </span><span class="spaces">                  </span><span class="istickedoff">recorded = object</span>
+<span class="lineno">  181 </span><span class="spaces">                    </span><span class="istickedoff">[ &quot;id&quot; .= skillIdText sid</span>
+<span class="lineno">  182 </span><span class="spaces">                    </span><span class="istickedoff">, &quot;description&quot; .= skDescription s</span>
+<span class="lineno">  183 </span><span class="spaces">                    </span><span class="istickedoff">, &quot;body&quot; .= skBody s</span>
+<span class="lineno">  184 </span><span class="spaces">                    </span><span class="istickedoff">, &quot;group&quot; .= skGroup s</span>
+<span class="lineno">  185 </span><span class="spaces">                    </span><span class="istickedoff">, &quot;updated_at&quot; .= skUpdatedAt s</span>
+<span class="lineno">  186 </span><span class="spaces">                    </span><span class="istickedoff">, &quot;session&quot; .= skSession s</span>
+<span class="lineno">  187 </span><span class="spaces">                    </span><span class="istickedoff">]</span>
+<span class="lineno">  188 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult [TrpText rendered] False recorded)</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  191 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid skill id: &quot; &lt;&gt;))</span> (const (Right ())) (mkSkillId t)</span></span>
+<span class="lineno">  192 </span>
+<span class="lineno">  193 </span>-- | SKILL_DELETE: remove a skill by id. Idempotent (deleting a missing id is
+<span class="lineno">  194 </span>-- a success with a &quot;not present&quot; message, not an error). Mirrors
+<span class="lineno">  195 </span>-- 'Seal.ISA.Ops.Memory.memoryDeleteOp'.
+<span class="lineno">  196 </span>skillDeleteOp :: SkillBackend -&gt; Opcode
+<span class="lineno">  197 </span><span class="decl"><span class="istickedoff">skillDeleteOp backend = TrustedOpcode</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SKILL_DELETE&quot;</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Delete an agent skill by id (idempotent).&quot;</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;id&quot; &quot;The skill id to delete.&quot;</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;SKILL_DELETE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkSkillId</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid skill id&quot;] True (object []))</span></span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="istickedoff">Just sid -&gt; do</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (sbRead backend sid)</span>
+<span class="lineno">  210 </span><span class="spaces">          </span><span class="istickedoff">liftIO (sbDelete backend sid)</span>
+<span class="lineno">  211 </span><span class="spaces">          </span><span class="istickedoff">let msg = case mExisting of</span>
+<span class="lineno">  212 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; &quot;deleted (was not present)&quot;</span>
+<span class="lineno">  213 </span><span class="spaces">                </span><span class="istickedoff">Just _  -&gt; <span class="nottickedoff">&quot;deleted&quot;</span></span>
+<span class="lineno">  214 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">recorded = object [&quot;id&quot; .= skillIdText sid]</span></span>
+<span class="lineno">  215 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText msg] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  218 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid skill id: &quot; &lt;&gt;))</span> (const (Right ())) (mkSkillId t)</span></span>
+<span class="lineno">  219 </span>
+<span class="lineno">  220 </span>-- | SKILL_LIST: enumerate all defined skills (id + description). Audited —
+<span class="lineno">  221 </span>-- listing is an evolutionary event worth logging, with secret-free metadata
+<span class="lineno">  222 </span>-- (no skill bodies in the recorded payload; the model sees only the
+<span class="lineno">  223 </span>-- id+description summary).
+<span class="lineno">  224 </span>skillListOp :: SkillBackend -&gt; Opcode
+<span class="lineno">  225 </span><span class="decl"><span class="istickedoff">skillListOp backend = TrustedOpcode</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SKILL_LIST&quot;</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;List all defined agent skills (id + description).&quot;</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  230 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object []</span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ _ -&gt; do</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">allSkills &lt;- liftIO (sbList backend)</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">let rendered = case allSkills of</span>
+<span class="lineno">  238 </span><span class="spaces">            </span><span class="istickedoff">[] -&gt; &quot;(no skills defined)&quot;</span>
+<span class="lineno">  239 </span><span class="spaces">            </span><span class="istickedoff">_  -&gt; T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  240 </span><span class="spaces">                    </span><span class="istickedoff">[ skillIdText (skId s)</span>
+<span class="lineno">  241 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; maybe &quot;&quot; <span class="nottickedoff">(\g -&gt; &quot; [&quot; &lt;&gt; g &lt;&gt; &quot;]&quot;)</span> (skGroup s)</span>
+<span class="lineno">  242 </span><span class="spaces">                        </span><span class="istickedoff">&lt;&gt; &quot;: &quot; &lt;&gt; skDescription s</span>
+<span class="lineno">  243 </span><span class="spaces">                    </span><span class="istickedoff">| s &lt;- allSkills ]</span>
+<span class="lineno">  244 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  245 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;count&quot; .= length allSkills</span></span>
+<span class="lineno">  246 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;ids&quot; .= fmap (skillIdText . skId) allSkills</span></span>
+<span class="lineno">  247 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

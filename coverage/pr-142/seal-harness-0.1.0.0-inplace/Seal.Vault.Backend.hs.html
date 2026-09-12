@@ -1,0 +1,298 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# OPTIONS_GHC -Wno-partial-fields #-}
+<span class="lineno">    3 </span>-- | Vault key-backend selection and setup. Produces a ResolvedKey (recipient +
+<span class="lineno">    4 </span>-- identity path) from whichever backend the user chooses; converts it into a
+<span class="lineno">    5 </span>-- live VaultEncryptor via the Phase 1 mkAgeEncryptor seam.
+<span class="lineno">    6 </span>module Seal.Vault.Backend
+<span class="lineno">    7 </span>  ( VaultKeyBackend (..)
+<span class="lineno">    8 </span>  , ResolvedKey (..)
+<span class="lineno">    9 </span>  , detectAgePlugins
+<span class="lineno">   10 </span>  , filterPluginNames    -- exported for testing
+<span class="lineno">   11 </span>  , parsePluginRecipient -- exported for testing
+<span class="lineno">   12 </span>  , setupLocalAgeKey
+<span class="lineno">   13 </span>  , setupYubiKey
+<span class="lineno">   14 </span>  , setupUserSupplied
+<span class="lineno">   15 </span>  , parseUnlockMode
+<span class="lineno">   16 </span>  , resolveEncryptor
+<span class="lineno">   17 </span>  , readProcessNoInput   -- exported for test reuse
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Control.Exception (IOException, try)
+<span class="lineno">   21 </span>import Data.ByteString qualified as BS
+<span class="lineno">   22 </span>import Data.Either (fromRight)
+<span class="lineno">   23 </span>import Data.List (isPrefixOf, nub, sort)
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>import Data.Text qualified as T
+<span class="lineno">   26 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   27 </span>import System.Directory (doesPathExist, findExecutable, listDirectory)
+<span class="lineno">   28 </span>import System.Environment (lookupEnv)
+<span class="lineno">   29 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   30 </span>import System.FilePath (splitSearchPath, (&lt;/&gt;))
+<span class="lineno">   31 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   32 </span>import System.Process
+<span class="lineno">   33 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   36 </span>import Seal.Config.Security (SecurityConfig (..))
+<span class="lineno">   37 </span>import Seal.Config.Paths (SealPaths (..))
+<span class="lineno">   38 </span>import Seal.Security.Path (ensureKeysRoot, getSafeKeyPath, mkSafeKeyPath)
+<span class="lineno">   39 </span>import Seal.Security.Vault (UnlockMode (..))
+<span class="lineno">   40 </span>import Seal.Security.Vault.Age
+<span class="lineno">   41 </span>  ( AgeIdentity (..)
+<span class="lineno">   42 </span>  , AgeRecipient (..)
+<span class="lineno">   43 </span>  , VaultEncryptor
+<span class="lineno">   44 </span>  , VaultError (..)
+<span class="lineno">   45 </span>  , mkAgeEncryptor
+<span class="lineno">   46 </span>  )
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | Run a process with no stdin, capturing stdout and stderr as strict
+<span class="lineno">   49 </span>-- 'ByteString's. Used by the age-keygen / age-plugin-yubikey setup seams
+<span class="lineno">   50 </span>-- (their output may carry non-ASCII recipient strings).
+<span class="lineno">   51 </span>readProcessNoInput :: FilePath -&gt; [String] -&gt; IO (ExitCode, BS.ByteString, BS.ByteString)
+<span class="lineno">   52 </span><span class="decl"><span class="nottickedoff">readProcessNoInput cmdPath args =</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="nottickedoff">withCreateProcess</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="nottickedoff">( (proc cmdPath args)</span>
+<span class="lineno">   55 </span><span class="spaces">        </span><span class="nottickedoff">{ std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="nottickedoff">) $ \_ mOut mErr ph -&gt; do</span>
+<span class="lineno">   57 </span><span class="spaces">      </span><span class="nottickedoff">(hOut, hErr) &lt;- case (mOut, mErr) of</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="nottickedoff">(Just a, Just b) -&gt; pure (a, b)</span>
+<span class="lineno">   59 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; error &quot;readProcessNoInput: pipe creation failed (unreachable)&quot;</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="nottickedoff">out &lt;- BS.hGetContents hOut</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="nottickedoff">err &lt;- BS.hGetContents hErr</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="nottickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="nottickedoff">let !_ = BS.length out</span>
+<span class="lineno">   64 </span><span class="spaces">          </span><span class="nottickedoff">!_ = BS.length err</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="nottickedoff">pure (ec, out, err)</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   68 </span>-- Types
+<span class="lineno">   69 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>data VaultKeyBackend
+<span class="lineno">   72 </span>  = LocalAgeKey
+<span class="lineno">   73 </span>  | YubiKey { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ykTouchRequired</span></span></span> :: Bool }
+<span class="lineno">   74 </span>  | UserSupplied
+<span class="lineno">   75 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>data ResolvedKey = ResolvedKey
+<span class="lineno">   78 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rkRecipient</span></span></span> :: Text   -- age1... / age1yubikey1...
+<span class="lineno">   79 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rkIdentity</span></span></span> :: Text   -- absolute path to identity file
+<span class="lineno">   80 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rkKeyType</span></span></span> :: Text   -- &quot;x25519&quot; | &quot;yubikey&quot; | &quot;user&quot;
+<span class="lineno">   81 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   84 </span>-- Plugin detection
+<span class="lineno">   85 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | Pure helper: given the filenames in one directory, return the plugin suffixes.
+<span class="lineno">   88 </span>filterPluginNames :: [FilePath] -&gt; [Text]
+<span class="lineno">   89 </span><span class="decl"><span class="istickedoff">filterPluginNames names =</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">[ T.pack (drop prefixLen n)</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">| n &lt;- names</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">, pluginPrefix `isPrefixOf` n</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">pluginPrefix = &quot;age-plugin-&quot;</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">prefixLen    = length pluginPrefix</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>detectAgePlugins :: IO [Text]
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">detectAgePlugins = do</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">mPath    &lt;- lookupEnv &quot;PATH&quot;</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">let dirs  = maybe <span class="nottickedoff">[]</span> splitSearchPath mPath</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">allNames &lt;- traverse safeList dirs</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">pure (sort (nub (concatMap filterPluginNames allNames)))</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">safeList d = do</span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="istickedoff">r &lt;- try @IOException (listDirectory d)</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff">pure (fromRight [] r)</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  110 </span>-- Backend setup
+<span class="lineno">  111 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  112 </span>
+<span class="lineno">  113 </span>-- | First available relative key-file name under the keys directory, of the
+<span class="lineno">  114 </span>-- form @&lt;base&gt;&lt;ext&gt;@, @&lt;base&gt;-1&lt;ext&gt;@, @&lt;base&gt;-2&lt;ext&gt;@, … A newly generated key
+<span class="lineno">  115 </span>-- is always written to a name that does not yet exist, so setup NEVER
+<span class="lineno">  116 </span>-- overwrites an identity file that an existing vault still depends on: key
+<span class="lineno">  117 </span>-- rotation must keep the old key intact in order to decrypt the current vault.
+<span class="lineno">  118 </span>freshKeyName :: FilePath -&gt; String -&gt; String -&gt; IO FilePath
+<span class="lineno">  119 </span><span class="decl"><span class="nottickedoff">freshKeyName keysDir base ext = go (0 :: Int)</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="nottickedoff">go n = do</span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="nottickedoff">let rel = base &lt;&gt; (if n == 0 then &quot;&quot; else &quot;-&quot; &lt;&gt; show n) &lt;&gt; ext</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="nottickedoff">taken &lt;- doesPathExist (keysDir &lt;/&gt; rel)</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="nottickedoff">if taken then go (n + 1) else pure rel</span></span>
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>setupLocalAgeKey :: SealPaths -&gt; Text -&gt; IO (Either Text ResolvedKey)
+<span class="lineno">  127 </span><span class="decl"><span class="nottickedoff">setupLocalAgeKey paths name = do</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="nottickedoff">keysRoot &lt;- ensureKeysRoot (spKeys paths)</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="nottickedoff">rel      &lt;- freshKeyName (spKeys paths) (T.unpack name) &quot;.identity&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="nottickedoff">pathRes  &lt;- mkSafeKeyPath keysRoot rel</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="nottickedoff">case pathRes of</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="nottickedoff">Left err       -&gt; pure (Left (T.pack (show err)))</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="nottickedoff">Right safePath -&gt; do</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="nottickedoff">let identPath = getSafeKeyPath safePath</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="nottickedoff">(exitCode, _stdout, stderrBs) &lt;-</span>
+<span class="lineno">  136 </span><span class="spaces">        </span><span class="nottickedoff">readProcessNoInput &quot;age-keygen&quot; [&quot;-o&quot;, identPath]</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="nottickedoff">case exitCode of</span>
+<span class="lineno">  138 </span><span class="spaces">        </span><span class="nottickedoff">ExitFailure n -&gt;</span>
+<span class="lineno">  139 </span><span class="spaces">          </span><span class="nottickedoff">pure (Left (&quot;age-keygen exited with code &quot; &lt;&gt; T.pack (show n)))</span>
+<span class="lineno">  140 </span><span class="spaces">        </span><span class="nottickedoff">ExitSuccess -&gt; do</span>
+<span class="lineno">  141 </span><span class="spaces">          </span><span class="nottickedoff">let stderrText = TE.decodeUtf8Lenient stderrBs</span>
+<span class="lineno">  142 </span><span class="spaces">          </span><span class="nottickedoff">case parseAgePublicKey stderrText of</span>
+<span class="lineno">  143 </span><span class="spaces">            </span><span class="nottickedoff">Nothing  -&gt; pure (Left &quot;age-keygen: could not parse public key from stderr&quot;)</span>
+<span class="lineno">  144 </span><span class="spaces">            </span><span class="nottickedoff">Just pub -&gt; do</span>
+<span class="lineno">  145 </span><span class="spaces">              </span><span class="nottickedoff">setFileMode identPath 0o600</span>
+<span class="lineno">  146 </span><span class="spaces">              </span><span class="nottickedoff">pure (Right ResolvedKey</span>
+<span class="lineno">  147 </span><span class="spaces">                </span><span class="nottickedoff">{ rkRecipient = pub</span>
+<span class="lineno">  148 </span><span class="spaces">                </span><span class="nottickedoff">, rkIdentity  = T.pack identPath</span>
+<span class="lineno">  149 </span><span class="spaces">                </span><span class="nottickedoff">, rkKeyType   = &quot;x25519&quot;</span>
+<span class="lineno">  150 </span><span class="spaces">                </span><span class="nottickedoff">})</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Generate (or reuse) a YubiKey-backed age identity.
+<span class="lineno">  153 </span>--
+<span class="lineno">  154 </span>-- @touchRequired@ -&gt; @--touch-policy always|never@.
+<span class="lineno">  155 </span>-- @pinRequired@   -&gt; @--pin-policy   once|never@. Choosing @never@ means
+<span class="lineno">  156 </span>-- decryption needs no PIN (only the token present, plus a touch if required);
+<span class="lineno">  157 </span>-- choosing @once@ (the age-plugin-yubikey default) prompts for the PIN once per
+<span class="lineno">  158 </span>-- decrypt session.
+<span class="lineno">  159 </span>setupYubiKey
+<span class="lineno">  160 </span>  :: SealPaths -&gt; Text -&gt; Bool -&gt; Bool -&gt; ChannelCaps
+<span class="lineno">  161 </span>  -&gt; IO (Either Text ResolvedKey)
+<span class="lineno">  162 </span><span class="decl"><span class="nottickedoff">setupYubiKey paths name touchRequired pinRequired caps = do</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="nottickedoff">mPlugin &lt;- findExecutable &quot;age-plugin-yubikey&quot;</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="nottickedoff">case mPlugin of</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt;</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="nottickedoff">pure (Left &quot;age-plugin-yubikey not found on PATH&quot;)</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="nottickedoff">Just _ -&gt; do</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="nottickedoff">keysRoot &lt;- ensureKeysRoot (spKeys paths)</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="nottickedoff">rel      &lt;- freshKeyName (spKeys paths) (T.unpack name) &quot;.yubikey.txt&quot;</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="nottickedoff">pathRes  &lt;- mkSafeKeyPath keysRoot rel</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="nottickedoff">case pathRes of</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; pure (Left (T.pack (show err)))</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="nottickedoff">Right safePath -&gt; do</span>
+<span class="lineno">  174 </span><span class="spaces">          </span><span class="nottickedoff">let identPath   = getSafeKeyPath safePath</span>
+<span class="lineno">  175 </span><span class="spaces">              </span><span class="nottickedoff">touchPolicy = if touchRequired then &quot;always&quot; else &quot;never&quot;</span>
+<span class="lineno">  176 </span><span class="spaces">              </span><span class="nottickedoff">pinPolicy   = if pinRequired then &quot;once&quot; else &quot;never&quot;</span>
+<span class="lineno">  177 </span><span class="spaces">          </span><span class="nottickedoff">(exitCode, stdoutBs, _) &lt;-</span>
+<span class="lineno">  178 </span><span class="spaces">            </span><span class="nottickedoff">readProcessNoInput &quot;age-plugin-yubikey&quot;</span>
+<span class="lineno">  179 </span><span class="spaces">              </span><span class="nottickedoff">[ &quot;--generate&quot;</span>
+<span class="lineno">  180 </span><span class="spaces">              </span><span class="nottickedoff">, &quot;--touch-policy&quot;, touchPolicy</span>
+<span class="lineno">  181 </span><span class="spaces">              </span><span class="nottickedoff">, &quot;--pin-policy&quot;, pinPolicy</span>
+<span class="lineno">  182 </span><span class="spaces">              </span><span class="nottickedoff">]</span>
+<span class="lineno">  183 </span><span class="spaces">          </span><span class="nottickedoff">let stdoutText = TE.decodeUtf8Lenient stdoutBs</span>
+<span class="lineno">  184 </span><span class="spaces">          </span><span class="nottickedoff">mRecipient &lt;-</span>
+<span class="lineno">  185 </span><span class="spaces">            </span><span class="nottickedoff">if exitCode == ExitSuccess &amp;&amp; not (T.null (T.strip stdoutText))</span>
+<span class="lineno">  186 </span><span class="spaces">              </span><span class="nottickedoff">then do</span>
+<span class="lineno">  187 </span><span class="spaces">                </span><span class="nottickedoff">BS.writeFile identPath (TE.encodeUtf8 stdoutText)</span>
+<span class="lineno">  188 </span><span class="spaces">                </span><span class="nottickedoff">setFileMode identPath 0o600</span>
+<span class="lineno">  189 </span><span class="spaces">                </span><span class="nottickedoff">pure (Right (parsePluginRecipient stdoutText))</span>
+<span class="lineno">  190 </span><span class="spaces">              </span><span class="nottickedoff">else do</span>
+<span class="lineno">  191 </span><span class="spaces">                </span><span class="nottickedoff">-- TTY fallback: instruct user and wait for manual completion.</span>
+<span class="lineno">  192 </span><span class="spaces">                </span><span class="nottickedoff">ccSend caps</span>
+<span class="lineno">  193 </span><span class="spaces">                  </span><span class="nottickedoff">(&quot;age-plugin-yubikey requires interactive input. Run:\n&quot;</span>
+<span class="lineno">  194 </span><span class="spaces">                   </span><span class="nottickedoff">&lt;&gt; &quot;    age-plugin-yubikey --generate --touch-policy &quot;</span>
+<span class="lineno">  195 </span><span class="spaces">                   </span><span class="nottickedoff">&lt;&gt; T.pack touchPolicy &lt;&gt; &quot; --pin-policy &quot; &lt;&gt; T.pack pinPolicy</span>
+<span class="lineno">  196 </span><span class="spaces">                   </span><span class="nottickedoff">&lt;&gt; &quot; &gt; &quot; &lt;&gt; T.pack identPath)</span>
+<span class="lineno">  197 </span><span class="spaces">                </span><span class="nottickedoff">_ &lt;- ccPrompt caps (AskPrompt &quot;Press Enter once the command has completed&quot; [])</span>
+<span class="lineno">  198 </span><span class="spaces">                </span><span class="nottickedoff">rawE &lt;- try @IOException (BS.readFile identPath)</span>
+<span class="lineno">  199 </span><span class="spaces">                </span><span class="nottickedoff">case rawE of</span>
+<span class="lineno">  200 </span><span class="spaces">                  </span><span class="nottickedoff">Left e -&gt;</span>
+<span class="lineno">  201 </span><span class="spaces">                    </span><span class="nottickedoff">pure (Left (&quot;age-plugin-yubikey: identity file not readable: &quot;</span>
+<span class="lineno">  202 </span><span class="spaces">                                 </span><span class="nottickedoff">&lt;&gt; T.pack (show e)))</span>
+<span class="lineno">  203 </span><span class="spaces">                  </span><span class="nottickedoff">Right raw -&gt; do</span>
+<span class="lineno">  204 </span><span class="spaces">                    </span><span class="nottickedoff">setFileMode identPath 0o600</span>
+<span class="lineno">  205 </span><span class="spaces">                    </span><span class="nottickedoff">pure (Right (parsePluginRecipient (TE.decodeUtf8Lenient raw)))</span>
+<span class="lineno">  206 </span><span class="spaces">          </span><span class="nottickedoff">case mRecipient of</span>
+<span class="lineno">  207 </span><span class="spaces">            </span><span class="nottickedoff">Left ioErr       -&gt; pure (Left ioErr)</span>
+<span class="lineno">  208 </span><span class="spaces">            </span><span class="nottickedoff">Right Nothing    -&gt; pure (Left &quot;age-plugin-yubikey: could not parse recipient line&quot;)</span>
+<span class="lineno">  209 </span><span class="spaces">            </span><span class="nottickedoff">Right (Just pub) -&gt;</span>
+<span class="lineno">  210 </span><span class="spaces">              </span><span class="nottickedoff">pure (Right ResolvedKey</span>
+<span class="lineno">  211 </span><span class="spaces">                </span><span class="nottickedoff">{ rkRecipient = pub</span>
+<span class="lineno">  212 </span><span class="spaces">                </span><span class="nottickedoff">, rkIdentity  = T.pack identPath</span>
+<span class="lineno">  213 </span><span class="spaces">                </span><span class="nottickedoff">, rkKeyType   = &quot;yubikey&quot;</span>
+<span class="lineno">  214 </span><span class="spaces">                </span><span class="nottickedoff">})</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>setupUserSupplied :: ChannelCaps -&gt; IO (Either Text ResolvedKey)
+<span class="lineno">  217 </span><span class="decl"><span class="istickedoff">setupUserSupplied caps = do</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">recipient &lt;- ccPrompt caps (AskPrompt &quot;Recipient (age1\x2026): &quot; [])</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">identity  &lt;- ccPrompt caps (AskPrompt &quot;Identity file path: &quot; [])</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">pure (Right ResolvedKey</span>
+<span class="lineno">  221 </span><span class="spaces">    </span><span class="istickedoff">{ rkRecipient = T.strip recipient</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">, rkIdentity  = T.strip identity</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">, rkKeyType   = &quot;user&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="istickedoff">})</span></span>
+<span class="lineno">  225 </span>
+<span class="lineno">  226 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  227 </span>-- Unlock mode + encryptor resolution
+<span class="lineno">  228 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  229 </span>
+<span class="lineno">  230 </span>parseUnlockMode :: Maybe Text -&gt; UnlockMode
+<span class="lineno">  231 </span><span class="decl"><span class="istickedoff">parseUnlockMode (Just &quot;startup&quot;)    = UnlockStartup</span>
+<span class="lineno">  232 </span><span class="spaces"></span><span class="istickedoff">parseUnlockMode (Just &quot;per_access&quot;) = UnlockPerAccess</span>
+<span class="lineno">  233 </span><span class="spaces"></span><span class="istickedoff">parseUnlockMode _                   = UnlockOnDemand</span></span>
+<span class="lineno">  234 </span>
+<span class="lineno">  235 </span>resolveEncryptor :: SecurityConfig -&gt; IO (Either VaultError VaultEncryptor)
+<span class="lineno">  236 </span><span class="decl"><span class="istickedoff">resolveEncryptor fc =</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">case (scVaultRecipient fc, scVaultIdentity fc) of</span>
+<span class="lineno">  238 </span><span class="spaces">    </span><span class="istickedoff">(Just r, Just i) -&gt;</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">mkAgeEncryptor <span class="nottickedoff">(AgeRecipient r)</span> <span class="nottickedoff">(AgeIdentity i)</span></span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">(Nothing, _) -&gt;</span>
+<span class="lineno">  241 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (VaultBackendError <span class="nottickedoff">&quot;vault not configured: missing vault_recipient&quot;</span>))</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">(_, Nothing) -&gt;</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (VaultBackendError <span class="nottickedoff">&quot;vault not configured: missing vault_identity&quot;</span>))</span></span>
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  246 </span>-- Internal parsers
+<span class="lineno">  247 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  248 </span>
+<span class="lineno">  249 </span>-- | Parse &quot;Public key: age1...&quot; from age-keygen stderr.
+<span class="lineno">  250 </span>-- age-keygen always emits exactly this line (capital P, no '#' prefix).
+<span class="lineno">  251 </span>parseAgePublicKey :: Text -&gt; Maybe Text
+<span class="lineno">  252 </span><span class="decl"><span class="nottickedoff">parseAgePublicKey txt =</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="nottickedoff">case filter (T.isPrefixOf &quot;Public key: &quot;) (T.lines txt) of</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="nottickedoff">[]       -&gt; Nothing</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="nottickedoff">(line:_) -&gt; Just (T.drop (T.length &quot;Public key: &quot;) line)</span></span>
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>-- | Parse the recipient (public key) from age-plugin-yubikey @--generate@
+<span class="lineno">  258 </span>-- output. The recipient appears on a comment line such as
+<span class="lineno">  259 </span>-- @#    Recipient: age1yubikey1...@. age-plugin-yubikey RIGHT-ALIGNS its
+<span class="lineno">  260 </span>-- comment labels, so the number of spaces between @#@ and the label varies
+<span class="lineno">  261 </span>-- between lines; we therefore strip the leading @#@ and surrounding whitespace
+<span class="lineno">  262 </span>-- before matching the label (case-insensitively per the age plugin spec) and
+<span class="lineno">  263 </span>-- take everything after the first @:@.
+<span class="lineno">  264 </span>parsePluginRecipient :: Text -&gt; Maybe Text
+<span class="lineno">  265 </span><span class="decl"><span class="istickedoff">parsePluginRecipient txt =</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">case filter isRecipientLine (T.lines txt) of</span>
+<span class="lineno">  267 </span><span class="spaces">    </span><span class="istickedoff">[]       -&gt; Nothing</span>
+<span class="lineno">  268 </span><span class="spaces">    </span><span class="istickedoff">(line:_) -&gt;</span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">let value = T.strip (T.drop 1 (T.dropWhile (/= ':') (labelOf line)))</span>
+<span class="lineno">  270 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null value</span> then <span class="nottickedoff">Nothing</span> else Just value</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">-- Drop a leading @#@ comment marker and the surrounding alignment spaces,</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">-- leaving the label, e.g. @&quot;Recipient: age1yubikey1...&quot;@.</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">labelOf l = T.stripStart (T.dropWhile (== '#') (T.stripStart l))</span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">isRecipientLine l = &quot;recipient:&quot; `T.isPrefixOf` T.toCaseFold (labelOf l)</span></span>
+
+</pre>
+</body>
+</html>

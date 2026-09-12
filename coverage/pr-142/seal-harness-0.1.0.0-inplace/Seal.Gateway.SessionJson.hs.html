@@ -1,0 +1,127 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The JSON encoders for tabs and sessions, shared between
+<span class="lineno">    3 </span>-- 'Seal.Gateway.API' (the REST endpoints) and 'Seal.Gateway.ListsSnapshot'
+<span class="lineno">    4 </span>-- (the WS @lists@ frame + the @GET /api/lists@ body). Lives one level below
+<span class="lineno">    5 </span>-- 'Seal.Gateway.API' so 'Seal.Gateway.ListsSnapshot' can import these
+<span class="lineno">    6 </span>-- without creating a source-level module cycle with 'Seal.Gateway.API'
+<span class="lineno">    7 </span>-- (which imports 'Seal.Gateway.ListsSnapshot' for the /api/lists route).
+<span class="lineno">    8 </span>module Seal.Gateway.SessionJson
+<span class="lineno">    9 </span>  ( tabToJson
+<span class="lineno">   10 </span>  , tabKindWire
+<span class="lineno">   11 </span>  , statusWire
+<span class="lineno">   12 </span>  , sessionWire
+<span class="lineno">   13 </span>  , sessionInfoJson
+<span class="lineno">   14 </span>  , sessionInfoJsonWithSnippet
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Data.Aeson (Value, object, (.=))
+<span class="lineno">   18 </span>import Data.Text (Text)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Agent.Def.Types (agentDefIdText)
+<span class="lineno">   21 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   22 </span>import Seal.Core.Types (sessionIdText)
+<span class="lineno">   23 </span>import Seal.Gateway.Transcript (firstUserMessageSnippet, lastUserMessageAt)
+<span class="lineno">   24 </span>import Seal.Handles.Tab (TabKind (..), tabIndexToInt)
+<span class="lineno">   25 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   26 </span>import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..))
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | One tab as JSON (the widened TabInfoWire shape the frontend expects).
+<span class="lineno">   31 </span>tabToJson :: Tab -&gt; Value
+<span class="lineno">   32 </span><span class="decl"><span class="istickedoff">tabToJson t = object</span>
+<span class="lineno">   33 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;index&quot; .= tabIndexToInt (tIndex t)</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">, &quot;kind&quot; .= tabKindWire (tKind t)</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">, &quot;label&quot; .= tLabel t</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">, &quot;status&quot; .= statusWire (tKind t) (tStatus t)</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">, &quot;session_id&quot; .= sessionWire (tRef t)</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">, &quot;ext_modified&quot; .= False</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">, &quot;stale&quot; .= False</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">, &quot;origin&quot; .= (Nothing :: Maybe Text)</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">, &quot;attach_command&quot; .= (Nothing :: Maybe Text)</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Map a 'TabKind' to the frontend's wire vocab.
+<span class="lineno">   45 </span>tabKindWire :: TabKind -&gt; Text
+<span class="lineno">   46 </span><span class="decl"><span class="istickedoff">tabKindWire k = case k of</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">KindHarness  -&gt; <span class="nottickedoff">&quot;harness&quot;</span></span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">KindProvider -&gt; &quot;session:provider&quot;</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">KindAi       -&gt; &quot;session:ai&quot;</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">KindShell    -&gt; <span class="nottickedoff">&quot;shell&quot;</span></span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">KindSsh      -&gt; <span class="nottickedoff">&quot;shell:ssh&quot;</span></span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">KindTmux     -&gt; <span class="nottickedoff">&quot;tmux&quot;</span></span></span>
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | Map ('TabKind', 'TabStatus') to the frontend's status vocab.
+<span class="lineno">   55 </span>statusWire :: TabKind -&gt; TabStatus -&gt; Text
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">statusWire _ Dead = <span class="nottickedoff">&quot;exited&quot;</span></span>
+<span class="lineno">   57 </span><span class="spaces"></span><span class="istickedoff">statusWire KindHarness Live = <span class="nottickedoff">&quot;running&quot;</span></span>
+<span class="lineno">   58 </span><span class="spaces"></span><span class="istickedoff">statusWire _ Live = &quot;idle&quot;</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Derive the @session_id@ wire field from a 'TabRef'.
+<span class="lineno">   61 </span>sessionWire :: TabRef -&gt; Maybe Text
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">sessionWire (BoundSession sid) = Just (sessionIdText sid)</span>
+<span class="lineno">   63 </span><span class="spaces"></span><span class="istickedoff">sessionWire (BoundHarness _)   = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Map a 'SessionMeta' to the frontend's 'SessionInfo' JSON shape
+<span class="lineno">   66 </span>-- (camelCase). The on-disk 'SessionMeta' uses snake_case; the gateway maps
+<span class="lineno">   67 </span>-- to the frontend's shape without changing 'SessionMeta's instance.
+<span class="lineno">   68 </span>-- @description@ is the user-set title (persisted via @PUT
+<span class="lineno">   69 </span>-- /api/sessions/:id/description@); @autoSummary@ and @channelUserId@ are
+<span class="lineno">   70 </span>-- fields the backend doesn't track yet and are returned as @null@.
+<span class="lineno">   71 </span>-- @firstMessageSnippet@ is derived from the session's transcript (the
+<span class="lineno">   72 </span>-- first user message), so a session has a readable title before the user
+<span class="lineno">   73 </span>-- sets an explicit description.
+<span class="lineno">   74 </span>--
+<span class="lineno">   75 </span>-- @agent@ is the display label for the session's active agent (used by
+<span class="lineno">   76 </span>-- the sidebar / chat header). It prefers 'smAgentName' (set whenever an
+<span class="lineno">   77 </span>-- agent is effective — either a bound 'smAgent' or a one-off uploaded
+<span class="lineno">   78 </span>-- file's frontmatter id), falling back to 'smAgent'\'s id for
+<span class="lineno">   79 </span>-- backwards-compat with old session.json files that predate smAgentName.
+<span class="lineno">   80 </span>sessionInfoJson :: Maybe Text -&gt; Maybe Text -&gt; SessionMeta -&gt; Value
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">sessionInfoJson mSnippet mLastUserMessageAt m = object</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;id&quot; .= sessionIdText (smId m)</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">, &quot;agent&quot; .= ( smAgentName m &lt;|&gt; (<span class="nottickedoff">agentDefIdText</span> &lt;$&gt; smAgent m) )</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">, &quot;runtime&quot; .= (&quot;session:&quot; &lt;&gt; smProvider m)</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">, &quot;model&quot; .= smModel m</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, &quot;lastActive&quot; .= smLastActive m</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">, &quot;createdAt&quot; .= smCreatedAt m</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">, &quot;description&quot; .= smDescription m</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">, &quot;autoSummary&quot; .= (Nothing :: Maybe Text)</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">, &quot;firstMessageSnippet&quot; .= mSnippet</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">, &quot;channel&quot; .= smChannel m</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">, &quot;channelUserId&quot; .= (Nothing :: Maybe Text)</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">, &quot;lastUserMessageAt&quot; .= mLastUserMessageAt</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Build the 'SessionInfo' JSON for a session, reading the first user
+<span class="lineno">   97 </span>-- message snippet and the last user-message timestamp from the transcript
+<span class="lineno">   98 </span>-- so the session has a default title before the user sets an explicit
+<span class="lineno">   99 </span>-- description and the sidebar can sort tabs by last-user-message time.
+<span class="lineno">  100 </span>sessionInfoJsonWithSnippet :: SealPaths -&gt; SessionMeta -&gt; IO Value
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">sessionInfoJsonWithSnippet paths m = do</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">mSnippet &lt;- firstUserMessageSnippet paths (smId m)</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">mLastUserMessageAt &lt;- lastUserMessageAt paths (smId m)</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">pure (sessionInfoJson mSnippet mLastUserMessageAt m)</span></span>
+
+</pre>
+</body>
+</html>

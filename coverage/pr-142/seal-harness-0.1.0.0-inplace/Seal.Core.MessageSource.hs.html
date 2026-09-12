@@ -1,0 +1,201 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | The authenticated-transport-derived identity of an inbound message.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- The critical security property: the 'ConversationId' is **server-derived
+<span class="lineno">    7 </span>-- from transport metadata, never read from a message body**, so a sender
+<span class="lineno">    8 </span>-- cannot forge it to hijack another conversation's tab cursor. This is
+<span class="lineno">    9 </span>-- enforced structurally — 'mkMessageSource' takes a 'ConversationId' (which
+<span class="lineno">   10 </span>-- itself is smart-constructed) and never reads a conversation id from the
+<span class="lineno">   11 </span>-- open field map. The open map is also forbidden from carrying a
+<span class="lineno">   12 </span>-- @conversationId@ key, so a future caller cannot smuggle a second id in.
+<span class="lineno">   13 </span>module Seal.Core.MessageSource
+<span class="lineno">   14 </span>  ( ConversationId (..)
+<span class="lineno">   15 </span>  , mkConversationId
+<span class="lineno">   16 </span>  , conversationIdText
+<span class="lineno">   17 </span>  , UserId (..)
+<span class="lineno">   18 </span>  , mkUserId
+<span class="lineno">   19 </span>  , userIdText
+<span class="lineno">   20 </span>  , MessageSource (..)
+<span class="lineno">   21 </span>  , mkMessageSource
+<span class="lineno">   22 </span>  , maxConversationIdLen
+<span class="lineno">   23 </span>  , maxUserIdLen
+<span class="lineno">   24 </span>  , maxOpenEntries
+<span class="lineno">   25 </span>  , maxOpenFieldLen
+<span class="lineno">   26 </span>  ) where
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   29 </span>import Data.Char (isControl)
+<span class="lineno">   30 </span>import Data.Map.Strict (Map)
+<span class="lineno">   31 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   32 </span>import Data.Set (Set)
+<span class="lineno">   33 </span>import Data.Set qualified as Set
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import GHC.Generics (Generic)
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>import Seal.Core.ChannelKind (ChannelKind)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   41 </span>-- Bounds (exported for tests + callers that need to pre-validate)
+<span class="lineno">   42 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Maximum length of a 'ConversationId' or 'UserId' (in characters).
+<span class="lineno">   45 </span>maxConversationIdLen :: Int
+<span class="lineno">   46 </span><span class="decl"><span class="istickedoff">maxConversationIdLen = 256</span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>maxUserIdLen :: Int
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">maxUserIdLen = 256</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Maximum number of entries in the open metadata map. Bounds the
+<span class="lineno">   52 </span>-- attacker-controlled metadata size so a malicious sender cannot bloat the
+<span class="lineno">   53 </span>-- transcript or exhaust a cursor map.
+<span class="lineno">   54 </span>maxOpenEntries :: Int
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">maxOpenEntries = 32</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | Maximum length of any single open-map key or value (in characters).
+<span class="lineno">   58 </span>maxOpenFieldLen :: Int
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">maxOpenFieldLen = 256</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   62 </span>-- ConversationId
+<span class="lineno">   63 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | A server-derived, transport-scoped conversation key. NEVER read from a
+<span class="lineno">   66 </span>-- message body — always minted from authenticated transport metadata (e.g.
+<span class="lineno">   67 </span>-- the Signal peer's phone number + UUID, the web session's authenticated
+<span class="lineno">   68 </span>-- principal). Smart-constructed; the predicate bounds length and charset so
+<span class="lineno">   69 </span>-- an attacker cannot bloat the transcript or exhaust a cursor map.
+<span class="lineno">   70 </span>newtype ConversationId = ConversationId Text
+<span class="lineno">   71 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   72 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>-- | Charset: @A-Za-z0-9_-:@. Colon is included for composite keys like
+<span class="lineno">   75 </span>-- @phone:uuid@. Leading dot is rejected (path-join defense-in-depth, even
+<span class="lineno">   76 </span>-- though conversation ids are never path-joined today).
+<span class="lineno">   77 </span>mkConversationId :: Text -&gt; Either Text ConversationId
+<span class="lineno">   78 </span><span class="decl"><span class="istickedoff">mkConversationId t</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">| T.null t              = Left <span class="nottickedoff">&quot;conversation id is empty&quot;</span></span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">| T.length t &gt; maxConversationIdLen</span>
+<span class="lineno">   81 </span><span class="spaces">                          </span><span class="istickedoff">= Left <span class="nottickedoff">(&quot;conversation id too long (&gt;&quot; &lt;&gt; T.pack (show maxConversationIdLen) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '.'       = Left <span class="nottickedoff">&quot;conversation id must not start with '.'&quot;</span></span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">| not (T.all validConvChar t)</span>
+<span class="lineno">   84 </span><span class="spaces">                          </span><span class="istickedoff">= Left <span class="nottickedoff">&quot;conversation id has invalid characters&quot;</span></span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = Right (ConversationId t)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>validConvChar :: Char -&gt; Bool
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">validConvChar c =</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">c `Set.member` convChars</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">convChars :: Set Char</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">convChars = Set.fromList</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">$ ['A'..'Z'] &lt;&gt; ['a'..'z'] &lt;&gt; ['0'..'9'] &lt;&gt; &quot;_-:+&quot;</span></span>
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>conversationIdText :: ConversationId -&gt; Text
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">conversationIdText (ConversationId t) = t</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   99 </span>-- UserId
+<span class="lineno">  100 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>-- | An authenticated user identity on a channel (e.g. a Signal phone number
+<span class="lineno">  103 </span>-- or UUID, a Telegram user id, a web principal). Optional — some channels
+<span class="lineno">  104 </span>-- (Background) have no user. Smart-constructed with the same predicate shape
+<span class="lineno">  105 </span>-- as 'ConversationId', plus @+@ (common in E.164 phone numbers). No
+<span class="lineno">  106 </span>-- leading-dot rule (user ids are transport-minted, never path-joined).
+<span class="lineno">  107 </span>newtype UserId = UserId Text
+<span class="lineno">  108 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  109 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>mkUserId :: Text -&gt; Either Text UserId
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">mkUserId t</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">| T.null t              = Left <span class="nottickedoff">&quot;user id is empty&quot;</span></span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">| T.length t &gt; maxUserIdLen</span>
+<span class="lineno">  115 </span><span class="spaces">                          </span><span class="istickedoff">= Left <span class="nottickedoff">(&quot;user id too long (&gt;&quot; &lt;&gt; T.pack (show maxUserIdLen) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">| not (T.all validUserChar t)</span>
+<span class="lineno">  117 </span><span class="spaces">                          </span><span class="istickedoff">= Left <span class="nottickedoff">&quot;user id has invalid characters&quot;</span></span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>             = Right (UserId t)</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>validUserChar :: Char -&gt; Bool
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">validUserChar c = c `Set.member` userChars</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">userChars :: Set Char</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">userChars = Set.fromList</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">$ ['A'..'Z'] &lt;&gt; ['a'..'z'] &lt;&gt; ['0'..'9'] &lt;&gt; &quot;_+-:&quot;</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>userIdText :: UserId -&gt; Text
+<span class="lineno">  128 </span><span class="decl"><span class="istickedoff">userIdText (UserId t) = t</span></span>
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  131 </span>-- MessageSource
+<span class="lineno">  132 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | The authenticated-transport-derived identity of an inbound message.
+<span class="lineno">  135 </span>-- Constructed ONLY via 'mkMessageSource', which strips control characters
+<span class="lineno">  136 </span>-- and bounds the length of every attacker-controlled string leaf.
+<span class="lineno">  137 </span>data MessageSource = MessageSource
+<span class="lineno">  138 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">msConversationId</span></span></span> :: ConversationId   -- ^ required; server-derived
+<span class="lineno">  139 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">msChannelKind</span></span></span>    :: ChannelKind
+<span class="lineno">  140 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">msUserId</span></span></span>         :: Maybe UserId     -- ^ optional; absent on Background
+<span class="lineno">  141 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">msOpen</span></span></span>           :: Map Text Text    -- ^ bounded, control-char-stripped
+<span class="lineno">  142 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  143 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | Smart constructor. Strips control characters from every open-map key and
+<span class="lineno">  146 </span>-- value, rejects any key or value over 'maxOpenFieldLen', rejects more than
+<span class="lineno">  147 </span>-- 'maxOpenEntries' entries, and rejects a @conversationId@ key in the open
+<span class="lineno">  148 </span>-- map (it is a structural field, not an open one — preventing a caller from
+<span class="lineno">  149 </span>-- smuggling a second conversation id).
+<span class="lineno">  150 </span>mkMessageSource
+<span class="lineno">  151 </span>  :: ConversationId
+<span class="lineno">  152 </span>  -&gt; ChannelKind
+<span class="lineno">  153 </span>  -&gt; Maybe UserId
+<span class="lineno">  154 </span>  -&gt; Map Text Text
+<span class="lineno">  155 </span>  -&gt; Either Text MessageSource
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">mkMessageSource cid kind mUid open0</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">| Map.size open0 &gt; maxOpenEntries</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">= Left <span class="nottickedoff">(&quot;open metadata map has too many entries (&gt;&quot; &lt;&gt; T.pack (show maxOpenEntries) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">| Map.member &quot;conversationId&quot; open0</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">= Left &quot;open field key 'conversationId' is reserved&quot;</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">let open1 = Map.mapKeys stripControl open0</span>
+<span class="lineno">  163 </span><span class="spaces">          </span><span class="istickedoff">open2 = Map.map stripControl open1</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">anyTooLong open2</span></span>
+<span class="lineno">  165 </span><span class="spaces">           </span><span class="istickedoff">then <span class="nottickedoff">Left (&quot;open field key/value too long (&gt;&quot; &lt;&gt; T.pack (show maxOpenFieldLen) &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">  166 </span><span class="spaces">           </span><span class="istickedoff">else Right MessageSource</span>
+<span class="lineno">  167 </span><span class="spaces">                  </span><span class="istickedoff">{ msConversationId = cid</span>
+<span class="lineno">  168 </span><span class="spaces">                  </span><span class="istickedoff">, msChannelKind    = kind</span>
+<span class="lineno">  169 </span><span class="spaces">                  </span><span class="istickedoff">, msUserId         = mUid</span>
+<span class="lineno">  170 </span><span class="spaces">                  </span><span class="istickedoff">, msOpen           = open2</span>
+<span class="lineno">  171 </span><span class="spaces">                  </span><span class="istickedoff">}</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">anyTooLong m = any (\(k,v) -&gt; T.length k &gt; maxOpenFieldLen || T.length v &gt; maxOpenFieldLen)</span>
+<span class="lineno">  174 </span><span class="spaces">                       </span><span class="istickedoff">(Map.toList m)</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>-- | Strip control characters from a Text leaf.
+<span class="lineno">  177 </span>stripControl :: Text -&gt; Text
+<span class="lineno">  178 </span><span class="decl"><span class="istickedoff">stripControl = T.filter (not . isControl)</span></span>
+
+</pre>
+</body>
+</html>
