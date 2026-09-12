@@ -1,3 +1,16 @@
+---
+name: start-task
+description: Main entry point for starting work on a task when the user mentions metaswarm, or when the user wants to begin tracked development work
+auto_activate: true
+triggers:
+  - "work on issue"
+  - "start issue"
+  - "start task"
+  - "use metaswarm"
+  - "@metaswarm"
+  - "agent-ready label"
+---
+
 # Start Task
 
 Determine task complexity and use appropriate workflow for efficient development.
