@@ -76,6 +76,7 @@ import Data.Text.IO qualified as TIO
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory
   , removeFile, renameFile )
+import System.IO (hPutStrLn, stderr)
 import System.FilePath (takeDirectory, (</>), (<.>))
 import System.Posix.Files (setFileMode)
 
@@ -283,6 +284,9 @@ collectFlat dir entries = do
   let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` T.pack e]
   defs <- forM mdFiles $ \e -> do
     content <- TIO.readFile (dir </> e)
+    case decodeAgentDef content of
+      Nothing -> warnMalformedAgent (T.pack e)
+      Just _  -> pure ()
     pure (decodeAgentDef content)
   pure (catMaybes defs)
 
@@ -295,7 +299,11 @@ collectGrouped dir groups = do
     entries <- listDirectory gDir
     let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` T.pack e]
     forM mdFiles $ \e -> do
+      let relPath = g <> "/" <> T.pack e
       content <- TIO.readFile (gDir </> e)
+      case decodeAgentDef content of
+        Nothing -> warnMalformedAgent relPath
+        Just _  -> pure ()
       pure (stampGroup g (decodeAgentDef content))
   pure (concatMap catMaybes results)
 
@@ -378,3 +386,13 @@ unionAgentDefBackend workdir user = AgentDefBackend
         pure (Map.elems merged)
     , adbDelete = adbDelete user
     }
+
+-- | Emit a warning to stderr when an agent def file on disk fails to
+-- decode (e.g. missing required @id@ frontmatter, invalid id characters).
+-- The file is silently skipped from the listing, but the operator is
+-- notified so they can fix the formatting. The path is the
+-- store-relative path of the malformed file.
+warnMalformedAgent :: Text -> IO ()
+warnMalformedAgent path =
+  hPutStrLn stderr ("warning: agent def file " <> T.unpack path
+                     <> " has invalid formatting and was skipped")

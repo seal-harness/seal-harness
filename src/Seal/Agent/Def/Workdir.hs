@@ -101,6 +101,8 @@ import Data.Vector qualified as V
 import Toml ((.=))
 import Toml qualified
 
+
+import System.IO (hPutStrLn, stderr)
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
   , isValidAgentDefId
@@ -502,7 +504,9 @@ loadProjectAgentDef fs = do
   eContent <- wfsReadFile fs =<< rpOrDie "agents.md"
   case eContent of
     Left _        -> pure Nothing  -- symlink escape, missing, oversize → skip
-    Right content -> pure (decodeProjectAgentsMd content)
+    Right content -> case decodeProjectAgentsMd content of
+      Nothing -> warnMalformedAgent "agents.md" >> pure Nothing
+      Just d  -> pure (Just d)
 
 -- | Load one protocol sub-agent from @agents\/\<id\>\/agent.md@ (§3.3). The
 -- id is the subdir name, unless frontmatter @id@ is present and valid
@@ -690,9 +694,11 @@ listAgentDefsFsSnap snap fs anchor = do
   let mdFiles = [p | p <- snapChildFilesAt snap anchor, ".md" `T.isSuffixOf` p]
   flatDefs <- forM mdFiles $ \rel -> do
     eContent <- wfsReadFile fs =<< rpOrDie rel
-    pure $ case eContent of
-      Left _    -> Nothing
-      Right txt -> decodeAgentDef txt
+    case eContent of
+      Left _    -> pure Nothing
+      Right txt -> case decodeAgentDef txt of
+        Nothing -> warnMalformedAgent rel >> pure Nothing
+        Just d  -> pure (Just d)
   let flatIds = Set.fromList (map (agentDefIdText . adId) (catMaybes flatDefs))
       dirNames =
         [ n | n <- map snapBasename (snapChildDirsAt snap anchor)
@@ -742,9 +748,11 @@ collectFlatFs fs entries = do
   let mdFiles = [e | e <- entries, ".md" `T.isSuffixOf` e]
   defs <- forM mdFiles $ \e -> do
     eContent <- wfsReadFile fs =<< rpOrDie e
-    pure $ case eContent of
-      Left _    -> Nothing
-      Right txt -> decodeAgentDef txt
+    case eContent of
+      Left _    -> pure Nothing
+      Right txt -> case decodeAgentDef txt of
+        Nothing -> warnMalformedAgent e >> pure Nothing
+        Just d  -> pure (Just d)
   pure (catMaybes defs)
 
 -- | Load DirScheme defs from subdirectories under the anchor (workdir-local
@@ -814,3 +822,11 @@ rpOrDie t = case mkRemotePath t of
   Right r  -> pure r
   Left err -> error ("rpOrDie: invalid remote path: " <> T.unpack err
                      <> ": " <> T.unpack t)
+-- | Emit a warning to stderr when an agent def file on disk fails to
+-- decode (e.g. missing required @id@ frontmatter, invalid id characters).
+-- The file is silently skipped from the listing, but the operator is
+-- notified so they can fix the formatting.
+warnMalformedAgent :: Text -> IO ()
+warnMalformedAgent path =
+  hPutStrLn stderr ("warning: agent def file " <> T.unpack path
+                     <> " has invalid formatting and was skipped")

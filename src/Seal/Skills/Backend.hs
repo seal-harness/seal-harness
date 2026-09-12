@@ -45,6 +45,7 @@ import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import System.IO (hPutStrLn, stderr)
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
@@ -299,17 +300,20 @@ staticSkillBackend skills = pure SkillBackend
 -- relative path of the skill directory.
 readAgentSkillDirect :: WorkdirFs -> Maybe Text -> Text -> IO (Maybe Skill)
 readAgentSkillDirect fs mGroup dirRel = do
-  eContent <- wfsReadFile fs =<< rpOrDie (dirRel <> "/SKILL.md")
+  let malformedPath = dirRel <> "/SKILL.md"
+  eContent <- wfsReadFile fs =<< rpOrDie malformedPath
   case eContent of
     Left _   -> pure Nothing
-    Right c -> pure (stampGroupDirect (decodeAgentSkillWithGroup mGroup c))
+    Right c  -> case decodeAgentSkillWithGroup mGroup c of
+      Nothing -> warnMalformedSkill malformedPath >> pure Nothing
+      Just s  -> pure (stampGroupDirect (Just s))
   where
     stampGroupDirect (Just s) =
       let s' = case skGroup s of
             Just _  -> s
             Nothing -> s { skGroup = mGroup }
       in Just s' { skId = qualifiedSkillId (skGroup s') (skId s') }
-    stampGroupDirect Nothing = Nothing
+    stampGroupDirect Nothing  = Nothing
 
 -- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
 -- so the @\<available_skills\>@ catalog groups them under a per-repo
@@ -461,9 +465,9 @@ readAndStampGroup :: WorkdirFs -> Text -> Maybe Text -> IO (Maybe Skill)
 readAndStampGroup fs rel mGroup = do
   eContent <- wfsReadFile fs =<< rpOrDie rel
   case eContent of
-    Left _ -> pure Nothing
+    Left _  -> pure Nothing
     Right content -> case decodeSkill content of
-      Nothing -> pure Nothing
+      Nothing -> warnMalformedSkill rel >> pure Nothing
       Just s  -> pure (Just (qualifyAndStamp s))
   where
     qualifyAndStamp s =
@@ -634,16 +638,20 @@ readAgentSkillAt fs dir mGroup = do
     then pure Nothing
     else do
       eContent <- wfsReadFile subFs =<< rpOrDie "SKILL.md"
+      -- The warning path is relative to the original anchor, not subFs.
+      let malformedPath = dir <> "/SKILL.md"
       case eContent of
         Left _   -> pure Nothing
-        Right c -> pure (stampGroup (decodeAgentSkillWithGroup mGroup c))
+        Right c  -> case decodeAgentSkillWithGroup mGroup c of
+          Nothing -> warnMalformedSkill malformedPath >> pure Nothing
+          Just s  -> pure (stampGroup (Just s))
   where
     stampGroup (Just s) =
       let s' = case skGroup s of
             Just _  -> s
             Nothing -> s { skGroup = mGroup }
       in Just s' { skId = qualifiedSkillId (skGroup s') (skId s') }
-    stampGroup Nothing = Nothing
+    stampGroup Nothing  = Nothing
 
 -- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter
 -- uses @name@ (required, maps to 'skId') and @description@ (required, maps to
@@ -724,3 +732,12 @@ rpOrDie t = case mkRemotePath t of
   Right r  -> pure r
   Left err -> error ("rpOrDie: invalid remote path: " <> T.unpack err
                      <> ": " <> T.unpack t)
+-- | Emit a warning to stderr when a skill file on disk fails to decode
+-- (e.g. missing required frontmatter, invalid id characters). The file is
+-- silently skipped from the listing, but the operator is notified so they
+-- can fix the formatting. The path is the workspace-relative or
+-- store-relative path of the malformed file.
+warnMalformedSkill :: Text -> IO ()
+warnMalformedSkill path =
+  hPutStrLn stderr ("warning: skill file " <> T.unpack path
+                     <> " has invalid formatting and was skipped")

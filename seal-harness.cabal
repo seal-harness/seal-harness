@@ -483,6 +483,7 @@ test-suite tests
         Seal.TestHelpers.FreePort
         Seal.TestHelpers.ScriptProvider
         Seal.TestHelpers.ApiTestHarness
+        Seal.TestHelpers.CaptureStderr
         Seal.Providers.AnthropicSpec
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec

@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Skills.BackendSpec (spec) where
 
+import qualified Data.Text as T
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -14,6 +15,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Skills.Backend
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.TestHelpers.Arbitrary ()
+import Seal.TestHelpers.CaptureStderr (captureStderr)
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
@@ -375,3 +377,68 @@ spec = describe "Seal.Skills.Backend" $ do
       -- Bare id is ambiguous — should return Nothing
       mBare <- sbRead backend (case mkSkillId "greet" of Right i -> i; Left _ -> sampleSkillId)
       mBare `shouldBe` Nothing
+
+  -- ── Load warnings for malformed files on disk ──────────────────────
+  -- When a skill file exists on disk but fails to decode (e.g. missing
+  -- required frontmatter fields, invalid id), the backend should emit a
+  -- warning to stderr naming the file so the operator knows it was
+  -- skipped rather than silently dropped.
+  describe "markdownSkillBackend load warnings for malformed files" $ do
+    it "warns about a flat .md skill with missing id frontmatter" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        -- A valid skill
+        let valid = "---\nid: good\ndescription: ok\n\
+                    \created_at: 2026-07-05T00:00:00Z\n\
+                    \updated_at: 2026-07-05T00:00:00Z\n\
+                    \session: manual\n---\n\nbody\n"
+        -- A malformed skill: no id field
+        let malformed = "---\ndescription: no id here\n---\n\nbroken\n"
+        TIO.writeFile (skillsDir </> "good.md") valid
+        TIO.writeFile (skillsDir </> "bad.md") malformed
+        (warnings, _count) <- captureStderr $ do
+          backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+          skills <- sbList backend
+          pure (length skills)
+        warnings `shouldSatisfy` ("bad.md" `T.isInfixOf`)
+        warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
+
+    it "warns about a grouped .md skill with invalid id characters" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (skillsDir </> "core")
+        let valid = "---\nid: good\ndescription: ok\n\
+                    \created_at: 2026-07-05T00:00:00Z\n\
+                    \updated_at: 2026-07-05T00:00:00Z\n\
+                    \session: manual\n---\n\nbody\n"
+        -- Malformed: id has spaces (fails mkSkillId)
+        let malformed = "---\nid: bad skill\ndescription: broken\n---\n\nbody\n"
+        TIO.writeFile (skillsDir </> "core" </> "good.md") valid
+        TIO.writeFile (skillsDir </> "core" </> "bad.md") malformed
+        (warnings, _) <- captureStderr $ do
+          backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+          sbList backend
+        warnings `shouldSatisfy` ("bad.md" `T.isInfixOf`)
+        warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
+
+    it "warns about a malformed agentskills.io SKILL.md (missing name)" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (skillsDir </> "good-skill")
+        createDirectoryIfMissing True (skillsDir </> "bad-skill")
+        TIO.writeFile (skillsDir </> "good-skill" </> "SKILL.md")
+          "---\nname: good-skill\ndescription: Good.\n---\nGood body.\n"
+        -- Malformed: no name field
+        TIO.writeFile (skillsDir </> "bad-skill" </> "SKILL.md")
+          "---\ndescription: no name.\n---\nBroken.\n"
+        (warnings, _) <- captureStderr $ do
+          backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+          sbList backend
+        warnings `shouldSatisfy` ("bad-skill" `T.isInfixOf`)
+        warnings `shouldSatisfy` ("warning" `T.isInfixOf`)

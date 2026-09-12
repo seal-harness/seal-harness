@@ -51,6 +51,7 @@ import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIO)
 import Seal.TestHelpers.FixtureRepo (stubCloneDeps)
 import Seal.Util.StrictIO (decodeFileStrict)
+import Seal.TestHelpers.CaptureStderr (captureStderr)
 
 aTime :: UTCTime
 aTime = UTCTime (fromGregorian 2026 8 17) (secondsToDiffTime (13 * 3600 + 14 * 60 + 4))
@@ -641,6 +642,42 @@ spec = do
       recorded <- readIORef calls
       length recorded `shouldBe` 3
       recorded `shouldNotSatisfy` any probeStyle
+
+  describe "workdir discovery load warnings for malformed files" $ do
+    it "warns about a malformed workdir-discovered skill (.agents/skills)" $ do
+      let tmp = "/tmp/seal-repo-discovery-skill-warn-test"
+      cleanup tmp
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "good")
+      createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "bad")
+      writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "good" </> "SKILL.md")
+        "---\nname: good\ndescription: Good.\n---\nGood body.\n"
+      -- Malformed: no name field
+      writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "bad" </> "SKILL.md")
+        "---\ndescription: no name.\n---\nBroken.\n"
+      (warnings, _) <- captureStderr $ do
+        backend <- workdirSkillBackend =<< mkFs tmp
+        sbList backend
+      warnings `shouldSatisfy` ("bad" `T.isInfixOf`)
+      warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
+      cleanup tmp
+
+    it "warns about a malformed workdir-discovered agent def (agents/ flat .md)" $ do
+      let tmp = "/tmp/seal-repo-discovery-agent-warn-test"
+      cleanup tmp
+      -- Use the legacy "agents" convention (no dot-prefix, not blocked by
+      -- SafePath) with a valid + malformed flat .md pair.
+      createDirectoryIfMissing True (tmp </> "my-repo" </> "agents")
+      writeFile (tmp </> "my-repo" </> "agents" </> "good.md")
+        "---\nid: good\nname: Good\nprovider: ollama\nmodel: llama3\n\
+        \tools: all\n---\nBe good.\n"
+      writeFile (tmp </> "my-repo" </> "agents" </> "bad.md")
+        "---\nname: no id\n---\nBroken.\n"
+      (warnings, _) <- captureStderr $ do
+        backend <- workdirAgentDefBackend =<< mkFs tmp
+        adbList backend
+      warnings `shouldSatisfy` ("bad.md" `T.isInfixOf`)
+      warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
+      cleanup tmp
 
 cleanup :: FilePath -> IO ()
 cleanup path =

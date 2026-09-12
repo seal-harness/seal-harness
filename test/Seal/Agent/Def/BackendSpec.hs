@@ -18,6 +18,7 @@ import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitHasCommits)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AllowList (..))
 import Seal.TestHelpers.Arbitrary ()
+import Seal.TestHelpers.CaptureStderr (captureStderr)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.WorkdirFs (mkLocalWorkdirFs)
 
@@ -345,3 +346,41 @@ spec = describe "Seal.Agent.Def.Backend" $ do
                   Nothing   -> expectationFailure "expected composed prompt preserved in flat body"
               Nothing -> expectationFailure "expected flat def after update"
           Left _ -> expectationFailure "invalid id"
+  -- ── Load warnings for malformed agent def files on disk ────────────
+  describe "markdownAgentDefBackend load warnings for malformed files" $ do
+    it "warns about a flat .md agent def with missing id frontmatter" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        let valid = "---\nid: good\nname: Good\nprovider: ollama\nmodel: llama3\n\
+                    \tools: all\ncreated_at: 2026-07-05T00:00:00Z\n\
+                    \updated_at: 2026-07-05T00:00:00Z\nsession: manual\n---\n\nbe nice\n"
+        -- Malformed: no id field
+        let malformed = "---\nname: no id\nprovider: ollama\nmodel: llama3\n---\n\nbroken\n"
+        TIO.writeFile (agentsDir </> "good.md") valid
+        TIO.writeFile (agentsDir </> "bad.md") malformed
+        (warnings, _) <- captureStderr $ do
+          backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+          adbList backend
+        warnings `shouldSatisfy` ("bad.md" `T.isInfixOf`)
+        warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
+
+    it "warns about a grouped .md agent def with invalid id characters" $
+      withSystemTempDirectory "seal-def" $ \root -> do
+        let cfgRoot = root </> "config"
+            agentsDir = cfgRoot </> "agents"
+        ensureConfigRepo cfgRoot
+        createDirectoryIfMissing True (agentsDir </> "core")
+        let valid = "---\nid: good\nname: Good\nprovider: ollama\nmodel: llama3\n\
+                    \tools: all\ncreated_at: 2026-07-05T00:00:00Z\n\
+                    \updated_at: 2026-07-05T00:00:00Z\nsession: manual\n---\n\nbe nice\n"
+        -- Malformed: id has spaces (fails mkAgentDefId)
+        let malformed = "---\nid: bad def\nname: broken\n---\n\nbody\n"
+        TIO.writeFile (agentsDir </> "core" </> "good.md") valid
+        TIO.writeFile (agentsDir </> "core" </> "bad.md") malformed
+        (warnings, _) <- captureStderr $ do
+          backend <- markdownAgentDefBackend agentsDir (openConfigRepo cfgRoot)
+          adbList backend
+        warnings `shouldSatisfy` ("bad.md" `T.isInfixOf`)
+        warnings `shouldSatisfy` ("warning" `T.isInfixOf`)
