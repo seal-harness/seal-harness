@@ -401,6 +401,7 @@ test-suite tests
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
+        Seal.Channels.TabFocusSpec
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Channels.TelegramSpec

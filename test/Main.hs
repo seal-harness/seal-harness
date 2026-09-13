@@ -88,6 +88,7 @@ import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
+import qualified Seal.Channels.TabFocusSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
 import qualified Seal.Channels.TelegramSpec
@@ -258,6 +259,7 @@ main = hspec $ do
   Seal.Channels.LoopSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.SignalSpec.spec
+  Seal.Channels.TabFocusSpec.spec
   Seal.Channels.TelegramSpec.spec
   Seal.Channels.Telegram.ButtonsSpec.spec
   Seal.Channels.Telegram.CommandsSpec.spec

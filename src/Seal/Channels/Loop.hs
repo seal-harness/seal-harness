@@ -37,6 +37,7 @@ module Seal.Channels.Loop
   , runChannelLoop
   , mkHandleCaps
   , handleTabCommand
+  , handleTabFocus
   , plainTurn
   , plainTurnWithCaps
   , buildChannelRegistry
@@ -52,9 +53,12 @@ module Seal.Channels.Loop
 
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Aeson qualified as A
+import Data.ByteString.Lazy qualified as BL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -77,7 +81,7 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
   ( RuntimeConfig )
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
   ( MessageSource, conversationIdText, msChannelKind, msConversationId )
@@ -92,11 +96,12 @@ import Seal.Handles.AskReply
   ( ApprovalCache, AskReplyStore, askHumanWithOptions, deliverNextAnswerResolved
   , formatQuestionWithOptions )
 import Seal.Handles.Channel (ChannelHandle (..))
-import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexToChar)
+import Seal.Handles.Tab (TabKind (..), TabIndex, tabIndexFromChar, tabIndexToChar)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Routing.Route qualified as Route
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Skills.Backend (SkillBackend)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
@@ -466,20 +471,32 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                   _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
                   loop h reg bgConvSid
                 Right (Route.SlashCommand _) -> do
-                  d <- ingest reg chain (RawInbound body)
-                  case d of
-                    DispatchAction a -> do
-                      eResult <- withExceptionLogging (cdLogger deps) Nothing "slash command" $
-                        runCommandAction a handleCaps
-                      case eResult of
-                        Left errMsg -> chSend h errMsg
-                        Right mFollowUp -> case mFollowUp of
-                          Just t  -> void (forkIO (plainHandler h meta (Just ms) t))
-                          Nothing -> pure ()
-                      loop h reg bgConvSid
-                    ShowText t       -> chSend h t >> loop h reg bgConvSid
-                    PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid
-                    Rejected msg     -> chSend h msg >> loop h reg bgConvSid
+                 -- Intercept /tab focus <N> before the registry: the
+                 -- registry's focusCmd only validates the index (it has
+                 -- no access to the cursor store or conversation key), so
+                 -- the cursor would not be updated and the next plain
+                 -- message would still route to the old session. Handle
+                 -- it inline with cursor update + reply subscribe + last
+                 -- reply delivery, matching the /N terse-grammar path.
+                 case parseTabFocus body of
+                   Just idx -> do
+                     handleTabFocus deps h tabsH key idx
+                     loop h reg bgConvSid
+                   Nothing -> do
+                     d <- ingest reg chain (RawInbound body)
+                     case d of
+                       DispatchAction a -> do
+                         eResult <- withExceptionLogging (cdLogger deps) Nothing "slash command" $
+                           runCommandAction a handleCaps
+                         case eResult of
+                           Left errMsg -> chSend h errMsg
+                           Right mFollowUp -> case mFollowUp of
+                             Just t  -> void (forkIO (plainHandler h meta (Just ms) t))
+                             Nothing -> pure ()
+                         loop h reg bgConvSid
+                       ShowText t       -> chSend h t >> loop h reg bgConvSid
+                       PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid
+                       Rejected msg     -> chSend h msg >> loop h reg bgConvSid
                 Right (Route.Plain t) -> do
                   void (forkIO (plainHandler h meta (Just ms) t))
                   loop h reg bgConvSid
@@ -637,6 +654,23 @@ isBgSlash body =
       in cmd == "bg"
     _ -> False
 
+-- | Parse @\/tab focus \<N\>@ from the inbound body. Returns 'Just' the
+-- 'TabIndex' if the body is @\/tab focus \<N\>@ (case-insensitive, N is a
+-- single tab-index char 0-9a-z), 'Nothing' otherwise. Used by the loop to
+-- intercept @\/tab focus@ before the registry dispatch (the registry's
+-- 'focusCmd' has no access to the cursor store or conversation key).
+parseTabFocus :: Text -> Maybe TabIndex
+parseTabFocus body =
+  case Route.route body of
+    Right (Route.SlashCommand rest) ->
+      let parts = T.words (T.toCaseFold rest)
+      in case parts of
+           ["tab", "focus", idxStr] -> case T.uncons idxStr of
+             Just (c, _) -> either (const Nothing) Just (tabIndexFromChar c)
+             Nothing     -> Nothing
+           _ -> Nothing
+    _ -> Nothing
+
 -- | Push the current tab-list snapshot to WS subscribers (the web frontend
 -- sidebar). No-op when 'cdBroker' is 'Nothing' (standalone channels without
 -- @seal serve@). Call after any channel-side tab mutation so the frontend
@@ -663,6 +697,69 @@ mkTabCloseNotifier cursors replies ref = case ref of
   BoundHarness _ -> pure ()
   where
     msg sid = "tab closed (session " <> sessionIdText sid <> "); a new tab will be created on your next message"
+
+-- | Handle @\/tab focus \<N\>@ on an inbox channel: validate the index,
+-- update the conversation's cursor to point at the focused tab's session,
+-- subscribe the channel handle to the focused session's replies (so future
+-- assistant replies from that session are fanned out to this channel), and
+-- send the last assistant reply from the focused session to the channel so
+-- the user sees the conversation context immediately. Sends a "focused tab N"
+-- confirmation, or "focus failed" on an out-of-range index.
+--
+-- This closes the gap between @\/N@ (the terse grammar, which already
+-- updated the cursor) and @\/tab focus \<N\>@ (which previously only
+-- validated the index without updating the cursor, so the next plain
+-- message still routed to the old session).
+handleTabFocus
+  :: ChannelDeps -> ChannelHandle -> TabsHandle
+ -> (Text, Text) -> TabIndex -> IO ()
+handleTabFocus deps h tabsH key idx = do
+  r <- focusTabH tabsH idx
+  case r of
+    Left e  -> chSend h ("focus failed: " <> e)
+    Right _ -> do
+      tl <- snapshotTabs tabsH
+      case lookupTabByIndex tl idx of
+        Nothing -> chSend h "focus failed: tab not found"
+        Just tab -> do
+          -- Update the conversation's cursor to the focused tab's ref.
+          cursorSet (cdCursors deps) key (tRef tab)
+          -- Subscribe the channel handle to the focused session's replies
+          -- so future assistant replies (from any surface) are fanned out
+          -- to this channel.
+          case tRef tab of
+            BoundSession sid -> do
+              _ <- replySubscribe (cdReplies deps) h sid
+              -- Send the last assistant reply from the focused session to
+              -- the channel so the user sees the conversation context.
+              sendLastAssistantReply deps h sid
+            BoundHarness _ -> pure ()
+          chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
+
+-- | Read the session's @conversation.jsonl@ and send the last assistant
+-- message's text content to the channel. No-op if the file is missing or
+-- has no assistant messages. Mirrors 'Seal.Core.TurnEngine.fanoutLastReply'
+-- but sends directly to the channel handle instead of fanning out.
+sendLastAssistantReply :: ChannelDeps -> ChannelHandle -> SessionId -> IO ()
+sendLastAssistantReply deps h sid = do
+  let convPath = sessionConversationPath (cdPaths deps) sid
+  exists <- doesFileExist convPath
+  if not exists
+    then pure ()
+    else do
+      raw <- BL.readFile convPath
+      let lines' = filter (not . BL.null) (BL.split 0x0a raw)
+          msgs = mapMaybe A.decode lines' :: [Message]
+      for_ (lastAssistantText msgs) (chSend h)
+
+-- | Extract the concatenated text content of the last 'Assistant' message.
+lastAssistantText :: [Message] -> Maybe Text
+lastAssistantText msgs =
+  case reverse (filter (\m -> msgRole m == Assistant) msgs) of
+    (m : _) -> case [t | CbText t <- msgContent m] of
+      (t : _) -> Just t
+      []      -> Nothing
+    []      -> Nothing
 
 -- | Handle a parsed 'TabSlashCommand' over a channel (mutates the
 -- TabsHandle, replies via chSend). Mirrors Seal.Channel.Cli.handleTabCommand.

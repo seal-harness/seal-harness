@@ -373,6 +373,12 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
 
 -- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
 -- replying via the channel caps. Pure-ish (the handle mutations are STM).
+--
+-- NOTE: The CLI tracks the active session via 'srActive', not a per-conversation
+-- cursor. @\/tab focus@ here only validates the index — it does NOT change
+-- which session the next message goes to (the CLI uses 'srActive' for that).
+-- The inbox-driven channels ('runChannelLoop') intercept @\/tab focus@ and
+-- update the cursor there.
 handleTabCommand :: ChannelCaps -> TabsHandle -> TabSlashCommand -> IO ()
 handleTabCommand caps tabsH = \case
   TabListCmd -> do
