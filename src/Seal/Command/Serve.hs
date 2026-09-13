@@ -279,6 +279,13 @@ runServeMain autonomy logger = do
           -- ^ Production: always use the real 'buildWorker' →
           -- 'mkDelegateWorker' path. The 'sdMkWorker' seam is for gateway
           -- API integration tests only.
+        , sdResolveProviderOverride = Nothing
+          -- ^ Production: resolve child providers via the real
+          -- 'resolveChild'. The seam is for gateway API integration tests
+          -- only (orchestrator children running scripted turns).
+        , sdMkWorkerStubDepth = 2
+          -- ^ Irrelevant in production ('sdMkWorker' is 'Nothing'); the
+          -- default keeps the depth-conditional stub semantics coherent.
         }
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)

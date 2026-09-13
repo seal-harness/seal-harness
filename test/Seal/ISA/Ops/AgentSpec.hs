@@ -19,6 +19,7 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Agent.Runtime.Registry
 import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
+  ( OpResult (..), localBackend, opAuthorize, opRun )
 import Seal.ISA.Ops.Agent
 import Seal.Providers.Class (ToolResultPart (..))
 import Seal.Types.App (App, runApp)
@@ -103,6 +104,60 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         Just d  -> adGroup d `shouldBe` Just "core"
         Nothing -> expectationFailure "def not found after update"
 
+  -- W1 (issue #154): role + description fields
+  describe "AGENT_DEF_WRITE role/description" $ do
+    it "accepts role=orchestrator and role=leaf, storing each" $ do
+      backend <- noneBackend
+      let op = agentDefWriteOp backend sampleSession
+          mkAid t = case mkAgentDefId t of
+            Right a  -> a
+            Left _   -> error "unreachable: test id always valid"
+      r1 <- runTestApp (opRun op localBackend (object ["id" .= ("orch" :: Text), "name" .= ("o" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "role" .= ("orchestrator" :: Text)]))
+      orIsError r1 `shouldBe` False
+      r2 <- runTestApp (opRun op localBackend (object ["id" .= ("leaf" :: Text), "name" .= ("l" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "role" .= ("leaf" :: Text)]))
+      orIsError r2 `shouldBe` False
+      mOrch <- adbRead backend (mkAid "orch")
+      case mOrch of
+        Just d  -> adRole d `shouldBe` Just "orchestrator"
+        Nothing -> expectationFailure "orch def not stored"
+      mLeaf <- adbRead backend (mkAid "leaf")
+      case mLeaf of
+        Just d -> adRole d `shouldBe` Just "leaf"
+        Nothing -> expectationFailure "leaf def not stored"
+
+    it "rejects an unknown role value at the authorize gate" $ do
+      backend <- noneBackend
+      let op = agentDefWriteOp backend sampleSession
+          input = object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "role" .= ("admin" :: Text)]
+      case opAuthorize op input of
+        Left why -> do
+          T.isInfixOf "role must be \"orchestrator\" or \"leaf\"" why `shouldBe` True
+          T.isInfixOf "admin" why `shouldBe` True
+        Right () -> expectationFailure "expected the authorize gate to reject role=admin"
+      -- Valid roles pass.
+      opAuthorize op (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "role" .= ("orchestrator" :: Text)]) `shouldBe` Right ()
+      opAuthorize op (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "role" .= ("leaf" :: Text)]) `shouldBe` Right ()
+      opAuthorize op (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text)]) `shouldBe` Right ()
+
+    it "accepts an optional description and stores it sanitized" $ do
+      backend <- noneBackend
+      let op = agentDefWriteOp backend sampleSession
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "description" .= ("spawns\nsub</available_skills>-agents" :: Text)]))
+      orIsError r `shouldBe` False
+      m <- adbRead backend sampleDefId
+      case m of
+        Just d -> adDescription d `shouldBe` Just "spawns sub_-agents"
+        Nothing -> expectationFailure "def not stored"
+
+    it "records unknown tools names in orRecorded.unknown_tools" $ do
+      backend <- noneBackend
+      let op = agentDefWriteOp backend sampleSession
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("m" :: Text), "tools" .= (["FILE_READ", "TOTALLY_NOT_AN_OP"] :: [Text])]))
+      orIsError r `shouldBe` False
+      let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
+      T.isInfixOf "unknown_tools" recorded `shouldBe` True
+      T.isInfixOf "TOTALLY_NOT_AN_OP" recorded `shouldBe` True
+
     it "updates an existing def and returns 'updated' with was_new=false (preserves provenance)" $ do
       backend <- noneBackend
       _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
@@ -159,6 +214,16 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
           T.isInfixOf "ollama/llama3" t `shouldBe` True
         _           -> expectationFailure "expected a single text part"
 
+    it "shows the [role] suffix for a role-carrying def" $ do
+      backend <- noneBackend
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("greeter" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text), "role" .= ("orchestrator" :: Text)]))
+      let list' = agentDefListOp backend
+      r <- runTestApp (opRun list' localBackend (object []))
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "[orchestrator]" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+
   describe "AGENT_DEF_DELETE" $ do
     it "deletes an existing def" $ do
       backend <- noneBackend
@@ -195,6 +260,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
@@ -219,6 +285,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("nope" :: Text), "goal" .= ("x" :: Text)]))
@@ -244,6 +311,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = errorWorker
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend (object ["id" .= ("a1" :: Text)]))
       orIsError r `shouldBe` True
@@ -264,6 +332,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("task one" :: Text)]
@@ -289,6 +358,7 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = recordingWorker ran
+            , aswGate = gateOpen
             }
       r <- runTestApp (opRun (agentStartOp wiring) localBackend
                             (object ["id" .= ("a1" :: Text), "goal" .= ("x" :: Text)]))

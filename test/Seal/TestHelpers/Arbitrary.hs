@@ -187,4 +187,6 @@ instance Arbitrary AgentDef where
     <*> arbitrary
     <*> arbitrary
     <*> arbitrary
+    <*> arbitrary
+    <*> arbitrary
     <*> genSessionId

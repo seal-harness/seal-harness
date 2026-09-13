@@ -196,6 +196,8 @@ mkSendDepsWith paths resolveStub = do
         , sdExecCache   = execCache
         , sdRemoteRunner = Nothing
         , sdMkWorker    = Nothing
+        , sdResolveProviderOverride = Nothing
+        , sdMkWorkerStubDepth = 2
         }
   pure sendDeps
 

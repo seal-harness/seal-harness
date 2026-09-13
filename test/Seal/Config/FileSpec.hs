@@ -199,6 +199,7 @@ spec = describe "Seal.Config.File" $ do
       let allNothing = AgentConfig { acParallelToolGuidance = Nothing
                                     , acToolUseEnforcement = Nothing
                                     , acTaskCompletionGuidance = Nothing
+                                    , acAvailableAgents = Nothing
                                     }
 
       it "default to True when [agent] is absent" $ do

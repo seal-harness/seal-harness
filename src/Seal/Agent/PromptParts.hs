@@ -16,10 +16,17 @@ module Seal.Agent.PromptParts
   , taskCompletionGuidance
   , staticGuidanceBlock
   , injectStaticGuidance
+  , availableAgentsBlock
+  , injectAvailableAgents
+  , leafAgentNote
   ) where
 
+import Data.List (groupBy, sortOn)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+
+import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
 
 -- | Parallel tool-call guidance. Tells the model to batch independent
 -- tool calls into one turn rather than running them sequentially across
@@ -82,5 +89,91 @@ injectStaticGuidance parallel toolUse taskCompletion mPrompt =
   in if T.null block
        then mPrompt
        else Just (case mPrompt of
+                    Nothing  -> block
+                    Just base -> base <> "\n\n" <> block)
+-- ---------------------------------------------------------------------------
+-- W3 (issue #154): the <available_agents> catalog
+-- ---------------------------------------------------------------------------
+
+-- | The per-def catalog budget (chars). Matches the skills catalog
+-- (4096) — with repo-prefixed ids and 256-char descriptions, ~19
+-- metaswarm agents fit comfortably; truncation is observable via the
+-- marker, and AGENT_DEF_LIST always stays complete.
+availableAgentsBudget :: Int
+availableAgentsBudget = 4096
+
+-- | The one-line note injected into a LEAF child's prompt instead of the
+-- catalog (the child's registry has no spawn capability, so advertising
+-- agents it cannot delegate to would waste turns).
+leafAgentNote :: Text
+leafAgentNote = "You are a leaf agent; delegation is not available."
+
+-- | The untruncated @\<available_agents\>@ catalog block: one bullet per
+-- def (@- \<full-id\> [\<role\>]: \<description|name-fallback\>@), grouped
+-- by 'adGroup' with @## \<group\>@ headers (ungrouped defs fall under
+-- @## Agents@), ending with the AGENT_START nudge line. The block is
+-- truncated to 'availableAgentsBudget' with the elided-count marker.
+-- The empty list renders @\"\"@ (the caller skips injection — no empty
+-- tags are ever emitted). Bullets always use the FULL merged-backend id
+-- (workdir-prefixed where applicable) — that is what AGENT_START accepts.
+availableAgentsBlock :: [AgentDef] -> Text
+availableAgentsBlock [] = ""
+availableAgentsBlock defs = truncateBlock budget (fullBlock defs)
+  where
+    budget = availableAgentsBudget
+    fullBlock ds =
+      "<available_agents>\n"
+      <> T.intercalate "\n\n" (map renderGroup grouped)
+      <> "\n\nDelegate with AGENT_START using an id before relying on an agent."
+      <> "\n</available_agents>"
+      where
+        sorted = sortOn (\d -> (groupKey d, agentDefIdText (adId d))) ds
+        grouped = groupBy (\a b -> groupKey a == groupKey b) sorted
+        groupKey d = fromMaybe "" (adGroup d)
+
+-- | Render one group's section: a header line (the group name, or
+-- \"Agents\" for the ungrouped section) followed by the @- id [role]: text@
+-- bullets.
+renderGroup :: [AgentDef] -> Text
+renderGroup [] = ""
+renderGroup group@(d0:_) =
+  header <> "\n" <> T.intercalate "\n" (map bullet group)
+  where
+    header = case adGroup d0 of
+      Just g  -> "## " <> g
+      Nothing -> "## Agents"
+    bullet d = "- " <> agentDefIdText (adId d) <> roleSuffix (adRole d)
+               <> ": " <> primaryText d
+    primaryText d = case adDescription d of
+      Just desc | not (T.null (T.strip desc)) -> desc
+      _         -> adName d
+    roleSuffix (Just r) = " [" <> r <> "]"
+    roleSuffix Nothing  = ""
+
+-- | Truncate the block to the budget, appending the elided count when
+-- truncation occurs (character boundary — 'Text' is Unicode-correct).
+truncateBlock :: Int -> Text -> Text
+truncateBlock budget block
+  | T.length block <= budget = block
+  | otherwise =
+      T.take budget block
+        <> "\n[...catalog truncated at "
+        <> T.pack (show budget)
+        <> " chars; "
+        <> T.pack (show (T.length block - budget))
+        <> " more chars elided...]"
+
+-- | Append the @\<available_agents\>@ catalog to the resolved system
+-- prompt. Pure over the def list (the caller passes 'adbList' from the
+-- per-turn union backend). Returns the prompt unchanged (no catalog)
+-- when the list is empty, so no empty tags are ever emitted. The catalog
+-- is appended AFTER everything else (skills catalog last per the
+-- cache-friendly ordering; agents follow).
+injectAvailableAgents :: [AgentDef] -> Maybe Text -> Maybe Text
+injectAvailableAgents defs mPrompt =
+  let block = availableAgentsBlock defs
+  in if T.null block
+       then mPrompt
+       else pure (case mPrompt of
                     Nothing  -> block
                     Just base -> base <> "\n\n" <> block)

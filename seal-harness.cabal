@@ -380,6 +380,7 @@ test-suite tests
         Seal.Agent.Def.BackendNoDirectFsFailSpec
         Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
+        Seal.Agent.Runtime.Delegation.WorkerSpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec

@@ -42,7 +42,7 @@ import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.ISA.Ops.Agent
   ( agentDefWriteOp, agentDefReadOp, agentInstancesOp
   , agentStartOp, agentStatusOp, agentStopOp, agentInterruptOp
-  , AgentStartWiring (..) )
+  , AgentStartWiring (..), gateOpen )
 import Seal.ISA.Ops.Memory
   ( memoryDeleteOp, memoryRecallOp, memoryWriteOp )
 import Seal.ISA.Ops.Skills
@@ -133,6 +133,7 @@ buildRegistry cfgRoot workerRan sid = do
         , aswMintSession = pure sid
         , aswParentDepth = 0
         , aswWorker = worker
+        , aswGate = gateOpen
         }
   pure $ ISA.mkRegistry
     [ memoryWriteOp memBackend sid
@@ -225,6 +226,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
             , aswMintSession = pure sid
             , aswParentDepth = 0
             , aswWorker = worker
+            , aswGate = gateOpen
             }
           reg = ISA.mkRegistry
             [ agentDefWriteOp defBackend sid

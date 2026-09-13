@@ -11,8 +11,13 @@
 module Seal.Agent.Runtime.Delegation.Worker
   ( mkDelegateWorker
   , delegationBlocklist
+  , childBlocklist
+  , effectiveRole
+  , intersectAllowList
   , filterBlocklisted
+  , filterBlocklistedWith
   , narrowAllowList
+  , narrowAllowListWith
   , DelegationWorkerDeps (..)
   ) where
 
@@ -23,6 +28,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (createDirectoryIfMissing)
 
+import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..))
 import Seal.Agent.Loop (runTurn)
@@ -69,14 +75,49 @@ delegationBlocklist = Set.fromList
   , OpName "AGENT_INTERRUPT"
   ]
 
--- | Apply the 'delegationBlocklist' to a child's tool allow-list. Only
+-- | The role-aware child blocklist (issue #154 §3.2): the delegation
+-- blocklist a CHILD's registry must apply. AGENT_START is ALWAYS
+-- present-but-rejecting in a child registry — the gate (its authorize)
+-- is the enforcement, returning the dedicated leaf/kill-switch messages
+-- (§3.2 item 6) instead of unknown-tool. So the blocklist drops only
+-- AGENT_START; every other entry (def mutation, lifecycle control)
+-- always applies — those stay parent/operator-only.
+childBlocklist :: Maybe Text -> Bool -> Set.Set OpName
+childBlocklist _ _ = Set.delete (OpName "AGENT_START") delegationBlocklist
+
+-- | The effective role for a spawned child (issue #154 §3.1): the def's
+-- role is AUTHORITATIVE; the per-task @role@ hint may only NARROW (an
+-- orchestrator def downgraded to leaf). Any other task hint is ignored —
+-- a leaf def can never be widened by task input. Returns @Nothing@ for
+-- an unrole'd def (implicit leaf).
+effectiveRole :: Maybe Text -> Maybe Text -> Maybe Text
+effectiveRole defRole (Just "leaf") = case defRole of
+  Just "orchestrator" -> Just "leaf"
+  other               -> other
+effectiveRole defRole _ = defRole
+
+-- | Intersect a def's @tools@ allow-list with the set of opcodes the
+-- harness's base child registry actually exposes ('AllowOnly' ⇒ keep only
+-- members; 'AllowAll' passes through unchanged — the full base registry).
+-- Unknown names silently drop (intersection semantics, not grants).
+intersectAllowList :: AllowList OpName -> (OpName -> Bool) -> AllowList OpName
+intersectAllowList AllowAll _         = AllowAll
+intersectAllowList (AllowOnly xs) inBase = AllowOnly (Set.filter inBase xs)
+
+-- | Apply a (role-aware) blocklist to a child's tool allow-list. Only
 -- narrows 'AllowOnly' (set-difference with the blocklist); 'AllowAll' is
 -- returned unchanged because the blocklist is enforced at registry-build
 -- time by omitting blocklisted opcodes from the ops list (we can't enumerate
 -- the universe of opcode names to form a complement here).
 narrowAllowList :: AllowList OpName -> AllowList OpName
-narrowAllowList AllowAll       = AllowAll
-narrowAllowList (AllowOnly xs) = AllowOnly (Set.difference xs delegationBlocklist)
+narrowAllowList = narrowAllowListWith delegationBlocklist
+
+-- | 'narrowAllowList' over an explicit (role-aware) blocklist — W2's
+-- second chokepoint: a def that explicitly lists @AGENT_START@ keeps it
+-- only when the computed blocklist also omits it.
+narrowAllowListWith :: Set.Set OpName -> AllowList OpName -> AllowList OpName
+narrowAllowListWith _ AllowAll       = AllowAll
+narrowAllowListWith bl (AllowOnly xs) = AllowOnly (Set.difference xs bl)
 
 -- | Filter a list of opcodes to remove any whose name is in the
 -- 'delegationBlocklist'. The wiring layer calls this on its base ops list
@@ -86,6 +127,13 @@ narrowAllowList (AllowOnly xs) = AllowOnly (Set.difference xs delegationBlocklis
 filterBlocklisted :: [opcode] -> (opcode -> OpName) -> [opcode]
 filterBlocklisted ops getName =
   [ o | o <- ops, not (getName o `Set.member` delegationBlocklist) ]
+
+-- | Filter a list of opcodes to remove any whose name is in an explicit
+-- (role-aware) blocklist. W2's generalized form — 'filterBlocklisted' is
+-- the static-blocklist special case.
+filterBlocklistedWith :: [opcode] -> Set.Set OpName -> (opcode -> OpName) -> [opcode]
+filterBlocklistedWith ops bl getName =
+  [ o | o <- ops, not (getName o `Set.member` bl) ]
 
 -- | The per-channel deps the worker-builder closes over. The wiring layer
 -- (Cli.hs, Channels.Loop.hs, Gateway.Send.hs) builds this from its own
@@ -112,12 +160,32 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- ^ Resolve the child's provider+model from the def, applying any
     -- delegation.provider/model/base_url override (the wiring layer reads
     -- the override from the RuntimeConfig and threads it here).
+  , dwdResolveProviderOverride
+      :: Maybe (AgentDef -> IO (Either Text (SomeProvider, ModelId)))
+    -- ^ Test seam (issue #154): when 'Just', REPLACES 'dwdResolveProvider'
+    -- for every child spawn. 'Nothing' in production. Gateway API
+    -- integration tests inject a resolver returning the harness's
+    -- 'ScriptProvider' so child turns pop the same scripted queue as the
+    -- parent turn (no real provider call). Mirrors the 'tdMkWorker' seam
+    -- pattern ('Nothing' = production behavior).
+  , dwdUnionDefBackend :: AgentDefBackend
+    -- ^ The per-turn workdir ⊕ user union agent-def backend (the SAME
+    -- one the parent session's turn assembled). The nested wiring (§3.2)
+    -- resolves grandchildren against it so repo-shipped orchestrators can
+    -- spawn repo-shipped specialists. In mode=remote this reuses the
+    -- parent's cachedWorkdirScan result — no new control-plane FS reads.
   , dwdChildRegistry
-      :: AgentDef -> SessionId -> ChannelCaps -> IO Registry
-    -- ^ Build the child's narrowed ISA registry. The wiring layer is
-    -- responsible for applying 'delegationBlocklist' to the def's
-    -- @adTools@ allow-list and constructing the registry. The caps + sid
-    -- are passed in so the registry can close over them (ASK_HUMAN etc.).
+      :: AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO Registry
+    -- ^ Build the child's narrowed ISA registry. W2 signature (was
+    -- @AgentDef -> SessionId -> ChannelCaps@): gains the CHILD's own
+    -- delegation depth ('dwdParentDepth' + 1) and the child's effective
+    -- role, both computed by 'mkDelegateWorker'. The wiring layer is
+    -- responsible for applying the role-aware blocklist
+    -- ('childBlocklist') to the ops list AND the def's @adTools@
+    -- allow-list ('narrowAllowListWith' / 'intersectAllowList') and
+    -- constructing the registry — including, for orchestrator children,
+    -- the role-conditioned nested @AGENT_START@. The caps + sid are
+    -- passed in so the registry can close over them (ASK_HUMAN etc.).
   , dwdChildSystemPrompt :: AgentDef -> ChildTask -> IO (Maybe Text)
     -- ^ Build the child's system prompt from the def's @adSystem@ + the
     -- task's @ctContext@. Runs in 'IO' so the wiring layer can load the
@@ -154,8 +222,12 @@ data DelegationWorkerDeps = DelegationWorkerDeps
 mkDelegateWorker :: DelegationWorkerDeps -> AgentWorkerBuilder
 mkDelegateWorker deps agentDef childSid task _hooks = do
   let childDir = agentSessionDir (dwdPaths deps) (dwdParentSid deps) childSid
+      childDepth = dwdParentDepth deps + 1
   createDirectoryIfMissing True childDir
-  eProv <- dwdResolveProvider deps agentDef
+  let resolve = case dwdResolveProviderOverride deps of
+        Just testResolve -> testResolve agentDef
+        Nothing          -> dwdResolveProvider deps agentDef
+  eProv <- resolve
   case eProv of
     Left err -> pure (ChildWorkerOutcome
                        (Just ("agent start failed: " <> err))
@@ -167,10 +239,17 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
               , ccStreaming    = False  -- children: capture final summary, no per-delta sends
               }
-        childReg <- dwdChildRegistry deps agentDef childSid capturingCaps
+        childReg <- dwdChildRegistry deps agentDef childDepth
+                                     (effectiveRole (adRole agentDef) (ctRole task))
+                                     childSid capturingCaps
         childUioEnv <- dwdMkUIOEnv deps childSid
         childSystem <- dwdChildSystemPrompt deps agentDef task
         childAbortFlag <- dwdAbortFlag deps childSid
+        -- Capture the final answer via 'aeOnStop': the loop's
+        -- final-answer path calls 'notifyStop' (the replyFanout hook)
+        -- rather than 'ccSend' — the double-delivery fix. The
+        -- summaryRef-capture hooks BOTH, taking the last write.
+        let childEnvOnStop = Just (\t -> atomicModifyIORef' summaryRef (const (Just t, ())))
         let env = AgentEnv
               { aeProvider   = prov
               , aeProviderLabel = providerLabel agentDef
@@ -190,7 +269,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeDebugRequestsPath = Nothing
               , aeOnEntry    = dwdOnEntry deps
               , aeOnUserMessage = Nothing
-              , aeOnStop     = Nothing
+              , aeOnStop     = childEnvOnStop
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
               , aeAbortFlag  = childAbortFlag
