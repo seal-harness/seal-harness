@@ -2,9 +2,14 @@
 module Seal.Gateway.StreamBrokerSpec (spec) where
 
 import Data.Aeson (object, (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.KeyMap qualified as KM
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Text qualified as T
-import Control.Concurrent.STM (TVar)
+import Data.Time (getCurrentTime, addUTCTime)
+import Control.Concurrent.STM (TVar, atomically, writeTVar)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (void)
 import Test.Hspec
@@ -157,3 +162,48 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     broadcast broker (BeEntryRecorded (mkSid "a") entry)
     closed <- readIORef closedRef
     closed `shouldBe` True
+
+  -- ── reconcileStaleThinking ──────────────────────────────────────────
+
+  describe "Seal.Gateway.StreamBroker.reconcileStaleThinking" $ do
+    it "clears sessions that have been thinking longer than the threshold" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "stale") True
+      -- Manually backdate the thinking timestamp so it's older than 1 second.
+      now <- getCurrentTime
+      atomically $ writeTVar (sbThinking broker)
+        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
+      cleared <- reconcileStaleThinking broker 60
+      cleared `shouldBe` Set.fromList [mkSid "stale"]
+      remaining <- thinkingSessions broker
+      Set.null remaining `shouldBe` True
+
+    it "does NOT clear sessions that started thinking recently" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "fresh") True
+      cleared <- reconcileStaleThinking broker 3600
+      Set.null cleared `shouldBe` True
+      remaining <- thinkingSessions broker
+      remaining `shouldBe` Set.fromList [mkSid "fresh"]
+
+    it "broadcasts an idle harness-status for each cleared session" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribeTest broker (mkSid "stale") (\e -> modifyIORef' ref (e :))
+      setThinking broker (mkSid "stale") True
+      now <- getCurrentTime
+      atomically $ writeTVar (sbThinking broker)
+        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
+      void $ reconcileStaleThinking broker 60
+      events <- readIORef ref
+      -- BeActivity is all-subscriber, so the subscriber focused on "stale"
+      -- receives the idle event.
+      any isIdleActivity events `shouldBe` True
+      where
+        isIdleActivity (BeActivity _ payload) =
+          case payload of
+            A.Object o -> case KM.lookup "status" o of
+              Just (A.String "idle") -> True
+              _ -> False
+            _ -> False
+        isIdleActivity _ = False

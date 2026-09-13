@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 -- | The in-process broker that fans 'BrokerEvent's to every subscribed WS
 -- connection, filtering by each connection's focused session. STM-backed:
 -- a 'TVar' of subscribers + a global cap.
@@ -16,14 +17,18 @@ module Seal.Gateway.StreamBroker
   , subscriberCount
   , thinkingSessions
   , setThinking
+  , reconcileStaleThinking
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (when, filterM, forM_)
-import Data.Aeson (Value)
+import Control.Monad (when, unless, filterM, forM_)
+import Data.Aeson (Value, object, (.=))
+import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
+import Data.Text (Text)
+import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
 
 import Seal.Core.Types (SessionId)
 
@@ -58,17 +63,20 @@ data Subscriber = Subscriber
 -- cap. Also tracks the set of sessions currently in a @thinking@ turn so
 -- a freshly-connected web client can hydrate its sidebar without waiting
 -- for the next harness-status event (which would only arrive at the next
--- turn boundary — leaving a mid-turn refresh stuck on Idle).
+-- turn boundary — leaving a mid-turn refresh stuck on Idle). The thinking
+-- map records /when/ thinking started so 'reconcileStaleThinking' can
+-- detect sessions stuck longer than a threshold (e.g. an unanswered
+-- ASK_HUMAN blocking the turn indefinitely).
 data StreamBroker = StreamBroker
   { sbSubs :: TVar [Subscriber]
   , sbCap :: Int
-  , sbThinking :: TVar (Set SessionId)
+  , sbThinking :: TVar (Map.Map SessionId UTCTime)
   }
 
 -- | Build a new broker with the given subscriber cap.
 newStreamBroker :: Int -> IO StreamBroker
 newStreamBroker cap =
-  StreamBroker <$> newTVarIO [] <*> pure cap <*> newTVarIO Set.empty
+  StreamBroker <$> newTVarIO [] <*> pure cap <*> newTVarIO Map.empty
 
 -- | Subscribe a new connection. If the global cap is exceeded, the subscribe
 -- is a no-op (the over-cap subscriber is never added — it should close).
@@ -174,12 +182,46 @@ subscriberCount broker = length <$> readTVarIO (sbSubs broker)
 -- lists-snapshot builders to hydrate a freshly-connected web client's
 -- sidebar (so a mid-turn refresh does not blank the thinking indicator).
 thinkingSessions :: StreamBroker -> IO (Set SessionId)
-thinkingSessions broker = readTVarIO (sbThinking broker)
+thinkingSessions broker =
+  Map.keysSet <$> readTVarIO (sbThinking broker)
 
 -- | Add ('True') or remove ('False') a session from the thinking set.
 -- Idempotent. Called by 'broadcastHarnessStatus' so the broker's
--- in-memory state mirrors the events it fans out.
+-- in-memory state mirrors the events it fans out. When adding, records
+-- the current time so 'reconcileStaleThinking' can detect sessions that
+-- have been stuck thinking longer than a threshold (e.g. an unanswered
+-- ASK_HUMAN blocking the turn indefinitely — session
+-- 20260912-183908-767 issue #3).
 setThinking :: StreamBroker -> SessionId -> Bool -> IO ()
-setThinking broker sid thinking =
+setThinking broker sid thinking = do
+  now <- getCurrentTime
   atomically $ modifyTVar' (sbThinking broker)
-    (\s -> if thinking then Set.insert sid s else Set.delete sid s)
+    (\m -> if thinking then Map.insert sid now m else Map.delete sid m)
+
+-- | Remove sessions that have been in the thinking set longer than the
+-- given threshold (in seconds). Returns the set of sessions that were
+-- cleared. Broadcasts an @idle@ harness-status for each cleared session
+-- so the web frontend updates. This is a safety net: a session blocked
+-- on an unanswered ASK_HUMAN (or a dead provider connection that slipped
+-- past the stream timeout) leaves the session permanently thinking in
+-- the broker's in-memory state. Without reconciliation, a page refresh
+-- shows the session as thinking forever.
+reconcileStaleThinking :: StreamBroker -> Int -> IO (Set SessionId)
+reconcileStaleThinking broker maxAgeSec = do
+  now <- getCurrentTime
+  let threshold = fromIntegral maxAgeSec :: Double
+  stale <- atomically $ do
+    m <- readTVar (sbThinking broker)
+    let isStale t = realToFrac (now `diffUTCTime` t) >= threshold
+        staleMap = Map.filter isStale m
+        staleSids = Map.keysSet staleMap
+    unless (Set.null staleSids) $
+      writeTVar (sbThinking broker) (Map.difference m staleMap)
+    pure staleSids
+  -- Broadcast idle for each cleared session so the frontend updates.
+  forM_ (Set.toList stale) $ \sid ->
+    broadcast broker (BeActivity sid (object
+      [ "kind" .= ("harness-status" :: Text)
+      , "status" .= ("idle" :: Text)
+      ]))
+  pure stale
