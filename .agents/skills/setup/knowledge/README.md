@@ -1,4 +1,4 @@
-# BEADS Knowledge Base
+# Knowledge Base
 
 This directory contains curated learnings from the agent swarm. Knowledge is extracted from:
 
@@ -80,10 +80,10 @@ Agents query knowledge before starting work:
 
 ```bash
 # Find relevant facts
-grep -l "<keyword>" .beads/knowledge/*.jsonl
+grep -l "<keyword>" docs/knowledge/*.jsonl
 
 # Query specific file patterns
-cat .beads/knowledge/api-behaviors.jsonl | jq 'select(.affectedServices | contains(["ExampleService"]))'
+cat docs/knowledge/api-behaviors.jsonl | jq 'select(.affectedServices | contains(["ExampleService"]))'
 ```
 
 ## Contributing Knowledge
@@ -98,7 +98,7 @@ To add knowledge manually:
 
 ```bash
 # Append to appropriate file
-echo '{"id": "...", ...}' >> .beads/knowledge/gotchas.jsonl
+echo '{"id": "...", ...}' >> docs/knowledge/gotchas.jsonl
 ```
 
 ## Maintenance

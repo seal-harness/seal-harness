@@ -6,8 +6,8 @@ module Seal.Command.Serve
   ( runServeMain
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Monad (filterM)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Monad (filterM, void, forever)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -55,7 +55,7 @@ import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
-import Seal.Gateway.StreamBroker (newStreamBroker)
+import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
@@ -333,6 +333,12 @@ runServeMain autonomy logger = do
       guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }
   logIO logger InfoS ("WS stream server binding to " <> ls (gcHost gwCfg <> ":" <> T.pack (show (gcWsPort gwCfg))))
   _ <- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)
+  -- Periodically clear stale "thinking" sessions (safety net for sessions
+  -- stuck on an unanswered ASK_HUMAN or a dead provider connection). Runs
+  -- every 5 minutes; clears sessions thinking longer than 30 minutes.
+  _ <- forkIO $ forever $ do
+    threadDelay (5 * 60 * 1_000_000)
+    void (reconcileStaleThinking broker (30 * 60))
   -- Fork channel listeners for any configured channel. Each channel gets
   -- its own askReply store; the tab list is shared (passed by the
   -- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'

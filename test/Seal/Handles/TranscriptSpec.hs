@@ -253,3 +253,43 @@ spec = describe "Seal.Handles.Transcript" $ do
         -- The second line must NOT contain an "envelope" key (the delta was
         -- empty, so the writer omits it entirely).
         BS8.unpack (entryLines !! 1) `shouldNotContain` "\"envelope\""
+
+    it "does not duplicate the conversation when a secret result is followed by another write" $
+      withSystemTempDirectory "seal-twofile" $ \dir -> do
+        -- Regression: the agent loop sends the FULL in-memory message list
+        -- (with UNREDACTED tool results) on every write. The daemon redacts
+        -- the new suffix before writing to disk and updates tfsWritten with
+        -- the REDACTED version. On the NEXT write, the incoming list still
+        -- has the UNREDACTED tool result, but tfsWritten has the REDACTED
+        -- one. The diff (stripPrefix) fails, and the fallback re-appends
+        -- the entire conversation — causing O(N²) duplication.
+        --
+        -- The fix: redact the full incoming list BEFORE diffing, so the
+        -- comparison is redacted-vs-redacted.
+        e1 <- mkEntryRecord
+        e2 <- mkEntryRecord
+        let secret = TrpText "super-secret-api-key"
+            toolUse = Message Assistant
+              [CbToolUse (ToolCallId "tc1") (OpName "SECRET_GET") (object [])]
+            resultMsg = Message User
+              [CbToolResult (ToolCallId "tc1") [secret] False]
+            -- Write A: the full conversation with the unredacted tool result.
+            convA = [toolUse, resultMsg]
+            -- Write B: same conversation + a new assistant response.
+            -- The in-memory list still has the UNREDACTED tool result.
+            convB = convA <> [Message Assistant [CbText "ok"]]
+        withTwoFileTranscript dir $ \h -> do
+          tfwSetSecretOps h (Set.fromList [OpName "SECRET_GET"])
+          tfwRecordAndAck h (TwoFileWrite convA e1)
+          tfwRecordAndAck h (TwoFileWrite convB e2)
+        convContents <- BS8.readFile (dir </> "conversation.jsonl")
+        -- Without the fix: convA writes 2 lines (toolUse + redacted result),
+        -- then convB's diff fails (unredacted vs redacted) and the fallback
+        -- re-appends all 3 lines -> 5 total. With the fix: convA writes 2
+        -- lines, convB diffs correctly (redacted-vs-redacted) and appends
+        -- only 1 new line -> 3 total.
+        length (BS8.lines convContents) `shouldBe` 3
+        -- The secret must never appear on disk.
+        BS8.unpack convContents `shouldNotContain` "super-secret-api-key"
+        BS8.unpack convContents `shouldContain` "<redacted:secret>"
+        BS8.unpack convContents `shouldContain` "ok"

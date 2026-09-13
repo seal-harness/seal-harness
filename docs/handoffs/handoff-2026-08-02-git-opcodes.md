@@ -40,7 +40,7 @@ Replace PR #80's on-disk `GIT_ASKPASS`/keyfile credential seam with **SSH agent 
 **Done & verified:**
 - Design doc: `docs/superpowers/specs/2026-08-02-git-opcodes-agent-forwarding-design.md` — **5/5 design-gate APPROVED (round 2)**, **feasibility re-verified (round 3, PASS)**, **rev 3** (encrypted-keyfile approach, user-approved). Latest commit `5037409` on the branch (pushed).
 - GitHub issue #81 filed: https://github.com/seal-harness/seal-harness/issues/81
-- **Implementation plan**: `.beads/plans/git-opcodes-plan.md` — **fully updated to match design rev 3** (encrypted keyfile; opcodes Untrusted; env `env VAR=val` prefix; `Env` fields; `UntrustedIORemoteSpec` in W2 scope; W1–W6 RED-GREEN-REFACTOR). Ready for the plan review gate + execution.
+- **Implementation plan**: `docs/plans/git-opcodes-plan.md` — **fully updated to match design rev 3** (encrypted keyfile; opcodes Untrusted; env `env VAR=val` prefix; `Env` fields; `UntrustedIORemoteSpec` in W2 scope; W1–W6 RED-GREEN-REFACTOR). Ready for the plan review gate + execution.
 - Empirical verifications on record: `ssh-keygen -f -` writes to a file named `-` (not stdout); `printf '<pass>\n' | SSH_ASKPASS_REQUIRE=never ssh-add <enc-file>` works non-interactively; GitHub's published host keys are public data; `crypton` has ed25519 primitives (not needed now but confirmed); `ssh-add -D` + `ssh-agent -k` work.
 
 **Not started:**
@@ -48,14 +48,14 @@ Replace PR #80's on-disk `GIT_ASKPASS`/keyfile credential seam with **SSH agent 
 
 ### Working tree
 - Branch `feat/git-opcodes-agent-forwarding`, **pushed** to origin.
-- Uncommitted: `.beads/plans/git-opcodes-plan.md` (the plan; `.beads/` is gitignored — working state, NOT committed). **The plan is on disk at `.beads/plans/git-opcodes-plan.md` — read it first.**
+- Uncommitted: `docs/plans/git-opcodes-plan.md` (the plan; `docs/` is gitignored — working state, NOT committed). **The plan is on disk at `docs/plans/git-opcodes-plan.md` — read it first.**
 - Recent commits: `5037409` (rev 3 encrypted keyfile), `c5f410a` (rev 2 feasibility fixes), `81ccf58` (rev 1), `802ca71` (initial design).
 
 ## 5. Required Reading (read these before acting, in order)
 
 | # | Path | Why | What to look for |
 |---|---|---|---|
-| 1 | `.beads/plans/git-opcodes-plan.md` | **The implementation plan — START HERE.** | W1–W6 DoD, file scopes, RED-GREEN-REFACTOR per WU, the credential mechanism (§2), the security table. Ready for the plan gate + execution. |
+| 1 | `docs/plans/git-opcodes-plan.md` | **The implementation plan — START HERE.** | W1–W6 DoD, file scopes, RED-GREEN-REFACTOR per WU, the credential mechanism (§2), the security table. Ready for the plan gate + execution. |
 | 2 | `docs/superpowers/specs/2026-08-02-git-opcodes-agent-forwarding-design.md` | The approved design (source of truth) | §4.1.1 (encrypted-keyfile keygen/use), §4.2 (opcodes Untrusted — GIT_PUSH audit via runLocal), §4.4 (env `env VAR=val` prefix), §4.6 (per-op agent), §4.7 (Generate flow + repo-remove cleanup), §5 (security), §7 (W1–W6), §8 (18 resolved decisions), §9 (12 AC) |
 | 3 | `docs/superpowers/specs/2026-08-02-source-control-repo-registry-design.md` + PR #80 | The base feature (the registry + the on-disk seam being replaced) | The `SourceRepo`/`RepoCredential`/`RepoRegistry`/`Clone` types this builds on |
 | 4 | `src/Seal/ISA/Opcode.hs` | The opcode trust model | `TrustedOpcode.toRun` has NO `UntrustedIO`; `UntrustedOpcode.uoRun` does — that's why the git opcodes MUST be Untrusted |
@@ -110,7 +110,7 @@ cd frontend && npm run build && npm test && npx tsc --noEmit   # frontend gate
 
 ## 10. Next Action
 
-**Run the plan review gate** (3 adversarial reviewers: Feasibility, Completeness, Scope & Alignment) on `.beads/plans/git-opcodes-plan.md`. On PASS, persist the approved plan to `.beads/plans/active-plan.md` (with the `<!-- user-approved: true -->` + `<!-- status: in-progress -->` headers per the orchestrated-execution skill) and **begin W1** (`lookupRepoByUrl` + shared `normalizeRepoUrl` + `CredAccountKey` codec fail-closed — the lowest-risk foundational unit).
+**Run the plan review gate** (3 adversarial reviewers: Feasibility, Completeness, Scope & Alignment) on `docs/plans/git-opcodes-plan.md`. On PASS, persist the approved plan to `docs/plans/active-plan.md` (with the `<!-- user-approved: true -->` + `<!-- status: in-progress -->` headers per the orchestrated-execution skill) and **begin W1** (`lookupRepoByUrl` + shared `normalizeRepoUrl` + `CredAccountKey` codec fail-closed — the lowest-risk foundational unit).
 
 Per the user directive: proceed through W1→W6 without stopping at user gates; the two checkpoints are self-reviewed adversarially (fresh security-auditor after W2; fresh code-review before PR). Continue until `make check` + frontend gate green and a registered `git@github.com:seal-harness/seal-harness.git` clones via `SETUP_REPO`. The 4-phase orchestrated-execution loop (IMPLEMENT → VALIDATE → fresh ADVERSARIAL REVIEW → COMMIT) per WU, with independent validation (never trust the coder's self-report).
 
@@ -118,7 +118,7 @@ If the plan gate finds blockers, fix them (in the plan or, if they trace to the 
 
 ## 11. Remaining Work (after the next action)
 
-1. Run the plan review gate (3 reviewers) on `.beads/plans/git-opcodes-plan.md`; persist the approved plan.
+1. Run the plan review gate (3 reviewers) on `docs/plans/git-opcodes-plan.md`; persist the approved plan.
 2. W1: URL normalization + `lookupRepoByUrl` + `CredAccountKey` codec fail-closed.
 3. W2 (self-reviewed security checkpoint): no-disk clone seam + `SshAgentHandle` + opt-in `-A` + env-override seam + pinned known_hosts + `UntrustedIORemoteSpec` recording-fake ripple.
 4. W3: `SETUP_REPO` revision + `Env` fields (`VaultHandle`/`RepoRegistryHandle`) + 5 `setupRepoOp` call sites + caller updates.

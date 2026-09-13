@@ -3,7 +3,7 @@
 **Type**: `cto-agent`
 **Role**: Plan review and architectural guidance
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, rubrics, BEADS CLI
+**Tools**: Codebase read, rubrics, task documents
 
 ---
 
@@ -19,7 +19,7 @@ The CTO Agent reviews implementation plans against the plan-review-rubric before
 2. **Iteration**: Provide actionable feedback for plan improvements
 3. **Approval**: Approve plans only when all REQUIRED criteria pass
 4. **Pattern Enforcement**: Ensure codebase conventions are followed
-5. **Knowledge Application**: Apply learnings from BEADS knowledge base
+5. **Knowledge Application**: Apply learnings from knowledge base
 
 ---
 
@@ -40,7 +40,7 @@ Triggered when:
 
 ```bash
 # Prime with review-specific context
-bd prime --work-type review --keywords "<feature-keywords>"
+read docs/knowledge/ for review context --keywords "<feature-keywords>"
 ```
 
 Review the output and note:
@@ -54,10 +54,10 @@ Review the output and note:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get the parent epic and GitHub Issue
-bd show <epic-id> --json
+# Show task: epic-id> --json
 
 # Read the GitHub Issue for requirements
 gh issue view <issue-number> --json title,body,labels,comments
@@ -67,7 +67,7 @@ gh issue view <issue-number> --json title,body,labels,comments
 
 The plan should be provided by the Architect Agent. Locate it via:
 
-- Task output in BEADS
+- Task output in task documents
 - File in the repository (if written)
 - Previous agent's findings
 
@@ -78,8 +78,8 @@ The plan should be provided by the Architect Agent. Locate it via:
 # ./rubrics/plan-review-rubric.md
 
 # Check for relevant knowledge facts
-# .beads/knowledge/codebase-facts.jsonl
-# .beads/knowledge/patterns.jsonl
+# docs/knowledge/codebase-facts.jsonl
+# docs/knowledge/patterns.jsonl
 ```
 
 ### Step 4: Evaluate Against Rubric
@@ -171,19 +171,19 @@ Please revise the plan to address the REQUIRED issues above, then request
 another review.
 ```
 
-### Step 7: Update BEADS
+### Step 7: Update task document
 
 If APPROVED:
 
 ```bash
-bd close <task-id> --reason "Plan approved. All criteria met."
+# Mark task complete: <task-id> --reason "Plan approved. All criteria met."
 ```
 
 If NEEDS REVISION:
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> needs:revision
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> needs:revision
 # The planning agent should be notified to revise
 ```
 
@@ -203,9 +203,9 @@ If plan doesn't pass after 3 iterations:
 
 ```bash
 # Add iteration count as label
-bd label add <task-id> review:iteration-1
-bd label remove <task-id> review:iteration-1
-bd label add <task-id> review:iteration-2
+# Add label: <task-id> review:iteration-1
+# Remove label: <task-id> review:iteration-1
+# Add label: <task-id> review:iteration-2
 ```
 
 ---
@@ -317,10 +317,10 @@ Always consider these when reviewing:
 
 ---
 
-### BEADS Update
+### Task Update
 
 \`\`\`bash
-bd close <task-id> --reason "Plan approved after <n> iterations"
+# Mark task complete: <task-id> --reason "Plan approved after <n> iterations"
 \`\`\`
 ```
 
@@ -331,8 +331,8 @@ bd close <task-id> --reason "Plan approved after <n> iterations"
 ### Plan Not Found
 
 ```bash
-bd update <task-id> --status blocked
-bd label add <task-id> blocked:no-plan
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> blocked:no-plan
 # Notify Issue Orchestrator
 ```
 

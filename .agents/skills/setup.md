@@ -1,17 +1,17 @@
 ---
-description: Interactive project setup — detects your project, configures metaswarm, writes project-local files
+description: Interactive project setup — detects your project, configures Seal Harness, writes project-local files
 ---
 
 # Setup
 
-Interactive setup for metaswarm in OpenCode. Detects your project stack, asks targeted questions, and writes project-local files including instructions, coverage configuration, and command definitions.
+Interactive setup for Seal Harness in OpenCode. Detects your project stack, asks targeted questions, and writes project-local files including instructions, coverage configuration, and command definitions.
 
 ## When to Use
 
 Run `/setup` when:
 
-- Setting up metaswarm for the first time in your OpenCode project
-- Re-configuring metaswarm (coverage thresholds, optional features)
+- Setting up Seal Harness for the first time in your OpenCode project
+- Re-configuring Seal Harness (coverage thresholds, optional features)
 - Switching to a different test runner or coverage tool
 
 ## How It Works
@@ -26,9 +26,9 @@ The setup process has three phases:
 
 After setup completes, your project will have:
 
-- **`.opencode/OPENCODE.md`** — project instructions explaining how to use metaswarm with your stack
+- **`.opencode/OPENCODE.md`** — project instructions explaining how to use Seal Harness with your stack
 - **`.coverage-thresholds.json`** — test coverage requirements (100% recommended, configurable)
-- **`.metaswarm/project-profile.json`** — your detected stack and configuration choices
+- **`docs/project-profile.json`** — your detected stack and configuration choices
 
 ## Running Setup
 
@@ -53,7 +53,7 @@ If you've already run setup and want to reconfigure:
 /setup
 ```
 
-It will detect your existing `.metaswarm/project-profile.json` and ask if you want to re-run (overwriting previous choices) or skip.
+It will detect your existing `docs/project-profile.json` and ask if you want to re-run (overwriting previous choices) or skip.
 
 ## Coverage Threshold
 
@@ -80,7 +80,7 @@ If you want to delegate implementation and review tasks to external AI models (C
 
 - Choose "Yes" during setup
 - Configure credentials via `opencode auth`
-- Setup will create `.metaswarm/external-tools.yaml` with routing rules
+- Setup will create `docs/external-tools.yaml` with routing rules
 
 ### Visual Review
 
@@ -112,14 +112,14 @@ If you don't have pre-push hooks:
 If you see an error about the setup script:
 
 - Verify you're running this from your OpenCode project root (where `.opencode/OPENCODE.md` exists)
-- Ensure the metaswarm plugin is installed via `opencode plugin list`
+- Ensure the Seal Harness plugin is installed via `opencode plugin list`
 
 ### Detection missed my framework
 
 If setup didn't detect your framework correctly:
 
 - Check that you have the appropriate marker files (e.g., `package.json` for Node.js, `pyproject.toml` for Python)
-- You can manually edit `.metaswarm/project-profile.json` after setup
+- You can manually edit `docs/project-profile.json` after setup
 - Re-run `/setup` to reconfigure
 
 ### Can't determine test runner
@@ -138,4 +138,4 @@ After setup completes:
 3. Run **`/start-task <description>`** to begin tracked development work
 4. Run **`/review-design`** for architecture reviews of design documents
 
-Your project is now configured for metaswarm-based development!
+Your project is now configured for Seal Harness-based development!

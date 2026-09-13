@@ -99,6 +99,11 @@ runSignal deps registry chain tabsH (account, chunkLimit, allow) askReply = do
 -- using the supplied 'ChannelHandle' for any sends).
 -- Terminates when 'chReceive' returns EOF (@(Nothing, "")@ with the reader
 -- exited). The 'withSignalChannel' bracket owns cleanup.
+--
+-- NOTE: This is the legacy standalone loop. It does NOT use a per-conversation
+-- cursor store (it tracks the active session via 'srActive'), so @\/tab focus@
+-- here only validates the index — the cursor is not updated. The production
+-- path goes through 'runSignal' → 'runChannelLoop' which has the fix.
 runSignalLoop
   :: Registry
   -> PreprocessChain

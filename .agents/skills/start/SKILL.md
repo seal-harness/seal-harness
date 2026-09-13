@@ -1,17 +1,17 @@
 ---
 name: start
-description: Use when starting work on any task, when the user mentions metaswarm, or when the user wants to begin tracked development work
+description: Use when starting work on any task, when the user mentions Seal Harness, or when the user wants to begin tracked development work
 auto_activate: true
 triggers:
   - "work on issue"
   - "start issue"
   - "start task"
-  - "use metaswarm"
-  - "@metaswarm"
+  - "use Seal Harness"
+  - "@Seal Harness"
   - "agent-ready label"
 ---
 
-# BEADS Multi-Agent Orchestration Skill
+# Multi-Agent Orchestration Skill
 
 This skill coordinates a swarm of specialized AI agents to autonomously handle GitHub Issues from creation to merged PR.
 
@@ -23,18 +23,18 @@ This skill coordinates a swarm of specialized AI agents to autonomously handle G
 
 ```bash
 # User triggers via any of:
-@beads start #123
-bd start 123
-/beads-start 123
+@seal start #123
+start task 123
+/start-task 123
 ```
 
-### Check BEADS Status
+### Check Task Status
 
 ```bash
-bd ready          # Show tasks ready to work
-bd list           # Show all tasks
-bd stats          # Show project statistics
-bd doctor         # Check system health
+gh issue list --assignee @me --state open  # Show issues ready to work
+gh issue list --state open                 # Show all open issues
+git log --oneline -10                      # Show recent commits
+make check                                 # Check system health
 ```
 
 ---
@@ -85,7 +85,7 @@ Design Document Created
        ALL APPROVED
         │
         ▼
-   Create BEADS Epic → Begin Implementation
+   Create task document → Begin Implementation
 ```
 
 ### Triggering the Design Review Gate
@@ -118,7 +118,7 @@ See the `design-review-gate` skill for full details.
 
 ## Team Mode Coordination
 
-When multiple Claude Code sessions are active on the same repository (e.g., parallel worktrees), metaswarm automatically enters **Team Mode**. In Team Mode, agents behave as persistent teammates with context retention across sessions and direct inter-agent messaging for coordination. Mode detection is automatic based on the presence of concurrent sessions.
+When multiple Claude Code sessions are active on the same repository (e.g., parallel worktrees), Seal Harness automatically enters **Team Mode**. In Team Mode, agents behave as persistent teammates with context retention across sessions and direct inter-agent messaging for coordination. Mode detection is automatic based on the presence of concurrent sessions.
 
 For the full Team Mode protocol — including message routing, context sharing, and conflict resolution — see `./guides/agent-coordination.md`.
 
@@ -202,7 +202,7 @@ See `orchestrated-execution` skill for the complete pattern, including work unit
 
 ## External AI Tools (Optional)
 
-When external AI CLI tools are configured (`.metaswarm/external-tools.yaml`), the orchestrator can delegate implementation and review tasks to OpenAI Codex CLI and Google Gemini CLI. This enables cost savings through cheaper models and cross-model adversarial review that eliminates single-model blind spots.
+When external AI CLI tools are configured (`docs/external-tools.yaml`), the orchestrator can delegate implementation and review tasks to OpenAI Codex CLI and Google Gemini CLI. This enables cost savings through cheaper models and cross-model adversarial review that eliminates single-model blind spots.
 
 ### How It Integrates
 
@@ -263,7 +263,7 @@ GitHub Issue #123 (agent-ready label)
         ▼
 ┌─────────────────────────────────────┐
 │       Issue Orchestrator             │
-│  Creates BEADS epic, delegates work  │
+│  Creates epic, delegates work  │
 └─────────────────────────────────────┘
         │
         ▼
@@ -406,71 +406,57 @@ For manually-created PRs, invoke `/pr-shepherd <pr-number>` to start the monitor
 
 ---
 
-## BEADS Commands Reference
+## Task Document Reference
 
 ### Issue Management
 
+Task documents are markdown files in `docs/tasks/`. Each document has
+YAML front matter with status, labels, and dependencies.
+
 ```bash
-# Create epic for GitHub Issue
-bd create "Feature: User Auth" --type epic --issue 123
+# Create a task document for a GitHub Issue
+# Write to: docs/tasks/<issue-number>-<slug>.md
+# Include: title, issue link, status, DoD, file scope
 
-# Create task under epic
-bd create "Research auth patterns" --type task --parent bd-abc123
+# Update task status by editing the markdown file
+# Change the "status:" field to: open, in_progress, blocked, or completed
 
-# Add dependency
-bd dep add <blocked-task> <blocking-task>
-
-# Update status
-bd update <task-id> --status open|in_progress|blocked|closed
-
-# Close with reason
-bd close <task-id> --reason "Completed successfully"
+# Mark task complete by updating status and adding a completion note
+# Add "Completed: <reason>" at the bottom of the task document
 ```
 
 ### Task Discovery
 
 ```bash
-# Show ready (unblocked) tasks
-bd ready --json
+# List task documents
+ls docs/tasks/*.md
 
-# List all tasks under epic
-bd list --parent <epic-id>
+# Find tasks by status
+grep -l "status: in_progress" docs/tasks/*.md
+grep -l "status: blocked" docs/tasks/*.md
+grep -l "status: open" docs/tasks/*.md
 
-# Show blocked tasks
-bd blocked
-
-# Show task details
-bd show <task-id> --json
+# Show a task document
+cat docs/tasks/<task-file>.md
 ```
 
 ### Labels for Custom States
 
-```bash
-# Waiting for human input
-bd label add <task-id> waiting:human
+Labels are tracked in the task document's YAML front matter:
 
-# Waiting for CI
-bd label add <task-id> waiting:ci
-
-# Agent failed, needs intervention
-bd label add <task-id> agent:failed
-
-# Review iteration tracking
-bd label add <task-id> review:iteration-1
+```yaml
+# In docs/tasks/<task>.md front matter:
+labels:
+  - waiting:human        # Waiting for human input
+  - waiting:ci           # Waiting for CI
+  - agent:failed         # Agent failed, needs intervention
+  - review:iteration-1   # Review iteration tracking
 ```
 
 ### Sync Operations
 
-```bash
-# Check sync status
-bd sync --status
-
-# Pull updates from main
-bd sync --from-main
-
-# Export to JSONL
-bd export
-```
+Task documents are plain markdown files in `docs/tasks/` and are synced
+via git like any other file — no special sync command needed.
 
 ---
 
@@ -483,20 +469,20 @@ bd export
 gh issue view 123 --json labels | jq '.labels[].name' | grep agent-ready
 ```
 
-### Step 2: Create BEADS Epic
+### Step 2: Create Task Document
 
 ```bash
 # Get Issue details
 ISSUE=$(gh issue view 123 --json title,body,number)
 
-# Create epic linked to Issue
-bd create "$(echo $ISSUE | jq -r .title)" --type epic --issue 123 --json
+# # Create task document linked to Issue
+# Create a task document in docs/tasks/ for: "$(echo $ISSUE | jq -r .title)" --type epic --issue 123 --json
 ```
 
 ### Step 3: Post Acknowledgment
 
 ```bash
-gh issue comment 123 --body "🤖 Agent claiming this issue. BEADS epic created."
+gh issue comment 123 --body "🤖 Agent claiming this issue. epic created."
 ```
 
 ### Step 4: Spawn Issue Orchestrator
@@ -537,8 +523,8 @@ Follow the workflow phases exactly as specified.`,
 
 ```bash
 # Mark task as waiting
-bd update <task-id> --status blocked
-bd label add <task-id> waiting:human
+# Update task status: <task-id> --status blocked
+# Add label: <task-id> waiting:human
 
 # Post to GitHub Issue
 gh issue comment <number> --body "$(cat <<'EOF'
@@ -555,7 +541,7 @@ gh issue comment <number> --body "$(cat <<'EOF'
 <recommendation>
 
 ---
-Reply: `@beads approve <task-id>` or `@beads respond <task-id> <option>`
+Reply: `@seal approve <task-id>` or `@seal respond <task-id> <option>`
 EOF
 )"
 ```
@@ -564,16 +550,16 @@ EOF
 
 ```bash
 # Approve a blocked task
-@beads approve bd-abc123
+@seal approve task-abc123
 
 # Respond with choice
-@beads respond bd-abc123 "Use option A"
+@seal respond task-abc123 "Use option A"
 
 # Request changes
-@beads request-changes bd-abc123 "Need more error handling"
+@seal request-changes task-abc123 "Need more error handling"
 
 # Defer to later
-@beads defer bd-abc123 "Discuss in Monday standup"
+@seal defer task-abc123 "Discuss in Monday standup"
 ```
 
 ---
@@ -626,22 +612,22 @@ const [reviewResult, securityResult] = await Promise.all([
 
 ```bash
 # General prime (loads critical rules + gotchas)
-bd prime
+read docs/knowledge/ files
 
 # Prime for specific files you'll modify
-bd prime --files "src/lib/services/*.ts" "src/api/routes/*.ts"
+read docs/knowledge/ files --files "src/lib/services/*.ts" "src/api/routes/*.ts"
 
 # Prime for specific topic
-bd prime --keywords "authentication" "jwt"
+read docs/knowledge/ files --keywords "authentication" "jwt"
 
 # Prime for work type
-bd prime --work-type planning     # Before planning
-bd prime --work-type implementation  # Before coding
-bd prime --work-type review       # Before reviewing
-bd prime --work-type research     # Before exploring
+read docs/knowledge/ and docs/plans/ for planning context     # Before planning
+read docs/knowledge/ for implementation context  # Before coding
+read docs/knowledge/ for review context       # Before reviewing
+read docs/knowledge/ for research context     # Before exploring
 
 # Combined (most thorough)
-bd prime --files "<files>" --keywords "<topic>" --work-type <type>
+read docs/knowledge/ files --files "<files>" --keywords "<topic>" --work-type <type>
 ```
 
 The prime command outputs relevant facts categorized as:
@@ -656,14 +642,14 @@ The prime command outputs relevant facts categorized as:
 Run self-reflection to extract learnings:
 
 ```bash
-# Fetch recent PR comments (metaswarm-specific GitHub integration)
-GITHUB_TOKEN=$(gh auth token) npx tsx scripts/beads-fetch-pr-comments.ts --days 7
+# Fetch recent PR comments (Seal Harness-specific GitHub integration)
+GITHUB_TOKEN=$(gh auth token) npx tsx scripts/seal-fetch-pr-comments.ts --days 7
 
 # Use self-reflect skill to evaluate and add learnings
 /self-reflect
 
-# Compact closed issues (semantic summarization via beads plugin)
-bd compact
+# Compact closed issues (semantic summarization via Seal Harness plugin)
+summarize completed work
 ```
 
 Or spawn Knowledge Curator agent:
@@ -674,7 +660,7 @@ Task({
   description: "Extract learnings from epic",
   prompt: `Review completed epic <epic-id> and extract learnings.
 
-FIRST: Run \`bd prime --work-type review\` to load context.
+FIRST: Run \`read docs/knowledge/ for review context\` to load context.
 
 Then analyze:
 - What patterns were used?
@@ -706,8 +692,8 @@ Epic (Issue Orchestrator)
 
 ```bash
 # Create sub-epics under parent epic
-bd create "Sub-Epic: API layer" --type epic --parent <parent-epic-id>
-bd create "Sub-Epic: UI components" --type epic --parent <parent-epic-id>
+# Create a task document in docs/tasks/ for: "Sub-Epic: API layer" --type epic --parent <parent-epic-id>
+# Create a task document in docs/tasks/ for: "Sub-Epic: UI components" --type epic --parent <parent-epic-id>
 
 # Each sub-epic gets its own orchestrator
 # The parent orchestrator coordinates completion
@@ -732,7 +718,7 @@ Before closing an epic, verify ALL:
 - [ ] Project Context Document maintained and passed to each coder subagent
 - [ ] Final comprehensive review completed (cross-unit integration)
 - [ ] All human checkpoints acknowledged
-- [ ] All BEADS tasks under epic are closed
+- [ ] All tasks under epic are closed
 - [ ] PR is created and linked to GitHub Issue
 - [ ] All CI checks are passing
 - [ ] All PR comments are addressed
@@ -750,35 +736,35 @@ Before closing an epic, verify ALL:
 
 ```bash
 # Check task status
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Check for orphaned agent
 # If agent failed, reset and retry
-bd update <task-id> --status open
-bd label remove <task-id> agent:failed
+# Update task status: <task-id> --status open
+# Remove label: <task-id> agent:failed
 ```
 
 ### Circular Dependencies
 
 ```bash
 # Run doctor to detect
-bd doctor
+run health check
 
 # If found, restructure dependencies
-bd dep remove <task1> <task2>
+remove dependency: # <task1> <task2>
 ```
 
-### BEADS Sync Issues
+### Task Sync Issues
 
 ```bash
 # Check sync status
-bd sync --status
+# Sync: --status
 
 # Force export
-bd export
+export tasks
 
 # Pull from main
-bd sync --from-main
+# Sync: --from-main
 ```
 
 ---
@@ -843,27 +829,25 @@ skills/external-tools/          # External AI tool delegation
 skills/visual-review/           # Playwright-based visual review
 └── SKILL.md
 
-commands/                       # Slash commands (invoked as /metaswarm:command-name)
-├── start-task.md               # /metaswarm:start-task
-├── prime.md                    # /metaswarm:prime
-├── review-design.md            # /metaswarm:review-design
-├── self-reflect.md             # /metaswarm:self-reflect
-├── pr-shepherd.md              # /metaswarm:pr-shepherd
-├── handle-pr-comments.md       # /metaswarm:handle-pr-comments
-├── create-issue.md             # /metaswarm:create-issue
-└── metaswarm-setup.md          # /metaswarm:metaswarm-setup
+commands/                       # Slash commands (invoked as /command-name)
+├── start-task.md               # /start-task
+├── prime.md                    # /prime
+├── review-design.md            # /review-design
+├── self-reflect.md             # /self-reflect
+├── pr-shepherd.md              # /pr-shepherd
+├── handle-pr-comments.md       # /handle-pr-comments
+└── create-issue.md             # /create-issue
 
 templates/                      # Project scaffolding templates
 ├── CLAUDE.md                   # Full CLAUDE.md template for new projects
-├── CLAUDE-append.md            # Metaswarm section to append to existing CLAUDE.md
+├── CLAUDE-append.md            # Seal Harness section to append to existing CLAUDE.md
 ├── UI-FLOWS.md                 # User flow and wireframe documentation template
 ├── gitignore                   # Standard Node.js/TypeScript ignores
 ├── SERVICE-INVENTORY.md        # Service/factory/module tracking template
 └── ci.yml                      # CI pipeline template
 
-.beads/                         # Runtime state (in user's project)
-├── beads.db                    # SQLite database
-├── issues.jsonl                # Issue/task data
+docs/                         # Project documentation (in user's project)
+├── tasks/                     # Task documents (markdown)
 └── knowledge/                  # Curated learnings
     ├── codebase-facts.jsonl
     ├── patterns.jsonl

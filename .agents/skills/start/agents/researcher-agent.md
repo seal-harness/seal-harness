@@ -3,7 +3,7 @@
 **Type**: `researcher-agent`
 **Role**: Codebase exploration and prior art research
 **Spawned By**: Issue Orchestrator
-**Tools**: Codebase read, web search, Context7, BEADS CLI
+**Tools**: Codebase read, web search, Context7, task documents
 
 ---
 
@@ -41,7 +41,7 @@ Triggered when:
 
 ```bash
 # Prime with research-specific context
-bd prime --work-type research --keywords "<task-keywords>"
+read docs/knowledge/ for research context --keywords "<task-keywords>"
 ```
 
 Review the output and note:
@@ -55,7 +55,7 @@ Review the output and note:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Read the GitHub Issue
 gh issue view <issue-number> --json title,body,comments
@@ -271,10 +271,10 @@ From GitHub Issue #<number>:
 
 ---
 
-### BEADS Update
+### Task Update
 
 \`\`\`bash
-bd close <task-id> --reason "Research complete. Findings documented."
+# Mark task complete: <task-id> --reason "Research complete. Findings documented."
 \`\`\`
 ```
 
@@ -352,7 +352,7 @@ When research is complete:
 5. Close the research task
 
 ```bash
-bd close <task-id> --reason "Research complete. See findings document."
+# Mark task complete: <task-id> --reason "Research complete. See findings document."
 ```
 
 The Architect Agent will use these findings to create the implementation plan.
@@ -406,4 +406,4 @@ The Researcher Agent produces a research findings document:
 - [ ] Knowledge base consulted
 - [ ] Constraints clearly listed
 - [ ] Questions for clarification noted
-- [ ] BEADS task closed with findings
+- [ ] task closed with findings

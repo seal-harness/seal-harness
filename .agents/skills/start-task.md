@@ -16,14 +16,14 @@ Before starting any new task:
 
 **Context Recovery Check**:
 
-- [ ] Check if `.beads/plans/active-plan.md` exists with `status: in-progress`
+- [ ] Check if `docs/plans/active-plan.md` exists with `status: in-progress`
 - [ ] If YES: An interrupted execution exists. Ask user: "There's an active plan from a previous session. Resume it or start fresh?"
-  - Resume → run `bd prime --work-type recovery` and pick up where execution stopped
+  - Resume → run `read docs/plans/active-plan.md and docs/context/execution-state.md to reload state` and pick up where execution stopped
   - Start fresh → mark the old plan as `status: abandoned` and proceed normally
 
 **Knowledge Priming (CRITICAL)**:
 
-- [ ] Run BEADS prime: `bd prime --keywords "<task-keywords>" --work-type planning`
+- [ ] Run context prime: `read docs/knowledge/ files --keywords "<task-keywords>" --work-type planning`
 - [ ] Review MUST FOLLOW rules and GOTCHAS before proceeding
 - [ ] Note any relevant patterns or decisions that constrain the approach
 
@@ -43,10 +43,10 @@ Check if external AI tools (Codex, Gemini) are available for cost savings and cr
   command -v codex >/dev/null 2>&1 && echo "codex: available" || echo "codex: not found"
   command -v gemini >/dev/null 2>&1 && echo "gemini: available" || echo "gemini: not found"
   ```
-- **If tools are detected but `.metaswarm/external-tools.yaml` does not exist**: Suggest the user enable them:
-  > "External tools (Codex/Gemini) are installed but not configured. Run `mkdir -p .metaswarm && cp templates/external-tools.yaml .metaswarm/` to enable cost-saving delegation."
+- **If tools are detected but `docs/external-tools.yaml` does not exist**: Suggest the user enable them:
+  > "External tools (Codex/Gemini) are installed but not configured. Run `mkdir -p docs/ && cp templates/external-tools.yaml docs/` to enable cost-saving delegation."
 - **If no tools are detected**: Briefly mention they can be installed:
-  > "Optional: Install Codex and Gemini CLIs for cost savings and cross-model review — see `templates/external-tools-setup.md`."
+  > "Optional: Install Codex and Gemini CLIs for cost savings and cross-model review."
 - **If tools are configured and working**: No message needed — proceed silently.
 
 This check is informational only. Always proceed to the task regardless of the result.
@@ -76,7 +76,7 @@ Then ask the user to confirm your assessment:
 - Adding basic validation
 - Fixing linting/test issues
 
-**Complex Task (full checklist + BEADS epic):**
+**Complex Task (full checklist + epic):**
 
 - New features with database changes
 - New API endpoints
@@ -147,9 +147,9 @@ If user confirms it's a simple task:
 
 If it's a complex task:
 
-- Create a BEADS epic: `bd create --title "<task>" --type epic --priority 2`
+- Create a epic: create task document: --title "<task>" --type epic --priority 2`
 - Use the full task completion checklist
-- Consider breaking into smaller tasks as BEADS sub-issues
+- Consider breaking into smaller tasks as sub-tasks
 - Use extended thinking for planning
 - Create detailed implementation plan
 
@@ -190,7 +190,7 @@ For complex tasks requiring multiple phases, consider spawning sub-agents:
 If a "simple task" becomes complex during implementation:
 
 - Stop and reassess
-- Create a BEADS epic: `bd create --title "<task>" --type epic --priority 2`
+- Create a epic: create task document: --title "<task>" --type epic --priority 2`
 - Switch to full checklist workflow
 - Inform user of complexity change
 - Consider breaking into multiple PRs

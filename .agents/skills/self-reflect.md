@@ -2,26 +2,26 @@
 description: Extract learnings from recent PR reviews, conversations, and session patterns to update the knowledge base
 ---
 
-# BEADS Self-Reflect
+# Self-Reflect
 
-You are performing a self-reflection for the BEADS agent swarm. Your job is to analyze PR review comments, conversation history, and session patterns to extract high-quality, reusable learnings.
+You are performing a self-reflection for the agent swarm. Your job is to analyze PR review comments, conversation history, and session patterns to extract high-quality, reusable learnings.
 
 **Philosophy**: Be judicious. Quality over quantity. Each learning should make future development measurably better.
 
 ## Phase A: PR Comment Analysis
 
-### Step 1: Fetch PR Comments
+### Step 1: Fetch PR Comments via GitHub CLI
 
 ```bash
-GITHUB_TOKEN=$(gh auth token) npx tsx scripts/beads-fetch-pr-comments.ts --days 7
+gh pr list --state all --limit 20 --json number,title,reviews,comments --jq '.[] | {number, title, comments: [.comments[].body], reviews: [.reviews[].body]}' > docs/temp/pr-comments.json
 ```
 
-This outputs PR comments to `.beads/temp/pr-comments.json`.
+This outputs PR comments to `docs/temp/pr-comments.json`.
 
 ### Step 2: Extract CodeRabbit's Structured Learnings
 
 ```bash
-cat .beads/temp/pr-comments.json | jq -r '.comments[].body' | grep -A5 "^Learnt from:" | grep "^Learning:" | sed 's/^Learning: //' | sort -u
+cat docs/temp/pr-comments.json | jq -r '.comments[].body' | grep -A5 "^Learnt from:" | grep "^Learning:" | sed 's/^Learning: //' | sort -u
 ```
 
 ### Evaluate Each CodeRabbit Learning
@@ -91,7 +91,7 @@ Present findings interactively: explain issue -> propose change -> get feedback 
 Beyond CodeRabbit's structured learnings, look for **recurring patterns** in review comments:
 
 ```bash
-cat .beads/temp/pr-comments.json | jq -r '.comments[] | select(.reviewerType == "coderabbit") | .body' | grep -i "nitpick\|issue\|suggestion\|consider\|should\|must\|avoid" | head -50
+cat docs/temp/pr-comments.json | jq -r '.comments[] | select(.reviewerType == "coderabbit") | .body' | grep -i "nitpick\|issue\|suggestion\|consider\|should\|must\|avoid" | head -50
 ```
 
 ### Pattern Detection Checklist
@@ -148,7 +148,7 @@ When a new learning conflicts with an existing one:
 
 ## Step 5: Categorize and Store
 
-For each validated learning, add it to the appropriate knowledge base JSONL file following the schema in `.beads/knowledge/README.md`.
+For each validated learning, add it to the appropriate knowledge base JSONL file following the schema in `docs/knowledge/README.md`.
 
 ### Type Guide
 
@@ -183,15 +183,12 @@ For each validated learning, add it to the appropriate knowledge base JSONL file
 
 Before adding, check for semantic duplicates in existing knowledge files.
 
-## Step 7: Semantic Summarization via bd compact
+## Step 7: Summarize Completed Work
 
-The standalone beads plugin (v0.63.3+) provides `bd compact` for semantic summarization of closed issues. After capturing learnings, run:
+After capturing learnings, review closed issues and write a brief summary to `docs/learnings/` for future reference. This handles knowledge base statistics, summarization, and cleanup.
 
-```bash
-bd compact
-```
-
-This replaces the former `beads-self-reflect.ts` script — `bd compact` handles knowledge base statistics, summarization, and cleanup natively.
+No CLI command is needed — simply create a markdown file in `docs/learnings/`
+with the date and a summary of what was learned.
 
 ## Step 8: Generate Report
 

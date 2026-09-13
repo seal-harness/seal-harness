@@ -130,7 +130,7 @@ Each work unit contains:
 
 | Field | Description | Example |
 | --- | --- | --- |
-| **ID** | Unique identifier (BEADS task ID) | `bd-wu-001` |
+| **ID** | Unique identifier (task ID) | `bd-wu-001` |
 | **Title** | Human-readable name | "Implement auth middleware" |
 | **Spec** | Written specification with acceptance criteria | Link to design doc section |
 | **DoD Items** | Enumerated, verifiable done criteria | `[ ] Middleware rejects expired tokens` |
@@ -161,13 +161,13 @@ wu-004 (UI components)  ──────────────────�
 ### Decomposition Template
 
 ```bash
-# Create work units as BEADS tasks under the epic
-bd create "WU-001: <title>" --type task --parent <epic-id> \
+# Create work units as tasks under the epic
+# Create a task document in docs/tasks/ for: "WU-001: <title>" --type task --parent <epic-id> \
   --description "Spec: <spec-section>\nDoD:\n- [ ] <item-1>\n- [ ] <item-2>\nFile scope: <files>\nCheckpoint: <yes/no>"
 
 # Set up dependencies
-bd dep add <wu-003> <wu-001>
-bd dep add <wu-003> <wu-002>
+# Add dependency: <wu-003> <wu-001>
+# Add dependency: <wu-003> <wu-002>
 ```
 
 ---
@@ -344,7 +344,7 @@ Reviewed-by: adversarial-review (PASS)"
 ```
 
 **After commit:**
-- Update BEADS task status: `bd close <wu-task-id> --reason "4-phase loop complete. PASS."`
+- Update task status: mark complete (docs/tasks/): <wu-task-id> --reason "4-phase loop complete. PASS."`
 - If this work unit has a **human checkpoint** flag, pause and report before continuing
 - Update the **Project Context Document** with completed work unit details
 
@@ -479,11 +479,11 @@ See SERVICE-INVENTORY.md
 
 ### Persisting to Disk (MANDATORY)
 
-The Project Context Document MUST be written to `.beads/context/project-context.md` and kept in sync with the in-memory version. This ensures the context survives context compaction and session boundaries.
+The Project Context Document MUST be written to `docs/context/project-context.md` and kept in sync with the in-memory version. This ensures the context survives context compaction and session boundaries.
 
 ```bash
 # Create directory if needed
-mkdir -p .beads/context
+mkdir -p docs/context
 
 # Write/update after each Phase 4 (COMMIT) and at orchestration start
 # The file should always reflect the current state of execution
@@ -501,25 +501,25 @@ mkdir -p .beads/context
 
 ## 6.5. Plan Persistence (Context Recovery)
 
-Approved plans and execution state are persisted to `.beads/` so agents can recover after context compaction or session interruption.
+Approved plans and execution state are persisted to `docs/` so agents can recover after context compaction or session interruption.
 
 ### What Gets Persisted
 
 | File | Contents | Written When |
 |------|----------|-------------|
-| `.beads/plans/active-plan.md` | The adversarially-reviewed, user-approved implementation plan | After plan review gate PASS + user approval |
-| `.beads/context/project-context.md` | Project Context Document (tooling, completed WUs, patterns) | After each Phase 4 COMMIT |
-| `.beads/context/execution-state.md` | Current work unit, phase, retry count | After each phase transition |
+| `docs/plans/active-plan.md` | The adversarially-reviewed, user-approved implementation plan | After plan review gate PASS + user approval |
+| `docs/context/project-context.md` | Project Context Document (tooling, completed WUs, patterns) | After each Phase 4 COMMIT |
+| `docs/context/execution-state.md` | Current work unit, phase, retry count | After each phase transition |
 
 ### Writing the Approved Plan
 
 After the Plan Review Gate approves a plan AND the user approves it, persist immediately:
 
 ```bash
-mkdir -p .beads/plans
+mkdir -p docs/plans
 
 # Write the approved plan with metadata header
-cat > .beads/plans/active-plan.md << 'PLAN_EOF'
+cat > docs/plans/active-plan.md << 'PLAN_EOF'
 # Active Plan
 <!-- approved: <timestamp> -->
 <!-- gate-iterations: <N> -->
@@ -535,7 +535,7 @@ PLAN_EOF
 After each phase transition, update the execution state:
 
 ```bash
-cat > .beads/context/execution-state.md << 'STATE_EOF'
+cat > docs/context/execution-state.md << 'STATE_EOF'
 # Execution State
 <!-- updated: <timestamp> -->
 
@@ -561,22 +561,22 @@ STATE_EOF
 When the orchestrator detects it has lost context (after compaction or in a new session), it recovers by reading persisted state:
 
 ```text
-1. Check: Does `.beads/plans/active-plan.md` exist with `status: in-progress`?
+1. Check: Does `docs/plans/active-plan.md` exist with `status: in-progress`?
    - YES → Context was lost mid-execution. Recover.
    - NO → No active execution. Start fresh.
 
 2. Recovery steps:
-   a. Read `.beads/plans/active-plan.md` — reload the approved plan
-   b. Read `.beads/context/project-context.md` — reload completed work and patterns
-   c. Read `.beads/context/execution-state.md` — find where execution stopped
-   d. Run `bd prime --work-type recovery` — reload relevant knowledge base facts
+   a. Read `docs/plans/active-plan.md` — reload the approved plan
+   b. Read `docs/context/project-context.md` — reload completed work and patterns
+   c. Read `docs/context/execution-state.md` — find where execution stopped
+   d. Run `read docs/plans/active-plan.md and docs/context/execution-state.md to reload state` — reload relevant knowledge base facts
    e. Resume from the current work unit and phase
 
 3. Announce recovery to user:
-   "Recovered execution context from BEADS. Resuming from WU-<id>, Phase <phase>."
+   "Recovered execution context from task documents. Resuming from WU-<id>, Phase <phase>."
 ```
 
-**When to trigger recovery:** The orchestrator should check for `.beads/plans/active-plan.md` at the start of any orchestrated execution. If the file exists with `status: in-progress` and the orchestrator has no plan in its current context, it's a recovery scenario.
+**When to trigger recovery:** The orchestrator should check for `docs/plans/active-plan.md` at the start of any orchestrated execution. If the file exists with `status: in-progress` and the orchestrator has no plan in its current context, it's a recovery scenario.
 
 ### Cleanup
 
@@ -585,13 +585,13 @@ After the PR is created (or the plan is abandoned):
 ```bash
 # Mark plan as completed (cross-platform sed)
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  sed -i '' 's/status: in-progress/status: completed/' .beads/plans/active-plan.md
+  sed -i '' 's/status: in-progress/status: completed/' docs/plans/active-plan.md
 else
-  sed -i 's/status: in-progress/status: completed/' .beads/plans/active-plan.md
+  sed -i 's/status: in-progress/status: completed/' docs/plans/active-plan.md
 fi
 
 # Archive execution state (don't delete — useful for post-mortem)
-mv .beads/context/execution-state.md .beads/context/execution-state-<timestamp>.md
+mv docs/context/execution-state.md docs/context/execution-state-<timestamp>.md
 
 # Project context can be kept for reference
 ```
@@ -630,7 +630,7 @@ When reaching a checkpoint, present this report and **wait for explicit human ap
 - <decision-1>: <rationale>
 - <decision-2>: <rationale>
 
-Record significant decisions persistently with `bd decision "<decision>: <rationale>"` so they survive compaction and are available across sessions.
+Record significant decisions persistently with `record decision: # "<decision>: <rationale>"` so they survive compaction and are available across sessions.
 
 ### What Comes Next
 - WU-003: <description>
@@ -772,7 +772,7 @@ For fixable and ambiguous failures:
 Track retry count:
 
 ```bash
-bd label add <task-id> retry:1  # or retry:2, retry:3
+# Add label: <task-id> retry:1  # or retry:2, retry:3
 ```
 
 ### Step 4: ESCALATE
@@ -845,7 +845,7 @@ For each work unit:
 - [ ] If PASS: commit with DoD verification in message
 - [ ] If FAIL: fix → re-validate → spawn **new** reviewer (max 3 retries, then ESCALATE)
 - [ ] If human checkpoint: present report and wait
-- [ ] Update BEADS task status
+- [ ] Update task status
 - [ ] Update **SERVICE-INVENTORY.md** if services/factories/modules were created
 - [ ] Update **Project Context Document** with completed work unit
 

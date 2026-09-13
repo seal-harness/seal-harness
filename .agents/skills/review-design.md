@@ -81,11 +81,11 @@ Use this command to:
 - Re-run reviews after making revisions
 - Run partial reviews (skip specific agents)
 
-### With BEADS
+### With task documents
 
 When design is approved, offers to:
 
-- Create BEADS epic linked to design doc
+- Create epic linked to design doc
 - Create tasks for implementation phases
 - Set up worktree for isolated development
 
