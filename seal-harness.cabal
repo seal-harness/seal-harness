@@ -409,6 +409,7 @@ test-suite tests
         Seal.Channels.TelegramSpec
         Seal.Channels.StreamProgressSpec
         Seal.Channels.Telegram.ButtonsSpec
+        Seal.Channels.Telegram.TransportEditSpec
         Seal.Channels.Telegram.CommandsSpec
         Seal.Channels.Telegram.TransportSpec
         Seal.Command.HelpSpec
