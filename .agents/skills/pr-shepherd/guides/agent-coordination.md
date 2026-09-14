@@ -1,6 +1,6 @@
 # Agent Coordination Guide
 
-This guide defines two coordination modes for the BEADS multi-agent swarm. Both modes produce identical work products; only the dispatch mechanism changes.
+This guide defines two coordination modes for the task tracking multi-agent swarm. Both modes produce identical work products; only the dispatch mechanism changes.
 
 ---
 
@@ -29,7 +29,7 @@ Workflow starts
 
 In EITHER mode:
   - Adversarial reviewers = ALWAYS fresh Task()
-  - BEADS = source of truth
+  - task documents = source of truth
   - Quality gates = blocking
   - Human checkpoints = mandatory
 ```
@@ -48,7 +48,7 @@ Teams are scoped to the orchestration level that creates them:
 | Issue (Issue Orchestrator)     | `issue-{issue-number}`     | `issue-123`               |
 | Design Review                  | `review-{design-doc-name}` | `review-user-auth-design` |
 
-Teams are ephemeral -- created at workflow start, deleted after completion. BEADS remains the durable record.
+Teams are ephemeral -- created at workflow start, deleted after completion. Task documents remain the durable record.
 
 ---
 
@@ -139,35 +139,35 @@ This is where Team Mode provides the biggest efficiency gain: design reviews oft
 
 ---
 
-## 5. BEADS + Team TaskList Bridging
+## 5. Task documents + Team TaskList Bridging
 
-BEADS and Team TaskLists serve different purposes and must be kept in sync during Team Mode.
+Task documents and Team TaskLists serve different purposes and must be kept in sync during Team Mode.
 
 ### Separation of Concerns
 
-| Concern         | BEADS                                  | Team TaskList                            |
+| Concern         | task documents                                  | Team TaskList                            |
 | --------------- | -------------------------------------- | ---------------------------------------- |
 | **Purpose**     | Canonical record of WHAT (durable)     | Dispatch of WHO/WHEN (ephemeral)         |
 | **Persistence** | Survives across sessions, syncs to git | Deleted with `TeamDelete` after workflow |
 | **Visibility**  | Visible to all agents, all sessions    | Visible only to team members             |
-| **Updates**     | `bd create`, `bd close`, `bd update`   | `TaskCreate`, `TaskUpdate`               |
+| **Updates**     | `create task`, `mark task complete`, `update task`   | `TaskCreate`, `TaskUpdate`               |
 
 ### Bridge Protocol (Team Mode Only)
 
-1. **Create BEADS task** --> `bd create "WU-001: <title>" --type task`
-2. **Create matching Team task** --> `TaskCreate({ subject: "WU-001: <title>", metadata: { beads_id: "<beads-task-id>" } })`
+1. **Create task** --> create task document: "WU-001: <title>" --type task`
+2. **Create matching Team task** --> `TaskCreate({ subject: "WU-001: <title>", metadata: { task_id: "<task-id>" } })`
 3. **Teammate completes Team task** --> `TaskUpdate({ taskId: "<team-task-id>", status: "completed" })` + `SendMessage` to orchestrator
-4. **Orchestrator closes BEADS task** --> `bd close <beads-task-id> --reason "4-phase loop complete. PASS."`
+4. **Orchestrator closes task** --> mark complete (docs/tasks/): <task-id> --reason "4-phase loop complete. PASS."`
 
-### Rule: Orchestrator Owns BEADS Updates
+### Rule: Orchestrator Owns Task Updates
 
-The orchestrator is the ONLY agent that updates BEADS. Teammates report completion via `SendMessage` or `TaskUpdate` on the Team TaskList; the orchestrator then runs `bd close` on the corresponding BEADS task.
+The orchestrator is the ONLY agent that updates task documents. Teammates report completion via `SendMessage` or `TaskUpdate` on the Team TaskList; the orchestrator then runs `mark task complete` on the corresponding task.
 
-**Why**: This prevents race conditions and ensures a single source of truth. BEADS tracks the canonical state; Team TaskList is just a dispatch mechanism.
+**Why**: This prevents race conditions and ensures a single source of truth. Task documents track the canonical state; Team TaskList is just a dispatch mechanism.
 
 ### Task Mode
 
-Bridging is not needed in Task Mode. Subagents update BEADS directly as they do today -- the `Task()` return value carries the completion signal.
+Bridging is not needed in Task Mode. Subagents update task documents directly as they do today -- the `Task()` return value carries the completion signal.
 
 ---
 
@@ -213,9 +213,9 @@ See Section 6. ALWAYS a fresh `Task()` instance on every single review pass. Nev
 | Invariant                       | Description                                                                    |
 | ------------------------------- | ------------------------------------------------------------------------------ |
 | **Orchestrator-run validation** | Validation is always run directly by the orchestrator, never delegated         |
-| **BEADS lifecycle**             | Create --> in_progress --> close lifecycle is identical in both modes           |
+| **task lifecycle**             | Create --> in_progress --> close lifecycle is identical in both modes           |
 | **4-phase execution loop**      | IMPLEMENT --> VALIDATE --> ADVERSARIAL REVIEW --> COMMIT is mode-agnostic      |
-| **Knowledge priming**           | `bd prime` runs before all agent work in both modes                            |
+| **Knowledge priming**           | read docs/knowledge/ files runs before all agent work in both modes                            |
 | **Human checkpoints**           | Planned pauses require explicit human approval in both modes                   |
 | **Quality gates**               | Coverage, lint, typecheck, tests -- all blocking state transitions             |
 | **Pipeline pattern**            | Push + PR + shepherd immediately after each agent completes, don't batch       |
@@ -228,7 +228,7 @@ See Section 6. ALWAYS a fresh `Task()` instance on every single review pass. Nev
 These invariants exist because they encode hard-won lessons about multi-agent coordination failure modes:
 
 - **Orchestrator-run validation** prevents subagents from self-certifying their own work
-- **BEADS lifecycle** ensures every piece of work has a durable, auditable trail
+- **task lifecycle** ensures every piece of work has a durable, auditable trail
 - **4-phase loop** prevents the "implement and hope" anti-pattern
 - **Knowledge priming** prevents agents from making decisions in ignorance of established patterns
 - **Human checkpoints** keep humans in the loop at critical decision points
@@ -254,7 +254,7 @@ These invariants exist because they encode hard-won lessons about multi-agent co
 +---------------------------+----------------------------+----------------------------+
 | Adversarial reviewer      | Fresh Task() (natural)     | Fresh Task() (enforced)    |
 +---------------------------+----------------------------+----------------------------+
-| BEADS updates             | Subagent direct            | Orchestrator only          |
+| update tasks             | Subagent direct            | Orchestrator only          |
 +---------------------------+----------------------------+----------------------------+
 | Team TaskList bridging    | Not needed                 | Required (see Section 5)   |
 +---------------------------+----------------------------+----------------------------+

@@ -4,7 +4,7 @@
   "command": {
     "setup": {
       "template": "{file:.opencode/commands/setup.md}",
-      "description": "Interactive project setup — detects your project, configures metaswarm, writes project-local files"
+      "description": "Interactive project setup — detects your project, configures Seal Harness, writes project-local files"
     },
     "start-task": {
       "template": "{file:.opencode/commands/start-task.md}",
@@ -12,7 +12,7 @@
     },
     "prime": {
       "template": "{file:.opencode/commands/prime.md}",
-      "description": "Load relevant knowledge from the BEADS knowledge base before starting work"
+      "description": "Load relevant knowledge from the knowledge base before starting work"
     },
     "review-design": {
       "template": "{file:.opencode/commands/review-design.md}",

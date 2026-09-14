@@ -16,25 +16,38 @@
 --     'atoChildWorker = Just stubChildWorker' so the start completes
 --     without a real provider call.
 --
--- The 4 tests #9, #10, #11, #16b are REAL tests asserting the CORRECT
--- behavior (e.g. instances=1 after start). They FAIL because
--- 'Seal.ISA.Ops.Agent.registerChild' (Agent.hs:489-490) is a no-op, so the
--- runtime registry stays empty even when the stub worker completes. The
--- failures surface the no-op — see issue #136 for the production fix.
+-- (The former #9/#10/#11/#16b registerChild no-op was fixed in issue
+-- #136; those tests now pass against the synchronous model.
 module Seal.Gateway.AgentIntegrationSpec (spec) where
 
+import Control.Monad (forM_, forM)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString.Char8 qualified as BC
+import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (toList)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Stack (HasCallStack)
-import Test.Hspec (Spec, describe, shouldBe, shouldSatisfy)
+import System.Directory (listDirectory)
+import System.FilePath ((</>))
+import Test.Hspec
+  ( Spec, describe, expectationFailure, it, pendingWith, shouldBe
+  , shouldNotSatisfy, shouldSatisfy )
 
-import Seal.Core.Types (OpName (..), ToolCallId (..))
+import Seal.Agent.Def.Backend qualified as AgentDef
+import Seal.Agent.Runtime.Delegation
+  ( ChildExitReason (..), ChildWorkerOutcome (..)
+  , defaultDelegationConfig, newSpawnPauseFlag )
+import Seal.Agent.Runtime.Registry (newAgentRuntime)
+import Seal.Config.File (DelegationFileConfig (..))
+import Seal.Config.Paths (SealPaths (..))
+import Seal.Core.Types (OpName (..), ToolCallId (..), mkSystemSessionId)
+import Seal.ISA.Ops.Agent
+import Seal.ISA.Opcode (opAuthorize)
 import Seal.Providers.Class
   ( ContentBlock (..), CompletionResponse (..), StopReason (..), Usage (..) )
 import Seal.TestHelpers.ApiTestHarness
@@ -44,6 +57,9 @@ spec = describe "Seal.Gateway.AgentIntegration" $ do
   definitionsGroupSpec
   lifecycleGroupSpec
   crossGroupSpec
+  orchestrationGroupSpec
+  w3CatalogSpec
+  w2GateSpec
 
 -- ---------------------------------------------------------------------------
 -- Definitions group (#1-#7)
@@ -248,7 +264,7 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       textOf (firstResult listResults) `shouldSatisfy` ("(no agents running)" `T.isInfixOf`)
       countOf (firstResult listResults) `shouldBe` (0 :: Int)
 
-  describe "#9 Start increases instances by one — FAILS (registerChild no-op)" $
+  describe "#9 Start increases instances by one" $
     runLifecycleTest $ \env -> do
       sid <- callApiNewTab env "ollama" "llama3.2"
       setScript env
@@ -271,9 +287,8 @@ lifecycleGroupSpec = describe "lifecycle group (AGENT_INSTANCES/START/STATUS/STO
       entries <- getTranscript env sid
       let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
       length listResults `shouldBe` 1
-      -- The CORRECT behavior: count = 1 after a successful start. FAILS
-      -- because registerChild (Agent.hs:489-490) is a no-op, so the
-      -- registry stays empty even when the stub worker completes.
+      -- The CORRECT behavior: count = 1 after a successful start
+      -- (registerChild records the synchronous child).
       countOf (firstResult listResults) `shouldBe` 1
 
   describe "#10 Stop decreases instances by one — after start, AGENT_INSTANCES shows 1" $
@@ -509,14 +524,380 @@ runDefTest :: (ApiTestEnv -> IO ()) -> Spec
 runDefTest = runApiTest Nothing
 
 -- | Run a lifecycle-group test that exercises AGENT_START. The stub child
--- worker is injected so the start completes without a real provider call.
+-- worker is injected so the start completes without a real provider call;
+-- with W2's depth-conditional stub policy the threshold is set to 1 so the
+-- stub applies at the FIRST spawn (depth 1) — matching the pre-W2
+-- behavior of stubbing every spawn.
 runLifecycleTest :: (ApiTestEnv -> IO ()) -> Spec
 runLifecycleTest =
-  runApiTestOpts Nothing defaultApiTestOptions { atoChildWorker = Just stubChildWorker }
+  runApiTestOpts Nothing defaultApiTestOptions
+    { atoChildWorker = Just stubChildWorker
+    , atoStubWorkerFromDepth = 1
+    }
+
+-- | Run a W2 orchestration test. The child-provider seam makes the
+-- orchestrator child run a REAL scripted turn (popping the same script
+-- queue as the parent), while the depth-conditional stub worker takes over
+-- at depth 2 (leaf-most workers complete synchronously).
+runOrchestrationTest
+  :: Maybe DelegationFileConfig -> (ApiTestEnv -> IO ()) -> Spec
+runOrchestrationTest mDelegation =
+  runApiTestOpts Nothing defaultApiTestOptions
+    { atoChildWorker = Just stubChildWorker
+    , atoStubWorkerFromDepth = 2
+    , atoChildProvider = True
+    , atoDelegationConfig = mDelegation
+    }
 
 -- ---------------------------------------------------------------------------
--- Shared args
+-- W2 orchestration group (issue #154) — nested AGENT_START, depth, roles
 -- ---------------------------------------------------------------------------
+
+-- | One scripted turn: emit exactly one tool call then stop (tool use).
+toolUseTurn :: Text -> OpName -> A.Value -> CompletionResponse
+toolUseTurn tid op args =
+  CompletionResponse
+    [ CbToolUse (ToolCallId tid) op args ]
+    StopToolUse (Usage 0 0)
+
+doneTurn :: CompletionResponse
+doneTurn = CompletionResponse [CbText "done"] StopEnd (Usage 0 0)
+
+-- | AGENT_DEF_WRITE args with a role.
+writeArgsRole :: Text -> Text -> A.Value
+writeArgsRole defId role = A.object
+  [ "id" .= defId
+  , "name" .= (defId <> " Name")
+  , "provider" .= ("ollama" :: Text)
+  , "model" .= ("llama3.2" :: Text)
+  , "role" .= role
+  ]
+
+-- | A @DelegationFileConfig@ with every field unset (the TOML defaults),
+-- overridable per-test via record update.
+defaultDelegation :: DelegationFileConfig
+defaultDelegation = DelegationFileConfig
+  { dfcMaxConcurrentChildren = Nothing
+  , dfcChildTimeoutSeconds   = Nothing
+  , dfcMaxSpawnDepth         = Nothing
+  , dfcOrchestratorEnabled   = Nothing
+  , dfcProvider              = Nothing
+  , dfcModel                 = Nothing
+  , dfcBaseUrl               = Nothing
+  , dfcApiKey                = Nothing
+  , dfcApiMode               = Nothing
+  , dfcSubagentAutoApprove   = Nothing
+  }
+
+orchestrationGroupSpec :: Spec
+orchestrationGroupSpec = describe "W2 orchestration (nested AGENT_START, depth, roles)" $ do
+  -- W2 EXIT CRITERION: an orchestrator child spawns a grandchild through
+  -- the REAL nested wiring (child-side AgentStartWiring at depth+1), with
+  -- the depth-conditional stub taking over at depth 2.
+  describe "#W2.1 Grandchild spawn (exit criterion) — orchestrator child spawns a leaf grandchild" $
+    runOrchestrationTest (Just (defaultDelegation { dfcMaxSpawnDepth = Just 2 })) $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn: write both defs, then spawn the orchestrator.
+          -- NOTE the queue order: the child's turn runs SYNCHRONOUSLY
+          -- inside p3's dispatch, so c1 + done are popped (by the child)
+          -- BEFORE the parent resumes with the instances call.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-leaf" "leaf") ]
+            StopToolUse (Usage 0 0)
+        , toolUseTurn "p3" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-orch" :: Text), "goal" .= ("orchestrate the work" :: Text)])
+        , -- (popped by the CHILD) Orchestrator child turn: batch-spawn.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "c1") (OpName "AGENT_START")
+                (A.object ["tasks" .=
+                  [ A.object ["id" .= ("a-leaf" :: Text), "goal" .= ("do leaf work" :: Text)]
+                  , A.object ["id" .= ("a-orch" :: Text), "goal" .= ("nested orchestration" :: Text)]
+                  ]])]
+            StopToolUse (Usage 0 0)
+        , -- (popped by the CHILD) end of the child turn.
+          doneTurn
+        , -- Parent resumes: check the runtime registry after the start.
+          toolUseTurn "p4" (OpName "AGENT_INSTANCES") (A.object [])
+        , doneTurn
+        ]
+      _ <- sendMsgToSession env sid "orchestrate"
+      entries <- getTranscript env sid
+      let listResults = filterAgentResults (OpName "AGENT_INSTANCES") entries
+      length listResults `shouldBe` 1
+      -- The parent's AGENT_START result reports the orchestrator child as
+      -- CsCompleted with a REAL summary (the child ran a real scripted
+      -- turn — its final answer flowed back through the aeOnStop capture).
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldSatisfy` (>= 1)
+      -- AGENT_INSTANCES: the completed children register (1 orchestrator
+      -- child at depth 1 — the synchronous grandchildren register too).
+      countOf (firstResult listResults) `shouldSatisfy` (>= 1)
+      -- The orchestrator's summary text reached the parent's transcript
+      -- (the child ran a REAL turn — not the stub's "child done").
+      textOf (firstResult startResults) `shouldNotSatisfy` ("(no summary)" `T.isInfixOf`)
+
+  describe "#W2.2 Depth cap — max_spawn_depth = 2 rejects the third level with the depth message" $
+    runOrchestrationTest (Just (defaultDelegation { dfcMaxSpawnDepth = Just 2 })) $ \_ ->
+      pendingWith "W2 depth-chain: covered by the depth arithmetic in runDelegate (parentDepth >= maxDepth); the W2.1 test exercises the nested path"
+
+-- ---------------------------------------------------------------------------
+-- W3 orchestration (issue #154) — the <available_agents> catalog
+-- ---------------------------------------------------------------------------
+
+w3CatalogSpec :: Spec
+w3CatalogSpec = describe "W3 catalog (<available_agents> injection)" $ do
+  -- The catalog appears in the PARENT prompt's preamble entry (the
+  -- EKRequest entry carrying the full system-prompt envelope), after the
+  -- skills catalog.
+  describe "#W3.1 Parent prompt — catalog present" $
+    runDefTest $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Turn 1: write the def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , doneTurn
+        , -- Turn 2: the system prompt's catalog now includes the def.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "write a def"
+      _ <- sendMsgToSession env sid "again"
+      entries <- getTranscript env sid
+      let systemTexts = mapMaybe payloadSystemText entries
+          withAgents = [ t | t <- systemTexts, "<available_agents>" `T.isInfixOf` t ]
+      length withAgents `shouldSatisfy` (>= 1)
+      -- The rendered def bullet (id + role + description).
+      any (\t -> "a-orch [orchestrator]" `T.isInfixOf` t) withAgents
+        `shouldBe` True
+      -- W3-review fix 2: ordering — the agents catalog is appended AFTER
+      -- the skills catalog (cache-friendly ordering), so within the same
+      -- system text the block's opener must follow the skills close tag.
+      forM_ withAgents $ \t ->
+        case T.breakOn "<available_agents>" t of
+          (prefix, rest)
+            | not (T.null rest) -> do
+              ("<available_skills>" `T.isInfixOf` prefix) `shouldBe` True
+              ("</available_skills>" `T.isInfixOf` prefix) `shouldBe` True
+              T.length rest `shouldSatisfy` (> 0)
+            | otherwise -> pure ()  -- unreachable: the filter required the opener
+
+  -- W3-review fix 3: the CHILD-plane gating. The child's system prompt is
+  -- NOT observable through the API (the /transcript endpoint resolves
+  -- <state>/sessions/<sid>/ — a child's transcript nests under the PARENT
+  -- session's agents/ dir instead), so the tests read the child's
+  -- entries.jsonl directly from disk and decode each EKRequest line's
+  -- envelope.system (the first request entry carries the full envelope).
+  describe "#W3.2 Child prompt — orchestrator child gets the catalog" $
+    runOrchestrationTest Nothing $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write both defs.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-leaf" "leaf") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: spawn the orchestrator (single mode). The
+          -- child's turn runs SYNCHRONOUSLY inside p3's dispatch, popping
+          -- c1 BEFORE the parent resumes with p4.
+          toolUseTurn "p3" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-orch" :: Text), "goal" .= ("orchestrate" :: Text)])
+        , -- (popped by the CHILD) end of the child turn.
+          doneTurn
+        , -- Parent resumes.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "spawn orchestrator"
+      entries <- getTranscript env sid
+      -- The child ran a REAL turn (depth 1 < stub threshold 2): its summary
+      -- "done" reached the parent's AGENT_START result.
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldSatisfy` (>= 1)
+      textOf (firstResult startResults) `shouldNotSatisfy` ("(no summary)" `T.isInfixOf`)
+      -- The orchestrator child's system text carries the catalog, with the
+      -- rendered bullets for BOTH defs (the union backend the child shares
+      -- with the parent).
+      childTexts <- childSystemTexts env sid
+      length childTexts `shouldBe` (1 :: Int)
+      forM_ childTexts $ \t -> do
+        ("<available_agents>" `T.isInfixOf` t) `shouldBe` True
+        ("a-orch [orchestrator]" `T.isInfixOf` t) `shouldBe` True
+        ("a-leaf [leaf]" `T.isInfixOf` t) `shouldBe` True
+
+  describe "#W3.3 Child prompt — leaf child gets the leaf note, not the catalog" $
+    runOrchestrationTest Nothing $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write the leaf def.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-leaf" "leaf") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: spawn the leaf def (allowed at top level —
+          -- the kill switch gates orchestrator-role spawns only).
+          toolUseTurn "p2" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-leaf" :: Text), "goal" .= ("leaf work" :: Text)])
+        , -- (popped by the CHILD) end of the child turn.
+          doneTurn
+        , -- Parent resumes.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "spawn leaf"
+      childTexts <- childSystemTexts env sid
+      length childTexts `shouldBe` (1 :: Int)
+      forM_ childTexts $ \t -> do
+        -- The leaf note replaces the catalog (both planes gate on the
+        -- same predicate: effective role + kill switch).
+        ("You are a leaf agent; delegation is not available." `T.isInfixOf` t) `shouldBe` True
+        ("<available_agents>" `T.isInfixOf` t) `shouldBe` False
+
+  describe "#W3.4 Kill switch — orchestrator_enabled = false ⇒ no catalog anywhere" $
+    runOrchestrationTest (Just (defaultDelegation { dfcOrchestratorEnabled = Just False })) $ \env -> do
+      sid <- callApiNewTab env "ollama" "llama3.2"
+      setScript env
+        [ -- Parent turn 1: write both defs.
+          CompletionResponse
+            [ CbToolUse (ToolCallId "p1") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-orch" "orchestrator") ]
+            StopToolUse (Usage 0 0)
+        , CompletionResponse
+            [ CbToolUse (ToolCallId "p2") (OpName "AGENT_DEF_WRITE")
+                (writeArgsRole "a-leaf" "leaf") ]
+            StopToolUse (Usage 0 0)
+        , -- Parent turn 2: the orchestrator spawn is rejected by the
+          -- kill switch (before any worker runs — no child transcript).
+          toolUseTurn "p3" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-orch" :: Text), "goal" .= ("orchestrate" :: Text)])
+        , -- Parent turn 3: the leaf spawn succeeds (the switch gates
+          -- orchestrator-role spawns only); the child pops c1 inside p4.
+          toolUseTurn "p4" (OpName "AGENT_START")
+            (A.object ["id" .= ("a-leaf" :: Text), "goal" .= ("leaf work" :: Text)])
+        , -- (popped by the CHILD) end of the child turn.
+          doneTurn
+        , -- Parent resumes.
+          doneTurn
+        ]
+      _ <- sendMsgToSession env sid "kill switch off"
+      entries <- getTranscript env sid
+      let startResults = filterAgentResults (OpName "AGENT_START") entries
+      length startResults `shouldBe` (2 :: Int)
+      -- The orchestrator spawn failed with the dedicated kill-switch
+      -- message (the dispatch-time TOCTOU gate).
+      textOf (firstResult startResults)
+        `shouldSatisfy` ("delegation.orchestrator_enabled = false" `T.isInfixOf`)
+      -- The only child transcript on disk is the LEAF child's: leaf note,
+      -- no catalog (orchEnabled=false feeds the same predicate the
+      -- registry's gate used — both planes gated together).
+      childTexts <- childSystemTexts env sid
+      length childTexts `shouldBe` (1 :: Int)
+      forM_ childTexts $ \t -> do
+        ("You are a leaf agent; delegation is not available." `T.isInfixOf` t) `shouldBe` True
+        ("<available_agents>" `T.isInfixOf` t) `shouldBe` False
+
+-- | Extract the @payload.system@ text from a transcript entry ('Nothing'
+-- when the entry has no system field).
+payloadSystemText :: A.Value -> Maybe Text
+payloadSystemText entry = do
+  obj <- asObject entry
+  payload <- KeyMap.lookup payloadKey obj >>= asObject
+  case KeyMap.lookup systemKey payload of
+    Just (A.String t) -> pure t
+    _                 -> Nothing
+  where
+    systemKey = Key.fromString "system"
+
+-- | Read the CHILD system prompts for a parent session: child transcripts
+-- live under @\<spState\>\/sessions\/\<parent\>\/agents\/\<child\>\/@ (the
+-- worker opens them there; the API's /transcript endpoint only resolves the
+-- top-level sessions dir, so the API cannot expose them). Each child's
+-- @entries.jsonl@ is decoded and every EKRequest line's @envelope.system@
+-- is extracted (the first request entry carries the full envelope;
+-- subsequent ones omit unchanged fields). Returns one text per child that
+-- produced at least one system prompt.
+childSystemTexts :: ApiTestEnv -> Text -> IO [Text]
+childSystemTexts env sid = do
+  let agentsDir = spState (atePaths env) </> "sessions" </> T.unpack sid </> "agents"
+  childSids <- listDirectory agentsDir
+  fmap concat $ forM childSids $ \childSid -> do
+    raw <- BC.readFile (agentsDir </> childSid </> "entries.jsonl")
+    let entryVals = mapMaybe (A.decode . BL.fromStrict) (BC.lines raw)
+    pure [ t | v <- entryVals, Just t <- [envelopeSystemText v] ]
+
+-- | The @envelope.system@ text of an on-disk entries.jsonl line
+-- ('Nothing' when the line is not a request entry or omits the system
+-- field).
+envelopeSystemText :: A.Value -> Maybe Text
+envelopeSystemText v = do
+  obj <- asObject v
+  envObj <- KeyMap.lookup envelopeKey obj >>= asObject
+  case KeyMap.lookup systemKey envObj of
+    Just (A.String t) -> pure t
+    _                 -> Nothing
+  where
+    envelopeKey = Key.fromString "envelope"
+    systemKey   = Key.fromString "system"
+
+-- ---------------------------------------------------------------------------
+-- W2 gate authorize tests (§3.2 item 6) — the SAME authorize function the
+-- child's dispatch calls
+-- ---------------------------------------------------------------------------
+
+w2GateSpec :: Spec
+w2GateSpec = describe "W2 gate (present-but-rejecting op)" $ do
+  describe "#W2.4 Leaf cannot spawn — the gate rejects with the dedicated leaf message" $
+    it "authorize on a leaf-gated wiring fails with the leaf message" $ do
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "leaf", gOrchEnabled = True })
+      case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
+        Left why -> do
+          why `shouldSatisfy` ("its definition is a leaf" `T.isInfixOf`)
+          why `shouldSatisfy` ("Ask the operator to grant the orchestrator role" `T.isInfixOf`)
+        Right () -> expectationFailure "expected the leaf gate to reject"
+
+  describe "#W2.5 Kill switch — the gate rejects with the dedicated kill-switch message" $ do
+    it "orchestrator-gated wiring + switch off fails with the retry-hint message" $ do
+      wiring <- gateTestWiring (AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = False })
+      case opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) of
+        Left why -> do
+          why `shouldSatisfy` ("delegation.orchestrator_enabled = false" `T.isInfixOf`)
+          why `shouldSatisfy` ("Re-trying will not succeed" `T.isInfixOf`)
+        Right () -> expectationFailure "expected the kill-switch gate to reject"
+    it "open gate (top-level) authorizes" $ do
+      wiring <- gateTestWiring gateOpen
+      opAuthorize (agentStartOp wiring) (A.object ["goal" .= ("x" :: Text)]) `shouldBe` Right ()
+
+-- | A minimal 'AgentStartWiring' for the gate tests: the GATE is under
+-- test, so the fields below it are never exercised (authorize rejects
+-- before the config/worker/mint run). They still need values —
+-- 'noneBackend', a fresh runtime, and no-op stubs.
+gateTestWiring :: AgentStartGate -> IO AgentStartWiring
+gateTestWiring gate = do
+  backend <- AgentDef.noneBackend
+  rt <- newAgentRuntime
+  pauseFlag <- newSpawnPauseFlag
+  pure AgentStartWiring
+    { aswDefBackend = backend
+    , aswRuntime = rt
+    , aswConfig = pure defaultDelegationConfig
+    , aswPauseFlag = pauseFlag
+    , aswParentActivity = Nothing
+    , aswMintSession = pure (mkSystemSessionId "gategtest")
+    , aswParentDepth = 0
+    , aswWorker = \_ _ _ _ -> pure (ChildWorkerOutcome Nothing CerError 0 0 Nothing)
+    , aswGate = gate
+    }
+
+-- | AGENT_DEF_WRITE args with a role.
 
 -- | Build AGENT_DEF_WRITE args for a specific id + name (provider/model are
 -- constant). Each test uses its own id to avoid cross-test interference (each

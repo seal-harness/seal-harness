@@ -36,6 +36,16 @@ mkSkill sid desc body =
       , skCreatedAt = aTime, skUpdatedAt = aTime, skSession = mkSystemSessionId "s1" }
     Left e   -> error ("invalid skill id: " <> T.unpack e)
 
+-- | Create a skill with a group. The id is qualified with the group so
+-- two skills with the same bare name in different groups don't collide.
+mkGroupedSkill :: Text -> Text -> Text -> Text -> IO Skill
+mkGroupedSkill group sid desc body =
+  case mkSkillId (group <> "/" <> sid) of
+    Right i  -> pure Skill
+      { skId = i, skDescription = desc, skBody = body, skGroup = Just group
+      , skCreatedAt = aTime, skUpdatedAt = aTime, skSession = mkSystemSessionId "s1" }
+    Left e   -> error ("invalid skill id: " <> T.unpack e)
+
 -- | A canned 'Right' dispatcher that returns a fixed text body. Used for the
 -- /skill load happy path.
 fakeLoadDispatcher :: [Text] -> Bool -> CallDispatcher
@@ -111,6 +121,26 @@ spec = describe "Seal.Command.Skill" $ do
       T.unlines sent `shouldSatisfy` ("greet" `T.isInfixOf`)
       T.unlines sent `shouldSatisfy` ("farewell" `T.isInfixOf`)
 
+    it "list shows [group/id] for grouped skills" $ do
+      (fc, _) <- makeFakeCaps []
+      s <- mkGroupedSkill "core" "greet" "greeting skill" "say hi"
+      _ <- runSkillWith [s] noLoad ["list"] fc
+      sent <- getSent fc
+      sent `shouldBe` ["[core/greet] greeting skill"]
+
+    it "list sorts by group name then skill name" $ do
+      (fc, _) <- makeFakeCaps []
+      s1 <- mkGroupedSkill "design" "alpha" "design alpha" "b"
+      s2 <- mkGroupedSkill "core" "zeta" "core zeta" "b"
+      s3 <- mkGroupedSkill "core" "alpha" "core alpha" "b"
+      _ <- runSkillWith [s1, s2, s3] noLoad ["list"] fc
+      sent <- getSent fc
+      sent `shouldBe`
+        [ "[core/alpha] core alpha"
+        , "[core/zeta] core zeta"
+        , "[design/alpha] design alpha"
+        ]
+
     it "list reports none when empty" $ do
       (fc, _) <- makeFakeCaps []
       _ <- runSkillWith [] noLoad ["list"] fc
@@ -130,11 +160,11 @@ spec = describe "Seal.Command.Skill" $ do
       sent <- getSent fc
       sent `shouldBe` ["skill not found: nope"]
 
-    it "info rejects an invalid id" $ do
+    it "info accepts a group-qualified id" $ do
       (fc, _) <- makeFakeCaps []
-      _ <- runSkillWith [] noLoad ["info", "bad/id"] fc
+      _ <- runSkillWith [] noLoad ["info", "core/greet"] fc
       sent <- getSent fc
-      sent `shouldBe` ["invalid skill id: \"bad/id\""]
+      sent `shouldBe` ["skill not found: core/greet"]
 
   describe "/skill load" $ do
     it "echoes only the header line on a successful load (body goes to transcript)" $ do

@@ -1,7 +1,7 @@
 # Codex CLI Tool Mapping
 
 This file maps Claude Code tool names to Codex CLI equivalents.
-Use these mappings when adapting metaswarm skills to run under Codex.
+Use these mappings when adapting Seal Harness skills to run under Codex.
 
 | Claude Code Tool | Codex Equivalent |
 |------------------|------------------|
@@ -17,7 +17,7 @@ Use these mappings when adapting metaswarm skills to run under Codex.
 
 ## Codex Plugin Notes
 
-- Codex discovers metaswarm skills from `.codex-plugin/plugin.json` via `"skills": "./skills/"`.
+- Codex discovers Seal Harness skills from `.codex-plugin/plugin.json` via `"skills": "./skills/"`.
 - Codex invokes skills by `SKILL.md` frontmatter name, not by directory name.
-- Codex plugin hooks are optional and require the `plugin_hooks` feature; core metaswarm workflows must work without hook context.
+- Codex plugin hooks are optional and require the `plugin_hooks` feature; core Seal Harness workflows must work without hook context.
 - Prefer explicit setup/status checks over assuming SessionStart hooks ran.

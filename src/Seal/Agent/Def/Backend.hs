@@ -81,6 +81,7 @@ import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Types
   ( AgentDef (..), AgentDefId (..), mkAgentDefId, agentDefIdText
+  , sanitizeAgentTextField, agentFieldCapSmall
   )
 import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -334,11 +335,14 @@ listGroupSubdirs dir = do
       pure (map T.pack ds)
 
 -- | Stamp 'adGroup' from the parent directory when the frontmatter omitted
--- it. Mirrors 'Seal.Skills.Backend.readAndStampGroup' / 'stampGroup'.
+-- it. Mirrors 'Seal.Skills.Backend.readAndStampGroup' / 'stampGroup'. The
+-- directory name is operator-controlled but rendered into the W3 catalog
+-- (@## \<group\>@ headers), so it passes the same field sanitizer as
+-- every other def field before it can reach a prompt.
 stampGroup :: Text -> Maybe AgentDef -> Maybe AgentDef
 stampGroup g (Just d) = case adGroup d of
   Just _  -> Just d
-  Nothing -> Just d { adGroup = Just g }
+  Nothing -> Just d { adGroup = Just (sanitizeAgentTextField agentFieldCapSmall g) }
 stampGroup _ Nothing = Nothing
 
 -- | Read the first grouped @.md@ file that decodes, stamping its group.

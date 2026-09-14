@@ -3,6 +3,7 @@ module Seal.ISA.Ops.SkillsSpec (spec) where
 
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
+import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -47,7 +48,7 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
     it "rejects an invalid id" $ do
       backend <- noneBackend
       let op = skillWriteOp backend sampleSession
-      r <- runTestApp (opRun op localBackend (object ["id" .= ("bad/id" :: Text), "description" .= ("x" :: Text), "body" .= ("y" :: Text)]))
+      r <- runTestApp (opRun op localBackend (object ["id" .= ("bad id" :: Text), "description" .= ("x" :: Text), "body" .= ("y" :: Text)]))
       orIsError r `shouldBe` True
 
     it "updates an existing skill and returns 'updated' with was_new=false (preserves provenance)" $ do
@@ -88,7 +89,41 @@ spec = describe "Seal.ISA.Ops.Skills" $ do
     it "rejects an invalid id" $ do
       backend <- noneBackend
       let read' = skillLoadOp backend
-      r <- runTestApp (opRun read' localBackend (object ["id" .= ("bad/id" :: Text)]))
+      r <- runTestApp (opRun read' localBackend (object ["id" .= ("bad id" :: Text)]))
+      orIsError r `shouldBe` True
+
+    it "loads a skill by fully-qualified id" $ do
+      backend <- noneBackend
+      let fqId = case mkSkillId "core/s1" of Right i -> i; Left _ -> sampleSkillId
+          skill = Skill
+            { skId = fqId, skDescription = "greet", skBody = "say hi"
+            , skGroup = Just "core"
+            , skCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skSession = sampleSession
+            }
+      sbCreate backend skill
+      let read' = skillLoadOp backend
+      r <- runTestApp (opRun read' localBackend (object ["id" .= ("core/s1" :: Text)]))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> T.isInfixOf "say hi" t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+
+    it "errors on ambiguous bare id (two groups, same name)" $ do
+      backend <- noneBackend
+      let mkFq g = case mkSkillId (g <> "/s1") of Right i -> i; Left _ -> sampleSkillId
+          mkS g = Skill
+            { skId = mkFq g, skDescription = g, skBody = "b"
+            , skGroup = Just g
+            , skCreatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skUpdatedAt = UTCTime (fromGregorian 2026 7 5) (secondsToDiffTime 0)
+            , skSession = sampleSession
+            }
+      sbCreate backend (mkS "core")
+      sbCreate backend (mkS "design")
+      let read' = skillLoadOp backend
+      r <- runTestApp (opRun read' localBackend (object ["id" .= ("s1" :: Text)]))
       orIsError r `shouldBe` True
 
   describe "SKILL_LIST" $ do

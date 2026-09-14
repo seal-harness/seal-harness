@@ -380,6 +380,7 @@ test-suite tests
         Seal.Agent.Def.BackendNoDirectFsFailSpec
         Seal.Agent.PromptPartsSpec
         Seal.Agent.Runtime.RegistrySpec
+        Seal.Agent.Runtime.Delegation.WorkerSpec
         Seal.ISA.Ops.MemorySpec
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
@@ -401,6 +402,7 @@ test-suite tests
         Seal.Channels.LoopSpec
         Seal.Channels.SignalSpec
         Seal.Channels.Signal.EnvelopeSpec
+        Seal.Channels.TabFocusSpec
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Channels.TelegramSpec

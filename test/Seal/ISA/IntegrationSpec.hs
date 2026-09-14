@@ -761,6 +761,7 @@ spec = describe "Seal.ISA.Integration" $ do
             , aswMintSession = pure (mkSystemSessionId "fresh")
             , aswParentDepth = 0
             , aswWorker = worker
+            , aswGate = gateOpen
             }
           op = agentStartOp wiring
           reg = Registry.mkRegistry [op]

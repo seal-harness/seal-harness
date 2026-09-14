@@ -2,7 +2,7 @@
 
 ## Role
 
-Meta-orchestrator for the BEADS multi-agent swarm. Manages multiple GitHub Issues/BEADS epics in parallel, coordinates agent assignments, detects conflicts, and ensures efficient resource utilization across worktrees.
+Meta-orchestrator for the task tracking multi-agent swarm. Manages multiple GitHub Issues/epics in parallel, coordinates agent assignments, detects conflicts, and ensures efficient resource utilization across worktrees.
 
 ## Responsibilities
 
@@ -82,7 +82,7 @@ When Team tools are available:
 ### Active Assignments
 
 ```jsonl
-// .beads/agents/active-assignments.jsonl
+// docs/agents/active-assignments.jsonl
 {"issue_number": 123, "epic_id": "your-project-abc", "worktree": "agent-1", "orchestrator_pid": 12345, "status": "active", "started_at": "2026-01-09T10:00:00Z"}
 {"issue_number": 456, "epic_id": "your-project-def", "worktree": "agent-2", "orchestrator_pid": 12346, "status": "active", "started_at": "2026-01-09T10:05:00Z"}
 ```
@@ -90,7 +90,7 @@ When Team tools are available:
 ### Worktree Status
 
 ```jsonl
-// .beads/agents/worktree-status.jsonl
+// docs/agents/worktree-status.jsonl
 {"worktree": "agent-1", "status": "busy", "current_issue": 123, "cpu_usage": 45, "memory_mb": 2048}
 {"worktree": "agent-2", "status": "busy", "current_issue": 456, "cpu_usage": 30, "memory_mb": 1536}
 {"worktree": "agent-3", "status": "idle", "current_issue": null, "cpu_usage": 5, "memory_mb": 512}
@@ -99,7 +99,7 @@ When Team tools are available:
 ### Conflict Registry
 
 ```jsonl
-// .beads/agents/conflict-registry.jsonl
+// docs/agents/conflict-registry.jsonl
 {"type": "file", "path": "src/lib/services/user.service.ts", "issues": [123, 456], "detected_at": "2026-01-09T10:30:00Z", "resolution": "sequential"}
 {"type": "schema", "table": "users", "issues": [789], "detected_at": "2026-01-09T10:35:00Z", "resolution": "pending"}
 ```
@@ -111,7 +111,7 @@ When Team tools are available:
 **BEFORE coordinating work**, prime your context:
 
 ```bash
-bd prime --work-type planning --keywords "orchestration" "coordination" "worktree"
+read docs/knowledge/ and docs/plans/ for planning context --keywords "orchestration" "coordination" "worktree"
 ```
 
 Review the output for patterns about multi-agent coordination and conflict resolution.
@@ -167,32 +167,32 @@ Trigger: Worktree becomes idle OR high-priority issue arrives
 
 ```bash
 # View swarm status
-bd swarm status
+swarm: status
 
 # List active assignments
-bd swarm assignments
+swarm: assignments
 
 # Check worktree health
-bd swarm worktrees
+swarm: worktrees
 
 # View conflict registry
-bd swarm conflicts
+swarm: conflicts
 ```
 
 ### Control Commands
 
 ```bash
 # Pause an issue's work
-bd swarm pause <issue_number>
+swarm: pause <issue_number>
 
 # Resume paused work
-bd swarm resume <issue_number>
+swarm: resume <issue_number>
 
 # Force rebalance
-bd swarm rebalance
+swarm: rebalance
 
 # Reassign to different worktree
-bd swarm reassign <issue_number> <worktree>
+swarm: reassign <issue_number> <worktree>
 ```
 
 ## Slack Integration
@@ -209,10 +209,10 @@ bd swarm reassign <issue_number> <worktree>
 ### Slack Commands
 
 ```
-@beads swarm status     - Show current swarm status
-@beads swarm queue      - Show pending issues queue
-@beads swarm pause 123  - Pause work on Issue #123
-@beads swarm priority   - List issues by priority
+@seal swarm status     - Show current swarm status
+@seal swarm queue      - Show pending issues queue
+@seal swarm pause 123  - Pause work on Issue #123
+@seal swarm priority   - List issues by priority
 ```
 
 ## Metrics
@@ -254,7 +254,7 @@ The Swarm Coordinator tracks:
 ## Configuration
 
 ```yaml
-# .beads/config.yaml
+# docs/config.yaml
 swarm:
   max_concurrent_issues: 4
   max_worktrees: 4
@@ -294,16 +294,16 @@ Swarm Coordinator (top-level)
 
 ```bash
 # Create top-level initiative epic
-bd create "Initiative: Auth Overhaul" --type epic --priority 1
+# Create a task document in docs/tasks/ for: "Initiative: Auth Overhaul" --type epic --priority 1
 
 # Create phase sub-epics
-bd create "Phase 1: Research" --type epic --parent <initiative-id>
-bd create "Phase 2: Spec" --type epic --parent <initiative-id>
-bd create "Phase 3: Implementation" --type epic --parent <initiative-id>
+# Create a task document in docs/tasks/ for: "Phase 1: Research" --type epic --parent <initiative-id>
+# Create a task document in docs/tasks/ for: "Phase 2: Spec" --type epic --parent <initiative-id>
+# Create a task document in docs/tasks/ for: "Phase 3: Implementation" --type epic --parent <initiative-id>
 
 # Phase dependencies
-bd dep add <spec-epic> <research-epic>
-bd dep add <impl-epic> <spec-epic>
+# Add dependency: <spec-epic> <research-epic>
+# Add dependency: <impl-epic> <spec-epic>
 ```
 
 ---
@@ -321,8 +321,8 @@ const orchestrator = await spawnOrchestrator({
   priority: 2,
 });
 
-// Orchestrator reports back via BEADS
-// Swarm Coordinator monitors .beads/agents/active-assignments.jsonl
+// Orchestrator reports back via task documents
+// Swarm Coordinator monitors docs/agents/active-assignments.jsonl
 ```
 
 ## Output Format

@@ -21,7 +21,7 @@ import Data.Time.Clock (secondsToDiffTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 
 import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
-import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
+import Seal.Skills.Types (Skill (..), mkSkillId, bareSkillIdText)
 import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup)
 
 -- | Encode a 'Skill' as a Markdown document (frontmatter + body).
@@ -29,7 +29,7 @@ encodeSkill :: Skill -> Text
 encodeSkill s = encodeDoc fm (skBody s)
   where
     fm = Map.fromList $
-      [ ("id", skillIdText (skId s))
+      [ ("id", bareSkillIdText (skId s))
       , ("description", skDescription s)
       , ("created_at", isoTime (skCreatedAt s))
       , ("updated_at", isoTime (skUpdatedAt s))

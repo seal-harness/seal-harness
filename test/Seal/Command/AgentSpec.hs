@@ -31,6 +31,7 @@ mkDef did name prov =
     Right i  -> pure AgentDef
       { adId = i, adName = name, adProvider = prov, adModel = ModelId "llama3"
       , adSystem = Just "be nice", adTools = AllowAll, adGroup = Nothing
+      , adRole = Nothing, adDescription = Nothing
       , adCreatedAt = aTime, adUpdatedAt = aTime, adSession = mkSystemSessionId "s1" }
     Left e   -> error ("invalid agent def id: " <> T.unpack e)
 

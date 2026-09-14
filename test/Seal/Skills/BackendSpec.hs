@@ -124,12 +124,12 @@ spec = describe "Seal.Skills.Backend" $ do
         sbCreate backend (mkG "beta"  "b" "ops")
         sbCreate backend (mkG "gamma" "g" "core")
         skills <- sbList backend
-        map (skillIdText . skId) skills `shouldBe` ["alpha", "beta", "gamma"]
+        map (skillIdText . skId) skills `shouldBe` ["core/alpha", "core/gamma", "ops/beta"]
         let byId = [ (skillIdText (skId s), skGroup s) | s <- skills ]
         byId `shouldBe`
-          [ ("alpha", Just "core")
-          , ("beta", Just "ops")
-          , ("gamma", Just "core")
+          [ ("core/alpha", Just "core")
+          , ("core/gamma", Just "core")
+          , ("ops/beta", Just "ops")
           ]
 
     it "stamps group from the directory when the frontmatter omitted it" $
@@ -154,7 +154,7 @@ spec = describe "Seal.Skills.Backend" $ do
         createDirectoryIfMissing True (skillsDir </> "core")
         TIO.writeFile (skillsDir </> "core" </> "dropped.md") raw
         skills <- sbList backend
-        case [ s | s <- skills, skillIdText (skId s) == "dropped" ] of
+        case [ s | s <- skills, skillIdText (skId s) == "core/dropped" ] of
           [s] -> skGroup s `shouldBe` Just "core"
           _   -> expectationFailure "hand-dropped grouped skill not listed"
 
@@ -224,7 +224,7 @@ spec = describe "Seal.Skills.Backend" $ do
           (agentSkillMd "my-skill" "A grouped agent skill." "Body here.")
         backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
         skills <- sbList backend
-        case [ s | s <- skills, skillIdText (skId s) == "my-skill" ] of
+        case [ s | s <- skills, skillIdText (skId s) == "core/my-skill" ] of
           [s] -> do
             skDescription s `shouldBe` "A grouped agent skill."
             skBody s `shouldBe` "Body here."
@@ -282,3 +282,96 @@ spec = describe "Seal.Skills.Backend" $ do
         let ids = map (skillIdText . skId) skills
         "native-flat" `elem` ids `shouldBe` True
         "agent-dir"   `elem` ids `shouldBe` True
+
+  describe "markdownSkillBackend group-scoping (duplicate ids across groups)" $ do
+    it "lists both skills when two groups have a skill with the same bare id" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        let mkG sid desc grp = (mkSkill desc "b")
+              { skId = case mkSkillId sid of Right i -> i; Left _ -> sampleSkillId
+              , skGroup = Just grp
+              }
+        sbCreate backend (mkG "greet" "core greeting" "core")
+        sbCreate backend (mkG "greet" "design greeting" "design")
+        skills <- sbList backend
+        let ids = map (skillIdText . skId) skills
+        ids `shouldContain` ["core/greet"]
+        ids `shouldContain` ["design/greet"]
+        length skills `shouldBe` 2
+
+    it "sbRead with a fully-qualified id returns the correct skill" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        let mkG sid desc grp = (mkSkill desc "b")
+              { skId = case mkSkillId sid of Right i -> i; Left _ -> sampleSkillId
+              , skGroup = Just grp
+              }
+        sbCreate backend (mkG "greet" "core greeting" "core")
+        sbCreate backend (mkG "greet" "design greeting" "design")
+        mCore <- sbRead backend (case mkSkillId "core/greet" of Right i -> i; Left _ -> sampleSkillId)
+        case mCore of
+          Just s -> skDescription s `shouldBe` "core greeting"
+          Nothing -> expectationFailure "core/greet not found"
+        mDesign <- sbRead backend (case mkSkillId "design/greet" of Right i -> i; Left _ -> sampleSkillId)
+        case mDesign of
+          Just s -> skDescription s `shouldBe` "design greeting"
+          Nothing -> expectationFailure "design/greet not found"
+
+    it "sbRead with a bare id returns Nothing when the id is ambiguous" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        let mkG sid desc grp = (mkSkill desc "b")
+              { skId = case mkSkillId sid of Right i -> i; Left _ -> sampleSkillId
+              , skGroup = Just grp
+              }
+        sbCreate backend (mkG "greet" "core greeting" "core")
+        sbCreate backend (mkG "greet" "design greeting" "design")
+        m <- sbRead backend (case mkSkillId "greet" of Right i -> i; Left _ -> sampleSkillId)
+        m `shouldBe` Nothing
+
+    it "sbRead with a bare id returns the skill when unambiguous" $
+      withSystemTempDirectory "seal-skill" $ \root -> do
+        let cfgRoot = root </> "config"
+            skillsDir = cfgRoot </> "skills"
+        ensureConfigRepo cfgRoot
+        backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
+        let mkG sid desc grp = (mkSkill desc "b")
+              { skId = case mkSkillId sid of Right i -> i; Left _ -> sampleSkillId
+              , skGroup = Just grp
+              }
+        sbCreate backend (mkG "greet" "core greeting" "core")
+        m <- sbRead backend (case mkSkillId "greet" of Right i -> i; Left _ -> sampleSkillId)
+        case m of
+          Just s -> skDescription s `shouldBe` "core greeting"
+          Nothing -> expectationFailure "bare id greet should resolve to core/greet"
+
+  describe "noneBackend group-scoping" $ do
+    it "stores two skills with the same bare id in different groups when qualified" $ do
+      backend <- noneBackend
+      let mkFq g = case mkSkillId (g <> "/greet") of Right i -> i; Left _ -> sampleSkillId
+          mkS g desc = Skill
+            { skId = mkFq g, skDescription = desc, skBody = "b"
+            , skGroup = Just g
+            , skCreatedAt = sampleTime, skUpdatedAt = sampleTime
+            , skSession = mkSystemSessionId "s1"
+            }
+      sbCreate backend (mkS "core" "core greeting")
+      sbCreate backend (mkS "design" "design greeting")
+      skills <- sbList backend
+      length skills `shouldBe` 2
+      mCore <- sbRead backend (case mkSkillId "core/greet" of Right i -> i; Left _ -> sampleSkillId)
+      case mCore of
+        Just s -> skDescription s `shouldBe` "core greeting"
+        Nothing -> expectationFailure "core/greet not found in noneBackend"
+      -- Bare id is ambiguous — should return Nothing
+      mBare <- sbRead backend (case mkSkillId "greet" of Right i -> i; Left _ -> sampleSkillId)
+      mBare `shouldBe` Nothing

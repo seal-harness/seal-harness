@@ -89,6 +89,20 @@ shellExecPayload = object
   , "op"       .= object [ "name" .= String "SHELL_EXEC" ]
   ]
 
+-- | An ASK_HUMAN harness payload (no approval key). The question text is
+-- in the @input.question@ field. This must surface so the web frontend
+-- sees pending questions from channel-originated turns (Telegram, Signal).
+-- Without this, a question sent to Telegram is invisible in the web
+-- transcript — a \"phantom message\" that exists in the audit log but
+-- not in the UI (session 20260912-183908-767 issue #2).
+askHumanPayload :: Value
+askHumanPayload = object
+  [ "messages" .= ([] :: [Value])
+  , "harness"  .= Null
+  , "op"       .= object [ "name" .= String "ASK_HUMAN" ]
+  , "input"    .= object ["question" .= String "What is the vault key?"]
+  ]
+
 -- | An approval-bearing harness payload (the existing confirmation-evidence
 -- surface). Should still surface (not dropped).
 approvalPayload :: Value
@@ -116,6 +130,12 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
   it "drops a SHELL_EXEC harness entry (not whitelisted, no approval)" $ do
     let te = mkHarnessTe shellExecPayload
     reconEntryToFrontend 0 te `shouldBe` Nothing
+
+  it "surfaces an ASK_HUMAN harness entry (whitelisted for cross-channel visibility)" $ do
+    let te = mkHarnessTe askHumanPayload
+    case reconEntryToFrontend 0 te of
+      Just _  -> pure ()
+      Nothing -> expectationFailure "expected Just (ASK_HUMAN entry surfaces), got Nothing"
 
   it "surfaces an approval-bearing harness entry (regression guard)" $ do
     let te = mkHarnessTe approvalPayload

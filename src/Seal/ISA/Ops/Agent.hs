@@ -38,6 +38,8 @@ module Seal.ISA.Ops.Agent
   , agentInterruptOp
   , AgentWorkerBuilder
   , AgentStartWiring (..)
+  , AgentStartGate (..)
+  , gateOpen
   ) where
 
 import Control.Monad.IO.Class (liftIO)
@@ -55,7 +57,10 @@ import Data.Vector qualified as V
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..))
 import Seal.Agent.Def.Types
-  ( AgentDef (..), mkAgentDefId, agentDefIdText )
+  ( AgentDef (..), mkAgentDefId, agentDefIdText
+  , sanitizeAgentDefFields, sanitizeAgentTextField, agentFieldCapSmall
+  )
+import Seal.Agent.Runtime.Delegation.Worker (effectiveRole)
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , ChildResult (..)
@@ -65,6 +70,7 @@ import Seal.Agent.Runtime.Delegation
   , SpawnPauseFlag
   , ParentActivity
   , SubagentId (..)
+  , resolveDelegationConfig
   , runDelegate
   , subagentIdText
   )
@@ -130,7 +136,13 @@ groupField v mExisting =
 -- provenance and 'adCreatedAt' are preserved; only 'adUpdatedAt' is bumped);
 -- if not, a fresh def is created. The name, provider, model, system prompt,
 -- and tool list are recorded in full (agent-visible data); 'orRecorded'
--- carries the id + op name + fields + @was_new@.
+-- carries the id + op name + fields + @was_new@ (+ @unknown_tools@ when the
+-- tools list names opcodes the harness does not have — a def-author typo
+-- is discoverable in the audit trail). The optional @role@ field gates
+-- delegation (\"orchestrator\" | \"leaf\"); anything else fails the
+-- authorize gate (role controls spawning — it must be explicit, never
+-- permissive). Optional @description@ is a one-line catalog summary; both
+-- are sanitized via 'sanitizeAgentDefFields'.
 agentDefWriteOp :: AgentDefBackend -> SessionId -> Opcode
 agentDefWriteOp backend session = TrustedOpcode
   { toName = OpName "AGENT_DEF_WRITE"
@@ -167,26 +179,50 @@ agentDefWriteOp backend session = TrustedOpcode
               [ "type" .= ("string" :: Text)
               , "description" .= ("Optional display group (e.g. \"core\"). Omit for the default (ungrouped) section." :: Text)
               ]
+          , fromText "role" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional delegation role: \"orchestrator\" (may spawn sub-agents, depth-capped) or \"leaf\" (default; cannot spawn). The def is authoritative — AGENT_START's per-task role can only narrow an orchestrator def to leaf, never widen a leaf." :: Text)
+              ]
+          , fromText "description" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Optional one-line description rendered into the <available_agents> catalog (single line; control characters and catalog-fence tokens are sanitized)." :: Text)
+              ]
           ]
       , "required" .= (["id", "name", "provider", "model"] :: [Text])
       ]
   , toOutSchema = object []
-  , toAuthorize = maybe (Left "AGENT_DEF_WRITE requires {id:string}") checkId . idField
+  , toAuthorize = \v ->
+      case idField v of
+        Nothing -> Left "AGENT_DEF_WRITE requires {id:string}"
+        Just idTxt -> case checkId idTxt of
+          Left e -> Left e
+          Right () -> case T.strip <$> textFieldMaybe "role" v of
+            Nothing -> Right ()
+            Just "" -> Right ()   -- empty role = unset (leaf)
+            Just r
+              | r == "orchestrator" || r == "leaf" -> Right ()
+              | otherwise ->
+                Left ("AGENT_DEF_WRITE: role must be \"orchestrator\" or \"leaf\" (got: " <> r <> ")")
   , toBlocking = False
   , toRun = \_ v -> do
       let mId = idField v >>= either (const Nothing) Just . mkAgentDefId
+          roleField vv = case T.strip <$> textFieldMaybe "role" vv of
+            Just ""  -> Nothing
+            r        -> r
       case mId of
         Nothing -> pure (OpResult [TrpText "invalid agent def id"] True (object []))
         Just aid -> do
           mExisting <- liftIO (adbRead backend aid)
           now <- liftIO getCurrentTime
-          let (def, wasNew) = case mExisting of
+          let (def0, wasNew) = case mExisting of
                 Just existing ->
                   ( existing
                       { adName = textField "name" v
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
                       , adGroup = groupField v (Just existing)
+                      , adRole = roleField v
+                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
                       , adUpdatedAt = now
                       }
                   , False
@@ -200,18 +236,43 @@ agentDefWriteOp backend session = TrustedOpcode
                       , adSystem = textFieldMaybe "system" v
                       , adTools = toolsField v
                       , adGroup = groupField v Nothing
+                      , adRole = roleField v
+                      , adDescription = sanitizeAgentTextField agentFieldCapSmall <$> textFieldMaybe "description" v
                       , adCreatedAt = now
                       , adUpdatedAt = now
                       , adSession = session
                       }
                   , True
                   )
+              def = sanitizeAgentDefFields def0
+              unknownTools =
+                case adTools def of
+                  AllowOnly xs ->
+                    [ t | OpName t <- Set.toList xs, Set.notMember t knownOpNames ]
+                  AllowAll -> []
           liftIO (adbUpdate backend def)
-          let recorded = encodeDefRecorded def wasNew
+          let recorded = encodeDefRecorded def wasNew unknownTools
           pure (OpResult [TrpText (if wasNew then "defined" else "updated")] False recorded)
   }
   where
     checkId t = either (Left . ("invalid agent def id: " <>)) (const (Right ())) (mkAgentDefId t)
+    -- The universe of opcode names the harness actually exposes. A tools
+    -- entry outside this set is silently dropped from the child registry
+    -- (intersection semantics) but recorded here so a def-author typo is
+    -- discoverable in the audit trail.
+    knownOpNames :: Set.Set Text
+    knownOpNames = Set.fromList
+      [ "SHOW_HUMAN", "ASK_HUMAN", "SECRET_GET"
+      , "MEMORY_WRITE", "MEMORY_RECALL", "MEMORY_DELETE"
+      , "SKILL_WRITE", "SKILL_LOAD", "SKILL_LIST", "SKILL_DELETE"
+      , "AGENT_DEF_WRITE", "AGENT_DEF_READ", "AGENT_DEF_LIST", "AGENT_DEF_DELETE"
+      , "AGENT_INSTANCES", "AGENT_START", "AGENT_STATUS", "AGENT_STOP", "AGENT_INTERRUPT"
+      , "SEARCH_FILES", "FILE_READ", "FILE_WRITE", "FILE_PATCH"
+      , "SHELL_EXEC", "SETUP_REPO", "BIN_EXEC", "PROCESS_MANAGE"
+      , "WEB_FETCH", "WEB_SEARCH"
+      , "HARNESS_LIST", "HARNESS_START", "HARNESS_STOP"
+      , "OPCODE_DESCRIBE", "OPCODE_LIST"
+      ]
 
 -- ---------------------------------------------------------------------------
 -- AGENT_DEF_READ
@@ -236,7 +297,7 @@ agentDefReadOp backend = TrustedOpcode
             Nothing -> pure (OpResult [TrpText "agent def not found"] True (object ["id" .= agentDefIdText aid]))
             Just d  -> do
               let rendered = renderDef d
-                  recorded = encodeDefRecorded d False
+                  recorded = encodeDefRecorded d False []
               pure (OpResult [TrpText rendered] False recorded)
   }
   where
@@ -250,7 +311,7 @@ agentDefListOp :: AgentDefBackend -> Opcode
 agentDefListOp backend = TrustedOpcode
   { toName = OpName "AGENT_DEF_LIST"
   , toTrust = Trusted
-  , toDesc = "List all agent definitions (id + name + provider/model)."
+  , toDesc = "List all agent definitions (id + role + name + provider/model)."
   , toInSchema = object
       [ "type" .= ("object" :: Text)
       , "properties" .= object []
@@ -263,12 +324,14 @@ agentDefListOp backend = TrustedOpcode
       let rendered = case defs of
             [] -> "(no agent definitions)"
             _  -> T.intercalate "\n"
-                    [ agentDefIdText (adId d) <> ": " <> adName d
+                    [ agentDefIdText (adId d) <> roleSuffix (adRole d) <> ": " <> adName d
                         <> " (" <> adProvider d <> "/" <> modelName <> ")"
                     | d <- defs, let ModelId modelName = adModel d ]
           recorded = object
             [ "count" .= length defs
             , "ids" .= fmap (agentDefIdText . adId) defs
+            , "roles" .= object
+                [ fromText (agentDefIdText (adId d)) .= adRole d | d <- defs ]
             ]
       pure (OpResult [TrpText rendered] False recorded)
   }
@@ -362,7 +425,30 @@ data AgentStartWiring = AgentStartWiring
     -- ^ The parent's delegation depth (0 for a top-level turn).
   , aswWorker       :: AgentWorkerBuilder
     -- ^ The worker-builder (closes over per-turn 'AgentEnv' deps).
+  , aswGate         :: AgentStartGate
+    -- ^ The role/kill-switch gate (issue #154 §3.2): a nested (child-side)
+    -- AGENT_START carries the spawning child's effective role + the
+    -- resolved kill-switch state so the op can reject with the dedicated
+    -- leaf/kill-switch messages. A top-level turn's wiring passes
+    -- 'gateOpen'.
   }
+
+-- | The role/switch condition the nested AGENT_START enforces before it
+-- will spawn. Leaf children (and orchestrator children while the kill
+-- switch is off) get a present-but-rejecting op whose authorize returns
+-- the dedicated error.
+data AgentStartGate = AgentStartGate
+  { gEffectiveRole :: Maybe Text
+    -- ^ The spawning agent's effective role ('Nothing' = leaf).
+  , gOrchEnabled   :: Bool
+    -- ^ The resolved @delegation.orchestrator_enabled@.
+  }
+
+-- | The open gate for top-level (operator-authorized) turns: spawning is
+-- governed only by the depth cap, spawn-pause, and per-spawn resolver
+-- checks.
+gateOpen :: AgentStartGate
+gateOpen = AgentStartGate { gEffectiveRole = Just "orchestrator", gOrchEnabled = True }
 
 -- | AGENT_START: spawn one or more child agents, run each against a goal to
 -- completion, return a JSON result per child. Input is either
@@ -390,7 +476,7 @@ agentStartOp wiring = TrustedOpcode
               ]
           , fromText "role" .= object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("\"leaf\" (default) or \"orchestrator\". Orchestrators may spawn their own subagents, bounded by max_spawn_depth." :: Text)
+              , "description" .= ("Optional narrow-only role hint: only \"leaf\" is meaningful per-task (downgrades an orchestrator def's child to leaf). Spawning capability comes from the def's role field — a leaf def can never be widened by task input." :: Text)
               ]
           , fromText "tasks" .= object
               [ "type" .= ("array" :: Text)
@@ -401,12 +487,18 @@ agentStartOp wiring = TrustedOpcode
       ]
   , toOutSchema = object []
   , toAuthorize = \v ->
-      -- Require either a top-level goal (single) or a tasks array (batch).
-      let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
-          hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
-      in if hasGoal || hasTasks
-           then Right ()
-           else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+      let shapeGate =
+            -- Require either a top-level goal (single) or a tasks array (batch).
+            let hasGoal = case textFieldMaybe "goal" v of { Just _ -> True; Nothing -> False }
+                hasTasks = case parseMaybe (withObject "in" (.:? "tasks")) v :: Maybe (Maybe Value) of { Just (Just _) -> True; _ -> False }
+            in if hasGoal || hasTasks
+                 then Right ()
+                 else Left "AGENT_START requires {goal:string} (single) or {tasks:array} (batch)."
+          roleGate = case (gEffectiveRole (aswGate wiring), gOrchEnabled (aswGate wiring)) of
+            (Just "orchestrator", True) -> Right ()
+            (Just "orchestrator", False) -> Left killSwitchMsg
+            (_, _) -> Left leafMsg
+      in shapeGate *> roleGate
   , toBlocking = False
   , toRun = \_ v -> do
       input <- liftIO (parseInput v)
@@ -414,6 +506,7 @@ agentStartOp wiring = TrustedOpcode
         Left err -> pure (OpResult [TrpText err] True (object []))
         Right di -> do
           cfg <- liftIO (aswConfig wiring)
+          let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
           eResults <- liftIO (runDelegate
                                 cfg
                                 (aswPauseFlag wiring)
@@ -424,6 +517,7 @@ agentStartOp wiring = TrustedOpcode
                                              (aswRuntime wiring)
                                              (aswMintSession wiring)
                                              (aswParentDepth wiring)
+                                             orchEnabled
                                              (aswWorker wiring)))
           case eResults of
             Left err -> pure (OpResult [TrpText err] True (object []))
@@ -436,7 +530,8 @@ agentStartOp wiring = TrustedOpcode
               -- the input tasks to recover the AgentDefId (the ChildResult
               -- carries the SubagentId but not the def id).
               let tasks = diTasks di
-              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) t r)) tasks results
+                  childDepth = aswParentDepth wiring + 1
+              zipWithM_ (\t r -> liftIO (registerChild (aswRuntime wiring) childDepth t r)) tasks results
               let rendered = encodeResultsJson results
               pure (OpResult [TrpText rendered] False (object ["results" .= results]))
    }
@@ -473,16 +568,23 @@ parseTask v =
                  | otherwise -> pure (Right (ChildTask defId goal (textFieldMaybe "context" v) (textFieldMaybe "role" v)))
 
 -- | Resolve a task to its def + worker + fresh session id. Returns Left if
--- the def id is invalid or the def doesn't exist.
+-- the def id is invalid, the def doesn't exist, or the effective-role /
+-- kill-switch gate rejects the spawn (issue #154 §3.2 item 5 — the
+-- dispatch-time TOCTOU gate: the def is in hand here, which is the only
+-- place the effective role is computable). @orchEnabled@ is the resolved
+-- @delegation.orchestrator_enabled@; @parentDepth@ is the spawning
+-- parent's depth (consumed for the error message context and forwarded
+-- via the wiring, not stored here).
 resolveTask
   :: AgentDefBackend
   -> AgentRuntime
   -> IO SessionId
   -> Int
+  -> Bool
   -> AgentWorkerBuilder
   -> ChildTask
   -> IO (Either Text (AgentDef, AgentWorkerBuilder, SessionId))
-resolveTask defBackend _runtime mintSession _parentDepth worker task = do
+resolveTask defBackend _runtime mintSession _parentDepth orchEnabled worker task = do
   case mkAgentDefId (ctDefId task) of
     Left err -> pure (Left err)
     Right aid -> do
@@ -490,25 +592,41 @@ resolveTask defBackend _runtime mintSession _parentDepth worker task = do
       case mDef of
         Nothing  -> pure (Left ("agent def not found: " <> ctDefId task))
         Just def -> do
-          sid <- mintSession
-          pure (Right (def, worker, sid))
+          let role = effectiveRole (adRole def) (ctRole task)
+          if role == Just "orchestrator" && not orchEnabled
+            then pure (Left killSwitchMsg)
+            else do
+              sid <- mintSession
+              pure (Right (def, worker, sid))
+
+-- | The dedicated kill-switch error (§3.2 item 6). Distinct from the
+-- depth/leaf/pause messages so the parent transcript distinguishes all
+-- spawn-failure causes.
+killSwitchMsg :: Text
+killSwitchMsg = "Delegation spawning is disabled: delegation.orchestrator_enabled = false. Re-trying will not succeed until the operator re-enables it."
+
+-- | The dedicated leaf-role error (§3.2 item 6): a leaf agent cannot
+-- spawn — actionable for both the model and the operator.
+leafMsg :: Text
+leafMsg = "AGENT_START is not available to this agent: its definition is a leaf (role: leaf). Ask the operator to grant the orchestrator role if delegation is required."
 
 -- | Register a finished child in the runtime registry (post-hoc; the worker
 -- ran synchronously to completion). Records the instance with status
 -- 'Stopped' (the synchronous child has already finished by the time this is
 -- called), so AGENT_INSTANCES / AGENT_STATUS / AGENT_STOP can observe it.
 -- Recovers the 'AgentDefId' from the task's @ctDefId@ (the ChildResult
--- carries the 'SubagentId' but not the def id).
-registerChild :: AgentRuntime -> ChildTask -> ChildResult -> IO ()
-registerChild runtime task result =
+-- carries the 'SubagentId' but not the def id). The recorded depth is the
+-- CHILD's own depth — the wiring's parent depth + 1 (issue #154: the
+-- former hardcoded 0 recorded every child at the root).
+registerChild :: AgentRuntime -> Int -> ChildTask -> ChildResult -> IO ()
+registerChild runtime childDepth task result =
   case mkAgentDefId (ctDefId task) of
     Left _ -> pure ()  -- malformed def id; skip registration
     Right aid ->
       case crChildSession result of
         Nothing -> pure ()  -- no child session; skip (error/timeout case)
         Just session -> do
-          let depth = 0  -- parent depth; the child's is depth+1 (not tracked here)
-          registerCompletedAgent runtime aid (crSubagentId result) session depth
+          registerCompletedAgent runtime aid (crSubagentId result) session childDepth
 
 -- | Extract the task list from a 'DelegateInput' (in order).
 diTasks :: DelegateInput -> [ChildTask]
@@ -648,8 +766,8 @@ singleStringSchema fieldName fieldDesc =
 
 -- | Encode the secret-free 'AgentDef' fields into the 'orRecorded' payload.
 -- The @was_new@ flag distinguishes create vs update in the audit log.
-encodeDefRecorded :: AgentDef -> Bool -> Value
-encodeDefRecorded d wasNew = object
+encodeDefRecorded :: AgentDef -> Bool -> [Text] -> Value
+encodeDefRecorded d wasNew unknownTools = object $
   [ "id"         .= agentDefIdText (adId d)
   , "name"       .= adName d
   , "provider"   .= adProvider d
@@ -657,11 +775,19 @@ encodeDefRecorded d wasNew = object
   , "system"     .= adSystem d
   , "tools"      .= encodeTools (adTools d)
   , "group"      .= adGroup d
+  , "role"       .= adRole d
+  , "description" .= adDescription d
   , "created_at" .= adCreatedAt d
   , "updated_at" .= adUpdatedAt d
   , "session"    .= adSession d
   , "was_new"    .= wasNew
-  ]
+  ] ++ [ "unknown_tools" .= unknownTools | not (null unknownTools) ]
+
+-- | The @[\<role\>]@ suffix rendered after a def id in AGENT_DEF_LIST
+-- output (and the W3 catalog): present only when the def carries a role.
+roleSuffix :: Maybe Text -> Text
+roleSuffix (Just r) = " [" <> r <> "]"
+roleSuffix Nothing  = ""
 
 -- | Encode an 'AllowList OpName' for the recorded payload: @\"all\"@ for
 -- 'AllowAll', or a JSON array of opcode-name strings for 'AllowOnly'.

@@ -3,7 +3,7 @@
 **Type**: `release-engineer-agent`
 **Role**: Safe delivery of approved code from merge through production verification
 **Spawned By**: Issue Orchestrator, PR Shepherd
-**Tools**: GitHub CLI (`gh`), deploy platform CLI, monitoring tools, BEADS CLI
+**Tools**: GitHub CLI (`gh`), deploy platform CLI, monitoring tools, task documents
 
 ---
 
@@ -48,7 +48,7 @@ Triggered when:
 **BEFORE any other work**, prime your context with relevant knowledge:
 
 ```bash
-bd prime --work-type release --keywords "deploy" "rollback" "merge" "production"
+read docs/knowledge/ for release context --keywords "deploy" "rollback" "merge" "production"
 ```
 
 Review the output and note:
@@ -64,7 +64,7 @@ Run the release readiness checklist. **Every item must pass before proceeding.**
 
 ```bash
 # Get the task/PR details
-bd show <task-id> --json
+# Show task: task-id> --json
 gh pr view <pr-number> --json reviews,statusCheckRollup,labels,mergeable
 
 # Check all required approvals
@@ -129,7 +129,7 @@ Types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `chore`, `ci`
 gh issue edit <issue-number> --add-label "merge-freeze:active"
 
 # Notify CoS/team about freeze
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 ```
 
 **Freeze rules:**
@@ -261,8 +261,8 @@ gh issue edit <issue-number> --remove-label "lifecycle:post-deploy-qa" --add-lab
 # Close the issue (or hand to CoS to close)
 gh issue close <issue-number>
 
-# Update BEADS
-bd close <task-id> --reason "Release complete. Deployed and verified in production."
+# Update task document
+# Mark task complete: <task-id> --reason "Release complete. Deployed and verified in production."
 
 # Notify stakeholders
 # - PM: release complete
@@ -400,9 +400,9 @@ When merge freeze is active and PRs are waiting:
 - Deploy URL: <url>
 - QA Report: <link>
 
-### BEADS Update
+### Task Update
 
-`bd close <task-id> --reason "Release complete"`
+mark complete (docs/tasks/): <task-id> --reason "Release complete"`
 ```
 
 ---
@@ -421,7 +421,7 @@ When merge freeze is active and PRs are waiting:
 - [ ] Merge freeze lifted
 - [ ] Stakeholders notified at each gate
 - [ ] Release report generated
-- [ ] BEADS task updated
+- [ ] task updated
 - [ ] If rollback: executed within 5 minutes of detection, P1 issue created
 - [ ] No production modifications made outside the deploy pipeline
 

@@ -1,11 +1,11 @@
 ---
 name: setup
-description: Interactive project setup — detects your project, configures metaswarm, writes project-local files
+description: Interactive project setup — detects your project, configures Seal Harness, writes project-local files
 ---
 
 # Setup
 
-Interactive setup for metaswarm. Detects your stack, asks targeted questions, writes project-local files, and creates platform-appropriate instruction files and command shims. Replaces both `npx metaswarm init` and the old `/metaswarm-setup` command.
+Interactive setup for Seal Harness. Detects your stack, asks targeted questions, writes project-local files, and creates platform-appropriate instruction files and command shims. Replaces both `npx Seal Harness init` and the old `/Seal Harness-setup` command.
 
 <CRITICAL-REQUIREMENTS>
 Setup MUST produce the mandatory outputs for the active platform. A shell script handles them automatically — you MUST run it.
@@ -15,7 +15,7 @@ After Phase 2 (user questions), determine the correct coverage command from the 
 ```bash
 PLUGIN_ROOT="${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${extensionPath:-}}}"
 if [ -z "$PLUGIN_ROOT" ]; then
-  setup_script="$(find "${CODEX_HOME:-$HOME/.codex}/plugins/cache" -path '*/metaswarm/*/lib/setup-mandatory-files.sh' -print -quit 2>/dev/null)"
+  setup_script="$(find "${CODEX_HOME:-$HOME/.codex}/plugins/cache" -path '*/Seal Harness/*/lib/setup-mandatory-files.sh' -print -quit 2>/dev/null)"
   if [ -n "$setup_script" ]; then
     PLUGIN_ROOT="$(cd "$(dirname "$setup_script")/.." && pwd)"
   fi
@@ -42,7 +42,7 @@ Where:
   - `all` only when the user explicitly asks to configure every supported CLI
 
 The script handles:
-1. **Instruction file** — `AGENTS.md` for Codex, `CLAUDE.md` for Claude, `GEMINI.md` for Gemini, `.opencode/OPENCODE.md` for OpenCode; appends metaswarm section (or writes new), skips if already present
+1. **Instruction file** — `AGENTS.md` for Codex, `CLAUDE.md` for Claude, `GEMINI.md` for Gemini, `.opencode/OPENCODE.md` for OpenCode; appends Seal Harness section (or writes new), skips if already present
 2. **`.coverage-thresholds.json`** — writes at project root with correct thresholds and command
 3. **Claude command shims** — for Claude/all only, writes `.claude/commands/start-task.md`, `prime.md`, `review-design.md`, `self-reflect.md`, `pr-shepherd.md`, `brainstorm.md`
 
@@ -55,9 +55,9 @@ The script outputs JSON with what was created/skipped/errored. Check that `"stat
 
 ### Existing Profile Check
 
-Use Glob to check if `.metaswarm/project-profile.json` exists.
+Use Glob to check if `docs/project-profile.json` exists.
 
-- **If it exists**: Read it, present the current configuration summary, and ask the user via AskUserQuestion: "You already have a metaswarm project profile. Re-run setup (overwrites choices) or skip?" Options: "Re-run setup" / "Skip". If the user skips, stop with: "Setup skipped. Existing configuration unchanged."
+- **If it exists**: Read it, present the current configuration summary, and ask the user via AskUserQuestion: "You already have a Seal Harness project profile. Re-run setup (overwrites choices) or skip?" Options: "Re-run setup" / "Skip". If the user skips, stop with: "Setup skipped. Existing configuration unchanged."
 - **If it does not exist**: Continue to Project Detection.
 
 ---
@@ -230,7 +230,7 @@ This is the FIRST thing to do after Phase 2. Determine the coverage command, the
 ```bash
 PLUGIN_ROOT="${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${extensionPath:-}}}"
 if [ -z "$PLUGIN_ROOT" ]; then
-  setup_script="$(find "${CODEX_HOME:-$HOME/.codex}/plugins/cache" -path '*/metaswarm/*/lib/setup-mandatory-files.sh' -print -quit 2>/dev/null)"
+  setup_script="$(find "${CODEX_HOME:-$HOME/.codex}/plugins/cache" -path '*/Seal Harness/*/lib/setup-mandatory-files.sh' -print -quit 2>/dev/null)"
   if [ -n "$setup_script" ]; then
     PLUGIN_ROOT="$(cd "$(dirname "$setup_script")/.." && pwd)"
   fi
@@ -269,7 +269,7 @@ If the instruction file was appended to (existing file), this step is not needed
 Read each file from `./knowledge/`:
 - `patterns.jsonl`, `gotchas.jsonl`, `decisions.jsonl`, `api-behaviors.jsonl`, `codebase-facts.jsonl`, `anti-patterns.jsonl`, `facts.jsonl`
 
-Write them to `.beads/knowledge/` in the project. Skip any that already exist.
+Write them to `docs/knowledge/` in the project. Skip any that already exist.
 
 #### Shell Utilities
 
@@ -278,17 +278,10 @@ Read each file from `./bin/`:
 
 Write them to `bin/` in the project. Make executable with `chmod +x`. Skip any that already exist.
 
-#### TypeScript Scripts
+#### Node.js Dependency Warning
 
-Read each file from `./scripts/`:
-- `beads-fetch-pr-comments.ts`, `beads-fetch-conversation-history.ts`
-
-Write them to `scripts/` in the project. Skip any that already exist.
-
-**Note**: The former `beads-self-reflect.ts` script is no longer bundled — the standalone beads plugin (v0.63.3+) provides `bd compact` for semantic summarization natively.
-
-**Node.js dependency warning**: If Node.js was NOT detected as the project language, print:
-> "Note: scripts/*.ts require Node.js (npx tsx) to run. Some advanced features (PR comment fetching, conversation history) will work once Node.js is available. Core metaswarm functionality does not require Node.js."
+If Node.js was NOT detected as the project language, print:
+> "Note: Some shell utilities in `bin/` may require Node.js. Core Seal Harness functionality does not require Node.js."
 
 #### Conditional Files
 
@@ -296,7 +289,6 @@ Write them to `scripts/` in the project. Skip any that already exist.
 |---|---|---|
 | User chose YES for CI | `./templates/ci.yml` | `.github/workflows/ci.yml` |
 | User chose YES for git hooks AND Husky detected or Node.js project | `./templates/pre-push` | `.husky/pre-push` (chmod +x) |
-| User chose YES for external tools | `./templates/external-tools.yaml` | `.metaswarm/external-tools.yaml` |
 | Always | `./templates/.env.example` | `.env.example` |
 | Always | `./templates/SERVICE-INVENTORY.md` | `SERVICE-INVENTORY.md` |
 | Always | `./templates/gitignore` | Merge into existing `.gitignore` (append missing entries, never duplicate) |
@@ -307,11 +299,11 @@ For `.gitignore`, read the existing file (if any), then append language-specific
 
 ## Phase 4: Profile Creation
 
-Write `.metaswarm/project-profile.json` with all detection results and user choices:
+Write `docs/project-profile.json` with all detection results and user choices:
 
 ```json
 {
-  "metaswarm_version": "1.0.0",
+  "Seal Harness_version": "1.0.0",
   "distribution": "plugin",
   "installed_at": "{current ISO 8601 timestamp}",
   "updated_at": "{current ISO 8601 timestamp}",
@@ -371,7 +363,7 @@ Command resolution reference:
 1. Check if Codex and Gemini CLIs are installed via Bash (`command -v codex`, `command -v gemini`)
 2. For tools not installed, tell the user how to install them
 3. For installed tools, verify with `--version`
-4. Update `.metaswarm/external-tools.yaml` — set `enabled: true` for installed tools, `enabled: false` for missing ones
+4. Update `docs/external-tools.yaml` — set `enabled: true` for installed tools, `enabled: false` for missing ones
 
 ### 5.2 Visual Review (if enabled)
 
@@ -406,7 +398,7 @@ Setup complete! Here's what was configured:
   Visual review:   {Enabled/Disabled}
 
 Mandatory files:
-  ✔ {instruction file} — {written new / appended metaswarm section / already had it}
+  ✔ {instruction file} — {written new / appended Seal Harness section / already had it}
   ✔ .coverage-thresholds.json — {threshold}% coverage, enforcement: `{command}`
   ✔ .claude/commands/   — Claude only: shims for start-task, prime, review-design, self-reflect, pr-shepherd, brainstorm
 
@@ -416,18 +408,18 @@ Other files written:
 You're all set! Run the platform's start command to begin working.
 ```
 
-**Command naming**: When recommending metaswarm skills to the user, use `$name` forms (`$start`, `$setup`, `$status`, `$pr-shepherd`) unless the active platform has already created and selected its own command shims.
+**Command naming**: When recommending Seal Harness skills to the user, use `$name` forms (`$start`, `$setup`, `$status`, `$pr-shepherd`) unless the active platform has already created and selected its own command shims.
 
 Offer 1-2 relevant tips based on configuration:
 - If external tools enabled: "Use `$external-tools` to check tool status."
-- If no CI set up: "Consider adding CI later -- metaswarm includes a template at `./templates/ci.yml`."
+- If no CI set up: "Consider adding CI later -- Seal Harness includes a template at `./templates/ci.yml`."
 - If visual review enabled: "The visual review skill will screenshot your app during development."
 
 ---
 
 ## Missing Setup Auto-Detection
 
-If `$start` is invoked and `.metaswarm/project-profile.json` does not exist, the start skill should auto-route here. This skill will run the full setup flow, then hand back to `$start` to continue with the user's original request.
+If `$start` is invoked and `docs/project-profile.json` does not exist, the start skill should auto-route here. This skill will run the full setup flow, then hand back to `$start` to continue with the user's original request.
 
 ---
 
@@ -457,7 +449,7 @@ case "$platform" in
   codex) instruction_file="AGENTS.md" ;;
   *) echo "UNKNOWN PLATFORM: $platform"; exit 1 ;;
 esac
-echo "$instruction_file:"; grep -c "metaswarm" "$instruction_file" 2>/dev/null || echo "MISSING"
+echo "$instruction_file:"; grep -c "Seal Harness" "$instruction_file" 2>/dev/null || echo "MISSING"
 echo "coverage:"; ls .coverage-thresholds.json 2>/dev/null || echo "MISSING"
 if [ "$platform" = "claude" ]; then
   echo "shims:"; ls .claude/commands/start-task.md .claude/commands/prime.md .claude/commands/brainstorm.md 2>/dev/null || echo "MISSING"

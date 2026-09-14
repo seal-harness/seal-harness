@@ -88,6 +88,7 @@ import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.LoopSpec
 import qualified Seal.Channels.SignalSpec
 import qualified Seal.Channels.Signal.EnvelopeSpec
+import qualified Seal.Channels.TabFocusSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
 import qualified Seal.Channels.TelegramSpec
@@ -127,6 +128,7 @@ import qualified Seal.Agent.Def.BackendSpec
 import qualified Seal.Agent.Def.BackendNoDirectFsFailSpec
 import qualified Seal.Agent.PromptPartsSpec
 import qualified Seal.Agent.Runtime.RegistrySpec
+import qualified Seal.Agent.Runtime.Delegation.WorkerSpec
 import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
@@ -258,6 +260,7 @@ main = hspec $ do
   Seal.Channels.LoopSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.SignalSpec.spec
+  Seal.Channels.TabFocusSpec.spec
   Seal.Channels.TelegramSpec.spec
   Seal.Channels.Telegram.ButtonsSpec.spec
   Seal.Channels.Telegram.CommandsSpec.spec
@@ -298,6 +301,7 @@ main = hspec $ do
   Seal.Skills.BackendNoDirectFsFailSpec.spec
   Seal.Agent.PromptPartsSpec.spec
   Seal.Agent.Runtime.RegistrySpec.spec
+  Seal.Agent.Runtime.Delegation.WorkerSpec.spec
   Seal.ISA.Ops.MemorySpec.spec
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec

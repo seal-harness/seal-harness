@@ -1,6 +1,6 @@
 # Project Instructions
 
-This project uses [metaswarm](https://github.com/dsifry/metaswarm), a multi-agent orchestration framework for OpenCode. It provides specialized agents, commands, and quality gates that enforce TDD, coverage thresholds, and spec-driven development.
+This project uses the Seal Harness multi-agent framework, a multi-agent orchestration framework for OpenCode. It provides specialized agents, commands, and quality gates that enforce TDD, coverage thresholds, and spec-driven development.
 
 ## How to Work in This Project
 
@@ -32,7 +32,7 @@ After writing a design document, you can request a review:
 
 | Command | Purpose |
 |---|---|
-| `/prime` | Load relevant knowledge from the BEADS knowledge base |
+| `/prime` | Load relevant knowledge from the knowledge base |
 | `/start-task` | Begin tracked work on a task with complexity assessment |
 | `/review-design` | Architecture-focused design review (single `@architect-agent` in this POC, not the full 5-agent gate) |
 
@@ -49,7 +49,7 @@ This is an initial POC integration. 3 of 13 commands and 2 of 19 agents are regi
 
 ## Current Limitations
 
-- BEADS integration via `.opencode/plugins` is not yet implemented
+- task tracking via `.opencode/plugins` is not yet implemented
 - Session hooks (compacting, session events) are not configured
 - Skills discovery is not wired
 - The full agent roster (17 remaining) is not registered

@@ -1596,8 +1596,8 @@ spec = describe "Seal.Gateway.API" $ do
           let now = UTCTime (fromGregorian 2026 7 1) 0
           let zoeId  = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
               devId  = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "dev"
-              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing now now (mkSystemSessionId "manual")
-              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll Nothing now now (mkSystemSessionId "manual")
+              mkZoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
+              mkDev = AgentDef devId "dev" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
           adbUpdate adb mkZoe
           adbUpdate adb mkDev
           let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
@@ -1673,7 +1673,7 @@ spec = describe "Seal.Gateway.API" $ do
       let now = UTCTime (fromGregorian 2026 7 1) 0
           adb = bAgentDefs backends
           zoeId = case mkAgentDefId "zoe" of Right x -> x; Left _ -> error "zoe"
-          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing now now (mkSystemSessionId "manual")
+          zoe = AgentDef zoeId "zoe" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
       adbUpdate adb zoe
       let paths = fakePaths { spState = tmp, spConfig = cfgRoot }
           sr = SessionRuntime { srPaths = paths, srConfigPath = cfgRoot </> "config.toml", srActive = activeRef }
@@ -1813,7 +1813,7 @@ spec = describe "Seal.Gateway.API" $ do
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "full" of Right x -> x; Left _ -> error "aid"
         d = AgentDef aid "Full Name" "anthropic" (ModelId "claude-sonnet-4") (Just "be terse")
-            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) Nothing now now (mkSystemSessionId "manual")
+            (AllowOnly (Set.fromList [OpName "FILE_READ", OpName "ASK_HUMAN"])) Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb d
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1907,7 +1907,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         aid = case mkAgentDefId "eddy" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = AgentDef aid "Eddy" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -1966,7 +1966,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let oldCreated = UTCTime (fromGregorian 2026 1 1) 0
         oldId = case mkAgentDefId "alpha" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing oldCreated oldCreated (mkSystemSessionId "manual")
+        seed = AgentDef oldId "Alpha" "ollama" (ModelId "llama3.2") Nothing AllowAll Nothing Nothing Nothing oldCreated oldCreated (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2024,7 +2024,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "keep" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll Nothing now now (mkSystemSessionId "manual")
+        seed = AgentDef aid "Keep" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -2063,7 +2063,7 @@ spec = describe "Seal.Gateway.API" $ do
     uiState <- newUiStateHandle mkPaths
     let now = UTCTime (fromGregorian 2026 7 1) 0
         aid = case mkAgentDefId "delme" of Right x -> x; Left _ -> error "aid"
-        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll Nothing now now (mkSystemSessionId "manual")
+        seed = AgentDef aid "delme" "" (ModelId "") Nothing AllowAll Nothing Nothing Nothing now now (mkSystemSessionId "manual")
     adbUpdate adb seed
     let sr = SessionRuntime { srPaths = mkPaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
@@ -3506,6 +3506,7 @@ spec = describe "Seal.Gateway.API" $ do
               { adId = uid, adName = "User Agent", adProvider = ""
               , adModel = ModelId "", adSystem = Just "user prompt"
               , adTools = AllowAll, adGroup = Nothing
+              , adRole = Nothing, adDescription = Nothing
               , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
               , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
               , adSession = mkSystemSessionId "manual" })
@@ -3638,6 +3639,7 @@ spec = describe "Seal.Gateway.API" $ do
           { adId = uid, adName = "User Agent", adProvider = ""
           , adModel = ModelId "", adSystem = Just "user prompt"
           , adTools = AllowAll, adGroup = Nothing
+          , adRole = Nothing, adDescription = Nothing
           , adCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
           , adUpdatedAt = UTCTime (fromGregorian 2026 1 1) 0
           , adSession = mkSystemSessionId "manual" })
@@ -3727,6 +3729,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdExecCache   = execCache404
             , sdRemoteRunner = Nothing
             , sdMkWorker    = Nothing
+, sdResolveProviderOverride = Nothing
+, sdMkWorkerStubDepth = 2
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3829,6 +3833,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
             , sdMkWorker    = Nothing
+, sdResolveProviderOverride = Nothing
+, sdMkWorkerStubDepth = 2
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3963,6 +3969,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
             , sdMkWorker    = Nothing
+, sdResolveProviderOverride = Nothing
+, sdMkWorkerStubDepth = 2
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4085,6 +4093,8 @@ spec = describe "Seal.Gateway.API" $ do
             , sdExecCache   = execCache
             , sdRemoteRunner = Nothing
             , sdMkWorker    = Nothing
+, sdResolveProviderOverride = Nothing
+, sdMkWorkerStubDepth = 2
             }
           deps = ApiDeps
             { adSessionRuntime  = sr

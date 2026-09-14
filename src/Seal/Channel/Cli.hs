@@ -226,6 +226,8 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
               , tdMkWorker    = Nothing
+              , tdResolveProviderOverride = Nothing
+              , tdMkWorkerStubDepth = 2
               }
             bgAdapter = TurnAdapter
               { taCaps          = bgCaps
@@ -276,6 +278,8 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
               , tdMkWorker    = Nothing
+              , tdResolveProviderOverride = Nothing
+              , tdMkWorkerStubDepth = 2
               }
         TurnEngine.callDispatcher td caps sid "cli" callOpName val
       plainHandler t = do
@@ -303,6 +307,8 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , tdExecCache    = execCache
               , tdRemoteRunner = Nothing
               , tdMkWorker    = Nothing
+              , tdResolveProviderOverride = Nothing
+              , tdMkWorkerStubDepth = 2
               }
             adapter = TurnAdapter
               { taCaps          = caps
@@ -377,6 +383,12 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
 
 -- | Handle a parsed 'TabSlashCommand' by mutating the 'TabsHandle' and
 -- replying via the channel caps. Pure-ish (the handle mutations are STM).
+--
+-- NOTE: The CLI tracks the active session via 'srActive', not a per-conversation
+-- cursor. @\/tab focus@ here only validates the index — it does NOT change
+-- which session the next message goes to (the CLI uses 'srActive' for that).
+-- The inbox-driven channels ('runChannelLoop') intercept @\/tab focus@ and
+-- update the cursor there.
 handleTabCommand :: ChannelCaps -> TabsHandle -> TabSlashCommand -> IO ()
 handleTabCommand caps tabsH = \case
   TabListCmd -> do

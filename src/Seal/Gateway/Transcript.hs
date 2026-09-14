@@ -455,11 +455,15 @@ trpToFrontend blk =
 -- 'recordSetupRepoResult' is dropped before reaching either the WS
 -- broadcast or the HTTP seed, so the user sees nothing for the repo
 -- setup).
+-- @ASK_HUMAN@ so pending questions from channel-originated turns
+-- (Telegram, Signal) surface in the web transcript. Without this, a
+-- question sent to a chat channel is invisible in the web UI — a
+-- "phantom message" that exists in the audit log but not the frontend.
 -- Approval-bearing entries always surface regardless of this whitelist.
 -- A 'Set' rather than a list to make the shared-state surface
 -- discoverable (see the design doc's §8 risk 2).
 userSurfacingOps :: Set.Set Text
-userSurfacingOps = Set.fromList ["SKILL_LOAD", "SETUP_REPO"]
+userSurfacingOps = Set.fromList ["SKILL_LOAD", "SETUP_REPO", "ASK_HUMAN"]
 
 -- | Predicate: does a harness payload's @op.name@ fall in
 -- 'userSurfacingOps'? Returns 'False' for payloads with no @op@ key, a

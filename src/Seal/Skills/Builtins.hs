@@ -34,7 +34,7 @@ import Data.Time.Clock (secondsToDiffTime)
 import Language.Haskell.TH.Syntax (qAddDependentFile)
 
 import Seal.Skills.Codec (decodeSkill)
-import Seal.Skills.Types (Skill (..), SkillId)
+import Seal.Skills.Types (Skill (..), SkillId, qualifiedSkillId)
 
 -- | The compiled-in provenance stamp for built-in skills. A fixed epoch
 -- instant so the embedded data is deterministic (no per-build timestamp
@@ -90,11 +90,15 @@ builtinSkills = mapMaybe decodeAndStamp builtinRaw
     decodeAndStamp (_expectedId, raw, group) =
       case decodeSkill raw of
         Nothing    -> Nothing
-        Just skill -> Just skill
-          { skCreatedAt = builtinStamp
-          , skUpdatedAt = builtinStamp
-          , skGroup     = Just group
-          }
+        Just skill ->
+          let stamped = skill
+                { skCreatedAt = builtinStamp
+                , skUpdatedAt = builtinStamp
+                , skGroup     = Just group
+                }
+          in Just stamped
+                { skId = qualifiedSkillId (skGroup stamped) (skId stamped)
+                }
 
 -- | 'builtinSkills' keyed by id for O(log n) lookups.
 builtinSkillMap :: Map SkillId Skill

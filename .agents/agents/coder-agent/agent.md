@@ -11,7 +11,7 @@ enabled: true
 **Type**: `coder-agent`
 **Role**: TDD implementation of features and fixes
 **Spawned By**: Issue Orchestrator
-**Tools**: Full codebase read/write, test runner, BEADS CLI
+**Tools**: Full codebase read/write, test runner, task documents
 
 ---
 
@@ -19,7 +19,7 @@ enabled: true
 
 The Coder Agent implements features and fixes following strict TDD (Test-Driven Development). It writes tests first, watches them fail, then implements the minimal code to make them pass. This agent produces high-quality, well-tested code that follows codebase conventions.
 
-> **Haskell project**: This repo is a Haskell (cabal + Nix + hspec + hlint) project. **Load the `haskell-coder` skill BEFORE writing any code** (see Step 0). The TypeScript/Vitest/Prisma patterns below are inherited from the upstream metaswarm template and do NOT apply here — the Haskell skill is authoritative for language-specific patterns (type-driven design, GHC extensions, cabal/Nix builds, hspec/QuickCheck testing).
+> **Haskell project**: This repo is a Haskell (cabal + Nix + hspec + hlint) project. **Load the `haskell-coder` skill BEFORE writing any code** (see Step 0). The TypeScript/Vitest/Prisma patterns below are inherited from the upstream Seal Harness template and do NOT apply here — the Haskell skill is authoritative for language-specific patterns (type-driven design, GHC extensions, cabal/Nix builds, hspec/QuickCheck testing).
 
 ---
 
@@ -29,7 +29,7 @@ The Coder Agent implements features and fixes following strict TDD (Test-Driven 
 2. **Code Quality**: Follow codebase conventions
 3. **Documentation**: Comment complex logic
 4. **Iteration**: Address review feedback
-5. **BEADS Updates**: Track progress via BEADS tasks
+5. **Task Updates**: Track progress via task documents
 
 ---
 
@@ -119,10 +119,10 @@ The TypeScript/Vitest/Prisma patterns in the inherited template below do NOT app
 
 ```bash
 # Prime with implementation-specific context for files you'll modify
-bd prime --work-type implementation --files "<affected-files>" --keywords "<feature-keywords>"
+read docs/knowledge/ for implementation context --files "<affected-files>" --keywords "<feature-keywords>"
 
 # Example:
-bd prime --work-type implementation --files "src/lib/services/*.ts" --keywords "testing" "service"
+read docs/knowledge/ for implementation context --files "src/lib/services/*.ts" --keywords "testing" "service"
 ```
 
 Review the output and note:
@@ -136,10 +136,10 @@ Review the output and note:
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get the approved plan from CTO review
-bd show <plan-task-id> --json
+# Show task: plan-task-id> --json
 
 # Read the implementation plan
 # (location specified in plan task output)
@@ -149,12 +149,12 @@ bd show <plan-task-id> --json
 
 ```bash
 # Mark task as in progress
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 
 # Create subtasks for each component
-bd create "Write tests for <component>" --type task --parent <epic-id>
-bd create "Implement <component>" --type task --parent <epic-id>
-bd dep add <impl-subtask> <test-subtask>
+# Create a task document in docs/tasks/ for: "Write tests for <component>" --type task --parent <epic-id>
+# Create a task document in docs/tasks/ for: "Implement <component>" --type task --parent <epic-id>
+# Add dependency: <impl-subtask> <test-subtask>
 ```
 
 ### Step 3: TDD Cycle
@@ -271,12 +271,12 @@ pnpm typecheck
 pnpm lint
 ```
 
-### Step 5: Update BEADS
+### Step 5: Update task document
 
 ```bash
 # Mark implementation complete
-bd update <task-id> --status completed
-bd close <task-id> --reason "Implementation complete. All tests passing."
+# Update task status: <task-id> --status completed
+# Mark task complete: <task-id> --reason "Implementation complete. All tests passing."
 
 # List files changed
 git diff --name-only main..HEAD
@@ -531,7 +531,7 @@ When Code Review Agent returns feedback:
 2. **Fix CRITICAL and HIGH** issues first
 3. **Address in order** of severity
 4. **Run tests after each fix** to prevent regression
-5. **Update BEADS** when fixes are complete
+5. **Update task document** when fixes are complete
 
 ```bash
 # After addressing feedback
@@ -539,9 +539,9 @@ pnpm test --run
 pnpm typecheck
 pnpm lint
 
-# Update BEADS
-bd update <task-id> --status in_progress
-bd label remove <task-id> needs:fixes
+# Update task document
+# Update task status: <task-id> --status in_progress
+# Remove label: <task-id> needs:fixes
 ```
 
 ---
@@ -552,17 +552,17 @@ bd label remove <task-id> needs:fixes
 
 ```bash
 # Update task with progress
-bd update <task-id> --status in_progress
+# Update task status: <task-id> --status in_progress
 
 # Add notes about what's done
-# (via BEADS comments or GitHub Issue comments)
+# (via task documents comments or GitHub Issue comments)
 ```
 
 ### On Completion
 
 ```bash
 # Mark complete with summary
-bd close <task-id> --reason "Implementation complete.
+# Mark task complete: <task-id> --reason "Implementation complete.
 Files changed: src/lib/services/feature.service.ts, etc.
 Tests: 12 added, all passing.
 Ready for code review."
@@ -632,4 +632,4 @@ The Coder Agent produces working code with:
 - [ ] Type-driven design (illegal states unrepresentable; newtypes for domain IDs; smart constructors with validation; strict fields by default)
 - [ ] No partial functions in production paths (`head`/`tail`/`fromJust`/`read`/`!!`/`error`/`undefined` — use total patterns or `Either`/`Maybe`)
 - [ ] `Text` over `String`; `foldl'` over `foldl`
-- [ ] BEADS task closed with summary
+- [ ] task closed with summary

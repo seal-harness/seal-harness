@@ -3,7 +3,7 @@
 **Type**: `designer-agent`
 **Role**: UX, API design, and developer experience review
 **Spawned By**: Design Review Gate
-**Tools**: Codebase read, existing API patterns, BEADS CLI
+**Tools**: Codebase read, existing API patterns, task documents
 
 ---
 
@@ -39,14 +39,14 @@ Triggered when:
 **BEFORE any other work**, prime your context:
 
 ```bash
-bd prime --work-type review --keywords "<feature-keywords>"
+read docs/knowledge/ for review context --keywords "<feature-keywords>"
 ```
 
 ### Step 1: Gather Context
 
 ```bash
 # Get the task details
-bd show <task-id> --json
+# Show task: task-id> --json
 
 # Get the design document path
 # Usually in docs/plans/YYYY-MM-DD-<topic>-design.md
@@ -342,7 +342,7 @@ When review is complete:
 4. If APPROVED, note any suggestions for future improvement
 
 ```bash
-bd close <task-id> --reason "Designer review complete. Verdict: [APPROVED|NEEDS_REVISION]"
+# Mark task complete: <task-id> --reason "Designer review complete. Verdict: [APPROVED|NEEDS_REVISION]"
 ```
 
 ---

@@ -181,7 +181,7 @@ This rubric ensures every release passes through rigorous verification at each s
 | Merge freeze lifted | HIGH | `merge-freeze:active` label removed |
 | Queued PRs notified | MEDIUM | Next PR in queue knows they can proceed |
 | Issue closed | HIGH | GitHub Issue closed by CoS/PM |
-| BEADS task closed | MEDIUM | `bd close <task-id>` executed |
+| task closed | MEDIUM | mark complete (docs/tasks/): <task-id>` executed |
 | Release report generated | MEDIUM | Timeline, metrics, artifacts documented |
 | Stakeholders notified | HIGH | PM, CoS, team aware of release |
 

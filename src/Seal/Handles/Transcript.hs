@@ -277,10 +277,17 @@ withTwoFileTranscript dir action = do
       ack = maybe (pure ()) (\tv -> atomically (putTMVar tv ()))
       writeOne st (TwoFileWrite msgs entry) = do
         secretOps <- readIORef (tfsSecretOpsRef st)
-        let new = diffMessages msgs (tfsWritten st)
-            redacted = redactMessages secretOps msgs new
+        -- Redact the FULL incoming list BEFORE diffing so the comparison
+        -- is redacted-vs-redacted. The agent loop passes the in-memory list
+        -- (with unredacted tool results) on every write; tfsWritten holds
+        -- the redacted version from the previous write. Without pre-diff
+        -- redaction, stripPrefix fails on the unredacted-vs-redacted
+        -- mismatch and the fallback re-appends the entire conversation
+        -- (O(N²) duplication — session 20260912-183908-767).
+        let redactedMsgs = redactMessages secretOps msgs msgs
+            new = diffMessages redactedMsgs (tfsWritten st)
         -- 1. Append new conversation lines, fsync.
-        mapM_ (\m -> writeFd (tfsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) redacted
+        mapM_ (\m -> writeFd (tfsConvFd st) (encodeConvLine (ConvLine m) <> "\n")) new
         fileSynchronise (tfsConvFd st)
         -- 2. Compute a minimal envelope delta for EKRequest entries. The
         -- caller passes a FULL delta (every field set to 'Just'); the writer
@@ -302,7 +309,7 @@ withTwoFileTranscript dir action = do
         -- 3. Append the entry line, fsync.
         writeFd (tfsEntriesFd st) (encodeEntryRecordRaw entry' <> "\n")
         fileSynchronise (tfsEntriesFd st)
-        pure st { tfsWritten = tfsWritten st <> redacted, tfsPriorEnv = mNextEnv }
+        pure st { tfsWritten = tfsWritten st <> new, tfsPriorEnv = mNextEnv }
       drain st = do
         next <- atomically (tryReadTQueue q)
         case next of
@@ -427,9 +434,9 @@ fakeTwoFileTranscript = do
       handle w = do
         secretOps <- readIORef secretOpsRef
         written <- readMVar convRef
-        let new = diffMessages (tfwMessages w) written
-            redacted = redactMessages secretOps (tfwMessages w) new
-        mapM_ pushConv redacted
+        let redactedMsgs = redactMessages secretOps (tfwMessages w) (tfwMessages w)
+            newRedacted = diffMessages redactedMsgs written
+        mapM_ pushConv newRedacted
         pushEntry (tfwEntry w)
   pure
     ( TwoFileHandle

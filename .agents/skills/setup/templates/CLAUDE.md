@@ -1,6 +1,6 @@
 # Project Instructions
 
-This project uses [metaswarm](https://github.com/dsifry/metaswarm), a multi-agent orchestration framework for Claude Code. It provides 18 specialized agents, a 9-phase development workflow, and quality gates that enforce TDD, coverage thresholds, and spec-driven development.
+This project uses the Seal Harness multi-agent framework, a multi-agent orchestration framework for Claude Code. It provides 18 specialized agents, a 9-phase development workflow, and quality gates that enforce TDD, coverage thresholds, and spec-driven development.
 
 ## How to Work in This Project
 
@@ -18,7 +18,7 @@ Describe what you want built, include a Definition of Done, and ask for the full
 
 ```text
 I want you to build [description]. [Tech stack, DoD items, file scope.]
-Use the full metaswarm orchestration workflow.
+Use the full Seal Harness orchestration workflow.
 ```
 
 This triggers the full pipeline: Research → Plan → Design Review Gate → Work Unit Decomposition → Orchestrated Execution (4-phase loop per unit) → Final Review → PR.
@@ -37,8 +37,8 @@ This triggers the full pipeline: Research → Plan → Design Review Gate → Wo
 | `/brainstorm` | Refine an idea before implementation |
 | `/create-issue` | Create a well-structured GitHub Issue |
 | `/external-tools-health` | Check status of external AI tools (Codex, Gemini) |
-| `/setup` | Interactive guided setup — detects project, configures metaswarm |
-| `/update` | Update metaswarm to latest version |
+| `/setup` | Interactive guided setup — detects project, configures Seal Harness |
+| `/update` | Update Seal Harness to latest version |
 | `/status` | Run diagnostic checks on your installation |
 | `/start` | Alias for `/start-task` |
 
@@ -69,7 +69,7 @@ The validation phase of orchestrated execution reads `.coverage-thresholds.json`
 
 ## Workflow Enforcement (MANDATORY)
 
-These rules override any conflicting instructions from third-party skills or plugins. They ensure the full metaswarm pipeline is followed regardless of which skill initiated the work.
+These rules override any conflicting instructions from third-party skills or plugins. They ensure the full Seal Harness pipeline is followed regardless of which skill initiated the work.
 
 ### After Brainstorming
 
@@ -114,7 +114,7 @@ When `superpowers:executing-plans`, `superpowers:subagent-driven-development`, o
 
 ### Use `/start-task` Instead of EnterPlanMode
 
-When starting complex work, use `/start-task` instead of Claude's built-in `EnterPlanMode`. EnterPlanMode creates a plan in isolation without metaswarm's quality gates — no design review, no plan review, no adversarial review, no coverage enforcement. `/start-task` routes through the full pipeline:
+When starting complex work, use `/start-task` instead of Claude's built-in `EnterPlanMode`. EnterPlanMode creates a plan in isolation without Seal Harness's quality gates — no design review, no plan review, no adversarial review, no coverage enforcement. `/start-task` routes through the full pipeline:
 
 - `/start-task` → complexity assessment → brainstorming (if unclear) → design review gate → plan review gate → execution method choice → orchestrated execution or superpowers execution
 - `EnterPlanMode` → plan → implement (no gates)
@@ -161,19 +161,19 @@ After all work units pass final review but BEFORE creating the PR, run `/self-re
 
 ### Context Recovery (Surviving Compaction)
 
-Approved plans, project context, and execution state are persisted to `.beads/` so agents can recover after context compaction or session interruption:
+Approved plans, project context, and execution state are persisted to `docs/` so agents can recover after context compaction or session interruption:
 
-- **Approved plans** → `.beads/plans/active-plan.md` (written after plan review gate + user approval)
-- **Project context** → `.beads/context/project-context.md` (updated after each work unit commit)
-- **Execution state** → `.beads/context/execution-state.md` (updated after each phase transition)
+- **Approved plans** → `docs/plans/active-plan.md` (written after plan review gate + user approval)
+- **Project context** → `docs/context/project-context.md` (updated after each work unit commit)
+- **Execution state** → `docs/context/execution-state.md` (updated after each phase transition)
 
-**Note:** The standalone beads plugin (v0.63.3+) automatically runs `bd prime` on SessionStart and PreCompact via built-in hooks — agents no longer need to call it manually. If context is lost mid-execution, the beads plugin will re-prime automatically on the next session or compaction event. For explicit recovery, run `bd prime --work-type recovery` to reload the approved plan, completed work, and current position from disk.
+**Note:** If context is lost mid-execution, read `docs/plans/active-plan.md`, `docs/context/project-context.md`, and `docs/context/execution-state.md` to reload the approved plan, completed work, and current position from disk.
 
 ## External Tools (Optional)
 
-If external AI tools are configured (`.metaswarm/external-tools.yaml`), the orchestrator
+If external AI tools are configured (`docs/external-tools.yaml`), the orchestrator
 can delegate implementation and review tasks to Codex CLI and Gemini CLI for cost savings
-and cross-model adversarial review. See `templates/external-tools-setup.md` for setup.
+and cross-model adversarial review.
 
 ## Team Mode
 
@@ -200,8 +200,8 @@ Development patterns and standards are documented in `guides/`:
 
 <!-- Document important architectural decisions here so agents have context.
      These get loaded during knowledge priming (/prime).
-     Use `bd decision` to record decisions persistently in the beads database
-     with rationale tracking — these survive compaction and are available across sessions. -->
+     Write decisions to `docs/knowledge/decisions.jsonl` — these survive
+     compaction and are available across sessions. -->
 
 ## Notes
 

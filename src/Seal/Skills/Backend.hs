@@ -41,7 +41,7 @@ import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -59,7 +59,7 @@ import Seal.Git.Repo (ConfigRepo, gitCommitAll)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Skills.Codec (decodeSkill, encodeSkill)
 import Seal.Skills.Builtins (builtinSkillMap)
-import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
+import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText, bareSkillIdText, qualifiedSkillId, skillIdGroup)
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types (RemotePath, mkRemotePath, getRemotePath)
@@ -83,6 +83,22 @@ data SkillBackend = SkillBackend
   -- ^ Remove a skill by id (delete the file + auto-commit; idempotent).
   }
 
+-- | Resolve a 'SkillId' against a 'Map' of skills, handling both
+-- fully-qualified ids (e.g. @core\/greet@) and bare ids (e.g. @greet@).
+-- A FQ id is a direct key lookup. A bare id searches all skills whose
+-- 'bareSkillIdText' matches; if exactly one matches, it is returned;
+-- if zero or multiple match, 'Nothing' (ambiguous or absent). This makes
+-- @sbRead (SkillId "greet")@ work when there is only one @greet@ across
+-- all groups, while @sbRead (SkillId "core\/greet")@ always works
+-- unambiguously.
+resolveSkillId :: SkillId -> Map.Map SkillId Skill -> Maybe Skill
+resolveSkillId sid m
+  | isJust (skillIdGroup sid) = Map.lookup sid m
+  | otherwise =
+      case [ s | (sId, s) <- Map.toList m, bareSkillIdText sId == bareSkillIdText sid ] of
+        [s] -> Just s
+        _   -> Nothing
+
 -- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
 -- Kept as a fallback when no config repo is available.
 noneBackend :: IO SkillBackend
@@ -90,7 +106,9 @@ noneBackend = do
   ref <- newIORef (Map.empty :: Map SkillId Skill)
   pure SkillBackend
     { sbCreate = \s -> modifyIORef' ref (Map.insert (skId s) s)
-    , sbRead   = \sid -> Map.lookup sid <$> readIORef ref
+    , sbRead   = \sid -> do
+        m <- readIORef ref
+        pure (resolveSkillId sid m)
     , sbList   = Map.elems <$> readIORef ref
     , sbUpdate = \s -> modifyIORef' ref (Map.insert (skId s) s)
     , sbDelete = modifyIORef' ref . Map.delete
@@ -104,7 +122,7 @@ noneBackend = do
 markdownSkillBackend :: FilePath -> ConfigRepo -> IO SkillBackend
 markdownSkillBackend dir repo = pure SkillBackend
     { sbCreate = writeSkill dir repo
-    , sbRead   = readSkill dir
+    , sbRead   = readSkillDisambig dir
     , sbList   = listSkills dir
     , sbUpdate = writeSkill dir repo
     , sbDelete = deleteSkill dir repo
@@ -130,7 +148,7 @@ unionSkillBackend user = SkillBackend
         mUser <- sbRead user sid
         case mUser of
           Just s  -> pure (Just s)
-          Nothing -> pure (Map.lookup sid builtinSkillMap)
+          Nothing -> pure (resolveSkillId sid builtinSkillMap)
     , sbList   = do
         userSkills <- sbList user
         let userMap = Map.fromList [(skId s, s) | s <- userSkills]
@@ -191,7 +209,7 @@ workdirSkillBackend fs = pure SkillBackend
     { sbCreate = \_ -> pure ()
     , sbRead   = \sid -> do
         skills <- listWorkdirSkills fs
-        pure (Map.lookup sid (Map.fromList [(skId s, s) | s <- skills]))
+        pure (resolveSkillId sid (Map.fromList [(skId s, s) | s <- skills]))
     , sbList   = listWorkdirSkills fs
     , sbUpdate = \_ -> pure ()
     , sbDelete = \_ -> pure ()
@@ -268,7 +286,7 @@ listWorkdirSkillsSnap snap fs = do
 staticSkillBackend :: [Skill] -> IO SkillBackend
 staticSkillBackend skills = pure SkillBackend
   { sbCreate = \_ -> pure ()
-  , sbRead   = \sid -> pure (Map.lookup sid (Map.fromList [(skId s, s) | s <- skills]))
+  , sbRead   = \sid -> pure (resolveSkillId sid (Map.fromList [(skId s, s) | s <- skills]))
   , sbList   = pure skills
   , sbUpdate = \_ -> pure ()
   , sbDelete = \_ -> pure ()
@@ -286,9 +304,11 @@ readAgentSkillDirect fs mGroup dirRel = do
     Left _   -> pure Nothing
     Right c -> pure (stampGroupDirect (decodeAgentSkillWithGroup mGroup c))
   where
-    stampGroupDirect (Just s) = case skGroup s of
-      Just _  -> Just s
-      Nothing -> Just s { skGroup = mGroup }
+    stampGroupDirect (Just s) =
+      let s' = case skGroup s of
+            Just _  -> s
+            Nothing -> s { skGroup = mGroup }
+      in Just s' { skId = qualifiedSkillId (skGroup s') (skId s') }
     stampGroupDirect Nothing = Nothing
 
 -- | Stamp a repo-local skill's 'skGroup' with @"\<repo\> project skills"@
@@ -338,7 +358,7 @@ tripleUnionSkillBackend workdir user = SkillBackend
             mUser <- sbRead user sid
             case mUser of
               Just s  -> pure (Just s)
-              Nothing -> pure (Map.lookup sid builtinSkillMap)
+              Nothing -> pure (resolveSkillId sid builtinSkillMap)
     , sbList   = do
         wdSkills <- sbList workdir
         userSkills <- sbList user
@@ -352,7 +372,7 @@ tripleUnionSkillBackend workdir user = SkillBackend
 
 -- | The filename for a skill in the flat layout: @\<id\>.md@.
 skillFile :: FilePath -> SkillId -> FilePath
-skillFile dir sid = dir </> T.unpack (skillIdText sid) <.> "md"
+skillFile dir sid = dir </> T.unpack (bareSkillIdText sid) <.> "md"
 
 -- | The full path for a skill write, honoring its group. A grouped skill
 -- lives at @\<root\>\/\<group\>\/\<id\>.md@; an ungrouped skill (or one
@@ -362,7 +382,7 @@ skillPath :: FilePath -> Skill -> FilePath
 skillPath root skill =
   case skGroup skill of
     Just g | not (T.null (T.strip g)) ->
-      root </> T.unpack (T.strip g) </> T.unpack (skillIdText (skId skill)) <.> "md"
+      root </> T.unpack (T.strip g) </> T.unpack (bareSkillIdText (skId skill)) <.> "md"
     _ -> skillFile root (skId skill)
 
 -- | Write one skill to disk (atomic) and auto-commit. Honors 'skGroup':
@@ -381,8 +401,8 @@ writeSkill root repo s = do
   renameFile tmp path
   let rel = "skills" </> case skGroup s of
         Just g | not (T.null (T.strip g)) ->
-          T.unpack (T.strip g) </> (T.unpack (skillIdText (skId s)) <.> "md")
-        _ -> T.unpack (skillIdText (skId s)) <.> "md"
+          T.unpack (T.strip g) </> (T.unpack (bareSkillIdText (skId s)) <.> "md")
+        _ -> T.unpack (bareSkillIdText (skId s)) <.> "md"
   _ <- gitCommitAll repo rel ("seal: SKILL write " <> skillIdText (skId s))
   pure ()
 
@@ -401,14 +421,36 @@ writeSkill root repo s = do
 readSkill :: FilePath -> SkillId -> IO (Maybe Skill)
 readSkill root sid = do
   let fs = userDirFs root
-      base = skillIdText sid <> ".md"
-      dir = skillIdText sid
+      base = bareSkillIdText sid <> ".md"
+      dir = bareSkillIdText sid
+  -- If the id is fully-qualified (e.g. "core/greet"), narrow the
+  -- group search to just that group. If the id is bare (e.g.
+  -- "greet"), search all groups (disambiguation is done by the
+  -- caller via sbRead — readSkill returns the first match, which
+  -- may not be the intended one for a bare id with duplicates).
   groups <- listSubdirs fs
-  let nativeGrouped   = [ readAndStampGroup fs (g <> "/" <> base) (Just g) | g <- groups ]
-      agentGrouped    = [ readAgentSkillAt fs (g <> "/" <> dir) (Just g) | g <- groups ]
+  let mFqGroup = skillIdGroup sid
+      searchGroups = case mFqGroup of
+        Just g  -> [g]
+        Nothing -> groups
+      nativeGrouped   = [ readAndStampGroup fs (g <> "/" <> base) (Just g) | g <- searchGroups ]
+      agentGrouped    = [ readAgentSkillAt fs (g <> "/" <> dir) (Just g) | g <- searchGroups ]
       nativeFlat      = readAndStampGroup fs base Nothing
       agentTop        = readAgentSkillAt fs dir Nothing
   firstMatchM (nativeGrouped ++ agentGrouped ++ [nativeFlat, agentTop])
+
+-- | Read one skill by id with disambiguation. For a fully-qualified id
+-- (e.g. @core\/greet@), delegates directly to 'readSkill' (which narrows
+-- the search to the specified group). For a bare id (e.g. @greet@), lists
+-- all skills and returns the unique match if exactly one skill has that
+-- bare id; returns 'Nothing' if zero or multiple skills match (ambiguous).
+-- This is the 'sbRead' implementation for 'markdownSkillBackend'.
+readSkillDisambig :: FilePath -> SkillId -> IO (Maybe Skill)
+readSkillDisambig root sid
+  | isJust (skillIdGroup sid) = readSkill root sid
+  | otherwise = do
+      allSkills <- listSkills root
+      pure (resolveSkillId sid (Map.fromList [(skId s, s) | s <- allSkills]))
 
 -- | Read a skill file at @\<anchor\>\/\<rel\>@ (via the 'WorkdirFs') and,
 -- if it decodes, fill in 'skGroup' from the directory when the frontmatter
@@ -422,11 +464,13 @@ readAndStampGroup fs rel mGroup = do
     Left _ -> pure Nothing
     Right content -> case decodeSkill content of
       Nothing -> pure Nothing
-      Just s  -> pure (Just (stampGroup s))
+      Just s  -> pure (Just (qualifyAndStamp s))
   where
-    stampGroup s = case skGroup s of
-      Just _  -> s
-      Nothing -> s { skGroup = mGroup }
+    qualifyAndStamp s =
+      let s' = case skGroup s of
+            Just _  -> s
+            Nothing -> s { skGroup = mGroup }
+      in s' { skId = qualifiedSkillId (skGroup s') (skId s') }
 
 -- | Enumerate the immediate sub-directories of the 'WorkdirFs' anchor
 -- (non-recursive, no hidden dirs), sorted for deterministic output.
@@ -539,7 +583,7 @@ listGroupedAgentSkills fs = do
 deleteSkill :: FilePath -> ConfigRepo -> SkillId -> IO ()
 deleteSkill dir repo sid = do
   let fs = userDirFs dir
-      base = T.unpack (skillIdText sid) <.> "md"
+      base = T.unpack (bareSkillIdText sid) <.> "md"
   groups <- listSubdirs fs
   let groupedPaths = [ dir </> T.unpack g </> base | g <- groups ]
       flatPath     = skillFile dir sid
@@ -594,9 +638,11 @@ readAgentSkillAt fs dir mGroup = do
         Left _   -> pure Nothing
         Right c -> pure (stampGroup (decodeAgentSkillWithGroup mGroup c))
   where
-    stampGroup (Just s) = case skGroup s of
-      Just _  -> Just s
-      Nothing -> Just s { skGroup = mGroup }
+    stampGroup (Just s) =
+      let s' = case skGroup s of
+            Just _  -> s
+            Nothing -> s { skGroup = mGroup }
+      in Just s' { skId = qualifiedSkillId (skGroup s') (skId s') }
     stampGroup Nothing = Nothing
 
 -- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter
