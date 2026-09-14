@@ -247,6 +247,8 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
       replyFanoutMessage (cdReplies deps) sid (chLabel h) t
   , taChannelLabel  = smChannel
   , taOnStop        = Just . replyFanout (cdReplies deps)
+  , taOnToolCall    = Nothing
+  , taOnTextDelta   = Nothing
   , taOnUserMessage = \meta -> if shouldAutoTab meta
                                  then Nothing
                                  else Just (broadcastTabs deps (cdTabs deps))

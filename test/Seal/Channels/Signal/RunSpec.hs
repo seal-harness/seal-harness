@@ -158,7 +158,7 @@ spec = do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
-                    , aeOnStop = Nothing
+                    , aeOnStop = Nothing, aeOnToolCall = Nothing, aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag

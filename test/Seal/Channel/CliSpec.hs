@@ -161,6 +161,8 @@ spec = do
                   , teOnUserMessage = Nothing
                   , teChannel       = "cli"
                   , teOnStop        = Nothing
+                  , teOnToolCall    = Nothing
+                  , teOnTextDelta   = Nothing
                   , teAbortFlag     = testAbortFlag
                   , teToolTimeout   = defaultToolTimeoutConfig
                   }
