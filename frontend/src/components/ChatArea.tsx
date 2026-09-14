@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Profiler, memo } from 'react'
 import type { Agent, AgentInfo, Message, MessageContent, CodeSpan, ToolCallInfo, ToolDefsBlock, SessionInfo, TranscriptEntry } from '../types'
@@ -6,7 +6,7 @@ import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
-import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
+import { fetchModelContext, fetchSkillsCatalog, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 
 /** Click-to-edit chat-header title. Displays the cascade
@@ -438,12 +438,41 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
   // string doesn't change during the modal's lifetime, so memoizing avoids
   // re-parsing a multi-MB payload every time the user switches tabs or
   // triggers any re-render.
-  const { pretty, parsed } = useMemo(() => {
+  const { pretty, parsed, truncationMarkers } = useMemo(() => {
     const done = perf.begin('rawJsonModal.parse')
-    const result = { pretty: prettyJsonOrRaw(body), parsed: tryParse(body) }
+    // Find all truncation markers in the pretty-printed text so we can
+    // render an inline "Load full catalog" button at each occurrence.
+    const markerRe = /\[\.\.\.catalog truncated at \d+ chars; (\d+) more chars elided\.\.\.\]/g
+    const markers: { index: number; text: string; elided: number }[] = []
+    let m: RegExpExecArray | null
+    while ((m = markerRe.exec(prettyJsonOrRaw(body))) !== null) {
+      markers.push({ index: m.index, text: m[0], elided: parseInt(m[1] ?? '0', 10) })
+    }
+    const result = { pretty: prettyJsonOrRaw(body), parsed: tryParse(body), truncationMarkers: markers }
     done({ meta: { bodyBytes: body.length } })
     return result
-  }, [body])
+  }, [body]) as { pretty: string; parsed: { ok: true; value: unknown } | { ok: false }; truncationMarkers: { index: number; text: string; elided: number }[] }
+
+  // Track which marker indices have been expanded (loaded). Each marker
+  // gets its own "Load full catalog" button; clicking loads the full
+  // catalog text and displays it inline at that marker's position.
+  const [loadedMarkers, setLoadedMarkers] = useState<Set<number>>(new Set())
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogError, setCatalogError] = useState(false)
+  const [catalogText, setCatalogText] = useState<string | null>(null)
+  const loadCatalog = useCallback((markerIdx: number) => {
+    setCatalogLoading(true)
+    setCatalogError(false)
+    void fetchSkillsCatalog().then((result) => {
+      setCatalogLoading(false)
+      if (result && result.catalog) {
+        setCatalogText(result.catalog)
+        setLoadedMarkers(prev => new Set(prev).add(markerIdx))
+      } else {
+        setCatalogError(true)
+      }
+    })
+  }, [])
 
   const [tab, setTab] = useState<JsonTab>('formatted')
 
@@ -530,7 +559,55 @@ function RawJsonModal({ title, body, onClose }: { title: string; body: string; o
             </div>
           )
         ) : (
-          <pre className="raw-json-body" data-testid="raw-json-body">{pretty}</pre>
+          <pre className="raw-json-body" data-testid="raw-json-body">
+            {truncationMarkers.length === 0 ? (
+              pretty
+            ) : (
+              (() => {
+                const parts: ReactNode[] = []
+                let lastIdx = 0
+                truncationMarkers.forEach((marker, mi) => {
+                  // Text before the marker — rendered as plain text inline
+                  if (marker.index > lastIdx) {
+                    parts.push(pretty.slice(lastIdx, marker.index))
+                  }
+                  if (loadedMarkers.has(mi) && catalogText) {
+                    // Expanded catalog inline at the marker position
+                    parts.push(
+                      <span key={`loaded-${mi}`} className="catalog-inline-expanded" data-testid="catalog-full-section">
+                        <span className="catalog-inline-expanded-text" data-testid="catalog-full-body">{catalogText}</span>
+                      </span>,
+                    )
+                  } else {
+                    // Inline button at the marker position
+                    parts.push(
+                      <span key={`marker-${mi}`} className="catalog-inline-marker" data-testid="catalog-truncation-notice">
+                        <button
+                          className="catalog-load-button"
+                          data-testid="catalog-load-button"
+                          disabled={catalogLoading}
+                          onClick={() => loadCatalog(mi)}
+                        >
+                          {catalogLoading ? 'Loading…' : 'Load full catalog'}
+                        </button>
+                        {catalogError && (
+                          <span className="catalog-error-text" data-testid="catalog-error-text">
+                            Failed to load. Try again.
+                          </span>
+                        )}
+                      </span>,
+                    )
+                  }
+                  lastIdx = marker.index + marker.text.length
+                })
+                // Trailing text after the last marker
+                if (lastIdx < pretty.length) {
+                  parts.push(pretty.slice(lastIdx))
+                }
+                return parts
+              })()
+            )}
+          </pre>
         )}
       </div>
     </div>,

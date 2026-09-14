@@ -121,6 +121,8 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteSkillCreate   :: SealRoute '[] '[] (Body Req) Resp
   RouteSkillUpdate   :: SealRoute '[SkillIdOrErr] '[] (Body Req) Resp
   RouteSkillDelete   :: SealRoute '[SkillIdOrErr] '[] Bodyless Resp
+  -- Skills catalog (full, untruncated)
+  RouteSkillsCatalog :: SealRoute '[] '[] Bodyless Resp
   -- Repos
   RouteReposList     :: SealRoute '[] '[] Bodyless Resp
   RouteRepoCreate    :: SealRoute '[] '[] (Body Req) Resp
@@ -191,6 +193,7 @@ routeMeta = \case
   RouteSkillCreate -> Meta (match "skills" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteSkillUpdate -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteSkillDelete -> Meta (match "skills" ./ capture skillIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
+  RouteSkillsCatalog -> Meta (match "skills" ./ match "catalog" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteReposList -> Meta (match "repos" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteRepoCreate -> Meta (match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteRepoGet -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
@@ -251,6 +254,7 @@ allRoutes =
   , Constructed RouteSkillCreate
   , Constructed RouteSkillUpdate
   , Constructed RouteSkillDelete
+  , Constructed RouteSkillsCatalog
   , Constructed RouteReposList
   , Constructed RouteRepoCreate
   , Constructed RouteRepoGet

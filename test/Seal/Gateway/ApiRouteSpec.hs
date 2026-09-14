@@ -9,9 +9,10 @@ import Test.Hspec
 
 import Seal.Gateway.Route (allRoutes)
 
--- | The expected route count from the §3.2 table (54 routes).
+-- | The expected route count from the §3.2 table (55 routes, including
+-- the skills-catalog route added for the truncation-load feature).
 expectedRouteCount :: Int
-expectedRouteCount = 54
+expectedRouteCount = 55
 
 spec :: Spec
 spec = do

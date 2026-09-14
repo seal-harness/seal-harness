@@ -255,6 +255,14 @@ export interface SkillInfo {
   session: string
 }
 
+/** Response from GET /api/skills/catalog — the full (untruncated)
+ *  available-skills catalog block text and whether the truncation
+ *  budget would have been hit. */
+export interface SkillsCatalog {
+  catalog: string
+  truncated: boolean
+}
+
 /** The body for POST /api/skills + PUT /api/skills/:id. The `id` is
  *  required for POST; PUT takes the id from the path. To RENAME an
  *  existing skill on PUT, send `new_id` with the new SkillId. */
