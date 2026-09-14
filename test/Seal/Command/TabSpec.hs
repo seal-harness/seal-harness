@@ -5,6 +5,7 @@ import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime (..), fromGregorian)
 import Test.Hspec
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -17,7 +18,9 @@ import Seal.Command.Spec (CommandAction(..), mkRegistry)
 import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec, TabCloseNotifier)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId, SessionId)
-import Seal.Handles.Tab (tabIndexToChar, TabKind(..))
+import Seal.Handles.Tab (tabIndexToChar, TabKind(..), mkTabIndex, TabIndex)
+import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (saveSessionMeta)
 import Seal.Tabs (insertTabH, newTabsHandle, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList(..), TabRef(..), tabCount)
 
@@ -136,6 +139,68 @@ spec = describe "Seal.Command.Tab" $ do
         [t] -> tLabel t `shouldBe` Just "work"
         _   -> expectationFailure "expected one tab"
 
+  it "/tab list does not display the Kind (e.g. KindProvider)" $
+    withSystemTempDirectory "seal-tab" $ \tmp -> do
+      h <- newTabsHandle
+      let paths = dummyPaths tmp
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+      (ref, caps) <- recordingCaps
+      _ <- insertTabH h (BoundSession (mkSid "a")) KindProvider Nothing
+      case parseSlash reg "/tab list" of
+        ParsedAction act -> runCommand act caps
+        other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+      sent <- readIORef ref
+      sent `shouldSatisfy` none (T.isInfixOf "KindProvider")
+      sent `shouldSatisfy` none (T.isInfixOf "KindAi")
+
+  it "/tab list shows the session description when set" $
+    withSystemTempDirectory "seal-tab" $ \tmp -> do
+      h <- newTabsHandle
+      let paths = dummyPaths tmp
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+      (ref, caps) <- recordingCaps
+      let sid = mkSid "desc-session"
+      saveSessionMeta paths (metaWithDescription sid (Just "My Custom Name"))
+      _ <- insertTabH h (BoundSession sid) KindProvider Nothing
+      case parseSlash reg "/tab list" of
+        ParsedAction act -> runCommand act caps
+        other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+      sent <- readIORef ref
+      sent `shouldSatisfy` any ("My Custom Name" `T.isInfixOf`)
+
+  it "/tab list falls back to first message snippet when no description and no label" $
+    withSystemTempDirectory "seal-tab" $ \tmp -> do
+      h <- newTabsHandle
+      let paths = dummyPaths tmp
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+      (ref, caps) <- recordingCaps
+      let sid = mkSid "no-desc"
+      saveSessionMeta paths (metaWithDescription sid Nothing)
+      _ <- insertTabH h (BoundSession sid) KindProvider Nothing
+      case parseSlash reg "/tab list" of
+        ParsedAction act -> runCommand act caps
+        other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+      sent <- readIORef ref
+      -- No description and no transcript: the tab line should still show
+      -- the session ref but no display name.
+      sent `shouldSatisfy` any (T.isInfixOf (T.singleton (tabIndexToChar (mkIdx 0))))
+
+  it "/tab list: tab label takes priority over session description" $
+    withSystemTempDirectory "seal-tab" $ \tmp -> do
+      h <- newTabsHandle
+      let paths = dummyPaths tmp
+          reg = mkRegistry [tabCommandSpec paths h noTabCloseNotifier]
+      (ref, caps) <- recordingCaps
+      let sid = mkSid "both"
+      saveSessionMeta paths (metaWithDescription sid (Just "Session Description"))
+      _ <- insertTabH h (BoundSession sid) KindAi (Just "Tab Label")
+      case parseSlash reg "/tab list" of
+        ParsedAction act -> runCommand act caps
+        other -> expectationFailure ("expected ParsedAction, got: " <> showPO other)
+      sent <- readIORef ref
+      sent `shouldSatisfy` any ("Tab Label" `T.isInfixOf`)
+      sent `shouldSatisfy` none ("Session Description" `T.isInfixOf`)
+
   it "/help includes the tab family + the terse grammar synopsis" $
     withSystemTempDirectory "seal-tab" $ \tmp -> do
       h <- newTabsHandle
@@ -174,3 +239,26 @@ showPO (ParseFailure t)    = "ParseFailure " <> show t
 showPO (ParsedAction _)   = "ParsedAction"
 showPO (ParseHelp Nothing) = "ParseHelp Nothing"
 showPO (ParseHelp (Just n)) = "ParseHelp " <> show n
+
+-- ---------------------------------------------------------------------------
+-- Helpers for display-name tests
+-- ---------------------------------------------------------------------------
+
+none :: (a -> Bool) -> [a] -> Bool
+none = all . (not .)
+
+mkIdx :: Int -> TabIndex
+mkIdx n = case mkTabIndex n of
+  Right i -> i
+  Left _  -> error "bad index"
+
+metaWithDescription :: SessionId -> Maybe Text -> SessionMeta
+metaWithDescription sid mDesc = SessionMeta
+  { smId = sid, smProvider = "ollama", smModel = "llama3.2"
+  , smChannel = "cli", smAgent = Nothing
+  , smSystemOverride = Nothing, smAgentName = Nothing
+  , smDescription = mDesc
+  , smCreatedAt = testTime, smLastActive = testTime
+  }
+  where
+    testTime = UTCTime (fromGregorian 2026 1 1) 0
