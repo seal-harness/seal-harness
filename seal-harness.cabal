@@ -94,6 +94,7 @@ library
         Seal.Channels.Telegram.Commands
         Seal.Channels.Telegram.Run
         Seal.Channels.Telegram.Transport
+        Seal.Channels.StreamProgress
         Seal.Command.Help
         Seal.Command.Model
         Seal.Command.Parse
@@ -406,6 +407,7 @@ test-suite tests
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Channels.TelegramSpec
+        Seal.Channels.StreamProgressSpec
         Seal.Channels.Telegram.ButtonsSpec
         Seal.Channels.Telegram.CommandsSpec
         Seal.Channels.Telegram.TransportSpec
