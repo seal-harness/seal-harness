@@ -14,21 +14,24 @@ module Seal.Channels.Signal.Transport
   , conversationIdForSignal
   ) where
 
-import Control.Concurrent.STM (atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Exception (IOException, try)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
 import System.Exit (ExitCode (..))
-import System.IO (BufferMode (..), hClose, hFlush, hGetLine, hSetBuffering)
+import System.IO (BufferMode (..), Handle, hClose, hFlush, hGetLine, hSetBuffering)
 import System.Process
   ( CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess,
     waitForProcess, withCreateProcess )
@@ -41,7 +44,21 @@ data SignalTransport = SignalTransport
   { stReceive :: IO (Either Text Value)
     -- ^ Next inbound JSON value (one line from signal-cli's stdout).
   , stSend    :: Text -> Text -> IO ()
-    -- ^ Send a message: recipient, body. Writes a JSON-RPC @send@ frame.
+    -- ^ Send a message: recipient, body. Writes a JSON-RPC @send@ frame
+    -- (fire-and-forget notification — no response is read).
+  , stSendWithId :: Text -> Text -> IO (Maybe Text)
+    -- ^ Send a message and return the timestamp from the JSON-RPC
+    -- response. Blocks until the matching response arrives (with a
+    -- timeout). 'Nothing' on failure or timeout. The timestamp is the
+    -- message's identity in the Signal protocol — pass it to
+    -- 'stEditMessage' to edit or 'stDeleteMessage' to delete.
+  , stEditMessage :: Text -> Text -> Text -> IO Bool
+    -- ^ Edit a previously sent message: recipient, timestamp, new
+    -- content. Sends a JSON-RPC @send@ with @editTimestamp@ set. Returns
+    -- 'True' on success.
+  , stDeleteMessage :: Text -> Text -> IO Bool
+    -- ^ Delete a previously sent message: recipient, timestamp. Calls
+    -- the JSON-RPC @remoteDelete@ method. Returns 'True' on success.
   , stClose   :: IO ()
   }
 
@@ -54,6 +71,7 @@ mkMockSignalTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
+  tsRef <- newIORef (1000 :: Int)
   let transport = SignalTransport
         { stReceive = do
             m <- atomically (tryReadTQueue q)
@@ -61,6 +79,13 @@ mkMockSignalTransport scripted = do
               Just v  -> pure (Right v)
               Nothing -> pure (Left "signal inbox empty")
         , stSend = \r b -> modifyIORef' capRef ((r, b) :)
+        , stSendWithId = \_r _b -> do
+            n <- readIORef tsRef
+            let n' = n + 1
+            writeIORef tsRef n'
+            pure (Just (T.pack (show n')))
+        , stEditMessage = \_r _ts _content -> pure True
+        , stDeleteMessage = \_r _ts -> pure True
         , stClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
@@ -101,12 +126,38 @@ mkRealSignalTransport account = do
             _ -> error "mkRealSignalTransport: pipe creation failed (unreachable)"
           hSetBuffering hIn (BlockBuffering Nothing)
           hSetBuffering hOut LineBuffering
+          inbox <- newTQueueIO
+          idRef <- newIORef (0 :: Int)
+          respMap <- newIORef (Map.empty :: Map.Map Int (MVar (Maybe Value)))
+          -- Spawn the demux reader thread: reads all stdout lines and
+          -- routes responses (have id) to waiting callers via MVars,
+          -- notifications (no id) to the inbox TQueue.
+          _ <- forkIO (demuxReader hOut inbox respMap)
+          let sendRequest :: Value -> IO (Maybe Value)
+              sendRequest frame = do
+                rid <- atomicModifyIORef' idRef (\n -> (n + 1, n))
+                mv <- newEmptyMVar
+                _ <- atomicModifyIORef' respMap (\m -> (Map.insert rid mv m, m))
+                let ridVal = A.Number (fromIntegral rid)
+                    -- Merge the id into the frame object (frame is always
+                    -- an A.object, so we use KeyMap.insert).
+                    framed = case frame of
+                      A.Object o -> A.Object (KeyMap.insert (Key.fromString "id") ridVal o)
+                      _ -> frame
+                BL.hPutStr hIn (A.encode framed)
+                TIO.hPutStrLn hIn ""
+                hFlush hIn
+                mResult <- timeout 10000000 (takeMVar mv)
+                _ <- atomicModifyIORef' respMap (\m -> (Map.delete rid m, m))
+                pure (case mResult of
+                  Just (Just v) -> Just v
+                  _ -> Nothing)
           pure (Right SignalTransport
             { stReceive = do
-                line <- hGetLine hOut
-                pure $ case A.decode (BL.fromStrict (TE.encodeUtf8 (T.pack line))) of
-                  Just v  -> Right v
-                  Nothing -> Left ("signal-cli: malformed JSON line: " <> T.pack line)
+                m <- atomically (tryReadTQueue inbox)
+                case m of
+                  Just v  -> pure (Right v)
+                  Nothing -> pure (Left "signal inbox empty")
             , stSend = \recipient body -> do
                 let frame = A.object
                       [ "jsonrpc" A..= ("2.0" :: Text)
@@ -119,12 +170,103 @@ mkRealSignalTransport account = do
                 BL.hPutStr hIn (A.encode frame)
                 TIO.hPutStrLn hIn ""
                 hFlush hIn
+            , stSendWithId = \recipient body -> do
+                let frame = A.object
+                      [ "jsonrpc" A..= ("2.0" :: Text)
+                      , "method"  A..= ("send" :: Text)
+                      , "params"  A..= A.object
+                          [ "recipient" A..= [recipient]
+                          , "message"   A..= body
+                          ]
+                      ]
+                mResp <- sendRequest frame
+                pure (extractTimestamp =<< mResp)
+            , stEditMessage = \recipient ts content -> do
+                let frame = A.object
+                      [ "jsonrpc" A..= ("2.0" :: Text)
+                      , "method"  A..= ("send" :: Text)
+                      , "params"  A..= A.object
+                          [ "recipient" A..= [recipient]
+                          , "message"   A..= content
+                          , "editTimestamp" A..= (read (T.unpack ts) :: Int)
+                          ]
+                      ]
+                mResp <- sendRequest frame
+                pure (case mResp of
+                  Just _  -> True
+                  Nothing -> False)
+            , stDeleteMessage = \recipient ts -> do
+                let frame = A.object
+                      [ "jsonrpc" A..= ("2.0" :: Text)
+                      , "method"  A..= ("remoteDelete" :: Text)
+                      , "params"  A..= A.object
+                          [ "recipient" A..= [recipient]
+                          , "targetTimestamp" A..= (read (T.unpack ts) :: Int)
+                          ]
+                      ]
+                mResp <- sendRequest frame
+                pure (case mResp of
+                  Just _  -> True
+                  Nothing -> False)
             , stClose = do
                 _ <- try @IOException (hClose hIn)
                 terminateProcess ph
                 _ <- timeout 5000000 (waitForProcess ph)
                 pure ()
             })
+
+-- | The background demux reader: reads all lines from signal-cli's
+-- stdout and classifies each:
+-- * JSON-RPC response (has @result@ or @error@ + @id@) → route to the
+--   waiting caller via the MVar keyed by @id@ in 'respMap'.
+-- * JSON-RPC notification (has @method@ + @params@, no @id@) → push to
+--   the inbox 'TQueue' (picked up by 'stReceive').
+-- On a read error or EOF, the reader exits silently (the transport is
+-- closing).
+demuxReader :: Handle -> TQueue Value -> IORef (Map.Map Int (MVar (Maybe Value))) -> IO ()
+demuxReader hOut inbox respMap = go
+  where
+    go = do
+      eLine <- try @IOException (hGetLine hOut)
+      case eLine of
+        Left _ -> pure ()  -- EOF or error: reader exits
+        Right line -> do
+          case A.decode (BL.fromStrict (TE.encodeUtf8 (T.pack line))) of
+            Nothing -> go  -- malformed line: skip
+            Just v -> do
+              case extractResponseId v of
+                Just rid -> do
+                  -- JSON-RPC response: deliver to the waiting MVar
+                  m <- readIORef respMap
+                  case Map.lookup rid m of
+                    Just mv -> putMVar mv (Just v)
+                    Nothing -> pure ()  -- stale: no waiting caller
+                Nothing -> do
+                  -- JSON-RPC notification: push to inbox
+                  atomically (writeTQueue inbox v)
+          go
+
+-- | Extract the @id@ field from a JSON-RPC response. Returns 'Nothing' for
+-- notifications (which have no @id@). Pure.
+extractResponseId :: Value -> Maybe Int
+extractResponseId v =
+  case v of
+    A.Object o -> case KeyMap.lookup (Key.fromString "id") o of
+      Just (A.Number n) -> Just (round n)
+      _ -> Nothing
+    _ -> Nothing
+
+-- | Extract the @result.timestamp@ from a JSON-RPC @send@ response. Returns
+-- 'Nothing' if the response is malformed or the field is absent. Pure.
+extractTimestamp :: Value -> Maybe Text
+extractTimestamp v =
+  case v of
+    A.Object o -> case KeyMap.lookup (Key.fromString "result") o of
+      Just (A.Object ro) -> case KeyMap.lookup (Key.fromString "timestamp") ro of
+        Just (A.Number n) -> Just (T.pack (show (round n :: Int)))
+        _ -> Nothing
+      _ -> Nothing
+    _ -> Nothing
 
 -- | Preflight @signal-cli --version@. Returns 'True' if the binary is on
 -- PATH and exits successfully. Mirrors 'Seal.Security.Vault.Age's

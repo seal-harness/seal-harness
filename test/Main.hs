@@ -92,6 +92,7 @@ import qualified Seal.Channels.TabFocusSpec
 import qualified Seal.Channels.StreamProgressSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
+import qualified Seal.Channels.Signal.TransportEditSpec
 import qualified Seal.Channels.TelegramSpec
 import qualified Seal.Channels.Telegram.ButtonsSpec
 import qualified Seal.Channels.Telegram.CommandsSpec
@@ -271,6 +272,7 @@ main = hspec $ do
   Seal.Channels.Telegram.TransportSpec.spec
   Seal.Channels.Signal.EnvelopeSpec.spec
   Seal.Channels.Signal.RunSpec.spec
+  Seal.Channels.Signal.TransportEditSpec.spec
   Seal.Channels.Signal.TransportSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec
