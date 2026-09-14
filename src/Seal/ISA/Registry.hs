@@ -13,6 +13,7 @@ module Seal.ISA.Registry
   , registryToolDefs'
   , stubSchema
   , secretOpNames
+ , secretOpcodes
   ) where
 
 import Data.Map.Strict (Map)
