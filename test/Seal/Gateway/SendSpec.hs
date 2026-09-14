@@ -30,7 +30,7 @@ import Seal.Agent.Def.Types (AgentDefId, mkAgentDefId)
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Channel.Cli (newBackends)
 import Seal.Command.Provider (ProviderRuntime (..))
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsDir)
 import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
@@ -53,6 +53,7 @@ import Seal.Command.Spec (CommandSpec (..), mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted)
 import Seal.Transcript.Conv (readConversation)
@@ -167,12 +168,14 @@ mkSendDepsWith paths resolveStub = do
   mgr <- newManager defaultManagerSettings
   cntRef <- newIORef 0
   execCache <- newSessionExecCache
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
       pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
         , sdRepoReg    = fakeRepoRegistryHandle
+        , sdAgentReg   = agentRegH
         , sdProvider   = pr
         , sdSession    = sr
         , sdBackends   = backends

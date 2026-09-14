@@ -24,7 +24,7 @@ import Seal.Command.Model (modelCommandSpecForSession, noModelTranscriptWriter)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (CommandSpec (..), runCommandAction)
 import Seal.Config.File (defaultRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), cursorMapPath)
+import Seal.Config.Paths (SealPaths (..), cursorMapPath, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Core.Types (SessionId, mkSessionId)
@@ -34,6 +34,7 @@ import Seal.Harness.Tmux (TmuxRunner (..))
 import Seal.Handles.AskReply (newApprovalCache)
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.Logging.Logger (testSealLogger)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs (newTabsHandle)
@@ -79,7 +80,8 @@ mkDeps paths vaultRt pr backends = do
   tabsH <- newTabsHandle
   logger <- testSealLogger
   cursors <- newPersistingCursorStore (cursorMapPath paths)
-  newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  newChannelDeps paths vaultRt fakeRepoRegistryHandle agentRegH pr backends
     Supervised Nothing harnessReg stubTmux (Just mgr) approvals
     (pure defaultRuntimeConfig) False tabsH logger cursors
 

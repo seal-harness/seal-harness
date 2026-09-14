@@ -103,6 +103,7 @@ import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Routing.Route qualified as Route
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Skills.Backend (SkillBackend)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.ExecCache (SessionExecCache, newSessionExecCache)
@@ -135,6 +136,9 @@ data ChannelDeps = ChannelDeps
   { cdPaths      :: SealPaths
   , cdVault      :: VaultRuntime
   , cdRepoReg    :: RepoRegistryHandle
+  , cdAgentReg   :: AgentRegistryHandle
+    -- ^ The shared ssh-agent registry (one per process). Threaded through
+    -- 'TurnDeps' so all git-op call sites share the same 'arhLive' set.
   , cdProvider   :: ProviderRuntime
   , cdBackends   :: Backends
   , cdAutonomy   :: Policy.AutonomyLevel
@@ -200,6 +204,7 @@ mkChannelTurnDeps deps = TurnDeps
   , tdProvider     = cdProvider deps
   , tdResolve      = resolveSessionProvider (cdProvider deps)
   , tdRepoReg      = cdRepoReg deps
+  , tdAgentReg     = cdAgentReg deps
   , tdAutonomy     = cdAutonomy deps
   , tdBroker       = cdBroker deps
   , tdHarnessReg   = cdHarnessRegistry deps
@@ -266,7 +271,7 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
 -- at boot (see 'Seal.Channels.Cursor.Persist.loadCursorMap' +
 -- 'seedCursorStore'); this function does NOT touch disk for cursors.
 newChannelDeps
-  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> ProviderRuntime -> Backends
+  :: SealPaths -> VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> ProviderRuntime -> Backends
   -> Policy.AutonomyLevel -> Maybe StreamBroker
   -> HarnessRegistry -> TmuxRunner -> Maybe Manager
   -> ApprovalCache -> IO RuntimeConfig
@@ -275,7 +280,7 @@ newChannelDeps
   -> SealLogger
   -> CursorStore
   -> IO ChannelDeps
-newChannelDeps paths vault repoReg provider backends autonomy broker
+newChannelDeps paths vault repoReg agentReg provider backends autonomy broker
                harnessReg tmux httpMgr approvals loadCfg isRemote tabsH logger cursors = do
   replies <- newReplyRegistry
   locks   <- newSessionLocks
@@ -285,6 +290,7 @@ newChannelDeps paths vault repoReg provider backends autonomy broker
     { cdPaths      = paths
     , cdVault      = vault
     , cdRepoReg    = repoReg
+    , cdAgentReg   = agentReg
     , cdProvider   = provider
     , cdBackends   = backends
     , cdAutonomy   = autonomy

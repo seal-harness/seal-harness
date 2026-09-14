@@ -54,7 +54,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, updateRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath, sshAgentsDir)
+import Seal.Config.Paths (SealPaths (..), repoKeysDir, sessionMetaPath)
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Session.AgentMetaCache
@@ -65,7 +65,7 @@ import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
-import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
@@ -132,6 +132,7 @@ data ApiDeps = ApiDeps
   , adBroker          :: Maybe StreamBroker      -- ^ the WS broker for pushing @lists@ frames (W6 broadcast triggers); 'Nothing' in tests without a broker
   , adTabCloseNotifier :: TabCloseNotifier      -- ^ invoked after a tab is closed via the REST API so attached channels are notified; 'noTabCloseNotifier' in tests
   , adRepoRegistry     :: RepoRegistryHandle    -- ^ for /api/repos CRUD (W4)
+  , adAgentRegistry    :: AgentRegistryHandle   -- ^ the shared ssh-agent registry (one per process)
   , adConfigRepo       :: ConfigRepo            -- ^ for the best-effort @gitCommitAll@ audit-commit of repos.toml after a mutation (W4)
   , adVault            :: VaultRuntime          -- ^ the vault runtime (for deploy-key generation: passphrase put/delete)
   , adPaths            :: SealPaths             -- ^ the seal paths (for repoKeysDir — the encrypted keyfile location)
@@ -853,12 +854,11 @@ handleSessionDescription deps sid body =
 -- compile-time-embedded.
 cloneDepsForApiDeps :: ApiDeps -> IO CloneDeps
 cloneDepsForApiDeps deps = do
-  agentRegH <- mkAgentRegistryHandle (sshAgentsDir (adPaths deps))
   pure CloneDeps
     { Clone.cdVault = adVault deps
     , Clone.cdRepoReg = adRepoRegistry deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
-    , Clone.cdAgentRegistry = agentRegH
+    , Clone.cdAgentRegistry = adAgentRegistry deps
     , Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts
     , Clone.cdKeyfilesDir = repoKeysDir (adPaths deps)
     , Clone.cdIsRemote = False
