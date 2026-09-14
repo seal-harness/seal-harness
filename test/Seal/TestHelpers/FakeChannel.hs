@@ -50,6 +50,9 @@ instance Channel FakeChannel where
   toHandle fc = ChannelHandle
     { chLabel       = "test"
     , chSend         = \t -> modifyIORef' (fcSent fc) (t :)
+    , chSendWithId   = \_ -> pure Nothing
+    , chEditMessage  = Nothing
+    , chDeleteMessage = Nothing
     , chSendError    = \t -> modifyIORef' (fcErrors fc) (t :)
     , chSendChunk    = \t -> modifyIORef' (fcChunks fc) (t :)
     , chPrompt       = const (popPrompt fc)

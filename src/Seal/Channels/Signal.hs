@@ -50,14 +50,17 @@ instance Channel SignalChannel where
   toHandle ch = ChannelHandle
     { chLabel       = "signal"
     , chSend         = sendChunked ch
+    , chSendWithId   = \_ -> pure Nothing
+    , chEditMessage  = Nothing
+    , chDeleteMessage = Nothing
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
-    , chPrompt       = \_ -> pure (Left Deferred)   -- Signal can't answer inline
+    , chPrompt       = \_ -> pure (Left Deferred)
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
-    , chReadSecret   = pure Nothing                  -- vault is reached via the vault handle
+    , chStreaming    = False
+    , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
-    , chLastChatId   = pure Nothing                  -- Signal addresses by user id, not chat id
+    , chLastChatId   = pure Nothing
     }
 
 -- | Run the reader thread with cleanup. Spawns a background thread that

@@ -51,11 +51,14 @@ instance Channel TelegramChannel where
   toHandle ch = ChannelHandle
     { chLabel       = "telegram"
     , chSend         = sendChunked ch
+    , chSendWithId   = \_ -> pure Nothing
+    , chEditMessage  = Nothing
+    , chDeleteMessage = Nothing
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
-    , chPrompt       = \_ -> pure (Left Deferred)  -- Telegram can't answer inline
+    , chPrompt       = \_ -> pure (Left Deferred)
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
+    , chStreaming    = False
     , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
     , chLastChatId   = readIORef (tcgLastChat ch)

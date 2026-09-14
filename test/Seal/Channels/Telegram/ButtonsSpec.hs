@@ -54,6 +54,9 @@ testHandle :: Maybe Text -> IORef [Text] -> ChannelHandle
 testHandle mChat sendRef = ChannelHandle
   { chLabel       = "telegram-test"
   , chSend         = \t -> modifyIORef' sendRef (t :)
+  , chSendWithId   = \_ -> pure Nothing
+  , chEditMessage  = Nothing
+  , chDeleteMessage = Nothing
   , chSendError    = \_ -> pure ()
   , chSendChunk    = \_ -> pure ()
   , chPrompt       = \_ -> pure (Left Deferred)
