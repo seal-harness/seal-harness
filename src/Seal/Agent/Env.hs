@@ -10,7 +10,8 @@ import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.MessageSource (MessageSource)
-import Seal.Core.Types (ModelId, SessionId)
+import Data.Aeson (Value)
+import Seal.Core.Types (ModelId, OpName, SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec, localBackend)
@@ -133,6 +134,18 @@ data AgentEnv = AgentEnv
     -- the arrival channel (which 'ccSend' covers). 'Nothing' (the default
     -- for tests and the standalone CLI) means no fan-out; the arrival
     -- channel alone is notified via 'ccSend'.
+  , aeOnToolCall :: Maybe (OpName -> Value -> IO ())
+    -- ^ When 'Just hook', the loop calls @hook opName input@ before each
+    -- tool dispatch. Chat channels wire this to the 'StreamProgress' manager
+    -- so tool-call progress messages are sent/edited on the chat platform.
+    -- 'Nothing' (the default) means no tool-progress notification.
+  , aeOnTextDelta :: Maybe (Text -> IO ())
+    -- ^ When 'Just hook', the loop calls @hook delta@ for each text
+    -- delta from the provider stream. Chat channels wire this to the
+    -- 'StreamProgress' manager for progressive text edits. 'Nothing'
+    -- (the default) means per-delta sends go through 'ccSend' (the
+    -- existing CLI/web path) or are skipped (chat channels with
+    -- ccStreaming = False).
   , aeOnDemandSchemas :: Bool
     -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
     -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,
@@ -175,6 +188,8 @@ data TurnEnv = TurnEnv
   , teOnUserMessage :: Maybe (IO ())
   , teChannel       :: Text
   , teOnStop        :: Maybe (Text -> IO ())
+  , teOnToolCall    :: Maybe (OpName -> Value -> IO ())
+  , teOnTextDelta   :: Maybe (Text -> IO ())
   , teAbortFlag     :: AbortFlag
   , teToolTimeout   :: ToolTimeoutConfig
   }
@@ -206,6 +221,8 @@ mkSessionAgentEnv te = AgentEnv
   , aeOnEntry    = teOnEntry te
   , aeOnUserMessage = teOnUserMessage te
   , aeOnStop     = teOnStop te
+  , aeOnToolCall = teOnToolCall te
+  , aeOnTextDelta = teOnTextDelta te
   , aeOnDemandSchemas = teOnDemand te
   , aeLogPath    = teLogPath te
   , aeAbortFlag  = teAbortFlag te

@@ -37,6 +37,9 @@ inlineHandle :: InlineFake -> ChannelHandle
 inlineHandle fc = ChannelHandle
   { chLabel       = "test"
   , chSend         = \t -> modifyIORef' (ifSent fc) (t :)
+  , chSendWithId   = \_ -> pure Nothing
+  , chEditMessage  = Nothing
+  , chDeleteMessage = Nothing
   , chSendError    = \t -> modifyIORef' (ifErrors fc) (t :)
   , chSendChunk    = \t -> modifyIORef' (ifChunks fc) (t :)
   , chPrompt       = const (popPrompt fc)

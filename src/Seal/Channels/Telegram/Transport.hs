@@ -15,6 +15,9 @@ module Seal.Channels.Telegram.Transport
   , parseTelegramUpdate
   , chunkMessage
   , tgSendWithKeyboardViaApi
+  , tgSendWithIdViaApi
+  , tgEditMessageViaApi
+  , tgDeleteMessageViaApi
   , answerCallbackQueryViaApi
   , editReplyMarkupViaApi
   ) where
@@ -30,6 +33,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Vector qualified as V
 import Network.HTTP.Client
   ( Manager, Request (..), httpLbs, parseRequest, requestBody, responseBody
@@ -71,6 +75,17 @@ data TelegramTransport = TelegramTransport
     -- ^ Remove the inline keyboard from a message via the Bot API
     -- @editMessageReplyMarkup@ (disables the buttons after a tap).
     -- Args: chat id, message id. Best-effort: never throws.
+  , tgSendWithId  :: Text -> Text -> IO (Maybe Text)
+    -- ^ Send a message and return the platform message id from the
+    -- Bot API @sendMessage@ response. 'Nothing' on failure. The id is
+    -- an opaque 'Text' (the integer @message_id@ stringified). Used by
+    -- the stream progress manager to create an editable message.
+  , tgEditMessage :: Text -> Text -> Text -> IO Bool
+    -- ^ Edit a previously sent message via @editMessageText@: chat id,
+    -- message id, new content. Returns 'True' on success. Best-effort.
+  , tgDeleteMessage :: Text -> Text -> IO Bool
+    -- ^ Delete a previously sent message via @deleteMessage@: chat id,
+    -- message id. Returns 'True' on success. Best-effort.
   , tgClose       :: IO ()
   }
 
@@ -136,7 +151,8 @@ data TelegramUpdate = TelegramUpdate
 mkMockTelegramTransport
   :: [TelegramUpdate]
   -> IO ( TelegramTransport, IO [(Text, Text)], IO [BotCommand]
-        , IO [Text], IO [(Text, Text, [[TelegramButton]])] )
+        , IO [Text], IO [(Text, Text, [[TelegramButton]])]
+        , IO [(Text, Text)], IO [(Text, Text, Text)], IO [(Text, Text)] )
 mkMockTelegramTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
@@ -144,6 +160,10 @@ mkMockTelegramTransport scripted = do
   cmdRef <- newIORef []
   kbRef <- newIORef []
   cbRef <- newIORef []
+  sendIdRef <- newIORef (0 :: Int)
+  sendIdCapRef <- newIORef []
+  editCapRef <- newIORef []
+  delCapRef <- newIORef []
   let transport = TelegramTransport
         { tgReceive = do
             m <- atomically (tryReadTQueue q)
@@ -151,6 +171,18 @@ mkMockTelegramTransport scripted = do
               Just u  -> pure (Right u)
               Nothing -> pure (Left "telegram inbox empty")
         , tgSend = \c b -> modifyIORef' capRef ((c, b) :)
+        , tgSendWithId = \c b -> do
+            n <- readIORef sendIdRef
+            let n' = n + 1
+            writeIORef sendIdRef n'
+            modifyIORef' sendIdCapRef ((c, b) :)
+            pure (Just (T.pack (show n')))
+        , tgEditMessage = \c mid content -> do
+            modifyIORef' editCapRef ((c, mid, content) :)
+            pure True
+        , tgDeleteMessage = \c mid -> do
+            modifyIORef' delCapRef ((c, mid) :)
+            pure True
         , tgSendWithKeyboard = \c b kb -> modifyIORef' kbRef ((c, b, kb) :)
         , tgSetCommands = writeIORef cmdRef
         , tgAnswerCallback = \cbId -> modifyIORef' cbRef (cbId :)
@@ -161,7 +193,10 @@ mkMockTelegramTransport scripted = do
       getCommands = readIORef cmdRef
       getCallbacks = reverse <$> readIORef cbRef
       getKeyboards = reverse <$> readIORef kbRef
-  pure (transport, getCaptured, getCommands, getCallbacks, getKeyboards)
+      getSendWithIds = reverse <$> readIORef sendIdCapRef
+      getEdits = reverse <$> readIORef editCapRef
+      getDeletes = reverse <$> readIORef delCapRef
+  pure (transport, getCaptured, getCommands, getCallbacks, getKeyboards, getSendWithIds, getEdits, getDeletes)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS
@@ -195,6 +230,9 @@ mkRealTelegramTransport token mgr = do
           Right _  -> pure ()
     , tgAnswerCallback = answerCallbackQueryViaApi mgr token
     , tgEditReplyMarkup = editReplyMarkupViaApi mgr token
+    , tgSendWithId = tgSendWithIdViaApi mgr token
+    , tgEditMessage = tgEditMessageViaApi mgr token
+    , tgDeleteMessage = tgDeleteMessageViaApi mgr token
     , tgClose = pure ()
     }
   where
@@ -504,6 +542,116 @@ editReplyMarkupViaApi mgr token chatId messageId = do
                      }
       _ <- try @SomeException (httpLbs req mgr)
       pure ()
+
+-- | Send a message via the Bot API @sendMessage@ and return the
+-- @message_id@ from the response. Returns 'Nothing' on any failure
+-- (network error, non-200 status, missing @message_id@ in the response).
+-- The returned id is the integer @message_id@ stringified — an opaque
+-- 'Text' the caller passes back to 'tgEditMessageViaApi' /
+-- 'tgDeleteMessageViaApi'.
+tgSendWithIdViaApi :: Manager -> Text -> Text -> Text -> IO (Maybe Text)
+tgSendWithIdViaApi mgr token chatId body = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
+  case eReq of
+    Left _ -> pure Nothing
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "text"   A..= body
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> pure Nothing
+        Right resp -> do
+          let code = statusCode (responseStatus resp)
+              body' = responseBody resp
+          if code == 200
+            then pure (parseMessageId body')
+            else pure Nothing
+
+-- | Parse the @result.message_id@ from a @sendMessage@ response. Returns
+-- 'Nothing' if the response is malformed or the field is absent. Pure.
+parseMessageId :: BL.ByteString -> Maybe Text
+parseMessageId bs =
+  case A.decode bs of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromString "result") o of
+      Just (A.Object ro) -> case KeyMap.lookup (Key.fromString "message_id") ro of
+        Just (A.Number n) -> Just (T.pack (show (round n :: Int)))
+        _ -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+
+-- | Edit a previously sent message via the Bot API @editMessageText@.
+-- Args: chat id, message id, new content. Returns 'True' on success
+-- (HTTP 200 + ok:true), 'False' on any failure. Handles the
+-- "message is not modified" error (identical content) as success — the
+-- edit is a no-op in that case, not a failure. Best-effort: never throws.
+tgEditMessageViaApi :: Manager -> Text -> Text -> Text -> Text -> IO Bool
+tgEditMessageViaApi mgr token chatId messageId content = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/editMessageText")))
+  case eReq of
+    Left _ -> pure False
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "message_id" A..= messageId
+            , "text" A..= content
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> pure False
+        Right resp -> do
+          let code = statusCode (responseStatus resp)
+              body' = responseBody resp
+          if code == 200
+            then pure (parseOk body')
+            else do
+              let errText = TE.decodeUtf8 (BL.toStrict body')
+              if "not modified" `T.isInfixOf` errText
+                then pure True
+                else pure False
+
+-- | Delete a previously sent message via the Bot API @deleteMessage@.
+-- Args: chat id, message id. Returns 'True' on success. Best-effort.
+tgDeleteMessageViaApi :: Manager -> Text -> Text -> Text -> IO Bool
+tgDeleteMessageViaApi mgr token chatId messageId = do
+  eReq <- try @SomeException
+    (parseRequest (T.unpack (telegramApiBase <> token <> "/deleteMessage")))
+  case eReq of
+    Left _ -> pure False
+    Right req0 -> do
+      let payload = A.object
+            [ "chat_id" A..= chatId
+            , "message_id" A..= messageId
+            ]
+          req = req0 { method = methodPost
+                     , requestBody = RequestBodyLBS (A.encode payload)
+                     , requestHeaders = [("Content-Type", "application/json")]
+                     }
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> pure False
+        Right resp -> pure (statusCode (responseStatus resp) == 200)
+
+-- | Parse the @ok@ boolean from a Bot API JSON response. 'True' when
+-- @ok@ is @true@. Pure.
+parseOk :: BL.ByteString -> Bool
+parseOk bs =
+  case A.decode bs of
+    Just (A.Object o) -> case KeyMap.lookup (Key.fromString "ok") o of
+      Just (A.Bool b) -> b
+      _ -> False
+    _ -> False
 
 -- | Register the bot's command menu via @setMyCommands@ so Telegram shows
 -- auto-completion for the bot's slash commands. Calls the Bot API with a

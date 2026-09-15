@@ -51,11 +51,14 @@ instance Channel TelegramChannel where
   toHandle ch = ChannelHandle
     { chLabel       = "telegram"
     , chSend         = sendChunked ch
+    , chSendWithId   = sendWithId ch
+    , chEditMessage  = Just (editMessage ch)
+    , chDeleteMessage = Just (deleteMessage ch)
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
-    , chPrompt       = \_ -> pure (Left Deferred)  -- Telegram can't answer inline
+    , chPrompt       = \_ -> pure (Left Deferred)
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
+    , chStreaming    = False
     , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
     , chLastChatId   = readIORef (tcgLastChat ch)
@@ -156,6 +159,33 @@ sendRaw ch t = do
   case mChat of
     Nothing -> logIO (tcgLogger ch) WarningS "telegram: dropping chunk — no last chat yet"
     Just chatId -> tgSend (tcgTransport ch) chatId t
+
+-- | Send a message and return the platform message id. Used by the
+-- stream progress manager to create an editable message.
+sendWithId :: TelegramChannel -> Text -> IO (Maybe Text)
+sendWithId ch t = do
+  mChat <- readIORef (tcgLastChat ch)
+  case mChat of
+    Nothing -> logIO (tcgLogger ch) WarningS "telegram: dropping sendWithId — no last chat yet" >> pure Nothing
+    Just chatId -> tgSendWithId (tcgTransport ch) chatId t
+
+-- | Edit a previously sent message: message id, new content. Returns
+-- 'True' on success. Used by the stream progress manager for
+-- progressive edits.
+editMessage :: TelegramChannel -> Text -> Text -> IO Bool
+editMessage ch msgId content = do
+  mChat <- readIORef (tcgLastChat ch)
+  case mChat of
+    Nothing -> pure False
+    Just chatId -> tgEditMessage (tcgTransport ch) chatId msgId content
+
+-- | Delete a previously sent message by id. Returns 'True' on success.
+deleteMessage :: TelegramChannel -> Text -> IO Bool
+deleteMessage ch msgId = do
+  mChat <- readIORef (tcgLastChat ch)
+  case mChat of
+    Nothing -> pure False
+    Just chatId -> tgDeleteMessage (tcgTransport ch) chatId msgId
 
 -- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:
 -- returns @(Nothing, "")@ when the inbox is empty AND the reader thread has

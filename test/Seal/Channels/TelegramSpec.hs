@@ -56,7 +56,7 @@ spec = describe "Seal.Channels.Telegram" $ do
   it "withTelegramChannel + chReceive yields scripted updates with the right MessageSource" $ do
     let upd1 = mkTestUpdate chatId1 senderId1 "hello"
         upd2 = mkTestUpdate chatId1 senderId1 "/ping"
-    (transport, _, _, _, _) <- mkMockTelegramTransport [upd1, upd2]
+    (transport, _, _, _, _, _, _, _) <- mkMockTelegramTransport [upd1, upd2]
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -73,7 +73,7 @@ spec = describe "Seal.Channels.Telegram" $ do
   it "chSend chunks a long message to the configured limit and sends to the last chat" $ do
     let longMsg = T.replicate 25 "a"
         upd1 = mkTestUpdate chatId1 senderId1 "x"
-    (transport, getCaptured, _, _, _) <- mkMockTelegramTransport [upd1]
+    (transport, getCaptured, _, _, _, _, _, _) <- mkMockTelegramTransport [upd1]
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 10) transport logger $ \ch -> do
       let h = toHandle ch
@@ -84,7 +84,7 @@ spec = describe "Seal.Channels.Telegram" $ do
       all (\(_, b) -> T.length b <= 10) sent `shouldBe` True
 
   it "chSend with no last chat is dropped (capture empty)" $ do
-    (transport, getCaptured, _, _, _) <- mkMockTelegramTransport []
+    (transport, getCaptured, _, _, _, _, _, _) <- mkMockTelegramTransport []
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -98,7 +98,7 @@ spec = describe "Seal.Channels.Telegram" $ do
           Right u -> u
           Left _  -> error "mkUserId failed"
         allow = AllowOnly (Set.fromList [blockedSender])
-    (transport, _, _, _, _) <- mkMockTelegramTransport [upd1]
+    (transport, _, _, _, _, _, _, _) <- mkMockTelegramTransport [upd1]
     logger <- testSealLogger
     withTelegramChannel (allow, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -108,7 +108,7 @@ spec = describe "Seal.Channels.Telegram" $ do
       mSrc `shouldBe` Nothing
 
   it "chPrompt returns Left Deferred (Telegram can't answer inline)" $ do
-    (transport, _, _, _, _) <- mkMockTelegramTransport []
+    (transport, _, _, _, _, _, _, _) <- mkMockTelegramTransport []
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -116,7 +116,7 @@ spec = describe "Seal.Channels.Telegram" $ do
       result `shouldBe` Left Deferred
 
   it "chStreaming is False for Telegram" $ do
-    (transport, _, _, _, _) <- mkMockTelegramTransport []
+    (transport, _, _, _, _, _, _, _) <- mkMockTelegramTransport []
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -124,7 +124,7 @@ spec = describe "Seal.Channels.Telegram" $ do
 
   it "chLastChatId returns the last chat id after an update is received" $ do
     let upd1 = mkTestUpdate chatId1 senderId1 "hello"
-    (transport, _, _, _, _) <- mkMockTelegramTransport [upd1]
+    (transport, _, _, _, _, _, _, _) <- mkMockTelegramTransport [upd1]
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -133,7 +133,7 @@ spec = describe "Seal.Channels.Telegram" $ do
 
   it "readerLoop calls tgAnswerCallback for callback_query updates" $ do
     let cbUpd = mkTestCallback chatId1 senderId1 "deadbeef:0" "cb-1"
-    (transport, _, _, getCallbacks, _) <- mkMockTelegramTransport [cbUpd]
+    (transport, _, _, getCallbacks, _, _, _, _) <- mkMockTelegramTransport [cbUpd]
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch
@@ -143,7 +143,7 @@ spec = describe "Seal.Channels.Telegram" $ do
 
   it "readerLoop does NOT call tgAnswerCallback for regular messages" $ do
     let msgUpd = mkTestUpdate chatId1 senderId1 "hello"
-    (transport, _, _, getCallbacks, _) <- mkMockTelegramTransport [msgUpd]
+    (transport, _, _, getCallbacks, _, _, _, _) <- mkMockTelegramTransport [msgUpd]
     logger <- testSealLogger
     withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
       let h = toHandle ch

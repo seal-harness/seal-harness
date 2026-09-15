@@ -84,6 +84,9 @@ stubHandle :: ChannelHandle
 stubHandle = ChannelHandle
   { chLabel       = "test"
   , chSend         = \_ -> pure ()
+  , chSendWithId   = \_ -> pure Nothing
+  , chEditMessage  = Nothing
+  , chDeleteMessage = Nothing
   , chSendError    = \_ -> pure ()
   , chSendChunk    = \_ -> pure ()
   , chPrompt       = \_ -> pure (Left Deferred)

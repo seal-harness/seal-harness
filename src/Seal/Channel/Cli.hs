@@ -232,6 +232,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , taPreTurn       = \_ _ _ -> pure ()
               , taChannelLabel  = smChannel
               , taOnStop        = const Nothing
+  , taOnToolCall    = Nothing
+  , taOnTextDelta   = Nothing
               , taOnUserMessage = const Nothing
               , taPostTurn      = \_ _ -> pure ()
               , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling m ->
@@ -311,6 +313,8 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , taPreTurn       = \_ _ _ -> pure ()
               , taChannelLabel  = const "cli"
               , taOnStop        = const Nothing
+  , taOnToolCall    = Nothing
+  , taOnTextDelta   = Nothing
               , taOnUserMessage = const Nothing
               , taPostTurn      = \_ _ -> pure ()
               , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling _meta ->

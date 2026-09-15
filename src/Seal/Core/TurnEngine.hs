@@ -420,6 +420,8 @@ data TurnAdapter = TurnAdapter
   , taPreTurn       :: SessionId -> SessionMeta -> Text -> IO ()
   , taChannelLabel  :: SessionMeta -> Text
   , taOnStop        :: SessionId -> Maybe (Text -> IO ())
+  , taOnToolCall    :: Maybe (OpName -> Value -> IO ())
+  , taOnTextDelta   :: Maybe (Text -> IO ())
   , taOnUserMessage :: SessionMeta -> Maybe (IO ())
   , taPostTurn      :: SessionId -> SessionMeta -> IO ()
   , taStartWiring   :: forall a. Backends -> SessionId -> Env
@@ -617,6 +619,8 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
               , teOnUserMessage = taOnUserMessage adapter meta'
               , teChannel       = taChannelLabel adapter meta'
               , teOnStop        = taOnStop adapter sid
+              , teOnToolCall    = taOnToolCall adapter
+              , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
               })
