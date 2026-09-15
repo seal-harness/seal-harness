@@ -9,8 +9,12 @@
 module Seal.Channels.LoopSpec (spec) where
 
 import Control.Monad (void)
+import Data.Time.Clock (getCurrentTime)
 import Data.Aeson (object, (.=))
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as K
+import Data.Aeson.KeyMap qualified as KM
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -22,7 +26,7 @@ import Test.Hspec
 import Seal.Channel.Cli (Backends (..), newBackends)
 import Seal.Channels.Loop
   ( channelCallDispatcher, mkChannelTurnDeps, newChannelDeps, ChannelDeps (..)
-  , shouldAutoTab, isBgSlash, createConversationSession, createConversationSessionHeadless
+  , handleNewSession, shouldAutoTab, isBgSlash, createConversationSession, createConversationSessionHeadless
   , mkBgRunner, buildChannelRegistry )
 import Seal.Command.Background (BgRunner (..))
 import Seal.Command.Call (CallDispatcher)
@@ -33,9 +37,10 @@ import Seal.Command.Spec
   , Availability (..), CommandGroup (..)
   , lookupSpec, mkRegistry, registrySpecs, runCommandAction )
 import Seal.Core.ChannelKind (ChannelKind (..))
-import Seal.Core.Types (OpName (..), mkSessionId, mkSystemSessionId)
+import Seal.Core.Types (OpName (..), SessionId, mkSessionId, mkSystemSessionId)
+import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Config.File (defaultRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe )
@@ -57,7 +62,13 @@ import Seal.Tabs.Types (TabRef (BoundSession), Tab (tRef), tlTabs)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps, getSent)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.TestHelpers.FakeChannel (newFakeChannel)
+import qualified Seal.TestHelpers.FakeChannel as FC (getSent)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Command.New (NewArgs (..), emptyNewArgs)
+import Seal.Util.StrictIO (decodeFileStrict)
+import Seal.Session.Store (saveSessionMeta)
+import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor (cursorLookup, newCursorStore)
 
 -- | A stub TmuxRunner that always succeeds with empty output.
@@ -643,7 +654,162 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       -- Should not throw.
       runBg runner "hello bg"
 
+  describe "handleNewSession" $ do
+    it "with no args, mints a session copying the old provider/model" $ do
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-noargs-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      oldMeta <- mkTestMeta "old-noargs" "anthropic" "claude-sonnet-4"
+      -- Persist the old session so handleNewSession can read it.
+      saveSessionMeta (cdPaths deps) oldMeta
+      -- Insert a tab bound to the old session so rebind has a target.
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      handleNewSession deps h tabsH Telegram oldMeta emptyNewArgs Nothing
+      -- The new session should have the same provider/model as the old.
+      sent <- FC.getSent fc
+      any ("anthropic/claude-sonnet-4" `T.isInfixOf`) sent `shouldBe` True
+
+    it "with -p/-m overrides, the new session uses the overrides" $ do
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-overrides-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      oldMeta <- mkTestMeta "old-overrides" "anthropic" "claude-sonnet-4"
+      saveSessionMeta (cdPaths deps) oldMeta
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      let args = emptyNewArgs { naProvider = Just "ollama", naModel = Just "llama3" }
+      handleNewSession deps h tabsH Telegram oldMeta args Nothing
+      sent <- FC.getSent fc
+      any ("ollama/llama3" `T.isInfixOf`) sent `shouldBe` True
+      any ("anthropic" `T.isInfixOf`) sent `shouldBe` False
+
+    it "with -r, dispatches SETUP_REPO with the resolved repo URL" $ do
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-repo-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      oldMeta <- mkTestMeta "old-repo" "anthropic" "claude-sonnet-4"
+      saveSessionMeta (cdPaths deps) oldMeta
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      callsRef <- newIORef ([] :: [(Text, Text)])
+      let args = emptyNewArgs { naRepo = Just "https://github.com/foo/bar.git" }
+          dispatcherFactory = Just (recordingDispatcher callsRef)
+      handleNewSession deps h tabsH Telegram oldMeta args dispatcherFactory
+      calls <- readIORef callsRef
+      calls `shouldBe` [("SETUP_REPO", "https://github.com/foo/bar.git")]
+
+    it "with -r but no dispatcher, sends a warning (standalone CLI)" $ do
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-nodispatch-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      oldMeta <- mkTestMeta "old-nodispatch" "anthropic" "claude-sonnet-4"
+      saveSessionMeta (cdPaths deps) oldMeta
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      let args = emptyNewArgs { naRepo = Just "https://github.com/foo/bar.git" }
+      handleNewSession deps h tabsH Telegram oldMeta args Nothing
+      sent <- FC.getSent fc
+      any ("repo" `T.isInfixOf`) sent `shouldBe` True
+
+    it "with no -r, uses the default agent (not the old session's agent)" $ do
+      -- When no -r is given, the new session should get the default agent
+      -- from config (matching the web frontend's "New Tab" flow), NOT the
+      -- old session's agent binding. The old session may have been bound
+      -- to a repo-specific agent via autoBindRepoAgent; carrying that
+      -- forward to a fresh session with no repo would be wrong.
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-default-agent-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      -- Old session has a repo-bound agent (simulating a prior /new -r).
+      let repoAgent = either (error "aid") id (mkAgentDefId "somerepo--agents-md")
+      now <- getCurrentTime
+      let oldMeta = (mkTestMetaNow "old-agent" "anthropic" "claude-sonnet-4" now)
+            { smAgent = Just repoAgent }
+      saveSessionMeta (cdPaths deps) oldMeta
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      handleNewSession deps h tabsH Telegram oldMeta emptyNewArgs Nothing
+      -- The new session's smAgent should be Nothing (no agent inherited
+      -- from the old session; the default will be resolved on the first
+      -- turn, same as the web frontend).
+      snap <- snapshotTabs tabsH
+      case tlTabs snap of
+        [tab] -> do
+          let newSid = case tRef tab of BoundSession s -> s; _ -> error "not a session tab"
+          mNewMeta <- decodeFileStrict (sessionMetaPath (cdPaths deps) newSid)
+          case mNewMeta of
+            Just newMeta -> smAgent newMeta `shouldBe` Nothing
+            Nothing -> expectationFailure "new session meta not found on disk"
+        _ -> expectationFailure ("expected exactly one tab, got " <> show (length (tlTabs snap)))
+
 -- | Match only 'BeListsSnapshot' broker events (the @lists@ WS frame).
 isListsSnapshot :: BrokerEvent -> Bool
 isListsSnapshot (BeListsSnapshot _) = True
 isListsSnapshot _ = False
+-- ── handleNewSession test helpers ─────────────────────────────────────
+
+-- | Build a SessionMeta with an explicit timestamp (for tests that need
+-- to set other fields after construction).
+mkTestMetaNow :: Text -> Text -> Text -> UTCTime -> SessionMeta
+mkTestMetaNow sidStr provider model now =
+  SessionMeta
+    { smId = either (error "sid") id (mkSessionId sidStr)
+    , smProvider = provider, smModel = model, smChannel = "telegram"
+    , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing, smCreatedAt = now, smLastActive = now
+    }
+
+-- | Build a SessionMeta with real timestamps for testing.
+mkTestMeta :: Text -> Text -> Text -> IO SessionMeta
+mkTestMeta sidStr provider model = do
+  now <- getCurrentTime
+  pure SessionMeta
+    { smId = either (error "sid") id (mkSessionId sidStr)
+    , smProvider = provider, smModel = model, smChannel = "telegram"
+    , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing, smCreatedAt = now, smLastActive = now
+    }
+
+-- | Build a fresh ChannelDeps for handleNewSession tests. Creates a
+-- minimal config repo + session store rooted at the given tmp path.
+mkLoopDeps :: FilePath -> IO ChannelDeps
+mkLoopDeps cfgRoot = do
+  ensureConfigRepo cfgRoot
+  let repo = openConfigRepo cfgRoot
+  backends <- newBackends cfgRoot repo
+  harnessReg <- newHarnessRegistry
+  let paths = SealPaths
+        { spHome = cfgRoot, spState = cfgRoot </> "state"
+        , spConfig = cfgRoot, spKeys = cfgRoot </> "keys"
+        , spCache = cfgRoot </> "cache"
+        }
+      vaultRt = VaultRuntime
+        { vrPaths = paths, vrConfigPath = cfgRoot </> "config.toml"
+        , vrHandleRef = error "vrHandleRef: stubbed — handleNewSession test"
+        }
+  mgr <- newManager defaultManagerSettings
+  cntRef <- newIORef (0 :: Int)
+  let pr = ProviderRuntime
+        { prConfigPath = cfgRoot </> "config.toml"
+        , prVault = vaultRt, prManager = mgr, prCallCounter = cntRef
+        }
+  approvals <- newApprovalCache
+  tabsH <- newTabsHandle
+  cursors <- newCursorStore
+  logger <- testSealLogger
+  newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
+          harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
+
+-- | A recording CallDispatcher that captures (OpName, url) pairs and
+-- always returns success. Used to verify handleNewSession dispatches
+-- SETUP_REPO with the right URL.
+recordingDispatcher :: IORef [(Text, Text)] -> SessionId -> CallDispatcher
+recordingDispatcher calls _sid (OpName opName) val = do
+  let url = case val of
+        A.Object m -> case KM.lookup (K.fromString "url") m of
+          Just (A.String u) -> u
+          _ -> ""
+        _ -> ""
+  modifyIORef' calls ((opName, url) :)
+  pure (Right (OpResult [TrpText "ok"] False (A.object [])))
