@@ -38,8 +38,9 @@ import Seal.Command.Spec
   , lookupSpec, mkRegistry, registrySpecs, runCommandAction )
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.Types (OpName (..), SessionId, mkSessionId, mkSystemSessionId)
+import Seal.Agent.Def.Types (mkAgentDefId)
 import Seal.Config.File (defaultRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionDir)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe )
@@ -65,6 +66,7 @@ import Seal.TestHelpers.FakeChannel (newFakeChannel)
 import qualified Seal.TestHelpers.FakeChannel as FC (getSent)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Command.New (NewArgs (..), emptyNewArgs)
+import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.Channels.Class (Channel (..))
 import Seal.Channels.Cursor (cursorLookup, newCursorStore)
@@ -707,11 +709,53 @@ spec = describe "Seal.Channels.Loop.channelCallDispatcher" $ do
       sent <- FC.getSent fc
       any ("repo" `T.isInfixOf`) sent `shouldBe` True
 
+    it "with no -r, uses the default agent (not the old session's agent)" $ do
+      -- When no -r is given, the new session should get the default agent
+      -- from config (matching the web frontend's "New Tab" flow), NOT the
+      -- old session's agent binding. The old session may have been bound
+      -- to a repo-specific agent via autoBindRepoAgent; carrying that
+      -- forward to a fresh session with no repo would be wrong.
+      deps <- mkLoopDeps "/tmp/seal-handleNewSession-default-agent-test"
+      tabsH <- newTabsHandle
+      fc <- newFakeChannel False
+      let h = toHandle fc
+      -- Old session has a repo-bound agent (simulating a prior /new -r).
+      let repoAgent = either (error "aid") id (mkAgentDefId "somerepo--agents-md")
+      now <- getCurrentTime
+      let oldMeta = (mkTestMetaNow "old-agent" "anthropic" "claude-sonnet-4" now)
+            { smAgent = Just repoAgent }
+      saveSessionMeta (cdPaths deps) oldMeta
+      _ <- insertTabH tabsH (BoundSession (smId oldMeta)) KindAi Nothing
+      handleNewSession deps h tabsH Telegram oldMeta emptyNewArgs Nothing
+      -- The new session's smAgent should be Nothing (no agent inherited
+      -- from the old session; the default will be resolved on the first
+      -- turn, same as the web frontend).
+      snap <- snapshotTabs tabsH
+      case tlTabs snap of
+        [tab] -> do
+          let newSid = case tRef tab of BoundSession s -> s; _ -> error "not a session tab"
+          mNewMeta <- decodeFileStrict (sessionMetaPath (cdPaths deps) newSid)
+          case mNewMeta of
+            Just newMeta -> smAgent newMeta `shouldBe` Nothing
+            Nothing -> expectationFailure "new session meta not found on disk"
+        _ -> expectationFailure ("expected exactly one tab, got " <> show (length (tlTabs snap)))
+
 -- | Match only 'BeListsSnapshot' broker events (the @lists@ WS frame).
 isListsSnapshot :: BrokerEvent -> Bool
 isListsSnapshot (BeListsSnapshot _) = True
 isListsSnapshot _ = False
 -- ── handleNewSession test helpers ─────────────────────────────────────
+
+-- | Build a SessionMeta with an explicit timestamp (for tests that need
+-- to set other fields after construction).
+mkTestMetaNow :: Text -> Text -> Text -> UTCTime -> SessionMeta
+mkTestMetaNow sidStr provider model now =
+  SessionMeta
+    { smId = either (error "sid") id (mkSessionId sidStr)
+    , smProvider = provider, smModel = model, smChannel = "telegram"
+    , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
+    , smDescription = Nothing, smCreatedAt = now, smLastActive = now
+    }
 
 -- | Build a SessionMeta with real timestamps for testing.
 mkTestMeta :: Text -> Text -> Text -> IO SessionMeta

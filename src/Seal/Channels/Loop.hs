@@ -580,14 +580,23 @@ handleNewSession
   -> Maybe (SessionId -> CallDispatcher) -> IO ()
 handleNewSession deps h tabsH kind oldMeta args mDispatcherFactory = do
   -- Apply -p/-m overrides (falling back to the old session's values so
-  -- mid-session /model use changes survive /new).
+  -- mid-session /model use changes survive /new). The agent is resolved
+  -- from config defaults (NOT inherited from the old session) — matching
+  -- the web frontend's "New Tab" flow which starts unbound and lets the
+  -- first turn's autoBindRepoAgent + resolveSystemPrompt resolve the
+  -- default. Inheriting the old session's agent would carry forward a
+  -- repo-specific binding to a session that has no repo.
   let channelLabel = channelKindToText kind
       oldSid = smId oldMeta
       oldRef = BoundSession oldSid
       provider = fromMaybe (smProvider oldMeta) (naProvider args)
       model = fromMaybe (smModel oldMeta) (naModel args)
-  newMeta <- newSessionMeta (cdPaths deps) provider model
-                            channelLabel (smAgent oldMeta)
+  -- Resolve the default agent from config (same as createConversationSession
+  -- and the web frontend's handleTabNew, which both start with no agent
+  -- binding and let the first turn's autoBindRepoAgent resolve it).
+  cfg <- cdConfig deps
+  (mAgent, _mProv, _mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
+  newMeta <- newSessionMeta (cdPaths deps) provider model channelLabel mAgent
   saveSessionMeta (cdPaths deps) newMeta
   -- Rebind the tab (if any) bound to the old sid to the new sid.
   snap <- snapshotTabs tabsH
