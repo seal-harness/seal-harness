@@ -1,0 +1,78 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The pure partition step: given the current tab list and the on-disk
+<span class="lineno">    2 </span>-- session lists (non-archived + archived), produce three mutually-exclusive
+<span class="lineno">    3 </span>-- lists. The backend's source of truth for the sidebar's three sections.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- Haddock note: Haskell record fields use the @ps@ prefix; the wire keys
+<span class="lineno">    6 </span>-- (in 'Seal.Gateway.ListsSnapshot') drop the prefix
+<span class="lineno">    7 </span>-- (@tabSessions@\/@recentSessions@\/@archivedSessions@).
+<span class="lineno">    8 </span>module Seal.Tabs.Partition
+<span class="lineno">    9 </span>  ( PartitionedSessions (..)
+<span class="lineno">   10 </span>  , partitionSessions
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Data.List (partition)
+<span class="lineno">   14 </span>import Data.Set qualified as Set
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   17 </span>import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>-- | The three mutually-exclusive session lists backing the sidebar sections.
+<span class="lineno">   20 </span>data PartitionedSessions = PartitionedSessions
+<span class="lineno">   21 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">psTabSessions</span></span></span>      :: [SessionMeta]
+<span class="lineno">   22 </span>    -- ^ wire key: @tabSessions@ — sessions with an open tab.
+<span class="lineno">   23 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">psRecentSessions</span></span></span>   :: [SessionMeta]
+<span class="lineno">   24 </span>    -- ^ wire key: @recentSessions@ — non-archived, no open tab.
+<span class="lineno">   25 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">psArchivedSessions</span></span></span> :: [SessionMeta]
+<span class="lineno">   26 </span>    -- ^ wire key: @archivedSessions@ — archived, no open tab.
+<span class="lineno">   27 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>-- | Partition the session space into three mutually-exclusive lists.
+<span class="lineno">   30 </span>--
+<span class="lineno">   31 </span>-- A session @s@ goes into 'psTabSessions' iff some tab's 'tRef' is
+<span class="lineno">   32 </span>-- @BoundSession (smId s)@; else into 'psRecentSessions' iff not archived;
+<span class="lineno">   33 </span>-- else into 'psArchivedSessions'.
+<span class="lineno">   34 </span>--
+<span class="lineno">   35 </span>-- Harness tabs (@'BoundHarness'@) carry no session and pull nothing into
+<span class="lineno">   36 </span>-- 'psTabSessions', so a harness's backing session (if it exists on disk)
+<span class="lineno">   37 </span>-- stays in 'psRecentSessions' — the intentional harness dual-listing is
+<span class="lineno">   38 </span>-- preserved.
+<span class="lineno">   39 </span>--
+<span class="lineno">   40 </span>-- An archived + tab-bound session goes into 'psTabSessions' (the tab wins;
+<span class="lineno">   41 </span>-- the archive flag stays on disk and resurfaces when the tab closes). Both
+<span class="lineno">   42 </span>-- the recent and archived lists are filtered by @tabSids@, and the
+<span class="lineno">   43 </span>-- tab-bound entries from both are merged into 'psTabSessions'.
+<span class="lineno">   44 </span>partitionSessions :: TabList -&gt; [SessionMeta] -&gt; [SessionMeta] -&gt; PartitionedSessions
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">partitionSessions tl recent archived =</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">let tabSids = Set.fromList [ sid | t &lt;- tlTabs tl, BoundSession sid &lt;- [tRef t] ]</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff">(tabbedFromRecent, recent') = partition (`belongsInTabs` tabSids) recent</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">(tabbedFromArchived, archived') = partition (`belongsInTabs` tabSids) archived</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">in PartitionedSessions</span>
+<span class="lineno">   50 </span><span class="spaces">       </span><span class="istickedoff">{ psTabSessions = tabbedFromRecent &lt;&gt; tabbedFromArchived</span>
+<span class="lineno">   51 </span><span class="spaces">       </span><span class="istickedoff">, psRecentSessions = recent'</span>
+<span class="lineno">   52 </span><span class="spaces">       </span><span class="istickedoff">, psArchivedSessions = archived'</span>
+<span class="lineno">   53 </span><span class="spaces">       </span><span class="istickedoff">}</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">belongsInTabs s tabSids = smId s `Set.member` tabSids</span></span>
+
+</pre>
+</body>
+</html>

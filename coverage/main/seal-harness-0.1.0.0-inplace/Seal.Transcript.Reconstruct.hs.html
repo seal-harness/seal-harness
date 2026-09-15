@@ -1,0 +1,242 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure reconstruction from the new two-file format
+<span class="lineno">    3 </span>-- (@conversation.jsonl@ + @entries.jsonl@) back to the old
+<span class="lineno">    4 </span>-- 'TranscriptEntry' stream. The reconstructed entries are byte-identical to
+<span class="lineno">    5 </span>-- what the old @transcript.jsonl@ format would have stored, modulo the
+<span class="lineno">    6 </span>-- intentional uncapping improvement (the new format stores full messages
+<span class="lineno">    7 </span>-- where the old format may have size-capped payloads).
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- A 'Request' entry @i@ is reconstructed with:
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- * @messages = conversation[0 .. convLen_i)@ (the prefix of conversation lines
+<span class="lineno">   12 </span>--   in effect at that turn);
+<span class="lineno">   13 </span>-- * the left-folded effective envelope at @i@ (model / system / tools /
+<span class="lineno">   14 </span>--   toolChoice / maxTokens), wrapped into a 'CompletionRequest'-shaped
+<span class="lineno">   15 </span>--   'Value';
+<span class="lineno">   16 </span>-- * the same direction + meta as the stored entry.
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- A 'Response' entry is reconstructed by re-inserting the assistant content
+<span class="lineno">   19 </span>-- blocks from @conversation.jsonl@ (the lines between the prior request's
+<span class="lineno">   20 </span>-- @convLen@ and this response's @convLen@) into the stored response envelope.
+<span class="lineno">   21 </span>--
+<span class="lineno">   22 </span>-- 'EKHarness' and 'EKCompaction' events carry no envelope; they round-trip
+<span class="lineno">   23 </span>-- their metadata + a 'Request'/'Response' direction derived from their kind
+<span class="lineno">   24 </span>-- (a harness turn is a 'Request' from the user side; a compaction is a
+<span class="lineno">   25 </span>-- boundary marker with 'Request' direction).
+<span class="lineno">   26 </span>module Seal.Transcript.Reconstruct
+<span class="lineno">   27 </span>  ( reconstruct
+<span class="lineno">   28 </span>  ) where
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Data.Aeson (Value (..), object, (.=))
+<span class="lineno">   31 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   32 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   33 </span>import Data.Text (Text)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Seal.Core.Types (ModelId (..))
+<span class="lineno">   36 </span>import Seal.Providers.Class (Message (..), ToolChoice (..), ToolDefinition (..))
+<span class="lineno">   37 </span>import Seal.Transcript.Entries
+<span class="lineno">   38 </span>import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | Reconstruct the old 'TranscriptEntry' stream from the two new files.
+<span class="lineno">   41 </span>--
+<span class="lineno">   42 </span>-- The input is the full conversation (the @conversation.jsonl@ contents decoded
+<span class="lineno">   43 </span>-- into a @[Message]@) and the full entry stream (the @entries.jsonl@ contents
+<span class="lineno">   44 </span>-- decoded into an @[EntryRecord]@). The output is one 'TranscriptEntry' per
+<span class="lineno">   45 </span>-- 'EntryRecord', in order, with payloads rebuilt from the conversation prefix
+<span class="lineno">   46 </span>-- and the effective envelope.
+<span class="lineno">   47 </span>--
+<span class="lineno">   48 </span>-- The first request's envelope is the initial envelope passed in (there is no
+<span class="lineno">   49 </span>-- prior to delta against, so the first request's full envelope is the
+<span class="lineno">   50 </span>-- baseline). Subsequent requests fold deltas on top.
+<span class="lineno">   51 </span>--
+<span class="lineno">   52 </span>-- Both 'EKRequest' and 'EKResponse' entries carry ONLY the NEW messages added
+<span class="lineno">   53 </span>-- since the prior turn (@conv[start:end]@), NOT the cumulative conversation
+<span class="lineno">   54 </span>-- prefix. This is the whole point of the two-file delta format: the on-disk
+<span class="lineno">   55 </span>-- @conversation.jsonl@ already stores each message exactly once, and
+<span class="lineno">   56 </span>-- re-embedding the full history into every request entry would be O(N²) in
+<span class="lineno">   57 </span>-- the conversation length (a 146-turn session would ship ~5,000 redundant
+<span class="lineno">   58 </span>-- message copies, turning 280KB on disk into ~18MB on the wire). The frontend
+<span class="lineno">   59 </span>-- extracts only the last message of each request for display, so the chat
+<span class="lineno">   60 </span>-- view is unaffected; the &quot;View raw JSON&quot; modal shows the delta payload (the
+<span class="lineno">   61 </span>-- new messages + the effective envelope), which is what the user actually
+<span class="lineno">   62 </span>-- wants to inspect when debugging a single turn.
+<span class="lineno">   63 </span>reconstruct :: [Message] -&gt; [EntryRecord] -&gt; [TranscriptEntry]
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">reconstruct conv = go 0 Nothing</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">-- @start@ is the conversation-line index where the current turn's new</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">-- messages begin (i.e. the prior response's convLen, or 0 for the first</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">-- turn). @mEnv@ is the effective envelope at the most recent request (used</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">-- to reconstruct response payloads, which carry the request's model).</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">go :: Int -&gt; Maybe Envelope -&gt; [EntryRecord] -&gt; [TranscriptEntry]</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">go _ _       [] = []</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">go start mEnv (e : es) =</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">case erKind e of</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">EKRequest -&gt;</span>
+<span class="lineno">   75 </span><span class="spaces">          </span><span class="istickedoff">let env = effectiveAt e mEnv</span>
+<span class="lineno">   76 </span><span class="spaces">              </span><span class="istickedoff">end = erConvLen e</span>
+<span class="lineno">   77 </span><span class="spaces">              </span><span class="istickedoff">-- Delta-only: the NEW messages added since the prior turn</span>
+<span class="lineno">   78 </span><span class="spaces">              </span><span class="istickedoff">-- (conv[start:end]), NOT the cumulative prefix.</span>
+<span class="lineno">   79 </span><span class="spaces">              </span><span class="istickedoff">msgs = take (end - start) (drop start conv)</span>
+<span class="lineno">   80 </span><span class="spaces">              </span><span class="istickedoff">-- Only include envelope fields when they CHANGED from the</span>
+<span class="lineno">   81 </span><span class="spaces">              </span><span class="istickedoff">-- prior effective envelope. The frontend deduplicates System</span>
+<span class="lineno">   82 </span><span class="spaces">              </span><span class="istickedoff">-- Prompt and Tools rows independently, so shipping the same</span>
+<span class="lineno">   83 </span><span class="spaces">              </span><span class="istickedoff">-- 36KB system prompt + 14KB tools array in all 73 request</span>
+<span class="lineno">   84 </span><span class="spaces">              </span><span class="istickedoff">-- entries of a 146-turn session wastes ~3.6MB. Omitting</span>
+<span class="lineno">   85 </span><span class="spaces">              </span><span class="istickedoff">-- unchanged fields lets the frontend skip the rows for those</span>
+<span class="lineno">   86 </span><span class="spaces">              </span><span class="istickedoff">-- entries (it only renders the first occurrence of each</span>
+<span class="lineno">   87 </span><span class="spaces">              </span><span class="istickedoff">-- unique system prompt / tools pair).</span>
+<span class="lineno">   88 </span><span class="spaces">              </span><span class="istickedoff">sys = if envSystem env /= (envSystem =&lt;&lt; mEnv)</span>
+<span class="lineno">   89 </span><span class="spaces">                      </span><span class="istickedoff">then envSystem env</span>
+<span class="lineno">   90 </span><span class="spaces">                      </span><span class="istickedoff">else Nothing</span>
+<span class="lineno">   91 </span><span class="spaces">              </span><span class="istickedoff">tools = if envTools env /= maybe [] envTools mEnv</span>
+<span class="lineno">   92 </span><span class="spaces">                        </span><span class="istickedoff">then Just (envTools env)</span>
+<span class="lineno">   93 </span><span class="spaces">                        </span><span class="istickedoff">else Nothing</span>
+<span class="lineno">   94 </span><span class="spaces">              </span><span class="istickedoff">payload = requestPayload env sys tools msgs</span>
+<span class="lineno">   95 </span><span class="spaces">              </span><span class="istickedoff">entry = toEntry e Request payload</span>
+<span class="lineno">   96 </span><span class="spaces">          </span><span class="istickedoff">in entry : go end (Just env) es</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">EKResponse -&gt;</span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="istickedoff">let end = erConvLen e</span>
+<span class="lineno">   99 </span><span class="spaces">              </span><span class="istickedoff">msgs = take (end - start) (drop start conv)</span>
+<span class="lineno">  100 </span><span class="spaces">              </span><span class="istickedoff">payload = responsePayload mEnv msgs e</span>
+<span class="lineno">  101 </span><span class="spaces">              </span><span class="istickedoff">entry = toEntry e Response payload</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="istickedoff">in entry : go end mEnv es</span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff">EKHarness -&gt;</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">-- A harness entry (opcode invocation) adds no conversation lines</span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">-- (erConvLen = 0), so the conversation cursor is preserved — the</span>
+<span class="lineno">  106 </span><span class="spaces">          </span><span class="istickedoff">-- next response entry must slice from the same @start@, not from 0.</span>
+<span class="lineno">  107 </span><span class="spaces">          </span><span class="istickedoff">-- Resetting the cursor here would make the next response's</span>
+<span class="lineno">  108 </span><span class="spaces">          </span><span class="istickedoff">-- @take end (drop 0 conv)@ return the ENTIRE conversation, which</span>
+<span class="lineno">  109 </span><span class="spaces">          </span><span class="istickedoff">-- the frontend renders as one giant duplicate response row.</span>
+<span class="lineno">  110 </span><span class="spaces">          </span><span class="istickedoff">let payload = harnessPayload (take (erConvLen e) <span class="nottickedoff">(drop start conv)</span>) e</span>
+<span class="lineno">  111 </span><span class="spaces">              </span><span class="istickedoff">entry = toEntry e Request payload</span>
+<span class="lineno">  112 </span><span class="spaces">          </span><span class="istickedoff">in entry : go start mEnv es</span>
+<span class="lineno">  113 </span><span class="spaces">        </span><span class="istickedoff">EKCompaction -&gt;</span>
+<span class="lineno">  114 </span><span class="spaces">          </span><span class="istickedoff">let entry = toEntry <span class="nottickedoff">e</span> Request Null</span>
+<span class="lineno">  115 </span><span class="spaces">          </span><span class="istickedoff">in entry : go <span class="nottickedoff">(erConvLen e)</span> <span class="nottickedoff">mEnv</span> es</span>
+<span class="lineno">  116 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">-- The effective envelope at a request entry. The first request has no</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">-- prior envelope, so its delta is folded against a default baseline; in</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="istickedoff">-- practice the writer always emits a full envelope on the first request,</span>
+<span class="lineno">  120 </span><span class="spaces">    </span><span class="istickedoff">-- so the delta carries every field. We fall back to a sensible default</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">-- only if the delta is absent (a malformed entry).</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">effectiveAt :: EntryRecord -&gt; Maybe Envelope -&gt; Envelope</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">effectiveAt e mEnv =</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">let baseline = fromMaybe defaultEnv mEnv</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">in case erEnvelope e of</span>
+<span class="lineno">  126 </span><span class="spaces">           </span><span class="istickedoff">Nothing -&gt; baseline</span>
+<span class="lineno">  127 </span><span class="spaces">           </span><span class="istickedoff">Just d  -&gt; applyDelta baseline d</span>
+<span class="lineno">  128 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">defaultEnv :: Envelope</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">defaultEnv = Envelope (ModelId &quot;&quot;) Nothing [] ToolAuto 0</span></span>
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>-- | Build the old 'Request' payload: a 'CompletionRequest'-shaped JSON object
+<span class="lineno">  133 </span>-- carrying the model, system, tools, toolChoice, maxTokens, and the message
+<span class="lineno">  134 </span>-- prefix in effect at this turn. The @sys@ and @tools@ arguments are the
+<span class="lineno">  135 </span>-- system prompt and tools to include — 'Nothing' means &quot;omit the field&quot;
+<span class="lineno">  136 </span>-- (used when the value is unchanged from the prior request, so the frontend
+<span class="lineno">  137 </span>-- skips the redundant row). Mirrors the old 'ToJSON CompletionRequest'
+<span class="lineno">  138 </span>-- encoding so a &quot;view raw&quot; reproduces the bytes the old format stored.
+<span class="lineno">  139 </span>requestPayload :: Envelope -&gt; Maybe Text -&gt; Maybe [ToolDefinition] -&gt; [Message] -&gt; Value
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">requestPayload env sys mTools msgs = object $</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;model&quot;      .= envModel env</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">, &quot;messages&quot;   .= msgs</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">] &lt;&gt; toolsField</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; [ &quot;toolChoice&quot; .= envToolChoice env</span>
+<span class="lineno">  145 </span><span class="spaces">       </span><span class="istickedoff">, &quot;maxTokens&quot;  .= envMaxTokens env</span>
+<span class="lineno">  146 </span><span class="spaces">       </span><span class="istickedoff">] &lt;&gt; systemField</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">systemField = case sys of</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []  -- unchanged from prior; omit so frontend skips</span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">Just s  -&gt; [&quot;system&quot; .= s]</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">toolsField = case mTools of</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []  -- unchanged from prior; omit so frontend skips</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">Just ts -&gt; [&quot;tools&quot; .= ts]</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | Build the old 'Response' payload: the assistant content blocks (drawn
+<span class="lineno">  156 </span>-- from the conversation lines added since the prior turn) plus the usage /
+<span class="lineno">  157 </span>-- stop / duration metadata stored on the entry.
+<span class="lineno">  158 </span>responsePayload :: Maybe Envelope -&gt; [Message] -&gt; EntryRecord -&gt; Value
+<span class="lineno">  159 </span><span class="decl"><span class="istickedoff">responsePayload mEnv msgs e = object</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;model&quot;    .= (envModel &lt;$&gt; mEnv)</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">, &quot;content&quot;  .= concatMap msgContent msgs</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">, &quot;usage&quot;    .= erUsage e</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">, &quot;stop&quot;     .= erStop e</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">, &quot;durationMs&quot; .= erDurationMs e</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | A harness turn's payload: the conversation lines added since the prior
+<span class="lineno">  168 </span>-- turn (the harness's input/output as messages), plus the harness name and
+<span class="lineno">  169 </span>-- the opcode metadata. The @op@ field is always included in the base
+<span class="lineno">  170 </span>-- payload (v1: so the frontend filter 'Seal.Gateway.Transcript.reconEntryToFrontend'
+<span class="lineno">  171 </span>-- can whitelist @op.name == &quot;SKILL_LOAD&quot;@ and surface /skill load
+<span class="lineno">  172 </span>-- invocations as distinct harness entries). The @input@, @result@, and
+<span class="lineno">  173 </span>-- @channel@ fields are included when present in @erMeta@ (the 'SKILL_LOAD'
+<span class="lineno">  174 </span>-- result entry recorded by 'Seal.ISA.Dispatch.recordSkillLoadResult' carries
+<span class="lineno">  175 </span>-- input + result + the originating channel label, so the frontend can render
+<span class="lineno">  176 </span>-- the skill body in a collapsible tool-call box AND surface channel
+<span class="lineno">  177 </span>-- provenance in the source label). When the entry carries approval metadata
+<span class="lineno">  178 </span>-- (erMeta has an &quot;approval&quot; key), the payload also includes the approval
+<span class="lineno">  179 </span>-- info so the frontend can render the confirmation decision.
+<span class="lineno">  180 </span>harnessPayload :: [Message] -&gt; EntryRecord -&gt; Value
+<span class="lineno">  181 </span><span class="decl"><span class="istickedoff">harnessPayload msgs e =</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">let base = object</span>
+<span class="lineno">  183 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;messages&quot; .= msgs</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="istickedoff">, &quot;harness&quot;  .= erHarness e</span>
+<span class="lineno">  185 </span><span class="spaces">        </span><span class="istickedoff">, &quot;op&quot;       .= (Map.lookup &quot;op&quot; (erMeta e) :: Maybe Value)</span>
+<span class="lineno">  186 </span><span class="spaces">        </span><span class="istickedoff">, &quot;input&quot;    .= (Map.lookup &quot;input&quot; (erMeta e) :: Maybe Value)</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="istickedoff">, &quot;result&quot;   .= (Map.lookup &quot;result&quot; (erMeta e) :: Maybe Value)</span>
+<span class="lineno">  188 </span><span class="spaces">        </span><span class="istickedoff">, &quot;channel&quot;  .= (Map.lookup &quot;channel&quot; (erMeta e) :: Maybe Value)</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">in case Map.lookup &quot;approval&quot; (erMeta e) of</span>
+<span class="lineno">  191 </span><span class="spaces">       </span><span class="istickedoff">Nothing -&gt; base</span>
+<span class="lineno">  192 </span><span class="spaces">       </span><span class="istickedoff">Just approvalVal -&gt; <span class="nottickedoff">object</span></span>
+<span class="lineno">  193 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">[ &quot;messages&quot; .= msgs</span></span>
+<span class="lineno">  194 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;harness&quot;  .= erHarness e</span></span>
+<span class="lineno">  195 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;op&quot;       .= (Map.lookup &quot;op&quot; (erMeta e) :: Maybe Value)</span></span>
+<span class="lineno">  196 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;input&quot;    .= (Map.lookup &quot;input&quot; (erMeta e) :: Maybe Value)</span></span>
+<span class="lineno">  197 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;result&quot;   .= (Map.lookup &quot;result&quot; (erMeta e) :: Maybe Value)</span></span>
+<span class="lineno">  198 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;channel&quot;  .= (Map.lookup &quot;channel&quot; (erMeta e) :: Maybe Value)</span></span>
+<span class="lineno">  199 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">, &quot;approval&quot; .= approvalVal</span></span>
+<span class="lineno">  200 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">]</span></span></span>
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- | Lift an 'EntryRecord' into a 'TranscriptEntry' with the given direction
+<span class="lineno">  203 </span>-- and payload. The id, timestamp, duration, correlation, and meta are
+<span class="lineno">  204 </span>-- carried over; the model is 'Nothing' (the dispatcher's opcode-invocation
+<span class="lineno">  205 </span>-- entries set teModel = Nothing; the loop's provider entries set it from the
+<span class="lineno">  206 </span>-- envelope — but the reconstructed old-format entry keeps teModel = Nothing
+<span class="lineno">  207 </span>-- to match the existing dispatch path; the response payload carries the
+<span class="lineno">  208 </span>-- model separately).
+<span class="lineno">  209 </span>toEntry :: EntryRecord -&gt; Direction -&gt; Value -&gt; TranscriptEntry
+<span class="lineno">  210 </span><span class="decl"><span class="istickedoff">toEntry e dir payload = TranscriptEntry</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">{ teId = erId e</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">, teTimestamp = erTimestamp e</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">, teModel = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">, teDirection = dir</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">, tePayload = payload</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">, teDurationMs = <span class="nottickedoff">erDurationMs e</span></span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">, teCorrelation = <span class="nottickedoff">erCorrelation e</span></span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">, teMeta = erMeta e</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,113 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | PROCESS_MANAGE (Untrusted): list or kill processes on the untrusted
+<span class="lineno">    3 </span>-- plane. @list@ runs @ps -o pid=,cmd=@ (fixed argv, bounded output); @kill@
+<span class="lineno">    4 </span>-- runs @kill &lt;pid&gt;@ with a validated positive-integer PID (rejects
+<span class="lineno">    5 </span>-- negative, self-pid). All IO through the 'UntrustedIO' seam; this module
+<span class="lineno">    6 </span>-- never imports 'System.Process'.
+<span class="lineno">    7 </span>module Seal.ISA.Ops.Process
+<span class="lineno">    8 </span>  ( processManageOp
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   12 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   13 </span>import Data.Text (Text)
+<span class="lineno">   14 </span>import Data.Text qualified as T
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   17 </span>import Seal.ISA.Opcode
+<span class="lineno">   18 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   19 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   20 </span>import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
+<span class="lineno">   21 </span>import Seal.Tools.Exec.UIO (renderUntrustedErr, uioProcessKill, uioProcessList)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | PROCESS_MANAGE opcode. Input: @{ action: &quot;list&quot; | &quot;kill&quot;, pid?: Int }@.
+<span class="lineno">   24 </span>processManageOp :: WorkspaceRoot -&gt; SecurityPolicy -&gt; Opcode
+<span class="lineno">   25 </span><span class="decl"><span class="istickedoff">processManageOp _wsRoot policy = UntrustedOpcode</span>
+<span class="lineno">   26 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;PROCESS_MANAGE&quot;</span>
+<span class="lineno">   27 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;List or kill processes on the untrusted plane (bounded output, validated PID).&quot;</span>
+<span class="lineno">   28 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = processManageSchema</span>
+<span class="lineno">   29 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   31 </span><span class="spaces">      </span><span class="istickedoff">case actionField v of</span>
+<span class="lineno">   32 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; Left &quot;PROCESS_MANAGE requires {action:string}&quot;</span>
+<span class="lineno">   33 </span><span class="spaces">        </span><span class="istickedoff">Just act</span>
+<span class="lineno">   34 </span><span class="spaces">          </span><span class="istickedoff">| act == &quot;list&quot; -&gt; checkAutonomy</span>
+<span class="lineno">   35 </span><span class="spaces">          </span><span class="istickedoff">| act == &quot;kill&quot;  -&gt; case pidField v of</span>
+<span class="lineno">   36 </span><span class="spaces">              </span><span class="istickedoff">Nothing  -&gt; Left &quot;PROCESS_MANAGE: kill requires {pid:positive integer}&quot;</span>
+<span class="lineno">   37 </span><span class="spaces">              </span><span class="istickedoff">Just pid</span>
+<span class="lineno">   38 </span><span class="spaces">                </span><span class="istickedoff">| <span class="tickonlytrue">pid &lt;= 0</span>   -&gt; Left &quot;PROCESS_MANAGE: pid must be a positive integer&quot;</span>
+<span class="lineno">   39 </span><span class="spaces">                </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>  -&gt; <span class="nottickedoff">checkAutonomy</span></span>
+<span class="lineno">   40 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Left (&quot;PROCESS_MANAGE: unknown action \&quot;&quot; &lt;&gt; act &lt;&gt; &quot;\&quot;&quot;)</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">   42 </span><span class="spaces">      </span><span class="istickedoff">let act = actionField v</span>
+<span class="lineno">   43 </span><span class="spaces">          </span><span class="istickedoff">mPid = pidField v</span>
+<span class="lineno">   44 </span><span class="spaces">          </span><span class="istickedoff">recorded = object [ &quot;action&quot; .= act, &quot;pid&quot; .= mPid ]</span>
+<span class="lineno">   45 </span><span class="spaces">      </span><span class="istickedoff">case act of</span>
+<span class="lineno">   46 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;PROCESS_MANAGE: missing action&quot;] True recorded)</span></span>
+<span class="lineno">   47 </span><span class="spaces">        </span><span class="istickedoff">Just a</span>
+<span class="lineno">   48 </span><span class="spaces">          </span><span class="istickedoff">| a == &quot;list&quot; -&gt; do</span>
+<span class="lineno">   49 </span><span class="spaces">              </span><span class="istickedoff">res &lt;- uioProcessList</span>
+<span class="lineno">   50 </span><span class="spaces">              </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">   51 </span><span class="spaces">                </span><span class="istickedoff">Left err   -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">   52 </span><span class="spaces">                </span><span class="istickedoff">Right out -&gt; OpResult [TrpText out] False <span class="nottickedoff">recorded</span></span>
+<span class="lineno">   53 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">a == &quot;kill&quot;</span> -&gt; case mPid of</span>
+<span class="lineno">   54 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;PROCESS_MANAGE: missing pid&quot;] True recorded)</span></span>
+<span class="lineno">   55 </span><span class="spaces">              </span><span class="istickedoff">Just pid -&gt; do</span>
+<span class="lineno">   56 </span><span class="spaces">                </span><span class="istickedoff">res &lt;- uioProcessKill pid</span>
+<span class="lineno">   57 </span><span class="spaces">                </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">   58 </span><span class="spaces">                  </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">OpResult [TrpText (renderUntrustedErr err)] True recorded</span></span>
+<span class="lineno">   59 </span><span class="spaces">                  </span><span class="istickedoff">Right _  -&gt; OpResult <span class="nottickedoff">[TrpText (&quot;killed pid &quot; &lt;&gt; T.pack (show pid))]</span> False recorded</span>
+<span class="lineno">   60 </span><span class="spaces">          </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;PROCESS_MANAGE: unknown action &quot; &lt;&gt; a)] True recorded)</span></span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">checkAutonomy = case spAutonomy policy of</span>
+<span class="lineno">   64 </span><span class="spaces">      </span><span class="istickedoff">Deny -&gt; <span class="nottickedoff">Left &quot;PROCESS_MANAGE denied by autonomy policy&quot;</span></span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">_   -&gt; Right ()</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>processManageSchema :: Value
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">processManageSchema =</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;action&quot; .= object</span>
+<span class="lineno">   73 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   74 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;\&quot;list\&quot; (list processes) or \&quot;kill\&quot; (kill by PID)&quot; :: Text)</span>
+<span class="lineno">   75 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">, &quot;pid&quot; .= object</span>
+<span class="lineno">   77 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">   78 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Required for kill; positive integer.&quot; :: Text)</span>
+<span class="lineno">   79 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">   80 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;action&quot;] :: [Text])</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>actionField :: Value -&gt; Maybe Text
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">actionField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;action&quot;))</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>pidField :: Value -&gt; Maybe Int
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">pidField v = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;pid&quot;)) v :: Maybe (Maybe Int) of</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">Just (Just n) -&gt; Just n</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">_             -&gt; Nothing</span></span>
+
+</pre>
+</body>
+</html>

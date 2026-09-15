@@ -1,0 +1,93 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure Markdown codec for 'Skill' — frontmatter + body. Split out of
+<span class="lineno">    3 </span>-- 'Seal.Skills.Backend' so the embedded built-in skills
+<span class="lineno">    4 </span>-- ('Seal.Skills.Builtins') can decode their compile-time sources without
+<span class="lineno">    5 </span>-- importing the IO-shaped backend (which would create a module cycle:
+<span class="lineno">    6 </span>-- Backend imports Builtins for the union layer, Builtins imports the
+<span class="lineno">    7 </span>-- codec).
+<span class="lineno">    8 </span>module Seal.Skills.Codec
+<span class="lineno">    9 </span>  ( encodeSkill
+<span class="lineno">   10 </span>  , decodeSkill
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Data.Either (fromRight)
+<span class="lineno">   14 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   15 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   16 </span>import Data.Text (Text)
+<span class="lineno">   17 </span>import Data.Text qualified as T
+<span class="lineno">   18 </span>import Data.Time (UTCTime (..))
+<span class="lineno">   19 </span>import Data.Time.Calendar (fromGregorian)
+<span class="lineno">   20 </span>import Data.Time.Clock (secondsToDiffTime)
+<span class="lineno">   21 </span>import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
+<span class="lineno">   24 </span>import Seal.Skills.Types (Skill (..), mkSkillId, bareSkillIdText)
+<span class="lineno">   25 </span>import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- | Encode a 'Skill' as a Markdown document (frontmatter + body).
+<span class="lineno">   28 </span>encodeSkill :: Skill -&gt; Text
+<span class="lineno">   29 </span><span class="decl"><span class="istickedoff">encodeSkill s = encodeDoc fm (skBody s)</span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   31 </span><span class="spaces">    </span><span class="istickedoff">fm = Map.fromList $</span>
+<span class="lineno">   32 </span><span class="spaces">      </span><span class="istickedoff">[ (&quot;id&quot;, bareSkillIdText (skId s))</span>
+<span class="lineno">   33 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;description&quot;, skDescription s)</span>
+<span class="lineno">   34 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;created_at&quot;, isoTime (skCreatedAt s))</span>
+<span class="lineno">   35 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;updated_at&quot;, isoTime (skUpdatedAt s))</span>
+<span class="lineno">   36 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;session&quot;, sessionIdText (skSession s))</span>
+<span class="lineno">   37 </span><span class="spaces">      </span><span class="istickedoff">] ++ maybe [] (\g -&gt; [(&quot;group&quot;, g)]) (skGroup s)</span></span>
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | Decode a Markdown document into a 'Skill'. Returns 'Nothing' if the id
+<span class="lineno">   40 </span>-- field is missing or fails 'mkSkillId'. Timestamps default to epoch 0 when
+<span class="lineno">   41 </span>-- absent or unparseable (the file was hand-edited without them).
+<span class="lineno">   42 </span>decodeSkill :: Text -&gt; Maybe Skill
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">decodeSkill content =</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">case decodeDoc content of</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="istickedoff">(fm, body) -&gt; do</span>
+<span class="lineno">   46 </span><span class="spaces">      </span><span class="istickedoff">sidT &lt;- fmLookup &quot;id&quot; fm</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff">sid  &lt;- either <span class="nottickedoff">(const Nothing)</span> Just (mkSkillId sidT)</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">Just Skill</span>
+<span class="lineno">   49 </span><span class="spaces">        </span><span class="istickedoff">{ skId = sid</span>
+<span class="lineno">   50 </span><span class="spaces">        </span><span class="istickedoff">, skDescription = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (fmLookup &quot;description&quot; fm)</span>
+<span class="lineno">   51 </span><span class="spaces">        </span><span class="istickedoff">, skBody = body</span>
+<span class="lineno">   52 </span><span class="spaces">        </span><span class="istickedoff">, skGroup = fmLookup &quot;group&quot; fm</span>
+<span class="lineno">   53 </span><span class="spaces">        </span><span class="istickedoff">, skCreatedAt = parseTime (fmLookup &quot;created_at&quot; fm)</span>
+<span class="lineno">   54 </span><span class="spaces">        </span><span class="istickedoff">, skUpdatedAt = parseTime (fmLookup &quot;updated_at&quot; fm)</span>
+<span class="lineno">   55 </span><span class="spaces">        </span><span class="istickedoff">, skSession = fromRight <span class="nottickedoff">(mkSystemSessionId &quot;unknown&quot;)</span> (mkSessionId (fromMaybe <span class="nottickedoff">&quot;unknown&quot;</span> (fmLookup &quot;session&quot; fm)))</span>
+<span class="lineno">   56 </span><span class="spaces">        </span><span class="istickedoff">}</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
+<span class="lineno">   59 </span>isoTime :: UTCTime -&gt; Text
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">isoTime = T.pack . formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot;</span></span>
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
+<span class="lineno">   63 </span>-- when absent or unparseable (hand-edited files).
+<span class="lineno">   64 </span>parseTime :: Maybe Text -&gt; UTCTime
+<span class="lineno">   65 </span><span class="decl"><span class="istickedoff">parseTime Nothing    = <span class="nottickedoff">epochZero</span></span>
+<span class="lineno">   66 </span><span class="spaces"></span><span class="istickedoff">parseTime (Just raw) = fromMaybe <span class="nottickedoff">epochZero</span> (parseTimeM True <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot; (T.unpack raw))</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | The epoch fallback for missing/unparseable timestamps.
+<span class="lineno">   69 </span>epochZero :: UTCTime
+<span class="lineno">   70 </span><span class="decl"><span class="nottickedoff">epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,693 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE LambdaCase #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The POST /api/sessions/:id/send handler: route the inbound text (Layer-1
+<span class="lineno">    4 </span>-- terse grammar → slash registry vs plain agent turn), run it, and return the
+<span class="lineno">    5 </span>-- outcome. Mirrors 'Seal.Channel.Cli.runCliTui's @plainHandler@ / @loop@
+<span class="lineno">    6 </span>-- routing, but pulls the session by id (not the active-session ref) and uses a
+<span class="lineno">    7 </span>-- collector-backed 'ChannelCaps' so slash-command output can be returned in
+<span class="lineno">    8 </span>-- the response body. Plain turns write the assistant reply to the transcript
+<span class="lineno">    9 </span>-- (the frontend polls the transcript, so the reply surfaces there); the HTTP
+<span class="lineno">   10 </span>-- response just carries @kind: &quot;assistant&quot;@ so the optimistic spinner clears.
+<span class="lineno">   11 </span>module Seal.Gateway.Send
+<span class="lineno">   12 </span>  ( SendDeps (..)
+<span class="lineno">   13 </span>  , SendOutcome (..)
+<span class="lineno">   14 </span>  , sendOutcomeJson
+<span class="lineno">   15 </span>  , handleSend
+<span class="lineno">   16 </span>  , handleSetupRepo
+<span class="lineno">   17 </span>  , ensureTabForSession
+<span class="lineno">   18 </span>  , handleAnswerDelivery
+<span class="lineno">   19 </span>  , handleAnswerTextDelivery
+<span class="lineno">   20 </span>  , parseAnswerBody
+<span class="lineno">   21 </span>  , handleAskCancel
+<span class="lineno">   22 </span>  , webCallDispatcher
+<span class="lineno">   23 </span>  , mkWebTurnDeps
+<span class="lineno">   24 </span>  , webAskCaps
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
+<span class="lineno">   28 </span>import Control.Monad (unless, when)
+<span class="lineno">   29 </span>import Data.Aeson (Value, object, (.=))
+<span class="lineno">   30 </span>import Data.Aeson qualified as A
+<span class="lineno">   31 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   32 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   33 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   34 </span>import Data.IORef (readIORef)
+<span class="lineno">   35 </span>import Data.Text (Text)
+<span class="lineno">   36 </span>import Data.Text qualified as T
+<span class="lineno">   37 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   38 </span>import System.Directory (doesFileExist)
+<span class="lineno">   39 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+<span class="lineno">   42 </span>import Data.Default (def)
+<span class="lineno">   43 </span>import Seal.Channel.Cli
+<span class="lineno">   44 </span>  ( Backends (..) )
+<span class="lineno">   45 </span>import Seal.Command.Provider (ProviderRuntime (..))
+<span class="lineno">   46 </span>import Seal.Command.Call (CallDispatcher, callCommandSpec, renderDispatchError)
+<span class="lineno">   47 </span>import Seal.Command.Skill (skillCommandSpec)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
+<span class="lineno">   50 </span>import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter)
+<span class="lineno">   51 </span>import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
+<span class="lineno">   52 </span>import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
+<span class="lineno">   53 </span>import Seal.Core.TurnEngine
+<span class="lineno">   54 </span>  (TurnDeps (..), TurnAdapter (..),
+<span class="lineno">   55 </span>   TurnOutcome (..), runSessionTurn)
+<span class="lineno">   56 </span>import qualified Seal.Core.TurnEngine as TurnEngine
+<span class="lineno">   57 </span>import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
+<span class="lineno">   58 </span>import Seal.Git.Repo (ConfigRepo)
+<span class="lineno">   59 </span>import Seal.Handles.AskReply
+<span class="lineno">   60 </span>  ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
+<span class="lineno">   61 </span>  , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
+<span class="lineno">   62 </span>  , approvalScopeText, parseApprovalScope )
+<span class="lineno">   63 </span>import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
+<span class="lineno">   64 </span>import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
+<span class="lineno">   65 </span>import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
+<span class="lineno">   66 </span>import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
+<span class="lineno">   67 </span>import Seal.ISA.Ops.Repo (validateRepoUrl)
+<span class="lineno">   68 </span>import Seal.ISA.Opcode (OpResult (..))
+<span class="lineno">   69 </span>import Seal.Providers.Class
+<span class="lineno">   70 </span>  ( SomeProvider, ToolResultPart (..) )
+<span class="lineno">   71 </span>import Seal.Harness.Registry (HarnessRegistry)
+<span class="lineno">   72 </span>import Seal.Harness.Tmux (TmuxRunner)
+<span class="lineno">   73 </span>import Seal.Routing.Route (ParseError (..), RoutingDecision (..), route)
+<span class="lineno">   74 </span>import Seal.Gateway.Broadcast (broadcastListsSnapshot)
+<span class="lineno">   75 </span>import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
+<span class="lineno">   76 </span>import Seal.SourceControl.Registry (RepoRegistryHandle)
+<span class="lineno">   77 </span>import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
+<span class="lineno">   78 </span>import Seal.Session.ExecCache (SessionExecCache)
+<span class="lineno">   79 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   80 </span>import Seal.Session.Store (SessionRuntime (..))
+<span class="lineno">   81 </span>import Seal.Session.Lock
+<span class="lineno">   82 </span>  ( ReplyRegistry, replyFanout, replyFanoutMessage
+<span class="lineno">   83 </span>  , SessionLocks )
+<span class="lineno">   84 </span>import Seal.Tools.Exec.Abort (SessionAbortRegistry)
+<span class="lineno">   85 </span>import Seal.Tools.Exec.Remote (RemoteRunner)
+<span class="lineno">   86 </span>import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
+<span class="lineno">   87 </span>import Seal.Logging.Logger (SealLogger)
+<span class="lineno">   88 </span>import Seal.Logging.Exceptions (withExceptionLogging)
+<span class="lineno">   89 </span>import Seal.Vault.Commands (VaultRuntime (..))
+<span class="lineno">   90 </span>import Seal.Util.StrictIO (decodeFileStrict)
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | The dependencies the send handler needs (the agent-loop plumbing). Built
+<span class="lineno">   93 </span>-- once in 'Seal.Command.Serve.runServeMain' and shared across requests. The
+<span class="lineno">   94 </span>-- 'sdResolve' seam defaults to the real 'resolveSessionProvider' but tests
+<span class="lineno">   95 </span>-- inject a fake to avoid the vault + live HTTP provider.
+<span class="lineno">   96 </span>data SendDeps = SendDeps
+<span class="lineno">   97 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">sdPaths</span></span></span>      :: SealPaths
+<span class="lineno">   98 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdVault</span></span></span>      :: VaultRuntime
+<span class="lineno">   99 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdRepoReg</span></span></span>    :: RepoRegistryHandle
+<span class="lineno">  100 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdProvider</span></span></span>   :: ProviderRuntime
+<span class="lineno">  101 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdSession</span></span></span>    :: SessionRuntime
+<span class="lineno">  102 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdBackends</span></span></span>   :: Backends
+<span class="lineno">  103 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sdConfigRepo</span></span></span> :: ConfigRepo
+<span class="lineno">  104 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdPreprocess</span></span></span> :: PreprocessChain
+<span class="lineno">  105 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdRegistry</span></span></span>   :: Registry
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdResolve</span></span></span>    :: SessionMeta -&gt; IO (Either Text (SomeProvider, ModelId))
+<span class="lineno">  107 </span>    -- ^ Resolve a session's provider+model. Defaults to
+<span class="lineno">  108 </span>    -- 'resolveSessionProvider' (vault-backed); tests inject a fake.
+<span class="lineno">  109 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdAutonomy</span></span></span>   :: Policy.AutonomyLevel
+<span class="lineno">  110 </span>    -- ^ The CLI autonomy level (--yolo / --locked / default Supervised).
+<span class="lineno">  111 </span>    -- When 'Full', the approval gate bypasses prompting so untrusted
+<span class="lineno">  112 </span>    -- opcodes run without asking (ACK audit still recorded).
+<span class="lineno">  113 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdBroker</span></span></span>     :: Maybe StreamBroker
+<span class="lineno">  114 </span>    -- ^ The WS broker for pushing live transcript entries to the frontend.
+<span class="lineno">  115 </span>    -- 'Nothing' in tests; in production, set by 'runServeMain'. After each
+<span class="lineno">  116 </span>    -- turn, new entries are read from disk and broadcast as 'BeEntryRecorded'
+<span class="lineno">  117 </span>    -- so the frontend's WS stream updates without a page refresh.
+<span class="lineno">  118 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sdHarnessRegistry</span></span></span> :: HarnessRegistry
+<span class="lineno">  119 </span>    -- ^ The live harness registry (shared with the gateway's
+<span class="lineno">  120 </span>    -- @adHarnessRegistry@). Backs HARNESS_LIST/START/STOP.
+<span class="lineno">  121 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sdTmuxRunner</span></span></span>  :: TmuxRunner
+<span class="lineno">  122 </span>    -- ^ The tmux runner (real via 'mkRealTmuxRunner' in production;
+<span class="lineno">  123 </span>    -- fail-closes to 'HeTmuxMissing' when tmux is absent). Backs
+<span class="lineno">  124 </span>    -- HARNESS_START/STOP.
+<span class="lineno">  125 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sdHttpManager</span></span></span> :: Maybe Manager
+<span class="lineno">  126 </span>    -- ^ The shared HTTP manager (TLS-configured) for WEB_FETCH and
+<span class="lineno">  127 </span>    -- WEB_SEARCH. 'Nothing' fail-closes those opcodes (they return a
+<span class="lineno">  128 </span>    -- structured error). Set by 'runServeMain'; tests use 'Nothing'.
+<span class="lineno">  129 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdAskReply</span></span></span> :: AskReplyStore
+<span class="lineno">  130 </span>    -- ^ The shared, medium-agnostic ask/reply store backing ASK_HUMAN on
+<span class="lineno">  131 </span>    -- async channels (web, Signal, Telegram). The agent loop blocks on the
+<span class="lineno">  132 </span>    -- store until the medium delivers an answer (web: POST
+<span class="lineno">  133 </span>    -- /api/sessions/:id/questions/:qid/answer; Signal/Telegram: the next
+<span class="lineno">  134 </span>    -- inbound message). Set by 'runServeMain'; tests use a fresh store.
+<span class="lineno">  135 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">sdApprovals</span></span></span> :: ApprovalCache
+<span class="lineno">  136 </span>    -- ^ The approval cache for Untrusted opcodes under 'Supervised' autonomy.
+<span class="lineno">  137 </span>    -- Records &quot;for this session&quot; and &quot;always&quot; approvals so subsequent calls
+<span class="lineno">  138 </span>    -- to the same opcode skip the prompt. Shared across all sessions (the
+<span class="lineno">  139 </span>    -- &quot;always&quot; scope is global; &quot;for this session&quot; is keyed by session id).
+<span class="lineno">  140 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdReplies</span></span></span> :: ReplyRegistry
+<span class="lineno">  141 </span>    -- ^ The per-session reply fan-out registry. After a web turn, the reply
+<span class="lineno">  142 </span>    -- is fanned out to every 'ChannelHandle' subscribed to this session,
+<span class="lineno">  143 </span>    -- so chat channels (Telegram, Signal) focused on the same tab receive
+<span class="lineno">  144 </span>    -- the reply via 'chSend'. The web frontend already receives entries
+<span class="lineno">  145 </span>    -- via the WS broker.
+<span class="lineno">  146 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdLocks</span></span></span> :: SessionLocks
+<span class="lineno">  147 </span>    -- ^ Per-session write locks. The web 'plainTurn' acquires the session's
+<span class="lineno">  148 </span>    -- lock before 'withTwoFileTranscript' so a web send and a channel
+<span class="lineno">  149 </span>    -- message on the same tab serialize rather than race.
+<span class="lineno">  150 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdAbortReg</span></span></span> :: SessionAbortRegistry
+<span class="lineno">  151 </span>    -- ^ Per-session abort registry (design Blocker Resolution #2). The web
+<span class="lineno">  152 </span>    -- @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on
+<span class="lineno">  153 </span>    -- this; 'handleSend' looks up the per-session 'AbortFlag' via
+<span class="lineno">  154 </span>    -- 'lookupOrCreateAbortFlag' and passes it into 'mkSessionAgentEnv' as
+<span class="lineno">  155 </span>    -- 'aeAbortFlag'. Mirrors 'sdLocks' (the registry is a session-keyed
+<span class="lineno">  156 </span>    -- map, lazily created per session).
+<span class="lineno">  157 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdTabsHandle</span></span></span> :: TabsHandle
+<span class="lineno">  158 </span>    -- ^ The shared tab handle. 'handleSend' auto-tabs the session after a
+<span class="lineno">  159 </span>    -- successful turn (W2 invariant 2: any message sent to a session with
+<span class="lineno">  160 </span>    -- no active tab creates one). Sourced from server-validated 'SessionMeta'
+<span class="lineno">  161 </span>    -- only — never from raw client strings.
+<span class="lineno">  162 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdLogger</span></span></span> :: SealLogger
+<span class="lineno">  163 </span>    -- ^ The shared logger for structured katip logging. Built once at
+<span class="lineno">  164 </span>    -- startup via 'withSealLogger'.
+<span class="lineno">  165 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdIsRemote</span></span></span> :: Bool
+<span class="lineno">  166 </span>    -- ^ Whether the untrusted executor runs commands over SSH (remote
+<span class="lineno">  167 </span>    -- mode from the security config). Threaded into 'CloneDeps' so the
+<span class="lineno">  168 </span>    -- deploy-key clone path knows to use agent forwarding (@ssh -A@).
+<span class="lineno">  169 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdExecCache</span></span></span> :: SessionExecCache
+<span class="lineno">  170 </span>    -- ^ The per-process session-exec + workdir-discovery cache, shared with
+<span class="lineno">  171 </span>    -- the gateway's 'ApiDeps' so a scan runs once per session across ALL
+<span class="lineno">  172 </span>    -- surfaces (turns, /call dispatches, GET /api/sessions/:id/agents).
+<span class="lineno">  173 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdRemoteRunner</span></span></span> :: Maybe RemoteRunner
+<span class="lineno">  174 </span>    -- ^ Test seam (mirrors 'TurnDeps.tdRemoteRunner'): when 'Just', replaces
+<span class="lineno">  175 </span>    -- 'mkRealRemoteRunner' as the SSH runner used to build the session exec
+<span class="lineno">  176 </span>    -- in mode=remote. 'Nothing' (production) uses the real runner. Gateway
+<span class="lineno">  177 </span>    -- API integration tests inject a recording fake so the composed ssh
+<span class="lineno">  178 </span>    -- argv — the fully-rendered remote command — is observable without a
+<span class="lineno">  179 </span>    -- live SSH host.
+<span class="lineno">  180 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdMkWorker</span></span></span> :: Maybe AgentWorkerBuilder
+<span class="lineno">  181 </span>    -- ^ Test seam (mirrors 'sdRemoteRunner' / 'TurnDeps.tdMkWorker'): when
+<span class="lineno">  182 </span>    -- 'Just', replaces 'buildWorker' as the 'AGENT_START' worker-builder.
+<span class="lineno">  183 </span>    -- 'Nothing' (production) uses the real 'buildWorker' →
+<span class="lineno">  184 </span>    -- 'mkDelegateWorker' path. Gateway API integration tests inject a stub
+<span class="lineno">  185 </span>    -- worker so 'AGENT_START' can run through the gateway without a real
+<span class="lineno">  186 </span>    -- provider call.
+<span class="lineno">  187 </span>  }
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>-- | Replace the @call@, @skill@, @stop@, and @model@ specs in a registry with
+<span class="lineno">  190 </span>-- per-request versions (W5: the call/skill dispatcher closes over the
+<span class="lineno">  191 </span>-- request's explicit 'SessionId' instead of reading the process-global
+<span class="lineno">  192 </span>-- @srActive@; the stop spec likewise targets the request's session so a
+<span class="lineno">  193 </span>-- @\/stop@ typed in tab N aborts tab N, not whatever @srActive@ points at;
+<span class="lineno">  194 </span>-- the model spec targets the request's session so a @\/model use@ in tab N
+<span class="lineno">  195 </span>-- updates tab N's @session.json@, not @srActive@'s). The other specs are
+<span class="lineno">  196 </span>-- reused as-is from the startup-built @sdRegistry@.
+<span class="lineno">  197 </span>replaceCallSkillSpecs :: Registry -&gt; CommandSpec -&gt; CommandSpec -&gt; CommandSpec -&gt; CommandSpec -&gt; Registry
+<span class="lineno">  198 </span><span class="decl"><span class="istickedoff">replaceCallSkillSpecs baseReg skillSpec callSpec stopSpec modelSpec =</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">mkRegistry (filter notPerRequestSpec (registrySpecs baseReg) &lt;&gt; [skillSpec, callSpec, stopSpec, <span class="nottickedoff">modelSpec</span>])</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">notPerRequestSpec s = let CommandName n = csName s in n `notElem` [&quot;call&quot;, &quot;skill&quot;, &quot;stop&quot;, &quot;model&quot;]</span></span>
+<span class="lineno">  202 </span>
+<span class="lineno">  203 </span>-- | Build a 'TurnDeps' from a 'SendDeps' (the web wiring). The unified turn
+<span class="lineno">  204 </span>-- adapter builder is the only place the web's 'SendDeps' shape meets the
+<span class="lineno">  205 </span>-- engine's 'TurnDeps' shape. After W4 collapses 'SendDeps' + 'ChannelDeps'
+<span class="lineno">  206 </span>-- + the CLI closures into one 'TurnDeps', this builder is dropped.
+<span class="lineno">  207 </span>mkWebTurnDeps :: SendDeps -&gt; TurnDeps
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">mkWebTurnDeps deps = TurnDeps</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">{ tdPaths        = sdPaths deps</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">, tdVault        = sdVault deps</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">, tdProvider     = sdProvider deps</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">, tdResolve      = sdResolve deps</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">, tdRepoReg      = sdRepoReg deps</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">, tdAutonomy     = sdAutonomy deps</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">, tdBroker       = sdBroker deps</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">, tdHarnessReg   = <span class="nottickedoff">sdHarnessRegistry deps</span></span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">, tdTmuxRunner   = <span class="nottickedoff">sdTmuxRunner deps</span></span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">, tdHttpManager  = <span class="nottickedoff">sdHttpManager deps</span></span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">, tdApprovals    = <span class="nottickedoff">sdApprovals deps</span></span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">, tdReplies      = sdReplies deps</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">, tdLocks        = sdLocks deps</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, tdAbortReg     = sdAbortReg deps</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, tdTabsHandle   = sdTabsHandle deps</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">, tdLogger       = sdLogger deps</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, tdIsRemote     = sdIsRemote deps</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, tdBaseBackends = sdBackends deps</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">, tdExecCache    = sdExecCache deps</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">, tdRemoteRunner = sdRemoteRunner deps</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">, tdMkWorker    = sdMkWorker deps</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  231 </span>
+<span class="lineno">  232 </span>-- | Build the web 'TurnAdapter' for a given 'ChannelCaps'. The web adapter:
+<span class="lineno">  233 </span>-- * @taPreTurn@ — fans out the user's message to subscribed chat channels
+<span class="lineno">  234 </span>--   (cross-channel mirroring, @&quot;web&quot;@ label). No 'replySubscribe' (the web
+<span class="lineno">  235 </span>--   isn't an inbox-driven channel handle).
+<span class="lineno">  236 </span>-- * @taChannelLabel@ — constant @&quot;web&quot;@.
+<span class="lineno">  237 </span>-- * @taOnStop@ — 'Just' the reply fan-out so chat channels subscribed to
+<span class="lineno">  238 </span>--   this session receive the final reply.
+<span class="lineno">  239 </span>-- * @taOnUserMessage@ — 'Nothing' (web turns aren't /bg).
+<span class="lineno">  240 </span>-- * @taPostTurn@ — @pure ()@ (the web's @lists@ snapshot is refreshed by
+<span class="lineno">  241 </span>--   'triggerBroadcast' in 'handleSend', not here).
+<span class="lineno">  242 </span>-- * @taStartWiring@ — the engine-owned 'TurnEngine.buildStartWiring' (W4
+<span class="lineno">  243 </span>--   collapsed the per-surface builders into this single one).
+<span class="lineno">  244 </span>mkWebTurnAdapter :: SendDeps -&gt; TurnDeps -&gt; ChannelCaps -&gt; TurnAdapter
+<span class="lineno">  245 </span><span class="decl"><span class="istickedoff">mkWebTurnAdapter deps td caps = TurnAdapter</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">{ taCaps          = caps</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">, taPreTurn       = \sid _meta t -&gt; replyFanoutMessage (sdReplies deps) sid <span class="nottickedoff">&quot;web&quot;</span> <span class="nottickedoff">t</span></span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">, taChannelLabel  = const &quot;web&quot;</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">, taOnStop        = Just . replyFanout (sdReplies deps)</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">, taOnUserMessage = const Nothing</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">, taPostTurn      = \_ _ -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">, taStartWiring   = \sessionBackends sid appEnv eCfg operatorCeiling _meta -&gt;</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">TurnEngine.buildStartWiring td sessionBackends <span class="nottickedoff">sid</span> <span class="nottickedoff">appEnv</span> <span class="nottickedoff">eCfg</span> <span class="nottickedoff">operatorCeiling</span> <span class="nottickedoff">&quot;web&quot;</span></span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>-- | The outcome of a send request. The HTTP layer ('Seal.Gateway.API') turns
+<span class="lineno">  257 </span>-- this into the JSON response body the frontend's @SendResult@ parses.
+<span class="lineno">  258 </span>data SendOutcome
+<span class="lineno">  259 </span>  = SendSlash Text (Maybe SessionId)
+<span class="lineno">  260 </span>    -- ^ transient slash-command output (no transcript entry). The optional
+<span class="lineno">  261 </span>    -- 'SessionId' is set by slash commands that mint+focus a new session
+<span class="lineno">  262 </span>    -- (e.g. @\/new@) so the frontend can navigate to it. 'Nothing' for
+<span class="lineno">  263 </span>    -- ordinary slash commands.
+<span class="lineno">  264 </span>  | SendAssistant       -- ^ plain turn; reply lands in the transcript
+<span class="lineno">  265 </span>  | SendError Int Text  -- ^ HTTP status code + message (400/404/500)
+<span class="lineno">  266 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  267 </span>
+<span class="lineno">  268 </span>-- | Encode a 'SendOutcome' as the JSON the frontend's @SendResult@ parses.
+<span class="lineno">  269 </span>-- Errors carry an @error@ field (the frontend logs them); success carries
+<span class="lineno">  270 </span>-- @kind@ + @response@; @\/new@ also carries @session_id@ so the SPA can
+<span class="lineno">  271 </span>-- navigate to the freshly-minted session.
+<span class="lineno">  272 </span>sendOutcomeJson :: SendOutcome -&gt; (Int, Value)
+<span class="lineno">  273 </span><span class="decl"><span class="istickedoff">sendOutcomeJson = \case</span>
+<span class="lineno">  274 </span><span class="spaces">  </span><span class="istickedoff">SendSlash t mSid -&gt;</span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">(200, object</span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;kind&quot; .= (&quot;slash&quot; :: Text)</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="istickedoff">, &quot;response&quot; .= t</span>
+<span class="lineno">  278 </span><span class="spaces">      </span><span class="istickedoff">, &quot;session_id&quot; .= (sessionIdText &lt;$&gt; mSid)</span>
+<span class="lineno">  279 </span><span class="spaces">      </span><span class="istickedoff">])</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">SendAssistant  -&gt; (200, object [ &quot;kind&quot; .= (&quot;assistant&quot; :: Text), &quot;response&quot; .= (&quot;&quot; :: Text) ])</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">SendError c m  -&gt; (c, <span class="nottickedoff">object [ &quot;error&quot; .= m ]</span>)</span></span>
+<span class="lineno">  282 </span>
+<span class="lineno">  283 </span>-- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
+<span class="lineno">  284 </span>-- the text, runs the turn, and returns the 'SendOutcome'. A missing session
+<span class="lineno">  285 </span>-- -&gt; 404; an unknown provider / vault error -&gt; 400; an internal failure -&gt;
+<span class="lineno">  286 </span>-- 500 (logged to stderr).
+<span class="lineno">  287 </span>--
+<span class="lineno">  288 </span>-- After a successful 'Plain'/'SlashCommand'/'NewSession' turn (any outcome
+<span class="lineno">  289 </span>-- that is NOT 'SendError'), auto-tabs the session via
+<span class="lineno">  290 </span>-- 'ensureTabForSession' (W2 invariant 2). The 'TabCommand'/'Focus'/'Inject'
+<span class="lineno">  291 </span>-- routes return 'SendSlash' but no message was sent — they are explicitly
+<span class="lineno">  292 </span>-- excluded from auto-tabbing.
+<span class="lineno">  293 </span>handleSend :: SendDeps -&gt; SessionId -&gt; Text -&gt; IO SendOutcome
+<span class="lineno">  294 </span><span class="decl"><span class="istickedoff">handleSend deps sid rawText = do</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="istickedoff">mMeta &lt;- loadSessionMeta (sdPaths deps) sid</span>
+<span class="lineno">  296 </span><span class="spaces">  </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (SendError 404 <span class="nottickedoff">&quot;session not found&quot;</span>)</span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="istickedoff">Just meta -&gt; case route rawText of</span>
+<span class="lineno">  299 </span><span class="spaces">      </span><span class="istickedoff">Left (ParseError e) -&gt; <span class="nottickedoff">pure (SendSlash e Nothing)</span></span>
+<span class="lineno">  300 </span><span class="spaces">      </span><span class="istickedoff">Right (Plain t) -&gt; do</span>
+<span class="lineno">  301 </span><span class="spaces">        </span><span class="istickedoff">er &lt;- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) (smId meta))) &quot;plainTurn&quot; $</span>
+<span class="lineno">  302 </span><span class="spaces">          </span><span class="istickedoff">plainTurn deps meta t</span>
+<span class="lineno">  303 </span><span class="spaces">        </span><span class="istickedoff">case er of</span>
+<span class="lineno">  304 </span><span class="spaces">          </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (SendError 500 err)</span></span>
+<span class="lineno">  305 </span><span class="spaces">          </span><span class="istickedoff">Right (Left err) -&gt; pure (SendError 500 <span class="nottickedoff">err</span>)</span>
+<span class="lineno">  306 </span><span class="spaces">          </span><span class="istickedoff">Right (Right ()) -&gt; do</span>
+<span class="lineno">  307 </span><span class="spaces">            </span><span class="istickedoff">ensureTabForSession (sdTabsHandle deps) <span class="nottickedoff">KindProvider</span> (smId meta)</span>
+<span class="lineno">  308 </span><span class="spaces">            </span><span class="istickedoff">triggerBroadcast deps</span>
+<span class="lineno">  309 </span><span class="spaces">            </span><span class="istickedoff">pure SendAssistant</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">Right (SlashCommand cmdName) -&gt; do</span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="istickedoff">-- W5: no srActive swap bracket. The per-request call/skill</span>
+<span class="lineno">  312 </span><span class="spaces">        </span><span class="istickedoff">-- dispatcher closes over the request's explicit sid (see</span>
+<span class="lineno">  313 </span><span class="spaces">        </span><span class="istickedoff">-- 'runSlash'). /new still swaps srActive via its ndRebind (the</span>
+<span class="lineno">  314 </span><span class="spaces">        </span><span class="istickedoff">-- swap is how /new communicates the new session to</span>
+<span class="lineno">  315 </span><span class="spaces">        </span><span class="istickedoff">-- 'newSessionIdIfChangedFrom').</span>
+<span class="lineno">  316 </span><span class="spaces">        </span><span class="istickedoff">r &lt;- runSlash deps meta rawText</span>
+<span class="lineno">  317 </span><span class="spaces">        </span><span class="istickedoff">case r of</span>
+<span class="lineno">  318 </span><span class="spaces">          </span><span class="istickedoff">SendError _ _ -&gt; <span class="nottickedoff">pure r</span></span>
+<span class="lineno">  319 </span><span class="spaces">          </span><span class="istickedoff">_            -&gt; do</span>
+<span class="lineno">  320 </span><span class="spaces">            </span><span class="istickedoff">-- /tab owns its tab lifecycle (close/resume mutate the list);</span>
+<span class="lineno">  321 </span><span class="spaces">            </span><span class="istickedoff">-- auto-tabbing the request's session afterward would resurrect</span>
+<span class="lineno">  322 </span><span class="spaces">            </span><span class="istickedoff">-- a tab that /tab close just removed. Skip the auto-tab for</span>
+<span class="lineno">  323 </span><span class="spaces">            </span><span class="istickedoff">-- /tab; still broadcast so the frontend reflects any mutation.</span>
+<span class="lineno">  324 </span><span class="spaces">            </span><span class="istickedoff">unless (isTabCommand cmdName) $</span>
+<span class="lineno">  325 </span><span class="spaces">              </span><span class="istickedoff">ensureTabForSession (sdTabsHandle deps) <span class="nottickedoff">KindProvider</span> <span class="nottickedoff">(smId meta)</span></span>
+<span class="lineno">  326 </span><span class="spaces">            </span><span class="istickedoff">triggerBroadcast deps</span>
+<span class="lineno">  327 </span><span class="spaces">            </span><span class="istickedoff">pure r</span>
+<span class="lineno">  328 </span><span class="spaces">      </span><span class="istickedoff">Right (NewSession _args) -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  329 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">r &lt;- runSlash deps meta rawText</span></span>
+<span class="lineno">  330 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case r of</span></span>
+<span class="lineno">  331 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">SendError _ _ -&gt; pure r</span></span>
+<span class="lineno">  332 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">_            -&gt; do</span></span>
+<span class="lineno">  333 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">ensureTabForSession (sdTabsHandle deps) KindProvider (smId meta)</span></span>
+<span class="lineno">  334 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">triggerBroadcast deps</span></span>
+<span class="lineno">  335 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">pure r</span></span>
+<span class="lineno">  336 </span><span class="spaces">      </span><span class="istickedoff">Right (TabCommand _)   -&gt; <span class="nottickedoff">pure (SendSlash &quot;(tab commands are not supported over the web send endpoint)&quot; Nothing)</span></span>
+<span class="lineno">  337 </span><span class="spaces">      </span><span class="istickedoff">Right CurrentTab        -&gt; do</span>
+<span class="lineno">  338 </span><span class="spaces">        </span><span class="istickedoff">tl &lt;- snapshotTabs (sdTabsHandle deps)</span>
+<span class="lineno">  339 </span><span class="spaces">        </span><span class="istickedoff">pure $ case lookupByRef tl (BoundSession (smId meta)) of</span>
+<span class="lineno">  340 </span><span class="spaces">          </span><span class="istickedoff">Just t  -&gt; SendSlash (renderWebTab t) <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  341 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; SendSlash &quot;no current tab&quot; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">Right (Focus _)        -&gt; pure (SendSlash <span class="nottickedoff">&quot;(focus is a tab-level operation; use the sidebar)&quot;</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">Right (Inject _ _)    -&gt; pure (SendSlash <span class="nottickedoff">&quot;(inject is a tab-level operation; use the sidebar)&quot;</span> <span class="nottickedoff">Nothing</span>)</span></span>
+<span class="lineno">  344 </span>
+<span class="lineno">  345 </span>-- | Render the current tab for the web send endpoint: @&lt;index&gt;  &lt;kind&gt;  [label]@.
+<span class="lineno">  346 </span>renderWebTab :: Tab -&gt; Text
+<span class="lineno">  347 </span><span class="decl"><span class="istickedoff">renderWebTab t =</span>
+<span class="lineno">  348 </span><span class="spaces">  </span><span class="istickedoff">T.singleton (tabIndexToChar (tIndex t)) &lt;&gt; &quot;  &quot; &lt;&gt; T.pack (show (tKind t))</span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; maybe &quot;&quot; <span class="nottickedoff">(&quot;  &quot; &lt;&gt;)</span> (tLabel t)</span></span>
+<span class="lineno">  350 </span>
+<span class="lineno">  351 </span>-- | True for slash commands that own their tab lifecycle (@/tab ...@).
+<span class="lineno">  352 </span>-- Used to skip 'ensureTabForSession' on the web send path so a
+<span class="lineno">  353 </span>-- @/tab close N@ that just removed a tab isn't immediately undone by the
+<span class="lineno">  354 </span>-- auto-tab. The head word is checked case-insensitively (the registry
+<span class="lineno">  355 </span>-- lookup is case-insensitive too).
+<span class="lineno">  356 </span>isTabCommand :: Text -&gt; Bool
+<span class="lineno">  357 </span><span class="decl"><span class="istickedoff">isTabCommand cmdName =</span>
+<span class="lineno">  358 </span><span class="spaces">  </span><span class="istickedoff">let headWord = T.takeWhile (/= ' ') (T.strip cmdName)</span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">in T.toCaseFold headWord == &quot;tab&quot;</span></span>
+<span class="lineno">  360 </span>
+<span class="lineno">  361 </span>-- | 'ensureTabForSession' is defined in 'Seal.Tabs' and re-exported here for
+<span class="lineno">  362 </span>-- the web send path. See its Haddock there for the contract (idempotent,
+<span class="lineno">  363 </span>-- race-safe, failure logged to stderr ids-only, sources SessionId only from
+<span class="lineno">  364 </span>-- server-validated contexts).
+<span class="lineno">  365 </span>
+<span class="lineno">  366 </span>-- | Push a fresh @lists@ snapshot to WS subscribers after a state change
+<span class="lineno">  367 </span>-- (W6 broadcast trigger). No-op when 'sdBroker' is 'Nothing' (tests).
+<span class="lineno">  368 </span>triggerBroadcast :: SendDeps -&gt; IO ()
+<span class="lineno">  369 </span><span class="decl"><span class="istickedoff">triggerBroadcast deps =</span>
+<span class="lineno">  370 </span><span class="spaces">  </span><span class="istickedoff">case sdBroker deps of</span>
+<span class="lineno">  371 </span><span class="spaces">    </span><span class="istickedoff">Nothing     -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  372 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt; <span class="nottickedoff">broadcastListsSnapshot broker (sdTabsHandle deps) (sdPaths deps)</span></span></span>
+<span class="lineno">  373 </span>
+<span class="lineno">  374 </span>-- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
+<span class="lineno">  375 </span>-- when the session directory or session.json is missing or undecodable.
+<span class="lineno">  376 </span>loadSessionMeta :: SealPaths -&gt; SessionId -&gt; IO (Maybe SessionMeta)
+<span class="lineno">  377 </span><span class="decl"><span class="istickedoff">loadSessionMeta paths sid = do</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">let mp = sessionDir paths sid &lt;/&gt; &quot;session.json&quot;</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist mp</span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="istickedoff">else decodeFileStrict mp :: IO (Maybe SessionMeta)</span></span>
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>-- | Resolve the system prompt for a web turn. An ad-hoc
+<span class="lineno">  385 </span>-- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
+<span class="lineno">  386 </span>-- Session setup screen's &quot;Use a one-off agent file&quot; upload) takes
+<span class="lineno">  387 </span>-- precedence over the bound agent's 'adSystem'. Returns 'Nothing' when
+<span class="lineno">  388 </span>-- neither is set. The auto-loaded skill (default @seal-usage@, the
+<span class="lineno">  389 </span>-- fresh-workdir contract) is appended so the model is oriented to its
+<span class="lineno">  390 </span>-- per-session workspace from turn one. Disabled by setting
+<span class="lineno">  391 </span>-- | Run a plain (non-slash) turn through the agent loop. Mirrors
+<span class="lineno">  392 </span>-- 'Seal.Channel.Cli.runCliTui's @plainHandler@ but pulls the session by id
+<span class="lineno">  393 </span>-- and uses the ask/reply-backed 'ChannelCaps' ('webAskCaps') so ASK_HUMAN
+<span class="lineno">  394 </span>-- surfaces the question to the frontend and blocks until the human answers
+<span class="lineno">  395 </span>-- (the web frontend reads replies + questions from the WS stream, not from
+<span class="lineno">  396 </span>-- ccSend).
+<span class="lineno">  397 </span>--
+<span class="lineno">  398 </span>-- After the turn, the reply is fanned out to any chat channels (Telegram,
+<span class="lineno">  399 </span>-- Signal) subscribed to this session via the 'ReplyRegistry', so a web
+<span class="lineno">  400 </span>-- send on a channel-origin tab also delivers the reply to the channel.
+<span class="lineno">  401 </span>plainTurn :: SendDeps -&gt; SessionMeta -&gt; Text -&gt; IO (Either Text ())
+<span class="lineno">  402 </span><span class="decl"><span class="istickedoff">plainTurn deps meta t = do</span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">let td = mkWebTurnDeps deps</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">adapter = mkWebTurnAdapter deps td (webAskCaps <span class="nottickedoff">(sdBroker deps)</span> <span class="nottickedoff">(sdAskReply deps)</span> <span class="nottickedoff">(smId meta)</span>)</span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">outcome &lt;- runSessionTurn td adapter meta Nothing t</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">pure (case toError outcome of</span>
+<span class="lineno">  407 </span><span class="spaces">          </span><span class="istickedoff">Just err -&gt; Left <span class="nottickedoff">err</span></span>
+<span class="lineno">  408 </span><span class="spaces">          </span><span class="istickedoff">Nothing  -&gt; Right ())</span></span>
+<span class="lineno">  409 </span>
+<span class="lineno">  410 </span>-- | Run a slash command. The output is collected via a 'ChannelCaps' whose
+<span class="lineno">  411 </span>-- 'ccSend' appends to an MVar-backed list, then returned as the @response@.
+<span class="lineno">  412 </span>-- 'ccPrompt' routes through the ask/reply store so ASK_HUMAN (e.g. from a
+<span class="lineno">  413 </span>-- slash command that delegates to the agent) surfaces to the frontend.
+<span class="lineno">  414 </span>--
+<span class="lineno">  415 </span>-- For @\/new@ specifically: the command's 'ndRebind' swaps the active-session
+<span class="lineno">  416 </span>-- ref ('sdSession') to the freshly-minted session. After the action runs, we
+<span class="lineno">  417 </span>-- re-read the active session and, if its id differs from the one we entered
+<span class="lineno">  418 </span>-- with, include the new id in the 'SendSlash' outcome so the frontend can
+<span class="lineno">  419 </span>-- navigate to it. (This avoids widening the 'CommandAction' contract or
+<span class="lineno">  420 </span>-- threading a per-call IORef through the registry.)
+<span class="lineno">  421 </span>runSlash :: SendDeps -&gt; SessionMeta -&gt; Text -&gt; IO SendOutcome
+<span class="lineno">  422 </span><span class="decl"><span class="istickedoff">runSlash deps meta fullLine = do</span>
+<span class="lineno">  423 </span><span class="spaces">  </span><span class="istickedoff">outVar &lt;- newMVar ([] :: [Text])</span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">let askCaps = webAskCaps <span class="nottickedoff">(sdBroker deps)</span> <span class="nottickedoff">(sdAskReply deps)</span> <span class="nottickedoff">(smId meta)</span></span>
+<span class="lineno">  425 </span><span class="spaces">      </span><span class="istickedoff">caps = askCaps { ccSend = \t' -&gt; modifyMVar_ outVar (\acc -&gt; pure (acc &lt;&gt; [t'])) }</span>
+<span class="lineno">  426 </span><span class="spaces">      </span><span class="istickedoff">sid = smId meta</span>
+<span class="lineno">  427 </span><span class="spaces">      </span><span class="istickedoff">td = mkWebTurnDeps deps</span>
+<span class="lineno">  428 </span><span class="spaces">      </span><span class="istickedoff">-- W5: build a per-request call dispatcher that closes over the</span>
+<span class="lineno">  429 </span><span class="spaces">      </span><span class="istickedoff">-- request's explicit sid (no srActive swap). The sdRegistry is</span>
+<span class="lineno">  430 </span><span class="spaces">      </span><span class="istickedoff">-- rebuilt per-request by replacing the call/skill specs with</span>
+<span class="lineno">  431 </span><span class="spaces">      </span><span class="istickedoff">-- per-request versions; the rest of the specs are reused as-is.</span>
+<span class="lineno">  432 </span><span class="spaces">      </span><span class="istickedoff">perRequestCallDispatcher = webCallDispatcher <span class="nottickedoff">deps</span> td sid</span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="istickedoff">perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)</span>
+<span class="lineno">  434 </span><span class="spaces">        </span><span class="istickedoff">(skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)</span>
+<span class="lineno">  435 </span><span class="spaces">        </span><span class="istickedoff">(callCommandSpec <span class="nottickedoff">perRequestCallDispatcher</span>)</span>
+<span class="lineno">  436 </span><span class="spaces">        </span><span class="istickedoff">(stopCommandSpecForSession (sdAbortReg deps) sid</span>
+<span class="lineno">  437 </span><span class="spaces">           </span><span class="istickedoff">(mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))</span>
+<span class="lineno">  438 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(modelCommandSpecForSession (sdProvider deps) (sdPaths deps) (pure sid)</span></span>
+<span class="lineno">  439 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">(mkModelTranscriptWriter (sdPaths deps) (sdBroker deps)))</span></span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="istickedoff">-- Snapshot the active-session ref BEFORE the action runs. The web</span>
+<span class="lineno">  441 </span><span class="spaces">  </span><span class="istickedoff">-- gateway is multi-session: @srActive@ is a process-global ref that</span>
+<span class="lineno">  442 </span><span class="spaces">  </span><span class="istickedoff">-- points at whatever session the last @\/new@ (or session creation)</span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="istickedoff">-- left it at — which may be a DIFFERENT session than the one this</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">-- request is operating on. Comparing the post-action @srActive@ to</span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="istickedoff">-- the request's sid would falsely report a change for every session</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">-- that isn't currently &quot;active&quot;, causing the frontend to navigate</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">-- away on benign slash commands like @\/skill list@. Instead we</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">-- compare before vs after: only a slash command that actually</span>
+<span class="lineno">  449 </span><span class="spaces">  </span><span class="istickedoff">-- swapped @srActive@ during THIS call (e.g. @\/new@) reports a</span>
+<span class="lineno">  450 </span><span class="spaces">  </span><span class="istickedoff">-- change.</span>
+<span class="lineno">  451 </span><span class="spaces">  </span><span class="istickedoff">activeBefore &lt;- readIORef (srActive (sdSession deps))</span>
+<span class="lineno">  452 </span><span class="spaces">  </span><span class="istickedoff">d &lt;- ingest perRequestRegistry (sdPreprocess deps) (RawInbound fullLine)</span>
+<span class="lineno">  453 </span><span class="spaces">  </span><span class="istickedoff">case d of</span>
+<span class="lineno">  454 </span><span class="spaces">    </span><span class="istickedoff">DispatchAction (CommandAction act) -&gt; do</span>
+<span class="lineno">  455 </span><span class="spaces">      </span><span class="istickedoff">act caps</span>
+<span class="lineno">  456 </span><span class="spaces">      </span><span class="istickedoff">chunks &lt;- readMVar outVar</span>
+<span class="lineno">  457 </span><span class="spaces">      </span><span class="istickedoff">-- If the action swapped the active session (e.g. /new), thread the</span>
+<span class="lineno">  458 </span><span class="spaces">      </span><span class="istickedoff">-- new sid into the outcome so the frontend navigates to it.</span>
+<span class="lineno">  459 </span><span class="spaces">      </span><span class="istickedoff">mNewSid &lt;- newSessionIdIfChangedFrom deps (smId activeBefore)</span>
+<span class="lineno">  460 </span><span class="spaces">      </span><span class="istickedoff">pure (SendSlash (T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> chunks) mNewSid)</span>
+<span class="lineno">  461 </span><span class="spaces">    </span><span class="istickedoff">ShowText t -&gt; <span class="nottickedoff">pure (SendSlash t Nothing)</span></span>
+<span class="lineno">  462 </span><span class="spaces">    </span><span class="istickedoff">Rejected t -&gt; <span class="nottickedoff">pure (SendError 400 t)</span></span>
+<span class="lineno">  463 </span><span class="spaces">    </span><span class="istickedoff">PlainMessage t -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  464 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">er &lt;- plainTurnWithCaps deps meta caps t</span></span>
+<span class="lineno">  465 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case er of</span></span>
+<span class="lineno">  466 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left err -&gt; pure (SendError 400 err)</span></span>
+<span class="lineno">  467 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right () -&gt; do</span></span>
+<span class="lineno">  468 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">chunks &lt;- readMVar outVar</span></span>
+<span class="lineno">  469 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure (SendSlash (T.intercalate &quot;\n&quot; chunks) Nothing)</span></span></span>
+<span class="lineno">  470 </span>
+<span class="lineno">  471 </span>-- | After a slash action runs, check whether the active session changed
+<span class="lineno">  472 </span>-- DURING this call. Returns the new 'SessionId' if 'sdSession' now points
+<span class="lineno">  473 </span>-- at a different session than @beforeSid@ (the snapshot taken before the
+<span class="lineno">  474 </span>-- action ran); 'Nothing' otherwise. Used by @\/new@ to thread the
+<span class="lineno">  475 </span>-- freshly-minted sid into the 'SendSlash' outcome. Comparing to the
+<span class="lineno">  476 </span>-- pre-action snapshot (rather than the request's sid) avoids false
+<span class="lineno">  477 </span>-- positives on multi-session web gateways where @srActive@ may already
+<span class="lineno">  478 </span>-- point at a different session than the one this request targets.
+<span class="lineno">  479 </span>newSessionIdIfChangedFrom :: SendDeps -&gt; SessionId -&gt; IO (Maybe SessionId)
+<span class="lineno">  480 </span><span class="decl"><span class="istickedoff">newSessionIdIfChangedFrom deps beforeSid = do</span>
+<span class="lineno">  481 </span><span class="spaces">  </span><span class="istickedoff">active &lt;- readIORef (srActive (sdSession deps))</span>
+<span class="lineno">  482 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlytrue">smId active == beforeSid</span></span>
+<span class="lineno">  483 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  484 </span><span class="spaces">    </span><span class="istickedoff">else <span class="nottickedoff">pure (Just (smId active))</span></span></span>
+<span class="lineno">  485 </span>
+<span class="lineno">  486 </span>-- | The plain-turn helper for a slash-dispatched PlainMessage (when the
+<span class="lineno">  487 </span>-- preprocess chain passes a leading-/ line through but the registry doesn't
+<span class="lineno">  488 </span>-- claim it). Mirrors 'plainTurn' but takes the caller's caps.
+<span class="lineno">  489 </span>plainTurnWithCaps :: SendDeps -&gt; SessionMeta -&gt; ChannelCaps -&gt; Text -&gt; IO (Either Text ())
+<span class="lineno">  490 </span><span class="decl"><span class="nottickedoff">plainTurnWithCaps deps meta caps t = do</span>
+<span class="lineno">  491 </span><span class="spaces">  </span><span class="nottickedoff">let td = mkWebTurnDeps deps</span>
+<span class="lineno">  492 </span><span class="spaces">      </span><span class="nottickedoff">adapter = mkWebTurnAdapter deps td caps</span>
+<span class="lineno">  493 </span><span class="spaces">  </span><span class="nottickedoff">outcome &lt;- runSessionTurn td adapter meta Nothing t</span>
+<span class="lineno">  494 </span><span class="spaces">  </span><span class="nottickedoff">pure (case toError outcome of</span>
+<span class="lineno">  495 </span><span class="spaces">          </span><span class="nottickedoff">Just err -&gt; Left err</span>
+<span class="lineno">  496 </span><span class="spaces">          </span><span class="nottickedoff">Nothing  -&gt; Right ())</span></span>
+<span class="lineno">  497 </span>
+<span class="lineno">  498 </span>-- | Build a 'CallDispatcher' for the web channel. Resolves the active
+<span class="lineno">  499 </span>-- session at call time, opens its transcript, builds the session's ISA
+<span class="lineno">  500 </span>-- registry, and dispatches the opcode via 'Seal.ISA.Dispatch.dispatch'
+<span class="lineno">  501 </span>-- under 'Full' autonomy semantics (the operator is the approver by
+<span class="lineno">  502 </span>-- typing @/call@). Mirrors 'plainTurnWithCaps' but invokes 'dispatch'
+<span class="lineno">  503 </span>-- directly instead of 'runTurn'. Returns the structured result for
+<span class="lineno">  504 </span>-- 'Seal.Command.Call.renderOpResult' to render.
+<span class="lineno">  505 </span>-- | Build a 'CallDispatcher' for the web channel. Closes over the request's
+<span class="lineno">  506 </span>-- explicit 'SessionId' (W5: no longer reads the process-global @srActive@).
+<span class="lineno">  507 </span>-- Delegates to the unified 'TurnEngine.callDispatcher'.
+<span class="lineno">  508 </span>webCallDispatcher :: SendDeps -&gt; TurnDeps -&gt; SessionId -&gt; CallDispatcher
+<span class="lineno">  509 </span><span class="decl"><span class="istickedoff">webCallDispatcher deps td sid callOpName val = do</span>
+<span class="lineno">  510 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">caps = webAskCaps (sdBroker deps) (sdAskReply deps) sid</span></span>
+<span class="lineno">  511 </span><span class="spaces">  </span><span class="istickedoff">TurnEngine.callDispatcher td <span class="nottickedoff">caps</span> sid &quot;web&quot; callOpName val</span></span>
+<span class="lineno">  512 </span>
+<span class="lineno">  513 </span>-- | Build the web 'ChannelCaps' for a per-turn 'AskReplyStore'. 'ccSend' is a
+<span class="lineno">  514 </span>-- no-op (web replies surface via the transcript poll); 'ccPrompt' drives the
+<span class="lineno">  515 </span>-- full ask/reply primitive: it mints a pending question (carrying the opcode
+<span class="lineno">  516 </span>-- metadata when provided), broadcasts a 'BeAsk' event so the frontend renders
+<span class="lineno">  517 </span>-- it, and blocks on the store until the human answers via POST
+<span class="lineno">  518 </span>-- /api/sessions/:id/questions/:qid/answer (or the question is
+<span class="lineno">  519 </span>-- cancelled/timed out). The returned 'Text' is the approval scope's wire form
+<span class="lineno">  520 </span>-- (e.g. @&quot;once&quot;@, @for_session@, @always@, @rejected@) for the confirmation
+<span class="lineno">  521 </span>-- gate, or the human's typed reply for @ASK_HUMAN@. 'ccPromptSecret' is
+<span class="lineno">  522 </span>-- fail-closed.
+<span class="lineno">  523 </span>webAskCaps
+<span class="lineno">  524 </span>  :: Maybe StreamBroker -&gt; AskReplyStore -&gt; SessionId -&gt; ChannelCaps
+<span class="lineno">  525 </span><span class="decl"><span class="istickedoff">webAskCaps mBroker store sid = def</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="istickedoff">{ ccPrompt = \(AskPrompt q opts) -&gt; do</span>
+<span class="lineno">  527 </span><span class="spaces">      </span><span class="istickedoff">outcome &lt;- askHumanWithOptions store sid q opts (\qid -&gt;</span>
+<span class="lineno">  528 </span><span class="spaces">        </span><span class="istickedoff">case mBroker of</span>
+<span class="lineno">  529 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  530 </span><span class="spaces">          </span><span class="istickedoff">Just broker -&gt;</span>
+<span class="lineno">  531 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">broadcast broker (BeAsk sid (object</span></span>
+<span class="lineno">  532 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;id&quot; .= askIdText qid</span></span>
+<span class="lineno">  533 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;question&quot; .= q</span></span>
+<span class="lineno">  534 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;options&quot; .= opts</span></span>
+<span class="lineno">  535 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]))</span>)</span>
+<span class="lineno">  536 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">(case outcome of</span></span>
+<span class="lineno">  537 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left _  -&gt; &quot;rejected&quot;</span></span>
+<span class="lineno">  538 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right t -&gt; t)</span></span>
+<span class="lineno">  539 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  540 </span>
+<span class="lineno">  541 </span>-- | Notify the broker that a pending question was resolved (answered or
+<span class="lineno">  542 </span>-- cancelled) so the frontend dismisses it. 'Nothing' broker (tests) is a
+<span class="lineno">  543 </span>-- no-op.
+<span class="lineno">  544 </span>broadcastAskResolved
+<span class="lineno">  545 </span>  :: Maybe StreamBroker -&gt; SessionId -&gt; AskId -&gt; Text -&gt; IO ()
+<span class="lineno">  546 </span><span class="decl"><span class="istickedoff">broadcastAskResolved mBroker sid qid resolution =</span>
+<span class="lineno">  547 </span><span class="spaces">  </span><span class="istickedoff">case mBroker of</span>
+<span class="lineno">  548 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  549 </span><span class="spaces">    </span><span class="istickedoff">Just broker -&gt;</span>
+<span class="lineno">  550 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">broadcast broker (BeAskResolved sid (object</span></span>
+<span class="lineno">  551 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[ &quot;id&quot; .= askIdText qid</span></span>
+<span class="lineno">  552 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;resolution&quot; .= resolution</span></span>
+<span class="lineno">  553 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">]))</span></span></span>
+<span class="lineno">  554 </span>
+<span class="lineno">  555 </span>-- | Handle @POST /api/sessions/:id/setup-repo@: clone a repo into the
+<span class="lineno">  556 </span>-- session's workdir before the first turn. The web &quot;set up repo&quot; combo box
+<span class="lineno">  557 </span>-- calls this. Rather than calling 'cloneRepoIO' directly (which is
+<span class="lineno">  558 </span>-- unaudited — a side channel that never appears in the transcript), this
+<span class="lineno">  559 </span>-- dispatches the real 'SETUP_REPO' opcode via 'webCallDispatcher'. The
+<span class="lineno">  560 </span>-- clone (and any failure) is therefore recorded in the session's
+<span class="lineno">  561 </span>-- transcript exactly like a model-invoked SETUP_REPO, so the user sees it
+<span class="lineno">  562 </span>-- in the chat and any error is visible there — not silent.
+<span class="lineno">  563 </span>--
+<span class="lineno">  564 </span>-- The 'srActive' ref is scoped to the target session for the duration of
+<span class="lineno">  565 </span>-- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
+<span class="lineno">  566 </span>-- reads 'srActive' to pick the transcript), then restored.
+<span class="lineno">  567 </span>--
+<span class="lineno">  568 </span>-- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
+<span class="lineno">  569 </span>-- with the opcode's text result (the clone/no-op/conflict/failure message)
+<span class="lineno">  570 </span>-- for the API layer to pass through to the frontend.
+<span class="lineno">  571 </span>handleSetupRepo :: SendDeps -&gt; SessionId -&gt; Text -&gt; IO (Either Text Text)
+<span class="lineno">  572 </span><span class="decl"><span class="istickedoff">handleSetupRepo deps sid url =</span>
+<span class="lineno">  573 </span><span class="spaces">  </span><span class="istickedoff">case validateRepoUrl url of</span>
+<span class="lineno">  574 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (Left (&quot;invalid url: &quot; &lt;&gt; err))</span></span>
+<span class="lineno">  575 </span><span class="spaces">    </span><span class="istickedoff">Right cleanUrl -&gt; do</span>
+<span class="lineno">  576 </span><span class="spaces">      </span><span class="istickedoff">mMeta &lt;- loadSessionMeta (sdPaths deps) sid</span>
+<span class="lineno">  577 </span><span class="spaces">      </span><span class="istickedoff">case mMeta of</span>
+<span class="lineno">  578 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (Left &quot;session not found&quot;)</span></span>
+<span class="lineno">  579 </span><span class="spaces">        </span><span class="istickedoff">Just _targetMeta -&gt; do</span>
+<span class="lineno">  580 </span><span class="spaces">          </span><span class="istickedoff">-- Dispatch SETUP_REPO via the audited path (records into the</span>
+<span class="lineno">  581 </span><span class="spaces">          </span><span class="istickedoff">-- transcript + broadcasts the entry so the frontend sees it).</span>
+<span class="lineno">  582 </span><span class="spaces">          </span><span class="istickedoff">-- W5: the dispatcher takes the explicit sid (no srActive swap).</span>
+<span class="lineno">  583 </span><span class="spaces">          </span><span class="istickedoff">let td = mkWebTurnDeps deps</span>
+<span class="lineno">  584 </span><span class="spaces">              </span><span class="istickedoff">dispatcher = webCallDispatcher <span class="nottickedoff">deps</span> td sid</span>
+<span class="lineno">  585 </span><span class="spaces">          </span><span class="istickedoff">res &lt;- dispatcher (OpName &quot;SETUP_REPO&quot;) (object [&quot;url&quot; .= cleanUrl])</span>
+<span class="lineno">  586 </span><span class="spaces">          </span><span class="istickedoff">case res of</span>
+<span class="lineno">  587 </span><span class="spaces">            </span><span class="istickedoff">Left dErr -&gt; <span class="nottickedoff">pure (Left (&quot;SETUP_REPO dispatch failed: &quot; &lt;&gt; renderDispatchError dErr))</span></span>
+<span class="lineno">  588 </span><span class="spaces">            </span><span class="istickedoff">Right opRes -&gt;</span>
+<span class="lineno">  589 </span><span class="spaces">              </span><span class="istickedoff">if <span class="tickonlyfalse">orIsError opRes</span></span>
+<span class="lineno">  590 </span><span class="spaces">                </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (opResultText opRes))</span></span>
+<span class="lineno">  591 </span><span class="spaces">                </span><span class="istickedoff">else pure (Right (opResultText opRes))</span></span>
+<span class="lineno">  592 </span>
+<span class="lineno">  593 </span>-- | Join the text parts of an 'OpResult' into a single message (the
+<span class="lineno">  594 </span>-- clone/no-op/conflict/failure text from SETUP_REPO).
+<span class="lineno">  595 </span>opResultText :: OpResult -&gt; Text
+<span class="lineno">  596 </span><span class="decl"><span class="istickedoff">opResultText r = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> [ t | TrpText t &lt;- orParts r ]</span></span>
+<span class="lineno">  597 </span>
+<span class="lineno">  598 </span>-- | Deliver an answer to a pending question for a session. Returns 'True'
+<span class="lineno">  599 </span>-- if the answer was accepted (the question was pending and not yet
+<span class="lineno">  600 </span>-- answered). Also broadcasts 'BeAskResolved' so the frontend dismisses the
+<span class="lineno">  601 </span>-- question. A 'Left' parse error is returned for a malformed ask id or
+<span class="lineno">  602 </span>-- approval scope.
+<span class="lineno">  603 </span>handleAnswerDelivery
+<span class="lineno">  604 </span>  :: SendDeps -&gt; SessionId -&gt; Text -&gt; ApprovalScope -&gt; IO (Either Text Bool)
+<span class="lineno">  605 </span><span class="decl"><span class="nottickedoff">handleAnswerDelivery deps sid qidTxt scope =</span>
+<span class="lineno">  606 </span><span class="spaces">  </span><span class="nottickedoff">case parseAskId qidTxt of</span>
+<span class="lineno">  607 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  608 </span><span class="spaces">    </span><span class="nottickedoff">Right qid -&gt; do</span>
+<span class="lineno">  609 </span><span class="spaces">      </span><span class="nottickedoff">let reply = AskReply scope (approvalScopeText scope)</span>
+<span class="lineno">  610 </span><span class="spaces">      </span><span class="nottickedoff">accepted &lt;- deliverAnswer (sdAskReply deps) qid reply</span>
+<span class="lineno">  611 </span><span class="spaces">      </span><span class="nottickedoff">when accepted $</span>
+<span class="lineno">  612 </span><span class="spaces">        </span><span class="nottickedoff">broadcastAskResolved (sdBroker deps) sid qid &quot;answered&quot;</span>
+<span class="lineno">  613 </span><span class="spaces">      </span><span class="nottickedoff">pure (Right accepted)</span></span>
+<span class="lineno">  614 </span>
+<span class="lineno">  615 </span>-- | Deliver a free-text answer (a chosen option's label or a typed &quot;Other&quot;
+<span class="lineno">  616 </span>-- reply) to a pending ASK_HUMAN question. The 'ApprovalScope' is always
+<span class="lineno">  617 </span>-- 'ScopeOnce' (ASK_HUMAN replies are never cached). Returns 'True' if the
+<span class="lineno">  618 </span>-- answer was accepted. Broadcasts 'BeAskResolved' so the frontend dismisses
+<span class="lineno">  619 </span>-- the question. A 'Left' parse error is returned for a malformed ask id.
+<span class="lineno">  620 </span>handleAnswerTextDelivery
+<span class="lineno">  621 </span>  :: SendDeps -&gt; SessionId -&gt; Text -&gt; Text -&gt; IO (Either Text Bool)
+<span class="lineno">  622 </span><span class="decl"><span class="istickedoff">handleAnswerTextDelivery deps sid qidTxt answerText =</span>
+<span class="lineno">  623 </span><span class="spaces">  </span><span class="istickedoff">case parseAskId qidTxt of</span>
+<span class="lineno">  624 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  625 </span><span class="spaces">    </span><span class="istickedoff">Right qid -&gt; do</span>
+<span class="lineno">  626 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">reply = AskReply ScopeOnce answerText</span></span>
+<span class="lineno">  627 </span><span class="spaces">      </span><span class="istickedoff">accepted &lt;- deliverAnswer (sdAskReply deps) qid <span class="nottickedoff">reply</span></span>
+<span class="lineno">  628 </span><span class="spaces">      </span><span class="istickedoff">when accepted $</span>
+<span class="lineno">  629 </span><span class="spaces">        </span><span class="istickedoff">broadcastAskResolved (sdBroker deps) <span class="nottickedoff">sid</span> <span class="nottickedoff">qid</span> <span class="nottickedoff">&quot;answered&quot;</span></span>
+<span class="lineno">  630 </span><span class="spaces">      </span><span class="istickedoff">pure (Right accepted)</span></span>
+<span class="lineno">  631 </span>
+<span class="lineno">  632 </span>-- | Parse the POST .../questions/:qid/answer body. Accepts EITHER
+<span class="lineno">  633 </span>-- @{scope: &quot;once|for_session|always|rejected&quot;}@ (the confirmation gate) OR
+<span class="lineno">  634 </span>-- @{answer: &quot;&lt;text&gt;&quot;}@ (ASK_HUMAN). Returns 'Right (Left scope)' for the
+<span class="lineno">  635 </span>-- scope path, 'Right (Right answerText)' for the answer path. 'Left' with
+<span class="lineno">  636 </span>-- an error message when both fields are present (ambiguous), neither is
+<span class="lineno">  637 </span>-- present, or a value is malformed. This is the explicit both-reject parser
+<span class="lineno">  638 </span>-- (gate: Security #6) — a body with both @scope@ and @answer@ is rejected
+<span class="lineno">  639 </span>-- with 400, NOT silently delivering @answer@ with @scope@ semantics.
+<span class="lineno">  640 </span>parseAnswerBody :: BL.ByteString -&gt; Either Text (Either ApprovalScope Text)
+<span class="lineno">  641 </span><span class="decl"><span class="istickedoff">parseAnswerBody body =</span>
+<span class="lineno">  642 </span><span class="spaces">  </span><span class="istickedoff">case A.decode body :: Maybe A.Value of</span>
+<span class="lineno">  643 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object o) -&gt;</span>
+<span class="lineno">  644 </span><span class="spaces">      </span><span class="istickedoff">let mScope  = KeyMap.lookup (Key.fromText &quot;scope&quot;) o</span>
+<span class="lineno">  645 </span><span class="spaces">          </span><span class="istickedoff">mAnswer = KeyMap.lookup (Key.fromText &quot;answer&quot;) o</span>
+<span class="lineno">  646 </span><span class="spaces">      </span><span class="istickedoff">in case (mScope, mAnswer) of</span>
+<span class="lineno">  647 </span><span class="spaces">        </span><span class="istickedoff">(Just (A.String t), Nothing) -&gt;</span>
+<span class="lineno">  648 </span><span class="spaces">          </span><span class="istickedoff">case parseApprovalScope t of</span>
+<span class="lineno">  649 </span><span class="spaces">            </span><span class="istickedoff">Right scope -&gt; Right (Left scope)</span>
+<span class="lineno">  650 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  651 </span><span class="spaces">        </span><span class="istickedoff">(Nothing, Just (A.String t)) -&gt; Right (Right t)</span>
+<span class="lineno">  652 </span><span class="spaces">        </span><span class="istickedoff">(Just _, Just _) -&gt; Left <span class="nottickedoff">&quot;ambiguous: send either {scope} or {answer}, not both&quot;</span></span>
+<span class="lineno">  653 </span><span class="spaces">        </span><span class="istickedoff">(Nothing, Nothing) -&gt; Left <span class="nottickedoff">&quot;missing 'scope' or 'answer' field&quot;</span></span>
+<span class="lineno">  654 </span><span class="spaces">        </span><span class="istickedoff">(Just _, Nothing) -&gt; <span class="nottickedoff">Left &quot;invalid 'scope' field (expected a string)&quot;</span></span>
+<span class="lineno">  655 </span><span class="spaces">        </span><span class="istickedoff">(Nothing, Just _) -&gt; <span class="nottickedoff">Left &quot;invalid 'answer' field (expected a string)&quot;</span></span>
+<span class="lineno">  656 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;invalid JSON body&quot;</span></span></span>
+<span class="lineno">  657 </span>
+<span class="lineno">  658 </span>-- | Cancel a pending question for a session. Returns 'True' if the question
+<span class="lineno">  659 </span>-- was pending and is now cancelled. Broadcasts 'BeAskResolved' so the
+<span class="lineno">  660 </span>-- frontend dismisses the question.
+<span class="lineno">  661 </span>handleAskCancel
+<span class="lineno">  662 </span>  :: SendDeps -&gt; SessionId -&gt; Text -&gt; IO (Either Text Bool)
+<span class="lineno">  663 </span><span class="decl"><span class="nottickedoff">handleAskCancel deps sid qidTxt =</span>
+<span class="lineno">  664 </span><span class="spaces">  </span><span class="nottickedoff">case parseAskId qidTxt of</span>
+<span class="lineno">  665 </span><span class="spaces">    </span><span class="nottickedoff">Left e -&gt; pure (Left e)</span>
+<span class="lineno">  666 </span><span class="spaces">    </span><span class="nottickedoff">Right qid -&gt; do</span>
+<span class="lineno">  667 </span><span class="spaces">      </span><span class="nottickedoff">cancelled &lt;- cancelAsk (sdAskReply deps) qid</span>
+<span class="lineno">  668 </span><span class="spaces">      </span><span class="nottickedoff">when cancelled $</span>
+<span class="lineno">  669 </span><span class="spaces">        </span><span class="nottickedoff">broadcastAskResolved (sdBroker deps) sid qid &quot;cancelled&quot;</span>
+<span class="lineno">  670 </span><span class="spaces">      </span><span class="nottickedoff">pure (Right cancelled)</span></span>
+
+</pre>
+</body>
+</html>
