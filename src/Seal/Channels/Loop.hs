@@ -38,11 +38,13 @@ module Seal.Channels.Loop
   , mkHandleCaps
   , handleTabCommand
   , handleTabFocus
+  , handleNewSession
   , plainTurn
   , plainTurnWithCaps
   , buildChannelRegistry
   , mkBgRunner
   , channelCallDispatcher
+  , channelCallDispatcherForSid
   , mkChannelTurnDeps
   , mkTabCloseNotifier
   , shouldAutoTab
@@ -89,7 +91,10 @@ import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
    runSessionTurn, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
-import Seal.Core.Types (SessionId, mkSessionId, sessionIdText)
+import Seal.Core.Types (SessionId, OpName (..), mkSessionId, sessionIdText)
+import Data.Aeson (object, (.=))
+import Seal.Command.New (NewArgs (..), parseNewArgs, resolveRepoUrl)
+import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.AskReply
@@ -392,13 +397,19 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
     bgConvSid <- newIORef (error "bgConvSid: set before first dispatch" :: SessionId)
     let td = mkChannelTurnDeps deps
         bgRunner = mkBgRunner deps h askReply bgConvSid tabsH
+        -- A factory that builds a CallDispatcher for an explicit sid
+        -- (used by handleNewSession to dispatch SETUP_REPO into the new
+        -- session). The new sid isn't in bgConvSid yet (cursor migrate
+        -- happens inside handleNewSession), so we use the explicit-sid
+        -- variant instead of channelCallDispatcher.
+        dispatcherFactory = channelCallDispatcherForSid deps td h askReply
         callDispatcher = channelCallDispatcher deps td h askReply bgConvSid
         registryWithBg = buildChannelRegistry
           (cdProvider deps) (cdPaths deps) (cdBroker deps)
           (bSkills (cdBackends deps)) bgRunner callDispatcher bgConvSid registry
-    loop h registryWithBg bgConvSid
+    loop h registryWithBg bgConvSid dispatcherFactory
   where
-    loop h reg bgConvSid = do
+    loop h reg bgConvSid dispatcherFactory = do
       (mSrc, body) <- chReceive h
       case mSrc of
         Nothing -> pure ()  -- EOF
@@ -442,7 +453,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
               then pure True
               else snd <$> deliverNextAnswerResolved askReply sid body
           if delivered
-            then loop h reg bgConvSid
+            then loop h reg bgConvSid dispatcherFactory
             else do
               let handleCaps = case mkCaps of
                     Nothing -> mkHandleCaps h askReply sid
@@ -455,23 +466,24 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                     Just tab -> cursorSet (cdCursors deps) key (tRef tab)
                     Nothing -> pure ()
                   chSend h ("focused tab " <> T.singleton (tabIndexToChar idx))
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
                 Right (Route.Inject idx payload) -> do
                   _ <- focusTabH tabsH idx
                   void (forkIO (plainHandler h meta (Just ms) payload))
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
                 Right (Route.TabCommand tsc) -> do
                   _ <- handleTabCommand h tabsH tsc
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
                 Right Route.CurrentTab -> do
                   tl <- snapshotTabs tabsH
                   case mCursor >>= lookupByRef tl of
                     Just t  -> chSend h (renderCurrentTab t)
                     Nothing -> chSend h "no current tab"
-                  loop h reg bgConvSid
-                Right (Route.NewSession _args) -> do
-                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
+                Right (Route.NewSession rawArgs) -> do
+                  let newArgs = parseNewArgs rawArgs
+                  _ <- handleNewSession deps h tabsH (msChannelKind ms) meta newArgs (Just dispatcherFactory)
+                  loop h reg bgConvSid dispatcherFactory
                 Right (Route.SlashCommand _) -> do
                  -- Intercept /tab focus <N> before the registry: the
                  -- registry's focusCmd only validates the index (it has
@@ -483,7 +495,7 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                  case parseTabFocus body of
                    Just idx -> do
                      handleTabFocus deps h tabsH key idx
-                     loop h reg bgConvSid
+                     loop h reg bgConvSid dispatcherFactory
                    Nothing -> do
                      d <- ingest reg chain (RawInbound body)
                      case d of
@@ -495,16 +507,16 @@ runChannelLoop deps withChannel plainHandler registry chain askReply tabsH mkCap
                            Right mFollowUp -> case mFollowUp of
                              Just t  -> void (forkIO (plainHandler h meta (Just ms) t))
                              Nothing -> pure ()
-                         loop h reg bgConvSid
-                       ShowText t       -> chSend h t >> loop h reg bgConvSid
-                       PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid
-                       Rejected msg     -> chSend h msg >> loop h reg bgConvSid
+                         loop h reg bgConvSid dispatcherFactory
+                       ShowText t       -> chSend h t >> loop h reg bgConvSid dispatcherFactory
+                       PlainMessage t   -> void (forkIO (plainHandler h meta (Just ms) t)) >> loop h reg bgConvSid dispatcherFactory
+                       Rejected msg     -> chSend h msg >> loop h reg bgConvSid dispatcherFactory
                 Right (Route.Plain t) -> do
                   void (forkIO (plainHandler h meta (Just ms) t))
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
                 Left (Route.ParseError e) -> do
                   chSend h e
-                  loop h reg bgConvSid
+                  loop h reg bgConvSid dispatcherFactory
 
 -- | Build the per-turn 'ChannelCaps' for a channel handle.
 mkHandleCaps :: ChannelHandle -> AskReplyStore -> SessionId -> ChannelCaps
@@ -539,30 +551,52 @@ resolveTabSession deps ref = case ref of
       else decodeFileStrict mp :: IO (Maybe SessionMeta)
   BoundHarness _   -> pure Nothing
 
--- | Handle @\/new@ on an inbox channel: mint a fresh session from config
--- defaults, rebind the conversation's current tab (if any) to the new sid,
--- migrate every OTHER conversation cursor pointing at the old ref to the
--- new ref (per the user's "a tab has one session at a time; all channels
--- focused on the tab follow the rebind" model), and send the confirmation
--- line. The old session is kept on disk (still in @/session list@).
+-- | Handle @\/new@ on an inbox channel: mint a fresh session, rebind the
+-- conversation's current tab (if any) to the new sid, migrate every OTHER
+-- conversation cursor pointing at the old ref to the new ref, and send the
+-- confirmation line. The old session is kept on disk (still in
+-- @/session list@).
+--
+-- When 'NewArgs' overrides are given (@-p@\/@-m@), the new session uses
+-- the overrides instead of copying the old session's provider/model.
+-- When @-r@\/@--repo@ is given and a 'CallDispatcher' factory is supplied,
+-- 'SETUP_REPO' is dispatched into the new session (same as the web
+-- frontend's "Set up repo" field). When @-r@ is given but no factory is
+-- available, a warning is sent.
 --
 -- Mirrors the CLI's @\/new@ path but lives at the loop level because the
 -- conversation key + cursor aren't available to a registry CommandAction
 -- (architect review issue C). The fresh @meta@ is NOT used to run a turn —
 -- the next inbound message's cursor lookup resolves to the new session
 -- automatically (the cursor migrate ensures that).
+--
+-- The @dispatcherFactory@ is @'Just' (sid -> 'CallDispatcher')@ when the
+-- loop has a dispatcher available (it always does under @seal serve@ and
+-- standalone @seal signal@\/@seal telegram@). 'Nothing' only in tests
+-- that don't wire the dispatcher.
 handleNewSession
   :: ChannelDeps -> ChannelHandle -> TabsHandle
-  -> ChannelKind -> SessionMeta -> IO ()
-handleNewSession deps h tabsH kind oldMeta = do
-  -- Preserve the old session's provider/model/agent (so mid-session
-  -- /model use changes survive /new). The new session gets a fresh id +
-  -- timestamps; everything else is copied from the old meta.
+  -> ChannelKind -> SessionMeta -> NewArgs
+  -> Maybe (SessionId -> CallDispatcher) -> IO ()
+handleNewSession deps h tabsH kind oldMeta args mDispatcherFactory = do
+  -- Apply -p/-m overrides (falling back to the old session's values so
+  -- mid-session /model use changes survive /new). The agent is resolved
+  -- from config defaults (NOT inherited from the old session) — matching
+  -- the web frontend's "New Tab" flow which starts unbound and lets the
+  -- first turn's autoBindRepoAgent + resolveSystemPrompt resolve the
+  -- default. Inheriting the old session's agent would carry forward a
+  -- repo-specific binding to a session that has no repo.
   let channelLabel = channelKindToText kind
       oldSid = smId oldMeta
       oldRef = BoundSession oldSid
-  newMeta <- newSessionMeta (cdPaths deps) (smProvider oldMeta) (smModel oldMeta)
-                            channelLabel (smAgent oldMeta)
+      provider = fromMaybe (smProvider oldMeta) (naProvider args)
+      model = fromMaybe (smModel oldMeta) (naModel args)
+  -- Resolve the default agent from config (same as createConversationSession
+  -- and the web frontend's handleTabNew, which both start with no agent
+  -- binding and let the first turn's autoBindRepoAgent resolve it).
+  cfg <- cdConfig deps
+  (mAgent, _mProv, _mModel) <- resolveDefaultAgent (bAgentDefs (cdBackends deps)) cfg
+  newMeta <- newSessionMeta (cdPaths deps) provider model channelLabel mAgent
   saveSessionMeta (cdPaths deps) newMeta
   -- Rebind the tab (if any) bound to the old sid to the new sid.
   snap <- snapshotTabs tabsH
@@ -580,6 +614,24 @@ handleNewSession deps h tabsH kind oldMeta = do
   -- future fan-outs (including tab-close notifications) reach attached
   -- channels under the new session id.
   _n <- replyMigrateAll (cdReplies deps) oldSid (smId newMeta)
+  -- When -r/--repo is given, dispatch SETUP_REPO into the new session
+  -- (same as the web frontend's "Set up repo" field). The dispatcher
+  -- factory creates a CallDispatcher bound to the new session's sid.
+  for_ (naRepo args) $ \repoVal -> do
+    repoUrl <- resolveRepoUrl (cdRepoReg deps) repoVal
+    case mDispatcherFactory of
+      Just mkDispatcher -> do
+        let dispatcher = mkDispatcher (smId newMeta)
+        case validateRepoUrl repoUrl of
+          Left err -> chSend h ("repo setup failed: invalid url: " <> err)
+          Right cleanUrl -> do
+            eRes <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+            case eRes of
+              Left dErr -> chSend h ("repo setup failed: " <> T.pack (show dErr))
+              Right _   -> pure ()
+      Nothing -> chSend h ("warning: repo setup not available on this channel; "
+                         <> "use the web frontend or /repo to clone manually into "
+                         <> "session " <> sessionIdText (smId newMeta))
   chSend h
     ("new session " <> sessionIdText (smId newMeta)
        <> " (" <> smProvider newMeta <> "/" <> smModel newMeta <> ")"
@@ -916,6 +968,21 @@ channelCallDispatcher
   :: ChannelDeps -> TurnDeps -> ChannelHandle -> AskReplyStore -> IORef SessionId -> CallDispatcher
 channelCallDispatcher deps td h askReply sidRef callOpName val = do
   sid <- readIORef sidRef
+  mChannel <- TurnEngine.loadChannelLabel (cdPaths deps) sid
+  let channelLabel = fromMaybe "cli" mChannel
+      caps = mkHandleCaps h askReply sid
+  TurnEngine.callDispatcher td caps sid channelLabel callOpName val
+
+-- | Build a 'CallDispatcher' for an explicit 'SessionId' (no IORef).
+-- Used by 'handleNewSession' to dispatch 'SETUP_REPO' into the freshly-
+-- minted session — the new sid isn't the conversation's active session
+-- yet (the cursor migrate happens inside 'handleNewSession'), so the
+-- IORef-based 'channelCallDispatcher' would dispatch against the wrong
+-- session.
+channelCallDispatcherForSid
+  :: ChannelDeps -> TurnDeps -> ChannelHandle -> AskReplyStore
+  -> SessionId -> CallDispatcher
+channelCallDispatcherForSid deps td h askReply sid callOpName val = do
   mChannel <- TurnEngine.loadChannelLabel (cdPaths deps) sid
   let channelLabel = fromMaybe "cli" mChannel
       caps = mkHandleCaps h askReply sid
