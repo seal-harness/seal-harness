@@ -727,7 +727,7 @@ encodeResultsJson rs = T.intercalate "\n" (map renderOne rs)
     renderOne r =
       subagentIdText (crSubagentId r) <> " | " <>
       T.pack (show (crStatus r)) <> " | " <>
-      maybe "(no summary)" (T.take 200) (summaryOrError r)
+      fromMaybe "(no summary)" (summaryOrError r)
     summaryOrError r = case crSummary r of
       Just s  -> Just s
       Nothing -> crError r
