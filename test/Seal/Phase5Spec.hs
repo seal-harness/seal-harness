@@ -166,6 +166,7 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
       reg <- buildRegistry cfgRoot workerRan sampleSession
       ref <- newIORef capstoneScript
       (tHandle, readTranscript) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
@@ -185,7 +186,9 @@ spec = describe "Phase 5 capstone (DoD scenario, git-backed)" $ do
                   , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
-                    , aeOnStop = Nothing, aeOnToolCall = Nothing, aeOnTextDelta = Nothing
+                    , aeOnStop = Nothing
+, aeStopFanoutDone = stopFanoutDoneRef
+                    , aeOnToolCall = Nothing, aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag

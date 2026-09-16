@@ -34,6 +34,7 @@ import Data.Aeson (Value)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_)
+import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -475,19 +476,35 @@ runSessionTurn td adapter meta mSrc t = do
       -- [engine] Broadcast "thinking" (before the lock, matches the existing
       -- web + channel paths).
       broadcastHarnessStatus (tdBroker td) sid "thinking"
+      -- Whether the agent loop's stop branch already fanned out the final
+      -- reply via 'aeOnStop' (see 'Seal.Agent.Loop.notifyStop'). The loop
+      -- sets this ONLY in the final-answer stop branch (the normal
+      -- completion path) — not on the error/abort/max-turns branches.
+      -- When it fired, the engine's bracket cleanup must NOT fan out the
+      -- same last-assistant text again (double delivery to every
+      -- subscribed chat channel — observed as a duplicate final message on
+      -- Telegram after /tab focus mid-turn). The cleanup still fires the
+      -- @reply-delivered@ signal and the idle broadcast on every path.
+      stopFanoutDoneRef <- newIORef False
       mErr <- bracket
         (pure ())
         (\_ -> do
           -- [engine] Guaranteed cleanup: signal idle + fan out the last
           -- assistant reply to subscribed chat channels (so a turn that
           -- dies mid-way still releases the tab + delivers any partial
-          -- reply).
+          -- reply). Skipped when the loop's stop branch already delivered
+          -- the final reply ('notifyStop') — the cleanup would re-send the
+          -- identical text (duplicate delivery).
           broadcastHarnessStatus (tdBroker td) sid "idle"
-          fanoutLastReply (tdReplies td) (tdBroker td) paths sid
-          broadcastReplyDelivered (tdBroker td) sid)
+          stopFanoutDone <- readIORef stopFanoutDoneRef
+          if stopFanoutDone
+            then broadcastReplyDelivered (tdBroker td) sid
+            else do
+              fanoutLastReply (tdReplies td) (tdBroker td) paths sid
+              broadcastReplyDelivered (tdBroker td) sid)
         (\_ -> withSessionLock (tdLocks td) sid $
           withTwoFileTranscript sessionDirPath $ \tHandle ->
-            runTurnBody td adapter meta mSrc t sid paths prov model tHandle)
+            runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
       -- [engine] Auto-tab the session (idempotent; no-op if a tab already
       -- binds sid). Gated on shouldAutoTab so /bg sessions stay headless.
       when (shouldAutoTab meta) $
@@ -541,9 +558,9 @@ metaCacheEnvFor td paths eSecCfg = do
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
   -> SessionId -> SealPaths
-  -> SomeProvider -> ModelId -> TwoFileHandle
+  -> SomeProvider -> ModelId -> IORef Bool -> TwoFileHandle
   -> IO (Maybe Text)
-runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
+runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle = do
   appEnv <- mkEnv (tdLogger td) defaultConfig
   eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
@@ -619,6 +636,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model tHandle = do
               , teOnUserMessage = taOnUserMessage adapter meta'
               , teChannel       = taChannelLabel adapter meta'
               , teOnStop        = taOnStop adapter sid
+              , teStopFanoutDone = stopFanoutDoneRef
               , teOnToolCall    = taOnToolCall adapter
               , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag

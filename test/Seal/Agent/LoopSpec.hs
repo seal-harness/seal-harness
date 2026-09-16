@@ -150,6 +150,7 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -170,6 +171,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -191,6 +193,7 @@ spec = describe "Seal.Agent.Loop" $ do
           [ CompletionResponse [CbText "reply"] StopEnd (Usage 1 2) ]
     ref <- newIORef script
     (h, readState) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -211,6 +214,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -250,6 +254,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script2 = [ CompletionResponse [CbText "ok"]      StopEnd (Usage 3 4) ]
       ref <- newIORef (script1 ++ script2)
       withTwoFileTranscript dir $ \h -> do
+        stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
                       , aeProviderLabel = "ollama"
@@ -270,6 +275,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                       , aeOnDemandSchemas = False
@@ -307,6 +313,7 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
       withTwoFileTranscript dir $ \h -> do
+        stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
                       , aeProviderLabel = "ollama"
@@ -327,6 +334,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                       , aeOnDemandSchemas = False
@@ -380,6 +388,7 @@ spec = describe "Seal.Agent.Loop" $ do
       ref <- newIORef (script1 ++ script2)
       let reqPath = dir </> "requests.jsonl"
       withTwoFileTranscript dir $ \h -> do
+        stopFanoutDoneRef <- newIORef False
         let mkEnv' = AgentEnv
                       { aeProvider = SomeProvider (ScriptProvider ref)
                       , aeProviderLabel = "ollama"
@@ -400,6 +409,7 @@ spec = describe "Seal.Agent.Loop" $ do
                       , aeOnEntry = pure ()
                       , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                       , aeOnDemandSchemas = False
@@ -489,6 +499,7 @@ spec = describe "Seal.Agent.Loop" $ do
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
@@ -509,6 +520,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -533,6 +545,7 @@ spec = describe "Seal.Agent.Loop" $ do
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
@@ -553,6 +566,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -577,6 +591,7 @@ spec = describe "Seal.Agent.Loop" $ do
           reg = mkRegistry [shellExecOp wsRoot policy]
       ref <- newIORef shellScript
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
@@ -597,6 +612,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -631,6 +647,7 @@ spec = describe "Seal.Agent.Loop" $ do
             ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let reg = mkRegistry [stubOp]
           env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -652,6 +669,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -674,6 +692,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -695,6 +714,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -716,6 +736,7 @@ spec = describe "Seal.Agent.Loop" $ do
       let caps = def
                    { ccSend = \t -> modifyIORef' sent (++ [t]) }
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
                   { aeProvider = SomeProvider (FailingProvider "connection refused")
@@ -737,6 +758,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -765,6 +787,7 @@ spec = describe "Seal.Agent.Loop" $ do
     let caps = def
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
     (h, readState) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (FailingProvider "could not reach Ollama at http://localhost:11434")
                 , aeProviderLabel = "ollama"
@@ -785,6 +808,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -819,6 +843,7 @@ spec = describe "Seal.Agent.Loop" $ do
     (h, _) <- fakeTwoFileTranscript
     -- Fail the first 2 calls (transport-style error), then succeed.
     ref <- newIORef (2 :: Int, CompletionResponse [CbText "recovered"] StopEnd (Usage 1 1), "could not reach Ollama at http://localhost:11434")
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (FlakyProvider ref)
                 , aeProviderLabel = "ollama"
@@ -839,6 +864,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -863,6 +889,7 @@ spec = describe "Seal.Agent.Loop" $ do
                  { ccSend = \t -> modifyIORef' sent (++ [t]) }
     (h, _) <- fakeTwoFileTranscript
     -- A provider that counts calls and always returns a 401 auth error.
+    stopFanoutDoneRef <- newIORef False
     let countingAuthFail = SomeProvider (CountingFailProvider (callCount, "Ollama rejected the credential (HTTP 401) — check the key with /provider add ollama"))
         env = AgentEnv
                 { aeProvider = countingAuthFail
@@ -884,6 +911,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -907,6 +935,7 @@ spec = describe "Seal.Agent.Loop" $ do
           script = [ CompletionResponse [CbText "hello"] StopEnd (Usage 0 0) ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
                   , aeProviderLabel = "ollama"
@@ -927,6 +956,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -953,6 +983,7 @@ spec = describe "Seal.Agent.Loop" $ do
                                    StopToolUse (Usage 0 0))
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -974,6 +1005,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -1007,6 +1039,7 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -1027,6 +1060,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1055,6 +1089,7 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -1075,6 +1110,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1099,6 +1135,7 @@ spec = describe "Seal.Agent.Loop" $ do
         script = replicate 4 (CompletionResponse [CbText "partial"] StopMaxTokens (Usage 1 100))
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -1119,6 +1156,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1144,6 +1182,7 @@ spec = describe "Seal.Agent.Loop" $ do
         -- A provider that always truncates and counts calls.
         countingTrunc = SomeProvider (CountingTruncProvider calls)
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = countingTrunc
                 , aeProviderLabel = "ollama"
@@ -1164,6 +1203,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1199,6 +1239,7 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -1219,6 +1260,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1288,6 +1330,7 @@ spec = describe "Seal.Agent.Loop" $ do
           ]
     ref <- newIORef script
     (h, readBack) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider (ScriptProvider ref)
                 , aeProviderLabel = "ollama"
@@ -1308,6 +1351,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
+                , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False
@@ -1334,6 +1378,7 @@ spec = describe "Seal.Agent.Loop" $ do
             ]
       ref <- newIORef script
       (h, _) <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let logPath = Just (logDir </> "seal.log")
           env = AgentEnv
                   { aeProvider = SomeProvider (ScriptProvider ref)
@@ -1355,6 +1400,7 @@ spec = describe "Seal.Agent.Loop" $ do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+                    , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
@@ -1402,6 +1448,7 @@ spec = describe "Seal.Agent.Loop" $ do
                            liftIO (setAbort abortFlag)
                            pure (OpResult [TrpText "stopped"] False Null))
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let env = AgentEnv
                 { aeProvider = SomeProvider countingScript
                 , aeProviderLabel = "ollama"
@@ -1422,6 +1469,7 @@ spec = describe "Seal.Agent.Loop" $ do
                 , aeOnEntry = pure ()
                 , aeOnUserMessage = Nothing
                 , aeOnStop = Nothing
+                , aeStopFanoutDone = stopFanoutDoneRef
                     , aeOnToolCall = Nothing
                     , aeOnTextDelta = Nothing
                 , aeOnDemandSchemas = False

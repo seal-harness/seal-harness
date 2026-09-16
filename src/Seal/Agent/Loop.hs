@@ -19,7 +19,7 @@ import Data.Aeson qualified as A
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BLC
-import Data.IORef
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -170,6 +170,28 @@ runTurn env userText = do
       case aeOnStop env of
         Just fanout -> fanout text
         Nothing     -> pure ()
+    -- | Deliver the final user-visible text on the normal final-answer
+    -- branch. Three delivery regimes (exactly one must fire):
+    --
+    -- 1. @aeOnStop@ wired (web + inbox channels): the fan-out sends to
+    --    EVERY subscribed channel — including the arrival one — so
+    --    'ccSend' would double-deliver (the duplicate-final-message bug).
+    --    Flips 'aeStopFanoutDone' so the engine's bracket cleanup skips
+    --    the redundant 'fanoutLastReply' re-send.
+    -- 2. @aeOnStop = Nothing@ + streaming caps ('ccStreaming' = True):
+    --    the text was ALREADY delivered live via per-delta 'ccSend' during
+    --    the stream — re-sending the full text would double-deliver.
+    -- 3. @aeOnStop = Nothing@ + non-streaming caps (tests): nothing was
+    --    streamed, so 'ccSend' is the only delivery.
+    deliverFinal :: Bool -> Text -> IO ()
+    deliverFinal streamed text =
+      case aeOnStop env of
+        Just fanout -> do
+          fanout text
+          writeIORef (aeStopFanoutDone env) True
+        Nothing
+          | streamed  -> pure ()
+          | otherwise -> ccSend (aeCaps env) text
     go :: Int -> Int -> [Message] -> App ()
     go 0 _ msgs = liftIO $ do
       logMaxTurns (aeLogPath env)
@@ -292,7 +314,7 @@ runTurn env userText = do
     -- ccSend (streaming path) — don't re-send the full text, only send the
     -- prefix / truncation notice if applicable.
     handleResponse :: AgentEnv -> UTCTime -> Int -> Int -> [Message] -> CompletionResponse -> Bool -> App ()
-    handleResponse env' tStart n lenContinue msgs resp _alreadySentText = do
+    handleResponse env' tStart n lenContinue msgs resp alreadySentText = do
       -- Record the provider response.
       liftIO $ do
         now <- getCurrentTime
@@ -367,17 +389,13 @@ runTurn env userText = do
                   ccSend (aeCaps env') (prefix <> combined)
                   notifyStop (prefix <> combined)
                 else do
-                  -- Normal final answer: text was already streamed live;
-                  -- don't re-send via ccSend (would double-deliver). Only
-                  -- fan out to other chat channels via notifyStop.
-                  -- For non-streaming channels (Telegram, Signal — chStreaming
-                  -- = False), alreadySentText is False, so ccSend would fire.
-                  -- But notifyStop (replyFanout) already sends to ALL
-                  -- subscribed channels INCLUDING the arrival channel. So
-                  -- ccSend would double-deliver. Fix: skip ccSend entirely;
-                  -- replyFanout handles all delivery (it sends to every
-                  -- subscribed channel, which includes the arrival one).
-                  notifyStop (prefix <> T.intercalate "\n" texts)
+                  -- Normal final answer: delivered via 'deliverFinal' —
+                  -- the 'aeOnStop' fan-out (which reaches EVERY subscribed
+                  -- channel including the arrival one) when wired, or
+                  -- 'ccSend' for non-streaming caps with no fan-out.
+                  -- Sending via BOTH would double-deliver. Streaming caps
+                  -- with no fan-out already saw the text live (skip).
+                  deliverFinal alreadySentText (prefix <> T.intercalate "\n" texts)
         else do
           results <- mapM dispatchOne toolUses
           -- Abort guard: if a tool call was aborted mid-flight (the user

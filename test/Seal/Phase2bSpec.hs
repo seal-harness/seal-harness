@@ -115,7 +115,8 @@ spec = describe "Seal.Phase2bSpec" $ do
         allow    = AllowOnly (Set.fromList [either (error "uid") id (mkUserId "+15551234567")])
     sigLogger <- testSealLogger
     appEnv <- mkEnv sigLogger defaultConfig
-    let runOneTurn h ms body =
+    let runOneTurn h ms body = do
+          stopFanoutDoneRef <- newIORef False
           let handleCaps = def
                 { ccSend = chSend h
                 , ccPrompt = \_ -> pure ""
@@ -141,13 +142,15 @@ spec = describe "Seal.Phase2bSpec" $ do
                 , aeDebugRequestsPath = Nothing
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
-                    , aeOnStop = Nothing, aeOnToolCall = Nothing, aeOnTextDelta = Nothing
+                    , aeOnStop = Nothing
+, aeStopFanoutDone = stopFanoutDoneRef
+                    , aeOnToolCall = Nothing, aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
                   , aeToolTimeout = defaultToolTimeoutConfig
                 }
-          in runApp appEnv (runTurn agentEnv body)
+          runApp appEnv (runTurn agentEnv body)
         plainHandler h mSrc body = case mSrc of
           Just ms -> runOneTurn h ms body
           Nothing -> pure ()

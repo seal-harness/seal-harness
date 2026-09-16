@@ -62,7 +62,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
 import Data.Text.Encoding qualified as TE
-import Data.Aeson (Value)
+import Data.Aeson (object, (.=), Value)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -97,7 +97,6 @@ import Seal.Core.TurnEngine
    runSessionTurn, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (SessionId, OpName (..), mkSessionId, sessionIdText)
-import Data.Aeson (object, (.=))
 import Seal.Command.New (NewArgs (..), parseNewArgs, resolveRepoUrl)
 import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
