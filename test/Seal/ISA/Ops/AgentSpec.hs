@@ -1,6 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.ISA.Ops.AgentSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar
+  ( MVar, newMVar, modifyMVar, withMVar )
+import Control.Exception (bracket)
 import Data.Aeson (encode, object, (.=))
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef
@@ -45,6 +49,27 @@ recordingWorker :: IORef Int -> Del.AgentWorkerBuilder
 recordingWorker ref _ _ _ _ = do
   modifyIORef' ref (+1)
   pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+
+-- | A worker that tracks the maximum number of concurrent executions.
+-- Each child increments a counter on entry, sleeps briefly so overlaps are
+-- observable, then decrements on exit. The max-concurrent value is tracked
+-- in the MVar alongside the current count.
+concurrencyTrackingWorker :: MVar (Int, Int) -> Del.AgentWorkerBuilder
+concurrencyTrackingWorker state _ _ _ _ =
+  bracket enter exit (\_ -> do
+    threadDelay 50000  -- 50ms so concurrent workers overlap
+    pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 (Just (mkSystemSessionId "child"))))
+  where
+    enter = modifyMVar state $ \(current, maxSeen) -> do
+      let !newCurrent = current + 1
+          !newMax = max maxSeen newCurrent
+      pure ((newCurrent, newMax), ())
+    exit _ = modifyMVar state $ \(current, maxSeen) ->
+      pure ((current - 1, maxSeen), ())
+
+-- | Read the max-concurrent value from the tracking state.
+maxConcurrent :: MVar (Int, Int) -> IO Int
+maxConcurrent state = withMVar state (\(_, m) -> pure m)
 
 -- | A worker that simulates a def-not-found resolution error (returns an
 -- error outcome).
@@ -341,6 +366,37 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       -- Both tasks ran (batch mode fans out).
       readIORef ran `shouldReturn` 2
 
+    it "AGENT_START batch mode runs children concurrently (not serialized)" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      concurrencyState <- newMVar (0 :: Int, 0 :: Int)
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig { dcChildTimeoutSeconds = Just 30 }
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = concurrencyTrackingWorker concurrencyState
+            , aswGate = gateOpen
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["tasks" .= [ object ["id" .= ("a1" :: Text), "goal" .= ("t1" :: Text)]
+                                                , object ["id" .= ("a1" :: Text), "goal" .= ("t2" :: Text)]
+                                                , object ["id" .= ("a1" :: Text), "goal" .= ("t3" :: Text)]
+                                                , object ["id" .= ("a1" :: Text), "goal" .= ("t4" :: Text)]
+                                                , object ["id" .= ("a1" :: Text), "goal" .= ("t5" :: Text)] ]]))
+      orIsError r `shouldBe` False
+      -- With default max_concurrent_children=3, at least 2 children should
+      -- overlap (the old broken semaphore serialized everything to 1 at a
+      -- time, so maxConcurrent would be 1).
+      mc <- maxConcurrent concurrencyState
+      mc `shouldSatisfy` (>= 2)
+
     it "AGENT_START rejects when spawn is paused" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
@@ -407,3 +463,4 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
       r <- runTestApp (opRun op localBackend (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("p" :: Text), "model" .= ("m" :: Text), "system" .= ("not-a-secret" :: Text)]))
       let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
       T.isInfixOf "not-a-secret" recorded `shouldBe` True
+

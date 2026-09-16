@@ -78,12 +78,13 @@ module Seal.Agent.Runtime.Delegation
   ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
-import Control.Concurrent.MVar
-  ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar
-  , tryTakeMVar )
 import Control.Concurrent.STM
-  ( TVar, atomically, newTVarIO, readTVarIO, writeTVar )
-import Control.Exception (SomeException, catch)
+  ( TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar
+  , modifyTVar', retry )
+import Control.Concurrent.MVar
+  ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar
+  , tryTakeMVar )
+import Control.Exception (SomeException, bracket, catch)
 import Control.Monad (forM, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
@@ -489,7 +490,7 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
           r <- runOne 0 t childTimeout
           pure (Right [r])
         _   -> do
-          sem <- newMVar maxConc
+          sem <- newTVarIO maxConc
           mvars <- forM (zip [0 ..] tasks) $ \(idx, task) -> do
             resMVar <- newEmptyMVar
             void (forkIO $
@@ -499,13 +500,21 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
           results <- forM mvars readMVar
           pure (Right results)
 
-    -- Acquire / release the semaphore MVar around an IO action.
-    bracketSem :: MVar Int -> IO a -> IO a
-    bracketSem sem act =
-      takeMVar sem *> act <* putMVar sem (maxBound :: Int)
-      -- The putMVar value doesn't matter; we just need to release the slot.
-      -- Using maxBound is a no-op marker (the sem is a counting semaphore via
-      -- takeMVar/putMVar).
+    -- Acquire / release the counting semaphore around an IO action. The
+    -- semaphore is a 'TVar Int' initialized to @maxConc@: each acquire
+    -- atomically decrements (blocking if zero via 'retry'), each release
+    -- atomically increments. This allows up to @maxConc@ concurrent holders,
+    -- unlike the previous 'MVar'-based approach which was a binary semaphore
+    -- (mutex) that serialized all children regardless of @maxConc@.
+    bracketSem :: TVar Int -> IO a -> IO a
+    bracketSem sem act = bracket acquire release (const act)
+      where
+        acquire = atomically $ do
+          n <- readTVar sem
+          if n > 0
+            then writeTVar sem (n - 1)
+            else retry
+        release _ = atomically (modifyTVar' sem (+1))
 
     -- Run a single task to completion with a hard timeout and a heartbeat
     -- thread that touches the parent-activity cell.
