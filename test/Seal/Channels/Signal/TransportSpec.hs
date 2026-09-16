@@ -2,6 +2,10 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 module Seal.Channels.Signal.TransportSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (race)
+import Control.Concurrent.STM
+  (atomically, newTQueueIO, newTVarIO, writeTQueue, writeTVar)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Aeson (Value (..))
@@ -75,6 +79,33 @@ spec = do
       (t, _) <- mkMockSignalTransport []
       stClose t
       stClose t  -- must not throw
+
+  describe "receiveBlocking (the real transport's stReceive contract)" $ do
+    it "returns pending values immediately, then blocks (no Left while the reader is alive)" $ do
+      inbox <- newTQueueIO
+      dead <- newTVarIO False
+      atomically (writeTQueue inbox (String "a"))
+      r1 <- receiveBlocking inbox dead
+      r1 `shouldBe` Right (String "a")
+      -- Inbox empty, reader alive: must NOT return Left (the pre-fix
+      -- non-blocking variant returned 'Left "signal inbox empty"' here,
+      -- which the channel's reader loop treats as fatal — killing the
+      -- Signal channel at startup). Verify it does not return within a
+      -- short window: race it against a timer.
+      winner <- race (threadDelay 200000) (receiveBlocking inbox dead)
+      winner `shouldBe` Left ()
+    it "returns Left only after the reader is dead and the inbox is drained" $ do
+      inbox <- newTQueueIO
+      dead <- newTVarIO False
+      atomically (writeTQueue inbox (String "last"))
+      atomically (writeTVar dead True)
+      -- Drains the remaining envelope first, THEN returns Left.
+      r1 <- receiveBlocking inbox dead
+      r2 <- receiveBlocking inbox dead
+      r1 `shouldBe` Right (String "last")
+      case r2 of
+        Left e  -> T.unpack e `shouldContain` "empty"
+        Right _ -> expectationFailure "expected Left after reader death + drained inbox"
 
 -- ---------------------------------------------------------------------------
 -- Generators

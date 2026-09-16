@@ -8,6 +8,7 @@ module Seal.Channels.Signal.Transport
   ( SignalTransport (..)
   , mkMockSignalTransport
   , mkRealSignalTransport
+  , receiveBlocking
   , chunkMessage
   , SignalEnvelope (..)
   , parseSignalEnvelope
@@ -16,7 +17,9 @@ module Seal.Channels.Signal.Transport
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+import Control.Concurrent.STM
+  ( TQueue, TVar, atomically, check, isEmptyTQueue, newTQueueIO, newTVarIO
+  , orElse, readTQueue, readTVar, tryReadTQueue, writeTQueue, writeTVar )
 import Control.Exception (IOException, try)
 import Data.Aeson (Value)
 import Data.Aeson qualified as A
@@ -127,12 +130,13 @@ mkRealSignalTransport account = do
           hSetBuffering hIn (BlockBuffering Nothing)
           hSetBuffering hOut LineBuffering
           inbox <- newTQueueIO
+          readerDead <- newTVarIO False
           idRef <- newIORef (0 :: Int)
           respMap <- newIORef (Map.empty :: Map.Map Int (MVar (Maybe Value)))
           -- Spawn the demux reader thread: reads all stdout lines and
           -- routes responses (have id) to waiting callers via MVars,
           -- notifications (no id) to the inbox TQueue.
-          _ <- forkIO (demuxReader hOut inbox respMap)
+          _ <- forkIO (demuxReader hOut inbox respMap readerDead)
           let sendRequest :: Value -> IO (Maybe Value)
               sendRequest frame = do
                 rid <- atomicModifyIORef' idRef (\n -> (n + 1, n))
@@ -153,11 +157,7 @@ mkRealSignalTransport account = do
                   Just (Just v) -> Just v
                   _ -> Nothing)
           pure (Right SignalTransport
-            { stReceive = do
-                m <- atomically (tryReadTQueue inbox)
-                case m of
-                  Just v  -> pure (Right v)
-                  Nothing -> pure (Left "signal inbox empty")
+            { stReceive = receiveBlocking inbox readerDead
             , stSend = \recipient body -> do
                 let frame = A.object
                       [ "jsonrpc" A..= ("2.0" :: Text)
@@ -221,15 +221,18 @@ mkRealSignalTransport account = do
 --   waiting caller via the MVar keyed by @id@ in 'respMap'.
 -- * JSON-RPC notification (has @method@ + @params@, no @id@) → push to
 --   the inbox 'TQueue' (picked up by 'stReceive').
--- On a read error or EOF, the reader exits silently (the transport is
--- closing).
-demuxReader :: Handle -> TQueue Value -> IORef (Map.Map Int (MVar (Maybe Value))) -> IO ()
-demuxReader hOut inbox respMap = go
+-- On a read error or EOF, the reader sets @readerDead@ and exits (the
+-- transport is closing).
+demuxReader
+  :: Handle -> TQueue Value
+  -> IORef (Map.Map Int (MVar (Maybe Value))) -> TVar Bool
+  -> IO ()
+demuxReader hOut inbox respMap readerDead = go
   where
     go = do
       eLine <- try @IOException (hGetLine hOut)
       case eLine of
-        Left _ -> pure ()  -- EOF or error: reader exits
+        Left _ -> atomically (writeTVar readerDead True)  -- EOF or error
         Right line -> do
           case A.decode (BL.fromStrict (TE.encodeUtf8 (T.pack line))) of
             Nothing -> go  -- malformed line: skip
@@ -245,6 +248,27 @@ demuxReader hOut inbox respMap = go
                   -- JSON-RPC notification: push to inbox
                   atomically (writeTQueue inbox v)
           go
+
+-- | Block until the demux reader's inbox yields a value; return 'Left'
+-- only when the reader is dead AND the inbox is drained (EOF). The
+-- channel's reader loop treats any 'Left' as fatal, so this must NOT
+-- return 'Left' while signal-cli is merely slow to emit — the pre-fix
+-- non-blocking variant returned @Left "signal inbox empty"@ the instant
+-- the inbox was momentarily empty, killing the channel at startup.
+-- Implemented as an STM orElse: @readTQueue@ (blocks while empty) racing
+-- the EOF check (@readerDead@ + queue empty → 'Left'). A live reader
+-- therefore blocks forever until an envelope arrives; a dead reader
+-- delivers any remaining envelopes first, then EOF.
+receiveBlocking :: TQueue Value -> TVar Bool -> IO (Either Text Value)
+receiveBlocking inbox readerDead =
+  atomically $
+    (Right <$> readTQueue inbox)
+      `orElse` do
+        dead <- readTVar readerDead
+        check dead
+        isEmpty <- isEmptyTQueue inbox
+        check isEmpty
+        pure (Left "signal inbox empty")
 
 -- | Extract the @id@ field from a JSON-RPC response. Returns 'Nothing' for
 -- notifications (which have no @id@). Pure.
