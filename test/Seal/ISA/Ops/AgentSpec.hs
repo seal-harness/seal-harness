@@ -297,6 +297,40 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         [TrpText t] -> T.isInfixOf "done" t `shouldBe` True
         _           -> expectationFailure "expected a single text part"
 
+    it "AGENT_START does not truncate long summaries" $ do
+      backend <- noneBackend
+      rt <- newAgentRuntime
+      pauseFlag <- newSpawnPauseFlag
+      ran <- newIORef (0 :: Int)
+      let longSummary = T.replicate 500 "x"
+          longSummaryWorker :: IORef Int -> Del.AgentWorkerBuilder
+          longSummaryWorker ref _ _ _ _ = do
+            modifyIORef' ref (+1)
+            pure (ChildWorkerOutcome (Just longSummary) CerCompleted 0 0 (Just (mkSystemSessionId "child")))
+      _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                             (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text), "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+      let wiring = AgentStartWiring
+            { aswDefBackend = backend
+            , aswRuntime = rt
+            , aswConfig = pure defaultDelegationConfig
+            , aswPauseFlag = pauseFlag
+            , aswParentActivity = Nothing
+            , aswMintSession = pure (mkSystemSessionId "fresh")
+            , aswParentDepth = 0
+            , aswWorker = longSummaryWorker ran
+            , aswGate = gateOpen
+            }
+      r <- runTestApp (opRun (agentStartOp wiring) localBackend
+                            (object ["id" .= ("a1" :: Text), "goal" .= ("do the thing" :: Text)]))
+      orIsError r `shouldBe` False
+      readIORef ran `shouldReturn` 1
+      case orParts r of
+        [TrpText t] ->
+          -- The full 500-char summary must appear in the result, not
+          -- truncated to 200 chars (the old T.take 200 cap).
+          T.isInfixOf longSummary t `shouldBe` True
+        _           -> expectationFailure "expected a single text part"
+
     it "AGENT_START errors when the def does not exist" $ do
       backend <- noneBackend
       rt <- newAgentRuntime
