@@ -1,3 +1,8 @@
+---
+name: start-task
+description: Begin tracked work on a task with complexity assessment
+---
+
 # Start Task
 
 Determine task complexity and use appropriate workflow for efficient development.

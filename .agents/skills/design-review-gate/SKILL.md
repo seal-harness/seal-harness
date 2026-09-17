@@ -603,3 +603,65 @@ The design review gate succeeds when:
 ## Agent Definitions
 
 See detailed agent definitions in your project's agent definition files (e.g., product-manager-agent.md, architect-agent.md, designer-agent.md, security-design-agent.md, cto-agent.md).
+
+---
+
+## Command Usage
+
+```bash
+/review-design <path-to-design-doc>
+```
+
+### Examples
+
+```bash
+# Review a specific design document
+/review-design docs/plans/2026-01-11-contact-assistant-design.md
+
+# Review the most recent design document
+/review-design --latest
+
+# Re-run review after revisions
+/review-design docs/plans/2026-01-11-contact-assistant-design.md --iteration 2
+```
+
+### Arguments
+
+| Argument              | Description                                                  |
+| --------------------- | ------------------------------------------------------------ |
+| `<path>`              | Path to design document (required unless --latest)           |
+| `--latest`            | Review most recent design doc in docs/plans/                 |
+| `--iteration N`       | Mark as iteration N of review cycle                          |
+| `--skip-agent <name>` | Skip specific agent (pm, architect, designer, security, cto) |
+
+## Troubleshooting
+
+### "Design document not found"
+
+Ensure the path is correct and the file exists:
+
+```bash
+ls -la docs/plans/
+```
+
+### "Agent timed out"
+
+Individual agents have 3-minute timeout. If timeout occurs:
+
+1. Check design document isn't too large
+2. Try running agents sequentially with `--sequential`
+3. Check for network/API issues
+
+### "Stuck in review loop"
+
+After 3 iterations, use `--force-override` to proceed anyway (documents technical debt).
+
+## Related Commands
+
+- `/create-issue` - Create GitHub issue from approved design
+- `/start-task` - Begin implementation of approved design
+
+## Related Skills
+
+- `brainstorming-extension` - Auto-triggers this gate after brainstorming
+- `superpowers:brainstorming` - The design creation skill
