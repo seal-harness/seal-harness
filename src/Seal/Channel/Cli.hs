@@ -19,6 +19,7 @@ import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
+import Data.Aeson (Value)
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe, isJust)
@@ -53,7 +54,7 @@ import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
 import qualified Seal.Core.TurnEngine as TurnEngine
-import Seal.Core.Types (mkSessionId)
+import Seal.Core.Types (SessionId, OpName (..), mkSessionId)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
@@ -232,7 +233,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , taPreTurn       = \_ _ _ -> pure ()
               , taChannelLabel  = smChannel
               , taOnStop        = const Nothing
-  , taOnToolCall    = Nothing
+  , taOnToolCall    = Nothing :: Maybe (SessionId -> OpName -> Value -> IO ())
   , taOnTextDelta   = Nothing
               , taOnUserMessage = const Nothing
               , taPostTurn      = \_ _ -> pure ()
@@ -313,7 +314,7 @@ runCliTui paths rt repoReg pr sr registry chain backends tabsH autonomy askReply
               , taPreTurn       = \_ _ _ -> pure ()
               , taChannelLabel  = const "cli"
               , taOnStop        = const Nothing
-  , taOnToolCall    = Nothing
+  , taOnToolCall    = Nothing :: Maybe (SessionId -> OpName -> Value -> IO ())
   , taOnTextDelta   = Nothing
               , taOnUserMessage = const Nothing
               , taPostTurn      = \_ _ -> pure ()

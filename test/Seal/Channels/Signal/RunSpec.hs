@@ -161,7 +161,7 @@ spec = do
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
 , aeStopFanoutDone = stopFanoutDoneRef
-                    , aeOnToolCall = Nothing, aeOnTextDelta = Nothing
+                    , aeOnToolCall = \_ _ -> pure (), aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag

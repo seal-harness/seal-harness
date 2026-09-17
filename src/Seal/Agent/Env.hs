@@ -142,11 +142,12 @@ data AgentEnv = AgentEnv
     -- last-assistant text — the double-delivery bug). The error/abort/
     -- max-turns stop branches do NOT set it: the engine's cleanup must
     -- still deliver the partial/notice text on those paths.
-  , aeOnToolCall :: Maybe (OpName -> Value -> IO ())
-    -- ^ When 'Just hook', the loop calls @hook opName input@ before each
-    -- tool dispatch. Chat channels wire this to the 'StreamProgress' manager
-    -- so tool-call progress messages are sent/edited on the chat platform.
-    -- 'Nothing' (the default) means no tool-progress notification.
+  , aeOnToolCall :: OpName -> Value -> IO ()
+    -- ^ The loop calls @aeOnToolCall opName input@ before each tool
+    -- dispatch. Chat channels wire this (via the turn adapter) to the
+    -- 'StreamProgress' manager so tool-call progress messages are
+    -- sent/edited on the chat platform. The default is a no-op (the turn
+    -- engine passes @\\_ _ -> pure ()@ when no adapter hook is wired).
   , aeOnTextDelta :: Maybe (Text -> IO ())
     -- ^ When 'Just hook', the loop calls @hook delta@ for each text
     -- delta from the provider stream. Chat channels wire this to the
@@ -203,7 +204,7 @@ data TurnEnv = TurnEnv
     -- channels). 'Nothing' is not possible here — the engine always
     -- supplies the ref; direct 'TurnEnv' constructions in tests pass a
     -- fresh ref.
-  , teOnToolCall    :: Maybe (OpName -> Value -> IO ())
+  , teOnToolCall    :: OpName -> Value -> IO ()
   , teOnTextDelta   :: Maybe (Text -> IO ())
   , teAbortFlag     :: AbortFlag
   , teToolTimeout   :: ToolTimeoutConfig

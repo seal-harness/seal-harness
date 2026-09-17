@@ -464,9 +464,7 @@ runTurn env userText = do
       -- Notify the stream progress manager (if wired) that a tool call
       -- is about to dispatch. This sends/edits the tool-progress bubble
       -- on chat channels, so the user sees which tools are running.
-      liftIO $ case aeOnToolCall env of
-        Just hook -> hook name input
-        Nothing   -> pure ()
+      liftIO $ aeOnToolCall env name input
       mConfirmed <- checkConfirmation name mOp input
       res <- case mConfirmed of
         Left denyMsg -> pure (Left (Denied denyMsg))
