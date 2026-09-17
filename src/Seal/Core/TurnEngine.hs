@@ -78,7 +78,7 @@ import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Paging (defaultPageParams)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId)
 import Seal.Gateway.Broadcast
-  (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered)
+  (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply (ApprovalCache)
@@ -615,13 +615,18 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
+      -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
+      -- broadcast idle → thinking around the blocking ccPrompt call. This
+      -- keeps the web frontend's status indicator correct while the turn
+      -- is waiting for human input (not stuck on "thinking").
+      askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
       isaReg = buildSessionRegistry (tdVault td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
-                 (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) (taCaps adapter) onDemand
+                 (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   tfwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       env = (mkSessionAgentEnv TurnEnv
-              { teCaps          = taCaps adapter
+              { teCaps          = askAwareCaps
               , teProvider      = prov
               , teProviderLabel = smProvider meta'
               , teModel         = model
