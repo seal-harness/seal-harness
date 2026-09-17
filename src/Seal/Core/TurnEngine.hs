@@ -63,6 +63,7 @@ import Seal.Config.File
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
+  , resolvedCredentialToolGuidance
   , WebConfig (..) )
 import Seal.Config.Paths
   (SealPaths (..), repoKeysDir, securityFilePath, sessionConversationPath,
@@ -206,6 +207,8 @@ resolveSystemPrompt
   -- ^ Whether to inject the tool-use enforcement guidance block.
   -> Bool
   -- ^ Whether to inject the task-completion guidance block.
+  -> Bool
+  -- ^ Whether to inject the credential-bearing-tool guidance block.
   -> Maybe Text
   -- ^ The codegraph skill body to inject ('Nothing' when no repo with
   -- @.codegraph/@ is in the workdir — skips codegraph injection).
@@ -213,13 +216,13 @@ resolveSystemPrompt
   -> IO (Maybe Text)
 resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
                     injectAgents agentDefs
-                    parallel toolUse taskCompletion mCodegraphBody meta = do
+                    parallel toolUse taskCompletion credentialTool mCodegraphBody meta = do
   base <- case smSystemOverride meta of
     Just t | not (T.null (T.strip t)) -> pure (Just t)
     _ -> case smAgent meta of
            Nothing  -> pure Nothing
            Just aid -> maybe Nothing adSystem <$> Def.adbRead agentDefBackend aid
-  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion base
+  let withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool base
   withAutoload <- injectAutoloadSkill skillBackend autoloadId withGuidance
   let withCodegraph = injectCodegraphSkill mCodegraphBody withAutoload
   withSkills <- if injectCatalog
@@ -597,6 +600,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       parallel = either (const True) resolvedParallelToolGuidance eCfg
       toolUse = either (const True) resolvedToolUseEnforcement eCfg
       taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+      credentialTool = either (const True) resolvedCredentialToolGuidance eCfg
   -- [engine] Check if any cloned repo has a .codegraph/ directory; if so,
   -- inject the codegraph skill body into the system prompt.
   mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
@@ -607,7 +611,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   -- [engine] System prompt (single resolver, honors smSystemOverride).
   mSystem <- resolveSystemPrompt agentDefBackend sessionSkills
               autoloadId injectCatalog injectAgents catalogAgentDefs
-              parallel toolUse taskCompletion mCodegraphBody meta'
+              parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
   turnAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
@@ -860,6 +864,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
                     parallel = either (const True) resolvedParallelToolGuidance eCfg
                     toolUse = either (const True) resolvedToolUseEnforcement eCfg
                     taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+                    credentialTool = either (const True) resolvedCredentialToolGuidance eCfg
                 freshSkills <- Skill.staticSkillBackend freshSkillsList
                 -- Rebuild sessionBackends with the FRESH agent defs (after
                 -- autoBindRepoAgent re-bound the agent to the repo's
@@ -877,7 +882,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 mSystem <- resolveSystemPrompt
                   (bAgentDefs freshBackends) sessionSkills
                   autoloadId injectCatalog injectAgents catalogAgentDefs'
-                  parallel toolUse taskCompletion mCodegraphBody meta'
+                  parallel toolUse taskCompletion credentialTool mCodegraphBody meta'
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
@@ -1123,6 +1128,7 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
       parallel = either (const True) resolvedParallelToolGuidance eCfg
       toolUse = either (const True) resolvedToolUseEnforcement eCfg
       taskCompletion = either (const True) resolvedTaskCompletionGuidance eCfg
+      credentialTool = either (const True) resolvedCredentialToolGuidance eCfg
       injectAgents = either (const True) resolvedAvailableAgents eCfg
       -- W3 (§3.4): the effective role (def-authoritative, ctRole
       -- narrowed) + the kill switch decide the CHILD's catalog plane —
@@ -1132,7 +1138,7 @@ childSystemPrompt td eCfg unionDefBackend orchEnabled agentDef task = do
       -- (or switch-off) gets the one-line leaf note.
       effRole = Worker.effectiveRole (adRole agentDef) (ctRole task)
       canSpawn = effRole == Just "orchestrator" && orchEnabled
-      withGuidance = injectStaticGuidance parallel toolUse taskCompletion basePrompt
+      withGuidance = injectStaticGuidance parallel toolUse taskCompletion credentialTool basePrompt
   withAutoload <- injectAutoloadSkill (bSkills (tdBaseBackends td)) autoloadId withGuidance
   withSkills <- if injectCatalog
     then injectAvailableSkills (bSkills (tdBaseBackends td)) withAutoload

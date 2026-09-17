@@ -130,6 +130,38 @@ BIN_EXEC { "binary": "gh", "args": ["pr", "create", ...], "cwd": "seal-harness" 
 As a general rule, `-C` is a git-specific flag, not a universal CLI
 convention. When in doubt, use the `cwd` parameter rather than a `-C` flag.
 
+### GitHub CLI (`gh`) and credential injection
+
+**Always use `BIN_EXEC` with `binary="gh"` for GitHub operations that
+require authentication** (push, PR creation, issue editing, repo cloning
+of private repos, etc.). Seal Harness automatically injects `GH_TOKEN`
+from the vault into the process environment when `gh` is run via
+`BIN_EXEC` from inside a registered repo's workdir. This is the **only**
+way `gh` receives credentials in a Seal session — there is no
+`gh auth login` keyring on the untrusted machine.
+
+**`SHELL_EXEC` with `gh` gets NO credential injection.** Running
+`gh pr create` through `SHELL_EXEC` will fail with an opaque
+authentication error because `GH_TOKEN` is never injected into a
+`SHELL_EXEC` subprocess. This is the single most common cause of
+push/PR failures in Seal sessions.
+
+```
+# Wrong — SHELL_EXEC gets no GH_TOKEN → auth failure:
+SHELL_EXEC { "command": "gh pr create --draft --fill" }
+# Right — BIN_EXEC injects GH_TOKEN from the vault:
+BIN_EXEC { "binary": "gh", "args": ["pr", "create", "--head", "my-branch", "--draft", "--fill"], "cwd": "my-repo" }
+```
+
+The same applies to `git` push/pull against PAT-registered repos:
+`BIN_EXEC` with `binary="git"` gets credential injection (SSH agent for
+deploy keys, `http.extraHeader` for PATs); `SHELL_EXEC` does not.
+
+If `gh` fails with an auth error despite using `BIN_EXEC`, the repo may
+not be registered in Seal Harness's repo registry, or the vault may be
+locked. Check with the operator — do not attempt `gh auth login`
+(it is blocked by the harness because it writes secrets to disk).
+
 **`gh pr create` needs `--head` in shallow clones.** In a shallow clone
 (which is what `SETUP_REPO` and most agent environments produce), `git
 push -u` may not reliably persist upstream tracking config to `.git/config`.
@@ -174,6 +206,8 @@ session, not just shallow clones — there is no downside to passing
 - [ ] Can this be a `BIN_EXEC` instead of `SHELL_EXEC`? (single binary + args → yes)
 - [ ] If I need to clone, am I cloning with **no destination path** (so it
       lands in my workdir as a subdirectory)?
+- [ ] If I'm using `gh` or `git` for authenticated operations, am I using
+      `BIN_EXEC`? (SHELL_EXEC gets no credential injection → auth failures)
 
 If you accidentally escaped the workdir, don't try to "fix" it by copying
 files around blindly. Tell the operator what happened, then re-run the work

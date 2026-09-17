@@ -172,6 +172,11 @@ token are guarded with `pendingWith`.
 
 ## PR Workflow
 
+> **Use `BIN_EXEC` (not `SHELL_EXEC`) for `gh` and `git` operations.** Seal
+> Harness injects credentials from the vault only through `BIN_EXEC` —
+> `SHELL_EXEC` gets no credential injection and `gh pr create` / `git push`
+> will fail with an opaque auth error. See the seal-usage skill for details.
+
 1. Claim the issue: `gh issue edit <NN> --add-assignee @me`.
 2. Branch from `main`: `git switch main && git pull && git switch -c
    <area>/<desc>-<NN>`.
