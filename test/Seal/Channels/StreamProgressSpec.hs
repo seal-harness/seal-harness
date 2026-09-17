@@ -13,6 +13,7 @@ import Test.QuickCheck (Gen, elements, forAll, listOf1, (===))
 
 import Seal.Channels.StreamProgress
   ( StreamProgressConfig (..)
+  , opEmoji
   , resolveStreamProgressConfig
   , formatToolLine
   , shouldEdit
@@ -54,23 +55,48 @@ spec = do
       resolveStreamProgressConfig (Just def { spcEnabled = True })
         `shouldBe` def { spcEnabled = True }
 
+  describe "opEmoji" $ do
+    it "returns the laptop emoji for SHELL_EXEC" $
+      opEmoji (OpName "SHELL_EXEC") `shouldBe` "\x1F4BB"
+
+    it "returns the open book emoji for FILE_READ" $
+      opEmoji (OpName "FILE_READ") `shouldBe` "\x1F4D6"
+
+    it "returns the writing hand emoji for FILE_WRITE" $
+      opEmoji (OpName "FILE_WRITE") `shouldBe` "\x270D\xFE0F"
+
+    it "returns the wrench emoji for FILE_PATCH" $
+      opEmoji (OpName "FILE_PATCH") `shouldBe` "\x1F527"
+
+    it "returns the magnifying glass emoji for WEB_SEARCH" $
+      opEmoji (OpName "WEB_SEARCH") `shouldBe` "\x1F50D"
+
+    it "returns the question mark emoji for ASK_HUMAN" $
+      opEmoji (OpName "ASK_HUMAN") `shouldBe` "\x2753"
+
+    it "returns the rocket emoji for AGENT_START" $
+      opEmoji (OpName "AGENT_START") `shouldBe` "\x1F680"
+
+    it "returns the high-voltage emoji for unknown opcodes" $
+      opEmoji (OpName "UNKNOWN_OP") `shouldBe` "\x26A1"
+
   describe "formatToolLine" $ do
-    it "shows the opcode name and a truncated input" $
+    it "shows the opcode name with the correct emoji and truncated input" $
       formatToolLine Set.empty (OpName "SHELL_EXEC") "{\"command\":\"ls\"}"
-        `shouldBe` "\x1F50D SHELL_EXEC {\"command\":\"ls\"}"
+        `shouldBe` "\x1F4BB SHELL_EXEC {\"command\":\"ls\"}"
 
     it "truncates long inputs to 120 chars + ..." $
       let longInput = T.replicate 200 "x"
       in formatToolLine Set.empty (OpName "FILE_READ") longInput
-           `shouldBe` "\x1F50D FILE_READ " <> T.take 120 longInput <> "..."
+           `shouldBe` "\x1F4D6 FILE_READ " <> T.take 120 longInput <> "..."
 
     it "redacts input for secret-bearing opcodes" $
       formatToolLine (Set.singleton (OpName "SECRET_GET")) (OpName "SECRET_GET") "vault-key"
-        `shouldBe` "\x1F50D SECRET_GET <redacted>"
+        `shouldBe` "\x1F5DD SECRET_GET <redacted>"
 
     it "does not redact non-secret opcodes" $
       formatToolLine (Set.singleton (OpName "SECRET_GET")) (OpName "SHELL_EXEC") "ls"
-        `shouldBe` "\x1F50D SHELL_EXEC ls"
+        `shouldBe` "\x1F4BB SHELL_EXEC ls"
 
   describe "shouldEdit" $ do
     let cfg = def { spcEditIntervalMs = 1000, spcBufferThreshold = 80 }

@@ -18,6 +18,7 @@ module Seal.Channels.StreamProgress
   , StreamProgress (..)
   , newStreamProgress
   , onToolCall
+  , opEmoji
   , onTextDelta
   , finalizeText
   , segmentBreak
@@ -238,11 +239,12 @@ voidEditOrFallback sp msgId content =
   void (editOrFallback sp msgId content)
 
 -- | Format a tool-call progress line. Shows the opcode name and a
--- truncated input. For secret-bearing opcodes (in the 'secretOps' set),
+-- truncated input. The opcode name is prefixed with a per-opcode emoji
+-- (see 'opEmoji'). For secret-bearing opcodes (in the 'secretOps' set),
 -- the input is replaced with @"<redacted>"@. Pure.
 formatToolLine :: Set OpName -> OpName -> Text -> Text
 formatToolLine secretOps (OpName name) input =
-  "\x1F50D " <> name <> " " <> inputDisplay
+  opEmoji (OpName name) <> " " <> name <> " " <> inputDisplay
   where
     inputDisplay
       | OpName name `Set.member` secretOps = "<redacted>"
@@ -251,6 +253,48 @@ formatToolLine secretOps (OpName name) input =
       if T.length t > 120
         then T.take 120 t <> "..."
         else t
+
+-- | Map an opcode name to a display emoji for tool-progress lines.
+-- Inspired by the per-tool emoji mapping in hermes-agent's tool registry.
+-- Unknown opcodes fall back to the high-voltage sign (@⚡@), matching
+-- the convention for generic tool activity. Pure.
+opEmoji :: OpName -> Text
+opEmoji (OpName name) = case name of
+  "SHELL_EXEC"       -> "\x1F4BB"  -- 💻 laptop
+  "BIN_EXEC"         -> "\x2699\xFE0F"  -- ⚙️ gear
+  "FILE_READ"        -> "\x1F4D6"  -- 📖 open book
+  "FILE_WRITE"       -> "\x270D\xFE0F"  -- ✍️ writing hand
+  "FILE_PATCH"       -> "\x1F527"  -- 🔧 wrench
+  "SEARCH_FILES"     -> "\x1F50E"  -- 🔎 magnifying glass tilted right
+  "WEB_SEARCH"       -> "\x1F50D"  -- 🔍 magnifying glass
+  "WEB_FETCH"        -> "\x1F4C4"  -- 📄 page facing up
+  "SETUP_REPO"       -> "\x1F4E5"  -- 📥 inbox tray
+  "SECRET_GET"       -> "\x1F5DD"  -- 🗝 old key
+  "MEMORY_WRITE"     -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_RECALL"    -> "\x1F9E0"  -- 🧠 brain
+  "MEMORY_DELETE"    -> "\x1F9E0"  -- 🧠 brain
+  "SKILL_WRITE"      -> "\x1F4DD"  -- 📝 memo
+  "SKILL_LOAD"       -> "\x1F4DA"  -- 📚 books
+  "SKILL_LIST"       -> "\x1F4DA"  -- 📚 books
+  "SKILL_DELETE"     -> "\x1F4DA"  -- 📚 books
+  "AGENT_DEF_WRITE"  -> "\x1F916"  -- 🤖 robot face
+  "AGENT_DEF_READ"   -> "\x1F916"  -- 🤖 robot face
+  "AGENT_DEF_LIST"   -> "\x1F916"  -- 🤖 robot face
+  "AGENT_DEF_DELETE" -> "\x1F916"  -- 🤖 robot face
+  "AGENT_INSTANCES"  -> "\x1F916"  -- 🤖 robot face
+  "AGENT_START"      -> "\x1F680"  -- 🚀 rocket
+  "AGENT_STATUS"     -> "\x1F916"  -- 🤖 robot face
+  "AGENT_STOP"       -> "\x1F6D1"  -- 🛑 stop sign
+  "AGENT_INTERRUPT"  -> "\x270B"   -- ✋ raised hand
+  "SHOW_HUMAN"       -> "\x1F4E2"  -- 📢 loudspeaker
+  "ASK_HUMAN"        -> "\x2753"   -- ❓ question mark
+  "PROCESS_MANAGE"   -> "\x2699\xFE0F"  -- ⚙️ gear
+  "HARNESS_LIST"     -> "\x1F5A5\xFE0F"  -- 🖥️ desktop computer
+  "HARNESS_START"    -> "\x1F5A5\xFE0F"  -- 🖥️ desktop computer
+  "HARNESS_STOP"     -> "\x1F5A5\xFE0F"  -- 🖥️ desktop computer
+  "OPCODE_DESCRIBE"  -> "\x1F50E"  -- 🔎 magnifying glass tilted right
+  "OPCODE_LIST"      -> "\x1F4CB"  -- 📋 clipboard
+  _                  -> "\x26A1"   -- ⚡ high voltage
 
 -- | Should the manager send an edit now? Returns 'True' when enough
 -- time has passed since the last edit, or the buffer threshold is
