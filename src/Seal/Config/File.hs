@@ -39,6 +39,7 @@ module Seal.Config.File
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement
   , resolvedTaskCompletionGuidance
+  , resolvedCredentialToolGuidance
   , resolvedAvailableAgents
   , saveRuntimeConfig
   , updateRuntimeConfig
@@ -335,6 +336,10 @@ data AgentConfig = AgentConfig
     -- ^ Whether to inject the task-completion / anti-fabrication guidance
     -- ("don't stop after a stub; don't fabricate output when blocked").
     -- Absent → @true@.
+  , acCredentialToolGuidance :: Maybe Bool
+    -- ^ Whether to inject the credential-bearing-tool guidance ("use
+    -- BIN_EXEC for git/gh — credentials are injected only via BIN_EXEC").
+    -- Absent → @true@.
   , acAvailableAgents :: Maybe Bool
     -- ^ Whether to inject the @\<available_agents\>@ catalog (a grouped
     -- listing of all agent-def ids + roles + descriptions) into the
@@ -548,6 +553,7 @@ agentConfigCodec = AgentConfig
   <$> Toml.dioptional (Toml.bool "parallel_tool_guidance") .= acParallelToolGuidance
   <*> Toml.dioptional (Toml.bool "tool_use_enforcement") .= acToolUseEnforcement
   <*> Toml.dioptional (Toml.bool "task_completion_guidance") .= acTaskCompletionGuidance
+  <*> Toml.dioptional (Toml.bool "credential_tool_guidance") .= acCredentialToolGuidance
   <*> Toml.dioptional (Toml.bool "available_agents") .= acAvailableAgents
 
 -- ---------------------------------------------------------------------------
@@ -708,6 +714,13 @@ resolvedToolUseEnforcement cfg =
 resolvedTaskCompletionGuidance :: RuntimeConfig -> Bool
 resolvedTaskCompletionGuidance cfg =
   fromMaybe True (rcAgent cfg >>= acTaskCompletionGuidance)
+
+-- | Resolve whether the credential-bearing-tool guidance block is
+-- injected. Absent @[agent]@ section or @credential_tool_guidance@ key
+-- → @True@ (injected); an explicit @false@ disables.
+resolvedCredentialToolGuidance :: RuntimeConfig -> Bool
+resolvedCredentialToolGuidance cfg =
+  fromMaybe True (rcAgent cfg >>= acCredentialToolGuidance)
 
 -- | Resolve whether the @\<available_agents\>@ catalog is injected (issue
 -- #154 §3.4). Absent @[agent]@ section or @available_agents@ key →
