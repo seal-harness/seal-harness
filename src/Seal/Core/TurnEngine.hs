@@ -421,7 +421,7 @@ data TurnAdapter = TurnAdapter
   , taPreTurn       :: SessionId -> SessionMeta -> Text -> IO ()
   , taChannelLabel  :: SessionMeta -> Text
   , taOnStop        :: SessionId -> Maybe (Text -> IO ())
-  , taOnToolCall    :: Maybe (OpName -> Value -> IO ())
+  , taOnToolCall    :: Maybe (SessionId -> OpName -> Value -> IO ())
   , taOnTextDelta   :: Maybe (Text -> IO ())
   , taOnUserMessage :: SessionMeta -> Maybe (IO ())
   , taPostTurn      :: SessionId -> SessionMeta -> IO ()
@@ -637,7 +637,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
               , teChannel       = taChannelLabel adapter meta'
               , teOnStop        = taOnStop adapter sid
               , teStopFanoutDone = stopFanoutDoneRef
-              , teOnToolCall    = taOnToolCall adapter
+              , teOnToolCall    = \hookOpName hookVal -> case taOnToolCall adapter of
+                   Just hook -> hook sid hookOpName hookVal
+                   Nothing   -> pure ()
               , teOnTextDelta   = taOnTextDelta adapter
               , teAbortFlag     = turnAbortFlag
               , teToolTimeout   = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg

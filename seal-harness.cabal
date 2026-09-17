@@ -407,6 +407,7 @@ test-suite tests
         Seal.Channels.Signal.RunSpec
         Seal.Channels.Signal.TransportSpec
         Seal.Channels.Signal.TransportEditSpec
+        Seal.Channels.Signal.TransportLockSpec
         Seal.Channels.TelegramSpec
         Seal.Channels.StreamProgressSpec
         Seal.Channels.Telegram.ButtonsSpec
@@ -448,6 +449,7 @@ test-suite tests
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
         Seal.Session.LockSpec
+        Seal.Session.LockFocusSpec
         Seal.SourceControl.RepoSpec
         Seal.SourceControl.RegistrySpec
         Seal.SourceControl.AgentRegistrySpec

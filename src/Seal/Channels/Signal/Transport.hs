@@ -16,7 +16,7 @@ module Seal.Channels.Signal.Transport
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, withMVar)
 import Control.Concurrent.STM
   ( TQueue, TVar, atomically, check, isEmptyTQueue, newTQueueIO, newTVarIO
   , orElse, readTQueue, readTVar, tryReadTQueue, writeTQueue, writeTVar )
@@ -137,6 +137,21 @@ mkRealSignalTransport account = do
           -- routes responses (have id) to waiting callers via MVars,
           -- notifications (no id) to the inbox TQueue.
           _ <- forkIO (demuxReader hOut inbox respMap readerDead)
+          -- Serialize all writes to hIn: the three operations (hPutStr +
+          -- hPutStrLn + hFlush) are not atomic together, so concurrent
+          -- sends from the forked agent-turn thread (tool-progress
+          -- bubbles) and the main loop thread (e.g. /tab focus
+          -- confirmation) can interleave bytes, corrupting JSON-RPC
+          -- frames. The lock is held only during the write itself, NOT
+          -- while waiting for a JSON-RPC response (so a stSendWithId
+          -- call does not block a concurrent stSend).
+          sendLock <- newMVar ()
+          let writeFrame :: Value -> IO ()
+              writeFrame frame = do
+                withMVar sendLock $ \_ -> do
+                  BL.hPutStr hIn (A.encode frame)
+                  TIO.hPutStrLn hIn ""
+                  hFlush hIn
           let sendRequest :: Value -> IO (Maybe Value)
               sendRequest frame = do
                 rid <- atomicModifyIORef' idRef (\n -> (n + 1, n))
@@ -148,9 +163,7 @@ mkRealSignalTransport account = do
                     framed = case frame of
                       A.Object o -> A.Object (KeyMap.insert (Key.fromString "id") ridVal o)
                       _ -> frame
-                BL.hPutStr hIn (A.encode framed)
-                TIO.hPutStrLn hIn ""
-                hFlush hIn
+                writeFrame framed
                 mResult <- timeout 10000000 (takeMVar mv)
                 _ <- atomicModifyIORef' respMap (\m -> (Map.delete rid m, m))
                 pure (case mResult of
@@ -167,9 +180,7 @@ mkRealSignalTransport account = do
                           , "message"   A..= body
                           ]
                       ]
-                BL.hPutStr hIn (A.encode frame)
-                TIO.hPutStrLn hIn ""
-                hFlush hIn
+                writeFrame frame
             , stSendWithId = \recipient body -> do
                 let frame = A.object
                       [ "jsonrpc" A..= ("2.0" :: Text)

@@ -29,6 +29,7 @@ module Seal.Session.Lock
   , replyFanout
   , replyFanoutMessage
   , replySubscriberCount
+  , replyIsSubscribed
   , replyMigrateAll
   ) where
 
@@ -134,6 +135,14 @@ newReplyRegistry = ReplyRegistry <$> newTVarIO Map.empty
 -- simultaneously, enabling cross-channel message mirroring. The handle is
 -- associated with an 'IORef' guard (returned to the caller) so it can be
 -- later unsubscribed.
+--
+-- A same-label sink is also removed from any /other/ session it was
+-- subscribed to: a channel handle is subscribed to at most one session at
+-- a time. When a conversation runs @/tab focus@ to switch to a different
+-- session, the handle moves to the new session and is removed from the
+-- old one. Without this, the old session's reply fan-out and
+-- tool-progress hooks continue to reach the channel even after the user
+-- changed focus — the "streaming continues after tab focus" bug.
 replySubscribe
   :: ReplyRegistry -> ChannelHandle -> SessionId
   -> IO (IORef (Maybe SessionId))
@@ -142,11 +151,14 @@ replySubscribe (ReplyRegistry tv) h sid = do
   let sink = ReplySink h guard (chLabel h)
   atomically $ do
     m <- readTVar tv
-    let sinks = Map.findWithDefault [] sid m
+    -- Remove any existing sink with the same channel label from ALL
+    -- other sessions first (at-most-one-session-per-handle invariant).
+    let m' = Map.map (filter (\s -> rsLabel s /= rsLabel sink)) m
+        sinks = Map.findWithDefault [] sid m'
         -- Drop any existing sink with the same channel label (replace
         -- same-kind), then prepend the new one.
         sinks' = sink : filter (\s -> rsLabel s /= rsLabel sink) sinks
-    writeTVar tv (Map.insert sid sinks' m)
+    writeTVar tv (Map.insert sid sinks' (Map.filter (not . null) m'))
   pure guard
 
 -- | Unsubscribe a handle from a session. The 'IORef' guard must match
@@ -211,6 +223,19 @@ replyFanoutMessage (ReplyRegistry tv) sid senderLabel text = do
 replySubscriberCount :: ReplyRegistry -> SessionId -> IO Int
 replySubscriberCount (ReplyRegistry tv) sid =
   maybe 0 length . Map.lookup sid <$> readTVarIO tv
+
+-- | Is the given channel handle (identified by its label) currently
+-- subscribed to the session's replies? Used by the tool-call hook to
+-- check whether the channel is still focused on the session before
+-- sending a tool-progress bubble — so a channel that has run
+-- @/tab focus@ to a different session does not receive tool-progress
+-- from this session's in-flight turn. Pure STM read.
+replyIsSubscribed :: ReplyRegistry -> Text -> SessionId -> IO Bool
+replyIsSubscribed (ReplyRegistry tv) label sid = do
+  m <- readTVarIO tv
+  case Map.lookup sid m of
+    Nothing  -> pure False
+    Just sinks -> pure (any (\s -> rsLabel s == label) sinks)
 
 -- | Migrate every 'ReplySink' subscribed to @oldSid@ to @newSid@. Used by
 -- @\/new@ when a tab is rebound to a fresh session: the channel handles

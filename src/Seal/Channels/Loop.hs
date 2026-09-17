@@ -54,7 +54,7 @@ module Seal.Channels.Loop
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.Foldable (for_)
 import Data.Either (fromRight)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -117,7 +117,7 @@ import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.ExecCache (SessionExecCache, newSessionExecCache)
 import Seal.Session.Lock
   ( ReplyRegistry, newReplyRegistry, replySubscribe, replyFanout
-  , replyFanoutMessage, replyMigrateAll
+  , replyFanoutMessage, replyIsSubscribed, replyMigrateAll
   , SessionLocks, newSessionLocks )
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
@@ -256,7 +256,7 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
       replyFanoutMessage (cdReplies deps) sid (chLabel h) t
   , taChannelLabel  = smChannel
   , taOnStop        = Just . replyFanout (cdReplies deps)
-  , taOnToolCall    = Just (toolCallHook deps h)
+  , taOnToolCall    = Just (toolCallHook deps h (cdReplies deps) (chLabel h))
   , taOnTextDelta   = Nothing
   , taOnUserMessage = \meta -> if shouldAutoTab meta
                                  then Nothing
@@ -272,14 +272,26 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
 -- 'StreamProgress' is created per call because the config may change
 -- between turns. When streaming is disabled, 'newStreamProgress' still
 -- creates the state but 'onToolCall' and 'segmentBreak' are no-ops (they
--- check 'spcEnabled' internally). IO.
-toolCallHook :: ChannelDeps -> ChannelHandle -> OpName -> Value -> IO ()
-toolCallHook deps h opName input = do
-  cfg <- cdConfig deps
-  let spCfg = chatStreamingConfig cfg
-  sp <- newStreamProgress spCfg h secretOpcodes
-  segmentBreak sp
-  onToolCall sp opName (TE.decodeUtf8 (BL.toStrict (A.encode input)))
+-- check 'spcEnabled' internally).
+--
+-- The hook checks 'replyIsSubscribed' before sending: if the channel has
+-- run @/tab focus@ to switch to a different session mid-turn, the handle
+-- is no longer subscribed to this session and the tool-progress bubble is
+-- suppressed. This ensures a chat channel only shows tool updates for the
+-- tab it's currently focused on. IO.
+toolCallHook
+  :: ChannelDeps -> ChannelHandle -> ReplyRegistry -> Text
+  -> SessionId -> OpName -> Value -> IO ()
+toolCallHook deps h replies label sid opName input = do
+  -- Only send tool progress if this channel is still subscribed to the
+  -- session (i.e. the user hasn't /tab focus'd away to a different session).
+  subscribed <- replyIsSubscribed replies label sid
+  when subscribed $ do
+    cfg <- cdConfig deps
+    let spCfg = chatStreamingConfig cfg
+    sp <- newStreamProgress spCfg h secretOpcodes
+    segmentBreak sp
+    onToolCall sp opName (TE.decodeUtf8 (BL.toStrict (A.encode input)))
 
 -- | Build a 'ChannelDeps' with fresh reply/lock/abort stores and the given
 -- config loader. Used by 'Seal.Command.Serve' and the standalone entry
