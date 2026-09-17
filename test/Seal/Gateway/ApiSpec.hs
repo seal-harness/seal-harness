@@ -70,12 +70,13 @@ import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime, makeLockedVaultRuntime)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), listSessions, saveSessionMeta)
-import Seal.Session.Lock (newSessionLocks, newReplyRegistry)
+import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
 import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
+import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.Harness.Id (newHarnessId)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Tabs (newTabsHandle, insertTabH)
@@ -108,6 +109,26 @@ instance Provider ScriptProvider where
 fakePaths :: SealPaths
 fakePaths = SealPaths
   { spHome = "", spState = "", spConfig = "", spKeys = "" , spCache = ""}
+
+-- | A stub 'ChannelHandle' with no-op sends (mirrors the one in
+-- LoopSpec). Tests override individual fields (e.g. chSend) with record
+-- update syntax.
+stubHandle :: ChannelHandle
+stubHandle = ChannelHandle
+  { chLabel       = "test"
+  , chSend         = \_ -> pure ()
+  , chSendWithId   = \_ -> pure Nothing
+  , chEditMessage  = Nothing
+  , chDeleteMessage = Nothing
+  , chSendError    = \_ -> pure ()
+  , chSendChunk    = \_ -> pure ()
+  , chPrompt       = \_ -> pure (Left Deferred)
+  , chPromptSecret = \_ -> pure (Left Deferred)
+  , chStreaming    = False
+  , chReadSecret   = pure Nothing
+  , chReceive      = pure (Nothing, "")
+  , chLastChatId   = pure Nothing
+  }
 
 fakeMeta :: SessionMeta
 fakeMeta =
@@ -3866,6 +3887,127 @@ spec = describe "Seal.Gateway.API" $ do
           -- (the frontend's block payload encodes it).
           T.isInfixOf "Hello from the fake provider" (T.pack (show transcriptBody))
             `shouldBe` True
+
+  -- ── Regression: subscribed chat channels must receive the final reply
+  -- EXACTLY ONCE after a web-originated turn ──────────────────────────────
+  -- A chat channel (Telegram/Signal) that subscribed to the session
+  -- (e.g. via /tab focus) used to get the final assistant reply TWICE:
+  -- once via taOnStop → replyFanout (the agent loop's stop branch) and
+  -- again via the engine bracket cleanup → fanoutLastReply → replyFanout
+  -- (both send the identical last-assistant text to every subscribed
+  -- handle). Observed on Telegram after /tab focus N mid-turn: the final
+  -- message was redundantly sent twice.
+  it "e2e: a subscribed chat channel receives the final reply exactly once" $
+    withSystemTempDirectory "seal-e2e-fanout" $ \tmp -> do
+      let stateRoot  = tmp </> "state"
+          configRoot = tmp </> "config"
+          sessionRoot = stateRoot </> "sessions"
+      createDirectoryIfMissing True stateRoot
+      createDirectoryIfMissing True configRoot
+      createDirectoryIfMissing True sessionRoot
+      ensureConfigRepo configRoot
+      let repo = openConfigRepo configRoot
+      backends <- newBackends configRoot repo
+      tabsH <- newTabsHandle
+      reg   <- newHarnessRegistry
+      tmuxR <- mkRealTmuxRunner
+      askReply <- newAskReplyStore 0
+      approvals <- newApprovalCache
+      testReplies <- newReplyRegistry
+      testLocks <- newSessionLocks
+      testLog <- testSealLogger
+      execCache <- newSessionExecCache
+      let sid = case mkSessionId "e2e-fanout" of Right s -> s; Left _ -> error "sid"
+          meta0 = fakeMeta { smId = sid, smChannel = "telegram" }
+          paths = SealPaths
+            { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = tmp </> "cache"}
+      -- A fake chat-channel handle that captures every chSend. This is the
+      -- handle a Telegram conversation would have registered via
+      -- /tab focus (the same chSend the reply fan-out delivers through).
+      sentRef <- newIORef ([] :: [T.Text])
+      let channelHandle = stubHandle { chSend = \t -> modifyIORef' sentRef (++ [t]) }
+      -- Subscribe the handle to the session (what /tab focus does).
+      _ <- replySubscribe testReplies channelHandle sid
+      -- A fake provider that returns one canned assistant reply.
+      providerRef <- newIORef
+        [ CompletionResponse [CbText "the one and only reply"] StopEnd (Usage 0 0) ]
+      vaultRef <- newIORef (Nothing :: Maybe VaultHandle)
+      mgr <- newManager defaultManagerSettings
+      cntRef <- newIORef 0
+      activeRef' <- newIORef meta0
+      uiState <- newUiStateHandle paths
+      let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
+          resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
+          resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
+          sendDeps = SendDeps
+            { sdPaths      = paths
+            , sdVault      = rt
+            , sdRepoReg    = fakeRepoRegistryHandle
+            , sdProvider   = pr
+            , sdSession    = sr
+            , sdBackends   = backends
+            , sdConfigRepo = repo
+            , sdPreprocess = emptyChain
+            , sdRegistry   = mkRegistry []
+            , sdResolve    = resolveStub
+            , sdAutonomy   = Policy.Full
+            , sdBroker     = Nothing
+            , sdHarnessRegistry = reg
+            , sdTmuxRunner  = tmuxR
+            , sdHttpManager = Nothing
+            , sdAskReply    = askReply
+            , sdApprovals   = approvals
+            , sdReplies     = testReplies
+            , sdLocks       = testLocks
+            , sdAbortReg    = testAbortReg
+            , sdTabsHandle  = tabsH
+            , sdLogger      = testLog
+            , sdIsRemote    = False
+            , sdExecCache   = execCache
+            , sdRemoteRunner = Nothing
+            , sdMkWorker    = Nothing
+            , sdResolveProviderOverride = Nothing
+            , sdMkWorkerStubDepth = 2
+            }
+          deps = ApiDeps
+            { adSessionRuntime  = sr
+            , adTabsHandle      = tabsH
+            , adHarnessRegistry = reg
+            , adAdoptConsent    = Just CcWeb
+            , adAgentDefs       = bAgentDefs backends
+            , adSkills          = bSkills backends
+            , adProviders       = pure knownProviders
+            , adUiState         = uiState
+            , adSend            = Just sendDeps
+            , adDefaultAgent    = pure Nothing
+            , adBroker          = Nothing
+            , adTabCloseNotifier = noTabCloseNotifier
+            , adRepoRegistry     = fakeRepoRegistryHandle
+            , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
+            , adVault            = fakeLockedVaultRuntime
+            , adPaths            = paths, adWsPort = 8081, adAbortReg = testAbortReg
+            , adSecurityConfig = defaultSecurityConfig
+            , adMkSessionExec = Nothing
+            }
+          app = apiApp deps
+      -- Persist the session so handleSend's loadSessionMeta finds it.
+      saveSessionMeta paths meta0
+      -- Send a plain message (a web-originated turn on a channel-subscribed tab).
+      sendReq <- testPost ["api", "sessions", "e2e-fanout", "send"]
+        (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+      (sendStatus, _) <- runAppBody app sendReq
+      sendStatus `shouldBe` 200
+      -- The subscribed channel must have received the reply EXACTLY ONCE.
+      -- (The surviving delivery carries the provider prefix from the stop
+      -- branch: "<provider>/<model>> <text>". Before the fix the channel
+      -- got TWO copies — the prefixed one via taOnStop → replyFanout and a
+      -- raw one via the engine's fanoutLastReply cleanup.)
+      sends <- readIORef sentRef
+      length (filter ("the one and only reply" `T.isInfixOf`) sends) `shouldBe` 1
+      filter ("the one and only reply" `T.isInfixOf`) sends
+        `shouldSatisfy` all ("ollama/llama3.2>" `T.isPrefixOf`)
   -- ── Regression: benign slash commands must not navigate ─────────────
   -- The web gateway is multi-session: srActive is a process-global ref
   -- that may point at a DIFFERENT session than the one a request targets.

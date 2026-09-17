@@ -61,6 +61,8 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
+import Data.Text.Encoding qualified as TE
+import Data.Aeson (object, (.=), Value)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Network.HTTP.Client (Manager)
@@ -68,6 +70,8 @@ import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
+import Seal.Channels.StreamProgress
+  (newStreamProgress, onToolCall, segmentBreak)
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), resolveSessionProvider )
@@ -82,7 +86,8 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs, runCommandAction)
 import Seal.Command.Tab (TabCloseNotifier)
 import Seal.Config.File
-  ( RuntimeConfig )
+  ( RuntimeConfig, chatStreamingConfig )
+import Seal.ISA.Registry (secretOpcodes)
 import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir)
 import Seal.Core.ChannelKind (ChannelKind (..), channelKindToText)
 import Seal.Core.MessageSource
@@ -92,7 +97,6 @@ import Seal.Core.TurnEngine
    runSessionTurn, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (SessionId, OpName (..), mkSessionId, sessionIdText)
-import Data.Aeson (object, (.=))
 import Seal.Command.New (NewArgs (..), parseNewArgs, resolveRepoUrl)
 import Seal.ISA.Ops.Repo (validateRepoUrl)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
@@ -252,6 +256,8 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
       replyFanoutMessage (cdReplies deps) sid (chLabel h) t
   , taChannelLabel  = smChannel
   , taOnStop        = Just . replyFanout (cdReplies deps)
+  , taOnToolCall    = Just (toolCallHook deps h)
+  , taOnTextDelta   = Nothing
   , taOnUserMessage = \meta -> if shouldAutoTab meta
                                  then Nothing
                                  else Just (broadcastTabs deps (cdTabs deps))
@@ -259,6 +265,21 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
   , taStartWiring   = \sessionBackends sid appEnv eCfg operatorCeiling meta ->
       TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling (smChannel meta)
   }
+
+-- | The per-turn tool-call hook. Creates a fresh 'StreamProgress' from the
+-- current config, then calls 'segmentBreak' (finalize any in-progress text)
+-- followed by 'onToolCall' (send/edit the tool-progress bubble). The
+-- 'StreamProgress' is created per call because the config may change
+-- between turns. When streaming is disabled, 'newStreamProgress' still
+-- creates the state but 'onToolCall' and 'segmentBreak' are no-ops (they
+-- check 'spcEnabled' internally). IO.
+toolCallHook :: ChannelDeps -> ChannelHandle -> OpName -> Value -> IO ()
+toolCallHook deps h opName input = do
+  cfg <- cdConfig deps
+  let spCfg = chatStreamingConfig cfg
+  sp <- newStreamProgress spCfg h secretOpcodes
+  segmentBreak sp
+  onToolCall sp opName (TE.decodeUtf8 (BL.toStrict (A.encode input)))
 
 -- | Build a 'ChannelDeps' with fresh reply/lock/abort stores and the given
 -- config loader. Used by 'Seal.Command.Serve' and the standalone entry

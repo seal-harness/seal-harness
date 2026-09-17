@@ -54,6 +54,9 @@ testHandle :: Maybe Text -> IORef [Text] -> ChannelHandle
 testHandle mChat sendRef = ChannelHandle
   { chLabel       = "telegram-test"
   , chSend         = \t -> modifyIORef' sendRef (t :)
+  , chSendWithId   = \_ -> pure Nothing
+  , chEditMessage  = Nothing
+  , chDeleteMessage = Nothing
   , chSendError    = \_ -> pure ()
   , chSendChunk    = \_ -> pure ()
   , chPrompt       = \_ -> pure (Left Deferred)
@@ -147,7 +150,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
 
     it "ccPrompt with options sends an inline keyboard (1 call, N rows)" $ do
       let opts = [opt "main", opt "develop"]
-      (transport, _, _, _, getKb) <- mkMockTelegramTransport []
+      (transport, _, _, _, getKb, _, _, _) <- mkMockTelegramTransport []
       sendRef <- newIORef []
       store <- newAskReplyStore 0
       let h = testHandle (Just chatId) sendRef
@@ -182,7 +185,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
       takeMVar done
 
     it "ccPrompt with empty opts sends plain text, no keyboard" $ do
-      (transport, _, _, _, getKb) <- mkMockTelegramTransport []
+      (transport, _, _, _, getKb, _, _, _) <- mkMockTelegramTransport []
       sendRef <- newIORef []
       store <- newAskReplyStore 0
       let h = testHandle (Just chatId) sendRef
@@ -202,7 +205,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
 
     it "ccPrompt with options but no chat id falls back to chSend (numbered list)" $ do
       let opts = [opt "yes", opt "no"]
-      (transport, _, _, _, getKb) <- mkMockTelegramTransport []
+      (transport, _, _, _, getKb, _, _, _) <- mkMockTelegramTransport []
       sendRef <- newIORef []
       store <- newAskReplyStore 0
       let h = testHandle Nothing sendRef
@@ -299,7 +302,7 @@ spec = describe "Seal.Channels.Telegram.Buttons" $ do
 
     it "a callback_query update triggers tgAnswerCallback" $ do
       let cbUpd = callbackUpdate chatId senderId "deadbeef:0" "cb-99"
-      (transport, _, _, getCallbacks, _) <- mkMockTelegramTransport [cbUpd]
+      (transport, _, _, getCallbacks, _, _, _, _) <- mkMockTelegramTransport [cbUpd]
       logger <- testSealLogger
       withTelegramChannel (AllowAll, 3900) transport logger $ \ch -> do
         let h = toHandle ch
