@@ -139,6 +139,7 @@ spec = do
       approvals <- newApprovalCache
       (_, caps) <- makeFakeCaps []
       (th, _)   <- fakeTwoFileTranscript
+      stopFanoutDoneRef <- newIORef False
       let sid = fromRight (error "unreachable: literal session id")
                   (mkSessionId "20260701-120000-002")
           env = mkSessionAgentEnv TurnEnv
@@ -161,6 +162,9 @@ spec = do
                   , teOnUserMessage = Nothing
                   , teChannel       = "cli"
                   , teOnStop        = Nothing
+                  , teStopFanoutDone = stopFanoutDoneRef
+                  , teOnToolCall    = Nothing
+                  , teOnTextDelta   = Nothing
                   , teAbortFlag     = testAbortFlag
                   , teToolTimeout   = defaultToolTimeoutConfig
                   }

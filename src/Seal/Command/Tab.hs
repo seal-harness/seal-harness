@@ -23,8 +23,10 @@ import Seal.Core.Types (mkSessionId, sessionIdText)
 import Seal.Gateway.Transcript (firstUserMessageSnippet)
 import Seal.Handles.Tab (mkTabIndex, TabIndex, TabKind (..), tabIndexToChar)
 import Seal.Routing.Route (terseSynopsis)
+import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs (TabsHandle, insertTabH, removeTabH, renameTabH, focusTabH, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..), tabCount)
+import Seal.Util.StrictIO (decodeFileStrict)
 
 -- | A hook invoked after a tab is successfully closed. The 'TabRef' is the
 -- closed tab's backing ref (e.g. @BoundSession sid@). Wiring sites build
@@ -87,10 +89,11 @@ tabParser paths h closeNotifier = hsubparser
                                  (progDesc "Rename a tab by index"))
   <> metavar "COMMAND"
 
--- | The /tab list subcommand. Resolves each tab's display name: the
--- user-set label (if any), or the first user message snippet (matching
--- the web frontend's 'sessionDisplayTitle' cascade) for session-backed
--- tabs with no label.
+-- | The /tab list subcommand. Resolves each tab's display name in priority
+-- order: the tab's user-set label, the session's user-set description
+-- (the web frontend's chat-header pencil), or the first user message
+-- snippet (matching the web frontend's 'sessionDisplayTitle' cascade) for
+-- session-backed tabs with no label or description.
 listCmd :: SealPaths -> TabsHandle -> CommandAction
 listCmd paths h = commandAction $ \caps -> do
   tl <- snapshotTabs h
@@ -100,8 +103,16 @@ listCmd paths h = commandAction $ \caps -> do
       names <- mapM (resolveTabName paths) (tlTabs tl)
       mapM_ (ccSend caps . uncurry renderTabLine) (zip names (tlTabs tl))
 
--- | Resolve a tab's display name. Returns 'Nothing' when no name is
--- available (no label, no transcript, or a harness tab with no label).
+-- | Resolve a tab's display name in priority order:
+--
+-- 1. The tab's user-set label ('tLabel').
+-- 2. The session's user-set description ('smDescription') — the web
+--    frontend's chat-header pencil.
+-- 3. The first user message snippet (for session-backed tabs with no
+--    label and no description).
+--
+-- Returns 'Nothing' when no name is available (no label, no description,
+-- no transcript, or a harness tab with no label).
 resolveTabName :: SealPaths -> Tab -> IO (Maybe Text)
 resolveTabName paths t
   | Just label <- tLabel t = pure (Just label)
@@ -110,7 +121,11 @@ resolveTabName paths t
       exists <- doesFileExist mp
       if not exists
         then pure Nothing
-        else firstUserMessageSnippet paths sid
+        else do
+          mMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+          case mMeta >>= smDescription of
+            Just desc -> pure (Just desc)
+            Nothing   -> firstUserMessageSnippet paths sid
   | otherwise = pure Nothing
 
 -- | The /tab new subcommand. (For 6b the kind is informational; a session
@@ -187,15 +202,16 @@ renameCmd h idx name = commandAction $ \caps -> do
         Left e  -> ccSend caps ("rename failed: " <> e)
         Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar i) <> " renamed to " <> name)
 
--- | One line per tab for /tab list. The display name (label or snippet) is
--- resolved by 'resolveTabName' and passed as 'mName'.
+-- | One line per tab for /tab list. The display name (label, session
+-- description, or snippet) is resolved by 'resolveTabName' and passed as
+-- 'mName'. The tab kind is intentionally not shown — its constructor
+-- names (e.g. @KindProvider@) carry no useful information for the user.
 renderTabLine :: Maybe Text -> Tab -> Text
 renderTabLine mName t =
-  T.singleton (tabIndexToChar (tIndex t)) <> "  " <> kindText (tKind t)
+  T.singleton (tabIndexToChar (tIndex t)) <> "  "
     <> maybe "" ("  " <>) mName
     <> "  " <> refText (tRef t)
   where
-    kindText = T.pack . show
     refText (BoundSession s)  = "session:" <> sessionIdText s
     refText (BoundHarness _)  = "harness:<id>"
 

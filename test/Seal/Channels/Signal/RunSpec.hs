@@ -132,7 +132,8 @@ spec = do
       sigLogger <- testSealLogger
       appEnv <- mkEnv sigLogger defaultConfig
       approvals <- newApprovalCache
-      let runOneTurn h ms body =
+      let runOneTurn h ms body = do
+            stopFanoutDoneRef <- newIORef False
             let handleCaps = def
                   { ccSend = chSend h
                   , ccPrompt = \_ -> pure ""
@@ -159,12 +160,14 @@ spec = do
                   , aeOnEntry = pure ()
                   , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+, aeStopFanoutDone = stopFanoutDoneRef
+                    , aeOnToolCall = Nothing, aeOnTextDelta = Nothing
                   , aeOnDemandSchemas = False
                   , aeLogPath = Nothing
                   , aeAbortFlag = testAbortFlag
                   , aeToolTimeout = defaultToolTimeoutConfig
                   }
-            in runApp appEnv (runTurn agentEnv body)
+            runApp appEnv (runTurn agentEnv body)
           plainHandler h mSrc body = case mSrc of
             Just ms -> runOneTurn h ms body
             Nothing -> pure ()

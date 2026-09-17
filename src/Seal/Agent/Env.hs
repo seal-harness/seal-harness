@@ -6,11 +6,13 @@ module Seal.Agent.Env
   , mkSessionAgentEnv
   ) where
 
+import Data.IORef (IORef)
 import Data.Text (Text)
 
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Core.MessageSource (MessageSource)
-import Seal.Core.Types (ModelId, SessionId)
+import Data.Aeson (Value)
+import Seal.Core.Types (ModelId, OpName, SessionId)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Transcript (TwoFileHandle (..))
 import Seal.ISA.Opcode (BackendExec, localBackend)
@@ -123,7 +125,7 @@ data AgentEnv = AgentEnv
     -- sidebar shows the session name immediately rather than after the
     -- first LLM response. 'Nothing' (the default) keeps the async
     -- 'tfwRecordAsync' write (no fsync latency at turn start).
-  , aeOnStop :: Maybe (Text -> IO ())
+  , aeOnStop     :: Maybe (Text -> IO ())
     -- ^ When 'Just fanout', the loop calls @fanout text@ with the final
     -- user-visible text at every stop branch (final answer, truncation
     -- give-up, max-turns stop, provider error). This is the chat-channel
@@ -133,6 +135,25 @@ data AgentEnv = AgentEnv
     -- the arrival channel (which 'ccSend' covers). 'Nothing' (the default
     -- for tests and the standalone CLI) means no fan-out; the arrival
     -- channel alone is notified via 'ccSend'.
+  , aeStopFanoutDone :: IORef Bool
+    -- ^ Flipped to 'True' by the loop's final-answer stop branch after
+    -- 'aeOnStop' delivers the final text, so the turn engine's bracket
+    -- cleanup skips 'fanoutLastReply' (which would re-send the identical
+    -- last-assistant text — the double-delivery bug). The error/abort/
+    -- max-turns stop branches do NOT set it: the engine's cleanup must
+    -- still deliver the partial/notice text on those paths.
+  , aeOnToolCall :: Maybe (OpName -> Value -> IO ())
+    -- ^ When 'Just hook', the loop calls @hook opName input@ before each
+    -- tool dispatch. Chat channels wire this to the 'StreamProgress' manager
+    -- so tool-call progress messages are sent/edited on the chat platform.
+    -- 'Nothing' (the default) means no tool-progress notification.
+  , aeOnTextDelta :: Maybe (Text -> IO ())
+    -- ^ When 'Just hook', the loop calls @hook delta@ for each text
+    -- delta from the provider stream. Chat channels wire this to the
+    -- 'StreamProgress' manager for progressive text edits. 'Nothing'
+    -- (the default) means per-delta sends go through 'ccSend' (the
+    -- existing CLI/web path) or are skipped (chat channels with
+    -- ccStreaming = False).
   , aeOnDemandSchemas :: Bool
     -- ^ When 'True', the loop emits stub @input_schema@s in the @tools@
     -- field (via 'Seal.ISA.Registry.registryToolDefs'') to save tokens,
@@ -175,6 +196,15 @@ data TurnEnv = TurnEnv
   , teOnUserMessage :: Maybe (IO ())
   , teChannel       :: Text
   , teOnStop        :: Maybe (Text -> IO ())
+  , teStopFanoutDone :: IORef Bool
+    -- ^ Set by the loop's final-answer stop branch AFTER 'teOnStop' fires,
+    -- so the turn engine's bracket cleanup skips the redundant
+    -- 'fanoutLastReply' re-send (double delivery to subscribed chat
+    -- channels). 'Nothing' is not possible here — the engine always
+    -- supplies the ref; direct 'TurnEnv' constructions in tests pass a
+    -- fresh ref.
+  , teOnToolCall    :: Maybe (OpName -> Value -> IO ())
+  , teOnTextDelta   :: Maybe (Text -> IO ())
   , teAbortFlag     :: AbortFlag
   , teToolTimeout   :: ToolTimeoutConfig
   }
@@ -206,6 +236,9 @@ mkSessionAgentEnv te = AgentEnv
   , aeOnEntry    = teOnEntry te
   , aeOnUserMessage = teOnUserMessage te
   , aeOnStop     = teOnStop te
+  , aeStopFanoutDone = teStopFanoutDone te
+  , aeOnToolCall = teOnToolCall te
+  , aeOnTextDelta = teOnTextDelta te
   , aeOnDemandSchemas = teOnDemand te
   , aeLogPath    = teLogPath te
   , aeAbortFlag  = teAbortFlag te

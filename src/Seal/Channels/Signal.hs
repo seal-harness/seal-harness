@@ -50,14 +50,17 @@ instance Channel SignalChannel where
   toHandle ch = ChannelHandle
     { chLabel       = "signal"
     , chSend         = sendChunked ch
+    , chSendWithId   = sendWithId ch
+    , chEditMessage  = Just (editMessage ch)
+    , chDeleteMessage = Just (deleteMessage ch)
     , chSendError    = \t -> sendChunked ch ("error: " <> t)
     , chSendChunk    = sendRaw ch
-    , chPrompt       = \_ -> pure (Left Deferred)   -- Signal can't answer inline
+    , chPrompt       = \_ -> pure (Left Deferred)
     , chPromptSecret = \_ -> pure (Left Deferred)
-    , chStreaming    = False  -- per-token messages flood the chat; send accumulated text once
-    , chReadSecret   = pure Nothing                  -- vault is reached via the vault handle
+    , chStreaming    = False
+    , chReadSecret   = pure Nothing
     , chReceive      = receiveFromInbox ch
-    , chLastChatId   = pure Nothing                  -- Signal addresses by user id, not chat id
+    , chLastChatId   = pure Nothing
     }
 
 -- | Run the reader thread with cleanup. Spawns a background thread that
@@ -159,6 +162,33 @@ sendRaw ch t = do
   case mSender of
     Nothing -> logIO (scLogger ch) WarningS "signal: dropping chunk — no last sender yet"
     Just uid -> stSend (scTransport ch) (userIdText uid) t
+
+-- | Send a message and return the platform timestamp. Used by the
+-- stream progress manager to create an editable message.
+sendWithId :: SignalChannel -> Text -> IO (Maybe Text)
+sendWithId ch t = do
+  mSender <- readIORef (scLastSender ch)
+  case mSender of
+    Nothing -> logIO (scLogger ch) WarningS "signal: dropping sendWithId — no last sender yet" >> pure Nothing
+    Just uid -> stSendWithId (scTransport ch) (userIdText uid) t
+
+-- | Edit a previously sent message: timestamp, new content. Returns
+-- 'True' on success. Sends a Signal protocol edit via @editTimestamp@.
+editMessage :: SignalChannel -> Text -> Text -> IO Bool
+editMessage ch ts content = do
+  mSender <- readIORef (scLastSender ch)
+  case mSender of
+    Nothing -> pure False
+    Just uid -> stEditMessage (scTransport ch) (userIdText uid) ts content
+
+-- | Delete a previously sent message by timestamp. Returns 'True' on
+-- success. Calls signal-cli's @remoteDelete@.
+deleteMessage :: SignalChannel -> Text -> IO Bool
+deleteMessage ch ts = do
+  mSender <- readIORef (scLastSender ch)
+  case mSender of
+    Nothing -> pure False
+    Just uid -> stDeleteMessage (scTransport ch) (userIdText uid) ts
 
 -- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:
 -- returns @(Nothing, "")@ when the inbox is empty AND the reader thread has
