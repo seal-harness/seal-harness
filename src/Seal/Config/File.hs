@@ -43,6 +43,9 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , ChatStreamingFileConfig (..)
+  , chatStreamingConfig
+  , chatStreamingConfigCodec
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -51,6 +54,7 @@ import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.HashMap.Strict qualified as HashMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Default (def)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -65,6 +69,7 @@ import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
+import Seal.Channels.StreamProgress (StreamProgressConfig (..))
 import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
 import Seal.Tools.Timeout
   ( ToolTimeoutConfig (..), defaultToolTimeoutConfig )
@@ -138,6 +143,9 @@ data RuntimeConfig = RuntimeConfig
     -- ^ Optional @[agent]@ section (static behavioral guidance blocks
     -- injected into the system prompt). Absent means all three blocks
     -- are injected (the defaults); individual flags disable each block.
+  , rcChatStreaming :: Maybe ChatStreamingFileConfig
+    -- ^ Optional @[chat_streaming]@ section (chat channel streaming +
+    -- tool-call progress). Absent means the feature is disabled.
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
@@ -267,6 +275,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcWorkdir          = Nothing
   , rcSkills           = Nothing
   , rcAgent            = Nothing
+  , rcChatStreaming    = Nothing
   , rcMaxTurns         = Nothing
   , rcToolTimeout      = Nothing
   }
@@ -393,6 +402,46 @@ toolTimeoutConfig cfg = case rcToolTimeout cfg of
     , ttcAbortPollMicros = fromMaybe (ttcAbortPollMicros defaultToolTimeoutConfig) (ttfcAbortPollMicros ttfc)
     }
 
+-- | The @[chat_streaming]@ section with all-optional fields at the TOML
+-- layer. The resolver ('chatStreamingConfig') fills absent fields from
+-- 'def'. Mirrors the @ToolTimeoutFileConfig@ pattern.
+data ChatStreamingFileConfig = ChatStreamingFileConfig
+  { csfcEnabled         :: Maybe Bool
+  , csfcToolProgress    :: Maybe Bool
+  , csfcTextStreaming   :: Maybe Bool
+  , csfcEditIntervalMs  :: Maybe Int
+  , csfcBufferThreshold :: Maybe Int
+  , csfcCursor          :: Maybe Text
+  } deriving stock (Eq, Show)
+
+-- | Resolve the effective 'StreamProgressConfig' from the optional
+-- @[chat_streaming]@ section. Absent = def (disabled). Present but partial
+-- = fields filled from def.
+chatStreamingConfig :: RuntimeConfig -> StreamProgressConfig
+chatStreamingConfig cfg = case rcChatStreaming cfg of
+  Nothing   -> def
+  Just csfc -> StreamProgressConfig
+    { spcEnabled         = fromMaybe (spcEnabled def)         (csfcEnabled csfc)
+    , spcToolProgress    = fromMaybe (spcToolProgress def)    (csfcToolProgress csfc)
+    , spcTextStreaming   = fromMaybe (spcTextStreaming def)   (csfcTextStreaming csfc)
+    , spcEditIntervalMs  = fromMaybe (spcEditIntervalMs def)  (csfcEditIntervalMs csfc)
+    , spcBufferThreshold = fromMaybe (spcBufferThreshold def) (csfcBufferThreshold csfc)
+    , spcCursor          = fromMaybe (spcCursor def)          (csfcCursor csfc)
+    }
+
+-- | Bidirectional tomland codec for the @[chat_streaming]@ section. Every
+-- field is optional at the TOML layer; a missing key decodes as Nothing
+-- and the resolver fills the default.
+chatStreamingConfigCodec :: Toml.TomlCodec ChatStreamingFileConfig
+chatStreamingConfigCodec = ChatStreamingFileConfig
+  <$> Toml.dioptional (Toml.bool "enabled")          .= csfcEnabled
+  <*> Toml.dioptional (Toml.bool "tool_progress")    .= csfcToolProgress
+  <*> Toml.dioptional (Toml.bool "text_streaming")   .= csfcTextStreaming
+  <*> Toml.dioptional (Toml.int  "edit_interval_ms") .= csfcEditIntervalMs
+  <*> Toml.dioptional (Toml.int  "buffer_threshold") .= csfcBufferThreshold
+  <*> Toml.dioptional (Toml.text "cursor")           .= csfcCursor
+
+
 -- ---------------------------------------------------------------------------
 -- Codec
 -- ---------------------------------------------------------------------------
@@ -417,6 +466,7 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table workdirConfigCodec "workdir") .= rcWorkdir
   <*> Toml.dioptional (Toml.table skillsConfigCodec "skills")   .= rcSkills
   <*> Toml.dioptional (Toml.table agentConfigCodec "agent")     .= rcAgent
+  <*> Toml.dioptional (Toml.table chatStreamingConfigCodec "chat_streaming") .= rcChatStreaming
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
   <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
 

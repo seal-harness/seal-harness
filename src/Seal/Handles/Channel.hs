@@ -37,6 +37,21 @@ data ChannelHandle = ChannelHandle
   , chSendChunk   :: Text -> IO ()
   -- ^ Emit one streaming chunk (for tool output / long replies). Channels
   -- that do not stream may batch and call 'chSend' once.
+  , chSendWithId  :: Text -> IO (Maybe Text)
+  -- ^ Send a message and return the platform message identifier (for
+  -- later editing via 'chEditMessage'). 'Nothing' if the send failed or
+  -- the platform doesn't support message ids. The identifier is opaque:
+  -- a Telegram @message_id@ string or a Signal @timestamp@ string.
+  -- The stream progress manager uses this to create the initial message
+  -- and then edit it as new content arrives.
+  , chEditMessage :: Maybe (Text -> Text -> IO Bool)
+  -- ^ Edit a previously sent message: message identifier, new content.
+  -- Returns 'True' on success, 'False' on failure. 'Nothing' if the
+  -- platform has no edit API. Best-effort: never throws. Used by the
+  -- stream progress manager for progressive text + tool-bubble edits.
+  , chDeleteMessage :: Maybe (Text -> IO Bool)
+  -- ^ Delete a previously sent message by identifier. 'Nothing' if
+  -- unsupported. Used for cursor cleanup on fallback. Best-effort.
   , chPrompt      :: Text -> IO (Either Deferral Text)
   -- ^ Visible prompt; returns 'Right' the typed line on interactive channels,
   -- 'Left Deferred' on channels that cannot answer inline (the caller must

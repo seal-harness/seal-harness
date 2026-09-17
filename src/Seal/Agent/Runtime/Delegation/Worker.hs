@@ -235,6 +235,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
     Right (prov, model) ->
       withTwoFileTranscript childDir $ \childTHandle -> do
         summaryRef <- newIORef (Nothing :: Maybe Text)
+        stopFanoutDoneRef <- newIORef False
         let capturingCaps = def
               { ccSend = \t -> atomicModifyIORef' summaryRef (const (Just t, ()))
               , ccStreaming    = False  -- children: capture final summary, no per-delta sends
@@ -270,6 +271,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
               , aeOnEntry    = dwdOnEntry deps
               , aeOnUserMessage = Nothing
               , aeOnStop     = childEnvOnStop
+              , aeStopFanoutDone = stopFanoutDoneRef
+              , aeOnToolCall = Nothing
+              , aeOnTextDelta = Nothing
               , aeOnDemandSchemas = dwdOnDemand deps
               , aeLogPath    = Nothing
               , aeAbortFlag  = childAbortFlag

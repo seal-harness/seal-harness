@@ -49,6 +49,7 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
     ref <- newIORef
              [ CompletionResponse [CbText "hello from model"] StopEnd (Usage 0 0) ]
     (h, _) <- fakeTwoFileTranscript
+    stopFanoutDoneRef <- newIORef False
     let agentEnv = AgentEnv
           { aeProvider = SomeProvider (ScriptProvider ref)
           , aeProviderLabel = "ollama"
@@ -69,6 +70,8 @@ spec = describe "Seal.Channel.Cli.handlePlain" $
           , aeOnEntry = pure ()
           , aeOnUserMessage = Nothing
                     , aeOnStop = Nothing
+, aeStopFanoutDone = stopFanoutDoneRef
+                    , aeOnToolCall = Nothing, aeOnTextDelta = Nothing
           , aeOnDemandSchemas = False
           , aeLogPath = Nothing
           , aeAbortFlag = testAbortFlag
