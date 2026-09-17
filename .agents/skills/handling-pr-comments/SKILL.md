@@ -265,6 +265,24 @@ This is intentional because [reason]. The [thing] is designed to [explanation].
 *(Response by Claude on behalf of @username)*
 ```
 
+## Mandatory Comment Handling Rules
+
+| Comment Type           | Action                     | DO NOT Skip                 |
+| ---------------------- | -------------------------- | --------------------------- |
+| Critical/Major         | Fix immediately            | Never                       |
+| High/Medium            | Fix before merge           | Never                       |
+| Minor                  | Fix                        | Never                       |
+| Trivial/Nitpick        | Fix these too              | These matter!               |
+| Out-of-scope           | Investigate thoroughly     | Often the BEST insights!    |
+| Human comments         | Always address             | Never                       |
+
+### Work Sizing Decision
+
+For EACH comment:
+
+- **< 1 day of work** -> Implement the fix in this PR
+- **> 1 day of work** OR architectural change -> Create a new GitHub issue, link it in your response
+
 ## Mandatory Pre-Completion Check
 
 **BLOCKING: You MUST run this script and show its output before declaring ANY PR ready:**
@@ -321,7 +339,54 @@ Before declaring PR comments handled:
 
 **DO NOT skip the "Outside diff range" check (Phase 2b) - this is the #2 cause of incomplete PR handling.**
 
-## Reference
+## Cross-Platform Compatibility
 
-For the complete detailed workflow with all edge cases and troubleshooting, see:
-the `/handle-pr-comments` command
+This skill is designed to work on both Windows (Git Bash) and Mac/Linux with automatic fallback logic.
+
+- **First choice**: Uses `jq` if available (more powerful, supports complex queries)
+- **Fallback**: Uses `gh api -q` (GitHub CLI's built-in jq subset) for simpler queries
+- No additional dependencies required beyond `gh` CLI (but `jq` is recommended for full functionality)
+
+## Rate Limit Considerations
+
+GitHub has separate rate limits for REST API and GraphQL API:
+
+- **REST API**: 5,000 requests/hour with PAT
+- **GraphQL API**: 5,000 points/hour with PAT (complex queries cost multiple points)
+
+This skill uses **REST API exclusively** to avoid GraphQL rate limit issues. If you encounter rate limits, check both:
+
+```bash
+gh api rate_limit -q '.rate'
+gh api graphql -f query='{ rateLimit { limit remaining resetAt } }' -q '.data.rateLimit'
+```
+
+## Critical Workflow Notes
+
+Comment IDs can change after you push commits. Always:
+
+1. Get initial comment IDs
+2. Make your fixes and commit
+3. **RE-FETCH comment IDs** before posting responses (comments may have been updated/replaced)
+4. Post responses to CURRENT comment IDs (not stale ones from before your commit)
+5. **WAIT for reviewer confirmation** — Do NOT resolve threads immediately after your reply
+6. Only resolve threads when: (a) reviewer confirms they're satisfied, OR (b) you're explicitly declining/ignoring the suggestion
+
+**Resolution Policy**:
+
+- **Wait for reviewer approval** before resolving addressed feedback
+- **Resolve immediately** only if declining a suggestion (explain why in your reply)
+- **Never auto-resolve** after posting a fix — let the reviewer verify
+
+## Complete PR Lifecycle Protocol
+
+A PR is **NOT complete** until ALL of the following are true:
+
+1. All CI checks pass
+2. **EVERY** code review comment has been addressed (including trivial/nitpicks)
+3. **EVERY** comment thread has received an individual response
+4. All threads are marked as resolved (after reviewer approval)
+5. Any work > 1 day has a GitHub issue created
+6. No pending reviewer comments awaiting response
+7. ALL tests pass, there are no pre-existing issues or flaky tests — fix the underlying issues, don't disable tests
+8. **No new reviews after last commit with actionable items**

@@ -459,3 +459,38 @@ fi
 If any output says "MISSING", go back and run the setup-mandatory-files.sh script or create the files manually. Do NOT declare success with missing files.
 
 When reporting available commands to the user, use `$name` skill invocation unless the active platform has its own confirmed command shims. Do NOT recommend commands that do not exist on that platform.
+
+---
+
+## Troubleshooting
+
+### Setup script not found
+
+If you see an error about the setup script:
+
+- Verify you're running this from your project root (where the instruction file exists)
+- Ensure the Seal Harness plugin is installed
+
+### Detection missed my framework
+
+If setup didn't detect your framework correctly:
+
+- Check that you have the appropriate marker files (e.g., `package.json` for Node.js, `pyproject.toml` for Python)
+- You can manually edit `docs/project-profile.json` after setup
+- Re-run `/setup` to reconfigure
+
+### Can't determine test runner
+
+If you have multiple test runners:
+
+- Setup will ask you to choose
+- You can always edit `.coverage-thresholds.json` afterward to change the command
+
+## Next Steps
+
+After setup completes:
+
+1. Read the project instructions file for platform-specific instructions
+2. Run `/prime` to load relevant knowledge before starting work
+3. Run `/start-task <description>` to begin tracked development work
+4. Run `/review-design` for architecture reviews of design documents
