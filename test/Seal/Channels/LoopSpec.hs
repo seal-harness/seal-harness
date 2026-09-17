@@ -807,7 +807,8 @@ mkLoopDeps cfgRoot = do
   tabsH <- newTabsHandle
   cursors <- newCursorStore
   logger <- testSealLogger
-  newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  newChannelDeps paths vaultRt fakeRepoRegistryHandle agentRegH pr backends Supervised Nothing
           harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
 
 -- | A recording CallDispatcher that captures (OpName, url) pairs and

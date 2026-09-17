@@ -3999,6 +3999,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
             , sdResolveProviderOverride = Nothing
             , sdMkWorkerStubDepth = 2
+            , sdAgentReg    = fakeAgentRegH
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -4019,6 +4020,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adPaths            = paths, adWsPort = 8081, adAbortReg = testAbortReg
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
+            , adAgentRegistry    = fakeAgentRegH
             }
           app = apiApp deps
       -- Persist the session so handleSend's loadSessionMeta finds it.
