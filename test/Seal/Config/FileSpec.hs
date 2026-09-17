@@ -21,6 +21,7 @@ import Seal.Config.File
   , updateRuntimeConfig, upsertProvider
   , defaultAutoloadSkill, resolvedAutoloadSkill, resolvedAvailableSkills
   , resolvedParallelToolGuidance, resolvedToolUseEnforcement, resolvedTaskCompletionGuidance
+  , resolvedCredentialToolGuidance
   , maxTurnsConfig )
 
 spec :: Spec
@@ -219,6 +220,7 @@ spec = describe "Seal.Config.File" $ do
       let allNothing = AgentConfig { acParallelToolGuidance = Nothing
                                     , acToolUseEnforcement = Nothing
                                     , acTaskCompletionGuidance = Nothing
+                                    , acCredentialToolGuidance = Nothing
                                     , acAvailableAgents = Nothing
                                     }
 
@@ -226,12 +228,14 @@ spec = describe "Seal.Config.File" $ do
         resolvedParallelToolGuidance defaultRuntimeConfig `shouldBe` True
         resolvedToolUseEnforcement defaultRuntimeConfig `shouldBe` True
         resolvedTaskCompletionGuidance defaultRuntimeConfig `shouldBe` True
+        resolvedCredentialToolGuidance defaultRuntimeConfig `shouldBe` True
 
       it "default to True when the keys are absent" $ do
         let cfg = defaultRuntimeConfig { rcAgent = Just allNothing }
         resolvedParallelToolGuidance cfg `shouldBe` True
         resolvedToolUseEnforcement cfg `shouldBe` True
         resolvedTaskCompletionGuidance cfg `shouldBe` True
+        resolvedCredentialToolGuidance cfg `shouldBe` True
 
       it "return False when a flag is explicitly False" $ do
         let cfg = defaultRuntimeConfig { rcAgent = Just allNothing { acParallelToolGuidance = Just False } }
@@ -240,6 +244,8 @@ spec = describe "Seal.Config.File" $ do
         resolvedToolUseEnforcement cfg2 `shouldBe` False
         let cfg3 = defaultRuntimeConfig { rcAgent = Just allNothing { acTaskCompletionGuidance = Just False } }
         resolvedTaskCompletionGuidance cfg3 `shouldBe` False
+        let cfg4 = defaultRuntimeConfig { rcAgent = Just allNothing { acCredentialToolGuidance = Just False } }
+        resolvedCredentialToolGuidance cfg4 `shouldBe` False
 
     it "round-trips defaultRuntimeConfig (all Nothing)" $
       withSystemTempDirectory "seal-config-test" $ \dir -> do

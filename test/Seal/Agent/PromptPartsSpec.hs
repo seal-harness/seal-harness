@@ -10,7 +10,7 @@ import Test.QuickCheck (Gen, chooseInt, elements, listOf, forAll, sized, vectorO
 
 import Seal.Agent.Def.Types
 import Seal.Agent.PromptParts
-  ( availableAgentsBlock, injectAvailableAgents, injectStaticGuidance
+  ( availableAgentsBlock, credentialToolGuidance, injectAvailableAgents, injectStaticGuidance
   , leafAgentNote, parallelToolGuidance, taskCompletionGuidance
   , toolUseEnforcement )
 import Seal.Core.Types (ModelId (..), mkSystemSessionId)
@@ -24,34 +24,44 @@ spec = describe "Seal.Agent.PromptParts" $ do
 staticGuidanceSpec :: Spec
 staticGuidanceSpec = describe "staticGuidanceBlock (via injectStaticGuidance)" $ do
   it "injects all three blocks when all are true" $ do
-    let mOut = injectStaticGuidance True True True (Just "BASE")
+    let mOut = injectStaticGuidance True True True True (Just "BASE")
     case mOut of
       Just out -> do
         T.isPrefixOf "BASE" out `shouldBe` True
         T.isInfixOf "Parallel tool calls" out `shouldBe` True
         T.isInfixOf "Tool use" out `shouldBe` True
         T.isInfixOf "Task completion" out `shouldBe` True
+        T.isInfixOf "Credential-bearing tools" out `shouldBe` True
       Nothing -> expectationFailure "expected a prompt"
 
   it "injects only the enabled block when one is true" $ do
-    let mOut = injectStaticGuidance True False False (Just "BASE")
+    let mOut = injectStaticGuidance True False False False (Just "BASE")
     case mOut of
       Just out -> do
         T.isInfixOf "Parallel tool calls" out `shouldBe` True
         T.isInfixOf "Tool use" out `shouldBe` False
         T.isInfixOf "Task completion" out `shouldBe` False
+        T.isInfixOf "Credential-bearing tools" out `shouldBe` False
       Nothing -> expectationFailure "expected a prompt"
 
   it "returns the prompt unchanged when no block is enabled" $
-    injectStaticGuidance False False False (Just "BASE") `shouldBe` Just "BASE"
+    injectStaticGuidance False False False False (Just "BASE") `shouldBe` Just "BASE"
 
   it "returns Nothing when no block is enabled and there was no prompt" $
-    injectStaticGuidance False False False Nothing `shouldBe` Nothing
+    injectStaticGuidance False False False False Nothing `shouldBe` Nothing
 
   it "makes the guidance the entire prompt when there was none" $ do
-    let mOut = injectStaticGuidance True False False Nothing
+    let mOut = injectStaticGuidance True False False False Nothing
     case mOut of
       Just out -> T.isPrefixOf "## Parallel tool calls" out `shouldBe` True
+      Nothing -> expectationFailure "expected a prompt"
+
+  it "injects the credential-tool block when only it is true" $ do
+    let mOut = injectStaticGuidance False False False True (Just "BASE")
+    case mOut of
+      Just out -> do
+        T.isInfixOf "Credential-bearing tools" out `shouldBe` True
+        T.isInfixOf "Parallel tool calls" out `shouldBe` False
       Nothing -> expectationFailure "expected a prompt"
 
   describe "block content" $ do
@@ -65,6 +75,11 @@ staticGuidanceSpec = describe "staticGuidanceBlock (via injectStaticGuidance)" $
     it "taskCompletionGuidance mentions stubs and fabrication" $ do
       T.isInfixOf "stub" taskCompletionGuidance `shouldBe` True
       T.isInfixOf "fabricate" taskCompletionGuidance `shouldBe` True
+
+    it "credentialToolGuidance mentions BIN_EXEC, gh, and SHELL_EXEC" $ do
+      T.isInfixOf "BIN_EXEC" credentialToolGuidance `shouldBe` True
+      T.isInfixOf "gh" credentialToolGuidance `shouldBe` True
+      T.isInfixOf "SHELL_EXEC" credentialToolGuidance `shouldBe` True
 
 -- ---------------------------------------------------------------------------
 -- W3 (issue #154): the <available_agents> catalog renderer

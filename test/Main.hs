@@ -26,6 +26,7 @@ import qualified Seal.Session.ExecCacheSpec
 import qualified Seal.Session.StoreSpec
 import qualified Seal.Session.LogSpec
 import qualified Seal.Session.LockSpec
+import qualified Seal.Session.LockFocusSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
@@ -93,6 +94,7 @@ import qualified Seal.Channels.StreamProgressSpec
 import qualified Seal.Channels.Signal.RunSpec
 import qualified Seal.Channels.Signal.TransportSpec
 import qualified Seal.Channels.Signal.TransportEditSpec
+import qualified Seal.Channels.Signal.TransportLockSpec
 import qualified Seal.Channels.TelegramSpec
 import qualified Seal.Channels.Telegram.ButtonsSpec
 import qualified Seal.Channels.Telegram.CommandsSpec
@@ -202,6 +204,7 @@ main = hspec $ do
   Seal.Session.StoreSpec.spec
   Seal.Session.LogSpec.spec
   Seal.Session.LockSpec.spec
+  Seal.Session.LockFocusSpec.spec
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
   Seal.Tools.Exec.UntrustedSpec.spec
@@ -273,6 +276,7 @@ main = hspec $ do
   Seal.Channels.Signal.EnvelopeSpec.spec
   Seal.Channels.Signal.RunSpec.spec
   Seal.Channels.Signal.TransportEditSpec.spec
+  Seal.Channels.Signal.TransportLockSpec.spec
   Seal.Channels.Signal.TransportSpec.spec
   Seal.Transcript.TypesSpec.spec
   Seal.Transcript.ConvSpec.spec

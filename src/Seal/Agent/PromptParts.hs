@@ -14,6 +14,7 @@ module Seal.Agent.PromptParts
   ( parallelToolGuidance
   , toolUseEnforcement
   , taskCompletionGuidance
+  , credentialToolGuidance
   , staticGuidanceBlock
   , injectStaticGuidance
   , availableAgentsBlock
@@ -60,16 +61,29 @@ taskCompletionGuidance =
   \permission denied), say so explicitly and ask for what you need — do \
   \not fabricate output to fill the gap."
 
+-- | Credential-bearing-tool guidance. Tells the model to use @BIN_EXEC@
+-- (not @SHELL_EXEC@) for @git@ and @gh@, because Seal Harness injects
+-- credentials from the vault only through the @BIN_EXEC@ path.
+credentialToolGuidance :: Text
+credentialToolGuidance =
+  "## Credential-bearing tools\n\n\
+ \Use `BIN_EXEC` (not `SHELL_EXEC`) for `git` and `gh` — Seal Harness \
+ \injects credentials from the vault only through `BIN_EXEC`. Running \
+ \`gh` via `SHELL_EXEC` gets no credential injection and will fail with \
+ \an opaque authentication error on push, PR creation, or any operation \
+ \that requires auth."
+
 -- | Render the enabled guidance blocks as a single section, joined with
 -- blank lines. Returns the empty 'Text' when no block is enabled (so the
 -- caller can skip emitting anything). Each enabled block is a
 -- @## header@ + body, so the whole section reads as a sequence of
 -- short guidance notes.
-staticGuidanceBlock :: Bool -> Bool -> Bool -> Text
-staticGuidanceBlock parallel toolUse taskCompletion =
+staticGuidanceBlock :: Bool -> Bool -> Bool -> Bool -> Text
+staticGuidanceBlock parallel toolUse taskCompletion credentialTool =
   let parts = [ parallelToolGuidance    | parallel ]
            <> [ toolUseEnforcement      | toolUse ]
            <> [ taskCompletionGuidance  | taskCompletion ]
+           <> [ credentialToolGuidance  | credentialTool ]
   in if null parts then "" else T.intercalate "\n\n" parts
 
 -- | Append the enabled static guidance blocks to the resolved system
@@ -82,10 +96,11 @@ injectStaticGuidance
   :: Bool    -- ^ parallel tool-call guidance
   -> Bool    -- ^ tool-use enforcement
   -> Bool    -- ^ task-completion guidance
+  -> Bool    -- ^ credential-bearing-tool guidance
   -> Maybe Text
   -> Maybe Text
-injectStaticGuidance parallel toolUse taskCompletion mPrompt =
-  let block = staticGuidanceBlock parallel toolUse taskCompletion
+injectStaticGuidance parallel toolUse taskCompletion credentialTool mPrompt =
+  let block = staticGuidanceBlock parallel toolUse taskCompletion credentialTool
   in if T.null block
        then mPrompt
        else Just (case mPrompt of
