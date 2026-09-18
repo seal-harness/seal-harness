@@ -144,6 +144,7 @@ import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
 import qualified Seal.SourceControl.RegistrySpec
 import qualified Seal.SourceControl.AgentRegistrySpec
+import qualified Seal.TestHelpers.SshAgentGuardSpec
 import qualified Seal.SourceControl.CloneSpec
 import qualified Seal.Phase2aSpec
 import qualified Seal.Phase2bSpec
@@ -323,6 +324,7 @@ main = withNoLeakedSshAgents $ hspec $ do
   Seal.SourceControl.RepoSpec.spec
   Seal.SourceControl.RegistrySpec.spec
   Seal.SourceControl.AgentRegistrySpec.spec
+  Seal.TestHelpers.SshAgentGuardSpec.spec
   Seal.SourceControl.CloneSpec.spec
   Seal.Phase2aSpec.spec
   Seal.Phase2bSpec.spec

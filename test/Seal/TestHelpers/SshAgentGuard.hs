@@ -27,6 +27,7 @@
 module Seal.TestHelpers.SshAgentGuard
   ( withNoLeakedSshAgents
   , sshAgentProcesses
+  , isLaunchdAgent
   , pidAlive
   , waitPidGone
   ) where
@@ -103,15 +104,16 @@ sshAgentProcesses = do
       (exe : _) -> takeFileName exe == "ssh-agent"
       _ -> False
 
--- | Is this the launchd-managed macOS user agent? Its plist
--- (@com.openssh.ssh-agent.plist@) runs exactly @["\/usr\/bin\/ssh-agent",
--- "-l"]@, so @ps@ shows @\<pid\> \/usr\/bin\/ssh-agent -l@. Match on the
--- executable basename + flag tail — never the absolute path, which
--- varies by platform — so a suite-spawned @ssh-agent -s@ is still
--- counted (its tail is @ssh-agent -s@).
+-- | Is this the launchd-managed macOS user agent? Takes the COMMAND FIELD
+-- from @ps@ with the leading PID REMOVED ('parseLine' strips it before
+-- calling) — i.e. @\/usr\/bin\/ssh-agent -l@ for the launchd form. The
+-- plist (@com.openssh.ssh-agent.plist@) runs exactly
+-- @["\/usr\/bin\/ssh-agent", "-l"]@. Match on the executable basename +
+-- flag — never the absolute path, which varies by platform — so a
+-- suite-spawned @ssh-agent -s@ is still counted (its flag is @-s@).
 isLaunchdAgent :: String -> Bool
 isLaunchdAgent cmd = case words cmd of
-  (_pid : exe : rest)
+  (exe : rest)
     | takeFileName exe == "ssh-agent"
     , rest == ["-l"]
     -> True
