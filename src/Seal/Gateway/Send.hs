@@ -53,7 +53,7 @@ import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..)
 import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
 import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
-   TurnOutcome (..), runSessionTurn)
+   TurnOutcome (..), runSessionTurn, sessionSkillBackend)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
@@ -447,8 +447,12 @@ runSlash deps meta fullLine = do
       -- rebuilt per-request by replacing the call/skill specs with
       -- per-request versions; the rest of the specs are reused as-is.
       perRequestCallDispatcher = webCallDispatcher deps td sid
-      perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
-        (skillCommandSpec (bSkills (sdBackends deps)) perRequestCallDispatcher)
+  -- Session-aware skill backend: includes workdir-discovered skills from
+  -- cloned repos (via the same cachedWorkdirScan the turn engine uses),
+  -- not just the base user + built-in skills.
+  sessionSkills <- sessionSkillBackend td sid
+  let perRequestRegistry = replaceCallSkillSpecs (sdRegistry deps)
+        (skillCommandSpec sessionSkills perRequestCallDispatcher)
         (callCommandSpec perRequestCallDispatcher)
         (stopCommandSpecForSession (sdAbortReg deps) sid
            (mkStopTranscriptWriter (sdPaths deps) (sdBroker deps)))

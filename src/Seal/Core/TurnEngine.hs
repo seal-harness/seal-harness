@@ -23,6 +23,7 @@ module Seal.Core.TurnEngine
   , callDispatcher
   , buildStartWiring
   , buildWorker
+  , sessionSkillBackend
   , loadChannelLabel
   , broadcastNewEntries
   , loadSessionMeta
@@ -797,6 +798,28 @@ loadChannelLabel :: SealPaths -> SessionId -> IO (Maybe Text)
 loadChannelLabel paths sid = do
   mMeta <- loadSessionMeta paths sid
   pure (smChannel <$> mMeta)
+
+-- | Build a session-aware 'SkillBackend' that includes workdir-discovered
+-- skills (from cloned repos) on top of the user store and built-ins. This
+-- is the same 'tripleUnionSkillBackend' that 'runTurnBody' and
+-- 'callDispatcher' wire into 'sessionBackends.bSkills', extracted so the
+-- @\/skill list@ slash command can share it without going through the full
+-- turn-engine path. Fail-soft: if the session exec or workdir scan fails,
+-- falls back to the base (user + built-in) backend.
+sessionSkillBackend :: TurnDeps -> SessionId -> IO Skill.SkillBackend
+sessionSkillBackend td sid = do
+  let paths = tdPaths td
+  eSecCfg <- loadSecurityConfig (securityFilePath paths)
+  cloneDeps <- mkCloneDepsTurn td
+  exec <- either (\_ _ _ _ -> pure (failClosedSessionExec cloneDeps))
+                 (\sc _sid _cd runner -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner)
+                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+  let wfs = seWorkdirFs exec
+      wsRoot = seWorkspaceRoot exec
+  metaEnv <- metaCacheEnvFor td paths eSecCfg
+  (_, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
+  workdirSkills <- Skill.staticSkillBackend workdirSkillsList
+  pure (Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td)))
 
 -- | The unified call dispatcher (design §5.3 — replaces @webCallDispatcher@,
 -- @channelCallDispatcher@, and the CLI's inline @callDispatcher@). Takes
