@@ -12,6 +12,14 @@
 -- sockets under the test runs' nix-shell TMPDIR, while the production
 -- registry file was untouched — the harness itself was not leaking.
 --
+-- The launchd-managed macOS user agent (@\/usr\/bin\/ssh-agent -l@, from
+-- @com.openssh.ssh-agent.plist@) is EXEMPT: it is OS infrastructure, not
+-- suite-owned. Launchd spawns it lazily the first time a subprocess
+-- connects to its socket-activated @SSH_AUTH_SOCK@ — e.g. a reachability
+-- probe that inherits the ambient environment mid-suite — so it can appear
+-- as a "new" process on macOS CI even though the suite neither started nor
+-- owns it. Killing the operator's ambient agent would be actively harmful.
+--
 -- The guard never trusts a kill command's exit code: liveness is
 -- determined by asking @ps@. Leaked agents are terminated with SIGTERM
 -- before the suite reports failure, so iterating on a fix does not
@@ -32,7 +40,7 @@ import Data.Set qualified as Set
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeFileName)
 import System.IO (hPutStrLn, stderr)
-import System.Posix.Signals (sigTERM, signalProcess)
+import System.Posix.Signals (sigKILL, sigTERM, signalProcess)
 import System.Process (proc, readCreateProcessWithExitCode)
 import Text.Read (readMaybe)
 
@@ -41,22 +49,35 @@ import Text.Read (readMaybe)
 -- left running) by the suite is terminated with SIGTERM and the suite
 -- FAILS with the leaked PIDs + command lines.
 --
--- The differential baseline means pre-existing agents (e.g. the ambient
--- macOS login agent) never trip the guard — only NEW processes count.
+-- The differential baseline means pre-existing agents never trip the
+-- guard — only NEW processes count, and launchd-managed agents (argv
+-- ending in @ssh-agent -l@) are exempt entirely (see module docs).
 withNoLeakedSshAgents :: IO () -> IO ()
 withNoLeakedSshAgents action = do
   before <- Set.fromList . map fst <$> sshAgentProcesses
   action `finally` do
     after <- sshAgentProcesses
-    let leaked = [ entry | entry@(pid, _) <- after, not (pid `Set.member` before) ]
+    let leaked =
+          [ entry
+          | entry@(pid, cmd) <- after
+          , not (pid `Set.member` before)
+          , not (isLaunchdAgent cmd)
+          ]
     unless (null leaked) $ do
       mapM_ terminate leaked
       hPutStrLn stderr (renderLeak leaked)
       exitFailure
   where
+    -- SIGTERM, then a bounded liveness-confirmed wait, then SIGKILL if
+    -- the process ignored SIGTERM (the "small delay" made robust: death
+    -- is verified by asking ps, never assumed from a kill's exit code).
     terminate (pid, _) = do
       _ <- try @IOError (signalProcess sigTERM (fromIntegral pid))
-      pure ()
+      gone <- waitPidGone pid
+      unless gone $ do
+        _ <- try @IOError (signalProcess sigKILL (fromIntegral pid))
+        _ <- waitPidGone pid
+        pure ()
 
 -- | Every running @ssh-agent@ process right now: @(pid, full command
 -- line)@. A process qualifies when the BASENAME of its executable is
@@ -81,6 +102,20 @@ sshAgentProcesses = do
     isAgentCmd cmd = case words cmd of
       (exe : _) -> takeFileName exe == "ssh-agent"
       _ -> False
+
+-- | Is this the launchd-managed macOS user agent? Its plist
+-- (@com.openssh.ssh-agent.plist@) runs exactly @["\/usr\/bin\/ssh-agent",
+-- "-l"]@, so @ps@ shows @\<pid\> \/usr\/bin\/ssh-agent -l@. Match on the
+-- executable basename + flag tail — never the absolute path, which
+-- varies by platform — so a suite-spawned @ssh-agent -s@ is still
+-- counted (its tail is @ssh-agent -s@).
+isLaunchdAgent :: String -> Bool
+isLaunchdAgent cmd = case words cmd of
+  (_pid : exe : rest)
+    | takeFileName exe == "ssh-agent"
+    , rest == ["-l"]
+    -> True
+  _ -> False
 
 -- | Is the PID still a live process? Asks @ps@ — never trusts a kill
 -- command's exit code (on macOS @ssh-agent -k@ without @SSH_AGENT_PID@
@@ -114,8 +149,9 @@ renderLeak leaked = unlines $
       <> " new ssh-agent process(es) were started by the test suite and are still running:"
   )
     : [ "  " <> show pid <> "  " <> cmd | (pid, cmd) <- leaked ]
-    <> [ "The leaked processes were terminated (SIGTERM)."
+    <> [ "The leaked processes were terminated (SIGTERM, escalating to SIGKILL)."
        , "The offending test must terminate its agent (SIGTERM on the parsed SSH_AGENT_PID)"
        , "and ASSERT the pid is gone (waitPidGone) — ssh-agent -k needs SSH_AUTH_SOCK and"
        , "SSH_AGENT_PID in the environment and silently no-ops without them (exit 0 on macOS)."
+       , "The launchd-managed macOS user agent (ssh-agent -l) is exempt — it is OS-owned."
        ]
