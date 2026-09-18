@@ -28,7 +28,6 @@ import Control.Exception (finally, try)
 import Control.Monad (unless)
 import Data.Char (isSpace)
 import Data.Maybe (mapMaybe)
-import Data.Set (Set)
 import Data.Set qualified as Set
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeFileName)
