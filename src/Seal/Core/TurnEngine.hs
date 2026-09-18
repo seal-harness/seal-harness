@@ -593,7 +593,9 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   -- cache's scan result (see above).
   let sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td))
       sessionBackends = (tdBaseBackends td)
-        { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td)) }
+        { bSkills = sessionSkills
+        , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
+        }
       agentDefBackend = bAgentDefs sessionBackends
       autoloadId = either (const Nothing) resolvedAutoloadSkill eCfg
       injectCatalog = either (const True) resolvedAvailableSkills eCfg
@@ -830,11 +832,15 @@ callDispatcher td caps sid channelLabel callOpName val = do
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
     metaEnv <- metaCacheEnvFor td paths eSecCfg
-    (workdirDefs, _) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
+    (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
     workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
+    workdirSkills <- Skill.staticSkillBackend workdirSkillsList
     let onDemand = either (const False) onDemandSchemas eCfg
+        sessionSkills = Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td))
         sessionBackends = (tdBaseBackends td)
-          { bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td)) }
+          { bSkills = sessionSkills
+          , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
+          }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
         isaReg = buildSessionRegistry (tdVault td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
@@ -882,8 +888,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 freshAgentDefs <- Def.staticAgentDefBackend freshDefs
                 let freshBackends = sessionBackends
                       { bAgentDefs = Def.unionAgentDefBackend freshAgentDefs (bAgentDefs (tdBaseBackends td)) }
-                    sessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
-                mCodegraphBody <- codegraphSkillBodyFor wfs sessionSkills
+                    freshSessionSkills = Skill.tripleUnionSkillBackend freshSkills (bSkills (tdBaseBackends td))
+                mCodegraphBody <- codegraphSkillBodyFor wfs freshSessionSkills
                 catalogAgentDefs' <- Def.adbList (bAgentDefs freshBackends)
                 let injectAgents = either (const True) resolvedAvailableAgents eCfg
                 mSystem <- resolveSystemPrompt
@@ -975,7 +981,7 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
     , dwdResolveProvider = resolveChild
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
-    , dwdChildRegistry = buildChildRegistryAdapter td eCfg operatorCeiling appEnv channel
+    , dwdChildRegistry = buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling appEnv channel
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1008,9 +1014,9 @@ buildWorker td sessionBackends parentSid appEnv eCfg operatorCeiling channel own
 -- 'AgentStartWiring' (child depth+1, child-rooted session mint, the SAME
 -- workdir⊕user union def backend, and a re-anchored worker-builder).
 buildChildRegistryAdapter
-  :: TurnDeps -> Either a RuntimeConfig -> Int -> Env -> Text
+  :: TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
+buildChildRegistryAdapter td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
@@ -1029,12 +1035,12 @@ buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
         , memoryWriteOp (bMemory (tdBaseBackends td)) childSid
         , memoryRecallOp defaultPageParams (bMemory (tdBaseBackends td))
         , memoryDeleteOp (bMemory (tdBaseBackends td))
-        , skillWriteOp (bSkills (tdBaseBackends td)) childSid
-        , skillLoadOp (bSkills (tdBaseBackends td))
-        , skillListOp (bSkills (tdBaseBackends td))
-        , skillDeleteOp (bSkills (tdBaseBackends td))
-        , agentDefReadOp (bAgentDefs (tdBaseBackends td))
-        , agentDefListOp (bAgentDefs (tdBaseBackends td))
+        , skillWriteOp (bSkills sessionBackends) childSid
+        , skillLoadOp (bSkills sessionBackends)
+        , skillListOp (bSkills sessionBackends)
+        , skillDeleteOp (bSkills sessionBackends)
+        , agentDefReadOp (bAgentDefs sessionBackends)
+        , agentDefListOp (bAgentDefs sessionBackends)
         , searchFilesOp childWsRoot securityPolicy operatorCeiling
         , fileReadOp childWsRoot operatorCeiling
         , fileWriteOp childWsRoot operatorCeiling
@@ -1075,7 +1081,7 @@ buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
       -- grandchildren get the stub).
       nestedAgentStartOp =
         agentStartOp AgentStartWiring
-          { aswDefBackend = bAgentDefs (tdBaseBackends td)
+          { aswDefBackend = bAgentDefs sessionBackends
           , aswRuntime = bRuntime (tdBaseBackends td)
           , aswConfig = do
               eCfg' <- loadRuntimeConfig (prConfigPath (tdProvider td))
@@ -1093,7 +1099,7 @@ buildChildRegistryAdapter td eCfg operatorCeiling adapterAppEnv adapterChannel
       nestedWorker = case tdMkWorker td of
         Just stub
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
-        _ -> buildWorker td (tdBaseBackends td) childSid adapterAppEnv
+        _ -> buildWorker td sessionBackends childSid adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at
