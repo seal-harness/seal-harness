@@ -22,7 +22,7 @@ import Test.Hspec
 
 import Seal.Agent.Def.Backend (noneBackend)
 import Seal.Command.Tab (noTabCloseNotifier)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..))
@@ -37,6 +37,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
@@ -79,6 +80,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     skills <- Skill.noneBackend
     activeRef <- newIORef fakeMeta
     uiState <- newUiStateHandle fakePaths
+    agentRegH <- mkAgentRegistryHandle (sshAgentsDir fakePaths)
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
           { adSessionRuntime = sr
@@ -94,6 +96,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry = fakeRepoRegistryHandle
+        , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths
@@ -136,6 +139,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     skills <- Skill.noneBackend
     activeRef <- newIORef fakeMeta
     uiState <- newUiStateHandle fakePaths
+    agentRegH <- mkAgentRegistryHandle (sshAgentsDir fakePaths)
     let sr = SessionRuntime { srPaths = fakePaths, srConfigPath = "", srActive = activeRef }
         deps = ApiDeps
           { adSessionRuntime = sr
@@ -151,6 +155,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adBroker = Nothing
         , adTabCloseNotifier = noTabCloseNotifier
         , adRepoRegistry = fakeRepoRegistryHandle
+        , adAgentRegistry = agentRegH
         , adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
     , adVault = fakeLockedVaultRuntime
     , adPaths = fakePaths

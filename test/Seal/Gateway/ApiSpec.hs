@@ -40,7 +40,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath)
+import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (ModelId (..), mkSystemSessionId, mkSessionId, ToolCallId (..), OpName (..))
@@ -75,6 +75,7 @@ import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..), mkRepoRegistryHandle)
+import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle)
 import Seal.Handles.Tab (TabKind (KindAi, KindHarness))
 import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 import Seal.Harness.Id (newHarnessId)
@@ -105,6 +106,9 @@ instance Provider ScriptProvider where
     case rs of
       (x:xs) -> writeIORef ref xs >> pure (Right x)
       [] -> pure (Right (CompletionResponse [CbText "done"] StopEnd (Usage 0 0)))
+fakeAgentRegH :: AgentRegistryHandle
+fakeAgentRegH = unsafePerformIO (mkAgentRegistryHandle (sshAgentsDir fakePaths))
+{-# NOINLINE fakeAgentRegH #-}
 
 fakePaths :: SealPaths
 fakePaths = SealPaths
@@ -270,6 +274,7 @@ mkDepsFor paths = do
     , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
     , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1630,7 +1635,8 @@ spec = describe "Seal.Gateway.API" $ do
                  , adDefaultAgent    = pure (Just "zoe")
                  , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1707,7 +1713,8 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1774,7 +1781,8 @@ spec = describe "Seal.Gateway.API" $ do
                 pure (case c of Right cfg -> rcDefaultAgent cfg; Left _ -> Nothing)
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1842,7 +1850,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1935,7 +1944,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -1993,7 +2003,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2050,7 +2061,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2088,7 +2100,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2178,7 +2191,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2234,7 +2248,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2289,7 +2304,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2338,7 +2354,8 @@ spec = describe "Seal.Gateway.API" $ do
           , adDefaultAgent    = pure Nothing
           , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2397,6 +2414,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adBroker          = Nothing
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2657,6 +2675,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adBroker          = Nothing
                 , adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = fakeAgentRegH
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
@@ -2845,6 +2864,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adBroker          = Nothing
                 , adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = fakeAgentRegH
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = vault
                 , adPaths            = paths
@@ -2918,6 +2938,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adBroker          = Nothing
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = corruptH
+        , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -2965,6 +2986,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adBroker          = Nothing
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = repoRegH
+        , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = vr
             , adPaths            = paths
@@ -3291,7 +3313,8 @@ spec = describe "Seal.Gateway.API" $ do
                 , adDefaultAgent    = pure Nothing
                 , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -3526,6 +3549,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+        , adAgentRegistry    = fakeAgentRegH
                 , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
@@ -3657,6 +3681,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSend = Nothing, adDefaultAgent = pure Nothing
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
+        , adAgentRegistry    = fakeAgentRegH
             , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsPort = 8081
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
@@ -3701,6 +3726,7 @@ spec = describe "Seal.Gateway.API" $ do
             { sdPaths      = fakePaths { spState = tmp }
             , sdVault      = error "sdVault: unused on the 404 path"
             , sdRepoReg    = fakeRepoRegistryHandle
+            , sdAgentReg   = fakeAgentRegH
             , sdProvider   = error "sdProvider: unused on the 404 path"
             , sdSession    = sr
             , sdBackends   = error "sdBackends: unused on the 404 path"
@@ -3740,7 +3766,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -3803,6 +3830,7 @@ spec = describe "Seal.Gateway.API" $ do
             { sdPaths      = paths
             , sdVault      = rt
             , sdRepoReg    = fakeRepoRegistryHandle
+            , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -3842,7 +3870,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -3970,6 +3999,7 @@ spec = describe "Seal.Gateway.API" $ do
             , sdMkWorker    = Nothing
             , sdResolveProviderOverride = Nothing
             , sdMkWorkerStubDepth = 2
+            , sdAgentReg    = fakeAgentRegH
             }
           deps = ApiDeps
             { adSessionRuntime  = sr
@@ -3990,6 +4020,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adPaths            = paths, adWsPort = 8081, adAbortReg = testAbortReg
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
+            , adAgentRegistry    = fakeAgentRegH
             }
           app = apiApp deps
       -- Persist the session so handleSend's loadSessionMeta finds it.
@@ -4058,6 +4089,7 @@ spec = describe "Seal.Gateway.API" $ do
             { sdPaths      = paths
             , sdVault      = rt
             , sdRepoReg    = fakeRepoRegistryHandle
+            , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -4097,7 +4129,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg
@@ -4180,6 +4213,7 @@ spec = describe "Seal.Gateway.API" $ do
             { sdPaths      = paths
             , sdVault      = rt
             , sdRepoReg    = fakeRepoRegistryHandle
+            , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
             , sdSession    = sr
             , sdBackends   = backends
@@ -4219,7 +4253,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adDefaultAgent    = pure Nothing
             , adBroker          = Nothing
     , adTabCloseNotifier = noTabCloseNotifier
-    , adRepoRegistry     = fakeRepoRegistryHandle
+        , adRepoRegistry     = fakeRepoRegistryHandle
+        , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime
                 , adPaths            = fakePaths, adWsPort = 8081, adAbortReg = testAbortReg

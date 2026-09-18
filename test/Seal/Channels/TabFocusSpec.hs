@@ -29,7 +29,7 @@ import Seal.Channels.Loop
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Config.File (defaultRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir)
+import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.MessageSource
   ( MessageSource, mkConversationId, mkMessageSource, mkUserId )
@@ -47,6 +47,7 @@ import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Session.Lock qualified as Lock
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (saveSessionMeta)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Tabs (insertTabH, newTabsHandle)
 import Seal.Tabs.Types (TabRef (BoundSession))
 import Seal.TestHelpers.FakeChannel
@@ -114,7 +115,8 @@ mkChannelDeps paths = do
   tabsH <- newTabsHandle
   cursors <- newCursorStore
   logger <- testSealLogger
-  newChannelDeps paths vaultRt fakeRepoRegistryHandle pr backends Supervised Nothing
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  newChannelDeps paths vaultRt fakeRepoRegistryHandle agentRegH pr backends Supervised Nothing
     harnessReg stubTmux (Just mgr) approvals (pure defaultRuntimeConfig) False tabsH logger cursors
 
 -- | A MessageSource for the test conversation.

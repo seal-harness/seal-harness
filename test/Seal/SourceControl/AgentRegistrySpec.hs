@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 -- | Tests for 'Seal.SourceControl.AgentRegistry' — the persistent
 -- ssh-agent registry (#88). Agents survive seal restarts; dead agents are
 -- GC'd at the next startup probe.
@@ -8,10 +9,13 @@ module Seal.SourceControl.AgentRegistrySpec (spec) where
 import Control.Exception (try)
 import Data.Map.Strict qualified as Map
 import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Signals (sigTERM, signalProcess)
 import System.Process (readCreateProcessWithExitCode, proc)
 import Test.Hspec
+import Text.Read (readMaybe)
 
 import Seal.SourceControl.AgentRegistry
+import Seal.TestHelpers.SshAgentGuard (waitPidGone)
 import Seal.Tools.Ssh.Agent (SshAgentEnv (..))
 
 spec :: Spec
@@ -64,10 +68,16 @@ spec = describe "Seal.SourceControl.AgentRegistry" $ do
           Just env -> do
             status <- probeAgent env
             status `shouldBe` AgentAlive
-            -- Clean up: kill the agent we started.
-            _ <- try @IOError (readCreateProcessWithExitCode
-                   (proc "ssh-agent" ["-k"]) "")
-            pure ()
+            -- Clean up: terminate the agent we started. ssh-agent -k
+            -- without SSH_AUTH_SOCK/SSH_AGENT_PID in the environment
+            -- silently no-ops on macOS (exits 0 doing nothing), so we
+            -- SIGTERM the parsed SSH_AGENT_PID directly and assert death.
+            case readMaybe @Int (saeAgentPid env) of
+              Nothing -> pure ()
+              Just pid -> do
+                _ <- try @IOError (signalProcess sigTERM (fromIntegral pid))
+                gone <- waitPidGone pid
+                gone `shouldBe` True
 
   describe "probeAndSweep" $ do
     it "removes dead entries and keeps alive ones" $
@@ -87,10 +97,14 @@ spec = describe "Seal.SourceControl.AgentRegistry" $ do
             -- The dead entry should be gone; the alive entry should remain.
             Map.lookup "dead-key" loaded `shouldBe` Nothing
             Map.lookup "alive-key" loaded `shouldBe` Just aliveEnv
-            -- Clean up.
-            _ <- try @IOError (readCreateProcessWithExitCode
-                   (proc "ssh-agent" ["-k"]) "")
-            pure ()
+            -- Clean up: SIGTERM the parsed SSH_AGENT_PID and assert
+            -- death (ssh-agent -k silently no-ops without the env vars).
+            case readMaybe @Int (saeAgentPid aliveEnv) of
+              Nothing -> pure ()
+              Just pid -> do
+                _ <- try @IOError (signalProcess sigTERM (fromIntegral pid))
+                gone <- waitPidGone pid
+                gone `shouldBe` True
 
   describe "reuse-on-restart (the core invariant)" $ do
     it "a second handle reuses the persisted agent (no new agent needed)" $

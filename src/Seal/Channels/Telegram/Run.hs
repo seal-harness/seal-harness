@@ -55,7 +55,7 @@ import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
 import Seal.Config.Paths
   ( SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths
-  , reposFilePath, securityFilePath, vaultFilePath )
+  , reposFilePath, securityFilePath, sshAgentsDir, vaultFilePath )
 import Seal.Core.AllowList (AllowList)
 import Seal.Core.MessageSource (UserId)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -67,6 +67,7 @@ import Seal.Channels.Cursor
 import Seal.Channels.Cursor.Persist (loadCursorMap)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.Security.Vault qualified as Vault
 import Seal.Session.Store (SessionRuntime (..), initSession)
 import Seal.Tabs (newTabsHandle)
@@ -159,11 +160,14 @@ runTelegramMain autonomy logger = do
         lc <- loadRuntimeConfig cfgPath
         pure (fromRight defaultRuntimeConfig lc)
   repoRegH <- mkRepoRegistryHandle (reposFilePath paths)
+  -- Shared ssh-agent registry (one per process — #88).
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep agentRegH
   cursorsH <- newPersistingCursorStore (cursorMapPath paths)
   mCursors <- loadCursorMap (cursorMapPath paths)
   for_ mCursors (seedCursorStore cursorsH)
   chanDeps <- newChannelDeps
-        paths rt repoRegH pr backends autonomy Nothing
+        paths rt repoRegH agentRegH pr backends autonomy Nothing
         harnessReg tmuxR (Just mgr) approvals loadCfg (isJust (untrustedExecConfigFromSecurity secCfg)) tabsH logger cursorsH
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt

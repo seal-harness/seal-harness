@@ -29,6 +29,7 @@ import Seal.Config.Paths
   , ensureSealDirs
   , getSealPaths
   , reposFilePath
+  , sshAgentsDir
   , securityFilePath
   , vaultFilePath
   )
@@ -37,6 +38,7 @@ import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
 import Seal.Security.Vault (VaultConfig (..), VaultHandle, openVault)
+import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (mkRepoRegistryHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), initSession)
@@ -144,6 +146,9 @@ runTui autonomy logger = do
   -- as the answer via deliverNextAnswerAny. 0 = block indefinitely.
   askReply <- newAskReplyStore 0
   repoReg <- mkRepoRegistryHandle (reposFilePath paths)
+  -- Shared ssh-agent registry (one per process — #88).
+  agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
+  arProbeAndSweep agentRegH
   abortReg <- newSessionAbortRegistry
   -- The /new command: mints a fresh session and inserts a new tab into
   -- the TabsHandle. The ndInsertTab closure reads the old sid from
@@ -190,4 +195,4 @@ runTui autonomy logger = do
         )
   harnessReg <- newHarnessRegistry
   tmuxRunner <- mkRealTmuxRunner
-  runCliTui paths rt repoReg pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg
+  runCliTui paths rt repoReg agentRegH pr sr registry emptyChain backends tabsH autonomy askReply logger harnessReg tmuxRunner abortReg
