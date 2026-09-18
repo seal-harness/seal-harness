@@ -21,6 +21,7 @@ module Seal.Gateway.Broadcast
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
+  , wrapCapsForAskStatus
   ) where
 
 import Data.Aeson (object, (.=))
@@ -32,6 +33,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 
+import Control.Exception (onException)
+import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (SessionId)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
@@ -113,3 +116,33 @@ broadcastSkillsChanged mBroker =
 broadcastReposChanged :: Maybe StreamBroker -> IO ()
 broadcastReposChanged mBroker =
   for_ mBroker SB.broadcastReposChanged
+
+-- | Wrap a 'ChannelCaps' so that 'ccPrompt' (the blocking ask primitive
+-- used by @ASK_HUMAN@ and the Untrusted confirmation gate) broadcasts a
+-- harness-status transition: @idle@ /before/ blocking on the human's
+-- reply, and @thinking@ /after/ the reply arrives (the turn is resuming).
+-- This ensures the web frontend shows the session as idle (not thinking)
+-- while it is waiting for human input — the core fix for the recurring
+-- \"stuck on thinking during ASK_HUMAN\" bug.
+--
+-- The wrapper uses 'onException' so the @thinking@ broadcast fires even
+-- if the inner 'ccPrompt' throws (e.g. a timeout/cancel from the
+-- AskReplyStore). Without this, an exception in the inner prompt would
+-- leave the session permanently idle in the broker's in-memory state
+-- (the turn's bracket cleanup would still broadcast idle at turn end,
+-- but the broker's thinking set would be inconsistent until then).
+--
+-- 'Nothing' broker (tests, standalone CLI) is a passthrough: the caps
+-- are returned unchanged except for the 'ccPrompt' wrapper which is a
+-- direct delegate (no broadcast, no overhead).
+--
+-- All other 'ChannelCaps' fields ('ccSend', 'ccShowHuman',
+-- 'ccPromptSecret', 'ccStreaming') are passed through unchanged.
+wrapCapsForAskStatus :: Maybe StreamBroker -> SessionId -> ChannelCaps -> ChannelCaps
+wrapCapsForAskStatus mBroker sid caps =
+  caps { ccPrompt = \prompt -> do
+           broadcastHarnessStatus mBroker sid "idle"
+           ans <- ccPrompt caps prompt `onException` broadcastHarnessStatus mBroker sid "thinking"
+           broadcastHarnessStatus mBroker sid "thinking"
+           pure ans
+       }
