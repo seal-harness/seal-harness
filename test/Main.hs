@@ -13,6 +13,7 @@ import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.BroadcastSpec
 import qualified Seal.Gateway.OpenApiSpec
 import qualified Seal.Gateway.PatIngestionSpec
 import qualified Seal.Gateway.SendSpec
@@ -191,6 +192,7 @@ main = withNoLeakedSshAgents $ hspec $ do
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
+  Seal.Gateway.BroadcastSpec.spec
   Seal.Gateway.PatIngestionSpec.spec
   Seal.Gateway.SendSpec.spec
   Seal.Gateway.ServerSpec.spec
