@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Seal.TestHelpers.SshAgentGuard (withNoLeakedSshAgents)
 import Test.Hspec
 
 import qualified Seal.Core.ChannelKindSpec
@@ -179,7 +180,7 @@ import qualified Seal.Tools.Exec.AbortSpec
 import qualified Seal.Tools.Exec.TimeoutSpec
 
 main :: IO ()
-main = hspec $ do
+main = withNoLeakedSshAgents $ hspec $ do
   Seal.Core.ChannelKindSpec.spec
   Seal.Core.MessageSourceSpec.spec
   Seal.Core.AllowListSpec.spec

@@ -487,6 +487,7 @@ test-suite tests
         Seal.TestHelpers.FakeChannel
         Seal.TestHelpers.FakeRegistry
         Seal.TestHelpers.FakeVault
+        Seal.TestHelpers.SshAgentGuard
         Seal.TestHelpers.FixtureRepo
         Seal.TestHelpers.FreePort
         Seal.TestHelpers.ScriptProvider
