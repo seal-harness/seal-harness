@@ -10,10 +10,10 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Test.Hspec
 
-import Data.Set qualified as Set
 import Data.Default (def)
 import Data.Aeson qualified as A
 import Data.Aeson.KeyMap qualified as KM
+import Data.Set qualified as Set
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Gateway.Broadcast (wrapCapsForAskStatus)
@@ -44,6 +44,23 @@ harnessStatusVal _ = Nothing
 hasStatus :: Text -> [BrokerEvent] -> Bool
 hasStatus expected = any (\e -> harnessStatusVal e == Just expected)
 
+-- | Poll an IORef until the predicate holds, or timeout after the given
+-- number of microseconds (retrying every 10ms). Avoids flaky timing-based
+-- assertions on loaded CI runners.
+waitFor :: Int -> IO a -> (a -> Bool) -> IO Bool
+waitFor totalWaitUs readAction predicate = go totalWaitUs
+  where
+    stepUs = 10000  -- 10ms per poll
+    go remaining
+      | remaining <= 0 = pure False
+      | otherwise = do
+          val <- readAction
+          if predicate val
+            then pure True
+            else do
+              threadDelay stepUs
+              go (remaining - stepUs)
+
 spec :: Spec
 spec = describe "Seal.Gateway.Broadcast" $ do
 
@@ -69,12 +86,10 @@ spec = describe "Seal.Gateway.Broadcast" $ do
       _ <- forkIO $ do
         ans <- ccPrompt wrapped (AskPrompt "what?" [])
         putMVar resultMVar ans
-      -- Give the thread a moment to call ccPrompt (which broadcasts idle
-      -- then blocks on the inner prompt)
-      threadDelay 100000  -- 100ms
-      -- The idle broadcast should have fired before the inner prompt blocked
-      eventsBefore <- readIORef ref
-      hasStatus "idle" eventsBefore `shouldBe` True
+      -- Wait for the idle broadcast to fire (poll up to 5 seconds to
+      -- avoid flakiness on loaded CI runners).
+      idleSeen <- waitFor 5000000 (readIORef ref) (hasStatus "idle")
+      idleSeen `shouldBe` True
       -- The session should NOT be in the thinking set (it's idle now)
       thinkingBefore <- thinkingSessions broker
       Set.notMember sid thinkingBefore `shouldBe` True
