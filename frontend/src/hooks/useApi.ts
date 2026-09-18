@@ -10,6 +10,7 @@ import type {
   RepoInfo,
   RepoInput,
   SessionInfo,
+  SkillsCatalog,
   SkillInfo,
   SkillInput,
   TabInfo,
@@ -1059,6 +1060,13 @@ export async function fetchSkills(): Promise<SkillInfo[] | null> {
 /** Fetch a single skill by id. Returns null on any failure (including 404). */
 export async function fetchSkill(id: string): Promise<SkillInfo | null> {
   return fetchJson<SkillInfo>(`/api/skills/${encodeURIComponent(id)}`)
+}
+
+/** Fetch the full (untruncated) available-skills catalog. Returns null on
+ *  any failure. Used by the RawJsonModal to load the complete catalog when
+ *  the truncated system-prompt text contains the truncation marker. */
+export async function fetchSkillsCatalog(): Promise<SkillsCatalog | null> {
+  return fetchJson<SkillsCatalog>('/api/skills/catalog')
 }
 
 /** Create a new skill. The body must include `id`, `description`, and
