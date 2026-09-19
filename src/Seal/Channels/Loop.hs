@@ -71,7 +71,7 @@ import System.FilePath ((</>))
 
 import Seal.Channel.Caps (AskPrompt (..), ChannelCaps (..))
 import Seal.Channels.StreamProgress
-  (newStreamProgress, onToolCall, segmentBreak)
+  (StreamProgress, newStreamProgress, onToolCall, segmentBreak)
 import Data.Default (def)
 import Seal.Channel.Cli
   ( Backends (..), resolveSessionProvider )
@@ -253,15 +253,18 @@ mkChannelTurnDeps deps = TurnDeps
 --   the first-message snippet. Runs for both auto-tab and /bg paths.
 -- * @taStartWiring@ — the engine-owned 'TurnEngine.buildStartWiring' (W4
 --   collapsed the per-surface builders into this single one).
-mkChannelTurnAdapter :: ChannelDeps -> TurnDeps -> ChannelHandle -> ChannelCaps -> TurnAdapter
-mkChannelTurnAdapter deps td h caps = TurnAdapter
+mkChannelTurnAdapter
+  :: ChannelDeps -> TurnDeps -> ChannelHandle -> ChannelCaps
+  -> IORef (Maybe StreamProgress)
+  -> TurnAdapter
+mkChannelTurnAdapter deps td h caps spRef = TurnAdapter
   { taCaps          = caps
   , taPreTurn       = \sid _meta t -> do
       _ <- replySubscribe (cdReplies deps) h sid
       replyFanoutMessage (cdReplies deps) sid (chLabel h) t
   , taChannelLabel  = smChannel
   , taOnStop        = Just . replyFanout (cdReplies deps)
-  , taOnToolCall    = Just (toolCallHook deps h (cdReplies deps) (chLabel h))
+  , taOnToolCall    = Just (toolCallHook deps h (cdReplies deps) (chLabel h) spRef)
   , taOnTextDelta   = Nothing
   , taOnUserMessage = \meta -> if shouldAutoTab meta
                                  then Nothing
@@ -271,13 +274,17 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
       TurnEngine.buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling (smChannel meta)
   }
 
--- | The per-turn tool-call hook. Creates a fresh 'StreamProgress' from the
--- current config, then calls 'segmentBreak' (finalize any in-progress text)
--- followed by 'onToolCall' (send/edit the tool-progress bubble). The
--- 'StreamProgress' is created per call because the config may change
--- between turns. When streaming is disabled, 'newStreamProgress' still
--- creates the state but 'onToolCall' and 'segmentBreak' are no-ops (they
--- check 'spcEnabled' internally).
+-- | The per-turn tool-call hook. Lazily creates a 'StreamProgress' on the
+-- first tool call of the turn, then reuses it for all subsequent calls so
+-- the tool-progress bubble is edited (not re-sent). The 'StreamProgress'
+-- lives in the 'IORef' supplied by 'mkChannelTurnAdapter', which is
+-- per-turn (the adapter is created fresh for each turn in
+-- 'runTurnOnSession').
+--
+-- Calls 'segmentBreak' (finalize any in-progress text) followed by
+-- 'onToolCall' (send/edit the tool-progress bubble). When streaming is
+-- disabled, 'newStreamProgress' still creates the state but 'onToolCall'
+-- and 'segmentBreak' are no-ops (they check 'spcEnabled' internally).
 --
 -- The hook checks 'replyIsSubscribed' before sending: if the channel has
 -- run @/tab focus@ to switch to a different session mid-turn, the handle
@@ -286,15 +293,22 @@ mkChannelTurnAdapter deps td h caps = TurnAdapter
 -- tab it's currently focused on. IO.
 toolCallHook
   :: ChannelDeps -> ChannelHandle -> ReplyRegistry -> Text
+  -> IORef (Maybe StreamProgress)
   -> SessionId -> OpName -> Value -> IO ()
-toolCallHook deps h replies label sid opName input = do
+toolCallHook deps h replies label spRef sid opName input = do
   -- Only send tool progress if this channel is still subscribed to the
   -- session (i.e. the user hasn't /tab focus'd away to a different session).
   subscribed <- replyIsSubscribed replies label sid
   when subscribed $ do
     cfg <- cdConfig deps
     let spCfg = chatStreamingConfig cfg
-    sp <- newStreamProgress spCfg h secretOpcodes
+    mSp <- readIORef spRef
+    sp <- case mSp of
+      Just existing -> pure existing
+      Nothing -> do
+        sp' <- newStreamProgress spCfg h secretOpcodes
+        writeIORef spRef (Just sp')
+        pure sp'
     segmentBreak sp
     onToolCall sp opName (TE.decodeUtf8 (BL.toStrict (A.encode input)))
 
@@ -940,7 +954,8 @@ runTurnOnSession deps h askReply mkCaps askSid meta mSrc t = do
       handleCaps = case mkCaps of
         Nothing  -> mkHandleCaps h askReply askSid
         Just f   -> f h askReply askSid
-      adapter = mkChannelTurnAdapter deps td h handleCaps
+  spRef <- newIORef Nothing
+  let adapter = mkChannelTurnAdapter deps td h handleCaps spRef
   _ <- runSessionTurn td adapter meta mSrc t
   pure ()
 

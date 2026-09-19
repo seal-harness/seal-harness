@@ -2,6 +2,7 @@
 module Seal.Channels.StreamProgressSpec (spec) where
 
 import Data.Default (Default (..))
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -13,6 +14,9 @@ import Test.QuickCheck (Gen, elements, forAll, listOf1, (===))
 
 import Seal.Channels.StreamProgress
   ( StreamProgressConfig (..)
+  , newStreamProgress
+  , onToolCall
+  , segmentBreak
   , opEmoji
   , resolveStreamProgressConfig
   , formatToolLine
@@ -21,6 +25,7 @@ import Seal.Channels.StreamProgress
   , stripCursor
   )
 import Seal.Core.Types (OpName (..))
+import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
 
 spec :: Spec
 spec = do
@@ -137,6 +142,105 @@ spec = do
     prop "stripCursor . addCursor == id" $
       forAll genText $ \t ->
         stripCursor cfg (addCursor cfg t) === t
+
+  -- The core regression test: multiple tool calls within a single turn
+  -- must edit the same message, not send a new message for each call.
+  -- This is the notification-spam bug: each tool call produced a separate
+  -- chat message, flooding the channel. The fix: the StreamProgress
+  -- persists across tool calls within a turn so spToolMsgId is reused.
+  describe "onToolCall message reuse" $ do
+    let cfg = def { spcEnabled = True, spcToolProgress = True }
+
+    it "sends one message then edits it for subsequent tool calls" $ do
+      (h, getSendWithIds, getEdits) <- mockEditChannel
+      sp <- newStreamProgress cfg h Set.empty
+      onToolCall sp (OpName "SHELL_EXEC") "ls"
+      onToolCall sp (OpName "FILE_READ") "README.md"
+      onToolCall sp (OpName "FILE_WRITE") "test.hs"
+
+      sends <- getSendWithIds
+      edits <- getEdits
+      length sends `shouldBe` 1
+      length edits `shouldBe` 2
+
+    it "accumulates tool lines in the edited message" $ do
+      (h, _getSendWithIds, getEdits) <- mockEditChannel
+      sp <- newStreamProgress cfg h Set.empty
+      onToolCall sp (OpName "SHELL_EXEC") "ls"
+      onToolCall sp (OpName "FILE_READ") "README.md"
+
+      edits <- getEdits
+      case edits of
+        [] -> expectationFailure "expected at least one edit"
+        (_, content) : _ -> do
+          T.isInfixOf "SHELL_EXEC" content `shouldBe` True
+          T.isInfixOf "FILE_READ" content `shouldBe` True
+
+    it "does not reset tool message id on segmentBreak" $ do
+      -- segmentBreak finalizes the text bubble (if any) but must NOT
+      -- reset the tool-progress bubble state. The tool bubble persists
+      -- across the entire turn so all tool calls edit the same message.
+      (h, getSendWithIds, _getEdits) <- mockEditChannel
+      sp <- newStreamProgress cfg h Set.empty
+      onToolCall sp (OpName "SHELL_EXEC") "ls"
+      segmentBreak sp
+      onToolCall sp (OpName "FILE_READ") "README.md"
+
+      sends <- getSendWithIds
+      -- First call sends, second call edits (segmentBreak did not reset)
+      length sends `shouldBe` 1
+
+  describe "onToolCall when disabled" $ do
+    it "is a no-op when spcEnabled is False" $ do
+      (h, getSendWithIds, _getEdits) <- mockEditChannel
+      let cfg' = def { spcEnabled = False }
+      sp <- newStreamProgress cfg' h Set.empty
+      onToolCall sp (OpName "SHELL_EXEC") "ls"
+      sends <- getSendWithIds
+      sends `shouldBe` []
+
+    it "is a no-op when spcToolProgress is False" $ do
+      (h, getSendWithIds, _getEdits) <- mockEditChannel
+      let cfg' = def { spcEnabled = True, spcToolProgress = False }
+      sp <- newStreamProgress cfg' h Set.empty
+      onToolCall sp (OpName "SHELL_EXEC") "ls"
+      sends <- getSendWithIds
+      sends `shouldBe` []
+
+-- | A mock channel handle that records sendWithId and editMessage calls.
+-- Returns unique ids for each sendWithId so edits can reference them.
+-- The edit function always succeeds (returns True).
+mockEditChannel :: IO (ChannelHandle, IO [Text], IO [(Text, Text)])
+mockEditChannel = do
+  sendIdRef <- newIORef (0 :: Int)
+  sendCapRef <- newIORef [] :: IO (IORef [Text])
+  editCapRef <- newIORef [] :: IO (IORef [(Text, Text)])
+  let h = ChannelHandle
+        { chLabel       = "mock"
+        , chSend        = \_ -> pure ()
+        , chSendError   = \_ -> pure ()
+        , chSendChunk   = \_ -> pure ()
+        , chSendWithId  = \_content -> do
+            n <- readIORef sendIdRef
+            let n' = n + 1
+            writeIORef sendIdRef n'
+            let id' = T.pack (show n')
+            modifyIORef' sendCapRef (id' :)
+            pure (Just id')
+        , chEditMessage = Just $ \msgId content -> do
+            modifyIORef' editCapRef ((msgId, content) :)
+            pure True
+        , chDeleteMessage = Just $ \_ -> pure True
+        , chPrompt      = \_ -> pure (Left Deferred)
+        , chPromptSecret = \_ -> pure (Left Deferred)
+        , chStreaming   = False
+        , chReadSecret  = pure Nothing
+        , chReceive     = pure (Nothing, "")
+        , chLastChatId  = pure Nothing
+        }
+      getSendWithIds = reverse <$> readIORef sendCapRef
+      getEdits = reverse <$> readIORef editCapRef
+  pure (h, getSendWithIds, getEdits)
 
 genText :: Gen Text
 genText = T.pack <$> listOf1 (elements ['a'..'z'])

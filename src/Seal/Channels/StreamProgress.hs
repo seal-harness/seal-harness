@@ -211,6 +211,11 @@ finalizeText sp finalText =
 -- | Signal a segment break: the current text message is finalized (edit
 -- without cursor) and the state is reset so the next text delta starts a
 -- new message below any tool-progress messages. IO.
+--
+-- The tool-progress bubble state ('spToolMsgId', 'spToolLines') is
+-- intentionally NOT reset: the tool bubble persists across the entire
+-- turn so all tool calls edit the same message, avoiding notification
+-- spam (one message per tool call).
 segmentBreak :: StreamProgress -> IO ()
 segmentBreak sp =
   when (spcTextStreaming cfg && spcEnabled cfg) $ do
@@ -221,8 +226,6 @@ segmentBreak sp =
       _                 -> pure ()
     writeIORef (spTextMsgId sp) Nothing
     writeIORef (spAccumulated sp) ""
-    writeIORef (spToolMsgId sp) Nothing
-    writeIORef (spToolLines sp) []
   where cfg = spConfig sp
 
 -- | Edit a message via 'chEditMessage'. Returns 'True' on success,
