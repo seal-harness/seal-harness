@@ -127,6 +127,7 @@ import qualified Seal.Routing.RouteSpec
 import qualified Seal.Memory.TypesSpec
 import qualified Seal.Memory.BackendSpec
 import qualified Seal.Memory.PathSpec
+import qualified Seal.Memory.StoreSpec
 import qualified Seal.Skills.TypesSpec
 import qualified Seal.Skills.BackendSpec
 import qualified Seal.Skills.BackendNoDirectFsFailSpec
@@ -308,6 +309,7 @@ main = withNoLeakedSshAgents $ hspec $ do
   Seal.Memory.TypesSpec.spec
   Seal.Memory.BackendSpec.spec
   Seal.Memory.PathSpec.spec
+  Seal.Memory.StoreSpec.spec
   Seal.Skills.TypesSpec.spec
   Seal.Skills.BackendSpec.spec
   Seal.Skills.PromptSpec.spec
