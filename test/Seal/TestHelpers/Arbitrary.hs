@@ -10,6 +10,7 @@ module Seal.TestHelpers.Arbitrary () where
 
 import Data.Aeson (Value (..))
 import Data.Either (fromRight)
+import Data.List (intercalate)
 import Data.Set qualified as Set
 import Data.Text (Text, pack)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
@@ -23,6 +24,7 @@ import Seal.Providers.Class
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))
 import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId)
+import Seal.Memory.Path (MemoryPath (..), mkMemoryPath)
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), mkAgentDefId)
 import Seal.Security.Policy (AllowList (..))
@@ -133,6 +135,20 @@ instance Arbitrary MemoryEntry where
     <*> arbitrary
     <*> arbitrary
     <*> genSessionId
+
+-- | A 'MemoryPath' generator producing valid hierarchical paths (1-3
+-- segments, each [A-Za-z0-9_-]+, non-empty, no leading dot).
+instance Arbitrary MemoryPath where
+  arbitrary = do
+    n  <- chooseInt (1, 3)
+    segs <- vectorOf n genPathSegment
+    let pathText = pack (intercalate "/" segs)
+    pure (fromRight (MemoryPath "x") (mkMemoryPath pathText))
+    where
+      genPathSegment = do
+        c  <- elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'])
+        cs <- listOf (elements (['a'..'z'] <> ['A'..'Z'] <> ['0'..'9'] <> "_-"))
+        pure (c : cs)
 
 -- | A 'SkillId' generator producing valid ids ([A-Za-z0-9_\/-]+, non-empty,
 -- no leading dot, no double\/trailing slash). May include a single forward
