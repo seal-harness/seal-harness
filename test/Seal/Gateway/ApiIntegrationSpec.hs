@@ -20,6 +20,9 @@ module Seal.Gateway.ApiIntegrationSpec (spec) where
 import Control.Exception (bracket)
 import Control.Monad (unless)
 import Data.Aeson (object, (.=))
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.IORef (readIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -44,6 +47,7 @@ spec :: Spec
 spec = do
   deployKeySpec
   patSetupRepoSpec
+  workdirSkillListSpec
 
 -- | The original deploy-key suite: clone + push through the gateway API in
 -- both modes.
@@ -285,4 +289,31 @@ ghShimScript expectedToken = T.unlines
   , "# gh repo clone <url> <dest> [-- --depth 1] — $4 is <dest>."
   , "mkdir -p \"$4/.git/objects\" || exit 1"
   , "echo \"Cloning into '$4'...\""
-  ]
+  ]-- Regression test: /skill list via the gateway API must include
+-- workdir-discovered skills from cloned repos. The bug was that the
+-- /skill list slash command used the base backends (user + built-in
+-- only), not the session-aware triple-union backend that includes
+-- workdir skills. This test creates a repo with .agents/skills/bar
+-- in the session workdir, sends /skill list, and asserts proj/foo/bar
+-- appears in the response.
+workdirSkillListSpec :: Spec
+workdirSkillListSpec = describe "Seal.Gateway.ApiIntegration (/skill list with workdir skills)" $ do
+  runApiTestLocal Nothing defaultApiTestOptions $ \env -> do
+    sid <- callApiNewTab env "ollama" "llama3.2"
+    let paths = atePaths env
+        workdir = spCache paths </> "workdirs" </> T.unpack sid
+        skillDir = workdir </> "foo" </> ".agents" </> "skills" </> "bar"
+    createDirectoryIfMissing True skillDir
+    writeFile (skillDir </> "SKILL.md")
+      "---\nname: bar\ndescription: A repo-local skill.\n---\nDo bar things.\n"
+    body <- sendMsgToSession env sid "/skill list"
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> do
+        case KeyMap.lookup (Key.fromText "response") o of
+          Just (A.String resp) ->
+            T.isInfixOf "proj/foo/bar" resp `shouldBe` True
+          Just other ->
+            expectationFailure ("expected response string, got: " <> show other)
+          Nothing ->
+            expectationFailure "expected 'response' field in /skill list output"
+      _ -> expectationFailure "expected JSON object"

@@ -88,7 +88,7 @@ spec = describe "Seal.Skills.Backend" $ do
         sbCreate backend ((mkSkill "z" "b") { skId = case mkSkillId "zeta" of Right i -> i; Left _ -> sampleSkillId })
         sbCreate backend ((mkSkill "a" "b") { skId = case mkSkillId "alpha" of Right i -> i; Left _ -> sampleSkillId })
         skills <- sbList backend
-        map (skillIdText . skId) skills `shouldBe` ["alpha", "zeta"]
+        map (skillIdText . skId) skills `shouldBe` ["user/alpha", "user/zeta"]
 
   describe "markdownSkillBackend grouped layout" $ do
     it "writes a grouped skill under <root>/<group>/<id>.md and reads it back" $
@@ -124,12 +124,12 @@ spec = describe "Seal.Skills.Backend" $ do
         sbCreate backend (mkG "beta"  "b" "ops")
         sbCreate backend (mkG "gamma" "g" "core")
         skills <- sbList backend
-        map (skillIdText . skId) skills `shouldBe` ["core/alpha", "core/gamma", "ops/beta"]
+        map (skillIdText . skId) skills `shouldBe` ["user/core/alpha", "user/core/gamma", "user/ops/beta"]
         let byId = [ (skillIdText (skId s), skGroup s) | s <- skills ]
         byId `shouldBe`
-          [ ("core/alpha", Just "core")
-          , ("core/gamma", Just "core")
-          , ("ops/beta", Just "ops")
+          [ ("user/core/alpha", Just "core")
+          , ("user/core/gamma", Just "core")
+          , ("user/ops/beta", Just "ops")
           ]
 
     it "stamps group from the directory when the frontmatter omitted it" $
@@ -154,7 +154,7 @@ spec = describe "Seal.Skills.Backend" $ do
         createDirectoryIfMissing True (skillsDir </> "core")
         TIO.writeFile (skillsDir </> "core" </> "dropped.md") raw
         skills <- sbList backend
-        case [ s | s <- skills, skillIdText (skId s) == "core/dropped" ] of
+        case [ s | s <- skills, skillIdText (skId s) == "user/core/dropped" ] of
           [s] -> skGroup s `shouldBe` Just "core"
           _   -> expectationFailure "hand-dropped grouped skill not listed"
 
@@ -207,7 +207,7 @@ spec = describe "Seal.Skills.Backend" $ do
           (agentSkillMd "pdf-processing" "Extract PDF text." "Do the thing.")
         backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
         skills <- sbList backend
-        case [ s | s <- skills, skillIdText (skId s) == "pdf-processing" ] of
+        case [ s | s <- skills, skillIdText (skId s) == "user/pdf-processing" ] of
           [s] -> do
             skDescription s `shouldBe` "Extract PDF text."
             skBody s `shouldBe` "Do the thing."
@@ -224,7 +224,7 @@ spec = describe "Seal.Skills.Backend" $ do
           (agentSkillMd "my-skill" "A grouped agent skill." "Body here.")
         backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
         skills <- sbList backend
-        case [ s | s <- skills, skillIdText (skId s) == "core/my-skill" ] of
+        case [ s | s <- skills, skillIdText (skId s) == "user/core/my-skill" ] of
           [s] -> do
             skDescription s `shouldBe` "A grouped agent skill."
             skBody s `shouldBe` "Body here."
@@ -280,8 +280,8 @@ spec = describe "Seal.Skills.Backend" $ do
         backend <- markdownSkillBackend skillsDir (openConfigRepo cfgRoot)
         skills <- sbList backend
         let ids = map (skillIdText . skId) skills
-        "native-flat" `elem` ids `shouldBe` True
-        "agent-dir"   `elem` ids `shouldBe` True
+        "user/native-flat" `elem` ids `shouldBe` True
+        "user/agent-dir"   `elem` ids `shouldBe` True
 
   describe "markdownSkillBackend group-scoping (duplicate ids across groups)" $ do
     it "lists both skills when two groups have a skill with the same bare id" $
@@ -298,8 +298,8 @@ spec = describe "Seal.Skills.Backend" $ do
         sbCreate backend (mkG "greet" "design greeting" "design")
         skills <- sbList backend
         let ids = map (skillIdText . skId) skills
-        ids `shouldContain` ["core/greet"]
-        ids `shouldContain` ["design/greet"]
+        ids `shouldContain` ["user/core/greet"]
+        ids `shouldContain` ["user/design/greet"]
         length skills `shouldBe` 2
 
     it "sbRead with a fully-qualified id returns the correct skill" $
@@ -314,11 +314,11 @@ spec = describe "Seal.Skills.Backend" $ do
               }
         sbCreate backend (mkG "greet" "core greeting" "core")
         sbCreate backend (mkG "greet" "design greeting" "design")
-        mCore <- sbRead backend (case mkSkillId "core/greet" of Right i -> i; Left _ -> sampleSkillId)
+        mCore <- sbRead backend (case mkSkillId "user/core/greet" of Right i -> i; Left _ -> sampleSkillId)
         case mCore of
           Just s -> skDescription s `shouldBe` "core greeting"
           Nothing -> expectationFailure "core/greet not found"
-        mDesign <- sbRead backend (case mkSkillId "design/greet" of Right i -> i; Left _ -> sampleSkillId)
+        mDesign <- sbRead backend (case mkSkillId "user/design/greet" of Right i -> i; Left _ -> sampleSkillId)
         case mDesign of
           Just s -> skDescription s `shouldBe` "design greeting"
           Nothing -> expectationFailure "design/greet not found"
@@ -368,7 +368,7 @@ spec = describe "Seal.Skills.Backend" $ do
       sbCreate backend (mkS "design" "design greeting")
       skills <- sbList backend
       length skills `shouldBe` 2
-      mCore <- sbRead backend (case mkSkillId "core/greet" of Right i -> i; Left _ -> sampleSkillId)
+      mCore <- sbRead backend (case mkSkillId "user/core/greet" of Right i -> i; Left _ -> sampleSkillId)
       case mCore of
         Just s -> skDescription s `shouldBe` "core greeting"
         Nothing -> expectationFailure "core/greet not found in noneBackend"
