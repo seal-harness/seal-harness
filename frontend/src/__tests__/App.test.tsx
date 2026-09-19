@@ -674,3 +674,119 @@ describe('App — tab close preserves the focused session', () => {
     expect(document.querySelector('.editable-title-text')?.textContent).toBe('Tab B')
   })
 })
+// ── Slash bubble inline ordering ────────────────────────────────────────
+// Slash-command output bubbles are transient (never persisted to the
+// transcript). They must appear at the position the command occupied in
+// the conversation flow — not pinned to the bottom and not reordered when
+// new entries arrive. When a slash command runs between two transcript
+// entries, its bubble must appear between them, not after the later one.
+
+describe('App — slash bubble inline ordering', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/')
+  })
+
+  it('slash bubble appears between earlier and later transcript entries, not pinned to the bottom', async () => {
+    // The slash bubble captures the transcript-messages length when the
+    // command response arrives (insertAt). The first entry ("first message")
+    // is already in the transcript, so insertAt = 1. When the second entry
+    // ("after slash") arrives later, the bubble stays at position 1 —
+    // between the two transcript entries.
+    let transcript = [
+      makeEntry({ id: 'e1', timestamp: '2024-06-01T12:00:00Z',
+        payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'first message' }] }] }) }),
+    ]
+    let sendCallCount = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      fetchCalls.push({ url, init })
+      const method = init?.method ?? 'GET'
+      if (url === '/api/agents') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers') return new globalThis.Response(JSON.stringify([{ name: 'anthropic', isDefault: true, defaultModel: 'claude-sonnet-4-20250514' }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/providers/anthropic/models') return new globalThis.Response(JSON.stringify([{ name: 'claude-sonnet-4-20250514', contextWindow: 200000 }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/sessions' && method === 'GET')
+        return new globalThis.Response(JSON.stringify([makeSession({ id: 'sess-slash', description: 'Slash Sess' })]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/sessions/archived') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/tabs') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/harnesses' || url === '/api/harnesses/discover') return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (url === '/api/sessions/sess-slash/transcript' && method === 'GET') {
+        // Return the current transcript state (grows as sends produce entries).
+        return new globalThis.Response(JSON.stringify(transcript), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/sessions/sess-slash/send' && method === 'POST') {
+        sendCallCount++
+        if (sendCallCount === 1) {
+          // First send: slash command → kind: 'slash' response.
+          return new globalThis.Response(JSON.stringify({ response: 'Available skills: ...', kind: 'slash' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        // Second send: regular message → kind: 'assistant'.
+        // Append a second user entry to the transcript.
+        transcript = [...transcript, makeEntry({ id: 'e2', timestamp: '2024-06-01T12:00:05Z',
+          payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'after slash' }] }] }) })]
+        return new globalThis.Response(JSON.stringify({ response: 'ok', kind: 'assistant' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/questions')) return new globalThis.Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new globalThis.Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    render(<App />)
+    // Select the session.
+    const row = await screen.findByText('Slash Sess')
+    fireEvent.click(row)
+    // Wait for the initial transcript entry to render.
+    await screen.findByText('first message')
+
+    // Send a slash command.
+    let textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: '/skill list' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.some((c) => c.url === '/api/sessions/sess-slash/send')).toBe(true)
+    })
+    // The slash bubble should appear with the command output text.
+    await waitFor(() => {
+      expect(screen.getByTestId('slash-bubble')).toBeTruthy()
+    })
+    expect(screen.getByText('Available skills: ...')).toBeTruthy()
+
+    // Now send a regular message ("after slash").
+    // Wait for the textarea to be available again (slash commands clear
+    // the pending state, so the input is immediately usable).
+    await waitFor(() => { expect(screen.getByPlaceholderText(/Message/)).not.toBeDisabled() })
+    textarea = screen.getByPlaceholderText(/Message/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: 'after slash' } })
+    fireEvent.click(screen.getByText('Send').closest('button')!)
+    await waitFor(() => {
+      expect(fetchCalls.filter((c) => c.url === '/api/sessions/sess-slash/send').length).toBe(2)
+    })
+    // Wait for the transcript re-fetch to deliver the second entry and
+    // clear the optimistic pending message. After the send completes,
+    // refresh() triggers a transcript re-fetch which returns the updated
+    // transcript (with e2). The pending message clears once entries.length
+    // grows beyond entryCountAtSend. Wait for the typing indicator (from
+    // the pending-thinking row) to disappear — that signals the pending
+    // state has cleared and the transcript-derived rows are the only ones
+    // left.
+    await waitFor(() => {
+      expect(document.querySelector('.typing-dot')).toBeFalsy()
+    })
+    await waitFor(() => {
+      expect(screen.getByText('after slash')).toBeTruthy()
+    })
+
+    // CRITICAL ASSERTION: The slash bubble must appear BEFORE "after slash"
+    // in the DOM order — not pinned to the bottom and not reordered to the
+    // top. The bubble was inserted at the position the command occupied
+    // (after "first message", before "after slash") and must stay there.
+    const slashBubble = screen.getByTestId('slash-bubble')
+    const afterSlashRow = screen.getByText('after slash').closest('.message-group')
+    expect(slashBubble).toBeTruthy()
+    expect(afterSlashRow).toBeTruthy()
+    // Compare DOM position: the slash bubble must come BEFORE "after slash"
+    // in document order. `afterSlashRow.compareDocumentPosition(slashBubble)`
+    // returns DOCUMENT_POSITION_PRECEDING (2) when slashBubble precedes
+    // afterSlashRow — that is the correct (fixed) behavior. With the bug,
+    // slashBubble follows afterSlashRow, which sets FOLLOWING (4) instead.
+    const rel = afterSlashRow!.compareDocumentPosition(slashBubble)
+    // slashBubble should PRECEDE afterSlashRow.
+    expect(rel & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+  })
+})
