@@ -437,7 +437,8 @@ export interface Message {
   rawJson?: string         // full transcript-entry payload (pretty-printed when JSON)
   /** Marks a TRANSIENT slash-command output bubble (kind:"slash" send
    *  response). These rows are NOT persisted — they never enter the
-   *  transcript and vanish on reload. Rendered in a muted "command output"
-   *  style with a "command output — not saved" label. */
+  *  transcript and vanish on reload. Rendered in a muted "command output"
+  *  style with a "command output — not saved" label. Interleaved into the
+  *  message list by timestamp so they appear in chronological position. */
   slashBubble?: boolean
 }
