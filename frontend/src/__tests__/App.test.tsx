@@ -674,36 +674,26 @@ describe('App — tab close preserves the focused session', () => {
     expect(document.querySelector('.editable-title-text')?.textContent).toBe('Tab B')
   })
 })
-
 // ── Slash bubble inline ordering ────────────────────────────────────────
 // Slash-command output bubbles are transient (never persisted to the
-// transcript). They must appear in CHRONOLOGICAL position among the
-// transcript messages — not pinned to the bottom of the session for the
-// rest of the session. When a slash command runs between two transcript
+// transcript). They must appear at the position the command occupied in
+// the conversation flow — not pinned to the bottom and not reordered when
+// new entries arrive. When a slash command runs between two transcript
 // entries, its bubble must appear between them, not after the later one.
 
 describe('App — slash bubble inline ordering', () => {
   beforeEach(() => {
     window.history.replaceState(null, '', '/')
-    vi.useFakeTimers({ shouldAdvanceTime: true })
-  })
-  afterEach(() => {
-    vi.useRealTimers()
   })
 
   it('slash bubble appears between earlier and later transcript entries, not pinned to the bottom', async () => {
-    // Use controlled timestamps so the three events are clearly ordered:
-    //   T0: first transcript entry ("first message")
-    //   T1: slash command response arrives → slash bubble timestamp
-    //   T2: second transcript entry ("after slash")
-    // The slash bubble must appear between T0 and T2 in the rendered list.
-    const T0 = '2024-06-01T12:00:00Z'
-    const T2 = '2024-06-01T12:00:05Z'
-    // Set the clock to T1 (between T0 and T2) so the slash bubble's
-    // `new Date().toISOString()` captures T1.
-    vi.setSystemTime(new Date('2024-06-01T12:00:02Z'))
+    // The slash bubble captures the transcript-messages length when the
+    // command response arrives (insertAt). The first entry ("first message")
+    // is already in the transcript, so insertAt = 1. When the second entry
+    // ("after slash") arrives later, the bubble stays at position 1 —
+    // between the two transcript entries.
     let transcript = [
-      makeEntry({ id: 'e1', timestamp: T0,
+      makeEntry({ id: 'e1', timestamp: '2024-06-01T12:00:00Z',
         payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'first message' }] }] }) }),
     ]
     let sendCallCount = 0
@@ -730,7 +720,7 @@ describe('App — slash bubble inline ordering', () => {
         }
         // Second send: regular message → kind: 'assistant'.
         // Append a second user entry to the transcript.
-        transcript = [...transcript, makeEntry({ id: 'e2', timestamp: T2,
+        transcript = [...transcript, makeEntry({ id: 'e2', timestamp: '2024-06-01T12:00:05Z',
           payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'after slash' }] }] }) })]
         return new globalThis.Response(JSON.stringify({ response: 'ok', kind: 'assistant' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
@@ -783,7 +773,9 @@ describe('App — slash bubble inline ordering', () => {
     })
 
     // CRITICAL ASSERTION: The slash bubble must appear BEFORE "after slash"
-    // in the DOM order — not pinned to the bottom.
+    // in the DOM order — not pinned to the bottom and not reordered to the
+    // top. The bubble was inserted at the position the command occupied
+    // (after "first message", before "after slash") and must stay there.
     const slashBubble = screen.getByTestId('slash-bubble')
     const afterSlashRow = screen.getByText('after slash').closest('.message-group')
     expect(slashBubble).toBeTruthy()

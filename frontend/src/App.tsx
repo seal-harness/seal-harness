@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
-import { ChatArea, transcriptToMessages, computeTokensUsed, formatTimestamp } from './components/ChatArea'
+import { ChatArea, transcriptToMessages, computeTokensUsed } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
@@ -147,14 +147,16 @@ function deriveAgent(
 
 /** A transient slash-command output bubble. `kind:"slash"` send responses
  *  add NO transcript entry, so each bubble is held in App state (keyed + ordered
- *  by its send `seq`) and interleaved into the rendered messages by
- *  timestamp so they appear in chronological position — not pinned to the
- *  bottom. These never persist — they vanish on reload or session switch. */
+ *  by its send `seq`) and spliced into the rendered messages at the
+ *  position the command occupied in the conversation flow (captured as the
+ *  transcript length when the response arrived). This keeps each bubble
+ *  in its original position — no reordering when new entries arrive.
+ *  These never persist — they vanish on reload or session switch. */
 interface SlashBubble {
   id: string
   text: string
-  at: number
-  ts: string  // ISO timestamp captured when the command response arrived
+  at: number       // send seq (ordering among multiple slash bubbles)
+  insertAt: number // transcript-messages length when the response arrived
 }
 
 // ── App ──────────────────────────────────────────────────────────────────
@@ -517,9 +519,16 @@ export default function App() {
   // SPA navigates to it so the new session becomes the focused one. Any
   // other kind falls through to the transcript-driven clear path. Returns
   // true when the caller must NOT keep a pending spinner.
+  // Ref that mirrors the current transcript-messages count so
+  // `handleSendResult` can capture the insert position for a slash bubble
+  // without adding `transcriptMessages` to its dependency array (which
+  // would recreate the callback on every transcript change and risk stale
+  // closures in `handleSend`).
+  const transcriptMsgCountRef = useRef(0)
+
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
     if (res && res.kind === 'slash') {
-      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, ts: new Date().toISOString() }])
+      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
       setPendingMessage(null)
       setPendingMessageModel(null)
       // /new swaps the backend's active session; navigate the SPA to it so
@@ -535,6 +544,9 @@ export default function App() {
   }, [syncPath])
 
   const transcriptMessages = useMemo(() => transcriptToMessages(entries), [entries])
+  // Keep the ref in sync so handleSendResult can read the current count
+  // without depending on transcriptMessages in its callback deps.
+  transcriptMsgCountRef.current = transcriptMessages.length
 
   // The most-recent `_te_model` column in the loaded transcript — the
   // default for the per-session model dropdown.
@@ -585,41 +597,33 @@ export default function App() {
 
   const messages = useMemo(() => {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z'
-    // Transient slash-command output rows. Each bubble carries the ISO
-    // timestamp captured when the command response arrived, formatted the
-    // same way as transcript-entry timestamps. The bubbles are merged into
-    // the transcript messages by timestamp so they appear in chronological
-    // position — not pinned to the bottom of the session.
-    const slashRows: Message[] = [...slashBubbles]
-      .sort((a, b) => a.at - b.at)
-      .map((sb) => ({
+    // Transient slash-command output rows. Each bubble carries the
+    // transcript-messages count at the time the command response arrived
+    // (`insertAt`). Bubbles are spliced into the transcript message list at
+    // that position so they stay where the command appeared in the
+    // conversation flow — no reordering when new entries arrive later.
+    const sortedBubbles = [...slashBubbles].sort((a, b) => a.at - b.at)
+    // Splice each slash bubble into the transcript messages at its captured
+    // insert position. Bubbles are sorted by send seq, so when multiple
+    // bubbles share the same insertAt they appear in send order. The splice
+    // offset accumulates because each inserted bubble shifts subsequent
+    // positions by 1. insertAt values beyond the current transcript length
+    // (e.g. the transcript shrank due to session switch race) clamp to the
+    // end so the bubble is always visible.
+    const merged: Message[] = [...transcriptMessages]
+    let offset = 0
+    for (const sb of sortedBubbles) {
+      const idx = Math.min(sb.insertAt + offset, merged.length)
+      merged.splice(idx, 0, {
         id: sb.id,
         agentName: 'Command output',
         agentStatus: 'idle' as const,
-        timestamp: formatTimestamp(sb.ts),
+        timestamp: now,
         blocks: [{ id: sb.id + '-text', text: sb.text }],
         slashBubble: true,
-      }))
-    // Merge slash rows into transcript messages by timestamp. Both arrays
-    // are sorted ascending; a standard merge keeps the result sorted.
-    // Slash bubbles that share a timestamp with a transcript entry are
-    // placed AFTER the transcript entry (stable: the transcript entry was
-    // already on disk when the slash command ran).
-    const merged: Message[] = []
-    let ti = 0, si = 0
-    while (ti < transcriptMessages.length && si < slashRows.length) {
-      const tm = transcriptMessages[ti]!
-      const sm = slashRows[si]!
-      if (sm.timestamp.localeCompare(tm.timestamp) < 0) {
-        merged.push(sm)
-        si++
-      } else {
-        merged.push(tm)
-        ti++
-      }
+      })
+      offset++
     }
-    while (ti < transcriptMessages.length) merged.push(transcriptMessages[ti++]!)
-    while (si < slashRows.length) merged.push(slashRows[si++]!)
 
     if (pendingMessage) {
       return [
