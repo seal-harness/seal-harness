@@ -2,6 +2,7 @@
 module Seal.RepoDiscoverySpec (spec) where
 
 import Control.Exception (SomeException, catch)
+import Control.Monad.IO.Class (liftIO)
 import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing, mapMaybe)
@@ -22,7 +23,7 @@ import Seal.Skills.Types (Skill (..), mkSkillId, skillIdText)
 import Data.Time (UTCTime (..))
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
-import Seal.Core.Types (mkSystemSessionId, mkSessionId)
+import Seal.Core.Types (mkSystemSessionId, mkSessionId, OpName (..))
 import Seal.Agent.Def.Backend
   ( AgentDefBackend (..)
   , workdirAgentDefBackend
@@ -48,9 +49,23 @@ import Seal.Tools.Exec.WorkdirFs
   )
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
-import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIO)
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIO, mkRemoteUntrustedIOStub)
 import Seal.TestHelpers.FixtureRepo (stubCloneDeps)
 import Seal.Util.StrictIO (decodeFileStrict)
+
+import Data.Aeson (Value, object)
+import Seal.ISA.Dispatch (DispatchError, dispatch)
+import Seal.ISA.Opcode (OpResult (..), localBackend)
+import Seal.Handles.Transcript (fakeTwoFileTranscript)
+import Seal.ISA.Ops.Skills (skillListOp)
+import Seal.ISA.Registry qualified as Registry
+import Seal.Providers.Class (ToolResultPart (..))
+import Seal.Tools.Exec.Abort (newAbortFlag)
+import Seal.Tools.Timeout (defaultToolTimeoutConfig)
+import Seal.Types.App (runApp)
+import Seal.Types.Config (defaultConfig)
+import Seal.Logging.Logger (testSealLogger)
+import Seal.Types.Env (mkEnv)
 
 aTime :: UTCTime
 aTime = UTCTime (fromGregorian 2026 8 17) (secondsToDiffTime (13 * 3600 + 14 * 60 + 4))
@@ -98,12 +113,12 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A repo-local skill."
           skBody s `shouldBe` "Do repo things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
-      case mkSkillId "my-repo--my-skill" of
+      case mkSkillId "proj/my-repo/my-skill" of
         Right sid -> do
           mSkill <- sbRead backend sid
           mSkill `shouldSatisfy` isJust
@@ -122,10 +137,10 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A .agents/skills skill."
           skBody s `shouldBe` "Do .agents things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
       cleanup tmp
 
@@ -155,10 +170,10 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A stub skill."
           skBody s `shouldBe` "Do stub things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
 
     it "rejects a symlinked SKILL.md escaping the workspace (stub-remote containment)" $ do
@@ -181,8 +196,8 @@ spec = do
       skills <- sbList backend
       let ids = map (skillIdText . skId) skills
       -- The good skill is discovered; the leaking 'leak' skill is rejected.
-      ids `shouldContain` ["my-repo--good-skill"]
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldContain` ["proj/my-repo/good-skill"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- No skill body contains the escaped secret.
       let bodies = map skBody skills
       bodies `shouldNotSatisfy` any ("PRIVATE" `T.isInfixOf`)
@@ -213,9 +228,63 @@ spec = do
           skills <- sbList unioned
           length skills `shouldBe` 4
           let ids = map (skillIdText . skId) skills
-          ids `shouldContain` ["my-repo--shared-skill"]
+          ids `shouldContain` ["proj/my-repo/shared-skill"]
           ids `shouldContain` ["shared-skill"]
         Left _ -> expectationFailure "invalid skill id"
+      cleanup tmp
+
+  -- Regression test: SKILL_LIST must include workdir-discovered skills.
+  -- The bug was that sessionBackends in runTurnBody/callDispatcher only
+  -- updated bAgentDefs, leaving bSkills as the base (user+built-in) backend
+  -- — so SKILL_LIST (which reads bSkills) missed workdir skills even though
+  -- the <available_skills> prompt catalog (which uses a separate
+  -- sessionSkills value) included them. This test verifies that
+  -- skillListOp, when backed by the triple-union backend (the fix), returns
+  -- workdir skills; and that it does NOT when backed by the user-only
+  -- backend (the bug pattern).
+  describe "SKILL_LIST with workdir skills (regression: bSkills wiring)" $ do
+    let setupRepo tmp = do
+          createDirectoryIfMissing True (tmp </> "my-repo" </> ".agents" </> "skills" </> "repo-skill")
+          writeFile (tmp </> "my-repo" </> ".agents" </> "skills" </> "repo-skill" </> "SKILL.md")
+            "---\nname: repo-skill\ndescription: A repo-local skill.\n---\nDo repo things.\n"
+    it "SKILL_LIST returns workdir skills when bSkills is the triple-union backend (the fix)" $ do
+      let tmp = "/tmp/seal-repo-discovery-skilllist-fix"
+      cleanup tmp
+      setupRepo tmp
+      workdirBackend <- workdirSkillBackend =<< mkFs tmp
+      userBackend <- SkillBackend.noneBackend
+      -- The fix: sessionSkills = tripleUnionSkillBackend workdir user
+      let sessionSkills = tripleUnionSkillBackend workdirBackend userBackend
+          reg = Registry.mkRegistry [skillListOp sessionSkills]
+      r <- runDispatch reg (OpName "SKILL_LIST") (object [])
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          case orParts res of
+            [TrpText t] ->
+              T.isInfixOf "proj/my-repo/repo-skill" t `shouldBe` True
+            _ -> expectationFailure "expected a single text part"
+        Left e -> expectationFailure ("dispatch failed: " ++ show e)
+      cleanup tmp
+    it "SKILL_LIST does NOT return workdir skills when bSkills is the user-only backend (the bug)" $ do
+      let tmp = "/tmp/seal-repo-discovery-skilllist-bug"
+      cleanup tmp
+      setupRepo tmp
+      -- The bug: bSkills stays as the user-only backend (no workdir skills)
+      userBackend <- SkillBackend.noneBackend
+      let reg = Registry.mkRegistry [skillListOp userBackend]
+      r <- runDispatch reg (OpName "SKILL_LIST") (object [])
+      case r of
+        Right res -> do
+          orIsError res `shouldBe` False
+          case orParts res of
+            [TrpText t] -> do
+              -- Built-in skills appear (seal-usage, codegraph), but no
+              -- workdir skill.
+              T.isInfixOf "proj/my-repo/repo-skill" t `shouldBe` False
+              T.isInfixOf "repo-skill" t `shouldBe` False
+            _ -> expectationFailure "expected a single text part"
+        Left e -> expectationFailure ("dispatch failed: " ++ show e)
       cleanup tmp
 
   describe "Seal.Agent.Def.Backend.workdirAgentDefBackend" $ do
@@ -335,7 +404,7 @@ spec = do
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- The leaking 'leak' agent must NOT appear (its body would be the secret).
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- The project def still appears (it's not a symlink).
       ids `shouldContain` ["my-repo--agents-md"]
       -- No def's system prompt contains the secret.
@@ -469,7 +538,7 @@ spec = do
       -- is rejected.
       length defs `shouldBe` 3
       ids `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "my-repo--linked"]
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- The project def's system prompt is the agents.md body.
       let mProject = [d | d <- defs, agentDefIdText (adId d) == "my-repo--agents-md"]
       case mProject of
@@ -659,10 +728,23 @@ spec = do
       fs <- mkRemoteScanFs calls canned
       backend <- workdirSkillBackend fs
       skills <- sbList backend
-      map (skillIdText . skId) skills `shouldBe` ["my-repo--my-skill"]
+      map (skillIdText . skId) skills `shouldBe` ["proj/my-repo/my-skill"]
       recorded <- readIORef calls
       length recorded `shouldBe` 3
       recorded `shouldNotSatisfy` any probeStyle
+
+-- | Dispatch a single Trusted opcode through the integration seam for the
+-- SKILL_LIST regression test. Uses the fail-closed 'UntrustedIO' stub (the
+-- opcode is Trusted — it never touches the untrusted plane).
+runDispatch :: Registry.Registry -> OpName -> Value -> IO (Either DispatchError OpResult)
+runDispatch reg opName input = do
+  logger <- testSealLogger
+  env <- mkEnv logger defaultConfig
+  runApp env $ do
+    deps <- liftIO stubCloneDeps
+    (h, _) <- liftIO fakeTwoFileTranscript
+    abortFlag <- liftIO newAbortFlag
+    dispatch reg h localBackend (mkTestUIOEnv mkRemoteUntrustedIOStub deps) defaultToolTimeoutConfig abortFlag opName input
 
 cleanup :: FilePath -> IO ()
 cleanup path =
