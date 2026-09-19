@@ -51,6 +51,8 @@ Backends, tests, Arbitrary instances) are updated.
 
 ## Scope — What's In
 
+### New / replaced modules
+
 - `Seal.Memory.Path` — new `MemoryPath` smart-constructed newtype
 - `Seal.Memory.Store` — new file-based store (active/archived, write-once, archive)
 - `Seal.Memory.Embedding` — `EmbeddingBackend` typeclass + null + engram backends
@@ -58,6 +60,22 @@ Backends, tests, Arbitrary instances) are updated.
 - `Seal.Core.Backends` — updated to construct the new memory store
 - `Seal.Core.TurnEngine` — updated wiring (2 sites: session + child)
 - All tests updated
+
+### Downstream files with hardcoded opcode names or type references
+
+These files don't import `Seal.Memory.*` but hardcode old opcode names
+(`MEMORY_RECALL`, `MEMORY_DELETE`) or reference old types
+(`isValidMemoryId`, `memoryDeleteOp`) in code or comments. They must be
+updated in M5 or the build/tests will break:
+
+- `src/Seal/ISA/Ops/Agent.hs:266` — `knownOpNames` set hardcodes `"MEMORY_WRITE"`, `"MEMORY_RECALL"`, `"MEMORY_DELETE"`. Replace with the 5 new opcode names.
+- `src/Seal/Channels/StreamProgress.hs:277-278` — emoji mappings for `"MEMORY_RECALL"` and `"MEMORY_DELETE"`. Replace with mappings for `"MEMORY_READ"`, `"MEMORY_LIST"`, `"MEMORY_SEARCH"`, `"MEMORY_ARCHIVE"`.
+- `src/Seal/ISA/Registry.hs:65-67` — comments reference `MEMORY_RECALL`. Update comments.
+- `src/Seal/ISA/Ops/Skills.hs:199` — doc comment references `memoryDeleteOp`. Update comment.
+- `src/Seal/Agent/Def/Types.hs:38` — doc comment references `isValidMemoryId`. Update comment.
+- `src/Seal/Skills/Types.hs:38` — doc comment references `isValidMemoryId`. Update comment.
+- `test/Seal/Agent/Runtime/Delegation/WorkerSpec.hs:113` — `baseSet` references `OpName "MEMORY_RECALL"`. Replace with `OpName "MEMORY_READ"`.
+- `test/Seal/Gateway/ApiSpec.hs:898` — test fixture JSON contains `"name":"MEMORY_RECALL"`. Replace with `"MEMORY_READ"`.
 
 ## Scope — What's Out (Deferred)
 
@@ -336,6 +354,20 @@ update all integration tests.
   Add `bEmbedding :: Mem.EmbeddingBackend`.
 - Modify: `src/Seal/Core/TurnEngine.hs` — update both `baseOps` sites
   (session + child) to wire the 5 new opcodes instead of the 3 old ones.
+- Modify: `src/Seal/ISA/Ops/Agent.hs` — update `knownOpNames` set
+  (line ~266): replace `"MEMORY_WRITE", "MEMORY_RECALL", "MEMORY_DELETE"`
+  with the 5 new opcode names.
+- Modify: `src/Seal/Channels/StreamProgress.hs` — update emoji mappings
+  (lines ~277-278): replace `"MEMORY_RECALL"` and `"MEMORY_DELETE"` with
+  `"MEMORY_READ"`, `"MEMORY_LIST"`, `"MEMORY_SEARCH"`, `"MEMORY_ARCHIVE"`.
+- Modify: `src/Seal/ISA/Registry.hs` — update comments (lines ~65-67)
+  that reference `MEMORY_RECALL`.
+- Modify: `src/Seal/ISA/Ops/Skills.hs` — update doc comment (line ~199)
+  that references `memoryDeleteOp`.
+- Modify: `src/Seal/Agent/Def/Types.hs` — update doc comment (line ~38)
+  that references `isValidMemoryId`.
+- Modify: `src/Seal/Skills/Types.hs` — update doc comment (line ~38)
+  that references `isValidMemoryId`.
 - Modify: `test/Seal/ISA/IntegrationSpec.hs` — update memory integration
   tests for the new opcodes.
 - Modify: `test/Seal/Phase5Spec.hs` — update the capstone scenario to use
@@ -344,6 +376,12 @@ update all integration tests.
   `MemoryEntry` instances with `MemoryPath` instances.
 - Modify: `seal-harness.cabal` — update module registrations.
 - Modify: `test/Main.hs` — update spec registrations.
+- Modify: `test/Seal/Agent/Runtime/Delegation/WorkerSpec.hs` — update
+  `baseSet` (line ~113): replace `OpName "MEMORY_RECALL"` with
+  `OpName "MEMORY_READ"`.
+- Modify: `test/Seal/Gateway/ApiSpec.hs` — update test fixture JSON
+  (line ~898): replace `"name":"MEMORY_RECALL"` with
+  `"name":"MEMORY_READ"`.
 
 **Tasks:**
 
@@ -356,12 +394,22 @@ update all integration tests.
 - [ ] 5.3 Update `TurnEngine` child `baseOps`: same replacement.
 - [ ] 5.4 Update `IntegrationSpec` memory tests: rewrite for new opcodes.
 - [ ] 5.5 Update `Phase5Spec` capstone: update the `MEMORY_WRITE` +
-      `MEMORY_RECALL` tool calls to `MEMORY_WRITE` + `MEMORY_READ`.
+      `MEMORY_RECALL` tool calls to `MEMORY_WRITE` + `MEMORY_READ`. Also
+      update the import list and `buildRegistry` to use the new opcode
+      functions.
 - [ ] 5.6 Update `Arbitrary`: remove `MemoryId` / `MemoryEntry` instances;
       add `MemoryPath` instance.
 - [ ] 5.7 Remove old `Seal.Memory.Types` / `Seal.Memory.Backend` modules
       and their test specs from cabal + `test/Main.hs`.
-- [ ] 5.8 `make check` — full gate green: build (-Werror), test, hlint.
+- [ ] 5.8 Update `src/Seal/ISA/Ops/Agent.hs` `knownOpNames`: replace old
+      opcode names with the 5 new ones.
+- [ ] 5.9 Update `src/Seal/Channels/StreamProgress.hs` emoji mappings for
+      the new opcodes.
+- [ ] 5.10 Update doc comments in `Registry.hs`, `Skills.hs`,
+       `Agent.Def.Types`, `Skills.Types` that reference old names.
+- [ ] 5.11 Update `WorkerSpec.hs` `baseSet` and `ApiSpec.hs` test fixture
+       to use new opcode names.
+- [ ] 5.12 `make check` — full gate green: build (-Werror), test, hlint.
 
 **Commit:** `feat: wire new memory system into Backends + TurnEngine`
 
