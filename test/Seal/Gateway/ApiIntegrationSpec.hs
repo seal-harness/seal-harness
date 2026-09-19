@@ -294,7 +294,7 @@ ghShimScript expectedToken = T.unlines
 -- /skill list slash command used the base backends (user + built-in
 -- only), not the session-aware triple-union backend that includes
 -- workdir skills. This test creates a repo with .agents/skills/bar
--- in the session workdir, sends /skill list, and asserts foo--bar
+-- in the session workdir, sends /skill list, and asserts proj/foo/bar
 -- appears in the response.
 workdirSkillListSpec :: Spec
 workdirSkillListSpec = describe "Seal.Gateway.ApiIntegration (/skill list with workdir skills)" $ do
@@ -311,7 +311,7 @@ workdirSkillListSpec = describe "Seal.Gateway.ApiIntegration (/skill list with w
       Just (A.Object o) -> do
         case KeyMap.lookup (Key.fromText "response") o of
           Just (A.String resp) ->
-            T.isInfixOf "foo--bar" resp `shouldBe` True
+            T.isInfixOf "proj/foo/bar" resp `shouldBe` True
           Just other ->
             expectationFailure ("expected response string, got: " <> show other)
           Nothing ->

@@ -92,12 +92,15 @@ data SkillBackend = SkillBackend
 -- all groups, while @sbRead (SkillId "core\/greet")@ always works
 -- unambiguously.
 resolveSkillId :: SkillId -> Map.Map SkillId Skill -> Maybe Skill
-resolveSkillId sid m
-  | isJust (skillIdGroup sid) = Map.lookup sid m
-  | otherwise =
-      case [ s | (sId, s) <- Map.toList m, bareSkillIdText sId == bareSkillIdText sid ] of
-        [s] -> Just s
-        _   -> Nothing
+resolveSkillId sid m =
+  case Map.lookup sid m of
+    Just s  -> Just s
+    Nothing -> case Map.lookup (stripUserPrefix sid) m of
+      Just s  -> Just s
+      Nothing ->
+        case [ s | (sId, s) <- Map.toList m, bareSkillIdText sId == bareSkillIdText sid ] of
+          [s] -> Just s
+          _   -> Nothing
 
 -- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
 -- Kept as a fallback when no config repo is available.
@@ -320,9 +323,9 @@ readAgentSkillDirect fs mGroup dirRel = do
 stampProjectGroup :: Text -> Skill -> Skill
 stampProjectGroup repo s = case skGroup s of
   Just g | not (T.null (T.strip g)) -> s
-  _ -> s { skGroup = Just (repo <> " project skills") }
+  _ -> s { skGroup = Just ("proj/" <> repo) }
 
--- | Prefix a workdir-discovered skill's id with @\<repo\>--\<id\>@ so it
+-- | Prefix a workdir-discovered skill's id with @proj/<repo>/<id>@ so it
 -- never collides with a user-store skill of the same name (mirrors the
 -- agent-def pattern in 'Seal.Agent.Def.Backend.prefixWorkdirDef'). The
 -- @--@ separator is charset-safe per 'isValidSkillId'. If the prefixed id
@@ -330,14 +333,14 @@ stampProjectGroup repo s = case skGroup s of
 -- the skill is dropped ('Nothing' — fail-closed).
 prefixWorkdirSkill :: Text -> Skill -> Maybe Skill
 prefixWorkdirSkill repo s =
-  let prefixedIdText = repo <> "--" <> skillIdText (skId s)
+  let prefixedIdText = "proj/" <> repo <> "/" <> skillIdText (skId s)
   in case mkSkillId prefixedIdText of
        Left _ -> Nothing
        Right sid -> Just s { skId = sid }
 
 -- | A three-way union of a workdir backend (repo-local skills), a user
 -- backend, and the built-in skills. Workdir skill ids are namespaced
--- (@\<repo\>--\<id\>@) so they never collide with user skills by design.
+-- (@proj/<repo>/<id>@) so they never collide with user skills by design.
 -- On id collisions between user and built-in, user shadows built-in.
 -- Reads check workdir first, then user, then the built-in map. Listing
 -- merges all three with the same precedence. Writes go to the /user/
@@ -418,9 +421,29 @@ writeSkill root repo s = do
 --
 -- The reads go through the 'WorkdirFs' handle (via 'userDirFs') so they
 -- share the single confined code path (§3.6) while remaining local-FS.
+
+-- | Strip the display-only @user/@ prefix from a 'SkillId' so it
+-- resolves to the on-disk group/bare-id structure. The @user/@
+-- namespace is added by the discovery layer ('readAndStampGroup',
+-- 'readAgentSkillAt') for display consistency but is not part of
+-- the on-disk directory layout.
+stripUserPrefix :: SkillId -> SkillId
+stripUserPrefix sid =
+  let t = skillIdText sid
+  in case T.stripPrefix "user/" t of
+       Just rest | not (T.null rest) ->
+         case mkSkillId rest of
+           Right s  -> s
+           Left _   -> sid
+       _ -> sid
+
 readSkill :: FilePath -> SkillId -> IO (Maybe Skill)
-readSkill root sid = do
+readSkill root sid0 = do
   let fs = userDirFs root
+      -- Strip the display-only @user/@ prefix so the id resolves
+      -- to the on-disk group/bare-id structure (e.g. @user/core/greet@
+      -- → group=@core@, bare=@greet@).
+      sid = stripUserPrefix sid0
       base = bareSkillIdText sid <> ".md"
       dir = bareSkillIdText sid
   -- If the id is fully-qualified (e.g. "core/greet"), narrow the
@@ -470,7 +493,7 @@ readAndStampGroup fs rel mGroup = do
       let s' = case skGroup s of
             Just _  -> s
             Nothing -> s { skGroup = mGroup }
-      in s' { skId = qualifiedSkillId (skGroup s') (skId s') }
+      in s' { skId = qualifiedSkillId (Just "user") (qualifiedSkillId (skGroup s') (skId s')) }
 
 -- | Enumerate the immediate sub-directories of the 'WorkdirFs' anchor
 -- (non-recursive, no hidden dirs), sorted for deterministic output.
@@ -642,7 +665,7 @@ readAgentSkillAt fs dir mGroup = do
       let s' = case skGroup s of
             Just _  -> s
             Nothing -> s { skGroup = mGroup }
-      in Just s' { skId = qualifiedSkillId (skGroup s') (skId s') }
+      in Just s' { skId = qualifiedSkillId (Just "user") (qualifiedSkillId (skGroup s') (skId s')) }
     stampGroup Nothing = Nothing
 
 -- | Decode an agentskills.io @SKILL.md@ file into a 'Skill'. The frontmatter

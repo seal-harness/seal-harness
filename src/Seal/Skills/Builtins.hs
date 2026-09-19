@@ -97,7 +97,7 @@ builtinSkills = mapMaybe decodeAndStamp builtinRaw
                 , skGroup     = Just group
                 }
           in Just stamped
-                { skId = qualifiedSkillId (skGroup stamped) (skId stamped)
+                { skId = qualifiedSkillId (Just "user") (qualifiedSkillId (skGroup stamped) (skId stamped))
                 }
 
 -- | 'builtinSkills' keyed by id for O(log n) lookups.

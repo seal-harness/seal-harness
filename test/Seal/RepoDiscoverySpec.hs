@@ -113,12 +113,12 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A repo-local skill."
           skBody s `shouldBe` "Do repo things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
-      case mkSkillId "my-repo--my-skill" of
+      case mkSkillId "proj/my-repo/my-skill" of
         Right sid -> do
           mSkill <- sbRead backend sid
           mSkill `shouldSatisfy` isJust
@@ -137,10 +137,10 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A .agents/skills skill."
           skBody s `shouldBe` "Do .agents things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
       cleanup tmp
 
@@ -170,10 +170,10 @@ spec = do
       length skills `shouldBe` 1
       case skills of
         [s] -> do
-          skillIdText (skId s) `shouldBe` "my-repo--my-skill"
+          skillIdText (skId s) `shouldBe` "proj/my-repo/my-skill"
           skDescription s `shouldBe` "A stub skill."
           skBody s `shouldBe` "Do stub things."
-          skGroup s `shouldBe` Just "my-repo project skills"
+          skGroup s `shouldBe` Just "proj/my-repo"
         _ -> expectationFailure "expected exactly 1 skill"
 
     it "rejects a symlinked SKILL.md escaping the workspace (stub-remote containment)" $ do
@@ -196,8 +196,8 @@ spec = do
       skills <- sbList backend
       let ids = map (skillIdText . skId) skills
       -- The good skill is discovered; the leaking 'leak' skill is rejected.
-      ids `shouldContain` ["my-repo--good-skill"]
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldContain` ["proj/my-repo/good-skill"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- No skill body contains the escaped secret.
       let bodies = map skBody skills
       bodies `shouldNotSatisfy` any ("PRIVATE" `T.isInfixOf`)
@@ -228,7 +228,7 @@ spec = do
           skills <- sbList unioned
           length skills `shouldBe` 4
           let ids = map (skillIdText . skId) skills
-          ids `shouldContain` ["my-repo--shared-skill"]
+          ids `shouldContain` ["proj/my-repo/shared-skill"]
           ids `shouldContain` ["shared-skill"]
         Left _ -> expectationFailure "invalid skill id"
       cleanup tmp
@@ -262,7 +262,7 @@ spec = do
           orIsError res `shouldBe` False
           case orParts res of
             [TrpText t] ->
-              T.isInfixOf "my-repo--repo-skill" t `shouldBe` True
+              T.isInfixOf "proj/my-repo/repo-skill" t `shouldBe` True
             _ -> expectationFailure "expected a single text part"
         Left e -> expectationFailure ("dispatch failed: " ++ show e)
       cleanup tmp
@@ -281,7 +281,7 @@ spec = do
             [TrpText t] -> do
               -- Built-in skills appear (seal-usage, codegraph), but no
               -- workdir skill.
-              T.isInfixOf "my-repo--repo-skill" t `shouldBe` False
+              T.isInfixOf "proj/my-repo/repo-skill" t `shouldBe` False
               T.isInfixOf "repo-skill" t `shouldBe` False
             _ -> expectationFailure "expected a single text part"
         Left e -> expectationFailure ("dispatch failed: " ++ show e)
@@ -404,7 +404,7 @@ spec = do
       defs <- adbList backend
       let ids = map (agentDefIdText . adId) defs
       -- The leaking 'leak' agent must NOT appear (its body would be the secret).
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- The project def still appears (it's not a symlink).
       ids `shouldContain` ["my-repo--agents-md"]
       -- No def's system prompt contains the secret.
@@ -538,7 +538,7 @@ spec = do
       -- is rejected.
       length defs `shouldBe` 3
       ids `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "my-repo--linked"]
-      ids `shouldNotContain` ["my-repo--leak"]
+      ids `shouldNotContain` ["proj/my-repo/leak"]
       -- The project def's system prompt is the agents.md body.
       let mProject = [d | d <- defs, agentDefIdText (adId d) == "my-repo--agents-md"]
       case mProject of
@@ -728,7 +728,7 @@ spec = do
       fs <- mkRemoteScanFs calls canned
       backend <- workdirSkillBackend fs
       skills <- sbList backend
-      map (skillIdText . skId) skills `shouldBe` ["my-repo--my-skill"]
+      map (skillIdText . skId) skills `shouldBe` ["proj/my-repo/my-skill"]
       recorded <- readIORef calls
       length recorded `shouldBe` 3
       recorded `shouldNotSatisfy` any probeStyle
